@@ -19036,3 +19036,151 @@ Benchmark priorities:
 - Treat stale-route prevention as the failure condition: eviction, promotion,
   refresh, and GC must never allow a reader to observe data outside its
   declared interval.
+
+### 2026-06-03 - Leveraging Lock Contention to Improve OLTP Application Performance
+
+**Citation:** Cong Yan and Alvin Cheung. "Leveraging Lock Contention to Improve
+OLTP Application Performance." Proceedings of the VLDB Endowment 9(5), 2016.
+Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`.
+
+**Category:** Transaction processing / write path and concurrency control.
+
+**Relevance tags:** lock contention; OLTP transaction scheduling; query
+reordering; two-phase locking; contention profiling; dependency analysis;
+stored procedure boundaries; high-concurrency write path.
+
+**Core idea:** The paper presents QURO, a query-aware compiler that improves
+lock-based OLTP transactions by changing the order in which application code
+issues queries. Instead of treating all locks as equally urgent, QURO profiles
+which queries are most likely to hit contended tuples and moves those queries
+as late as program and database dependencies permit. The goal is not to avoid
+conflicts entirely; it is to keep transactions doing independent useful work
+before they acquire the hot lock that will serialize them.
+
+This is an application-code transformation for 2PL systems, but the principle
+transfers to any engine that has a small number of hot serialization points.
+If a request must eventually cross a mutation owner, a hot partition owner, a
+visibility publication boundary, or a GPU refresh publication point, the rest
+of the independent work should be scheduled before that crossing when doing so
+does not change semantics.
+
+**Concrete mechanisms:**
+
+- Developers demarcate transaction functions; QURO's prototype is built on
+  Clang for C/C++ transaction code and assumes standard DB APIs such as ODBC.
+- QURO first emits an instrumented binary and profiles it under a representative
+  workload. In the prototype, each query's contention index is approximated
+  from the standard deviation of that query's running time, on the assumption
+  that most variance in the tested main-memory setup comes from lock waits.
+- The compiler splits reorderable regions into smaller "reorder units."
+  It applies loop fission and conditional-block splitting where statements do
+  not affect the loop condition, conditional predicate, or each other's data.
+- Reaching-definition analysis derives program-variable dependencies. QURO
+  preserves RAW, WAR, and WAW constraints and can remove some WAR/WAW name
+  dependencies through variable renaming when primitive values can be safely
+  cloned.
+- Database-level dependencies add ordering constraints when two queries touch
+  the same table and at least one writes, when views are involved, when foreign
+  keys may be affected, or when triggers may mutate referenced tables. Those
+  conservative constraints keep rewritten code semantically equivalent.
+- Reordering is formulated as an integer linear program. Each reorder unit gets
+  a final position, dependency constraints restrict legal positions, and the
+  objective arranges query-related units in ascending contention index so hot
+  operations move later.
+- To keep the ILP tractable, QURO removes non-query units from the solved
+  problem while deriving transitive constraints among query units, then
+  reconstructs a full statement order with validity checks, variable renaming,
+  and rollback/retry when a proposed placement violates a constraint.
+- Evaluation uses MySQL 5.5 on a 128-core, 1056GB-memory machine with data in
+  memory and commit-time disk flush disabled for the main experiments. The
+  authors report up to 6.53x throughput improvement and up to 85% latency
+  reduction on tested OLTP benchmarks, including TPC-C, TPC-E trade update,
+  and a bidding workload.
+- The largest wins occur under high data contention. TPC-C payment moves the
+  contentious warehouse update later; TPC-E trade update benefits from loop
+  fission that groups many writes toward the end; the bidding transaction moves
+  the hot item read/update late.
+- The paper reports an important tradeoff: delaying the hottest lock can
+  increase waiting on less-contended queries because transactions now make more
+  concurrent progress. The net win depends on the hot-lock wait saved being
+  larger than the extra waiting introduced elsewhere.
+- Reordering also shortens a "deadlock window" in TPC-E trade update because
+  hot updates are held for less of the transaction's lifetime, reducing aborts
+  when concurrent transactions touch the same objects in different orders.
+- Stored procedures reduce client/server round trips, but in the paper's
+  TPC-C payment comparison, contention-aware reordering outperforms the stored
+  procedure variant when contention is high. With little contention, the stored
+  procedure wins from lower communication overhead.
+- The authors note workload drift as a limitation: because the profile is
+  static, transaction code should be re-profiled and reordered if contention
+  patterns change. Dynamic profiling and regeneration are left as future work.
+
+**GPU DB mapping:** GPU DB should not blindly preserve client-issued operation
+order inside multi-step logical transactions when the engine can prove a
+different order is equivalent. A future stored-procedure or prepared workflow
+path can annotate read sets, write sets, required result dependencies, and
+owner crossings. The scheduler can then run independent retained reads, CPU
+lookups, validation, and parameter derivation before enqueueing the hot mutation
+owner command or hot partition write.
+
+The paper also strengthens the case for exposing contention telemetry at the
+query-shape and owner-boundary level. Current runtime docs already call for
+queue wait telemetry and bounded rings. QURO suggests a more semantic layer:
+which statement or route family causes the request to wait, which owner or
+tuple/range class is hot, and how long the request holds the serialization
+point after acquisition. That is the input needed for a planner to decide
+whether to delay a mutation, batch several compatible writes, precompute GPU
+read inputs first, or reject overload before occupying a scarce owner slot.
+
+For GPU-resident reads, the transferable idea is "contentious gates last."
+A lookup transaction that needs a hot write plus several read-only retained
+checks should run compatible immutable snapshot work before it joins the
+mutation queue. A refresh transaction that must publish a new resident
+generation should prebuild buffers, validate schema/generation compatibility,
+and prepare response metadata before acquiring the publication boundary. A
+batch of writes to a hot partition should similarly collect and validate
+independent inputs before crossing into the owner that serializes visibility.
+
+QURO's ILP is probably not the first implementation shape for GPU DB. A more
+practical first step is a small dependency DAG for stored procedures or
+multi-command workflows: nodes are reads, writes, validation steps, GPU kernels,
+and response assembly; edges are true data or visibility dependencies; each
+node carries observed contention and owner/queue wait. The scheduler can choose
+a topological order that pushes high-contention owner gates later while staying
+within a latency budget.
+
+**Risks and mismatches:** QURO targets 2PL application code, not MVCC snapshot
+visibility, WAL recovery, CUDA execution, or protocol-level session admission.
+Its main experiments disable commit-time disk flushing, so the reported
+throughput is not a durability-inclusive GPU DB write target. The profiling
+method assumes query-time variance is mostly lock waiting, which may be false
+when GPU kernel launch, PCIe transfer, network backpressure, or cold-tier IO
+variance dominates. Static reordering can become wrong for performance, though
+not necessarily semantics, when hot keys or route costs shift. Compiler-level
+rewrites also require a stored-procedure or prepared-workflow boundary; they
+do not apply to arbitrary interactive SQL where the next query depends on the
+client seeing the previous result.
+
+**Benchmark candidates:**
+
+- Add owner-boundary contention telemetry for multi-step requests: per-step
+  queue wait, execution time, owner id, tuple/range/partition hotness class,
+  and hold time after entering the mutation or residency publication owner.
+- Build a stored-workflow simulator with a dependency DAG for TPC-C payment-like
+  logic. Compare client order against "contentious owner last" topological
+  ordering. Gate: SQL-visible results and WAL-before-visibility are identical.
+- Create a hot-partition write benchmark where each logical request performs
+  independent retained reads plus one hot mutation. Measure p50/p99 latency,
+  mutation queue hold time, abort/retry count, and throughput when independent
+  reads are done before versus after mutation admission.
+- Prototype a refresh-publication DAG: prepare GPU/host buffers and validate
+  generations before acquiring the residency publication boundary. Failure
+  condition: publication-order changes let a reader observe a generation whose
+  WAL/schema/invalidation boundary is not yet valid.
+- Compare static profile-based reordering with adaptive ordering based on live
+  queue-wait EWMA by route family. Gate: adaptive ordering must not oscillate
+  or starve short requests when hotness shifts.
+- Test the stored-procedure versus reordered-workflow tradeoff for pgwire:
+  one variant reduces round trips but preserves application order; another
+  keeps a workflow boundary and reorders hot owner gates. Measure when
+  communication savings dominate and when contention-aware order dominates.

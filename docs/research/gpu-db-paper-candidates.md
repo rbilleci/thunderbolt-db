@@ -96,11 +96,13 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   PDF: `https://irenezhang.net/papers/demikernel-sosp21.pdf`
   Why: low-latency OS/network stack architecture relevant to session and
   response-ring design.
-- `queued` — **Design Choices in Low-Latency C++ Systems: Empirical Insights
+- `skipped` — **Design Choices in Low-Latency C++ Systems: Empirical Insights
   With Applications to High-Frequency Trading**, SSRN 2026.
   URL: `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6513601`
   Why: modern HFT-oriented low-latency systems survey; useful for queue,
-  allocation, cache, and thread-pinning patterns.
+  allocation, cache, and thread-pinning patterns. Skipped in this cron worker
+  because both the SSRN landing page and Delivery PDF were blocked by a
+  Cloudflare challenge on 2026-06-03.
 
 ### Multi-tier cache, buffer management, and data placement
 
@@ -350,7 +352,7 @@ Append new candidates here as each paper is processed.
   Why: OS-level mmap scalability work cited by the CIDR 2022 mmap paper; useful
   as a contrasting source on whether modified mmap paths can ever be safe or
   fast enough for GPU DB cold-tier experiments.
-- `queued` — **Leveraging Lock Contention to Improve OLTP Application
+- `reviewed` — **Leveraging Lock Contention to Improve OLTP Application
   Performance**, Yan and Cheung, PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`
   Why: program-analysis and contention-aware execution ideas that complement
@@ -520,6 +522,13 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/osdi24/presentation/xiang`
   Why: transactional page migration for tiered memory cited by vmcache^n;
   useful for comparing OS-assisted migration against explicit DBMS ownership.
+- `queued` — **Improving Optimistic Concurrency Control Through Transaction
+  Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2019.
+  URL: `https://doi.org/10.14778/3282495.3282502`
+  PDF: `https://dl.acm.org/doi/pdf/10.14778/3282495.3282502`
+  Why: modern follow-up for QURO-style reordering at storage and validation
+  stages under OCC; useful for comparing application-level query ordering
+  with engine-owned micro-batching and dependency-aware validation.
 - `queued` — **Counting Is All You Need for Instant Tuple Discovery:
   Enabling Real-Time HTAP in Standalone DBMSs**, Lim et al., PACMMOD 2025.
   URL: `https://doi.org/10.1145/3769775`
