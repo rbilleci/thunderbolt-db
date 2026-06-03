@@ -11157,3 +11157,156 @@ Multi-Version Concurrency Control, ERMIA, or Moving on From Group Commit.
 - For P8 over-resident work, test async prefetch and storage queue ownership
   behind a visibility-generation cache descriptor before experimenting with
   GPU-initiated or SPDK-backed production paths.
+
+### 2026-06-03 - Autonomous commit for low-latency NVMe durability
+
+**Citation:** Lam-Duy Nguyen, Adnan Alhomssi, Tobias Ziegler, and Viktor
+Leis. "Moving on From Group Commit: Autonomous Commit Enables High
+Throughput and Low Latency on NVMe SSDs." Proc. ACM Manag. Data 3(3),
+SIGMOD 2025, Article 191. DOI: `10.1145/3725328`. Retrieved 2026-06-03
+from the official TUM-hosted PDF,
+`https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/latency.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** WAL; commit processing; decentralized logging; group
+commit; NVMe SSDs; write admission; dependency checking; low-tail latency;
+lock-free queues; force commit; durable visibility.
+
+**Core idea:** The paper argues that group commit is no longer the obvious
+answer for durable transaction processing on modern enterprise NVMe SSDs.
+Traditional group commit amortizes slow disk writes by batching many
+transactions behind one committer, but that same single-threaded batching
+creates large I/O spikes, serial commit acknowledgment, and queuing delays.
+The authors show that in LeanStore's decentralized logging path, transaction
+execution itself is negligible in a high-throughput YCSB commit-latency
+breakdown; queuing and dependency-check acknowledgment dominate.
+
+Autonomous commit replaces one large commit round with worker-local small
+flushes plus parallel commit acknowledgment. The storage premise is concrete:
+their Kioxia enterprise PCIe 5 NVMe SSD delivers low-latency small random
+writes, with 4 KiB writes around 11 us in the paper's microbenchmark and
+latency still low under parallel writers. The commit protocol therefore leans
+into device parallelism rather than hiding it behind a single batching thread.
+The authors report microsecond-range 90th-percentile commit latencies across
+YCSB, TATP, and TPC-C variants, and a YCSB throughput improvement of 26.1%
+over their best queued group-commit competitor in the main comparison. In
+their scalability test, the 16 KiB autonomous variant reaches about 11 million
+transactions per second with 192 hardware threads.
+
+**Concrete mechanisms:**
+
+- Each worker owns a local log buffer and flushes it once dirty log entries
+  reach a small configurable log flush unit. The evaluated variants use 4 KiB
+  for lowest latency and 16 KiB as a throughput/latency compromise.
+- Autonomous log flush separates durability progress from a single group
+  committer. Workers submit independent small writes instead of waiting for
+  a central thread to collect hundreds of megabytes of log records.
+- Commit acknowledgment is also decentralized. A worker checks commit
+  eligibility for its own pre-committed transactions, or for a small
+  acknowledgment group, instead of waiting for one global thread to inspect
+  every worker queue.
+- The paper keeps the two correctness conditions explicit for decentralized
+  logging: a transaction must first become `HARDENED` when its log records are
+  durable, then `COMMITTED` only after its dependencies are committed.
+- Acknowledgment groups trade synchronization cost against queuing delay. The
+  paper finds group sizes of two or four are robust across YCSB and TPC-C,
+  while larger groups can help TPC-C but hurt very high-rate YCSB.
+- Log stealing reduces latency when small transactions do not fill a worker's
+  local flush unit quickly. A worker clones dirty log bytes from peers in the
+  same topology group, claims them with CAS on a clean cursor, flushes the
+  combined buffer, and publishes durability for the stolen range.
+- Stealing is constrained by CPU topology, for example within an L3-sharing
+  group, to avoid excessive inter-die traffic on large server CPUs.
+- Out-of-order stealing completion is handled by merging notification tasks,
+  so a later physical write does not publish a worker's durable prefix ahead
+  of earlier stolen log records.
+- Under low load, force commit predicts idle periods and probabilistically
+  triggers flush plus acknowledgment so sparse transactions do not wait
+  forever for a threshold-sized log batch.
+- For Global Sequence Number dependency tracking, barrier transactions advance
+  idle workers' GSNs without modifying data or writing log records, avoiding
+  the straggler problem where one idle worker pins the global minimum durable
+  GSN.
+- The transaction queue is a single-producer/single-consumer circular
+  lock-free queue with serialized transaction metadata stored contiguously and
+  cache-line aligned, reducing allocation and latch contention in the commit
+  path.
+
+**GPU DB mapping:** This paper is directly relevant to COPY/INSERT commit
+latency and to the "WAL-before-visibility" boundary in the current runtime
+document. GPU DB should not treat group commit as the only durable publication
+shape. A mutation owner or partition owner can still preserve ordered
+visibility while allowing owner-local WAL fragments to harden in small,
+parallel, generation-tagged writes. Visibility publication remains separate:
+rows, resident invalidations, and GPU snapshot generations become SQL-visible
+only after the relevant durable ranges and dependency frontiers are satisfied.
+
+The strongest transferable mechanism is a three-frontier write path:
+`executed`, `hardened`, and `visible`. Today those may collapse inside one
+owner loop, but the benchmark design should expose them separately. COPY
+admission can batch row encoding and index preparation, WAL owners can harden
+small aligned buffers, and a visibility publisher can acknowledge only the
+safe prefix whose dependencies and invalidations are complete.
+
+Autonomous acknowledgment also maps to partition ownership. If future GPU DB
+partitions own disjoint write sets, a central commit acknowledger would become
+the same bottleneck the paper identifies. Per-owner committed-state summaries,
+small acknowledgment groups, and explicit dependency frontiers fit the
+existing owner-domain model better than one global commit queue.
+
+Log stealing is useful, but only as an owner-aware mechanism. For GPU DB, a
+worker should not steal arbitrary WAL bytes if that blurs ownership of table
+invalidation, relation generation, or partition visibility. A safe variant
+would steal only sealed WAL fragments carrying table/partition identity,
+source transaction range, dependency summary, and a callback for durable-prefix
+publication.
+
+The low-load force-commit and barrier ideas matter for 1M logical sessions.
+Interactive sessions and bursty clients can produce sparse writes that never
+fill a large group-commit batch. The runtime should have a latency ceiling for
+durable publication, and idle partition owners should advance harmless
+frontier markers so retained readers and GPU snapshot retirement are not
+pinned by inactive owners.
+
+**Risks and mismatches:** The design assumes enterprise NVMe behavior, direct
+I/O/block-device-style logging, and enough independent write parallelism. It
+may underperform on mechanical disks, weak consumer SSDs, cloud volumes with
+opaque flush semantics, or file-system paths where `fsync` remains expensive.
+The evaluated system is LeanStore on CPU, not a GPU database, and the paper
+does not address PostgreSQL protocol serving, CUDA streams, resident cache
+invalidation, DDL, replication, or SQL planner routing.
+
+Autonomous commit does not remove the need for correct dependency tracking.
+GSN/RFA is low-overhead but uses a weaker commit condition; barrier
+transactions mitigate stragglers but do not magically provide precise
+causality. GPU DB should treat the paper as a durable publication design, not
+as a full MVCC or serializability proof. Log stealing also adds subtle
+publication-order hazards; any prototype needs replay and crash tests before
+throughput numbers matter.
+
+**Benchmark candidates:**
+
+- Add a WAL commit microbenchmark with explicit `executed -> hardened ->
+  visible` phase timers. Compare current group/batch flush, owner-local 4 KiB
+  and 16 KiB aligned flush units, and a latency-ceiling force-commit mode.
+  Gate: WAL replay produces identical CPU table state and resident
+  invalidation generations.
+- Build a COPY admission benchmark with bursty clients: many small commits,
+  idle gaps, and one long retained read snapshot. Measure commit p50/p90/p99,
+  WAL bytes/write, IOPS, write amplification, visible-generation lag, and GPU
+  snapshot invalidation delay.
+- Prototype per-partition durable frontiers. Each partition owner reports a
+  local `hardened` prefix and a local `visible` prefix; a read snapshot chooses
+  only a complete frontier vector. Failure condition: a retained read observes
+  a row whose WAL range is not replay-safe.
+- Test acknowledgment group sizes for GPU DB owner domains: one owner, one
+  NUMA/L3 group, and all owners. Required metrics: synchronization cost,
+  visible-prefix lag, queue wait, abort/retry behavior, and throughput under
+  skewed hot partitions.
+- Simulate safe log stealing with sealed WAL fragments only. Gate: stolen
+  fragments cannot publish visibility until their original owner's earlier
+  fragments are durable and their invalidation callbacks have run.
+- Add low-load force-commit and barrier-frontier tests. Sparse write sessions
+  should commit under a configured latency ceiling, and idle owners should not
+  pin global snapshot retirement or old resident-generation cleanup.

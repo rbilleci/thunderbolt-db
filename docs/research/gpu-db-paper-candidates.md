@@ -1079,12 +1079,27 @@ Append new candidates here as each paper is processed.
   ingestion; relevant to COPY admission, cold-partition prefetch, and deciding
   how much data-movement timing information the DBMS should expose to lower
   I/O layers.
-- `queued` — **Moving on From Group Commit: Autonomous Commit Enables High
+- `reviewed` — **Moving on From Group Commit: Autonomous Commit Enables High
   Throughput and Low Latency on NVMe SSDs**, Nguyen et al., SIGMOD 2025.
-  URL: `https://doi.org/10.1145/3725311`
+  URL: `https://doi.org/10.1145/3725328`
+  PDF:
+  `https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/latency.pdf`
   Why: DaMoN 2025 kernel-bypass paper cites it as a modern WAL/storage
   follow-up; directly relevant to COPY admission, WAL flush scheduling, and
   whether GPU DB should decouple commit progress from group-commit bottlenecks.
+- `queued` — **The Art of Latency Hiding in Modern Database Engines**,
+  Huang et al., PVLDB 2023.
+  URL: `https://doi.org/10.14778/3632093.3632106`
+  Why: autonomous commit builds on its flush-pipelining and latency-hiding
+  context; useful for deciding which background commit, scheduling, and I/O
+  overlap techniques still matter before adopting fully autonomous WAL
+  publication.
+- `queued` — **Your Read is Our Priority in Flash Storage**, An et al.,
+  PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p1911-an.pdf`
+  Why: autonomous commit cites it for flash-storage behavior; relevant to
+  balancing WAL writes, cold-partition reads, and read-latency priority when
+  GPU DB shares NVMe devices between durability and over-resident execution.
 - `queued` — **What Modern NVMe Storage Can Do, And How To Exploit It:
   High-Performance I/O for High-Performance Storage Engines**, Haas and Leis,
   PVLDB 2023.
