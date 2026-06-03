@@ -23756,3 +23756,170 @@ retained partitioned scans and aggregates.
 - Once future memory tiers exist, replay the same workload with injected
   remote-memory latency to estimate the threshold where GPU DB should
   use warm remote-memory indexes versus direct NVMe/cold fallback.
+
+### 2026-06-03 - Swift delay-based datacenter congestion control
+
+**Citation:** Gautam Kumar, Nandita Dukkipati, Keon Jang, Hassan M.
+G. Wassel, Xian Wu, Behnam Montazeri, Yaogong Wang, Kevin Springborn,
+Christopher Alfeld, Michael Ryan, David Wetherall, and Amin Vahdat.
+"Swift: Delay is Simple and Effective for Congestion Control in the
+Datacenter." SIGCOMM 2020, pages 514-528. doi:10.1145/3387514.3406591.
+Retrieved 2026-06-03 from the Google Research publication page,
+`https://research.google/pubs/swift-delay-is-simple-and-effective-for-congestion-control-in-the-datacenter/`;
+the ACM PDF endpoint returned HTTP 403 in this worker, so the full
+paper text was read from the public course mirror at
+`https://2022-cs244.github.io/papers/L5-swift.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** high-concurrency networking; response-ring
+backpressure; delay-based admission; host congestion; fabric
+congestion; incast; pacing; target-delay control; queue-delay telemetry;
+low-tail latency; OS-bypass transport.
+
+**Core idea:** Swift is a production datacenter congestion-control
+protocol that uses measured delay as the primary signal. The key design
+choice is not just "use RTT"; Swift decomposes end-to-end delay into
+fabric and endpoint components, then controls both with simple AIMD
+windows around explicit target delays. This lets Google run large-scale
+storage, shuffle, and RPC traffic near line rate while keeping tail
+latency and loss low, including under very large incasts where ordinary
+one-packet congestion windows are still too aggressive.
+
+For GPU DB, the transferable idea is that high concurrency needs
+continuous delay feedback at each resource boundary, not only static
+queue caps. A million logical sessions will not be limited first by a
+single TCP connection count; it will be limited by endpoint queues,
+response buffers, pinned memory, owner rings, GPU execution lanes, WAL
+flush slots, and cold-tier IO. Swift provides a concrete pattern for
+turning queue wait into per-boundary rate control while preserving
+simple operational knobs.
+
+**Concrete mechanisms:**
+
+- Swift measures end-to-end RTT with NIC and host timestamps, then
+  separates fabric delay from endpoint delay. Endpoint delay includes
+  remote NIC receive queueing and local NIC receive delay; fabric delay
+  is RTT minus endpoint delay.
+- The protocol maintains separate congestion windows for fabric and
+  endpoint pressure. Each follows an AIMD controller around its own
+  target delay, and the effective send window is the minimum of the two.
+- On each ACK, Swift increases the window when measured delay is below
+  target and multiplicatively decreases it when delay exceeds target.
+  The decrease magnitude depends on how far the delay is above target,
+  and decreases are limited to once per RTT so the sender does not react
+  repeatedly to the same congestion event.
+- Endpoint delay is filtered with EWMA because host-side queueing is
+  noisier than fabric delay. The paper reports that separating endpoint
+  and fabric congestion improved production tail latency for most
+  applications by about 2x without regressions.
+- For extreme incast, Swift allows the congestion window to fall below
+  one packet and converts the fractional window into an inter-packet
+  pacing delay. This is used only in the very low-window regime because
+  always-on pacing is less CPU-efficient than ACK clocking at ordinary
+  rates.
+- Target delay is scaled by topology and flow pressure. Swift uses hop
+  count to avoid making short paths tolerate the same queueing as long
+  paths, and uses the current congestion window as a proxy for many
+  competing flows, increasing target headroom when the fair-share window
+  is small.
+- Loss recovery remains deliberately simple because the controller keeps
+  loss rare. The implementation uses SACK-style bitmaps, per-flow RTO,
+  and fast recovery, but the paper emphasizes avoiding loss rather than
+  optimizing complex recovery paths.
+- Swift coexists with other traffic through QoS classes and
+  weighted-fair queueing rather than requiring switch-side programmable
+  scheduling or ECN threshold tuning.
+- The production evaluation reports very low loss even at high link
+  utilization, low fabric RTT relative to the configured target, and
+  strong application-level results for in-memory BigQuery shuffle and
+  storage workloads. In a large testbed, Swift sustains close to 100
+  Gbps per server while keeping 99.9th-percentile RTT below 50
+  microseconds at near-full load; a 5000-to-1 incast experiment shows
+  that fractional-window pacing avoids the loss and multi-millisecond
+  RTT seen without `cwnd < 1` support.
+
+**GPU DB mapping:** The runtime in
+`11-high-throughput-query-runtime.md` already names bounded ingress,
+mutation, read-snapshot, GPU execution, residency, and response rings.
+Swift suggests the next layer: each ring needs a target queue-delay
+contract, not just a maximum depth. A session or route class can be
+allowed to send more work while owner-ring wait is below target, but
+must shrink credits or add pacing when the fabric-equivalent boundary
+is hot.
+
+The fabric/endpoint split maps well to GPU DB's owner domains.
+"Fabric" pressure is the shared transport path: network IO workers,
+socket writability, response rings, and gateway/load-balancer queues.
+"Endpoint" pressure is the local service path: mutation owner wait,
+WAL flush backlog, read snapshot lane wait, GPU stream/scratch
+availability, pinned-buffer exhaustion, and cold-tier IO. Combining the
+effective rate as the minimum of independent pressure windows prevents
+the runtime from blaming the wrong boundary and overfeeding a saturated
+owner simply because the socket path looks healthy.
+
+The fractional-window incast mechanism is especially relevant to
+COPY, reconnect storms, and many sessions issuing the same retained
+lookup. If active sessions exceed the useful batch or buffer
+bandwidth-delay product, "one outstanding request per session" is still
+too much. GPU DB should be able to assign fractional active-work credits
+per session or route class, implemented as timed admission into rings
+rather than as unbounded pending work.
+
+Swift's target-delay scaling also maps to route classes. Same-rack
+short retained reads, cold NVMe fallbacks, WAL-heavy writes, and
+over-resident GPU scans should not share one queue-wait target. The
+planner/admission path can choose target delays by route shape and
+tier distance, then let measured queue wait enforce them. That gives a
+cleaner overload policy than static "max clients" settings.
+
+Finally, the low operational complexity matters. GPU DB should avoid
+designs that require perfect global scheduling before the first
+production fast path works. Delay measured at the boundaries already
+visible in telemetry can drive useful admission long before the engine
+has a sophisticated global scheduler.
+
+**Risks and mismatches:** Swift is a network transport paper, not a
+database runtime. It does not handle SQL transactions, WAL safety,
+snapshot isolation, GPU residency, query planning, or PostgreSQL
+protocol state. Its strongest deployment results rely on Google's
+Pony Express/Snap-style OS-bypass stack, NIC timestamps, known
+datacenter topology, and production observability that a local pgwire
+endpoint may not have.
+
+Delay feedback can also oscillate if GPU DB applies it blindly. Owner
+queues carry heterogeneous work where service time depends on query
+shape, memory tier, snapshot generation, and GPU kernel occupancy.
+Queue delay alone is insufficient without route classification and
+service-time telemetry. Pacing also has CPU overhead; for ordinary
+rates, Swift deliberately prefers ACK-clocked windows, which maps to
+GPU DB using simple credits most of the time and timed pacing only
+under severe pressure.
+
+**Benchmark candidates:**
+
+- Add a response-ring admission experiment with per-session credits
+  controlled by measured response-ring wait. Gate: same SQL-visible
+  results and lower p95/p99 latency than a fixed outstanding-request
+  cap under 1k-64k logical sessions.
+- Build a host-only Swift-style controller for owner queues: separate
+  windows for network IO, mutation owner, read-snapshot lane, GPU
+  execution lane, and WAL flush backlog; effective admission is the
+  minimum window. Failure condition: the controller improves throughput
+  by letting any ring exceed its bounded capacity or hiding overload.
+- Add an incast retained-read smoke where thousands of logical sessions
+  issue the same lookup or aggregate. Compare one-outstanding-request,
+  static credits, and fractional timed admission. Gate: bounded memory
+  use, stable p99 latency, and no owner queue blow-up.
+- Extend telemetry with target queue delay per route class: fast
+  retained lookup, retained aggregate, COPY chunk, WAL flush, refresh,
+  cold fallback, and over-resident GPU scan. Gate: every overload or
+  pacing decision reports the boundary and target it used.
+- Test route-specific target delays. Short retained lookups should have
+  a microsecond-scale queue target; cold-tier fallback and refresh work
+  can tolerate longer waits. Failure condition: a single global target
+  either starves long work or lets short reads miss their latency goal.
+- For future kernel-bypass or DPU work, compare OS TCP queue-delay
+  signals, io_uring/socket writability, and NIC timestamp-style
+  feedback to decide whether pgwire needs a transport split before the
+  1M logical-session target is realistic.

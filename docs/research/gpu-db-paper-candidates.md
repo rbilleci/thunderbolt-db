@@ -424,7 +424,7 @@ Append new candidates here as each paper is processed.
   Why: direct predecessor to AIFO that uses a small set of strict-priority
   queues to approximate PIFO; useful for comparing one-queue admission with
   multi-lane response scheduling.
-- `queued` — **Swift: Delay is Simple and Effective for Congestion Control in
+- `reviewed` — **Swift: Delay is Simple and Effective for Congestion Control in
   the Datacenter**, Kumar et al., SIGCOMM 2020.
   URL: `https://doi.org/10.1145/3387514.3406591`
   Why: AIFO depends on fast-converging end-host congestion control; useful for
@@ -970,7 +970,7 @@ Append new candidates here as each paper is processed.
   full transaction stages rather than only WAL, index, or GPU refresh
   substeps, and when batch-level write-set ordering should be preferred over
   per-request optimistic validation in hot partitions.
-- `queued` — **Swift: Delay is Simple and Effective for Congestion Control in
+- `reviewed` — **Swift: Delay is Simple and Effective for Congestion Control in
   the Datacenter**, Kumar et al., SIGCOMM 2020.
   URL: `https://doi.org/10.1145/3387514.3406591`
   Why: PowerTCP contrasts against delay-based congestion control; useful for
@@ -2024,3 +2024,15 @@ Append new candidates here as each paper is processed.
   Why: modern cache-placement follow-up from the same tiering research area;
   useful for comparing DB-owned cache admission and pushdown placement with
   GPU DB resident, host, and cold-tier policies.
+- `queued` — **Making congestion control robust to per-packet load balancing in
+  datacenters**, arXiv 2025.
+  URL: `https://arxiv.org/abs/2509.07907`
+  Why: modern Swift follow-up that studies robustness under per-packet load
+  balancing; useful if GPU DB later maps delay-based admission across
+  multi-path gateways, distributed IO workers, or multiple response lanes.
+- `queued` — **FASTFLOW: Flexible Adaptive Congestion Control for
+  High-Performance Datacenters**, arXiv 2024.
+  URL: `https://arxiv.org/abs/2404.01630`
+  Why: recent congestion-control comparison against Swift, PowerTCP, and other
+  datacenter schemes; useful for deciding whether GPU DB admission should
+  combine delay, queue-depth, and optional explicit notification signals.
