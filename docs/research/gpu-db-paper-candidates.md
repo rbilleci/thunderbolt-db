@@ -1543,12 +1543,29 @@ Append new candidates here as each paper is processed.
   scalable range-locking is a modern comparison point for page-fault,
   mmap/munmap, and non-overlapping virtual-address operations in
   VM-assisted buffer managers.
-- `queued` — **F2: Designing a Key-Value Store for Large Skewed Workloads**,
-  Kanellis, Chandramouli, and Venkataraman, arXiv 2023.
-  URL: `https://arxiv.org/abs/2305.01516`
+- `reviewed` — **From FASTER to F2: Evolving Concurrent Key-Value Store
+  Designs for Large Skewed Workloads**, Kanellis, Chandramouli, Hart, and
+  Venkataraman, PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p4910-kanellis.pdf`
+  arXiv: `https://arxiv.org/abs/2305.01516`
+  DOI: `https://doi.org/10.14778/3750601.3750615`
   Why: Tiered-Indexing cites F2 as skewed log-structured storage work; useful
   for comparing record hotness, write buffering, and skew adaptation against
   GPU DB hot/cold resident lookup placement.
+- `queued` — **Spooky: Granulating LSM-Tree Compactions Correctly**,
+  Dayan et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p3071-dayan.pdf`
+  DOI: `https://doi.org/10.14778/3551793.3551843`
+  Why: F2 contrasts against LSM compaction policies; Spooky is a modern
+  compaction-granularity baseline for deciding whether GPU DB cold-tier
+  segment refresh should move whole runs, partitions, pages, or smaller
+  key-range fragments.
+- `queued` — **RocksDB: Evolution of Development Priorities in a Key-value
+  Store Serving Large-scale Applications**, Dong et al., ACM TOS 2021.
+  URL: `https://doi.org/10.1145/3483840`
+  Why: F2 uses RocksDB and MixGraph-style production skew as a workload
+  baseline; this paper can ground GPU DB skew, memory-budget, and write
+  amplification benchmarks in production KV workload evolution.
 - `queued` — **EvenDB: Optimizing Key-Value Storage for Spatial Locality**,
   Gilad et al., EuroSys 2020.
   URL: `https://doi.org/10.1145/3342195.3387523`

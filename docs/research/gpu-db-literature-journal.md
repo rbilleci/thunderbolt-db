@@ -18717,3 +18717,150 @@ claim.
   chunks, 2 MiB chunks, and database segment-sized transfers. Minimum proof:
   the chosen granularity is good for both scan bandwidth and high-concurrency
   point-query tails, or the planner can route them differently.
+
+### 2026-06-03 - F2 skew-aware hot/cold record placement
+
+**Citation:** Konstantinos Kanellis, Badrish Chandramouli, Ted Hart, and
+Shivaram Venkataraman. "From FASTER to F2: Evolving Concurrent Key-Value
+Store Designs for Large Skewed Workloads." PVLDB 18(12), 2025,
+4910-4923. Retrieved 2026-06-03 from the VLDB PDF,
+`https://www.vldb.org/pvldb/vol18/p4910-kanellis.pdf`; DOI
+`https://doi.org/10.14778/3750601.3750615`; arXiv
+`https://arxiv.org/abs/2305.01516`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** skewed point access; hot/cold placement; read-cache;
+write-hot separation; larger-than-memory state; latch-free compaction;
+two-level hash index; NVMe bandwidth; write amplification; linearizable KV
+semantics.
+
+**Core idea:** F2 evolves FASTER for large, skewed, memory-constrained
+point-operation workloads where read-hot and write-hot records may not be the
+same records. Its central move is to separate record placement by observed
+hotness instead of letting one hybrid log fight over all hot and cold records.
+Write-hot records stay in a hot log with an in-memory index, write-cold
+records move to a mostly disk-resident cold log with a compact two-level
+index, and disk-resident read-hot records are copied into a dedicated
+in-memory read-cache.
+
+For GPU DB, the transferable lesson is that a single "resident or not"
+decision is too coarse. A retained lookup path needs distinct budgets for
+write-hot mutation deltas, read-hot immutable snapshots, and cold backing
+segments. Otherwise, cold refresh work can evict lookup-hot GPU/host state, or
+read caching can amplify write traffic by dragging write-cold records through
+the wrong tier.
+
+**Concrete mechanisms:**
+
+- F2 uses a hot log for write-hot records and a separate cold log for
+  write-cold records. Hot-cold compaction copies live records from the old
+  part of the hot log to the cold-log tail, then truncates the hot log. Cold-
+  cold compaction copies live cold-log records to the cold-log tail and
+  truncates old cold regions.
+- The hot-log index is an in-memory lock-free hash table. It indexes only hot
+  log and read-cache records, so it avoids paying full in-memory index cost for
+  every cold key.
+- The cold-log index is a two-level hash index. Hash entries are grouped into
+  fixed-size hash chunks, such as 256-byte chunks with 32 entries, and an
+  in-memory hash table indexes the chunks while the chunks themselves live in
+  a log-structured disk store. The paper's example indexes 250M cold keys with
+  about 64 MiB of in-memory chunk-index state.
+- Lookup-based compaction uses a Conditional-Insert primitive. It appends a
+  copied record only if no newer record with the same key appeared in the
+  relevant source-log address range; CAS updates to the index entry prevent an
+  older compacted record from overwriting a newer record.
+- Multi-threaded compaction scans fixed log ranges and distributes records to
+  compaction threads with atomic fetch-and-add. A small circular buffer holds
+  prefetched log pages. The paper reports lookup-based compaction finishing
+  5.2x faster than scan-based compaction at the same disk-bandwidth target and
+  using 120 MiB instead of 3 GiB of memory in the evaluated setup.
+- Reads first check hot-log/read-cache chains, then cold log if needed. A
+  disk-resident read-hot record may be inserted into the read-cache after it
+  is fetched, while writes/RMWs/deletes invalidate older read-cache replicas
+  for the key.
+- The read-cache is another in-memory HybridLog with mutable and read-only
+  regions. A requested record in the read-only region is copied to the tail,
+  giving it second-chance behavior. Eviction rewrites hash-chain heads with
+  CAS so future reads skip evicted cache entries.
+- The paper identifies a cold-log false-absence anomaly under concurrent
+  cold-cold compaction, where a read can miss a key copied past truncation. F2
+  tracks completed truncations with an atomic counter; if a read returns
+  absent and a truncation occurred, it searches the newly introduced chain
+  portion before returning `NOT_FOUND`.
+- Evaluation uses YCSB and Meta MixGraph-style workloads with 250M keys, a
+  10% memory budget by default, 16 CPU cores, and four Samsung PM9A3 NVMe SSDs
+  in RAID-0. Reported throughput improves by 2x to 11.9x versus compared KV
+  stores across workloads; the read-cache improves read-heavy throughput by
+  up to 1.27x; write amplification is reported 1.3x to 3.9x lower than
+  LSM-based stores on average. The authors disable WAL, compression, and
+  checksums in baselines where supported, so durability costs are not part of
+  the headline numbers.
+
+**GPU DB mapping:** GPU DB's P8 design already splits durable CPU truth from
+GPU resident snapshots. F2 suggests adding a second split inside the
+performance tiers: write-hot mutable state, read-hot retained snapshots, and
+read-cold backing segments should have independent budgets and eviction
+reasons. A table or key range should not become GPU-resident only because it
+was recently updated; it should become resident because read route telemetry
+shows it will repay refresh and HBM/host-memory cost.
+
+The read-cache maps to a retained immutable snapshot cache, not to arbitrary
+SQL result caching. When a cold CPU/NVMe segment becomes lookup-hot, GPU DB can
+promote a compact key/vector or column-group generation into host pinned memory
+or GPU memory. Mutation publication must invalidate or supersede that
+generation before a stale retained read can claim compatibility. F2's explicit
+cache invalidation on updates is therefore a useful shape, but GPU DB needs
+MVCC generation checks and WAL-before-visibility in addition to per-key
+linearizability.
+
+Conditional-Insert is also a useful model for refresh and compaction
+correctness. A resident refresh builder can copy rows or column chunks from an
+older CPU snapshot only if no newer visible generation for the same key/range
+has been published past its start boundary. If a newer generation exists, the
+copy should abort or be marked obsolete before publication. This is the same
+basic protection F2 uses to keep compaction from reviving old records.
+
+The cold-log index is a reminder that full in-memory indexing of cold keys is
+not free. For P8, a cold-tier locator can be chunked: compact host/GPU-visible
+directories for hot partitions, larger on-NVMe locator chunks for cold
+segments, and promotion based on observed key-range hotness. That avoids
+building GPU-resident or host-resident indexes for all cold rows just because a
+few ranges are hot.
+
+**Risks and mismatches:** F2 is a KV library, not a SQL engine. It does not
+model MVCC visibility, range predicates, joins, text layouts, columnar GPU
+snapshots, WAL recovery, SQL error handling, or 1M protocol sessions. Its
+evaluation disables durability features where supported, so the reported
+throughput is not a direct write-path target for GPU DB. F2's hash-centric
+point-access design may not transfer to scans or mixed analytical kernels
+without a separate column-group path. The read-cache holds record replicas; in
+GPU DB, replicas must carry snapshot generation, schema generation, and
+invalidation metadata or they become unsafe.
+
+**Benchmark candidates:**
+
+- Add hotness-class telemetry for P8: write-hot mutation deltas, read-hot
+  retained snapshots, read-hot exact responses, read-cold backing segments,
+  and cold locator chunks. Gate: eviction and promotion decisions name the
+  class and do not silently mix scratch, durable truth, and retained reads.
+- Build a skewed retained-lookup benchmark with non-overlapping read-hot and
+  write-hot key sets. Compare one shared resident budget against separate
+  budgets for write deltas, retained read generations, and cold locators.
+  Failure condition: write churn evicts read-hot retained state enough to
+  regress p99 lookup latency.
+- Prototype chunked cold locators for a large table: a small in-memory
+  directory points to cold key/range locator chunks on NVMe or compressed host
+  memory. Gate: cold lookup p99 and locator memory per key are both reported.
+- Add a refresh Conditional-Insert analog: when rebuilding a resident
+  generation, abort or obsolete a copied chunk if a newer generation for the
+  same key/range was published after the builder's start boundary. Gate:
+  injected concurrent mutations cannot revive stale rows.
+- Compare read-cache admission policies for retained lookups: promote on first
+  cold miss, second-chance promotion, frequency threshold, and planner-directed
+  warmup. Measure HBM/host-memory bytes, refresh bytes, p50/p99 latency, and
+  invalidation churn.
+- Add a false-absence stress test for concurrent cold-tier compaction and
+  retained lookup. The GPU DB version should use generation/truncation
+  counters so a lookup cannot return absent merely because a segment was
+  compacted while the lookup traversed locator metadata.
