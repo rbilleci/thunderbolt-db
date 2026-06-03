@@ -700,13 +700,20 @@ Append new candidates here as each paper is processed.
   Why: Vessel-style userspace process abstraction is a direct contrast to
   Skyloft's shared scheduler model; relevant to tenant/session isolation,
   core sharing, and minimizing inter-application switching cost.
-- `queued` — **Efficient Scheduling Policies for Microsecond-Scale Tasks**,
+- `reviewed` — **Efficient Scheduling Policies for Microsecond-Scale Tasks**,
   McClure et al., NSDI 2022.
   URL: `https://www.usenix.org/conference/nsdi22/presentation/mcclure`
   PDF: `https://www.usenix.org/system/files/nsdi22-paper-mcclure_2.pdf`
   Why: policy-focused evaluation of work stealing, static allocation, and
   core reallocation for microsecond tasks; useful before choosing GPU DB
   IO-worker, retained-read, and background-refresh scheduling policies.
+- `queued` — **Syrup: User-defined Scheduling across the Stack**,
+  Kaffes et al., SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483548`
+  Why: cited by the NSDI 2022 scheduling-policy paper as a cross-stack
+  scheduling design; useful for deciding whether GPU DB should expose query
+  class, priority, and owner-boundary scheduling hints through the runtime
+  instead of hard-coding one queue policy.
 - `queued` — **Lemo: A Cache-Enhanced Learned Optimizer for Concurrent
   Queries**, Mo et al., PACMMOD 2023.
   URL: `https://doi.org/10.1145/3626713`

@@ -19184,3 +19184,158 @@ client seeing the previous result.
   one variant reduces round trips but preserves application order; another
   keeps a workflow boundary and reorders hot owner gates. Measure when
   communication savings dominate and when contention-aware order dominates.
+
+### 2026-06-03 - Efficient Scheduling Policies for Microsecond-Scale Tasks
+
+**Citation:** Sarah McClure, Amy Ousterhout, Scott Shenker, and Sylvia
+Ratnasamy. "Efficient Scheduling Policies for Microsecond-Scale Tasks."
+NSDI 2022. Retrieved 2026-06-03 from the USENIX publication page and PDF,
+`https://www.usenix.org/conference/nsdi22/presentation/mcclure`.
+
+**Category:** Runtime / HFT / session scale.
+
+**Relevance tags:** microsecond scheduling; work stealing; core allocation;
+tail latency; CPU efficiency; IO workers; retained reads; background refresh;
+admission control; queue telemetry.
+
+**Core idea:** The paper separates two decisions that are often bundled inside
+low-latency runtimes: how tasks are load-balanced across cores inside one
+application, and how cores are reallocated across colocated applications as
+load changes. Its central finding is that implementation polish is not enough;
+policy choice can waste cores or inflate tails when task service times are
+around one microsecond.
+
+For commodity hardware, the authors find that work stealing is the strongest
+load-balancing policy across the tested conditions. Dynamic core reallocation
+is more subtle. For very short tasks and fixed average load, static core
+allocation can be as good or better than dynamic allocation because allocation
+overheads become large relative to service time. When load changes, however,
+policies that proactively revoke cores based on average delay or utilization
+perform better than policies that wait for a core to fail to find work. Their
+Caladan implementation reports up to 13-22% better background throughput
+than Shenango/Caladan-style allocation policies without degrading memcached
+median or tail latency.
+
+**Concrete mechanisms:**
+
+- The paper evaluates load-balancing policies separately from core-allocation
+  policies through simulation, using measured overheads from real systems
+  rather than comparing whole runtimes whose network stacks and thread systems
+  differ.
+- Load-balancing candidates include single shared queue, no software load
+  balancing, enqueue choice, work stealing, and work shedding. The single queue
+  is treated as ideal without contention but bottlenecks in real systems.
+- Enqueue choice pays overhead at arrival time to inspect candidate queues and
+  assign a task. It can strand work if a later-idle core cannot help with tasks
+  already placed elsewhere.
+- Work stealing pays overhead only when a core is idle: it probes other cores
+  and steals queued tasks. The paper models each remote check or steal as a
+  cross-core communication cost and uses 100 ns as the canonical simulation
+  value.
+- Work shedding moves tasks after an overloaded core detects excess queueing
+  delay and notifies another core. In the authors' analysis, tail tasks wait
+  longer before being moved than with work stealing.
+- Core-allocation candidates include static allocation, per-task allocation,
+  queueing-delay triggers, CPU-utilization triggers, and yielding when a core
+  fails to find work.
+- The delay-range policy checks average queueing delay at fixed intervals and
+  adds or revokes a core when delay leaves configured lower/upper bounds.
+- The utilization-range policy similarly adds or revokes cores when average
+  CPU utilization leaves a configured range.
+- A key policy result is that yielding cores only after work stealing fails can
+  waste many cycles searching for nonexistent work, especially as core count
+  grows. Proactive revocation can recover those cycles even when some queued
+  work may still exist.
+- The simulations model core-allocation overhead as 5 microseconds and discuss
+  lower-level costs such as cache misses for cross-core communication and
+  inter-processor-interrupt latency for moving a core.
+- The implementation extends Caladan with small runtime and scheduler changes:
+  expose queue delay and CPU utilization to a scheduler core, let application
+  cores yield when notified between tasks, and revoke the core with the least
+  queued work.
+- The paper does not preempt running tasks in the Caladan implementation; core
+  revocation happens at runtime scheduler boundaries.
+- The experimental setup colocates memcached with a background application.
+  Delay-range and utilization-range policies preserve similar memcached
+  latency while freeing more CPU capacity for background work than the compared
+  Shenango/Caladan policies.
+- The authors explicitly note that with known constant load and very small
+  tasks, static allocation may be the best choice; dynamic allocation mainly
+  matters for adapting quickly to load changes without overprovisioning peak
+  capacity.
+
+**GPU DB mapping:** This paper is a useful guardrail for the 1M-logical-session
+target in `11-high-throughput-query-runtime.md`. The engine should not treat
+"dynamic scheduling" as automatically superior. For microsecond retained-read
+routes, exact-response hits, response metadata reuse, and small owner messages,
+the cost of rebalancing work or changing worker ownership can rival the work
+itself. Stable partitioning plus cheap work stealing may beat aggressive
+per-request steering.
+
+The strongest transferable idea is to separate load balancing from resource
+allocation. GPU DB can use work-stealing-like behavior inside a class of
+network IO workers or retained-read workers while using a different policy to
+allocate scarce resources such as CPU cores, pinned buffers, CUDA streams,
+scratch buffers, response buffers, and background refresh slots. A session
+admission policy should not be hidden inside the worker queue algorithm.
+
+Delay-range and utilization-range also map naturally to runtime telemetry.
+For each owner/ring class, GPU DB should track average queue delay, p99 queue
+delay, worker utilization, active credits, and saturation reason. If a retained
+read ring is below its delay target, spare workers or buffers can be reclaimed
+for mutation, refresh, or background work. If delay exceeds target, capacity
+can be granted if the target resource is really available. That is more
+controllable than waiting until workers repeatedly fail to steal work or until
+tails have already inflated.
+
+For GPU execution, the paper argues for route-class stability. Single-row
+lookups, small aggregates, refresh jobs, over-resident scans, COPY admission,
+and response writes should not all share one dynamic queue policy. Short
+retained reads may prefer mostly static worker assignment with stealing at idle
+boundaries. Longer refresh or over-resident work may tolerate dynamic resource
+reallocation because the scheduling overhead is small relative to service time.
+
+The proactive revocation result is especially relevant to background refresh.
+GPU DB should not let background refresh or cold-tier work keep scarce CPU,
+pinned-memory, or GPU-stream capacity just because it still has queued work.
+If foreground retained-read delay or mutation admission delay is outside its
+range, background resources should be reclaimable at explicit yield points.
+
+**Risks and mismatches:** The paper studies datacenter tasks and memcached-like
+RPC workloads, not SQL engines, WAL ordering, MVCC, pgwire transactions, GPU
+kernel execution, or NVMe tiering. Its simulation assumes simplified per-core
+queues and does not model preemption. The Caladan implementation uses
+kernel-bypass networking and user-level runtime machinery that the current GPU
+DB benchmark endpoint does not have. The 13-22% efficiency result is a CPU
+resource result under colocated workloads, not a direct query-throughput
+prediction. Finally, work stealing can interact badly with cache locality,
+snapshot affinity, CUDA stream ownership, and partition-owned mutable state if
+the stolen work crosses ownership boundaries too freely.
+
+**Benchmark candidates:**
+
+- Add a no-GPU runtime simulation for retained-read workers with static
+  assignment, enqueue choice, work stealing, and work shedding. Gate: report
+  p50/p99 queue delay, worker utilization, cross-worker moves, and response
+  latency for 1 microsecond, 10 microsecond, and 100 microsecond service-time
+  classes.
+- Add queue-delay and utilization-range telemetry to the bounded-ring design:
+  average queue delay, p99 queue delay, active worker count, worker idle/search
+  time, and explicit add/revoke decisions. Failure condition: a worker class
+  cannot explain why it kept or released capacity.
+- Compare static retained-read worker allocation against dynamic worker
+  reallocation under fixed average load. Expected result from the paper:
+  static should be competitive for tiny same-shape reads; failure condition:
+  dynamic steering adds tail latency without measurable utilization benefit.
+- Prototype proactive revocation for background refresh capacity. If retained
+  read or mutation queue delay leaves its target range, refresh work yields
+  pinned buffers or worker slots at safe boundaries. Gate: no resident
+  generation is published before its WAL/schema/invalidation boundary is valid.
+- Measure work stealing only within ownership-compatible classes: same snapshot
+  generation, relation/partition identity, query shape, and response shape.
+  Failure condition: stealing crosses a mutation or residency owner boundary
+  and creates stale-route or ordering risk.
+- Build a session-scale admission experiment that keeps many idle logical
+  sessions but bounds active work by delay/utilization-range policy. Required
+  metrics: idle-session memory, active credits, queue delay, rejected/admitted
+  work, and p99 latency under bursty load.
