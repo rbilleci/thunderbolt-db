@@ -12498,3 +12498,184 @@ invalidation, queue tail latency, or memory-tier disruption.
 - Use top-k similarity telemetry instead of only top-1 accuracy: report how
   close the top three observed route latencies are, and allow low-risk
   selection among them only when their measured penalty spread is small.
+
+### 2026-06-03 - WeBridge synthesized stored procedures for hot paths
+
+**Citation:** Gansen Hu, Zhaoguo Wang, Chuzhe Tang, Jiahuan Shen,
+Zhiyuan Dong, Sheng Yao, and Haibo Chen. "WeBridge: Synthesizing
+Stored Procedures for Large-Scale Real-World Web Applications."
+Proceedings of the ACM on Management of Data 2(1), SIGMOD 2024,
+Article 64, pp. 64:1-64:29. doi:10.1145/3639319. Retrieved
+2026-06-03 from
+`https://chuzhe.me/assets/pdf/2024%20-%20WeBridge-%20Synthesizing%20Stored%20Procedures%20for%20Large-Scale%20Real-World%20Web%20Applications.pdf`.
+
+**Category:** runtime / HFT / session scale, with transaction processing
+and query planning relevance.
+
+**Relevance tags:** stored procedures; client/server round trips; hot-path
+synthesis; concolic execution; ORM transparency; dependent SQL chains;
+transaction lock-hold time; route templates; cold-path fallback; speculative
+execution; session admission.
+
+**Core idea:** WeBridge targets a communication bottleneck that matches the
+recent Looking Glass and Tigger thread: web applications often issue many
+interactive SQL statements through ORM or database-access libraries, and
+later statements frequently depend on earlier query results. Ordinary
+prefetching or batching cannot collapse those dependent round trips because
+the application normally computes the dependency on the web-server side.
+WeBridge records real request paths, uses concolic execution to recover SQL
+data/control dependencies for hot paths, compiles those paths into stored
+procedures, and transparently invokes them through an extended database
+driver. The application still executes its original code, but the driver
+answers its expected SQL calls from buffered stored-procedure results.
+
+The strongest transferable idea for GPU DB is to treat repeated transaction
+or read templates as synthesizable route programs, not just as individual SQL
+requests. A high-concurrency pgwire path can continue to support ordinary
+interactive SQL, while hot, dependency-shaped request classes are promoted
+into bounded server-side programs that run near the owner, retained snapshot,
+or GPU execution worker. That reduces network round trips, owner re-entry,
+and lock-hold time without requiring every client to hand-author stored
+procedures.
+
+**Concrete mechanisms:**
+
+- WeBridge splits into an offline compiler and a runtime library. The runtime
+  records request inputs, SQL result sets, and external method return values;
+  the compiler identifies hot paths after a replay-count threshold and
+  synthesizes stored procedures for those paths.
+- Hot-path identification replays recorded request states on a separate
+  application instance and compares the sequence of branch decisions. Paths
+  that cross the hot threshold become synthesis targets.
+- Dependency extraction uses concolic execution. SQL invocations become graph
+  vertices containing query template, symbolic parameters, path conditions,
+  symbolic query results, and successor links. Edges capture issue order, and
+  parameters/path conditions capture data and control dependencies.
+- Multiple hot-path graphs are merged by matching equal query templates and
+  parameter expressions, then disjoining compatible path conditions. Divergent
+  suffixes remain as alternative graph branches.
+- Stored procedure generation is rule based. The implementation described in
+  the paper supports common SQL statement forms and uses 71 transformation
+  rules for arithmetic, comparisons, type mapping, and string operations.
+- If computations cannot be expressed in the target stored-procedure language,
+  such as unsupported external method calls or MySQL array operations, the
+  dependency graph is split into multiple subgraphs and procedures rather than
+  pretending the dependency vanished.
+- The generated procedures preserve transaction boundaries by carrying BEGIN
+  and COMMIT statements from the original sequence instead of implicitly
+  opening or closing a transaction for the procedure.
+- Runtime integration happens at the database-access driver. On the first SQL
+  call for an optimized API, the driver invokes the stored procedure, buffers
+  result sets and write-status outputs, resumes the application code, and
+  satisfies matching later SQL calls from the buffer.
+- Cold-path fallback uses per-query marker variables returned by the stored
+  procedure. If only a prefix of the expected statements executed, the driver
+  serves that prefix from buffered results and resumes ordinary interactive
+  SQL for the remaining cold path.
+- Exception handling is delayed to the application statement that would have
+  observed the error. Procedure-start errors fall back to the original
+  application path because no procedure statement has run yet.
+- Speculative execution prunes path conditions that do not distinguish
+  neighboring hot branches. For procedures with writes, WeBridge excludes the
+  final commit, adds savepoints, validates whether executed statements match
+  the application's requested statements, and rolls back incorrect speculative
+  writes before continuing.
+- Evaluation uses six open-source Java applications from e-commerce,
+  blogging, forum, and configuration-management domains, with separate
+  client, web, and MySQL 5.7 database machines. The paper reports up to
+  79.8% median latency reduction, geometric-mean median latency reduction of
+  58.1%, up to 2x peak throughput, and geometric-mean peak throughput
+  improvement of 1.34x. It attributes throughput gains partly to reduced SQL
+  parse/optimize work and partly to shorter transactions holding contended
+  locks.
+- The paper also reports that speculative execution reduces Shopizer API
+  latency by 10.6%-32.2%, while very low web/database RTT can expose runtime
+  overhead; one Sagan API is slower at 0.1 ms RTT.
+
+**GPU DB mapping:** WeBridge argues for a route-template layer between raw
+pgwire messages and execution owners. Today a client can send many small
+statements that repeatedly enter the owner, refresh route metadata, acquire a
+snapshot, and return tiny results. A GPU DB stored-route analogue would
+classify a known request path, bind parameters once, and execute a compact
+server-side program over owner state, retained snapshots, or GPU workers.
+The program could include multiple reads, conditional branches based on
+previous results, and writes that publish only at explicit durable/visible
+frontiers.
+
+For 1M logical sessions, this is an admission strategy as much as a planning
+strategy. Sessions that repeatedly execute known templates should hold a
+route handle rather than repeatedly paying full parse/plan/owner admission
+cost. The handle still needs deterministic invalidation by catalog generation,
+schema, supported operators, snapshot generation, residency state, and
+prepared/session state. Unknown or unsupported SQL remains on the conservative
+interactive path.
+
+The concolic dependency graph maps to GPU DB's future route descriptor:
+statement sequence, parameter dependencies, branch predicates, result shapes,
+transaction boundaries, visibility requirements, and required owner domains.
+The same graph can decide whether a template is safe for mutation-owner
+execution, immutable retained reads, CPU prefilter plus GPU tail, or ordinary
+CPU fallback. Importantly, WeBridge keeps cold fallback explicit. GPU DB
+should do the same: a synthesized route may serve a correct prefix, but once
+it sees an unmatched branch, stale generation, unsupported operator, or
+memory-pressure rejection, it must resume through the normal planner/owner
+path with visible telemetry.
+
+The speculative-write mechanism is also useful as a warning. GPU DB should
+not speculate visible writes for throughput unless rollback and publication
+fronts are named. Savepoints, validation markers, and commit exclusion map to
+the journal's recurring multi-front design: `validated`, `durable`,
+`pending-visible`, `resident-built`, and `SQL-visible` need separate state.
+Speculative retained reads are easier, but speculative writes require owner
+fences and WAL-before-visibility discipline.
+
+**Risks and mismatches:** WeBridge optimizes web-application request latency,
+not DBMS-internal execution. Its correctness relies on REST-style request
+handlers without application-side shared mutable state, deterministic SQL,
+and good modeling of external method results. GPU DB cannot assume arbitrary
+clients are REST-like or that a driver sees full application paths. A native
+GPU DB version would need to synthesize from observed SQL transaction traces,
+prepared-statement usage, or explicit stored-route definitions.
+
+The implementation targets Java applications, JDBC interception, ORM usage,
+and MySQL stored procedures. It does not solve pgwire compatibility,
+PostgreSQL session state, portals, cursors, temporary objects, or arbitrary
+SQL procedure language differences. The paper's evaluation is strong for
+round-trip-heavy web APIs, but when database CPU is already saturated by
+compute-intensive queries, throughput converges with the original
+application. For GPU DB, synthesized routes help most when communication,
+planning, lock-hold duration, or owner re-entry dominate; they will not fix
+an overloaded GPU kernel or a saturated storage tier by themselves.
+
+**Benchmark candidates:**
+
+- Add trace-only route-template mining for pgwire sessions: group statement
+  sequences by normalized SQL, parameter dependency, transaction boundary,
+  branch/fallback outcome, result shape, catalog generation, and route
+  family. Gate: no behavior change and a report naming the top hot templates
+  by round trips, owner entries, lock-hold time, and retained-read hits.
+- Prototype one server-side stored-route for a repeated read-only path:
+  bind parameters once, execute two or more dependent reads against a single
+  compatible snapshot, and return buffered per-statement results to the
+  client-visible protocol layer. Failure condition: result ordering,
+  error timing, or transaction semantics differ from the interactive path.
+- Compare interactive pgwire versus stored-route execution for a synthetic
+  dependent lookup chain under 0.1 ms, 1 ms, and 5 ms client/server RTT.
+  Required metrics: p50/p99 latency, owner entries per request, queue wait,
+  parse/plan time, response bytes, and fallback count.
+- For a write-containing template, implement only a dry-run validator first:
+  identify transaction boundaries, required WAL front, branch predicates, and
+  rollback points without executing speculative writes. Gate: the validator
+  rejects every template whose visible effects cannot be fenced.
+- Add cold-path fallback markers for synthesized retained routes: each
+  substep reports executed/not-executed, route generation, fallback reason,
+  and result hash. Minimum proof: a route can serve a valid prefix and resume
+  through the conservative planner without duplicated writes or missing reads.
+- Measure whether stored-route execution shortens contended owner critical
+  sections. Use a hot-key update/read mix and compare lock/owner hold time,
+  abort or retry count, p99 latency, and throughput against ordinary
+  statement-by-statement execution.
+- Use the mined route templates as training data for the CARPO/PARQO-style
+  route-ranker track: rank full request paths, not just single SQL
+  statements, while hard eligibility rules preserve snapshot, catalog,
+  residency, and WAL invariants.

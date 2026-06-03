@@ -277,9 +277,11 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol17/p2115-leis.pdf`
   Why: DB/OS co-design direction for shrinking communication and isolation
   overhead while preserving hardware-backed boundaries.
-- `queued` — **WeBridge: Synthesizing Stored Procedures for Large-Scale
+- `reviewed` — **WeBridge: Synthesizing Stored Procedures for Large-Scale
   Real-World Web Applications**, Hu et al., PACMMOD 2024.
-  URL: `https://dl.acm.org/doi/10.1145/3639315`
+  URL: `https://dl.acm.org/doi/10.1145/3639319`
+  PDF:
+  `https://chuzhe.me/assets/pdf/2024%20-%20WeBridge-%20Synthesizing%20Stored%20Procedures%20for%20Large-Scale%20Real-World%20Web%20Applications.pdf`
   Why: stored-procedure synthesis for reducing client/server transaction
   round trips while keeping application logic maintainable.
 - `reviewed` — **Practical DB-OS Co-Design with Privileged Kernel Bypass**,
@@ -956,6 +958,16 @@ Append new candidates here as each paper is processed.
   Why: CARPO cites Neo as an end-to-end learned optimizer baseline; useful for
   contrasting full learned plan search against bounded GPU DB route ranking
   and deterministic fallback rules.
+- `queued` — **Optimizing Distributed Protocols with Query Rewrites**,
+  Chu et al., SIGMOD/PACMMOD 2024.
+  URL: `https://dl.acm.org/doi/10.1145/3654906`
+  Author page:
+  `https://www.microsoft.com/en-us/research/publication/optimizing-distributed-protocols-with-query-rewrites/`
+  Why: follow-up discovered while reviewing WeBridge; uses rule-driven
+  rewrites, dependency analysis, and spatiotemporal correctness reasoning to
+  scale coordination protocols, which may inform stored-procedure route
+  synthesis, owner split rules, and safe batching of GPU DB transaction
+  frontiers.
 - `queued` — **Is Your Learned Query Optimizer Behaving As You Expect? A
   Machine Learning Perspective**, Lehmann et al., PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p1565-lehmann.pdf`
