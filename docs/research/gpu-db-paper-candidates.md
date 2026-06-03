@@ -581,7 +581,7 @@ Append new candidates here as each paper is processed.
   Why: hybrid GPU-initiated but CPU-managed SSD control path; useful follow-up
   to Torp et al. for reducing GPU busy-wait/control-plane burn while still
   overlapping storage access with GPU compute.
-- `queued` — **GPU-Initiated On-Demand High-Throughput Storage Access in the
+- `reviewed` — **GPU-Initiated On-Demand High-Throughput Storage Access in the
   BaM System Architecture**, Qureshi et al., ASPLOS 2023.
   URL: `https://arxiv.org/abs/2203.04910`
   Why: foundational modern BaM design evaluated by Torp et al.; relevant to
@@ -592,6 +592,19 @@ Append new candidates here as each paper is processed.
   Why: three-tier GPU/CPU/storage cache approach summarized by Torp et al.;
   relevant to future explicit tier promotion and demotion policies when reuse
   can justify CPU and GPU resource use.
+- `queued` — **DRAGON: Breaking GPU Memory Capacity Limits with Direct NVM
+  Access**, Markthub et al., SC 2018.
+  URL: `https://doi.org/10.1109/SC.2018.00035`
+  PDF: `https://www.osti.gov/servlets/purl/1489577`
+  Why: BaM contrasts against DRAGON's UVM/page-fault path; useful for comparing
+  transparent GPU page-fault extension against explicit GPU-initiated queues
+  and cache-line admission.
+- `queued` — **HippogriffDB: Balancing I/O and GPU Bandwidth in Big Data
+  Analytics**, Li et al., PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p1647-li.pdf`
+  Why: BaM cites HippogriffDB as a GPUDirect OLAP data-movement baseline;
+  useful for database-specific comparison of CPU-orchestrated GPU storage
+  transfers, I/O amplification, and GPU bandwidth saturation.
 - `queued` — **GPU Database Systems Characterization and Optimization**,
   Cao et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol17/p441-cao.pdf`

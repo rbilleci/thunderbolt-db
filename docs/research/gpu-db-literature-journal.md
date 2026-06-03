@@ -8911,3 +8911,168 @@ Benchmark priorities:
   resident generation is insufficient.
 - Work-conserving session scheduler benchmark that can steal ready work while
   preserving per-session response ordering and batch-lane compatibility.
+
+### 2026-06-03 - BaM GPU-initiated storage access
+
+**Citation:** Zaid Qureshi, Vikram Sharma Mailthody, Isaac Gelado, Seungwon
+Min, Amna Masood, Jeongmin Park, Jinjun Xiong, C. J. Newburn, Dmitri
+Vainbrand, I-Hsin Chung, Michael Garland, William Dally, and Wen-mei Hwu.
+"GPU-Initiated On-Demand High-Throughput Storage Access in the BaM System
+Architecture." ASPLOS 2023, pages 325-339. doi:10.1145/3575693.3575748.
+Retrieved 2026-06-03 from arXiv at `https://arxiv.org/abs/2203.04910`; author
+page available at `https://mgarland.org/papers/2022/bam/`.
+
+**Category:** Multi-tier cache / data placement, with GPU execution and
+over-resident storage access.
+
+**Relevance tags:** GPU-initiated IO; GPUDirect storage; NVMe queues; GPU
+software cache; cache-line coalescing; warp coalescing; clock replacement;
+queue-depth sizing; over-resident execution; CPU orchestration avoidance;
+write-back caveats; GPU/CPU consistency boundary.
+
+**Core idea:** BaM moves the storage control path closer to the GPU. Instead
+of having CPU code tile a dataset, service GPU page faults, or launch repeated
+copy/compute phases, GPU threads can issue fine-grained on-demand requests to
+NVMe-backed data through GPU-resident submission/completion queues. A GPU
+software cache coalesces redundant requests and gives kernels a memory-like
+array API.
+
+The key observation is that GPUs have enough thread-level parallelism to hide
+storage latency if the IO path can keep enough requests in flight. BaM applies
+Little's Law directly to the storage path: target bandwidth times latency
+determines required queue depth, and that queue depth can be distributed
+across many device queues and GPU threads.
+
+**Concrete mechanisms and findings:**
+
+- BaM maps NVMe submission queues, completion queues, IO buffers, and doorbell
+  registers into GPU-visible memory/address space using a custom Linux driver,
+  GPUDirect RDMA, and GPUDirect Async-style doorbell mapping.
+- GPU threads access data through `bam::array<T>`. The abstraction computes a
+  cache-line offset, lets warp threads coalesce accesses to the same cache
+  line, probes GPU cache metadata, and on miss submits storage requests.
+- The queue algorithm avoids one giant critical section for GPU thread
+  submission. Each queue has local head/tail copies, an atomic ticket counter,
+  per-entry turn counters, a mark bit-vector, and a lock used only to advance
+  contiguous submitted entries and ring the doorbell. This batches expensive
+  PCIe doorbell writes while allowing many threads to prepare entries in
+  parallel.
+- Completion queues are polled by GPU threads without a lock for the lookup
+  phase. Mark bits and a similar head-advance routine publish cleanup progress
+  and release SQ entries for reuse.
+- The software cache preallocates virtual and physical backing memory at
+  startup. A cache miss locks the line, finds an eviction victim, fetches the
+  backing line, then marks it valid and increments a reference count. Other
+  threads requesting the same line wait rather than issuing redundant IO.
+- Eviction uses a clock-style global counter so concurrent evictors are
+  assigned different candidate slots. Pinned cache lines with nonzero reference
+  counts are skipped.
+- Warp coalescing uses CUDA warp primitives so only one leader per same-line
+  group manipulates cache metadata; the leader broadcasts the resulting GPU
+  address to its group.
+- BaM can reach peak IOPs per SSD and scale linearly over the tested Optane
+  SSDs. The paper reports 45.8M random read IOPs and 10.6M random write IOPs
+  with ten Optane SSDs for 512-byte accesses, about 22.9 GB/s random-read
+  bandwidth and 90% of measured PCIe Gen4 x16 bandwidth.
+- Compared with NVIDIA GDS in the paper's sequential benchmark, BaM saturates
+  the GPU PCIe link at 4KB granularity, while GDS needs much larger IO
+  granularity to hide CPU/Linux stack overhead.
+- For graph analytics on BFS and connected components, BaM with four Optane
+  SSDs is reported as on par with or faster than an optimistic host-memory
+  target once end-to-end file loading is included: 1.0x for BFS and 1.49x for
+  connected components.
+- For data analytics over NYC taxi queries, BaM avoids transferring entire
+  columns when later query stages use data-dependent subsets. The paper reports
+  up to 5.3x speedup over a RAPIDS baseline with the dataset pinned in the CPU
+  page cache.
+- Cache capacity is not always the dominant knob. On one graph dataset, 1GB
+  cache performs similarly to 8GB because locality is still captured; queue-pair
+  count only begins to hurt around 40 or fewer queue pairs in the tested setup.
+- Writes exist in the stack as write requests, dirty cache lines, and flush
+  APIs, but BaM's programming model leaves crash consistency, checkpointing,
+  and CPU/GPU shared-data synchronization to the application. The vector-add
+  write-heavy workload is slower than a tiled baseline because the prototype
+  does not yet overlap read-miss handling with write-back.
+
+**GPU DB mapping:** BaM is a strong source for the P8 over-resident path, but
+not as a transactional storage engine. The transferable mechanism is an
+explicit GPU-side cold-tier request lane: retained kernels should be able to
+request missing cold blocks, cache them in GPU memory, and expose queue-depth,
+cache-hit, coalescing, and doorbell/submit telemetry instead of hiding IO
+behind CPU page faults.
+
+For GPU DB, the safe unit is not an arbitrary byte range. It should be a
+database-owned resident block: table id, partition id, column group, source WAL
+boundary, visibility boundary, encoding generation, and checksum. BaM's
+cache-line concept maps to this block only if each block is immutable for the
+reader's snapshot. Otherwise, BaM's application-managed consistency is too weak
+for MVCC.
+
+BaM's SQ/CQ design is useful for future GPU execution owners. A GPU owner could
+own one or more storage queues, pinned staging buffers, cache metadata, and
+device handles. Other runtime workers would enqueue logical cold-block
+requests, while the GPU owner batches and coalesces actual device queue
+operations. This preserves the owner-domain rule and makes doorbell writes,
+queue depth, and cache pressure measurable.
+
+The cache-miss coalescing maps directly to over-resident partition access.
+Multiple retained queries or warp lanes that need the same cold column block
+should wait on one in-flight fill rather than submitting duplicate reads. That
+suggests an explicit state machine for GPU DB block residency: `absent`,
+`fetching`, `valid`, `pinned_by_readers`, `dirty_or_mutated`, `invalidated`,
+and `evicted`.
+
+BaM also reinforces that GPU DB should benchmark IO granularity. The P8 design
+currently thinks in resident columns and partitions; BaM shows that the
+practical granularity tradeoff is more subtle. Too-small blocks increase
+metadata, atomics, and queue pressure; too-large blocks create IO
+amplification and waste HBM. GPU DB should measure 512B, 4KB, 16KB, 64KB, and
+column-run blocks for point lookups, filtered aggregates, and sparse
+over-resident scans.
+
+**Risks and mismatches:** BaM's prototype requires a custom driver, direct NVMe
+queue mapping, GPUDirect features, root/system integration, and security
+assumptions that may not fit a normal database process. The paper's best
+results are for graph and analytical access patterns, not OLTP writes, WAL
+flush, MVCC validation, SQL result marshalling, or PostgreSQL protocol latency.
+Its write path is application-consistent rather than database-consistent, and
+the authors explicitly leave crash guarantees and CPU/GPU sharing
+synchronization to applications. GPU DB cannot adopt that model for committed
+data.
+
+BaM's cache API overhead can become significant once storage ceases to dominate,
+especially from metadata contention, atomics, and polling warp scheduling. The
+paper also shows that workloads with insufficient frontier/request parallelism
+cannot hide storage latency well. That matters for selective SQL point reads:
+GPU-initiated IO only helps when a batch lane has enough independent cold-block
+misses or useful compute to overlap.
+
+**Benchmark candidates:**
+
+- Build an over-resident retained-read simulator with database block ids rather
+  than raw byte offsets. Gate: duplicate misses for the same block coalesce into
+  one in-flight fetch, and every returned block matches table/partition/WAL
+  boundary/snapshot generation metadata before it can be read.
+- Compare CPU-orchestrated cold-block fetch, OS/UVM-style fault simulation, and
+  explicit GPU-owner queue submission for sparse retained scans. Metrics:
+  queue depth, coalesced miss count, IO amplification bytes, H2D/DMA bytes,
+  p95/p99 latency, and CPU owner time.
+- Add a block-size sweep for over-resident column groups: 512B, 4KB, 16KB,
+  64KB, and compressed column-run blocks. Failure condition: larger blocks
+  improve throughput only by hiding excessive IO amplification or stale
+  visibility assumptions.
+- Prototype a `fetching` residency state with reader pin counts and
+  invalidation generation. Gate: mutation invalidation cannot mark a block
+  route-valid for new readers while a stale fetch completion is racing.
+- Measure GPU cache metadata overhead separately from storage time by running
+  hot-cache retained point lookups through the same cache API. Gate: hot-cache
+  metadata overhead stays below a fixed percentage of kernel time, otherwise
+  GPU DB should prefer pre-published resident snapshots for hot OLTP reads.
+- Evaluate whether a storage-backed route should be admitted only when a
+  same-shape batch can provide enough queue depth. Failure condition:
+  per-request cold misses create higher p99 than CPU fallback for point
+  lookups.
+- For future write experiments, require WAL-before-visibility and CPU
+  validation around any GPU write-back cache. Gate: GPU dirty blocks cannot be
+  externally visible or durable-authoritative without WAL, replay metadata, and
+  crash recovery proof.
