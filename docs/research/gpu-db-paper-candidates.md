@@ -522,7 +522,7 @@ Append new candidates here as each paper is processed.
   Why: Shirakami cites Plor as modern transaction scheduling work; relevant to
   predictable low-tail mutation and admission paths under mixed transaction
   sizes.
-- `queued` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
+- `reviewed` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
   Larger-Than-Memory Range Index**, Hao and Chandramouli, PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p3442-hao.pdf`
   Why: variable-length mini-pages decouple cached hot records and update
@@ -1341,3 +1341,9 @@ Append new candidates here as each paper is processed.
   Why: range-tracking approach for old-version reclamation; relevant to
   bounding retained snapshot metadata and version-chain cleanup under long
   GPU reads.
+- `queued` — **Tiered-Indexing: Optimizing Access Methods for Skew**,
+  Zhou, Hao, Yu, and Stonebraker, VLDB Journal 2025.
+  URL: `https://doi.org/10.1007/s00778-025-00928-6`
+  Why: modern follow-up that generalizes hot-record migration across
+  buffer-managed access methods; useful for comparing Bf-Tree mini-pages with
+  explicit tiered hot/cold structures under skewed GPU DB lookup workloads.

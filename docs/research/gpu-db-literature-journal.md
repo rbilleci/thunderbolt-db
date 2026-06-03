@@ -14651,3 +14651,142 @@ cardinality error.
   claims
 - planner route reasons that name the limiting front, not just the chosen
   device
+
+### 2026-06-03 - Bf-Tree variable-length mini-pages for larger-than-memory indexes
+
+**Citation:** Xiangpeng Hao and Badrish Chandramouli. "Bf-Tree: A Modern
+Read-Write-Optimized Concurrent Larger-Than-Memory Range Index." PVLDB
+17(11), 2024, pp. 3442-3455. doi:10.14778/3681954.3682012. Retrieved
+2026-06-03 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol17/p3442-hao.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** larger-than-memory indexes; buffer management; NVMe;
+hot-record caching; write buffering; range scans; cold partitions; cache
+granularity; concurrent access methods.
+
+**Core idea:** Bf-Tree argues that traditional larger-than-memory B-Trees
+couple the cache granularity to the disk-page granularity. That makes one hot
+record pull an entire cold-heavy page into memory, and makes one small update
+dirty and rewrite the full page. LSM-style and delta-chain alternatives reduce
+some write amplification but can add read, scan, or compaction cost.
+
+The paper's central mechanism is the mini-page: a variable-length in-memory
+representation associated with a disk leaf page, but not required to mirror the
+whole disk page. A mini-page can hold selected hot records, buffered updates,
+range gaps, or grow to a full page when range scans make that worthwhile. The
+result is a B-Tree-like range index whose memory component acts more like a
+workload-shaped hot/cold tier than a simple page cache.
+
+In the reported YCSB-like evaluation, Bf-Tree is claimed to be 2.5x faster
+than RocksDB for scans, 6x faster than a conventional B-Tree for writes, and
+2x faster than both B-Trees and LSM-Trees for point lookups. The useful lesson
+for GPU DB is not the exact throughput number; it is the storage-engine shape:
+the unit stored on NVMe, the unit cached in host memory, and the unit promoted
+to GPU memory do not have to be identical.
+
+**Concrete mechanisms:**
+
+- Disk leaves remain page-oriented, while in-memory mini-pages are
+  variable-length cache/update objects tied to those leaves.
+- Mini-pages can cache individual hot records, range gaps between keys,
+  recent updates, or full-page mirrors when sequential range access dominates.
+- A fixed-size circular buffer stores mini-pages. Allocation advances a tail
+  pointer; deallocation returns regions to a free list.
+- Mini-page grow/shrink uses a read-copy-update style replacement: allocate a
+  new mini-page, copy the old content plus the change, then publish the new
+  pointer.
+- When the circular buffer fills, older mini-pages near the head are evicted,
+  preserving a bounded memory budget rather than letting hot-record caching
+  become a side cache with its own uncontrolled capacity.
+- Bf-Tree uses a copy-on-access region as an approximate LRU mechanism. The
+  paper's default is 10% of the circular buffer, balancing runtime overhead
+  against cache quality.
+- Promotion from a disk page into a mini-page is probabilistic. The reported
+  default promotion rate is 20%, trading off quick response to workload shifts
+  against pollution from one-time cold accesses.
+- Buffered writes can be absorbed into mini-pages and later flushed to disk
+  pages, reducing page-write amplification for small record updates.
+- Range scans can still work efficiently because mini-pages may represent
+  gaps or grow toward full-page contents rather than being only a point-record
+  cache.
+- The implementation is concurrent and larger-than-memory; the paper notes
+  careful interaction between mini-pages and disk pages for consistency, and
+  WAL replay reapplies operations to the corresponding page during recovery.
+- The evaluation highlights cache sensitivity: Bf-Tree's advantage is larger
+  when much of the data is on disk, while systems converge as data becomes
+  memory resident.
+
+**GPU DB mapping:** Bf-Tree maps directly to P8's open question about resident
+segment and cold-partition granularity. GPU DB should not assume that the CPU
+MVCC tuple, host-memory cache object, NVMe block, and GPU resident segment all
+share one physical size. The transferable design is to give each tier its own
+unit: durable WAL records and cold pages for recovery, compact host mini-pages
+or mini-segments for hot records and updates, and GPU column/key vectors for
+batchable retained reads.
+
+For cold-partition indexes, a mini-page-like host tier could sit between the
+CPU canonical tuple store and full GPU residency. Hot equality keys, recent
+updates, deleted-key/tombstone markers, or key ranges that repeatedly miss GPU
+residency could be cached in bounded host structures without admitting a whole
+disk page or full GPU segment. That complements DANA's lane model: storage
+lanes decide how bytes move; mini-pages decide which bytes deserve to move.
+
+The write-buffering side is also relevant to WAL/MVCC. Bf-Tree does not remove
+the need for WAL-before-visibility, but it suggests that post-WAL index/cache
+maintenance can accumulate in compact per-page or per-partition host buffers
+before a cold page or GPU segment is rewritten. The GPU DB equivalent would be
+delta mini-segments that fresh CPU lookups can merge, while GPU retained
+snapshots either use a previous immutable generation or refresh at a
+deterministic batch boundary.
+
+Promotion-rate and copy-on-access tuning should become explicit telemetry in
+P8. A GPU-resident cache that promotes every observed key will pollute device
+memory under scans and one-off lookups. A cache that promotes too slowly will
+miss shifting hot sets. The planner/admission layer should expose promotion
+reason, sampled hotness, mini-segment bytes, and whether the chosen route
+served point lookup, range scan, or write buffering.
+
+**Risks and mismatches:** Bf-Tree is a key-value/range-index design, not a
+SQL MVCC storage engine. The paper does not solve tuple visibility,
+serializable reads, DDL invalidation, GPU layout, PostgreSQL protocol work, or
+columnar analytical execution. The mini-page abstraction is row/key oriented;
+GPU DB may need column-family mini-segments, key-order vectors, or tombstone
+bundles rather than literal B-Tree mini-pages.
+
+Variable-length buffers add fragmentation, copy cost, and concurrency
+complexity. A GPU DB implementation would also need crash recovery rules:
+mini-pages should remain rebuildable acceleration state unless deliberately
+made durable. Promotion-rate heuristics can be workload sensitive, and the
+paper's defaults should be treated as starting points rather than universal
+constants. Finally, the evaluation compares storage engines on CPU/NVMe
+workloads; it does not measure GPU transfer, kernel launch, resident snapshot
+retirement, or MVCC chain traversal.
+
+**Benchmark candidates:**
+
+- Add a host mini-segment simulator for cold `int4` key lookups: compare full
+  4 KB page caching, record-level mini-segments, and no host cache under
+  Zipfian and shifting-hot workloads. Gate: identical lookup results and
+  measured bytes promoted per hit.
+- Extend the P8 residency benchmark plan with separate units for NVMe page,
+  host mini-segment, and GPU resident column group. Failure condition: one
+  hard-coded page/segment size is used for all tiers without telemetry.
+- Prototype a post-WAL update buffer for cold index entries that can be merged
+  with CPU lookups before rewriting cold pages or refreshing GPU segments.
+  Gate: WAL replay rebuilds the same visible index/cache state.
+- Measure promotion policies for retained lookup caches: always promote,
+  sampled promotion at 1%, 10%, 20%, and promote-after-N-hits. Required
+  metrics: hit ratio, resident bytes, p95 lookup latency, GPU fallback count,
+  and pollution after a cold scan.
+- Add a range-scan stress where point-hot keys are scattered across cold pages.
+  Compare full-page caching versus mini-segment/gap caching for both point
+  reads and bounded range scans.
+- Track route reasons that distinguish `host_mini_segment_hit`,
+  `host_mini_segment_merge`, `gpu_resident_hit`, `cold_page_read`, and
+  `promotion_rejected_budget`. This makes cache granularity visible to the
+  optimizer instead of hidden inside the storage layer.
+- Test variable-size cache object accounting under concurrency: grow, shrink,
+  evict, and retire mini-segments while retained snapshots hold old
+  generations. Proof gate: no reuse before all readers release the generation.
