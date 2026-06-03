@@ -16207,3 +16207,170 @@ claim is the dependency/scheduling shape, not the hardware numbers.
   fallback records replayed, dependency blocks, ready queue depth, conflict
   stalls, CPU truth rebuild time, resident rebuild time, and first-safe-query
   timestamp.
+
+### 2026-06-03 - Bounded multiversion garbage collection
+
+**Citation:** Yuanhao Wei, Guy E. Blelloch, Panagiota Fatourou, and
+Eric Ruppert. "Practically and Theoretically Efficient Garbage Collection for
+Multiversioning." arXiv:2212.13557v2, 2023. Retrieved 2026-06-03 from
+`https://arxiv.org/abs/2212.13557`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** multiversion garbage collection; long read-only
+transactions; version chains; range tracking; epoch reclamation; lock-free
+lists; retained snapshots; bounded memory; update/read tradeoff.
+
+**Core idea:** The paper compares multiversion garbage-collection schemes in a
+single experimental setting and then introduces two practical collectors,
+DL-RT and SL-RT, that combine range tracking with simpler concurrent version
+list structures. The problem is the familiar MVCC failure mode: a long
+read-only transaction can keep an epoch open, while frequent updates create
+many obsolete intermediate versions that are not needed by any active reader
+but still remain reachable.
+
+Epoch-based reclamation is simple and fast, but it only reclaims old tail
+versions and can leave obsolete versions in the middle of a chain. Periodic or
+update-triggered compaction can remove middle versions, but may scan lists that
+contain little garbage and lacks strong worst-case space bounds. The paper's
+range-tracking variants identify which timestamp intervals are still protected
+by active read-only transactions, then remove versions whose intervals are no
+longer needed.
+
+The result is not a universal winner. EBR and an optimized Steam variant often
+have the best update throughput on friendly workloads, but EBR can use up to
+10x more memory under long read transactions or oversubscription, and Steam can
+show high space use in hierarchical multiversion structures. SL-RT and DL-RT
+are closer to EBR/Steam throughput than the earlier theoretically bounded
+BBF+ implementation while preserving predictable space behavior.
+
+**Concrete mechanisms:**
+
+- Each object keeps a timestamp-sorted version list. A read-only transaction
+  announces its timestamp and reads the newest version whose timestamp is not
+  greater than that read timestamp.
+- A version with timestamp `t1` followed by a newer version at `t2` is needed
+  only if an active read-only transaction timestamp falls in `[t1, t2)`. The
+  latest version is always needed.
+- EBR advances global epochs and safely reclaims versions overwritten before
+  old epochs, but it does not remove obsolete versions that are trapped between
+  still-needed versions in the middle of a list.
+- Compaction-based schemes read announced timestamps, sort them, and traverse
+  version lists to remove versions whose valid intervals contain no active
+  announcement.
+- Range tracking, inherited from BBF+, records non-current version intervals
+  and identifies obsolete versions more directly than periodically scanning all
+  lists or compacting every updated list.
+- DL-RT uses a practical doubly linked list, PDL, so identified middle versions
+  can be removed from their local neighborhood. It relaxes the constant
+  amortized-time machinery of BBF+'s TreeDL because long consecutive removal
+  chains were rare in the experiments.
+- SL-RT uses a simple singly linked list, SSL, and compacts by traversing a
+  list. This can be faster and smaller when version chains are short, because
+  it avoids back pointers and extra pointer updates.
+- The paper also implements a lock-free Steam variant using the same SSL list
+  structure, reducing the cost of Steam's older list-level locking.
+- The theoretical bound for DL-RT and SL-RT keeps reachable versions within a
+  constant factor of the maximum number of needed versions, plus terms tied to
+  process count and list count rather than unbounded obsolete chains.
+- The evaluation applies all collectors to the same multiversion balanced tree
+  and multiversion hash table, isolating collector effects from broader DBMS
+  concurrency-control differences.
+- Workloads vary data-structure size, update/read mix, read-only transaction
+  size, thread count, oversubscription, and Zipf skew.
+- Long read-only transactions and oversubscription are the adverse cases:
+  epochs are delayed, update-heavy paths create many versions, and EBR's
+  retained old versions inflate space.
+- The authors report that in most experiments SL-RT has the best space
+  behavior; EBR reaches more than an order of magnitude more memory in one
+  adverse hash-table case.
+- Throughput effects are workload dependent. Maintaining range tracking costs
+  extra update work, but shorter version lists can improve read-only
+  transaction traversal, so mixed throughput does not have a single winner.
+- The paper's experiments rely on Java GC to reclaim unlinked nodes; the MVGC
+  schemes decide when versions become unreachable from version lists, not how
+  allocator-level reclamation is implemented.
+
+**GPU DB mapping:** GPU DB needs version and retained-snapshot cleanup to be
+bounded by active readers, not by hope that old epochs eventually clear. A
+future retained-read runtime may have many short point reads, some long
+analytical or refresh reads, and possibly a large number of idle logical
+sessions. EBR alone is too blunt if one long read or stalled session keeps
+obsolete row versions, resident generations, or visibility summaries alive
+across a heavy write burst.
+
+The transferable design is to expose the same interval rule in GPU DB's MVCC
+metadata: each CPU tuple version, resident partition generation, and derived
+index generation should have a begin/end visibility interval, and the runtime
+should know which read timestamps or snapshot generations are actively held.
+Garbage collection can then reclaim versions that no active reader can still
+observe, including middle versions, instead of waiting for all older snapshots
+to drain.
+
+Range tracking also maps to retained GPU snapshots. A resident partition
+generation should not be kept merely because it is older than the newest
+generation; it should be kept only if an admitted read has a compatible
+snapshot handle. That suggests a common "active snapshot interval" service
+shared by CPU MVCC chains, resident metadata, and refresh/invalidation
+retirement. Publication remains WAL-before-visibility: GC can remove
+unneeded old state only after newer visible state is safely published and no
+active reader can name the old interval.
+
+SL-RT is probably the first implementation shape to benchmark. GPU DB's first
+MVCC chains and resident generation lists should usually be short if mutation
+batching and partition invalidation work. A singly linked list plus explicit
+compaction at generation or update boundaries may be faster and smaller than a
+fully general doubly linked version chain. DL-RT becomes interesting if hot
+rows or hot partitions accumulate long chains and middle-version removal
+without full traversal becomes necessary.
+
+The paper also argues for adversarial GC benchmarks, not only normal-case
+throughput. GPU DB should test long retained reads, slow clients holding
+snapshot handles, oversubscribed workers, skewed hot keys, and write bursts.
+The pass condition is bounded retained bytes and predictable collector work,
+not only high query throughput when all readers are short.
+
+**Risks and mismatches:** This is a concurrent-data-structure paper rather
+than a full DBMS MVCC system. It does not cover SQL isolation levels, WAL,
+crash recovery, durable undo, DDL, vacuum-visible indexes, distributed
+transactions, GPU memory, or disk/NVMe tiers. Its read-only transactions are
+range queries over multiversion trees or hash tables, not arbitrary SQL plans.
+
+The evaluation uses Java and relies on automatic memory management after
+versions are unlinked. GPU DB will need explicit allocator, pinned-buffer,
+host-memory, and device-memory retirement. A version being unreachable from a
+CPU list is not enough if a CUDA stream, response encoder, or protocol worker
+still holds a buffer reference.
+
+Range tracking adds update-path metadata work. If every small write must update
+a global tracking object, the collector could become another owner-thread
+bottleneck. GPU DB should shard tracking by table/partition/owner and treat a
+single global active-timestamp array only as a baseline. Also, exact interval
+tracking for every row may be too expensive; coarse partition-generation
+tracking may be the right first proof even if row-level chains use a simpler
+epoch fallback.
+
+**Benchmark candidates:**
+
+- Implement a synthetic MVCC-chain benchmark with three collectors: EBR-only
+  tail reclamation, update-triggered full-chain compaction, and range-tracked
+  middle-version reclamation. Gate: under one long retained read plus hot-key
+  updates, range tracking keeps retained versions bounded while preserving
+  correct snapshot reads.
+- Add retained-generation GC for GPU resident partitions: publish generations,
+  hold/release snapshot handles, invalidate on writes, and reclaim old
+  generations only when no active handle can observe them. Failure condition:
+  stale resident reads, premature buffer free, or unbounded generation growth.
+- Compare SL-style list compaction versus DL-style local removal for hot
+  row-version chains and resident partition generation lists. Measure update
+  cost, read traversal length, retained bytes, and collector CPU time.
+- Add an oversubscription test where one worker holding a snapshot is delayed
+  while many updates run. Gate: bounded memory and explicit telemetry naming
+  the protected interval and blocked reclamation reason.
+- Track MVCC GC telemetry per owner: active snapshot count, oldest active
+  timestamp, protected interval count, versions removed from tails, versions
+  removed from middles, retained bytes, collector queue depth, and failed
+  reclaim reasons.
+- Test coarse partition-generation range tracking before row-level exact
+  tracking. Expected result: a coarse first version catches most retained
+  snapshot memory blowups with lower write-path metadata cost.

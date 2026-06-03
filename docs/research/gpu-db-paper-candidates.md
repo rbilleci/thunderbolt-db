@@ -1391,8 +1391,8 @@ Append new candidates here as each paper is processed.
   Why: ScaleRPC contrasts software resource sharing with kernel-level RDMA
   abstractions; LITE is a useful boundary paper for comparing application-owned
   connection/message pools against OS-mediated safety and registration control.
-- `queued` — **Practically and Theoretically Efficient Garbage Collection for
-  Multiversioning**, Sun et al., arXiv 2022.
+- `reviewed` — **Practically and Theoretically Efficient Garbage Collection for
+  Multiversioning**, Wei et al., arXiv 2022/2023.
   URL: `https://arxiv.org/abs/2212.13557`
   Why: modern MVGC follow-up with experimental and theoretical collector
   variants; useful for comparing HybridGC-style production heuristics against
@@ -1442,3 +1442,15 @@ Append new candidates here as each paper is processed.
   Why: Tiered-Indexing cites EvenDB as record-placement work; useful for
   studying whether physical clustering by access locality can reduce cold-tier
   reads and resident refresh churn under skew.
+- `queued` — **Jiffy: A Lock-Free Skip List with Batch Updates and
+  Snapshots**, Kobus, Kokocinski, and Wojciechowski, PPoPP 2022.
+  URL: `https://doi.org/10.1145/3503221.3508437`
+  Why: cited by the MVGC paper as a modern multiversion/snapshot data structure;
+  useful for comparing batched update publication and wait-free range snapshot
+  support against GPU DB retained-read generations.
+- `queued` — **MV-RLU: Scaling Read-Log-Update with Multi-Versioning**,
+  Kim et al., ASPLOS 2019.
+  URL: `https://doi.org/10.1145/3297858.3304040`
+  Why: cited by the MVGC paper as a practical multiversioning system; useful
+  for contrasting reader-side logging, version lifetime, and reclamation costs
+  with GPU DB MVCC chains and long retained snapshots.
