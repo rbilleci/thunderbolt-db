@@ -4249,3 +4249,222 @@ contention point.
 - Add a guardrail benchmark for low-contention traffic. Scheduling must
   stay within a small overhead budget, or auto-disable for that template
   and partition.
+
+### 2026-06-03 - Pasha partitioned/shared CXL-pod architecture
+
+**Citation:** Yibo Huang, Newton Ni, Vijay Chidambaram, Emmett
+Witchel, and Dixin Tang. "Pasha: An Efficient, Scalable Database
+Architecture for CXL Pods." CIDR 2025. Retrieved 2026-06-03
+from the CIDR proceedings page and author PDF,
+`https://www.vldb.org/cidrdb/2025/pasha-an-efficient-scalable-database-architecture-for-cxl-pods.html`
+and `https://www.cs.utexas.edu/~witchel/pubs/huang25cidr-pasha.pdf`.
+
+**Category:** multi-tier cache / data placement and transaction
+processing / write path.
+
+**Relevance tags:** CXL memory; future memory tiers; partition
+ownership; shared region; OLTP scaling; MVCC version placement;
+data movement; local DRAM versus shared memory; partial failure;
+elasticity.
+
+**Core idea:** Pasha targets a CXL pod: a small set of independent
+hosts connected to shared CXL memory. The paper argues that this
+hardware shape can combine the strengths of shared-nothing and
+shared-memory databases. Most data remains in host-owned local
+DRAM partitions, where access is cheap and synchronization is
+local. Data that would otherwise force multi-host transactions is
+moved into a shared CXL region, where all hosts can use ordinary
+load/store access and shared synchronization metadata instead of
+message-heavy two-phase commit.
+
+The strongest result is architectural rather than a finished product:
+Pasha tries to turn many multi-host transactions into single-host
+transactions that access one local partition plus a shared region. In
+the preliminary Sundial/TPC-C experiment, the paper reports up to
+5.9x higher throughput than a partitioned shared-nothing baseline
+and 1.4x higher throughput than a fully shared-memory baseline in
+selected configurations. The evaluation is explicitly preliminary:
+the prototype emulates an 8-host CXL pod on one machine, uses only
+two worker threads per VM, and does not implement dynamic movement.
+
+**Concrete mechanisms:**
+
+- Data is divided into disjoint host-owned partitions and one shared
+  region. Partition data lives in the owning host's local DRAM;
+  shared data lives in CXL memory.
+- A host that needs a tuple outside its partition asks the owning
+  host to move the tuple and metadata such as locks into the shared
+  region. After that, the requesting host can complete the
+  transaction through local partition access plus direct shared-region
+  access.
+- While a tuple is resident in the shared region, even the original
+  owner accesses it through the shared-region concurrency-control
+  protocol.
+- The paper assumes only a limited hardware-cache-coherent CXL
+  region, for example hundreds of MB, while larger CXL capacity may
+  need database-specific software coherence.
+- One proposed split is to keep synchronization-heavy metadata in
+  the hardware-coherent region and larger tuple payloads in a
+  software-coherent region tracked at coarser-than-cache-line
+  granularity.
+- The measured CXL 1.1 device in the paper has about 2.3x local
+  DRAM latency and 58% of local DRAM single-channel bandwidth, while
+  still being much lower latency than RDMA-style disaggregated
+  memory.
+- For MVCC, the paper identifies the cost of moving all tuple
+  versions as a central problem. It suggests moving only requested
+  versions into the shared region and selectively moving useful
+  versions back to partitions, allowing different versions of one
+  tuple to reside in different places.
+- The MVCC challenge is validation: a transaction may read an old
+  local-DRAM version while another host creates a newer CXL-resident
+  version, so the protocol must decide when that old-version read can
+  still serialize safely.
+- Dynamic data movement and partitioning are treated as open design
+  problems. The partitioner should minimize shared-region operations,
+  not merely minimize multi-host transactions.
+- High core counts in a future pod motivate scheduling transactions
+  before execution, rather than resolving all conflicts reactively at
+  runtime.
+- Durability and atomicity still require logging and checkpoints; the
+  authors call out parallel logging and partial-failure recovery as
+  open challenges for a pod where one host or process may fail while
+  others continue.
+
+**GPU DB mapping:** Pasha is not about GPUs, but it is highly relevant
+to the future tiering and ownership model. It reinforces that a
+high-throughput engine should not make one "shared memory" tier the
+default home for all data. Local ownership remains valuable. For GPU
+DB, the analogous rule is: keep hot partition-local mutation and CPU
+canonical state close to the owner that mutates it, and use shared or
+slower tiers only for data whose access pattern justifies the
+coordination cost.
+
+The shared-region idea maps to a future host-tier design beneath GPU
+residency. Some data may need to be visible to multiple owners,
+devices, or nodes: old snapshot side structures, cross-partition hot
+tuples, shared catalog metadata, resident-generation descriptors,
+route-risk summaries, and future CXL/remote-memory segments. Pasha
+suggests making that shared region explicit and small, not treating
+CXL or remote memory as a transparent extension of local DRAM.
+
+For MVCC, the paper's "versions may live in different places" warning
+is directly useful. GPU DB may eventually hold one tuple's latest
+version in CPU canonical memory, old snapshot-visible versions in a
+cold side structure, compressed host segments in a warm tier, and
+read-optimized column copies in GPU memory. The visibility design must
+validate the version chain and placement generation together. A read
+snapshot cannot only know `txn_id`; it also needs a stable placement
+handle and source generation for every version or segment it may read.
+
+Pasha also strengthens the case for partition owners. If a tuple or
+segment moves between owner-local state and a shared tier, movement is
+a transactionally visible event that needs ordering, logging,
+invalidation, and reader safety. That is close to P8's resident
+refresh problem: moving a partition into GPU memory or shared host
+memory should publish a new immutable generation only after the CPU
+truth and WAL boundary are stable.
+
+Finally, the partial-failure discussion matters for future scale-out.
+GPU DB's current single-process path can treat CUDA buffers and
+resident snapshots as rebuildable acceleration state. If later CXL or
+multi-host tiers appear, the engine should preserve that discipline:
+durable WAL/checkpoint authority first, rebuildable shared placement
+metadata second, and explicit recovery paths for a failed owner or
+movement operation.
+
+**Risks and mismatches:** Pasha is a CIDR architecture paper with
+preliminary experiments, not a complete evaluated database. The CXL
+pod hardware assumed by the design, especially fine-grained
+cross-host cache coherence, was not commercially available for the
+full prototype. The experiment uses VMs on one host and a CXL 1.1
+device, so inter-host coherence is faster than a real pod would be.
+
+The implementation does not support dynamic data movement; shared
+TPC-C tables are pre-moved before tests. MVCC support, software
+coherence, partitioning policy, parallel logging, recovery, partial
+failure handling, and auto-scaling are research challenges rather
+than solved mechanisms. For GPU DB specifically, CXL memory does not
+replace GPU HBM, CUDA stream ownership, pinned buffers, WAL ordering,
+or pgwire response backpressure. A CXL shared region could easily
+become a new contention point if treated as a general heap.
+
+**Benchmark candidates:**
+
+- Add a placement-state simulator for P8 segments: owner-local CPU
+  partition, shared host tier, GPU resident generation, and evicted
+  cold state. Minimum gate: every movement has an ordered source
+  generation, target tier, bytes moved, and reader-visible state.
+- Build a version-placement MVCC test where different versions of one
+  logical row are held in different simulated tiers. Proof gate:
+  snapshot visibility remains correct across update, movement,
+  invalidation, replay, and GC boundaries.
+- Compare partition-local versus shared-tier metadata for hot
+  resident-generation descriptors. Required measurements: lookup
+  latency, cache-line contention proxy if available, invalidation
+  cost, and effect on independent partitions.
+- Add a movement-policy benchmark for a skewed workload: keep hot
+  partition-local data local, move cross-partition hot rows or
+  metadata to a shared tier, and measure write latency, read latency,
+  movement bytes, and invalidation churn.
+- Add a future-tier capability matrix to the research backlog:
+  local DRAM, pinned DRAM, GPU HBM, CXL system memory,
+  hardware-coherent CXL shared region, software-coherent CXL region,
+  NVMe, and remote memory. Include direct GPU access, coherence,
+  durability role, movement primitive, expected latency/bandwidth, and
+  whether the tier is safe for mutable state.
+- Treat CXL/shared memory as a future benchmark track only after the
+  current owner/ring/resident-snapshot design can report per-tier
+  movement and invalidation telemetry. Failure condition: CXL-like
+  placement hides stale snapshot reads or turns movement into
+  unbounded background work.
+
+## Cross-Paper Synthesis
+
+### 2026-06-03 - Owner-local first, shared only when measured
+
+The recent reviewed papers now converge on a sharper architecture
+track: keep mutable hot paths owner-local, expose queue and movement
+pressure explicitly, and admit shared or accelerated tiers only when a
+route descriptor can prove the generation, bytes, and conflict class.
+Pasha adds future CXL/shared-region pressure to this picture; SMF adds
+schedule-first hot-key ordering; Shenango adds persistent queue-delay
+feedback; vmcache and vmcache^n add explicit tier movement; PARQO and
+PAR2QO add risk-aware route reuse.
+
+Converging design tracks:
+
+- **Owner-local mutation first:** partition owners should keep hot
+  writes, WAL ordering, and local visibility state close to the owner;
+  shared tiers should hold only data or metadata whose cross-owner use
+  repays the synchronization cost.
+- **Descriptor-gated movement:** moving data to GPU, host warm memory,
+  CXL-like shared memory, or NVMe should be an explicit transition with
+  generation, bytes, deadline, invalidation risk, and fallback reason.
+- **Conflict-aware admission:** hot-key scheduling, queue-duration
+  feedback, and route-risk penalties should all feed the same admission
+  surface instead of becoming separate ad hoc knobs.
+- **Version placement is visibility state:** if tuple versions,
+  tombstones, resident segments, or old snapshot side structures live
+  in different tiers, a snapshot handle must validate both transaction
+  visibility and placement generation.
+
+Current category gaps: GPU execution has enough recent coverage for
+now; the next queued paper should favor MVCC/GC, transaction write
+path, multi-tier placement, or high-concurrency runtime before another
+GPU OLAP paper. The weakest unsolved area is still production-safe
+movement: how to move data among owners and tiers without weakening
+WAL-before-visibility or causing unbounded snapshot retention.
+
+Benchmark priorities:
+
+- Implement tier/movement telemetry before adding another cache layer:
+  source tier, target tier, generation, bytes, queue wait, invalidation
+  boundary, and fallback reason.
+- Add an MVCC version-placement stress test with versions and
+  tombstones split across simulated tiers.
+- Compare FIFO, hot-key-aware, and queue-delay-aware admission on a
+  mixed retained-read plus mutation workload.
+- Require every GPU or future CXL route to report whether it improved
+  latency/throughput by reducing movement, reducing conflicts, or only
+  shifting work to a less visible queue.

@@ -385,7 +385,7 @@ Append new candidates here as each paper is processed.
   Why: work-conserving dataplane scheduler for high-connection-count
   microsecond services, including Silo/TPC-C evaluation; relevant to pgwire
   IO-worker and request-stealing choices.
-- `queued` — **Pasha: An Efficient, Scalable Database Architecture for CXL
+- `reviewed` — **Pasha: An Efficient, Scalable Database Architecture for CXL
   Pods**, Huang et al., CIDR 2025.
   URL: `https://www.vldb.org/cidrdb/papers/2025/p8-huang.pdf`
   Why: CXL-pod database architecture cited by vmcache^n; relevant to
@@ -572,3 +572,15 @@ Append new candidates here as each paper is processed.
   multi-tenant TCP acceleration service; useful for comparing a central
   IO/runtime service against GPU DB's planned IO-worker and response-ring
   topology.
+- `queued` — **A CXL-Powered Database System: Opportunities and Challenges**,
+  Guo and Li, ICDE 2024.
+  URL: `https://dbgroup.cs.tsinghua.edu.cn/ligl/papers/CXL_ICDE.pdf`
+  Why: Pasha contrasts itself with this CXL database position paper; useful
+  for a broader capability matrix of CXL memory, pooling, coherence, and
+  database architecture constraints.
+- `queued` — **So Far and yet so Near - Accelerating Distributed Joins with
+  CXL**, Baumstark et al., DaMoN 2024.
+  URL: `https://doi.org/10.1145/3662010.3663449`
+  Why: Pasha cites this CXL data-management work; relevant to deciding when
+  CXL/shared-memory tiers help cross-partition joins versus GPU or CPU
+  partition-local execution.
