@@ -505,7 +505,7 @@ Append new candidates here as each paper is processed.
   Why: DuckDB external aggregation work cited by Resource-Adaptive Query
   Execution; useful for paged intermediate state, spill-resistant aggregates,
   and over-resident query execution under bounded memory.
-- `queued` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
+- `reviewed` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
   Cao et al., SIGMOD 2023.
   URL: `https://doi.org/10.1145/3603164`
   Preprint:
@@ -594,3 +594,20 @@ Append new candidates here as each paper is processed.
   Why: Pasha cites this CXL data-management work; relevant to deciding when
   CXL/shared-memory tiers help cross-partition joins versus GPU or CPU
   partition-local execution.
+- `queued` — **Handling Highly Contended OLTP Workloads Using Fast Dynamic
+  Partitioning**, Prasaad, Cheung, and Suciu, SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3389708`
+  Why: Strife is a key partitioner baseline used by the runtime-conflict
+  scheduler; useful for hot-key partitioning, residual transaction handling,
+  and contention-aware owner assignment.
+- `queued` — **Scheduling OLTP Transactions via Learned Abort Prediction**,
+  Sheng, Tomasic, Zhang, and Pavlo, aiDM 2019.
+  URL: `https://doi.org/10.1145/3329859.3329871`
+  Why: lightweight learned transaction-to-thread assignment cited by TSkd;
+  relevant to admission-time prediction before choosing an owner, CPU route,
+  or deferred execution path.
+- `queued` — **Polyjuice: High-Performance Transactions via Learned
+  Concurrency Control**, Wang et al., OSDI 2021.
+  URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`
+  Why: learned concurrency-control policy selection cited by TSkd; useful as
+  a contrast to deterministic owner-queue rules and runtime-conflict telemetry.

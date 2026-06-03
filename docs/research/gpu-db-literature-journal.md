@@ -4605,3 +4605,161 @@ costly, although batching reclamation reduces the overhead.
   mutation-owner windows. The batch path should auto-disable or shrink
   when p50/p99 latency regresses more than the throughput gain
   justifies.
+
+### 2026-06-03 - Runtime-conflict transaction scheduling
+
+**Citation:** Yang Cao, Wenfei Fan, Weijie Ou, Rui Xie, and Wenyue
+Zhao. "Transaction Scheduling: From Conflicts to Runtime
+Conflicts." Proceedings of the ACM on Management of Data 1(1),
+article 26, SIGMOD 2023. Retrieved 2026-06-03 from the University
+of Edinburgh accepted manuscript,
+`https://www.pure.ed.ac.uk/ws/portalfiles/portal/360117816/Transaction_Scheduling_CAO_DOA16082022_AFV.pdf`.
+DOI: `https://doi.org/10.1145/3603164`.
+
+**Category:** transaction processing / write path and runtime /
+session-scale scheduling.
+
+**Relevance tags:** OLTP scheduling; runtime conflicts; contention
+management; transaction partitioning; proactive deferment; lock-free
+progress tracking; abort reduction; owner queues; admission control.
+
+**Core idea:** The paper argues that conventional conflict graphs are
+too conservative for multicore OLTP scheduling. Two transactions may
+touch conflicting records, but if their scheduled execution intervals
+do not overlap, they do not conflict at runtime. The proposed TSkd
+tool therefore adds ordering to transaction partitions and treats
+runtime overlap as a first-class scheduling dimension, not just key-set
+intersection.
+
+The strongest transfer for GPU DB is the distinction between "may
+conflict" and "will conflict on this schedule." Current owner/ring
+planning tends to bucket work by table, partition, route shape, and
+visibility generation. This paper suggests adding a small predicted
+runtime window and conflict class so the mutation owner can avoid
+needlessly serializing operations whose hot regions or owner phases
+do not overlap in time.
+
+**Concrete mechanisms:**
+
+- TSkd has two modules. TsPar turns an existing transaction partition
+  into ordered per-thread queues plus a residual set, aiming to
+  minimize both makespan and unscheduled residual work. TsDefer works
+  online for residual or unbundled transactions by deferring a
+  transaction that is likely to collide with currently active work.
+- Runtime conflict is defined by both logical conflict and scheduled
+  interval overlap. A schedule assigns transactions to queues and
+  orders each queue; two logically conflicting transactions are
+  runtime-conflict-free if their scheduled runtime intervals do not
+  overlap.
+- The exact scheduling problem is NP-complete, so the paper uses
+  TSgen, a heuristic that reuses the partitioner's conflict graph,
+  examines residual transactions, chooses the least-loaded queue, and
+  appends a residual transaction only if the resulting queues remain
+  runtime-conflict-free.
+- TsPar uses rough runtime estimates from execution history,
+  partitioner dry-runs, nearby template instances, or fallback access
+  set sizes. It is sensitive mainly to relative transaction lengths,
+  not exact wall time.
+- TsDefer keeps a lock-free progress structure for thread-local
+  buffers: each thread owns its queue array plus head and tail
+  pointers, while other threads read progress. Before execution, a
+  thread performs a bounded number of random lookups into active
+  remote transactions' predicted write sets and may move the current
+  transaction to the queue tail with configurable probability.
+- The deferment knobs are `#lookups` and `deferp%`, trading detection
+  overhead against abort/retry reduction. The paper reports best
+  short-transaction throughput around two lookups in its tested
+  TPC-C/YCSB setup, with larger lookup counts reducing retries but
+  adding overhead.
+- Evaluation integrates TSkd into DBx1000 with Strife, Schism,
+  Horticulture, and CC-only baselines. Reported averages are 131%
+  higher throughput for partitioner-based systems and 109% higher
+  throughput for CC-only systems, with retry reductions around 45%.
+  Benefits are stronger under contention, more cores, longer or more
+  variable transaction runtimes, and simulated I/O latency.
+
+**GPU DB mapping:** GPU DB should not copy TSkd as a transaction
+partitioner, but the runtime-conflict model maps cleanly to owner
+queue admission. A mutation or refresh request can carry a conflict
+class, key or partition estimate, predicted CPU/GPU phase duration,
+and visibility boundary. The owner can then choose between immediate
+execution, short deferment, batching, or fallback based on predicted
+overlap, not just "same table" conflict.
+
+For write admission, this complements the batch-publication ideas in
+P-Trees and the owner-local tracks from prior synthesis. A partition
+owner could drain a bounded window, sort writes by key/segment and
+estimated duration, and publish one WAL/visibility boundary while
+keeping conflicting long operations from causing avoidable retries or
+queue stalls. The key invariant is that reordering happens inside an
+explicit admission boundary; external visibility still follows
+WAL-before-visibility.
+
+For read paths, TsDefer suggests a cheap pre-execution filter before
+routing a retained read to a busy GPU execution queue. If an active
+mutation, refresh, or eviction is likely to invalidate the same
+partition generation during the read's window, the runtime can defer
+briefly, use a still-valid older snapshot, or choose CPU fallback
+instead of entering a route that will fail late. This is especially
+relevant for 1M logical sessions where many requests may target the
+same small set of hot keys.
+
+For observability, the paper reinforces that scheduling should expose
+conflict penalties as telemetry. GPU DB should count predicted
+runtime conflicts, actual aborts/retries or fallbacks, defer count,
+defer wait, active owner phase, active GPU phase, and avoided stale
+snapshot attempts. Without those counters, a deferral policy could
+look like lower latency while only shifting time into an invisible
+queue.
+
+**Risks and mismatches:** TSkd assumes useful read/write-set or access
+set estimates for many workloads. That fits stored-procedure-like
+OLTP better than arbitrary SQL text, ad hoc predicates, range scans,
+or query plans with data-dependent access. GPU DB would need planner
+route descriptors and index/statistics support before it can predict
+conflicts well enough for broad SQL.
+
+The paper is evaluated in DBx1000, not in a durable production DBMS
+with WAL, recovery, DDL, network backpressure, GPU kernels, or
+resident cache invalidation. Its RC-free queues are still executed
+with CC in the prototype to preserve correctness under inaccurate
+estimates, so the reported speedups are signals about conflict
+reduction rather than proof that CC can be removed safely.
+
+Deferral can also hurt fairness and tail latency. A hot transaction
+may be repeatedly moved to the back of a queue, and a high lookup
+count may cost more than the conflict it avoids for short requests.
+GPU DB should treat deferment as bounded admission control with
+per-class limits, not as an unbounded retry-avoidance trick.
+
+**Benchmark candidates:**
+
+- Add a runtime-conflict admission simulator for one partition owner:
+  inputs are key or segment ids, predicted CPU phase, predicted GPU
+  phase, and operation class. Compare FIFO, key-grouped batching, and
+  runtime-conflict-aware ordering. Minimum gate: same serializable
+  result and WAL publication order, with lower retry/fallback count or
+  lower p99 under skew.
+- Prototype bounded deferment in the benchmark endpoint's retained
+  request scheduler without changing SQL semantics. Measurements:
+  defer count, defer wait, queue wait, actual fallback count, p50/p99,
+  and starvation count. Failure condition: any request exceeds a
+  configured defer budget without explicit overload/fallback reason.
+- Add an active-phase conflict probe for retained reads: before
+  entering a GPU route, check whether the relevant partition has an
+  active mutation, refresh, eviction, or invalidation phase likely to
+  cross the read window. Proof gate: fewer late invalidation fallbacks
+  without stale reads.
+- Stress mixed short and long work: short point reads, short writes,
+  long refreshes, and long analytical retained scans against hot and
+  cold partitions. Compare FIFO owner queues with runtime-window-aware
+  admission. Required output: throughput, p99, max wait, conflict
+  class, and whether long work starves short retained reads.
+- Test `#lookups`-style sampling for conflict prediction using only
+  bounded metadata: sample active owner/GPU phases and key ranges
+  rather than reading full access sets. Minimum gate: constant-time
+  probe with measurable avoided retries/fallbacks.
+- Keep the first production rule simple: only allow reordering inside
+  an explicit owner batch whose WAL and visibility boundary is known.
+  Failure condition: a schedule can make an externally visible result
+  differ from FIFO under the same committed transaction order.
