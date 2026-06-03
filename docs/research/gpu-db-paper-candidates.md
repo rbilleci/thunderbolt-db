@@ -756,12 +756,20 @@ Append new candidates here as each paper is processed.
   Why: modern geo-replicated transaction protocol cited by Bonspiel; useful as
   a contrast for placement-aware commit and low-latency multi-partition
   transaction routing.
-- `queued` — **Natto: Providing Distributed Transaction Prioritization for
+- `reviewed` — **Natto: Providing Distributed Transaction Prioritization for
   High-Contention Workloads**, Yang, Yan, and Wong, SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3517869`
+  URL: `https://doi.org/10.1145/3514221.3526161`
+  PDF: `https://cs.uwaterloo.ca/~bernard/natto.pdf`
   Why: priority-based distributed transaction handling cited by Bonspiel;
   relevant to deciding whether GPU DB should prioritize long/remote or
   expensive route classes without wounding short local work.
+- `queued` — **Carousel: Low-Latency Transaction Processing for
+  Globally-Distributed Data**, Yan et al., SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3196912`
+  PDF: `https://www.cs.cornell.edu/~hongbo/files/carousel-sigmod-2018.pdf`
+  Why: Natto's base protocol; useful for evaluating fixed-set interactive
+  transactions that overlap read/prepare, commit, and replication phases,
+  which maps to GPU DB route descriptors with predeclared read/write sets.
 - `reviewed` — **Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit
   Rate**, Cheng et al., OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/cheng`

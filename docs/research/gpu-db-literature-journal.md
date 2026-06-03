@@ -14097,3 +14097,194 @@ Benchmark priorities:
   snapshot generation, GPU completion, or socket write completion.
 - Compare FIFO, classed priority, and active-window grouping policies
   before implementing transport-specific kernel bypass or RDMA support.
+
+### 2026-06-03 - Natto distributed transaction prioritization
+
+**Citation:** Linguan Yang, Xinan Yan, and Bernard Wong. "Natto:
+Providing Distributed Transaction Prioritization for High-Contention
+Workloads." SIGMOD 2022, pp. 715-729. DOI:
+`10.1145/3514221.3526161`. Retrieved 2026-06-03 from the author PDF,
+`https://cs.uwaterloo.ca/~bernard/natto.pdf`.
+
+**Category:** transaction processing / write path and runtime admission.
+
+**Relevance tags:** transaction priority; high-contention OLTP;
+distributed ordering; abort avoidance; conditional prepare; early
+committed-state forwarding; classed admission; hot-key tail latency;
+predeclared read/write sets.
+
+**Core idea:** Natto targets a specific but useful transaction shape:
+two-round fixed-set interactive transactions, where read keys and write
+keys are known up front, the first round reads, and the second round
+commits writes derived from those reads. In geo-distributed systems,
+different partitions may receive the same transactions in different
+orders, so a high-priority transaction can be blocked or aborted by
+low-priority work even when every individual partition uses local
+priority queues.
+
+Natto uses network-delay measurements to assign each transaction an
+execution timestamp equal to the estimated arrival time at its furthest
+participant. Earlier-arriving participants buffer the transaction until
+that timestamp, giving all participant leaders a common timestamp order
+without a centralized sequencer. This common order creates safe windows
+for priority abort, conditional prepare, and early committed-state
+forwarding. The paper's main evaluation shows lower high-priority tail
+latency than Carousel, TAPIR, and 2PL+2PC variants on YCSB+T, Retwis,
+and SmallBank deployments across a local WAN-emulation cluster and five
+Microsoft Azure regions.
+
+**Concrete mechanisms:**
+
+- Clients assign transaction ids and runtime priority, then use a local
+  proxy's recent client-to-leader delay measurements to estimate arrival
+  time at every participant leader.
+- The transaction timestamp is the future time when the read-and-prepare
+  request should have arrived at all participant leaders. Servers queue
+  received transactions by timestamp and transaction id, and process a
+  transaction only after local time passes the timestamp and it reaches
+  the queue head.
+- Low-priority transactions use Carousel's OCC read-and-prepare path.
+  High-priority transactions use a locking-based prepare path over the
+  known read and write keys, avoiding repeated abort/retry when waiting
+  is cheaper than another WAN transaction attempt.
+- If a high-priority transaction arrives late and conflicts with an
+  already queued or prepared smaller-timestamp transaction, Natto aborts
+  the late high-priority transaction to preserve deadlock freedom.
+- Priority abort lets a participant abort a queued low-priority
+  transaction before prepare if it would block a conflicting
+  high-priority transaction. The paper notes starvation risk and suggests
+  retry-based priority promotion as a mitigation.
+- Priority abort is guarded by estimated low-priority completion time:
+  if the low-priority transaction is expected to finish before the
+  high-priority timestamp, the server can avoid aborting it.
+- Conditional prepare handles the case where one participant already
+  prepared the low-priority transaction while another participant is
+  expected to priority-abort it. The server can conditionally prepare
+  the high-priority transaction, replicate the conditional result, and
+  let the coordinator commit it only if the low-priority abort condition
+  is confirmed.
+- Transaction requests carry estimated arrival times and read/write keys
+  for all participants so a server can predict whether priority abort is
+  likely elsewhere before it receives the remote abort acknowledgement.
+- Local early committed-state forwarding lets a transaction read from a
+  committed conflicting transaction before that prior transaction's
+  updates have completed normal replication, reducing lock hold time by
+  roughly one WAN round trip in the intended setting.
+- Remote early committed-state forwarding can forward a high-priority
+  read to the prior transaction's coordinator when the local participant
+  cannot yet serve the committed value.
+- The prototype extends Carousel in Go with gRPC and Raft, uses one proxy
+  per datacenter for periodic delay probing, and has clients refresh
+  delay information from the local proxy periodically.
+- Evaluation uses 5 partitions, 3 replicas per partition, 15 data
+  servers across five datacenters, 10% high-priority transactions by
+  default, 1 million 64-byte key/value pairs unless varied, 60-second
+  runs, and latency that includes retries.
+- In one YCSB+T high-contention result at 350 txn/s, the paper reports
+  over 5000 ms 95th-percentile high-priority latency for Carousel and
+  TAPIR versus 656 ms for Natto-TS, with further gains from forwarding
+  and priority mechanisms.
+- Natto is sensitive to deployment assumptions: it depends on relatively
+  stable private-WAN delays and loosely synchronized clocks. Under low or
+  moderate network-delay variance, the evaluated Natto variants keep
+  lower high-priority latency than the baselines; high variance increases
+  late-arrival aborts.
+
+**GPU DB mapping:** The GPU DB does not need geo-distributed timestamps
+to serve local pgwire clients, but Natto gives a useful structure for
+classed transaction admission under contention. The strongest
+transferable idea is a transaction or route descriptor with predeclared
+resource and conflict sets: read keys, write keys, touched columns,
+resident generations, expected route duration, priority class, and
+expiration/deadline. Once that descriptor exists, owner queues can
+distinguish "this low-priority COPY chunk can finish before a retained
+lookup's deadline" from "this queued low-priority refresh will block a
+short high-priority read and should yield, abort, or be delayed."
+
+For the mutation owner, Natto supports priority-aware conflict handling
+without giving up a deterministic order. GPU DB could use per-owner
+generation timestamps or batch sequence numbers, not wall-clock WAN
+timestamps, to order admitted work. Within that order, high-priority
+short transactions can wait for earlier conflicting work when bounded,
+but low-priority queued work can be retired, delayed, or promoted when
+it would repeatedly block hot committed paths.
+
+Conditional prepare maps to speculative preparation with an explicit
+condition frontier. For example, a retained read batch, resident refresh,
+or derived index update could prepare descriptors, allocate buffers, or
+compile a route while waiting for a conflicting low-priority mutation,
+but publication must remain conditional on the mutation's abort,
+completion, invalidation, or WAL-visible generation. This fits the
+standing invariant: work may be prepared early, but visibility and
+resident-route eligibility are published only after the condition is
+known.
+
+Early committed-state forwarding is riskier but instructive. In GPU DB,
+the analogous idea is not to expose unflushed writes. Instead, once WAL
+and CPU visibility are safe but residency refresh or downstream
+replication is lagging, the owner might forward reads to a CPU-visible
+fresh path or a coordinator-owned committed result rather than forcing a
+short transaction to wait for a full resident refresh. That creates a
+classed fallback rule: high-priority reads may bypass stale GPU
+residency and use the freshest safe CPU path; low-priority analytical
+work can wait for a refreshed retained snapshot.
+
+The paper also fits the 1M logical-session target. Priority should be
+attached to admitted active work, not to every idle session. A small
+number of high-priority requests should be able to preempt or bypass
+queued low-priority work without letting all high-priority sessions
+reserve pinned buffers, GPU descriptors, or mutation-owner slots.
+
+**Risks and mismatches:** Natto is a geo-distributed 2FI transaction
+system, not a local SQL engine with arbitrary pgwire statements. It
+requires read and write sets to be known at transaction start, so it
+maps best to prepared procedures, COPY chunks, point updates, retained
+lookups, and known-shape refresh work rather than arbitrary SQL. Its
+early committed-state forwarding depends on Carousel's replication and
+commit protocol; GPU DB must not copy that mechanism in a way that
+weakens WAL-before-visibility or resident invalidation.
+
+Priority abort can starve low-priority work unless retry-age promotion,
+budget caps, or fairness windows are explicit. Natto has only two
+priority levels in the evaluated prototype, while GPU DB likely needs
+classes such as commit acknowledgement, short retained read, COPY
+admission, refresh, cold scan, analytical read, and maintenance. The
+network-delay timestamp trick is less relevant inside one machine; the
+transferable concept is a common owner-visible order plus predicted
+service time, not WAN timing. Finally, Natto's absolute latency numbers
+come from WAN deployments and Go/gRPC prototypes, so they should inform
+conflict policy rather than local microsecond targets.
+
+**Benchmark candidates:**
+
+- Add route/transaction descriptors for one mutation-heavy benchmark:
+  priority class, read/write key family, touched columns, resident
+  generation, estimated service time, and deadline. Gate: no behavior
+  change, but every queue wait and conflict report names the descriptor.
+- Implement a CPU-only priority-abort simulation in the mutation owner:
+  low-priority queued writes can be delayed or aborted when a short
+  high-priority conflicting transaction arrives and the low-priority
+  completion estimate exceeds the high-priority budget. Measure abort
+  rate, starvation, p50/p99 latency, and write throughput.
+- Add retry-age promotion for low-priority transactions or refresh work.
+  Failure condition: a low-priority class can be aborted indefinitely
+  while high-priority load remains below a configured cap.
+- Prototype conditional preparation for retained read batches: prepare
+  descriptors and buffers while a conflicting low-priority mutation or
+  refresh is pending, but publish only after the condition frontier is
+  confirmed. Required metrics: prepared-but-cancelled count, handoff
+  latency, stale-generation rejection count, and correctness under WAL
+  replay.
+- Build an early-safe-fallback benchmark: after WAL-visible commit but
+  before GPU resident refresh, route high-priority point reads to the
+  CPU-visible fresh path while low-priority analytical reads wait for
+  residency. Gate: identical SQL results and explicit reason
+  `fresh_cpu_bypass_stale_residency`.
+- Compare FIFO, static priority, and bounded priority-abort admission on
+  a hot-account SmallBank-like workload at concurrency `1,2,4,8,16,32,64`.
+  Expected improvement: lower p99 for short high-priority writes without
+  unbounded low-priority backlog.
+- For future prepared procedures, test whether predeclared read/write
+  sets let COPY or update batches overlap validation, WAL staging, and
+  resident invalidation the way Carousel/Natto overlap read/prepare and
+  commit phases.
