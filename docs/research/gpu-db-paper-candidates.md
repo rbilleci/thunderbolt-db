@@ -441,7 +441,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf`
   Why: memory-optimized MVCC in a disk-backed engine; relevant to version
   storage, undo chains, and cache-aware snapshot visibility.
-- `queued` — **FOEDUS: OLTP Engine for a Thousand Cores and NVRAM**,
+- `reviewed` — **FOEDUS: OLTP Engine for a Thousand Cores and NVRAM**,
   Kimura, SIGMOD 2015.
   URL: `https://dl.acm.org/doi/10.1145/2723372.2746480`
   Tech report: `https://www.labs.hpe.com/techreports/2015/HPL-2015-37.pdf`
@@ -1498,3 +1498,10 @@ Append new candidates here as each paper is processed.
   buffer paper; useful as a DB-external contrast for per-application logs,
   performance isolation, and when DB-owned tiering should bypass the file
   system.
+- `queued` — **Design Principles for Scaling Multi-core OLTP Under High
+  Contention**, Ren et al., SIGMOD 2016 / arXiv 2015.
+  URL: `https://arxiv.org/abs/1512.06168`
+  Why: ORTHRUS-style separation of transaction execution stages and advanced
+  transaction planning is a direct follow-up for FOEDUS's many-core OCC
+  scaling limits under high contention, and may inform GPU DB mutation-owner
+  admission and partitioned write lanes.

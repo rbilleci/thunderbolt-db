@@ -17036,3 +17036,145 @@ route-selected slowdown versus oracle, HBM evictions, host demotions, NVMe
 bytes, and stale-generation rejections. The pass condition is not just higher
 throughput; it is bounded short-read latency with explainable tier decisions
 and unchanged WAL/MVCC correctness.
+
+### 2026-06-03 - FOEDUS thousand-core OLTP with dual pages
+
+**Citation:** Hideaki Kimura. "FOEDUS: OLTP Engine for a Thousand Cores and
+NVRAM." SIGMOD 2015, pp. 691-706. doi:10.1145/2723372.2746480. Retrieved
+2026-06-03 from the DOI metadata and the CMU course-hosted SIGMOD PDF,
+`https://15721.courses.cs.cmu.edu/spring2016/papers/p691-kimura.pdf`; the
+candidate's HP Labs tech-report URL was unreachable during this run.
+
+**Category:** transaction processing / write path, with multi-tier cache /
+data placement and MVCC-style snapshot design.
+
+**Relevance tags:** many-core OLTP; NVRAM; NUMA locality; decentralized
+logging; optimistic concurrency control; immutable snapshots; stratified
+snapshots; page residency; recovery; hot/cold tier split.
+
+**Core idea:** FOEDUS is built around a dual-page representation for scaling
+OLTP beyond DRAM while preserving in-memory-style transaction speed. Each
+logical page has a mutable volatile page in DRAM and an immutable snapshot
+page in NVRAM. The two are physically independent but logically equivalent, so
+transaction execution can mutate DRAM pages while background log-gleaning
+constructs NVRAM snapshot pages from logical logs.
+
+The paper's key lesson for GPU DB is that tiering can be made into a
+correctness-preserving publication protocol rather than a transparent page
+fault. FOEDUS keeps hot mutable state small and local, writes durable snapshot
+state sequentially, and lets immutable snapshot pages be cached or replicated
+without ordinary mutable-buffer synchronization. In its 240-core TPC-C
+evaluation, FOEDUS reports about 13.9 million logged transactions per second
+on the DragonHawk server and roughly 2.4x SILO throughput at that scale; the
+absolute number is hardware- and benchmark-specific, but the architecture is
+directly relevant.
+
+**Concrete mechanisms:**
+
+- A dual page pointer holds a DRAM volatile pointer and an NVRAM snapshot
+  pointer. If the volatile page is absent, the snapshot page is the complete
+  current representation for that key range.
+- Volatile and snapshot pages are physically independent, which lets mutation
+  and snapshot construction run in parallel. They are logically equivalent, so
+  lookups need no separate cold-data mapping table or per-record cold metadata.
+- FOEDUS intentionally avoids out-of-page record bodies, central lock managers,
+  and global mapping tables. Its footprint for cold data can shrink to page
+  pointers and immutable NVRAM pages rather than DRAM metadata proportional to
+  the cold database size.
+- Transaction workers keep private read sets, write sets, and circular log
+  buffers. Log writers dump committed portions of worker buffers directly to
+  NVRAM log files, avoiding an extra logger-side copy.
+- The commit protocol extends SILO-style OCC. Precommit locks write-set
+  records, validates read-set TIDs, obtains an epoch/TID, applies writes, and
+  publishes logs; durability arrives through coarse-grained group commit.
+- Serializable transactions that jump from volatile pages into snapshot pages
+  record a pointer set. At precommit, they abort if a new volatile page was
+  installed at that pointer, protecting the existence of new mutable state.
+- Stratified snapshots are complete immutable database images by epoch, but
+  newer snapshots only replace modified parts. A lookup or range read consults
+  one snapshot path rather than probing many LSM levels or Bloom filters.
+- The Log Gleaner periodically assigns partitions, maps and buckets logical
+  log records by storage/key/partition, sorts them, and reducers build new
+  snapshot pages with mostly sequential writes.
+- Log records are compacted during snapshot construction: repeated overwrites,
+  deletes, and increments can collapse before reducers apply them to snapshot
+  pages.
+- Installing snapshot pointers and dropping unmodified volatile pointers is a
+  short in-memory phase. Most log-gleaning work runs concurrently with
+  transactions.
+- Snapshot cache is NUMA/SOC-local because snapshot pages are immutable.
+  FOEDUS can tolerate occasional duplicate cached copies without violating
+  correctness, avoiding locks or atomics in the cache hot path.
+- Crash recovery truncates logs to the durable point and invokes the same log
+  gleaner used during normal operation; no volatile pages survive restart.
+- Master-Tree combines Masstree and Foster B-tree ideas. Foster-twins give
+  split pages stable key regions, mark old record TIDs as moved, and let
+  precommit track relocated records rather than restart from the root.
+- In the NVRAM TPC-C experiments, snapshot cache remains important even at
+  very low emulated NVRAM latency because it also avoids filesystem calls,
+  page-copy overhead, and remote-NUMA access.
+
+**GPU DB mapping:** FOEDUS strengthens the P8 rule that GPU resident state
+should be immutable acceleration state published from WAL/CPU truth, not a
+transparent mutable buffer pool. A GPU DB equivalent of dual pages would keep
+mutable CPU/WAL-owned segments for writes and publish immutable GPU or
+host-warm snapshot segments after deterministic generation boundaries. Reads
+can use the immutable side without asking the mutation owner, while writes
+remain local to mutation or partition owners.
+
+The Log Gleaner maps to resident refresh and cold-tier compaction. Instead of
+refreshing GPU state by scanning mutable tuples synchronously on the read
+path, the engine can batch logical WAL/MVCC changes into sorted per-table or
+per-partition refresh inputs, compact redundant updates, and build new
+resident column groups in parallel with OLTP writes. Publication is then a
+pointer/generation swap gated by WAL-before-visibility.
+
+FOEDUS's pointer-set validation is a useful analogy for snapshot compatibility
+checks. When a retained read crosses from CPU mutable truth to a resident or
+cold snapshot segment, the request should record which generation boundary it
+depended on. If a mutation installs a newer mutable/resident generation before
+the read commits or responds, the route must either prove the old generation is
+still valid for that snapshot or reject/fallback.
+
+The snapshot-cache result argues for replicated immutable host-side buffers.
+Warm compressed host segments, decoded row descriptions, and resident metadata
+can be duplicated per NUMA/GPU worker when immutable. That is much cheaper than
+sharing mutable page state across all IO, mutation, and GPU execution workers.
+
+Master-Tree's stable key-region idea is relevant even if GPU DB does not adopt
+that tree. The storage engine should prefer page/segment layouts whose
+identity and key range remain stable across splits, refreshes, or demotions,
+so in-flight read snapshots and validation records can track local generation
+changes instead of restarting all work from a global root.
+
+**Risks and mismatches:** FOEDUS targets CPU OLTP on many-core NUMA machines
+and emulated NVRAM, not GPU HBM, CUDA kernels, PCIe/NVLink, GPUDirect Storage,
+or PostgreSQL protocol concurrency. Its OCC design assumes read/write-set
+tracking and serializable transactions; the current GPU DB baseline has a much
+simpler MVCC tuple store and must not import OCC details without a full
+conflict and recovery model. The paper's NVRAM assumptions from 2015 do not
+map one-to-one to CXL, Optane's market reality, NVMe SSDs, or GPU memory
+tiers in 2026. The Log Gleaner briefly pauses transactions to drop volatile
+pointers; GPU DB would need to bound any analogous publication pause under
+pgwire/session SLOs.
+
+**Benchmark candidates:**
+
+- Prototype a dual-generation retained segment model: mutable CPU/WAL segment
+  plus immutable GPU/host snapshot segment. Gate: writes publish only after WAL
+  safety, and retained reads never observe a stale generation after mutation.
+- Add a WAL-log compaction refresh test for one hot table: repeated updates and
+  deletes collapse before building a new resident column group. Gate: lower
+  refresh bytes and identical SQL-visible rows versus full rebuild.
+- Measure immutable host snapshot replication by NUMA or GPU worker. Gate:
+  reduced cross-worker contention and stable memory overhead under 64+ logical
+  sessions.
+- Add pointer/generation validation for reads that route from mutable CPU state
+  to resident snapshots. Failure condition: a read can complete from a
+  generation invalidated before its declared visibility boundary.
+- Build a cold-tier lookup benchmark where a hot mutable segment and a cold
+  immutable segment cover the same logical table. Gate: one lookup path per key
+  range, not LSM-style probing of many historical levels.
+- Compare resident refresh from CPU tuple scan versus sorted WAL/MVCC delta
+  application. Measure refresh latency, write-path interference, GPU bytes
+  built, and p99 retained-read impact.
