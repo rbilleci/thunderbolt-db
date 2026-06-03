@@ -371,7 +371,7 @@ Append new candidates here as each paper is processed.
   Why: direct GPU compression baseline compared by the FastLanes-GPU paper;
   useful for benchmarking tile granularity, global-memory traffic, and
   compression-versus-occupancy tradeoffs.
-- `queued` — **The FastLanes File Format**, Afroozeh et al., PVLDB 2025.
+- `reviewed` — **The FastLanes File Format**, Afroozeh et al., PVLDB 2025.
   URL: `https://vldb.org/pvldb/vol18/p4629-afroozeh.pdf`
   Why: modern file-format follow-up that may connect GPU-friendly compressed
   vectors to disk/NVMe cold-tier layout and CPU/GPU shared data placement.
@@ -685,6 +685,21 @@ Append new candidates here as each paper is processed.
   Why: Umbra's adaptive bytecode/JIT execution foundation; relevant to deciding
   when GPU DB should interpret, compile, batch, or route short SQL plans
   without paying excessive setup latency.
+- `queued` — **An Empirical Evaluation of Columnar Storage Formats**,
+  Zeng et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol17/p148-zeng.pdf`
+  arXiv: `https://arxiv.org/abs/2304.05028`
+  Why: comparative study of Parquet/ORC/Arrow internals, including format
+  inefficiencies for machine-learning workloads and GPU decoding; useful
+  baseline for deciding whether P8 should adopt an existing file format,
+  a FastLanes-style resident segment, or an internal-only GPU layout.
+- `queued` — **Mainlining Databases: Supporting Fast Transactional Workloads on
+  Universal Columnar Data File Formats**, Li et al., arXiv 2020.
+  URL: `https://arxiv.org/abs/2004.14471`
+  Why: transactional workload support over universal columnar file formats;
+  useful counterpoint to FastLanes for whether GPU DB cold/warm segments can
+  also serve point lookups and mutation-adjacent routes without separate
+  row-store copies.
 - `reviewed` — **Polaris: Enabling Transaction Priority in Optimistic
   Concurrency Control**, Ye et al., PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3588724`

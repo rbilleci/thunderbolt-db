@@ -21268,3 +21268,207 @@ under write-heavy workloads.
   asynchronous analytical log queried for p99 root cause. Failure condition:
   analytics/provenance capture competes with mutation owner WAL/index buffers
   or changes visibility publication timing.
+
+### 2026-06-03 - The FastLanes File Format
+
+**Citation:** Azim Afroozeh and Peter Boncz. "The FastLanes File
+Format." PVLDB 18(11), 2025, pp. 4629-4643. doi:10.14778/3749646.3749718.
+Retrieved 2026-06-03 from the official PVLDB PDF,
+`https://vldb.org/pvldb/vol18/p4629-afroozeh.pdf`.
+
+**Category:** Multi-tier cache / data placement, with GPU execution /
+analytics relevance.
+
+**Relevance tags:** compressed resident segments; GPU-friendly decoding;
+columnar file format; vector-at-a-time access; partial decompression;
+multi-column compression; predicate pushdown; cold/warm tier layout;
+P8 resident segment design.
+
+**Core idea:** FastLanes is a new open-source columnar file format built
+around data-parallel lightweight compression rather than Parquet-style
+general-purpose heavyweight compression such as Snappy or Zstd. Its design
+goal is to preserve or improve compression ratio while making decoding
+regular enough for SIMD and future GPU execution. The key move is to turn
+compression into an explicit expression over small vectors, then store the
+intermediate encoded pieces in a segmented layout that a scan can access at
+vector granularity.
+
+The paper's strongest transferable claim is that a storage format can expose
+compressed vectors as execution inputs instead of treating decompression as an
+opaque all-or-nothing scan step. FastLanes can return individual 1024-value
+vectors, partially decode an expression chain, and let an engine exploit
+compressed forms such as constants, dictionary codes, frame-of-reference
+bases, casts, and multi-column relationships. In the paper's Public BI
+evaluation, FastLanes is reported as compressing better than Parquet+Snappy
+and BtrBlocks, roughly matching or edging Parquet+Zstd on that corpus, while
+decoding far faster. The absolute numbers are CPU-only, but the mechanism is
+directly relevant to GPU-resident and host-warm segment design.
+
+**Concrete mechanisms:**
+
+- Expression Encoding represents compressed data as a chain of operators over
+  fixed 1024-value vectors. Operators include FFOR, PATCH, DELTA, ALP,
+  dictionary, transposed layout, cast, RLE variants, FSST/FSST12, constant,
+  equality, and external dictionary.
+- Each operator stores an executable encoded layout rather than only a generic
+  compressed blob. For example, dictionary keeps codes and dictionary separate,
+  while FFOR keeps base, bit width, and bit-packed data separate.
+- Expressions are serialized as integer operator and operand arrays in a
+  reverse-Polish-like form, avoiding runtime string parsing. During decoding,
+  the reader binds function pointers and segment offsets from descriptors.
+- The file uses fixed-record-count rowgroups whose size is a multiple of
+  1024, so vectorized encodings can use SIMD lanes and, in principle, GPU warp
+  or tile-friendly work patterns.
+- Rowgroup, column, and segment descriptors live in footer metadata. The paper
+  suggests storing footer metadata separately from binary data so engines can
+  cache metadata, apply projection pushdown, and skip rowgroups before
+  touching data bytes.
+- A segmented page layout stores encoded pieces of the same role and type
+  together, plus an entry-point array giving per-vector offsets. A query can
+  fetch the relevant segment for a vector rather than decompressing a whole
+  rowgroup.
+- Segment organization enables fine-grained predicate pushdown. FFOR bases can
+  act as per-vector minimum metadata, and constants can be answered from
+  metadata without fetching column bytes.
+- Decoding proceeds bottom-up through the expression chain, but the reader does
+  not have to fully decode to the SQL physical type. It can stop at a compressed
+  vector form that the query engine knows how to execute.
+- Multi-column compression is integrated into expressions. Equality encodes a
+  column as a reference to another column; one-to-one mappings can reuse
+  external dictionary codes; casts and column splitting can expose numerical
+  substructure inside strings or wider types.
+- Expression detection is two-phase. A rule-based phase detects constants,
+  equality, string-as-numeric, double-as-integer, narrower integers, and
+  one-to-one mappings. A sampling phase tests a predefined expression pool on
+  the first, middle, and last 1024-value vectors of a rowgroup.
+- The paper reports that this three-way sampling reaches more than 99%
+  compression-ratio accuracy versus full-rowgroup expression search on the
+  Public BI corpus.
+- In the evaluation setup, FastLanes uses a portable C++ implementation with
+  no external dependencies. End-to-end query-engine integration is left as
+  future work, so the measured wins are format and decoding wins rather than
+  full SQL-runtime wins.
+
+**GPU DB mapping:** P8 currently builds generated GPU column-group snapshots
+from CPU MVCC truth. FastLanes suggests a sharper resident-segment contract:
+resident or host-warm data should not be just "dense decoded columns" or
+"opaque compressed blobs." A better first-class unit is a generation-bound
+compressed vector with a known expression, per-vector entry points, and
+metadata that the planner and GPU execution owner can reason about.
+
+The segmented layout maps well to the current tier plan. Footer-like metadata
+could live in CPU memory or a catalog-side resident descriptor cache, while
+selected encoded segments live in HBM, host warm memory, or NVMe. A route
+descriptor could ask for only dictionary codes, FFOR bases, bit-packed payloads,
+text offsets, or constant metadata depending on the predicate and projection.
+That gives the cache manager a smaller movement unit than "whole table
+snapshot" without giving up deterministic generation identity.
+
+Partial decompression is especially important for GPU execution. A retained
+`COUNT`, equality lookup, range filter, or grouped aggregate may not need full
+SQL-value reconstruction. For example, constants can collapse whole vectors;
+FFOR bases can reject vector ranges; dictionary codes can execute equality or
+grouping before string reconstruction; casts can keep narrow integers on the
+GPU; and equality/external-dictionary relationships can avoid loading a second
+logical column. This should be benchmarked before committing to fully decoded
+HBM-resident column buffers as the universal P8 layout.
+
+FastLanes also gives a concrete shape for cold and warm tier compatibility.
+If host/NVMe segments use the same vector and expression descriptors as HBM
+segments, promotion can move expression pieces rather than converting formats
+at every tier boundary. WAL, MVCC, and recovery still own correctness, but
+compressed resident segments can become rebuildable acceleration artifacts with
+stable rowgroup/vector ids, source WAL boundary, schema generation, and
+invalidation generation.
+
+**Risks and mismatches:** FastLanes is an analytical file-format paper, not an
+OLTP or MVCC storage engine. It does not specify WAL-before-visibility,
+snapshot isolation, update/delete handling, garbage collection, recovery
+replay, tuple-level locking, or PostgreSQL protocol behavior. The format's
+rowgroups are immutable-style units; a write-heavy GPU DB would need delta
+segments, rebuild triggers, or CPU fallback for fresh mutations.
+
+The evaluation is CPU-format-centric. The paper argues that its data-parallel
+encodings are GPU-friendly and discusses GPU cascaded decoding as future work,
+but it does not provide a complete CUDA reader/writer or full SQL benchmark.
+Multi-column compression also creates invalidation risk: if column A encodes
+column B through equality or dictionary relationships, mutation and refresh
+must invalidate every dependent expression before a retained route can use it.
+
+There is a latency risk as well. Expression interpretation, metadata lookup,
+and partial decode decisions can help large scans but may hurt tiny point
+lookups unless route descriptors are compiled or cached. P8 should treat
+FastLanes-style expression descriptors as a candidate resident/cold segment
+layout, not an automatic replacement for CPU indexes or decoded hot key
+vectors.
+
+**Benchmark candidates:**
+
+- Add a compressed-resident-segment microbenchmark with three layouts for one
+  `int4` column: dense decoded HBM, FFOR-style base/bit-packed vectors, and
+  dictionary-code vectors. Measure HBM bytes, H2D bytes, kernel time, p50/p99,
+  and result parity for `COUNT`, range filter, equality lookup, and grouped
+  aggregate.
+- Prototype per-vector route metadata for resident segments: vector id,
+  row count, source WAL boundary, min/max or base, encoding expression id,
+  segment offsets, and invalidation generation. Gate: planner can skip vectors
+  without touching payload bytes and stale metadata causes fallback, not a
+  stale retained read.
+- Compare full decode versus partial decode for dictionary-coded text equality
+  and grouping. Gate: string reconstruction is avoided when SQL semantics allow
+  code-level execution, and results match CPU fallback.
+- Build a cold/warm promotion experiment where footer-like descriptors stay in
+  CPU memory while payload segments move among NVMe, host memory, and HBM.
+  Measure promoted bytes, metadata hit rate, route latency, and warm-tier
+  memory pressure.
+- Stress multi-column compression invalidation: encode one column through
+  equality or external dictionary reference to another, then update one side.
+  Gate: dependent resident expressions invalidate before the mutation becomes
+  visible to new reads.
+- Test expression selection overhead on COPY/refresh. Compare always-decoded
+  resident rebuild, simple fixed FFOR/dictionary selection, and three-vector
+  sampling. Failure condition: refresh or COPY p95 regresses enough to erase
+  read-side wins for short-lived hot segments.
+
+### 2026-06-03 - Cross-paper synthesis: tier-aware execution needs metadata before movement
+
+GMT, DBOS, and FastLanes converge on the same practical rule from different
+layers: a high-throughput GPU DB should decide and record what work is valid,
+worth moving, and worth scheduling before it allocates scarce HBM, pinned
+buffers, queue slots, or response memory. GMT makes placement a reuse-aware
+tier decision. DBOS makes runtime control state transactional and inspectable.
+FastLanes makes compressed-vector metadata executable enough to avoid moving
+or decoding unnecessary bytes.
+
+Converging design tracks:
+
+- **Generation-bound route metadata:** resident snapshots, warm-tier segments,
+  compressed-vector descriptors, pruning facts, and admission tickets all need
+  relation identity, schema generation, visibility boundary, tier generation,
+  and invalidation generation.
+- **Descriptor-first placement:** keep small route descriptors and footer-like
+  metadata hot, then move only the segment pieces a route proves it needs.
+- **Warm tier as a policy surface:** host memory should hold reusable, valid
+  compressed segments or descriptors, not become an unmeasured dump for every
+  HBM eviction.
+- **Control plane separate from data plane:** admission, tier state, and route
+  provenance should be queryable and replayable, while the hot path consumes
+  compact tickets and descriptors through bounded rings.
+
+Category gaps remain around write-path batching with MVCC, HTAP tuple discovery
+for fresh analytical snapshots, and GPU-native transaction execution. The next
+high-value queued paper should likely be **Counting Is All You Need for Instant
+Tuple Discovery** if source access is available, or another modern HTAP/MVCC
+paper with an accessible primary source.
+
+Benchmark priorities:
+
+- Build a descriptor-first retained route prototype before broadening GPU join
+  or compression kernels.
+- Add tier miss classes that distinguish descriptor hit, HBM segment hit, host
+  promotion, NVMe fetch, compressed-vector partial decode, full decode, stale
+  generation fallback, and CPU fallback.
+- Measure "bytes avoided" and "queue slots avoided" alongside latency for every
+  retained route.
+- Treat stale compressed metadata, stale warm-tier segments, and stale pruning
+  facts as correctness failures equal to stale resident buffers.
