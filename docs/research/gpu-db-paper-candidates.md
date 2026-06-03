@@ -1078,7 +1078,7 @@ Append new candidates here as each paper is processed.
   Why: lightweight learned transaction-to-thread assignment cited by TSkd;
   relevant to admission-time prediction before choosing an owner, CPU route,
   or deferred execution path.
-- `queued` — **Polyjuice: High-Performance Transactions via Learned
+- `reviewed` — **Polyjuice: High-Performance Transactions via Learned
   Concurrency Control**, Wang et al., OSDI 2021.
   URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`
   Why: learned concurrency-control policy selection cited by TSkd; useful as
@@ -1732,3 +1732,10 @@ Append new candidates here as each paper is processed.
   useful for comparing an optimizer switch between binary and WCOJ plans with
   GPU DB's possible spectrum of binary, multiway, factorized, and GPU-resident
   join routes.
+- `queued` — **CCaaLF: Concurrency Control as a Learnable Function**,
+  Wang et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2503.10036`
+  Why: modern learned-concurrency-control follow-up to Polyjuice-style policy
+  search; useful for deciding whether GPU DB should limit itself to offline
+  policy tables or consider broader learned functions for owner admission,
+  wait placement, and retry/backoff decisions.

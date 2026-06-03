@@ -20157,3 +20157,156 @@ experiment rather than a design dependency.
   UPDATE invalidates a table generation, no compressed snapshot route may use
   stale vectors, even if dense resident state for another generation remains
   available.
+
+### 2026-06-03 - Polyjuice learned concurrency control policies
+
+**Citation:** Jiachen Wang, Ding Ding, Huan Wang, Conrad Christensen,
+Zhaoguo Wang, Haibo Chen, and Jinyang Li. "Polyjuice: High-Performance
+Transactions via Learned Concurrency Control." OSDI 2021. Retrieved
+2026-06-03 from the USENIX PDF,
+`https://www.usenix.org/system/files/osdi21-wang-jiachen.pdf`, and USENIX
+landing page,
+`https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`.
+
+**Category:** Transaction processing / write path and concurrency control.
+
+**Relevance tags:** learned concurrency control; policy tables; contention
+adaptation; early validation; dirty-read exposure; wait actions; backoff
+learning; stored procedures; owner admission; transaction batching.
+
+**Core idea:** Polyjuice treats concurrency control as a workload-specific
+policy-search problem rather than choosing one fixed protocol such as OCC,
+2PL, IC3, or MVCC. For a known transaction workload, it defines a table whose
+rows are static transaction access contexts and whose columns are fine-grained
+actions: how long to wait on dependent transactions, whether to read committed
+or exposed uncommitted data, whether to expose buffered writes, whether to run
+early validation, and how to adjust retry backoff. Offline evolutionary search
+then finds a policy that maximizes commit throughput on the target workload.
+
+The important transfer is not "make GPU DB learned everywhere." The useful
+pattern is to separate correctness from scheduling policy. Polyjuice keeps a
+final validation step that ensures serializability, then lets the policy table
+optimize only the interleaving choices that affect wasted work, waiting, and
+pipeline parallelism. That is a strong shape for GPU DB: WAL-before-visibility
+and snapshot validity should remain hard invariants, while route admission,
+wait placement, owner choice, batch growth, and retry/backoff can be tuned from
+measured workload classes.
+
+**Concrete mechanisms:**
+
+- The policy state is intentionally small: transaction type plus static
+  access-id inside the stored procedure. The paper reports that this was
+  enough for TPC-C, TPC-E, and a synthetic 10-transaction workload; adding data
+  contention level helped only contrived microbenchmarks.
+- Wait actions are not absolute sleeps. A transaction waits until dependent
+  transactions of each type have advanced to configured access ids, making the
+  policy more stable than fixed-time waits.
+- Read-version actions choose between committed reads and visible
+  uncommitted writes. Write-visibility actions choose whether a transaction
+  keeps writes private or makes all private writes so far visible through a
+  per-object access list.
+- Early validation can run after a read or write. Failed early validation
+  retries from the last successful validation point, reducing wasted work under
+  contention, but final commit validation is still required for correctness.
+- Final validation is Silo-style physical timestamp validation with two
+  Polyjuice additions: committed and uncommitted versions both get unique
+  version ids, and a transaction waits for dependent transactions to finish
+  committing before validating.
+- Backoff is learned in a separate table indexed by transaction type, current
+  commit/abort status, and bounded prior-abort count. The learned action
+  multiplicatively increases or decreases retry backoff.
+- Training is offline. Polyjuice logs transaction inputs, replays them on a
+  training machine, measures commit throughput, and uses an evolutionary
+  algorithm with warm-start policies such as OCC, 2PL-like, and IC3-like
+  policies.
+- The implementation stores the trained table as a file loaded by the C++
+  database. Worker threads keep policy-table pointers, and policy switching can
+  happen without an atomic global switch because validation preserves
+  correctness across mixed policy execution.
+- Evaluation on a 56-core machine reports that Polyjuice beats the best
+  compared baseline by 15-56% on moderate/high-contention TPC-C and TPC-E
+  configurations. In the paper's high-contention TPC-C factor analysis, early
+  validation gives a large initial gain, and fine-grained waits add another
+  large jump by exploiting more pipeline parallelism.
+- The paper is explicit that offline training is unsuitable for rapidly and
+  unpredictably changing workloads. Its proposed deployment strategy is to
+  train for predictable peak workloads and retrain when observed peak
+  contention changes materially.
+
+**GPU DB mapping:** GPU DB can use the Polyjuice shape as a policy layer over
+declared owner/runtime boundaries. The mutation owner, read snapshot workers,
+residency owner, GPU execution owners, and response rings should not have their
+correctness rules learned. Their admission and scheduling choices can be
+table-driven: transaction type, query shape, snapshot generation, partition,
+access phase, current boundary pressure, and prior retry/fallback count can map
+to actions such as execute now, wait for a dependency phase, defer to a later
+micro-batch, use CPU fallback, expose a read snapshot to a compatible batch, or
+reject with a named overload reason.
+
+For write throughput, Polyjuice suggests a benchmarkable path for contention
+classes. Hot-key writes, COPY chunks, resident refresh invalidations, and
+partition-local mutations may need different wait/validation points. Rather
+than one global "writes serialize through the owner" rule forever, GPU DB could
+keep WAL-before-visibility fixed and learn only whether a transaction class
+should wait before enqueue, wait before validation, run early conflict checks,
+or route to a partition owner.
+
+For 1M logical sessions, the learned backoff table is the most direct transfer.
+Session admission should distinguish transaction/query class and prior abort or
+overload history. A retained point lookup, a long scan, a hot update, and a
+refresh-triggering write should not share one retry delay. The policy can
+adjust retry/backoff and response pacing while correctness remains enforced by
+snapshot compatibility and final validation.
+
+Polyjuice also reinforces that static access context is valuable. GPU DB can
+start with explicit, inspectable route-policy tables for known stored
+procedures or repeated query shapes before attempting online learning. This
+fits the current retained-route work: same-shape reads and bounded writes
+already have stable identifiers that could be used as policy rows.
+
+**Risks and mismatches:** Polyjuice is an in-memory multicore OLTP system, not
+a GPU, WAL/recovery, pgwire, or multi-tier storage design. Its prototype does
+not support MVCC in the learned policy space; it only discusses how MVCC-like
+algorithms can be described by the same action vocabulary. It also assumes
+known transaction logic and logged inputs for offline training, which maps
+better to stored procedures and repeated query templates than to ad hoc SQL.
+
+Dirty reads and public uncommitted writes are dangerous transfers. GPU DB
+should not expose uncommitted SQL-visible state merely because a learned policy
+likes the interleaving. A safer adaptation is exposing provisional dependency
+metadata, retained refresh placeholders, or immutable read snapshots after a
+durable visibility boundary, while final SQL result visibility remains
+validated.
+
+The measured improvements depend on high-contention workloads and a prototype
+with extra metadata overhead. The paper reports an 8% slowdown versus Silo for
+near-zero contention TPC-C because Polyjuice learned an OCC-like policy but
+still paid its metadata cost. GPU DB should require a no-contention guardrail:
+any policy layer must disappear or choose the simple path when queues,
+conflicts, and retry rates are low.
+
+**Benchmark candidates:**
+
+- Build a no-GPU transaction-admission simulator with policy rows keyed by
+  transaction/query shape, access phase, owner domain, and contention class.
+  Compare fixed FIFO/OCC-like admission, hand-coded contention waits, and a
+  searched policy table under hot-key writes plus retained reads.
+- Add an early-conflict-check experiment for write batches: before a batch
+  reaches WAL append, detect hot-key dependency patterns and decide whether to
+  wait, split by partition, or abort/retry. Gate: reduced wasted write work
+  without weakening WAL-before-visibility.
+- Prototype class-specific retry/backoff for pgwire sessions and benchmark
+  endpoint requests. Required rows: retained lookup, retained aggregate,
+  mutation, COPY chunk, refresh, and CPU fallback. Metrics: p50/p99 latency,
+  retry count, accepted/rejected count, throughput, and named backoff reason.
+- For stored-procedure-like benchmarks, assign stable access ids to each
+  relational operation and log conflict/queue outcomes. Train or search an
+  offline policy that chooses wait points and CPU/GPU/fallback route actions;
+  require the generated policy table to be human-readable before use.
+- Test a low-contention guardrail: when conflict rate and queue pressure are
+  near zero, the policy layer must match the simple route's throughput within a
+  small tolerance and avoid extra per-request allocation.
+- Add a correctness proof harness for mixed policy execution. During a policy
+  switch, some workers use the old table and some use the new table; the test
+  must prove snapshot compatibility, validation, and WAL visibility remain
+  independent of the policy choice.
