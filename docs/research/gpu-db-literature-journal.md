@@ -21781,3 +21781,186 @@ current GPU DB benchmark envelope.
   `VarlenEntry` metadata, and FastLanes/dictionary codes. Measure update
   cost, refresh cost, text-prefix predicate latency, and memory reclamation
   safety under long retained snapshots.
+
+### 2026-06-03 - RTCUDB ray-tracing-core query execution
+
+**Citation:** Xuri Shi, Kai Zhang, X. Sean Wang, Xiaodong Zhang, and
+Rubao Lee. "RTCUDB: Building Databases with RT Processors."
+arXiv:2412.09337v2, 2024. Retrieved 2026-06-03 from
+`https://arxiv.org/abs/2412.09337`.
+
+**Category:** GPU execution / analytics, with route-choice and resident-index
+relevance.
+
+**Relevance tags:** RT cores; BVH materialized views; fused scan/group/aggregate;
+hardware intersection; encoded predicates; compressed coordinate layout;
+memory-bandwidth avoidance; alternate GPU functional units; resident route
+eligibility.
+
+**Core idea:** RTCUDB argues that CUDA-core GPU query engines such as Crystal
+are becoming memory-bandwidth limited, then maps a restricted class of
+analytical queries onto ray-tracing hardware. Instead of implementing scan,
+grouping, and aggregation as separate kernels or separate ray-tracing jobs, it
+builds bounding-volume hierarchies over query-relevant attributes and executes
+scan, group-by, and aggregation together as one ray-tracing job. Data values
+become triangle coordinates in 3D space, predicates become ray-launch regions,
+and the any-hit shader accumulates grouped aggregate results.
+
+The transferable lesson is not "use RT cores for every SQL query." It is that
+alternate GPU hardware can win only when the data layout, query shape, and
+execution boundary are chosen together. RTCUDB gets its win by treating the
+BVH like a prebuilt materialized view and fusing operators so the ray job
+accesses fewer records and fetches scan, group, and aggregate fields through
+one primitive coordinate. The paper reports up to 18.3x speedup over Crystal
+on SSB-flat queries and average memory-throughput use near 36.7% instead of
+Crystal's roughly saturated 97.4%, but the workload is analytical, flattened,
+and shaped around SSB.
+
+**Concrete mechanisms:**
+
+- RTCUDB stores records as triangle primitives because NVIDIA RT cores
+  accelerate ray-triangle intersection in hardware; other primitive types
+  would fall back to CUDA intersection shaders.
+- For a simple query, aggregation attributes map to the X coordinate,
+  group-by attributes to Y, and scan attributes to Z. A row with values
+  `(a, b, c)` becomes a right triangle whose right-angle vertex is `(a, b, c)`.
+- Scan predicates become ray-launch regions. For `Z` ranges, parallel rays are
+  launched through the selected slab so only triangles inside the predicate
+  region intersect.
+- The any-hit shader reads the intersected primitive id and coordinate,
+  uses a flag bit array to avoid double-counting primitives intersected by
+  multiple rays, and updates group-specific aggregate arrays with atomics.
+- Multiple scan predicates are encoded with bijective integer encoding onto
+  one coordinate. Attribute ordering tries to put wider predicate ranges later
+  so the ray-launch region splits into fewer slabs.
+- Multiple group-by attributes are dictionary encoded into a natural-number
+  group id, which becomes the Y coordinate and directly indexes result arrays.
+- Multiple aggregation attributes are packed into the 32-bit float coordinate
+  when possible. If precision/range limits prevent packing all fields, the
+  remaining attributes stay in GPU memory and the shader performs extra lookup
+  by primitive id.
+- BVHs are built offline. For multi-table databases, RTCUDB treats the join
+  needed to produce BVH coordinates as materialized-view construction rather
+  than query-time join execution.
+- Operators that do not map cleanly to RT traversal, such as `HAVING`,
+  `ORDER BY`, and `TOP`, are handled by CUDA kernels after the ray-tracing
+  stage. Some `ORDER BY` work can be skipped when dictionary group order
+  already matches the requested prefix.
+- Evaluation uses SSB-flat on an RTX 4090 and compares mainly against a
+  Crystal-style CUDA implementation. The paper also runs a pure-CUDA
+  ray-tracing variant on an older GPU without RT cores and finds it far slower
+  than Crystal, showing the design depends on hardware RT traversal.
+
+**GPU DB mapping:** For P8, RTCUDB suggests a new class of route predicates:
+not just CPU versus CUDA resident versus over-resident, but "specialized
+hardware route is valid only for a declared shape." A future RT-core route
+should be admitted only when the query can be represented as a fused
+predicate/group/aggregate over already-resident encoded segments or BVHs. The
+planner should treat such a route like a materialized resident view with an
+explicit schema generation, source visibility boundary, encoded attribute
+order, supported operators, and invalidation state.
+
+The BVH-as-materialized-view idea maps to resident indexes. GPU DB could
+prototype a read-only retained BVH side structure for narrow integer range
+filters or grouped aggregates, built from a frozen segment generation. The
+route would be invalidated by the same WAL-before-visibility rules as other
+resident snapshots. It should not be built during a latency-sensitive query
+unless the query explicitly pays a refresh/admission cost, because RTCUDB's
+own motivation is that query-time BVH construction is too expensive.
+
+The coordinate-encoding mechanisms are useful even if RT cores are not used.
+They are a reminder that resident routes should pre-compose the fields that
+will be consumed together. A retained grouped aggregate route can store compact
+predicate keys, group ids, and aggregate payloads in one lane-specific layout
+instead of scanning unrelated columns or performing random materialization.
+That maps directly to P8's column-group segment design and to micro-batching by
+query shape.
+
+RTCUDB also exposes a correctness boundary. Its fast path works best on
+flattened, mostly static analytical data. GPU DB's transactional target needs
+MVCC visibility, WAL replay, invalidation, and long-reader rules. An RT route
+must therefore run only over immutable published generations, or carry a
+separate compact visibility side structure whose cost is measured against a
+plain CUDA retained route.
+
+**Risks and mismatches:** RTCUDB is not an OLTP design. It does not solve write
+admission, MVCC version chains, snapshot isolation, pgwire concurrency, WAL
+ordering, recovery, or high-contention transactions. It uses SSB-flat, so joins
+are effectively moved into offline BVH construction. That maps to materialized
+resident views, not to arbitrary online SQL joins.
+
+The design depends on hardware and API details. OptiX coordinates are
+single-precision floats, which restricts exact integer ranges and forces
+fallback memory accesses for some attributes. Atomic aggregation in the
+any-hit shader can become a bottleneck for low-cardinality grouping or
+queries without `GROUP BY`; the paper reports one SSB query where RTCUDB loses
+to Crystal at larger scale because many atomics target one scalar. BVH memory
+access and traversal cost are also workload-dependent, so lower memory
+bandwidth use does not mean the route is universally faster.
+
+**Benchmark candidates:**
+
+- Add a planner-only "specialized hardware route" model: route eligibility must
+  declare encoded attributes, fused operators, resident generation, visibility
+  boundary, and fallback reason. Gate: no query can silently choose an RT-like
+  route without proving the generation and operator contract.
+- Prototype a retained BVH-style side index for one immutable integer segment:
+  range predicate plus grouped `COUNT` or `SUM`. Compare against current CUDA
+  retained scan and CPU fallback. Measure build cost, resident bytes, p50/p99,
+  memory bandwidth, and invalidation cost.
+- Test fused layout versus separate columns for grouped aggregates even on
+  CUDA: encode `{predicate key, group id, aggregate payload}` into one resident
+  lane and compare against scanning independent column buffers. Gate: same SQL
+  answers and better bytes-read per result for selective predicates.
+- Add a low-cardinality atomic-contention benchmark: one group, 8 groups,
+  1k groups, and high cardinality. Failure condition: specialized route loses
+  to simple CUDA retained scan because all accumulation targets one cache line
+  or scalar.
+- Measure build-amortization thresholds for resident side structures. Vary
+  refresh frequency and query reuse count; gate the route only when amortized
+  build plus invalidation cost beats the normal retained route under p99 goals.
+- Evaluate coordinate/range encoding limits with real P8 column domains:
+  packed integers, dictionary-coded text prefixes, nullability, and MVCC
+  visibility markers. Failure condition: the encoding needs extra random
+  device loads so often that the fused route no longer reduces bytes accessed.
+
+### 2026-06-03 - Cross-paper synthesis: specialized data paths need declared shape contracts
+
+**Papers covered:** FastLanes File Format, FNCC, Mainlining Databases, and
+RTCUDB.
+
+**Converging design tracks:** The latest batch keeps pointing at the same
+control idea from different layers: fast paths work when their shape is
+declared before work starts. FastLanes makes compressed vectors fast by fixing
+lane and block metadata; FNCC makes congestion response fast by carrying the
+narrowest saturated boundary back with normal responses; Mainlining Databases
+makes Arrow export transactional by separating hot relaxed blocks from frozen
+canonical blocks; RTCUDB makes RT cores useful by prebuilding BVH materialized
+views for a limited fused query shape.
+
+For GPU DB, that argues for route descriptors that are more explicit than
+"resident=true." A descriptor should name the physical encoding, visibility
+boundary, operator family, output shape, side structures, invalidation state,
+and the queue or tier budget that owns admission. The planner and runtime can
+then choose among CUDA retained scan, compressed retained route, RT/BVH-style
+side route, CPU fallback, or overload rejection without guessing from stale
+global metrics.
+
+**Category gaps:** The queue still has several GPU/analytics papers pending,
+but the next non-GPU candidates should continue runtime/session shaping or
+transactional visibility so the loop does not drift into OLAP-only work.
+Packet scheduling and RTScan/RTIndex are useful follow-ups, but the strongest
+near-term balance gap remains high-concurrency response scheduling tied to
+MVCC-safe route admission.
+
+**Benchmark priorities:**
+
+- Route descriptor proof: every retained route reports physical encoding,
+  visibility generation, side structures, queue wait, and fallback reason.
+- Build-amortization proof: side indexes, compressed layouts, or BVHs are
+  admitted only when refresh cost is paid back over measured query reuse.
+- Response-carried feedback proof: queue/tier saturation observed by a worker
+  changes IO admission before p99 has already spiked.
+- Visibility-preserving frozen segment proof: fast export or specialized
+  execution can skip per-row visibility only when metadata proves the segment
+  is version-free for the requested snapshot.

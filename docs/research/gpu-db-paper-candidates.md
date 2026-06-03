@@ -185,7 +185,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://arxiv.org/abs/2605.10511`
   Why: modern GPU-driven data path fusion that combines IO, decompression, and
   query work into GPU execution.
-- `queued` — **RTCUDB: Building Databases with RT Processors**, arXiv 2024.
+- `reviewed` — **RTCUDB: Building Databases with RT Processors**, arXiv 2024.
   URL: `https://arxiv.org/abs/2412.09337`
   Why: explores ray-tracing cores for database query processing and may suggest
   alternate hardware mapping for lookup/search-heavy paths.
@@ -418,6 +418,19 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up on approximating programmable scheduling with a single
   FIFO-style queue; relevant to bounded high-concurrency response shaping
   without expensive per-session queues.
+- `queued` — **RTScan: Efficient Scan with Ray Tracing Cores**, Lv et al.,
+  PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p1460-lv.pdf`
+  DOI: `https://doi.org/10.14778/3641204.3641216`
+  Why: RTCUDB cites RTScan as the main RT-core scan baseline; useful for
+  isolating predicate-only ray tracing from RTCUDB's fused scan/group/aggregate
+  mapping.
+- `queued` — **RTIndex: Exploiting Hardware-Accelerated GPU Raytracing for
+  Database Indexing**, Henneberg and Schuhknecht, arXiv 2023.
+  URL: `https://arxiv.org/abs/2303.01139`
+  Why: RTCUDB cites RTIndex as related RT-core indexing work; useful for
+  evaluating whether resident equality/range indexes can map to BVH traversal
+  without forcing the whole query into a ray-tracing job.
 - `queued` — **DBOS: A DBMS-oriented Operating System**,
   Skiadopoulos et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf`
