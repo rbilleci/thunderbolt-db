@@ -585,8 +585,8 @@ Append new candidates here as each paper is processed.
   full transaction stages rather than only WAL, index, or GPU refresh
   substeps, and when batch-level write-set ordering should be preferred over
   per-request optimistic validation in hot partitions.
-- `queued` — **CAM: Asynchronous GPU-Initiated, CPU-Managed SSD Management for
-  Batching Storage Access**, Zhou et al., ICDE 2025.
+- `reviewed` — **CAM: Asynchronous GPU-Initiated, CPU-Managed SSD Management for
+  Batching Storage Access**, Song et al., ICDE 2025.
   URL: `https://doi.org/10.1109/ICDE65448.2025.00175`
   Why: hybrid GPU-initiated but CPU-managed SSD control path; useful follow-up
   to Torp et al. for reducing GPU busy-wait/control-plane burn while still
@@ -699,6 +699,18 @@ Append new candidates here as each paper is processed.
   Why: learned hint-based optimizer baseline compared by PAR2QO; useful for
   deciding whether GPU route tuning should learn bounded hints around a
   deterministic planner rather than replace route rules.
+
+- `queued` — **AGILE: Lightweight and Efficient Asynchronous GPU-SSD
+  Integration**, arXiv 2025.
+  URL: `https://arxiv.org/abs/2504.19365`
+  Why: modern asynchronous GPU-centric SSD access library; useful contrast to
+  CAM's CPU-managed control plane and BaM's synchronous GPU polling path.
+- `queued` — **Hyperion: Co-Optimizing SSD Access and GPU Computation for
+  Cost-Efficient GNN Training**, ICDE 2025.
+  URL: `https://doi.org/10.1109/ICDE65448.2025.00031`
+  Why: modern GPU-initiated asynchronous SSD access and cache co-optimization;
+  useful follow-up for deciding when GPU DB over-resident execution should
+  jointly plan GPU work, SSD reads, and CPU/GPU memory cache placement.
 - `reviewed` — **TAS: TCP Acceleration as an OS Service**, Kaufmann et al.,
   EuroSys 2019.
   URL: `https://os.mpi-sws.org/projects/tas.html`

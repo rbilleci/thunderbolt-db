@@ -9772,3 +9772,218 @@ templates, not as the only path for all SQL.
 - For GPU-assisted deterministic updates, test whether CPU owner ordering
   plus GPU value computation can fill precreated version slots faster than
   CPU-only execution while preserving exactly the same publish boundary.
+
+### 2026-06-03 - CAM asynchronous GPU-initiated CPU-managed SSD access
+
+**Citation:** Ziyu Song, Jie Zhang, Jie Sun, Mo Sun, Zihan Yang,
+Zheng Zhang, Xuzheng Chen, Fei Wu, Huajin Tang, and Zeke Wang.
+"CAM: Asynchronous GPU-Initiated, CPU-Managed SSD Management for
+Batching Storage Access." ICDE 2025, pp. 2309-2322,
+doi:10.1109/ICDE65448.2025.00175. Retrieved 2026-06-03 from the
+author PDF, `https://wangzeke.github.io/doc/cam-ICDE25.pdf`, with
+metadata cross-checks from DBLP and the IEEE DOI page.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** GPU-SSD data path; NVMe tiering; GPUDirect;
+SPDK; over-resident execution; asynchronous prefetch; CPU/GPU
+control-plane split; pinned GPU buffers; SSD batching; compute/IO
+overlap.
+
+**Core idea:** CAM argues that both common GPU out-of-core designs
+leave performance on the table. CPU-managed paths such as POSIX I/O,
+libaio, or SPDK can keep GPU compute kernels simple, but often route
+SSD data through CPU memory and pay kernel or copy overheads. Fully
+GPU-managed paths such as BaM avoid the CPU staging copy and let GPU
+thread blocks submit NVMe work directly, but their synchronous API can
+consume many GPU SMs waiting on SSD latency and can serialize storage
+access with useful GPU computation.
+
+CAM's compromise is GPU-initiated but CPU-managed storage access. The
+GPU computes logical block addresses and signals an asynchronous batch,
+while persistent CPU-side polling threads use SPDK/user-space NVMe
+control to submit requests. The data plane still transfers directly
+between SSDs and pinned GPU memory, so CPU memory does not become the
+intermediate tier. The control plane is moved off GPU SMs, allowing GPU
+compute kernels to use the device while the CPU manages SSD queues.
+The paper evaluates this design on an A100 80GB server with 12 Intel
+P5510 NVMe SSDs and reports that CAM reaches roughly the same raw
+multi-SSD throughput as SPDK/BaM while avoiding GPU SM burn and CPU
+memory bandwidth pressure; its end-to-end workloads include GNN
+training, sort, and GEMM.
+
+**Concrete mechanisms:**
+
+- The GPU writes an array of logical block addresses for the next
+  prefetch/write-back batch into CPU-visible memory, then a leading GPU
+  thread publishes a signal that the batch is ready.
+- A persistent CPU polling thread observes the signal, submits NVMe
+  work through SPDK, waits for completions, and writes a completion
+  signal for the GPU.
+- GPU threads can perform computation over data fetched by the previous
+  stage while the CPU and SSDs process the next stage. The API exposes
+  `prefetch`, `prefetch_synchronize`, `write_back`, and
+  `write_back_synchronize` so applications can write code that looks
+  mostly synchronous while the implementation pipelines IO and compute.
+- CAM uses four preallocated synchronization regions: a GPU-written LBA
+  array, a GPU-written argument region, a GPU-to-CPU ready signal, and a
+  CPU-to-GPU completion signal. The first three are unified-memory
+  regions; the completion region is GPU memory with a CPU-visible copy.
+- GPU memory allocation goes through CAM rather than plain
+  `cudaMalloc`; CAM pins and maps buffers with GDRCopy and
+  `nvidia_p2p_get_pages`, then uses physical addresses in NVMe SQEs so
+  SSD DMA targets GPU memory directly.
+- CPU-side SSD management uses SPDK to bypass the kernel block layer,
+  filesystem, page cache, and mode switches. Each CPU thread can manage
+  one or more SSDs with dedicated NVMe queue pairs and lock-free driver
+  paths.
+- CAM dynamically adjusts CPU core allocation for SSD control based on
+  the prior batch's compute time versus IO time. If compute dominates,
+  fewer CPU threads can be used without extending total time; if IO
+  dominates, the control path needs more threads.
+- The evaluation states that one CPU thread can control two SSDs without
+  throughput loss on their platform, while one thread controlling four
+  SSDs drops to about 75% of the one-thread-per-SSD throughput.
+- With 12 SSDs and 4KB granularity, the paper reports about 20GB/s CAM
+  throughput, close to the measured platform PCIe peak of about 21GB/s
+  and below the theoretical 32GB/s due to PCIe overhead and contention.
+- The paper contrasts CAM with SPDK plus overlap: SPDK still stages
+  through CPU memory, consuming roughly twice the SSD bandwidth in CPU
+  memory bandwidth for GPU reads/writes, and its scatter/non-contiguous
+  destination path performs poorly at small granularity.
+- Reported end-to-end improvements include up to 1.84x for GNN model
+  training versus the BaM-based GIDS baseline, up to 1.5x for sort, and
+  up to 1.84x for GEMM versus evaluated GPU storage baselines. These
+  are paper-reported application results, not GPU DB measurements.
+- The authors list three limitations: CAM requires raw SSD access
+  without a filesystem, concurrent access by multiple processes risks
+  consistency issues, the prototype targets a single GPU, and fully
+  exploiting more SSDs still needs CPU cores that scale with device
+  count.
+
+**GPU DB mapping:** CAM is most useful for the over-resident P8 path,
+where cold or warm partitions live on NVMe but the execution target is
+still GPU memory. It suggests that GPU DB should not treat "GPU
+initiated" as synonymous with "GPU managed." A retained or over-resident
+kernel can compute the next partition/block IDs, publish a compact IO
+batch descriptor, and return SMs to useful work while CPU-owned storage
+workers drive NVMe queues and completions.
+
+The design maps naturally to the owner-domain runtime. GPU execution
+owners should own CUDA streams and staging buffers; storage/IO owners
+should own SPDK queue pairs, NVMe submission, raw-device safety, and
+completion accounting; residency owners should decide whether a block is
+admitted, reused, invalidated, or evicted. CAM's four-region handshake
+is a hardware-level analog of the bounded command/response rings already
+called out in `11-high-throughput-query-runtime.md`.
+
+For P8, the direct SSD-to-GPU data path is a candidate future tier, not
+a replacement for durable WAL/checkpoint authority. NVMe-resident
+partitions can be read directly into pinned GPU buffers for scans,
+external aggregation, sort/merge, or refresh, but every route still needs
+catalog generation, source WAL boundary, checksum or block identity,
+visibility boundary, and invalidation checks before results become
+SQL-visible.
+
+CAM also sharpens the benchmark question around CPU memory bandwidth.
+If an over-resident route stages `NVMe -> CPU DRAM -> GPU HBM`, it can
+consume CPU memory bandwidth at roughly twice the SSD bandwidth and can
+compete with WAL, MVCC, pgwire, and host cache work. A direct
+`NVMe -> GPU HBM` experiment should therefore measure not only GPU
+query time but also CPU memory bandwidth, IO worker cores, pinned-memory
+budget, and interference with mutation admission.
+
+The dynamic CPU-core policy transfers to tier placement. GPU DB should
+not statically reserve one core per NVMe device for every workload. It
+should adjust storage-worker budget based on whether the current route
+is IO-bound, GPU-bound, response-bound, or mutation-bound, with hard
+admission ceilings when CPU cores, queue pairs, pinned buffers, or SSD
+bandwidth become saturated.
+
+**Risks and mismatches:** CAM is not a database system. It does not
+handle filesystems, SQL transactions, WAL recovery, MVCC visibility,
+checksums, page ownership, concurrent tenants, DDL, or multi-process
+consistency. Its raw-device requirement is a major mismatch for a
+general DBMS unless GPU DB controls its own cold-partition device layout
+or uses a carefully isolated block arena.
+
+The evaluated workloads are GNN training, sort, and GEMM, not
+transactional queries or HTAP with fresh writes. CAM's best case assumes
+predictable next-batch addresses and enough independent compute to cover
+IO latency. Point lookups, high-selectivity reads, write-heavy COPY
+admission, or data-dependent joins may have pipeline bubbles that CAM
+cannot remove.
+
+The prototype is single-GPU and requires pinned GPU memory. GPU DB will
+need explicit budgets and fallback behavior for pinned HBM/host mappings,
+NVMe queue depth, SSD namespaces, and concurrent sessions. Finally, the
+paper reports throughput under a specific A100/12-SSD platform; the
+transferable claim is the control/data-plane split and overlap pattern,
+not the absolute GB/s target.
+
+**Benchmark candidates:**
+
+- Add an over-resident IO microbenchmark with three paths:
+  `NVMe -> CPU DRAM -> GPU`, SPDK-overlapped staging, and a future direct
+  `NVMe -> GPU pinned buffer` path. Required metrics: GB/s, p50/p99
+  request latency, CPU memory bandwidth, CPU cores consumed, GPU SM idle
+  time, and correctness checksum.
+- Prototype a bounded GPU-computed block-request descriptor for one
+  resident refresh or scan route. The GPU or planner emits block IDs;
+  the storage owner drains them through a CPU-managed queue. Gate:
+  identical rows and visibility boundaries versus CPU-staged refresh.
+- Add a pipeline-bubble benchmark for over-resident scans: predictable
+  sequential partitions, random block batches, and data-dependent next
+  block selection. Failure condition: direct IO complexity helps only the
+  sequential case while harming point lookups or p99 latency.
+- Measure CPU memory bandwidth interference during staged over-resident
+  execution while COPY/WAL admission is active. Expected result: direct
+  SSD-to-GPU transfer should reduce host-memory pressure; failure
+  condition: storage-worker polling steals enough CPU to regress write
+  throughput.
+- Add storage-worker budget telemetry: SSD queue depth, storage ring
+  wait, completions per poll, CPU cores assigned, pinned GPU bytes,
+  direct-transfer bytes, staged-transfer bytes, and fallback reason.
+- Test dynamic storage-worker allocation by route class. Minimum proof:
+  reducing storage cores when GPU compute dominates does not change wall
+  time, while increasing cores for IO-bound scans improves throughput
+  until SSD or PCIe saturation.
+- Keep a negative-control path for raw-device safety: if a cold partition
+  cannot prove exclusive block ownership, checksum identity, and source
+  generation, the direct path must reject or fall back rather than read
+  unmanaged blocks.
+
+### 2026-06-03 - Cross-paper synthesis: control planes should stay explicit
+
+The recent BOHM, Rebirth-Retire, and CAM reviews converge on the same
+shape from different layers: the system should separate the cheap common
+execution path from the control path that establishes ordering, ownership,
+and resource safety. BOHM prepares version placeholders before executing
+known writes, Rebirth-Retire arms dependency machinery only under real
+contention, and CAM moves SSD command management off GPU SMs while keeping
+GPU-side initiation and direct data movement.
+
+For GPU DB, that points to three active design tracks. First, mutation
+batches need explicit order/allocation/publication slots before expensive
+value work starts, but visibility still waits for WAL and invalidation
+safety. Second, conflict handling should be adaptive and owner-local:
+cheap deterministic order in the common case, bounded dependency or
+priority metadata only when hot-key contention appears, and measured
+fallback when the graph grows too large. Third, over-resident reads should
+separate GPU compute from storage control: GPU/planner code can describe
+needed blocks, while CPU-owned storage workers drive NVMe queues,
+checksums, generations, and completion rings.
+
+The category gap after this set is still multi-tier transactional
+storage. CAM covers direct GPU/SSD movement, but not DBMS page ownership,
+filesystem integration, recovery, or shared cold-partition allocation.
+A next high-value tiering paper should be LeanStore, Umbra, FOEDUS,
+BTrim, or another transactional storage source that explains how hot CPU
+working sets coexist with durable/cold data.
+
+Benchmark priorities should now be ordered around control-plane costs:
+per-owner generation allocation versus global timestamp allocation,
+conflict-triggered dependency metadata overhead, staged versus direct
+NVMe-to-GPU transfer under concurrent COPY/WAL admission, and a negative
+control that proves unknown write sets or unmanaged raw blocks fall back
+cleanly rather than guessing.
