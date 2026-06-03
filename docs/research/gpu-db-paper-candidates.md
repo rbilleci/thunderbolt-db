@@ -418,7 +418,7 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up on approximating programmable scheduling with a single
   FIFO-style queue; relevant to bounded high-concurrency response shaping
   without expensive per-session queues.
-- `queued` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
+- `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`
   Why: direct predecessor to AIFO that uses a small set of strict-priority
@@ -698,6 +698,12 @@ Append new candidates here as each paper is processed.
   Why: hybrid disk/in-memory transactional architecture cited by the Umbra
   MVCC paper; useful as a contrast point for hot working-set placement and
   contention reduction across CPU memory and durable storage.
+- `queued` — **Eiffel: Efficient and Flexible Software Packet Scheduling**,
+  Saeed et al., NSDI 2019.
+  URL: `https://www.usenix.org/conference/nsdi19/presentation/saeed`
+  Why: SP-PIFO cites Eiffel as an alternative programmable scheduling design;
+  useful for comparing strict-priority queue approximation with software
+  integer-priority queues for request/response scheduling.
 - `queued` — **Cost/Performance in Modern Data Stores: How Data Caching
   Systems Succeed**, Lomet, DaMoN 2018.
   URL: `https://doi.org/10.1145/3211922.3211931`

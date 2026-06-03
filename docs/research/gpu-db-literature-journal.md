@@ -22603,3 +22603,144 @@ production mutation-path feature.
   exactly which admission/conflict actions preserve WAL-before-visibility,
   MVCC boundaries, retained snapshot invalidation, and pgwire ordering. Any
   learned function can only select from that alphabet.
+
+### 2026-06-03 - SP-PIFO strict-priority approximation of programmable scheduling
+
+**Citation:** Albert Gran Alcoz, Alexander Dietmuller, and Laurent
+Vanbever. "SP-PIFO: Approximating Push-In First-Out Behaviors using
+Strict-Priority Queues." NSDI 2020, pages 59-76. Retrieved 2026-06-03
+from `https://www.usenix.org/conference/nsdi20/presentation/alcoz` and
+`https://www.usenix.org/system/files/nsdi20-paper-alcoz.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** programmable scheduling; strict-priority queues;
+ranked admission; approximate PIFO; response scheduling; queue-bound
+adaptation; starvation policing; high-concurrency request shaping;
+bounded queue lanes.
+
+**Core idea:** SP-PIFO asks whether the useful abstraction of PIFO
+scheduling can be approximated on existing hardware instead of waiting
+for ideal push-in-first-out priority queues. The answer is to map an
+unbounded rank space onto a small number of strict-priority FIFO queues,
+then adapt the rank-to-queue boundaries online as inversions are
+observed. The paper reports that this approach closely approximates PIFO
+behavior with as few as 8 priority queues, scales to many flows and
+ranks, adapts to traffic variation, and runs at line rate on Barefoot
+Tofino with small state.
+
+The transferable point for GPU DB is not packet scheduling itself. It is
+the idea that a runtime can expose a rich rank function while implementing
+the hot path with a small fixed set of queue lanes. A request can carry a
+rank derived from route class, snapshot generation, estimated service
+time, response size, miss risk, and client priority; the runtime can map
+those ranks to a few bounded request or response rings instead of
+maintaining one priority queue per session or per exact rank.
+
+**Concrete mechanisms:**
+
+- Each packet carries a rank; lower ranks mean higher scheduling priority.
+  SP-PIFO uses `n` strict-priority queues where each queue drains FIFO and
+  higher-priority queues drain before lower-priority queues.
+- A vector of queue bounds maps ranks to queues. Enqueue scans the bounds
+  from the lowest-priority queue upward and places the packet in the first
+  queue whose bound is no larger than the packet rank.
+- The scheduling error is "unpifoness": an inversion where a higher-rank
+  packet is scheduled before an already enqueued lower-rank packet. The
+  paper formulates bound selection as empirical-risk minimization over
+  rank distributions.
+- The theoretically cleaner gradient-style adaptation estimates rank
+  distributions over windows and adjusts bounds to minimize expected
+  inversions, but its requirements do not fit current programmable data
+  planes.
+- The deployable SP-PIFO adaptation is local and online. On enqueue, the
+  push-up rule updates the selected queue's bound to the packet rank so
+  future lower-ranked packets are pushed to more preferred queues.
+- When an inversion is detected in the highest-priority queue, the
+  push-down rule decreases queue bounds by the inversion magnitude so
+  future higher-ranked packets are pushed toward lower-priority queues.
+- The evaluation uses packet-level simulations for flow-completion-time
+  and fairness objectives, plus P4 hardware deployment. Reported results
+  include 8 queues being within roughly 20-29% of gradient/optimal mapping
+  in the inversion experiment, 32 queues getting closer, and FIFO
+  inversion improvement of roughly 3.3x with 8 queues and 10x with 32
+  queues.
+- The paper explicitly names limitations: approximation cannot perfectly
+  emulate PIFO for all ranks, strict-priority queues can starve lower
+  ranks unless high-priority traffic is policed, and adversarial rank
+  orderings can attack the adaptation assumptions.
+
+**GPU DB mapping:** GPU DB can use SP-PIFO as a design pattern for bounded
+request and response lanes. Instead of one global FIFO, one per-session
+queue, or a full priority heap, the runtime can derive a small integer
+rank and place work into a fixed number of lanes: short retained reads,
+ordinary retained reads, mutation commits, refresh/eviction work,
+over-resident misses, and large responses. Within each lane FIFO order
+keeps implementation simple; across lanes strict priority gives the
+runtime a strong latency lever.
+
+The adaptive-bound idea maps to route admission. The rank distribution of
+GPU DB requests will drift: bursty point lookups, long scans, WAL flushes,
+cold-tier misses, and large result sets do not arrive in stable ratios.
+Rather than hard-code rank cutoffs forever, telemetry can adjust lane
+bounds when inversions show that short, latency-sensitive requests are
+being trapped behind lower-value work. The adaptation should operate at
+micro-batch or queue-drain boundaries, not per tuple or per GPU lane.
+
+The paper also fits the response path. Current high-concurrency goals are
+not only about executing queries; network IO workers must return results
+without letting large responses or slow clients block small completions.
+Response rings can carry rank fields such as response bytes, client
+credit, transaction visibility boundary, and deadline. SP-PIFO-style
+lanes would allow a few cheap response classes while preserving per-session
+ordering inside each session's sequence numbers.
+
+For MVCC and WAL, strict priority is only an admission and scheduling
+mechanism. It must not reorder commit visibility, WAL flush dependencies,
+or protocol responses within a transaction. Mutation-owner work can be
+ranked for queue admission, but the owner still owns the serialization and
+WAL-before-visibility boundary.
+
+**Risks and mismatches:** SP-PIFO is a network-scheduling paper, not a
+database runtime or transaction-processing design. Packet ranks are
+smaller and more uniform than SQL requests; a GPU DB rank must include
+correctness constraints, not just performance objectives. Approximation is
+acceptable for scheduling order, but not for visibility or commit order.
+
+Strict-priority queues are dangerous without policing. If all work claims
+the highest-priority lane, lower-priority refresh, eviction, checkpoint,
+or large-response work can starve. Conversely, if refresh and eviction are
+always low priority, resident snapshots may age out and eventually damage
+read latency. GPU DB needs quotas, aging, or deficit-style credits around
+any SP-PIFO-inspired lane design.
+
+The paper's adaptation assumes queues drain often enough to observe
+inversions and recover. Under 1M logical sessions, a saturated response
+lane or miss-heavy over-resident workload may stay congested long enough
+that adaptation alone is too slow. In those cases the runtime should
+reject, shed, or fall back rather than merely adjust rank bounds.
+
+**Benchmark candidates:**
+
+- Add a synthetic request scheduler with 4, 8, and 16 strict-priority
+  lanes fed by ranked route descriptors. Compare against global FIFO,
+  fixed route-class lanes, and a binary heap priority queue. Measure queue
+  wait, p50/p99 latency, scheduler CPU time, allocations, and starvation.
+- Implement offline SP-PIFO-style bound adaptation over recorded request
+  traces. Gate: fewer "short request behind long request" inversions than
+  fixed bounds while preserving per-session response order.
+- Add high-priority policing: cap the fraction of requests or bytes that
+  can enter the top lane per IO worker and per route class. Failure
+  condition: refresh, eviction, mutation commit, or large-response progress
+  stalls under a synthetic flood of high-rank retained reads.
+- Test response-ring ranking separately from execution ranking. Large
+  result sets should not block small completions, but responses for one
+  session must remain protocol-ordered. Gate: no per-session ordering
+  violation and lower small-response p99 under mixed response sizes.
+- Include memory-tier rank terms: resident hit, expected H2D bytes, major
+  miss risk, pinned-buffer budget, and snapshot age. Failure condition:
+  scheduling improves CPU queue latency while increasing GPU miss stalls
+  or retained-snapshot invalidation latency.
+- Record every scheduling decision with rank, lane, queue-bound generation,
+  queue wait, service time, bytes, snapshot generation, and fallback or
+  rejection reason so later learned or adaptive policies can be replayed.
