@@ -5693,3 +5693,171 @@ machinery.
   components present. Any semantic-placement or split-plan machinery
   must either be bypassed or stay under a small microsecond latency
   overhead threshold.
+
+### 2026-06-03 - Morty transaction re-execution
+
+**Citation:** Matthew Burke, Florian Suri-Payer, Jeffrey Helt,
+Lorenzo Alvisi, and Natacha Crooks. "Morty: Scaling Concurrency
+Control with Re-Execution." EuroSys 2023, pp. 687-702.
+doi:10.1145/3552326.3567500. Retrieved 2026-06-03 from the
+author PDF, `https://www.cs.cornell.edu/~matthelb/papers/morty-eurosys23.pdf`.
+
+**Category:** transaction processing / write path and MVCC /
+visibility.
+
+**Relevance tags:** serializable transactions; contention
+management; transaction re-execution; MVTSO; speculative ordering;
+interactive transactions; commit validation; write hot spots; partial
+retry; long conflict windows.
+
+**Core idea:** Morty argues that high-contention serializable systems
+lose throughput because conflicting transactions create serialization
+windows that overlap, then conventional OCC or 2PL turns that overlap
+into aborts, backoff, lock waiting, or idle CPU time. Its response is
+not to guess a better retry delay. Morty gives transactions a
+speculative timestamp order, exposes writes early enough for replicas
+to detect missed writes, and partially re-executes the affected
+transaction continuation so the read shifts forward to the newer
+write. The goal is to align contending windows back-to-back without
+discarding the whole transaction.
+
+The evaluation is a replicated key-value transaction system, not a
+single-node database engine. Still, the contention lesson is directly
+useful: if the GPU DB write path eventually supports read-modify-write
+transactions, it should measure how much work is wasted by whole
+transaction retry before assuming abort/retry is acceptable. Morty
+reports that on TPC-C with 100 warehouses it reaches 11.8k committed
+transactions/sec in the regional setup, compared with 6.8k for its
+replicated MVTSO baseline, 2.7k for TAPIR, and 1.6k for Spanner. On a
+highly contended Retwis workload it reports much larger relative gains
+and a near-perfect commit rate under increasing skew.
+
+**Concrete mechanisms:**
+
+- Morty defines a serialization window for a transaction's access to
+  object `x`: it starts at the write version of `x` that the transaction
+  read and ends when the transaction's own write to `x` becomes visible.
+  Serializability requires these windows not to overlap for committed
+  conflicting writers.
+- It also defines validity windows for read validity, then frames
+  throughput under contention as a function of how long those windows
+  are and how much idle time exists between them.
+- Each transaction receives a version from a loosely synchronized
+  timestamp plus coordinator id. That version is the speculative total
+  order used by MVTSO-style reads, writes, and validation.
+- Reads return the newest write version smaller than the transaction's
+  version. Replicas remember uncommitted reads and the last write version
+  returned for each read.
+- Writes are broadcast asynchronously. When a replica receives a write,
+  it checks whether an earlier read with a larger transaction version
+  missed that write. If so, the replica sends a new read reply to the
+  transaction coordinator.
+- Re-execution uses a continuation-passing API. The client library keeps
+  transaction contexts and continuations for the current execution, then
+  replays only the affected continuation with the newer read value when a
+  missed write reply arrives.
+- Coordinators track read execution history so stale replies do not
+  re-execute a branch that the transaction has already moved past or
+  abandoned.
+- Commit operates at execution granularity. A transaction may have
+  multiple executions; one execution can commit, while older executions
+  are abandoned rather than treated as committed transaction decisions.
+- Prepare validation checks missed reads, other transactions' missed
+  reads of this transaction's writes, dirty reads, and whether needed
+  committed metadata was already truncated.
+- Replica votes distinguish `Commit`, `Abandon-Tentative`, and
+  `Abandon-Final`. Depending on quorum agreement, the coordinator can
+  skip or run a finalize phase to make the execution decision durable.
+- Decide logs committed read/write metadata for future validation and
+  removes prepared metadata for abandoned executions. If the whole
+  transaction aborts, replicas send new replies to reads that had
+  observed its writes.
+- Coordinator recovery uses a Paxos-like view-change path for stalled
+  execution decisions, preventing a failed coordinator from blocking
+  conflicting transactions indefinitely.
+- Garbage collection deletes uncommitted read/write metadata after
+  transaction decision, and truncation chooses a safe version below which
+  execution and committed conflict metadata can be removed.
+- The paper's strongest reported high-contention result is that Morty
+  can use extra cores for re-execution and reply generation while OCC
+  and 2PL baselines leave CPUs mostly idle due to abort/backoff or lock
+  waiting.
+
+**GPU DB mapping:** The immediate transfer is a contention metric:
+measure conflict-window length and wasted prepared work, not only abort
+count. A GPU DB mutation owner should know when a hot row, account,
+warehouse, queue head, or catalog item is causing read-write windows to
+overlap, how much WAL/index/resident-refresh preparation was discarded,
+and whether the conflict was local to one predicate or touched the
+whole transaction.
+
+Morty's re-execution shape complements the earlier MV3C transaction
+repair entry. MV3C focuses on dependency graphs over predicates; Morty
+shows a runtime path for shifting reads forward using retained
+continuations and speculative order. For GPU DB, a practical first
+version would not expose a broad CPS API to arbitrary SQL clients. It
+could instead target internal or stored-procedure-like transaction
+fragments where the engine can name dependencies: read hot row, compute
+derived writes, append WAL batch, update value indexes, and invalidate
+or refresh resident generations.
+
+The speculative timestamp order maps to owner-domain sequencing.
+Partition owners can assign monotonic transaction or batch generations
+before execution, then use them to identify when a later-arriving write
+should force a dependent read fragment to re-run rather than forcing the
+entire client transaction through parse, admission, WAL preparation, and
+route planning again. This should remain subordinate to
+WAL-before-visibility: early values can be used for speculative
+re-execution only if commit validation and durable publication still
+prevent uncommitted or abandoned writes from becoming externally
+visible.
+
+For retained GPU snapshots, the interesting path is conflict-local
+refresh repair. If a long read-modify-write or maintenance transaction
+builds a candidate row vector or resident invalidation plan, a conflict
+on one hot key should not automatically discard unrelated candidate
+work. A future route descriptor could record which read values,
+partitions, and column families derived each write or refresh fragment,
+then re-run only the affected fragment when the owner detects a missed
+write.
+
+**Risks and mismatches:** Morty is a replicated key-value store for
+interactive transactions, not a PostgreSQL-compatible SQL engine. Its
+API assumes continuation-passing transaction code and stored contexts;
+ordinary pgwire SQL statements do not naturally expose that structure.
+It uses early uncommitted write visibility internally, which is
+dangerous unless validation, dirty-read checks, abandoned-execution
+cleanup, WAL ordering, and recovery semantics are all precise. The
+paper does not address GPU residency, SQL planning, DDL invalidation,
+response rings, or million-session admission. Its evaluation is
+distributed and contention-heavy, so its throughput numbers should not
+be projected onto local GPU execution. Finally, repeated partial
+re-execution can burn CPU under extreme skew if the engine does not cap
+attempts or switch to an ordered hot-key path.
+
+**Benchmark candidates:**
+
+- Add mutation-owner conflict-window telemetry for one read-modify-write
+  microbenchmark: first read time, conflicting write publish time,
+  validation time, abort/retry time, and bytes or fragments of prepared
+  WAL/index/resident work discarded. Minimum gate: no behavior change and
+  explicit attribution by table, key, column family, and owner.
+- Build a stored-procedure-only partial retry proof with two independent
+  fragments and one hot account or warehouse row. Re-run only the
+  fragment whose read missed a newer write, preserve WAL-before-visibility,
+  and compare against full abort/retry at concurrency `1,2,4,8,16,32,64`.
+- Add a hot-key policy switch benchmark: optimistic retry, partial
+  re-execution, and deterministic owner-queue ordering. Failure condition:
+  partial re-execution burns more CPU or tail latency than ordered
+  execution once conflict-window overlap is continuous.
+- Test dependency-tagged resident invalidation planning. Prepare refresh
+  or invalidation fragments for several partitions, inject a conflict in
+  one partition, and verify that unaffected fragments are reused only when
+  their source WAL/catalog/visibility generation remains valid.
+- Add safety tests for speculative/internal early values: no abandoned or
+  uncommitted execution may become externally visible, survive recovery as
+  committed state, or make a retained GPU snapshot valid.
+- Track re-execution attempt count, context bytes retained, continuation
+  memory, and age of speculative executions. Proof gate: bounded memory
+  and an explicit fallback to abort/retry or ordered execution under
+  pathological skew.

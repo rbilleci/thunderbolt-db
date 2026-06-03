@@ -547,9 +547,9 @@ Append new candidates here as each paper is processed.
   Why: follow-up theoretical and experimental foundation for P-Tree-style
   functional data structures, bounded reader/writer delay, and precise
   version reclamation; relevant to long retained snapshots and GC budgets.
-- `queued` — **Morty: Scaling Concurrency Control with Re-Execution**,
+- `reviewed` — **Morty: Scaling Concurrency Control with Re-Execution**,
   Burke et al., EuroSys 2023.
-  URL: `https://doi.org/10.1145/3552326.3587441`
+  URL: `https://doi.org/10.1145/3552326.3567500`
   Why: re-execution-based concurrency control cited by R-SMF; relevant to
   retrying or repairing conflicted transactions without throwing away all
   scheduling and snapshot work.
@@ -683,3 +683,17 @@ Append new candidates here as each paper is processed.
   Why: Mordred notes that interconnect bandwidth changes CPU/GPU placement
   economics; this multi-GPU/NVLink-oriented follow-up is relevant to future
   NVLink/CXL/GPUDirect tiers and over-resident execution.
+- `queued` — **Meerkat: Multicore-Scalable Replicated Transactions Following
+  the Zero-Coordination Principle**, Szekeres et al., EuroSys 2020.
+  URL: `https://www.microsoft.com/en-us/research/uploads/prod/2020/05/meerkat-eurosys20.pdf`
+  Why: Morty contrasts itself with Meerkat-style integrated commit and
+  replicated transaction processing; useful for comparing decentralized
+  agreement, per-core validation, and contention behavior against
+  re-execution or owner-queue designs.
+- `queued` — **Basil: Breaking up BFT with ACID (transactions)**,
+  Suri-Payer et al., SOSP 2021.
+  URL: `https://www.cs.cornell.edu/~matthelb/papers/basil-sosp21.pdf`
+  Why: Morty compares its MVTSO lineage with Basil's transactional BFT path;
+  useful as a future contrast for timestamp-order validation, delayed write
+  visibility, and commit coordination when durability/replication becomes a
+  GPU DB architecture question.
