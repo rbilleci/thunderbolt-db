@@ -701,9 +701,10 @@ Append new candidates here as each paper is processed.
   gCCTB study; useful for comparing GPU transaction execution models, GPU hash
   table/B+ tree indexing, and SmallBank/TPC-C write-path claims against
   conflict-control-only testbeds.
-- `queued` — **LibPreemptible: Enabling Fast, Adaptive, and
+- `reviewed` — **LibPreemptible: Enabling Fast, Adaptive, and
   Hardware-Assisted User-Space Scheduling**, Li et al., HPCA 2024.
   URL: `https://doi.org/10.1109/HPCA57654.2024.00075`
+  PDF: `https://people.csail.mit.edu/delimitrou/papers/2024.hpca.libpreemptible.pdf`
   Why: general hardware-assisted userspace preemption framework cited by
   PreemptDB; useful if GPU DB wants preemption mechanics outside a full
   transaction-engine rewrite.
@@ -828,8 +829,17 @@ Append new candidates here as each paper is processed.
   Microsecond-scale Datacenter Applications**, Kogias et al., NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/kogias`
   Why: Vessel cites SmartNIC/offloaded scheduling as an orthogonal direction;
-  relevant to future NIC/DPU-aware admission and response steering for
-  million-session GPU DB deployments.
+  useful for comparing host-side preemption with NIC-assisted request
+  placement for microsecond services, and relevant to future NIC/DPU-aware
+  admission and response steering for million-session GPU DB deployments.
+- `queued` — **SKQ: Event Scheduling for Optimizing Tail Latency in a
+  Traditional OS Kernel**, Zhao, Gu, and Mashtizadeh, USENIX ATC 2021.
+  URL: `https://www.usenix.org/conference/atc21/presentation/zhao-siyao`
+  PDF: `https://www.usenix.org/system/files/atc21-zhao.pdf`
+  Why: LibPreemptible contrasts against traditional-kernel event scheduling;
+  useful for deciding how much GPU DB can improve pgwire/event-loop tail
+  latency through event prioritization and delivery control before adopting
+  hardware-assisted preemption or kernel bypass.
 - `reviewed` — **CAM: Asynchronous GPU-Initiated, CPU-Managed SSD Management for
   Batching Storage Access**, Song et al., ICDE 2025.
   URL: `https://doi.org/10.1109/ICDE65448.2025.00175`

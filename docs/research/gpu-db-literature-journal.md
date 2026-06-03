@@ -20493,3 +20493,138 @@ should replay hot lookups, scans, COPY chunks, and updates; compare whole-table,
 partition, row-range, column-group, and sparse-map residency; and require every
 admission/demotion decision to name the correctness generation and the pressure
 or cost signal that drove it.
+
+### 2026-06-03 - LibPreemptible hardware-assisted user-space scheduling
+
+**Citation:** Yueying Li, Nikita Lazarev, David Koufaty, Tenny Yin, Andy
+Anderson, Zhiru Zhang, G. Edward Suh, Kostis Kaffes, and Christina
+Delimitrou. "LibPreemptible: Enabling Fast, Adaptive, and Hardware-Assisted
+User-Space Scheduling." HPCA 2024, pp. 922-936.
+doi:10.1109/HPCA57654.2024.00075. Retrieved 2026-06-03 from the author PDF,
+`https://people.csail.mit.edu/delimitrou/papers/2024.hpca.libpreemptible.pdf`.
+
+**Category:** Runtime / HFT / session scale.
+
+**Relevance tags:** user-space scheduling; microsecond tail latency; hardware
+user interrupts; adaptive preemption; request classes; context pools; timer
+precision; session admission; CPU sharing.
+
+**Core idea:** LibPreemptible argues that microsecond-scale services need
+preemption, but ordinary kernel timers/signals and privileged APIC tricks make
+preemption either too coarse, too expensive, hard to deploy, or unsafe for
+cloud use. The paper builds a user-level threading library on Intel User
+Interrupts (UINTR), then separates the low-level preemption mechanism from
+application scheduling policy.
+
+The key transfer is not "GPU DB must use UINTR." The transferable idea is that
+long and short request classes should share cores through an explicit,
+low-overhead preemption/admission mechanism, and the time quantum should adapt
+to observed queue length, load, and service-time dispersion. In the evaluation,
+LibPreemptible reports about 10x better tail latency than Shinjuku under high
+load in the synthetic workloads, 22% higher bounded-tail throughput on one
+heavy-tailed workload, 33% higher on a distribution-shift workload, and better
+latency/throughput balance when a latency-critical MICA workload is colocated
+with best-effort zlib compression.
+
+**Concrete mechanisms:**
+
+- UINTR lets user threads send hardware-delivered interrupts to configured
+  receiver threads without kernel mediation on the delivery path. Setup still
+  uses kernel-managed descriptors, handlers, file descriptors, and target
+  tables.
+- LibPreemptible wraps UINTR in LibUtimer, a user-level timer service. Worker
+  threads register a naturally aligned 64-byte deadline address. A timer
+  thread polls the TSC and sends a user interrupt when a registered deadline
+  expires.
+- The paper reports a 3 microsecond minimum time slice for LibUtimer, far below
+  ordinary kernel timer granularity in their measurements.
+- Each scheduled request runs as a preemptible function with a context,
+  deadline, stack, saved registers/program counter, and completion state.
+- `fn_launch` starts a preemptible function and returns when it completes or
+  reaches the timeout. `fn_resume` restarts a preempted function, and
+  `fn_completed` reports whether more scheduling is needed.
+- Contexts and stacks are allocated from an application-sized global pool.
+  Completed functions return contexts to a free list; preempted functions move
+  to a waiting/running list.
+- The scheduler is policy-owned by the application. It can use queue length,
+  median latency, tail latency, incoming load, and prior request statistics to
+  set per-request deadlines or quanta.
+- The paper sketches an adaptive time-quantum controller: lower the quantum
+  under high load, long queues, or heavy-tailed behavior; raise it under low
+  load to avoid wasting CPU on unnecessary preemption.
+- In the colocated MICA/zlib experiment, a fixed preemption interval favors the
+  latency-critical workload but can hurt best-effort latency. A dynamic
+  interval keeps the latency-critical path low during bursts while reducing
+  best-effort damage during quieter periods.
+- LibPreemptible avoids Shinjuku's direct APIC exposure. In its design, only
+  timer threads in the same security domain send preemption interrupts to
+  configured worker targets, limiting the blast radius of buggy runtime code.
+
+**GPU DB mapping:** GPU DB's current runtime target already separates network
+IO workers, mutation owners, read snapshot workers, GPU execution owners, and
+response rings. LibPreemptible strengthens the case that those domains need
+explicit request classes and preemption/admission boundaries rather than a
+single run-to-completion worker policy. Short retained point lookups and small
+aggregates should not wait behind COPY chunks, CPU fallback scans, resident
+refresh, over-resident fetches, or long response encoding when those long jobs
+can be yielded at safe points.
+
+For the near-term engine, the practical adaptation is cooperative and measured,
+not hardware-specific. GPU DB can add route-level quanta and safe-yield points
+inside CPU fallback, COPY admission loops, refresh builders, response
+serialization, and over-resident staging. The "interrupt" can initially be a
+queue-depth or deadline check at chunk boundaries. Later, hardware/user-space
+preemption can be reconsidered if CPU service phases become the p99 bottleneck.
+
+For 1M logical sessions, the deadline-address idea maps to compact active
+request metadata: each active request should carry a route class, admission
+deadline, execution budget, queue-enter timestamp, snapshot generation, and
+resume handle if it can yield. Idle logical sessions should not own stacks,
+contexts, pinned buffers, or GPU slots. Active context pools should be bounded
+and observable, like LibPreemptible's context pool.
+
+The adaptive quantum controller maps to route admission. Under heavy-tailed
+retained reads or mixed short/long requests, reduce CPU chunk sizes and drain
+short response/read rings more aggressively. Under light load or homogeneous
+requests, use larger chunks to reduce scheduling overhead. The decision should
+be based on telemetry already called for in the runtime doc: queue depth, queue
+wait, batch size, p50/p99 latency, and route class.
+
+**Risks and mismatches:** LibPreemptible is a CPU scheduling library, not a
+database system. It does not address WAL-before-visibility, MVCC validation,
+snapshot compatibility, GPU kernel preemption, CUDA stream scheduling, pgwire
+transaction state, or recovery. UINTR support is hardware- and kernel-dependent
+and not a portable near-term dependency for the project. The evaluation uses
+microservice/KVS/compression workloads rather than SQL transactions, and some
+benefits depend on dedicating a timer core. Preempting arbitrary database code
+is unsafe unless the preemption points preserve ownership, buffer lifetime,
+locks, transaction state, and CUDA resource invariants.
+
+The safe transfer is therefore deadline-aware cooperative scheduling at
+explicit owner boundaries and chunk boundaries. Any future async interrupt
+mechanism must be treated as an implementation detail below database-visible
+correctness.
+
+**Benchmark candidates:**
+
+- Add route-class telemetry to the pgwire benchmark endpoint: short retained
+  read, retained aggregate, COPY chunk, mutation, refresh, CPU fallback,
+  over-resident scan, and response encode. Minimum gate: every request reports
+  queue wait, service time, and route class without changing SQL results.
+- Prototype cooperative quanta for one long CPU phase, such as response
+  encoding or COPY chunk processing. Yield after a row/byte/time budget and
+  resume through a bounded context handle. Failure condition: WAL ordering,
+  response ordering, or error cleanup becomes ambiguous.
+- Build a no-GPU mixed-service benchmark with short retained lookups and long
+  scan/refresh tasks sharing a small worker pool. Compare run-to-completion,
+  fixed chunk quantum, and adaptive quantum driven by queue length plus p99
+  latency.
+- Add an active-context pool probe for high logical session counts. Idle
+  sessions should remain compact; only admitted active work should consume
+  stacks, request contexts, response buffers, or pinned staging slots.
+- Test route-specific deadline admission: short retained reads get a small
+  queue-wait budget; refresh/over-resident work gets chunked or delayed when
+  the short-read ring is saturated. Gate: lower p99 for short reads without
+  starving long work indefinitely.
+- Keep hardware preemption as a research-only follow-up until CPU service
+  phases, not owner serialization or GPU work, are proven to dominate p99.
