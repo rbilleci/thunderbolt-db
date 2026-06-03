@@ -136,7 +136,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
 
 ### Query optimizers, planning, and route choice
 
-- `queued` — **Lero: A Learning-to-Rank Query Optimizer**, arXiv 2023.
+- `reviewed` — **Lero: A Learning-to-Rank Query Optimizer**, arXiv 2023.
   URL: `https://arxiv.org/abs/2302.06873`
   Why: learned ranking layered on native optimizers; relevant to route choice
   without replacing deterministic planner rules.
@@ -318,6 +318,12 @@ Append new candidates here as each paper is processed.
   PDF: `https://www.usenix.org/system/files/nsdi19-kaffes.pdf`
   Why: microsecond-scale request scheduling and preemption; relevant to
   separating short retained reads from long mutation, scan, or refresh work.
+- `queued` — **CARPO: Leveraging Listwise Learning-to-Rank for
+  Context-Aware Query Plan Optimization**, arXiv 2025.
+  URL: `https://arxiv.org/abs/2509.03102`
+  Why: modern listwise follow-up to Lero-style plan ranking; relevant to
+  whether GPU DB route selection should rank candidate CPU/GPU/tiered plans as
+  a set instead of pairwise comparisons only.
 - `queued` — **RUMA has it: Rewired User-space Memory Access is Possible!**,
   Schuhknecht et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p768-schuhknecht.pdf`

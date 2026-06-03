@@ -7963,3 +7963,140 @@ should not be transferred to the GPU engine.
   path, long analytical path, and CPU fallback. Expected improvement: policy
   decisions can be tied to observed version-chain length, snapshot age,
   refresh cost, and write-stall budget.
+
+### 2026-06-03 - Lero learning-to-rank query optimization
+
+**Citation:** Rong Zhu, Wei Chen, Bolin Ding, Xingguang Chen, Andreas
+Pfadler, Ziniu Wu, and Jingren Zhou. "Lero: A Learning-to-Rank Query
+Optimizer." PVLDB 16(6):1466-1479, 2023. DOI
+`10.14778/3583140.3583160`. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol16/p1466-zhu.pdf`; arXiv version:
+`https://arxiv.org/abs/2302.06873`.
+
+**Category:** Query optimization / planning.
+
+**Relevance tags:** learned route selection; candidate plan ranking;
+pairwise plan comparison; native optimizer augmentation; dynamic workload
+adaptation; cardinality perturbation; background exploration; GPU route
+fallback; resource-budget-aware planning.
+
+**Core idea:** Lero argues that query optimization does not need a learned
+model to predict exact plan latency. It needs a reliable way to rank a bounded
+set of candidate plans. Instead of replacing the native optimizer, Lero runs
+on top of it, generates a small but diverse candidate set, and uses a
+pairwise learning-to-rank comparator to choose among candidates. This keeps
+the native optimizer as the cold-start baseline while allowing execution
+feedback to correct systematic plan-choice mistakes.
+
+The paper's strongest lesson for GPU DB is that learned route selection should
+be shaped as bounded ranking over admissible candidates, not unbounded
+latency prediction. A GPU DB planner can enumerate a small candidate set such
+as CPU tuple/index path, CPU segment path, GPU resident route, GPU cold
+transfer route, and reject/fallback path, then rank only candidates that have
+already passed correctness, visibility, residency, and resource-budget gates.
+
+**Concrete mechanisms:**
+
+- Lero uses a native optimizer to generate candidate plans rather than
+  learning a full optimizer from scratch.
+- The comparator `CmpPlan(P1, P2)` is trained as a binary classifier over two
+  plans, with labels derived from observed plan latency order rather than
+  absolute latency values.
+- Plan embeddings are shared between the two comparator inputs. The practical
+  implementation uses a one-dimensional embedding so the model induces a
+  simple total order over candidates.
+- Offline pre-training uses synthetic plans and native estimated costs, so the
+  model starts close to the native optimizer without executing a large cold
+  training workload.
+- Online training runs alternative candidate plans on idle workers, stores
+  execution statistics, and periodically updates the pairwise comparator.
+- Candidate exploration perturbs cardinality estimates by scaling factors and
+  sub-query size groups, then asks the native optimizer to produce alternative
+  plans. This is intended to uncover join-order and physical-operator choices
+  hidden by cardinality error.
+- Candidate generation is prioritized near the native optimizer's choice and
+  has bounded growth, reported as at most `O(q * log_alpha Delta)` candidates
+  for `q` tables under the paper's heuristic.
+- The authors evaluate on PostgreSQL 13.1 with JOB/IMDB, STATS, TPC-H, and
+  TPC-DS-style generated workloads. They report stable-model execution-time
+  reductions versus PostgreSQL of 70%, 44%, 21%, and 13% on those benchmark
+  families, respectively, with lower regression frequency than Bao/Bao+ on
+  STATS.
+- The evaluation includes dynamic data insertion on STATS and finds the
+  relative ordering labels easier to adapt than exact latency labels.
+- The paper explicitly treats varying runtime resource budgets as future work:
+  resource budget features could be added to plan embeddings, but that would
+  require training data under varied budgets.
+
+**GPU DB mapping:** GPU DB's planner has a harder route-choice problem than
+ordinary PostgreSQL plan selection because correctness gates and resource
+budgets are first-class. A route may be fast only if a resident generation is
+valid, a GPU queue has capacity, a snapshot holder can be acquired, and HBM or
+pinned-buffer budgets are not saturated. Lero suggests splitting this into two
+layers: deterministic admissibility first, learned ranking second.
+
+For the first planner slice, the native rules should still generate and gate
+candidate routes: CPU owner path, immutable resident GPU path, cold transfer
+GPU path, partitioned resident path, and overload/fallback. A Lero-like
+ranking layer can then compare only candidates whose invariants are already
+proved. This prevents the learned model from optimizing through
+WAL-before-visibility, MVCC compatibility, invalidation, or memory pressure.
+
+The pairwise-ordering idea maps well to GPU route telemetry. Exact latency
+prediction will be noisy across queue depth, batch size, CUDA stream state,
+resident bytes, snapshot age, and CPU contention. Pairwise labels such as
+"resident partitioned route beat CPU segment path for this query shape under
+this queue-depth bucket" are likely cheaper to learn and easier to invalidate
+when data placement changes.
+
+Lero's cardinality-perturbation explorer also gives a concrete GPU DB
+counterpart: perturb route-relevant estimates rather than arbitrary SQL hints.
+Examples include selectivity, expected result rows, resident bytes touched,
+transfer bytes, snapshot freshness, queue wait bucket, and refresh cost.
+Exploration should remain bounded and should run on idle capacity or shadow
+workloads, never on a path that jeopardizes production latency.
+
+The pre-training story maps to starting from deterministic architecture rules:
+prefer valid resident routes for supported same-shape hot reads, prefer CPU
+fallback when visibility or residency cannot be proven, reject when all queues
+are saturated, and avoid cold GPU transfer below a measured row/byte threshold.
+Observed measurements can later adjust the ranking without erasing those
+rules.
+
+**Risks and mismatches:** Lero is evaluated mainly on analytical join
+benchmarks, not OLTP transaction scheduling, write admission, MVCC visibility,
+or GPU execution. Its candidate plans are generated through PostgreSQL-style
+cardinality perturbation; GPU DB route alternatives include resource and
+residency states that may not appear in a normal optimizer search space. The
+paper assumes candidate exploration can use idle resources, which is dangerous
+under strict latency SLOs unless capped and isolated. The reported gains are
+for PostgreSQL workloads and should not be transferred to point lookups,
+micro-batched retained aggregates, or high-concurrency pgwire sessions without
+measurement. The resource-budget extension is only discussed, not evaluated,
+yet GPU DB route quality depends heavily on queue, memory, and CUDA resource
+budgets.
+
+**Benchmark candidates:**
+
+- Build a deterministic candidate-route enumerator for one retained query
+  family. Candidate set: CPU tuple/index path, CPU segment path, GPU resident
+  path, GPU cold transfer path, and explicit overload/reject. Gate: every
+  candidate carries a reasoned admissible/not-admissible status before ranking.
+- Collect pairwise route labels from bounded smoke runs: for identical query
+  shapes, record which admissible route wins under row-count, selectivity,
+  resident-byte, queue-depth, snapshot-age, and batch-size buckets. Failure
+  condition: ranking decisions cannot be explained by recorded route features.
+- Add a shadow-ranking mode that logs the route a Lero-like comparator would
+  have chosen while executing the deterministic production route. Minimum
+  proof: no correctness behavior changes and no visible latency impact.
+- Compare exact-latency regression with pairwise ranking for CPU-vs-GPU route
+  choice on retained `COUNT`, `SUM`, point lookup, prefix filter, and cold
+  transfer queries. Required metric: misroute rate, p95/p99 latency regression,
+  and adaptation speed after resident invalidation or refresh.
+- Treat resource budgets as explicit features: GPU queue depth, HBM pressure,
+  pinned-buffer availability, active snapshot holders, and mutation-owner queue
+  depth. Gate: model recommendations change when a route becomes saturated,
+  but deterministic overload rules still dominate.
+- Run a negative-control exploration experiment that lets the model rank
+  ungated routes. It should fail by demonstrating stale, saturated, or
+  non-admissible choices, justifying the deterministic gate-before-rank design.
