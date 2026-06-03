@@ -15124,3 +15124,144 @@ queue wait, snapshot-generation mismatch, and prefetch pollution. A useful
 first proof is not raw maximum throughput; it is showing that concurrent
 sessions with overlapping cold ranges produce one storage action, many
 well-routed consumers, and no visibility or resident-generation ambiguity.
+
+### 2026-06-03 - Predicate Transfer for multi-join pre-filtering
+
+**Citation:** Yifei Yang, Hangdong Zhao, Xiangyao Yu, and Paraschos Koutris.
+"Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries." CIDR 2024.
+Retrieved 2026-06-03 from the CIDR PDF,
+`https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** predicate transfer; Bloom filters; multi-join planning;
+over-resident transfer reduction; GPU join admission; cardinality feedback;
+route robustness; pre-filter scheduling.
+
+**Core idea:** Predicate Transfer generalizes Bloom join from a one-hop
+pre-filter into a multi-hop join-graph phase. A local predicate on one table is
+encoded as a compact filter, transferred across equi-join edges, transformed at
+intermediate tables when join keys change, and used to reduce the base inputs
+before the normal join phase runs. The paper borrows the shape of the
+Yannakakis semi-join phase, but replaces expensive exact semi-joins with cheaper
+Bloom-filter construction and probing.
+
+The design goal is deliberately practical rather than theoretically optimal.
+Yannakakis can remove all non-contributing tuples for acyclic joins, but its
+semi-join phase pays hash-table build/probe and memory costs. Predicate
+Transfer accepts bounded Bloom-filter false positives in exchange for a lighter
+pre-filter phase that can also operate on cyclic join graphs and selected
+non-inner-join or non-join operators. In the paper's preliminary TPC-H
+evaluation on FPDB/Apache Arrow, Predicate Transfer outperforms Bloom join by
+3.3x on average, with much larger wins on join-heavy queries such as TPC-H Q5.
+
+**Concrete mechanisms:**
+
+- The optimizer builds a join graph where vertices are tables and equi-join
+  edges are join predicates.
+- A directed predicate-transfer graph is selected from that join graph. The
+  prototype orients every edge from the smaller table to the larger table,
+  keeps all join edges, and relies on that heuristic to produce a DAG.
+- Execution uses two phases: a predicate-transfer phase that builds and applies
+  filters, followed by the ordinary join phase over the reduced table inputs.
+- Filter transformation handles key changes across multi-hop transfers. When a
+  table receives a filter on one join attribute and must send a filter on
+  another, it scans the relevant join-key columns once, applies incoming and
+  local filters, and inserts the outgoing join keys for surviving rows into a
+  new filter.
+- A forward pass starts from leaf/source nodes in topological order. A table
+  waits for all incoming filters, scans once regardless of the number of
+  incoming or outgoing edges, and emits transformed filters downstream.
+- A backward pass reverses edge directions and repeats the same process so
+  predicates can flow back toward earlier tables.
+- Bloom filters are the prototype representation, but the abstraction permits
+  precise filters or future filter types. The paper's tradeoff is no false
+  negatives, acceptable false positives, and low construction/probe cost.
+- Left and right outer joins can participate only in the direction that
+  preserves outer-join semantics; full outer joins block transfer.
+- Operators such as projection, sorting, top-K, and filters do not block
+  transfer; grouped aggregation is allowed when the join key is a subset of the
+  group key. Scalar UDFs may block reverse transfer if not invertible.
+- The authors identify transfer-path pruning and better scheduling as future
+  work. The prototype always performs full forward and backward passes.
+- The filtered tables can be fed into an otherwise ordinary executor. The paper
+  also notes that the transfer phase produces updated cardinalities, so a
+  replan between transfer and join may improve the final join plan.
+- Evaluation uses a single AWS r5.4xlarge, TPC-H SF1 and SF10, one CPU core,
+  FPDB, Parquet inputs, and Apache Arrow join/Bloom-filter implementations.
+  Results may vary with DBMS-specific Bloom-filter and join costs.
+
+**GPU DB mapping:** Predicate Transfer is a clean planner-side candidate for
+reducing GPU and storage work before multi-join routes. For P8, the useful
+artifact is not a generic "do joins faster" rule; it is a pre-execution filter
+lane keyed by snapshot generation, relation/partition identity, join key, and
+query shape. If a selective dimension predicate can flow to a large fact
+partition, GPU DB can avoid reading cold NVMe ranges, avoid staging host-pinned
+buffers, and avoid launching kernels over rows that cannot survive the join.
+
+The filter-transformation scan maps well to resident or warm column groups. A
+GPU/CPU route can scan only the join-key columns for a relation, apply incoming
+filters, and produce outgoing key filters before materializing full rows. That
+fits the current P8 layout idea of dense column buffers and optional key-order
+vectors: filters should operate over narrow key vectors first, then admit full
+payload columns only for surviving partitions or row sets.
+
+The two-phase shape also gives the runtime an explicit admission boundary. A
+query can spend a bounded amount of CPU/GPU work constructing filters, then
+either proceed with smaller inputs, replan, or fall back if filter cost,
+false-positive rate, memory budget, or snapshot mismatch makes the route
+unattractive. This is safer than letting a GPU join discover bad selectivity
+after over-resident reads and kernels have already consumed scarce queues.
+
+For 1M logical-session planning, Predicate Transfer suggests a shared filter
+cache or inflight filter table. Same-shape requests against the same snapshot
+and join graph should be able to join an existing filter-build phase rather than
+each session independently scanning key columns and building equivalent Bloom
+filters. The cache key must include visibility and invalidation generation, or
+the filter becomes a stale-route bug.
+
+**Risks and mismatches:** The paper is OLAP-oriented and evaluated on TPC-H,
+not OLTP transactions, pgwire latency, MVCC writes, or GPU execution. Its
+prototype is CPU/Arrow-based, so absolute speedups do not transfer directly.
+The full-pass schedule can waste cycles when transferred filters are weak; GPU
+DB should add path pruning and budget checks before adopting the technique on
+latency-sensitive routes.
+
+Bloom filters have false positives. They are safe as pre-filters but cannot
+replace final join predicates, visibility checks, or SQL correctness. The
+current paper also treats the transfer graph as fixed during runtime, while GPU
+DB's tier state can change between planning and execution because of mutation,
+residency invalidation, pressure, or cold-prefetch cancellation. Filter
+construction must therefore validate the snapshot generation at both build and
+consume time.
+
+The technique helps most when local predicates are selective and can move
+through multi-hop join structure. It may not help point lookups, single-table
+aggregates, short OLTP transactions, or queries where filter construction costs
+more than the avoided work. Outer joins and aggregations need explicit semantic
+guards.
+
+**Benchmark candidates:**
+
+- Add a planner experiment for one TPC-H-style multi-join route: build
+  snapshot-keyed Bloom filters over dimension predicates, transfer them to a
+  large fact-like table, and measure skipped rows, filter bytes, build/probe
+  time, and final join correctness.
+- Compare three fact-table admission modes for over-resident joins: no
+  pre-filter, one-hop Bloom join, and multi-hop predicate transfer. Required
+  metrics: NVMe bytes read, H2D bytes, pinned-buffer occupancy, kernel rows
+  scanned, p50/p95 latency, and false-positive rate.
+- Prototype filter transformation over resident key vectors only. Proof gate:
+  outgoing filters are generation-compatible and final SQL results are
+  identical to unfiltered joins under insert/update/delete invalidation.
+- Add transfer-path pruning telemetry: `filter_selectivity`, `filter_build_us`,
+  `filter_probe_us`, `avoided_bytes`, and `route_aborted_due_to_filter_budget`.
+  Failure condition: the pre-filter phase increases p95 latency on low-selective
+  or small-input queries.
+- Test shared same-shape filter inflight accounting for concurrent sessions.
+  Gate: concurrent identical requests join one filter-build action and fan out
+  to many consumers without duplicate key-vector scans or stale-generation use.
+- Replan after filter construction in a CPU-only prototype first. Expected
+  improvement: better join order and smaller intermediate materialization after
+  transfer-updated cardinalities; failure condition: replanning overhead exceeds
+  avoided join work.

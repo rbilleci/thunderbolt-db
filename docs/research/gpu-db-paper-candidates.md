@@ -290,11 +290,25 @@ Append new candidates here as each paper is processed.
   PDF: `https://zxjcarrot.github.io/files/libdbos_SIGMOD25.pdf`
   Why: follow-up DB/OS kernel-bypass design from the Looking Glass 2.0 authors;
   directly relevant to low-overhead networking, IPC, and isolation boundaries.
-- `queued` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
+- `reviewed` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
   Queries**, Yang et al., CIDR 2024.
   URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`
   Why: modern predicate-transfer/pre-filtering work cited by the 2025 hybrid
   CPU-GPU paper; relevant to reducing over-resident transfer before GPU joins.
+- `queued` — **Pushing Data-Induced Predicates Through Joins in Big-Data
+  Clusters**, Kandula, Orr, and Chaudhuri, PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol13/p252-orr.pdf`
+  DOI: `https://doi.org/10.14778/3368289.3368292`
+  Why: predicate transfer cites it as a related predicate-through-join
+  approach; useful for comparing runtime Bloom-filter transfer with
+  statistics-driven plan-time data skipping.
+- `queued` — **Free Join: Unifying Worst-Case Optimal and Traditional Joins**,
+  Wang, Willsey, and Suciu, PACMMOD 2023.
+  URL: `https://arxiv.org/abs/2301.10841`
+  Author page: `https://www.mwillsey.com/papers/freejoin`
+  Why: predicate transfer references modern worst-case-optimal join work; useful
+  for deciding when GPU DB should keep binary joins plus filters versus expose
+  a different multiway join route.
 - `reviewed` — **Orchestrating data placement and query execution in
   heterogeneous CPU-GPU DBMS**, Yogatama et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
