@@ -16877,3 +16877,162 @@ pool.
 - Add mixed short/long workload lanes: short retained lookup, long resident
   scan, refresh job, and mutation. Gate: bounded short-read p99 under long
   route pressure without violating WAL, snapshot, or DDL ordering.
+
+### 2026-06-03 - Adaptive multi-tier buffer management for NVM
+
+**Citation:** Joy Arulraj, Andrew Pavlo, and Krishna Teja Malladi.
+"Multi-Tier Buffer Management and Storage System Design for Non-Volatile
+Memory." arXiv:1901.10938, 2019. Retrieved 2026-06-03 from
+`https://arxiv.org/pdf/1901.10938`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** tiered buffer management; DRAM/NVM/SSD placement;
+adaptive migration; write endurance; workload-sensitive promotion; storage
+hierarchy selection; HTAP; TPC-C; cache admission.
+
+**Core idea:** The paper argues that once a middle tier such as byte-addressable
+NVM is close enough to DRAM, a DBMS should stop treating every page miss as
+"copy to DRAM before doing work." NVM creates more legal data paths: operate on
+NVM-resident data directly, persist some writes directly to NVM, sometimes skip
+NVM on SSD reads, and sometimes skip NVM on DRAM evictions. The best choice is
+not a fixed rule; it depends on workload locality, write frequency, NVM latency,
+DRAM/NVM capacity ratio, and endurance goals.
+
+The authors model the buffer manager with four migration probabilities: copy
+NVM data into DRAM on reads, copy write data into DRAM, copy SSD-read pages into
+NVM, and copy DRAM-evicted pages into NVM. They then tune those probabilities
+with a simulated-annealing search over recent workload measurements. In their
+trace-driven evaluation over OLTP, OLAP, and HTAP workloads, adaptive migration
+converges near the best fixed policy without manual tuning; for TPC-C and Voter,
+it raises throughput by 79% and 92%, respectively, from an eager starting
+policy.
+
+**Concrete mechanisms:**
+
+- The multi-tier hierarchy has DRAM and NVM buffer pools above SSD. DRAM is the
+  hottest volatile tier; NVM can hold a larger warm working set and can be read
+  or written directly by the CPU.
+- `Dr` controls whether an NVM-resident page is promoted to DRAM on read.
+  Lower `Dr` values keep cold NVM pages from polluting scarce DRAM, while eager
+  promotion helps when the working set fits in DRAM or the DRAM/NVM capacity
+  ratio is high.
+- `Dw` controls whether write data goes through DRAM. Lower `Dw` lets durable
+  log/checkpoint-style writes persist directly to NVM and avoids evicting hot
+  DRAM pages.
+- `Nr` controls whether SSD-read pages are admitted into NVM. Lower `Nr` avoids
+  writing one-time cold reads into NVM and reduces NVM wear.
+- `Nw` controls whether DRAM-evicted pages are copied into NVM. Lower `Nw`
+  reduces NVM write amplification and keeps the NVM tier focused on warmer
+  pages.
+- The adaptive tuner measures buffer-manager throughput and NVM write count for
+  recent operations, combines them as a weighted objective, and periodically
+  searches nearby policy configurations with simulated annealing.
+- The storage-hierarchy recommender grid-searches candidate DRAM/NVM/SSD
+  device capacities under a cost budget, runs the target workload, and selects
+  the highest performance-per-price hierarchy rather than relying on a closed
+  form locality model.
+- The evaluation uses traces from real DBMS workloads via OLTP-Bench, including
+  TPC-C, CH-benCHmark, Voter, and AuctionMark, then replays buffer operations on
+  an Intel persistent-memory emulator.
+- Lazy DRAM migration can materially improve small-DRAM/large-NVM systems: the
+  paper reports a 94% TPC-C throughput gain for one 4 GB DRAM plus 1 TB NVM
+  configuration because DRAM stops caching cold pages.
+- Policy comparison shows a throughput/endurance tradeoff: the faster policy
+  that eagerly writes to NVM can outperform the prior NVM buffer baseline by
+  3.5x on TPC-C and 6.6x on Voter, while lazier NVM write policies reduce NVM
+  writes by 1.4x to 2.1x versus that fast policy.
+
+**GPU DB mapping:** GPU DB should treat GPU HBM, host DRAM, future CXL/NVM-like
+memory, and NVMe as a measured tier hierarchy rather than a simple cache ladder.
+The P8 storage doc already says correctness lives in WAL/CPU truth and GPU
+resident state is acceleration state. This paper adds a policy shape: promotion
+and demotion should be independently controllable by read path, write path,
+cold-load path, and eviction path.
+
+For retained GPU snapshots, the direct analogy to `Dr` is whether a warm
+host-resident segment should be promoted to GPU HBM on a read. Eager promotion
+can waste HBM on one-off scans; lazy promotion can keep repeated point lookups
+or aggregate columns hot. The route planner should expose this as telemetry and
+policy, not hide it behind a binary resident/nonresident flag.
+
+The analogy to `Dw`, `Nr`, and `Nw` matters for COPY admission and over-resident
+execution. Some writes should go straight to WAL/host append buffers without
+polluting GPU resident pages. Some cold NVMe reads should stream through a GPU
+or CPU path without being admitted to warm host memory. Some evicted GPU
+segments should demote to compressed host memory or metadata only, while others
+should be discarded and rebuilt from WAL/CPU state. Each decision needs a
+measured write-amplification, transfer-byte, latency, and reuse signal.
+
+The simulated-annealing tuner is too heavyweight to copy directly into a
+correctness-critical hot path, but the objective is useful. GPU DB can start
+with conservative deterministic policies and run offline or background policy
+search over benchmark telemetry: resident hit rate, H2D/D2H bytes, NVMe bytes,
+refresh cost, queue wait, pinned-buffer pressure, p50/p99 latency, and explicit
+wear or write-amplification equivalents.
+
+**Risks and mismatches:** The paper studies CPU-visible NVM and SSD, not GPU
+HBM, CUDA streams, GPUDirect Storage, PCIe/NVLink, MVCC visibility, WAL
+publication on GPU snapshots, or pgwire session pressure. Its trace-driven
+simulator moves pages and models I/O, but it does not execute SQL kernels or
+validate route-specific correctness. First-generation NVM economics in 2019 may
+not match CXL, persistent memory availability, or future GPU memory tiers in
+2026. The tuner changes probabilities at coarse workload intervals; an online
+GPU DB admission path must bound experimentation so it cannot violate latency
+SLOs or flood scarce HBM/pinned buffers.
+
+**Benchmark candidates:**
+
+- Add tier-policy telemetry for each retained route: source tier, target tier,
+  promoted bytes, demoted bytes, discarded bytes, reuse count, queue wait, and
+  fallback reason. Gate: every route decision can be explained from measured
+  tier state.
+- Build a hot/warm/cold segment benchmark with GPU HBM budget smaller than the
+  working set. Compare eager GPU promotion, lazy promotion by reuse count, and
+  no promotion for streamed reads. Failure condition: one-off scans evict hot
+  retained lookup segments.
+- Add a COPY/write-path pollution test: sustained ingest plus repeated retained
+  reads. Compare policies that invalidate and rebuild GPU snapshots eagerly
+  versus policies that keep writes in WAL/host append buffers until a measured
+  refresh boundary. Gate: no stale reads and lower p99 retained-read latency.
+- Prototype a demotion policy for resident segments: discard, keep host
+  compressed buffers, or keep only rebuild metadata. Measure rebuild latency,
+  HBM pressure, host memory pressure, and NVMe reads.
+- Run an offline policy search over existing retained-route telemetry to choose
+  promotion thresholds by workload class. Gate: selected policy beats a fixed
+  eager policy on throughput and p99 without increasing fallback errors.
+- Add a tier cost matrix to planner tests: HBM resident, host warm, NVMe cold,
+  and streamed over-resident. Gate: route selection changes when measured
+  transfer or refresh costs change, rather than relying on static residency
+  assumptions.
+
+### 2026-06-03 - Cross-paper synthesis: admission needs tier-aware memory fronts
+
+**Converging design tracks:** The last three papers point to the same missing
+front door from different angles. Learned cost-model evaluation says route
+selection must be judged by the choice it makes, not by prediction error alone.
+R2P2 says each request needs an explicit response identity, route policy, and
+bounded admission slot. Adaptive multi-tier buffer management says data
+placement is also an admission decision: a read or write should not silently
+promote, demote, or pollute a scarce tier just because the page was touched.
+
+For GPU DB, the promising track is a typed route envelope that carries both
+request admission and tier-admission metadata: snapshot generation, route
+family, deadline, response destination, selected worker, HBM budget, pinned
+buffer budget, host warm-segment policy, NVMe streaming policy, and fallback
+permission. That envelope lets the scheduler, planner, and cache manager explain
+why a request ran on GPU, streamed from NVMe, stayed on CPU, waited, or was
+rejected.
+
+**Category gaps:** The queue still needs more transaction/write-path and MVCC
+papers after this tiering/runtime cluster. The next high-value candidates should
+prefer HTAP MVCC, deterministic/partitioned OLTP, or write admission unless a
+newer 2025-2026 tiering paper is directly more relevant.
+
+**Benchmark priorities:** Prioritize one mixed benchmark that combines retained
+point reads, a long scan, cold-tier reads, and COPY admission under a small HBM
+budget. Measure p50/p99 latency, request drops/fallbacks, worker queue depth,
+route-selected slowdown versus oracle, HBM evictions, host demotions, NVMe
+bytes, and stale-generation rejections. The pass condition is not just higher
+throughput; it is bounded short-read latency with explainable tier decisions
+and unchanged WAL/MVCC correctness.

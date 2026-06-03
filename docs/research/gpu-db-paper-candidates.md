@@ -130,7 +130,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   Why: combines DBMS buffer management with virtual-memory mechanisms for fast
   storage and multicore CPUs; relevant to host-memory tier policy and fault
   telemetry.
-- `queued` — **Multi-Tier Buffer Management and Storage System Design for
+- `reviewed` — **Multi-Tier Buffer Management and Storage System Design for
   Non-Volatile Memory**, arXiv 2019.
   URL: `https://arxiv.org/abs/1901.10938`
   Why: explicit multi-tier DBMS buffer design across DRAM and non-volatile
@@ -1486,3 +1486,15 @@ Append new candidates here as each paper is processed.
   Why: Vortex contrasts multi-GPU memory-capacity scaling with IO forwarding;
   MG-Join is a direct follow-up for future multi-device join partitioning and
   interconnect-aware placement.
+- `queued` — **Managing Non-Volatile Memory in Database Systems**, van Renen
+  et al., SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3196897`
+  Why: NVM-aware multi-tier buffer-manager baseline compared by the 2019
+  adaptive migration paper; useful for page admission queues and recent-access
+  filters before designing GPU DB host/NVMe tier promotion.
+- `queued` — **Strata: A Cross Media File System**, Kwon et al., SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132770`
+  Why: cross-media NVM/SSD file-system design cited by the 2019 multi-tier
+  buffer paper; useful as a DB-external contrast for per-application logs,
+  performance isolation, and when DB-owned tiering should bypass the file
+  system.
