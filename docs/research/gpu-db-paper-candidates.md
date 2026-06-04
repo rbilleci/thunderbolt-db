@@ -772,7 +772,7 @@ Append new candidates here as each paper is processed.
   asynchronous log push-down, and independently scalable conflict-resolution
   resources; directly relevant to mutation-owner decomposition and write-path
   admission.
-- `queued` — **A Hybrid Approach to Integrating Deterministic and
+- `reviewed` — **A Hybrid Approach to Integrating Deterministic and
   Non-deterministic Concurrency Control in Database Systems**, Hong et al.,
   PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p1376-lu.pdf`
@@ -2887,3 +2887,16 @@ Append new candidates here as each paper is processed.
   Why: ACC cites Leopard as online partitioning for dynamic datasets; useful
   for comparing lightweight scoring and incremental boundary changes against
   route-descriptor based hot-key clustering.
+- `queued` — **Hybrid Deterministic and Nondeterministic Execution of
+  Transactions in Actor Systems**, Liu et al., SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526172`
+  Why: HDCC contrasts against Snapper's batch-level Calvin/2PL validation;
+  useful for comparing coarse batch validation with finer per-transaction
+  dependency tracking when GPU DB mixes deterministic batches and optimistic
+  owner lanes.
+- `queued` — **Knock Out 2PC with Practicality Intact: A High-performance and
+  General Distributed Transaction Protocol**, Lai et al., ICDE 2023.
+  URL: `https://doi.org/10.1109/ICDE55515.2023.00179`
+  Why: HDCC contrasts deterministic execution against 2PC-like deterministic
+  optimistic protocols; useful for measuring whether GPU DB multi-owner write
+  batches should avoid 2PC entirely or make the commit path cheaper.

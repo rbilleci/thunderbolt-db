@@ -34154,3 +34154,202 @@ have one deterministic visibility order.
   `preprocess_wait_us`, `execution_lock_wait_us`, `validation_us`,
   `commit_publish_us`, `wal_epoch`, and `policy_id`. This is needed before any
   CPU/GPU mixed transaction path can be trusted.
+
+### 2026-06-04 - HDCC interleaves deterministic batches with optimistic lanes
+
+**Citation:** Yinhao Hong, Hongyao Zhao, Wei Lu, Xiaoyong Du, Yuxing Chen,
+Anqun Pan, and Lixiong Zheng. "A Hybrid Approach to Integrating Deterministic
+and Non-deterministic Concurrency Control in Database Systems." PVLDB 18(5),
+2025. DOI `10.14778/3718057.3718066`. Retrieved 2026-06-04 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol18/p1376-lu.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; runtime / HFT / session scale.
+
+**Relevance tags:** deterministic OLTP; OCC; Calvin; hybrid concurrency
+control; global validation; lock-sharing; hot partition routing; two-log
+interleaving; checkpoint recovery; declared read/write sets; distributed
+transactions; phantom avoidance.
+
+**Core idea:** HDCC argues that deterministic and non-deterministic
+concurrency control can coexist in one database if the integration exposes the
+exact dependency and recovery order between the two protocols. It combines
+Calvin for distributed or hot declared transactions with Silo-style OCC for
+low- or medium-contention work and transactions whose read/write sets are not
+known up front. The assignment policy is simple and rule-based, but the hard
+part is not the classifier; it is preserving serializability and recovery
+correctness across protocols with different scheduling and logging models.
+
+The paper's strongest transfer to GPU DB is the idea that deterministic
+batches should not be an all-or-nothing runtime mode. A GPU DB write path can
+use deterministic same-shape or hot-partition batches where they help, while
+keeping optimistic or owner-local execution for short low-contention requests.
+That only works if each route exposes its dependency frontier, validation
+phase, log order, and visibility publication boundary.
+
+The evaluation uses a Deneva-based shared-nothing in-memory prototype with
+YCSB and TPC-C. Reported results show HDCC outperforming Snapper by up to 3.1x
+on YCSB and 2.3x on TPC-C in the undeclared-transaction experiments, tracking
+Calvin under high distributed/hot contention, and tracking OCC-like behavior
+when contention is low. The paper also reports linear scaling from 2 to 12
+nodes in its cloud scalability experiment and small logging/checkpoint
+overheads in the measured setup.
+
+**Concrete mechanisms:**
+
+- Route each transaction to exactly one protocol for its whole execution:
+  Calvin or OCC. Calvin receives distributed transactions with declared
+  read/write sets and local declared transactions that touch hot partitions.
+  OCC receives undeclared and otherwise low/medium-contention transactions.
+- Keep a storage-layer lock/statistics table with shared metadata across both
+  protocols. The lock-sharing mechanism adds per-item lock state and a `wid`
+  field for the latest writer id, so OCC validation can see Calvin writes and
+  Calvin scheduling can wait behind OCC locks instead of missing conflicts.
+- Add global validation for distributed OCC transactions that conflict with
+  Calvin transactions. HDCC tracks each OCC transaction's maximum dependent
+  Calvin transaction id, `gMaxCid`, using per-item `cid` and `cid_prime`
+  metadata. At validation, the OCC transaction commits only if all Calvin
+  subtransactions up to that frontier have committed on the accessed nodes.
+- Use an extended dependent set rather than computing full transitive closure
+  over all dependency edges. This deliberately accepts some conservative
+  aborts to avoid expensive graph maintenance.
+- Integrate the same lock-sharing idea into B+ tree leaf nodes, so inserts,
+  deletes, and range queries avoid phantom anomalies.
+- Reschedule aborted OCC transactions through the assignment rules after their
+  read/write sets are known. A failed optimistic attempt can therefore become
+  a deterministic Calvin transaction on retry.
+- Add immediate-read/deferred-commit behavior: when an OCC transaction reads a
+  value written by an uncommitted Calvin transaction, it can wait for that
+  Calvin transaction instead of aborting immediately when the `wid` conditions
+  prove the read is still consistent.
+- Interleave Calvin logical logs and OCC redo/commit logs for recovery. OCC
+  commit logs record `gMaxCid`; replay scans OCC logs, replays Calvin logs up
+  to each recorded Calvin frontier before the OCC transaction, then continues
+  interleaving. The checkpoint records both the Calvin pivot and the last OCC
+  transaction included in the checkpoint.
+- Modify Calvin logging so each node persists the subtransactions it must
+  execute, and add partial redo logs for Calvin writes that depend on remote
+  reads.
+
+**GPU DB mapping:** HDCC maps naturally to a route-family model for the GPU DB
+mutation path. Instead of one global rule such as "all writes go through the
+owner" or "all declared batches go to GPU", route descriptors should carry
+transaction shape: declared read/write set confidence, key/partition home,
+hotness, distributed or multi-owner footprint, current abort rate, current
+queue delay, and whether deterministic batching can preserve the latency
+budget. The selected policy becomes part of the request's correctness
+contract, not an incidental scheduler choice.
+
+For write throughput, HDCC suggests a conservative path to GPU-assisted OLTP:
+let the CPU mutation owner keep WAL and visibility authority, but admit
+declared hot-partition or same-shape write batches into a deterministic lane.
+Low-contention and undeclared requests stay in optimistic or owner-local
+lanes. If an optimistic request aborts after discovering a stable read/write
+set, it can retry through the deterministic lane. This is especially relevant
+to GPU batches where the first attempt pays classification and staging cost:
+failed work should either be repaired or converted into a better-shaped batch,
+not blindly retried through the same route.
+
+For MVCC/snapshot design, the `gMaxCid` idea is a useful abstraction even if
+GPU DB does not copy Calvin/OCC literally. A retained read or write batch
+should carry a dependency frontier: the latest WAL epoch, owner generation,
+catalog generation, and any deterministic batch id it depends on. A mixed
+CPU/GPU execution path can validate that all required frontiers are committed
+before publishing visibility or serving a retained snapshot. This resembles a
+route-local vector clock more than a single global timestamp.
+
+For recovery, the two-log-interleaving mechanism is a warning that mixed
+protocols must be replayable in the same order they were externally
+serialized. GPU DB can have per-owner WAL streams, GPU refresh logs, and
+rebuildable resident state, but a commit record must still encode enough
+dependency information to replay CPU truth before any retained GPU generation
+is trusted. A deterministic GPU batch should not become a second durability
+universe; it should emit dependency metadata into the authoritative WAL order.
+
+For 1M logical sessions, HDCC reinforces route-level admission. Sessions do
+not need one protocol; active requests need a small set of observable policy
+lanes. Admission can reject or defer at the protocol boundary:
+`deterministic_batch_closed`, `optimistic_abort_rate_high`,
+`calvin_frontier_not_committed`, `mixed_route_validation_failed`, or
+`retry_as_deterministic_lane`.
+
+**Risks and mismatches:** HDCC is a distributed in-memory OLTP prototype, not a
+GPU database, and it assumes transactional procedures where read/write set
+availability can be classified. The chosen protocols are Calvin and OCC; GPU
+DB's likely policy space also includes owner-serialized lanes, MVCC retained
+snapshot reads, deterministic GPU write batches, CPU fallback, and maybe
+lock-like hot-key handling. The per-item `wid`, `cid`, and `cid_prime`
+metadata may become cache-contention hot spots at GPU DB's target session
+counts unless partitioned or sampled carefully.
+
+The paper's immediate-read/deferred-commit optimization intentionally waits on
+Calvin transactions. That can reduce aborts, but it can also hide tail-latency
+risks if a short retained read waits behind a long deterministic batch or
+refresh job. HDCC's global validation uses a conservative extended dependency
+set, which may abort useful schedules. Unknown from this read: how the approach
+behaves with very long analytical reads, SQL planner-driven dynamic access
+paths, high fan-out secondary indexes, NUMA placement, GPU kernel staging, or
+storage larger than memory.
+
+The recovery design is the most important caution. Mixing protocol-specific
+logs is easy to get wrong. GPU DB should not introduce deterministic GPU batch
+logs, residency refresh logs, or per-owner WAL streams unless the replay order,
+checkpoint frontier, and invalidation frontier are explicit and tested under
+crash/replay.
+
+**Benchmark candidates:**
+
+- Build a write-route simulator with three lanes: owner-serialized,
+  optimistic, and deterministic-batch. Route by declared read/write set,
+  hotness, distributed footprint, and abort rate. Gate: mixed routing beats the
+  best single lane across phase shifts without changing replay order.
+- Add dependency-frontier telemetry to mutation requests:
+  `wal_epoch`, `owner_generation`, `deterministic_batch_id`,
+  `optimistic_read_frontier`, `catalog_generation`, and `selected_policy`.
+  Gate: every committed write can explain which frontiers had to be stable.
+- Test optimistic-to-deterministic retry. Run hot-key YCSB/SmallBank-like
+  phases where the first OCC attempt discovers a read/write set, then retry as
+  a deterministic batch. Failure condition: retry conversion increases p99
+  latency more than it improves abort/throughput.
+- Prototype global validation only as a CPU-side metadata check before any GPU
+  batch writes become visible. Proof gate: WAL replay reproduces the same
+  accepted/aborted mixed schedule after a simulated crash.
+- Add phantom-safe index validation tests for mixed range reads and inserts:
+  owner lane versus deterministic batch versus optimistic read. Gate: range
+  predicates never observe stale resident rows across insert/delete.
+- Measure deferred commit separately from immediate abort under short and long
+  deterministic batches. Gate: reduced aborts do not violate a fixed p99
+  latency ceiling for short retained reads.
+- Add overload reasons for mixed-policy admission:
+  `deterministic_lane_full`, `optimistic_validation_hot`,
+  `dependency_frontier_uncommitted`, `mixed_policy_replay_unsafe`, and
+  `retry_policy_changed`.
+
+### 2026-06-04 - Cross-paper synthesis: mixed routes need replayable frontiers
+
+RTScan, ACC, and HDCC point at the same control-plane requirement from very
+different angles. RTScan says an accelerated route must be tied to a specific
+resident snapshot generation and invalidated when writes move past it. ACC
+says conflict policy should be selected per hot cluster rather than globally.
+HDCC says mixed policies are only safe when their dependency and recovery order
+are explicit enough to validate and replay.
+
+The converging design track is a route descriptor with a replayable frontier:
+relation or key cluster, selected policy, resident generation, WAL/owner
+generation, dependency frontier, expected queue wait, and fallback/retry rule.
+GPU DB should treat resident predicate indexes, deterministic write batches,
+optimistic owner lanes, and CPU fallbacks as policy families under one
+frontier contract. A fast route that cannot state its frontier is not
+production-safe, even if it is benchmark-fast.
+
+The current category gap is still full-stack write-path recovery under mixed
+owners and accelerators. The journal now has strong pieces for routing,
+concurrency choice, resident indexes, tiering, and scheduling, but the next
+high-value papers should keep biasing toward logging, commit protocols,
+multi-owner replay, and transaction scheduling unless the queue becomes empty.
+
+Benchmark priority: implement a no-GPU write-route simulator before adding
+more accelerator code. It should exercise phase-changing hot keys,
+distributed/multi-owner transactions, optimistic abort/retry, deterministic
+batch admission, and crash/replay of the selected order. Passing that gate
+would make later GPU write batches much less speculative.
