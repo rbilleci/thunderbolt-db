@@ -319,9 +319,10 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
   Why: cost-based CPU/GPU placement and execution orchestration for
   heterogeneous CPU-GPU database systems.
-- `queued` — **Dynamic Resource Management for Efficient Utilization of
-  Multitasking GPUs**, Park, Park, and Mahlke, HPCA 2017.
-  URL: `https://doi.org/10.1109/HPCA.2017.19`
+- `reviewed` — **Dynamic Resource Management for Efficient Utilization of
+  Multitasking GPUs**, Park, Park, and Mahlke, ASPLOS 2017.
+  URL: `https://doi.org/10.1145/3037697.3037707`
+  PDF: `https://cccp.eecs.umich.edu/papers/jasonjk-asplos17.pdf`
   Why: GPU Maestro-style dynamic resource partitioning for multitasking GPUs;
   useful follow-up to kernel/batch concurrency scheduling for GPU DB streams.
 - `queued` — **Classification-Driven Search for Effective SM Partitioning in
@@ -758,6 +759,19 @@ Append new candidates here as each paper is processed.
   Why: user-level core-aware thread management cited by Caladan; useful for
   exposing internal request concurrency to a scheduler without adopting a full
   Caladan-style interference-control stack.
+- `queued` — **Efficient Dynamic Resource Management for Spatial Multitasking
+  GPUs**, Zhu et al., IEEE Transactions on Cloud Computing 2024.
+  URL: `https://doi.org/10.1109/TCC.2024.3511548`
+  Why: modern spatial-multitasking resource allocation follow-up to GPU
+  Maestro-style GPU sharing; useful for comparing software-visible GPU
+  partition policy with current hardware and cloud scheduling assumptions.
+- `queued` — **Towards Efficient and Practical GPU Multitasking in the Era of
+  LLM**, arXiv 2025.
+  URL: `https://arxiv.org/abs/2508.08448`
+  Why: recent GPU multitasking position paper that surveys sharing, isolation,
+  and resource-management requirements; useful for checking whether database
+  GPU owners should expose a GPU-OS-like control plane before adopting
+  hardware-specific scheduling assumptions.
 - `reviewed` — **ZygOS: Achieving Low Tail Latency for Microsecond-scale
   Networked Tasks**, Prekas, Kogias, and Bugnion, SOSP 2017.
   URL: `https://dl.acm.org/doi/10.1145/3132747.3132780`

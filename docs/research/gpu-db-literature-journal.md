@@ -41778,3 +41778,190 @@ fallbacks.
 - Test native/cold-tier interaction by placing base rows on CPU/NVMe and cache
   rows in DRAM or GPU memory. The planner should select placement-aware
   reconstruction instead of assuming all MVCC metadata is resident.
+
+### 2026-06-04 - GPU sharing should be measured, not guessed
+
+**Citation:** Jason Jong Kyu Park, Yongjun Park, and Scott Mahlke. "Dynamic
+Resource Management for Efficient Utilization of Multitasking GPUs." ASPLOS
+2017, pages 527-540. DOI `10.1145/3037697.3037707`. Retrieved 2026-06-04 from
+the University of Michigan author/project PDF,
+`https://cccp.eecs.umich.edu/papers/jasonjk-asplos17.pdf`.
+
+**Category:** GPU execution / runtime scheduling; admission control.
+
+**Relevance tags:** GPU multitasking; spatial multitasking; simultaneous
+multi-kernel execution; SM partitioning; direct measurement; epoch scheduling;
+resource fragmentation; kernel-aware warp scheduling; route certificates; GPU
+owner admission.
+
+**Core idea:** GPU Maestro argues that no single GPU sharing policy wins across
+application mixes. Spatial multitasking, which partitions whole SMs among
+kernels, can avoid interference between memory-heavy kernels. Simultaneous
+multi-kernel execution, which co-runs kernels inside an SM, can improve
+utilization when kernels have complementary resource or functional-unit demand.
+Rather than predicting all interference from isolated profiles, GPU Maestro
+uses a subset of SMs to directly measure candidate partitions every epoch, then
+applies the best measured partition to follower SMs.
+
+The strongest transferable idea for GPU DB is that the GPU execution owner
+should treat concurrent route scheduling as a measured control loop. A route
+certificate can start with static fields, but the admission decision should be
+calibrated by live telemetry: which combinations actually co-run well on this
+GPU, under this snapshot/data-placement shape, with this queue and transfer
+pressure.
+
+**Concrete mechanisms:**
+
+- GPU Maestro evaluates both spatial multitasking and SMK-style sharing.
+  Spatial multitasking assigns kernels to different SMs; SMK shares an SM
+  between kernels by partitioning thread blocks and on-chip resources.
+- The scheduler divides SMs into dedicated, trial, and follower roles.
+  Dedicated SMs estimate single-kernel performance and spatial multitasking
+  behavior. Trial SMs test nearby SMK partition choices. Follower SMs use the
+  best partition from prior measurement.
+- Repartitioning decisions happen at fixed epochs. The paper uses `50k` cycles
+  per epoch in its simulator to limit repartitioning overhead, and it defers
+  the next epoch until requested preemptions and thread-block repartitioning
+  have taken effect.
+- The objective can be chosen from multiprogram metrics. The paper's evaluation
+  uses ANTT as the main objective for deciding partitions, while reporting STP
+  as throughput.
+- GPU Maestro uses direct performance counters from trial and dedicated SMs,
+  avoiding a pure model that extrapolates from isolated kernels and misses
+  phase changes or co-run interference.
+- To reduce repartitioning cost, trial and follower SMs can swap roles instead
+  of moving all SMs at once. Dedicated SMs are turned into followers when their
+  measurements are stable, then periodically refreshed.
+- The paper identifies resource fragmentation inside SMK: registers or shared
+  memory may be free in total but unavailable as a contiguous usable region for
+  another thread block. Its synthetic study reports register fragmentation up
+  to `50%` in the worst case.
+- GPU Maestro proposes 2-way resource allocation. Two kernels allocate
+  one-dimensional resources such as register file and shared memory from
+  opposite directions, and preemption priority releases boundary thread blocks
+  adjacent to free space. This preserves usable free regions for the other
+  kernel.
+- Because 2-way allocation supports only two kernels per SM directly, the paper
+  suggests mixing it with spatial multitasking or recursively extending it to
+  more kernels, with some remaining fragmentation risk between pairs.
+- The paper also identifies starvation from the interaction between SMK and the
+  GPU warp scheduler. It uses loose round-robin kernel-aware scheduling, which
+  changes kernel priority when a lower-priority kernel has a ready instruction.
+- Evaluation is simulation-based, using GPGPU-Sim v3.2.2 with a modeled Nvidia
+  GTX 980/Maxwell GPU. Workloads are pairs of kernels from Nvidia SDK, Rodinia,
+  and Parboil, classified as compute- or memory-intensive.
+- Reported averages: spatial multitasking, SMK, and GPU Maestro improve STP by
+  `20.7%`, `27.3%`, and `45.0%` over non-shared execution, while increasing
+  ANTT by `72.2%`, `99.1%`, and `57.6%`, respectively. Compared with spatial
+  and SMK baselines, the abstract reports GPU Maestro improves average system
+  throughput by `20.2%` and `13.9%`. Repartitioning overhead is reported at
+  `0.8%` on average.
+
+**GPU DB mapping:** For the high-throughput runtime, this paper sharpens the
+GPU execution-owner contract. Same-shape micro-batches are not enough. The GPU
+owner should maintain a small compatibility table saying which route pairs or
+route classes co-run well as spatially separated streams, which should share an
+SM-like execution window, and which should never be admitted together because
+they fight over memory bandwidth, cache, registers, shared memory, pinned
+buffers, or result scatter.
+
+In current CUDA-visible software, GPU DB may not control SM partitioning at the
+granularity assumed by GPU Maestro. The design lesson still applies at the
+route scheduler layer: use trial windows, canary batches, and telemetry-based
+co-scheduling decisions before globally enabling a packing policy. A retained
+lookup route and a retained aggregate scan should earn co-run compatibility
+through measured queue wait, kernel time, transfer time, and p95/p99 latency,
+not through a planner hint alone.
+
+For 1M logical sessions, this reinforces that GPU residency should be attached
+to active admitted work, not to idle sessions. Many logical sessions can share
+one GPU owner only if the owner exposes hard budgets, epoch-level telemetry,
+and explicit overload/fallback reasons. The runtime can admit session work into
+CPU, GPU, or delayed lanes based on measured route compatibility rather than
+letting every active client enqueue arbitrary kernels.
+
+The 2-way allocation idea maps to memory and buffer ownership even if hardware
+SM resource allocation is unavailable. GPU DB can allocate pinned buffers,
+scratch slabs, and result arenas in shape-specific regions with predictable
+release priority, reducing fragmentation when mixed lookup, scan, refresh, and
+join batches overlap.
+
+**Risks and mismatches:** The paper is a GPU architecture simulation, not a
+database system and not a production CUDA scheduling API. It assumes hardware
+support for SMK, thread-block repartitioning, preemption, performance-counter
+visibility, and warp scheduling that ordinary CUDA code may not expose. Modern
+GPUs, MPS, MIG, copy engines, stream priorities, cooperative kernels, and
+driver behavior need separate measurement.
+
+The evaluation uses pairs of benchmark kernels, not SQL query plans with
+MVCC visibility, result materialization, network response rings, or
+WAL/residency invalidation. Its throughput objective can conflict with
+database p50/p95 latency, fairness, and correctness. GPU DB should treat the
+reported numbers as motivation for a control loop, not as predicted speedups.
+
+The paper also does not address snapshot compatibility, long-reader
+retirement, memory-tier placement, CPU fallback, or query planning. Its
+resource-sharing policy must be wrapped in database route certificates and
+correctness guards before it can influence production admission.
+
+**Benchmark candidates:**
+
+- Add a GPU route co-run matrix in the scheduler harness. Route classes should
+  include retained point lookup, retained aggregate scan, delta-overlay scan,
+  join build/probe, refresh/rebuild, and result scatter. Proof gate:
+  incompatible classes are never admitted together without a named fallback.
+- Measure telemetry-calibrated co-scheduling: FIFO, static same-shape batching,
+  static resource-certificate packing, and live measured compatibility. Expected
+  improvement: higher throughput than FIFO/static packing without worse p95
+  latency under a fixed micro-batch ceiling.
+- Build a canary-batch mode where a small percentage of compatible-looking
+  route pairs are tested under low load before the policy is enabled for the
+  full GPU owner. Required metrics: queue wait, kernel elapsed time, transfer
+  bytes, result scatter time, p95/p99 latency, and fallback count.
+- Add scratch/pinned/result-buffer fragmentation tests for mixed GPU routes.
+  Compare generic pool allocation with shape-specific two-sided arenas and
+  boundary-priority release. Failure condition: fragmentation causes rejected
+  work despite enough total bytes for the declared route budget.
+- Stress a mixed workload with many logical sessions issuing short retained
+  reads while long scan or refresh work is active. Required result: short reads
+  either co-run within latency budget, route to CPU fallback, or receive an
+  explicit overload reason; they must not wait behind unbounded GPU work.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates need live control loops
+
+The last three reviewed papers converge on the same design track from different
+angles. Concurrent GPU query processing says a route should publish a resource
+shape before admission. Snapshot reconstruction says a route should also
+publish its visibility and physical reconstruction plan. GPU Maestro says those
+certificates are only the starting point: the runtime must measure which
+certified routes actually co-run well on the deployed GPU and workload.
+
+The promising implementation track is now a **certified, measured route
+controller**:
+
+- A route certificate names snapshot generation, base/delta/tombstone layout,
+  kernel DAG, transfer bytes, scratch/pinned/result-buffer budgets, and fallback
+  reasons.
+- The GPU owner keeps live compatibility telemetry for route-class pairs rather
+  than relying only on static cost estimates.
+- Micro-batching remains bounded by latency ceilings, but admission should also
+  account for measured interference and buffer fragmentation.
+- Visibility correctness remains outside the optimizer's discretion: a fast
+  measured route can be used only if its snapshot certificate proves the
+  requested read boundary.
+
+Category gaps remain around write-path batching, serializable transaction
+validation, and durable recovery/warmup. The queue should bias the next few
+non-GPU papers toward transaction execution, MVCC cleanup, write admission, or
+metadata/tier placement unless a GPU source directly informs those gaps.
+
+Benchmark priorities:
+
+- Route-certificate schema and validator tests before any GPU scheduling
+  policy becomes trusted.
+- Synthetic co-run scheduler harness with measured compatibility, overload
+  reasons, and latency-budget gates.
+- Delta-overlay snapshot benchmarks that vary delta cardinality, tombstone
+  count, and resident base size.
+- Buffer-fragmentation benchmarks for pinned host slabs, scratch buffers, and
+  result arenas under mixed retained lookup/scan/refresh workloads.
