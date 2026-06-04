@@ -36093,3 +36093,137 @@ Benchmark priority: build a no-GPU route-control harness that can replay a
 mixed sequence of hot-key writes, retained reads, cache shifts, and crash-replay
 simulation. The pass/fail question is whether route state predicts the right
 promotion or demotion before latency collapses.
+
+### 2026-06-04 - Database Kernels turn CXL storage into typed database services
+
+**Citation:** Sangjin Lee, Alberto Lerner, Philippe Bonnet, and Philippe
+Cudre-Mauroux. "Database Kernels: Seamless Integration of Database Systems and
+Fast Storage via CXL." CIDR 2024. Retrieved 2026-06-04 from
+`https://www.cidrdb.org/cidr2024/papers/p43-lee.pdf`.
+
+**Category:** Multi-tier cache / data placement.
+
+**Relevance tags:** CXL; computational storage; near-data processing; storage
+kernels; buffer management; transaction logging; coherent virtual views;
+compression; cold-tier pushdown; device-side placement.
+
+**Core idea:** The paper argues that Flash should not only sit behind NVMe
+block APIs or naive CXL memory-expansion semantics. Instead, a storage device
+can expose CXL-backed address ranges whose reads and writes invoke
+database-specific kernels inside the device. A database can then treat some
+device ranges as ordinary coherent memory, some as append/logging endpoints,
+some as compressed or transposed views, and some as query-worker access paths
+such as predicate scans or indexed lookups.
+
+The important design move is replacing "storage is a byte range" with
+"storage exports typed address ranges with declared semantics." That matches
+the GPU DB route-control direction: cold and warm tiers should not be generic
+fallbacks; they should expose capabilities, latency/byte budgets, consistency
+contracts, and invalidation rules to the planner and runtime.
+
+**Concrete mechanisms:**
+
+- The proposed device is a CXL Type 2 device. It exposes memory through
+  `cxl.mem`, caches host memory through `cxl.cache`, and can still offer a
+  conventional NVMe path for legacy access.
+- A device-side indirection layer maps selected physical address ranges to
+  kernels. A simple kernel can implement memory-expansion semantics over DRAM
+  or NAND Flash, while a database kernel can implement richer read/write
+  behavior.
+- The Type 2 choice is deliberate: because the device can cache lines, host
+  writes that require exclusive ownership generate invalidations that notify
+  the device before the final memory write arrives. The paper frames that as
+  early warning the device can use to prepare Flash work.
+- Classic kernels rely on coherent memory and can move database helper
+  processes closer to storage while still sharing pages with host workers.
+- Advanced kernels use CXL properties beyond basic coherence: low-latency
+  flit-based messaging, freedom to back one range with different memory types,
+  and address ranges that are backed by computation rather than stored bytes.
+- A buffer-manager extension kernel can flush pages from device DRAM to device
+  Flash internally, avoiding a host-mediated copy from "expanded memory" into a
+  separate persistent-device interface.
+- A query execution worker kernel can push scan/filter or indexed lookup work
+  into the device, returning filtered/materialized access-path pages rather
+  than forcing the host to transfer all base or index data first.
+- A transaction logging kernel can expose an append-only CXL range backed by
+  low-latency staging memory and asynchronous Flash destaging.
+- A data placement kernel can map different portions of a logical address range
+  to media with different write/read economics, such as write-heavy regions on
+  faster Flash and read-mostly regions on denser Flash.
+- A coherent virtual-view kernel can expose different logical layouts over the
+  same data, such as row and column views, and invalidate cached lines in the
+  related view when either representation is updated.
+- The viability section is preliminary. The authors report FPGA area estimates
+  for Type 2 and Type 3 CXL designs and a Gen5 x16 bandwidth target, but the
+  paper is a position/design paper rather than a full DBMS performance
+  evaluation.
+
+**GPU DB mapping:** For P8, Database Kernels argues for tier objects with
+typed service contracts. A GPU DB cold-tier object should be able to say "I can
+serve append-only WAL staging," "I can return a decompressed column window," "I
+can scan this predicate near storage," or "I can flush this host-resident
+segment internally," rather than only exposing a byte range and letting the
+CPU/GPU runtime do all interpretation.
+
+The buffer-manager extension maps to future host/CXL/NVMe placement. If a
+resident segment is warm in CXL-attached memory but must be persisted or
+demoted, a DB-owned service should move it inside the tier when possible and
+report the movement as route telemetry. That is cleaner than routing every
+flush through CPU staging buffers and then treating the storage device as an
+opaque block sink.
+
+The query-worker kernel maps to over-resident GPU execution. Before launching a
+GPU scan over cold data, the planner should be able to choose among
+near-storage filtering, host decompression, direct GPU transfer, or GPU
+resident execution. The DBK idea is not a reason to offload arbitrary SQL to
+storage; it is a reason to make cold-tier access paths first-class planner
+routes with measured capabilities.
+
+The transaction logging kernel is relevant to the write path, but only as a
+WAL accelerator. GPU DB must still publish visibility only after durable log
+safety. A CXL append kernel could reduce CPU overhead or absorb bursts, but it
+must expose enough completion semantics for WAL-before-visibility, group
+commit, replay ordering, and failure fencing.
+
+Coherent virtual views are the closest fit to CPU row/MVCC truth plus GPU
+column-group snapshots. If a future CXL tier exposes row, column, compressed,
+and predicate-filtered views, invalidation has to be tied to MVCC generation
+and resident snapshot identity. Coherence can invalidate cache lines, but SQL
+visibility still needs transaction boundaries, catalog generations, and
+snapshot leases.
+
+**Risks and mismatches:** The paper is a research agenda and architecture
+proposal, not an end-to-end evaluated database engine. It does not provide
+query latency, WAL throughput, recovery, or MVCC correctness results for the
+proposed kernels. CXL product availability, Type 2 device programmability,
+device isolation, kernel development tooling, and failure behavior remain open
+questions. The model also assumes cooperation between database software and
+specialized storage hardware, while the current GPU DB target must run first on
+ordinary CPU/GPU/NVMe systems. Finally, hardware coherence is not database
+isolation: cache-line invalidation cannot replace MVCC visibility checks,
+WAL replay, DDL invalidation, or retained snapshot retirement.
+
+**Benchmark candidates:**
+
+- Add a tier-service route model to the no-GPU placement harness: byte-range
+  NVMe, host-memory cache, compressed-host segment, near-storage filter, and
+  append-only log service. Measure route choice by bytes moved, queue wait, and
+  p95 latency.
+- Build a WAL service simulation with append staging and delayed durable
+  completion. Proof gate: no visibility publication occurs before the simulated
+  storage kernel reports the correct durability fence.
+- Compare cold predicate routes: CPU reads full chunk then filters, storage
+  prefilters then CPU/GPU consumes a smaller chunk, and direct GPU transfer of
+  the full chunk. Failure condition: pushdown wins bandwidth but loses p95
+  latency because of queueing or setup cost.
+- Model coherent virtual views as row source, column source, and compressed
+  source generations over the same MVCC boundary. Minimum gate: mutation or DDL
+  invalidates all derived views before any new reader can select them.
+- Add tier movement telemetry for internal flush/demotion: source tier,
+  destination tier, bytes, service time, queue delay, and resulting route
+  capability. Use it to decide whether demotion should run synchronously,
+  asynchronously, or under admission throttling.
+- For future hardware, define a CXL/GPUDirect experiment matrix: CXL memory
+  expansion only, CXL append/log service, CXL near-storage filter, and direct
+  GPU transfer. The first proof metric is correctness of fences and
+  invalidation, not peak bandwidth.

@@ -1736,7 +1736,7 @@ Append new candidates here as each paper is processed.
   Why: CXL DB position paper cites this as a CXL pooling study; useful for
   measuring bandwidth limits and when explicit DBMS placement beats transparent
   far-memory expansion.
-- `queued` — **Database Kernels: Seamless Integration of Database Systems and
+- `reviewed` — **Database Kernels: Seamless Integration of Database Systems and
   Fast Storage via CXL**, Lee et al., CIDR 2024.
   URL: `https://www.cidrdb.org/cidr2024/papers/p43-lee.pdf`
   Why: CXL DB position paper cites CXL-enabled SSD/storage integration; useful
@@ -2993,3 +2993,27 @@ Append new candidates here as each paper is processed.
   coherent DRAM/NVMe page protocol; useful for deciding when GPU DB should
   move hot objects to owner lanes versus run distributed commit or remote
   accelerator access.
+- `queued` — **X-SSD: A Storage System with Native Support for Database Logging
+  and Replication**, Lee et al., SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526188`
+  Why: Database Kernels cites X-SSD as a dedicated storage-device path for
+  database logging; useful for comparing append-only CXL logging kernels with
+  WAL-before-visibility and recovery accelerator designs.
+- `queued` — **Delilah: eBPF-Offload on Computational Storage**, Hedam et al.,
+  DaMoN 2023.
+  URL: `https://doi.org/10.1145/3592980.3595319`
+  Why: Database Kernels cites Delilah as a programmable computational-storage
+  example; useful for deciding whether storage-side database functions should
+  be fixed kernels, eBPF-like user functions, or DBMS-owned operators.
+- `queued` — **Hello Bytes, Bye Blocks: PCIe Storage Meets Compute Express Link
+  for Memory Expansion (CXL-SSD)**, Jung, HotStorage 2022.
+  URL: `https://doi.org/10.1145/3538643.3539745`
+  Why: Database Kernels contrasts naive CXL-Flash memory expansion with richer
+  DBK semantics; useful for benchmarking simple load/store CXL storage against
+  explicit database-owned placement and offload contracts.
+- `queued` — **PLayer: Expanding Coherence Protocol Stack with a Persistence
+  Layer**, Braun, Ramdas, Friedman, and Alonso, DIMES 2023.
+  URL: `https://doi.org/10.1145/3609308.3625270`
+  Why: Database Kernels points to coherent virtually materialized views and
+  persistence-layer coherence mechanisms; useful for future row/column view
+  invalidation across CPU, CXL, and GPU-resident representations.
