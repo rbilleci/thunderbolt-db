@@ -518,7 +518,7 @@ Append new candidates here as each paper is processed.
   caching/routing layers to avoid synchronous database round trips while
   preserving distributed transaction support; useful for GPU DB catalog,
   route-cache, and cold-tier namespace scaling.
-- `queued` — **Facebook's Tectonic Filesystem: Efficiency from Exascale**,
+- `reviewed` — **Facebook's Tectonic Filesystem: Efficiency from Exascale**,
   Pan et al., FAST 2021.
   URL: `https://www.usenix.org/conference/fast21/presentation/pan`
   Why: FileScale contrasts Tectonic's sharded metadata/key-value approach with
@@ -618,6 +618,21 @@ Append new candidates here as each paper is processed.
   Why: combines learned optimizer search with DBMS operator restrictions and
   beam search; relevant to adding learned GPU route suggestions without
   surrendering deterministic planner guardrails.
+- `queued` — **Azure Data Lake Store: A Hyperscale Distributed File Service
+  for Big Data Analytics**, Ramakrishnan et al., SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3056100`
+  PDF: `https://www.cs.ucf.edu/~kienhua/classes/COP5711/Papers/MSazure2017.pdf`
+  Why: Tectonic compares against ADLS's layered metadata approach; useful for
+  contrasting range-partitioned metadata, relational/distributed-system
+  integration, and data-lake scale metadata routing with Tectonic's
+  hash-partitioned design.
+- `queued` — **Pangea: Monolithic Distributed Storage for Data Analytics**,
+  Ghosh et al., PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p681-ghosh.pdf`
+  Why: Tectonic's related work contrasts monolithic analytics storage with
+  layered filesystem designs; useful for evaluating whether GPU DB cold-tier
+  placement should centralize data placement, caching, and failure recovery or
+  keep them as explicit route-owned tiers.
 - `reviewed` — **Oze: Decentralized Graph-Based Concurrency Control for
   Long-Running Update Transactions**, Nemoto et al., PVLDB 2025.
   URL: `https://vldb.org/pvldb/vol18/p2321-nemoto.pdf`

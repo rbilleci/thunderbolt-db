@@ -31974,3 +31974,204 @@ resident multiversion index can run under 1M logical sessions.
 - Compare resident B-tree, resident hash table, and resident scan routes for
   selective point predicates. The proof gate is a planner threshold where the
   index wins on p50 and p99 without hidden reclamation debt or stale reads.
+
+### 2026-06-04 - Tectonic turns cold-tier efficiency into explicit traffic classes and sealed metadata
+
+**Citation:** Satadru Pan, Theano Stavrinos, Yunqiao Zhang, Atul
+Sikaria, Pavel Zakharov, Abhinav Sharma, Shiva Shankar P, Mike Shuey,
+Richard Wareing, Monika Gangapuram, Guanglei Cao, Christian Preseau,
+Pratap Singh, Kestutis Patiejunas, JR Tipton, Ethan Katz-Bassett, and
+Wyatt Lloyd. "Facebook's Tectonic Filesystem: Efficiency from
+Exascale." FAST 2021. Retrieved 2026-06-04 from the USENIX page and
+official PDF: `https://www.usenix.org/conference/fast21/presentation/pan`
+and `https://www.usenix.org/system/files/fast21-pan.pdf`.
+
+**Category:** Multi-tier cache / data placement and runtime / admission.
+
+**Relevance tags:** exabyte storage; metadata sharding; traffic classes;
+tenant groups; weighted fair sharing; client-side rate limiting; direct
+storage access; single writer; append-only blocks; quorum append; hedged
+reservation; sealed metadata; hot chunk cache; erasure coding; reconstruction
+storm control; cold-tier namespace.
+
+**Core idea:** Tectonic consolidates formerly specialized large storage
+systems into one shared filesystem by separating flat chunk storage from
+layered metadata, then making resource policy explicit at the request
+boundary. The paper's strongest transferable idea is that a general storage
+fabric can stay efficient only when workloads declare enough intent for the
+system to choose durability, placement, scheduling, and visibility policy per
+operation instead of baking a single storage behavior into the namespace.
+
+For GPU DB, this is a cold-tier and metadata-control-plane paper more than a
+database transaction paper. It suggests that P8 should treat disk/NVMe,
+compressed host memory, GPU HBM, metadata lookup, and refresh work as shared
+resources with typed request classes. A retained read, a COPY append, a cold
+partition fetch, a resident refresh, and a background compaction should not
+all fight in one queue with only FIFO ordering and byte counts.
+
+**Concrete mechanisms:**
+
+- Tectonic uses a flat Chunk Store for raw chunks and a Metadata Store built
+  from disaggregated Name, File, and Block layers over a sharded key-value
+  store. The layers are hash-partitioned by directory, file, and block ids to
+  avoid placing too much related traffic on one range shard.
+- Metadata maps are often expanded into one key per item, so large directories
+  or file-to-block lists can be updated without rewriting a giant value. Prefix
+  scans reconstruct the logical list.
+- Sealed blocks, files, and directories become immutable metadata objects that
+  can be cached by metadata nodes and clients. Block-to-chunk caches can still
+  go stale because chunks move; read failures detect that and trigger refresh.
+- The key-value store supplies strong consistency and atomic operations inside
+  one shard, but not cross-shard transactions. Cross-directory moves and other
+  multi-step operations are implemented with careful ordering, backpointers,
+  validation, and background garbage collectors rather than pretending the
+  whole namespace is one transaction domain.
+- Clients orchestrate chunk and metadata operations directly. This avoids a
+  proxy data hop inside the datacenter, while remote clients use a stateless
+  in-datacenter proxy when orchestration round trips would be too expensive.
+- Files have single-writer append semantics enforced by write tokens. The
+  single writer can write chunks in parallel, hedge storage reservations, and
+  publish metadata only after the write protocol has reached its visibility
+  point.
+- Ephemeral resources such as storage IOPS and metadata QPS are managed by
+  tenant, TrafficGroup, and TrafficClass. TrafficClasses are Gold, Silver, and
+  Bronze; spare resources flow first within the tenant and then across tenants
+  by priority.
+- A client-side rate limiter uses near-real-time distributed counters and a
+  modified leaky-bucket algorithm to delay or reject requests before sending
+  work that is likely to waste backend resources.
+- Storage and metadata nodes enforce local fairness with weighted round-robin.
+  Storage nodes add priority-specific protections: lower-priority work may
+  cede its turn to Gold work, non-Gold in-flight IO is capped when Gold waits,
+  and non-Gold scheduling pauses if a disk has held a Gold request beyond a
+  threshold.
+- Data warehouse workloads use full-block asynchronous Reed-Solomon writes and
+  hedged reservation requests. For an RS(9,6) block, the client can reserve 19
+  nodes, write to the first 15 accepted nodes, and acknowledge after 14
+  successes; the paper reports about a 20% improvement in 99th percentile
+  latency for 72 MB block writes in a highly loaded test cluster.
+- Blob workloads use low-latency replicated quorum appends for small writes,
+  commit the post-append block size and checksum to metadata before
+  acknowledgment, then re-encode sealed blocks into RS(10,4) for space
+  efficiency.
+- Production evidence includes a representative multitenant cluster with
+  1,590 PB capacity, 1,250 PB used, 10.7 billion files, 15 billion blocks, and
+  4,208 storage nodes. The paper reports that consolidating blob storage and
+  data warehouse allowed warehouse spikes to use otherwise stranded blob-store
+  disk time, avoiding about 17% overprovisioning for the observed peaks.
+- To avoid reconstruction storms, Tectonic caps reconstructed reads to 10% of
+  all reads rather than letting overload convert many cheap direct reads into
+  much more expensive erasure-code reconstruction reads.
+- The deployment lessons emphasize iterative layering, checksums across
+  process and transformation boundaries, and explicit integrity checks when
+  data is encoded, encrypted, repaired, or reconstructed.
+
+**GPU DB mapping:** The cold-tier route should look more like Tectonic's
+typed operations than a generic file read. A GPU DB cold-partition request can
+carry `tenant_or_workload_class`, `route_class`, `tier_budget`, `latency_class`,
+`expected_bytes`, `reconstruction_allowed`, `direct_access_allowed`, and
+`sealed_generation` before it enters NVMe, decompression, host staging, or GPU
+transfer queues. That gives admission a chance to reject background refresh
+work while preserving short retained reads.
+
+The sealed-object idea maps directly to immutable resident generations. Once a
+P8 segment or resident index generation is sealed at a WAL/visibility boundary,
+metadata and route descriptors can be cached aggressively by IO workers and
+GPU workers. Mutable append or refresh state stays behind an owner token until
+the checksum, WAL boundary, resident generation, and invalidation state are
+published. This is the same shape as Tectonic's single appender plus metadata
+commit, translated from block size to SQL visibility generation.
+
+Tectonic's TrafficGroup/TrafficClass split is also a concrete model for 1M
+logical sessions. Session admission should not need one fair queue per session.
+It can group sessions by workload class and route shape, keep bounded global
+and local counters, and give latency-sensitive retained lookups a different
+rank from COPY, refresh, compaction, cold scan, or maintenance work. The
+important detail is two-level enforcement: client or protocol-edge admission
+before backend work, and local worker/device fairness where the resource is
+actually consumed.
+
+For tier placement, disk time is the more useful analogy than raw byte count.
+GPU DB should measure and budget tier time: NVMe queue time, host decompression
+time, PCIe transfer time, GPU HBM residency time, kernel time, and pinned-buffer
+occupancy. A cold route that causes "reconstruction" work, such as fallback
+decode, refetch, CPU revalidation, or resident refresh repair, should have a
+cap so overload cannot cascade into more expensive recovery paths.
+
+**Risks and mismatches:** Tectonic's filesystem is append-only with
+single-writer files, not a general SQL update engine. Its consistency model
+includes read-after-write for data and strong consistency for selected
+single-shard metadata operations; it deliberately avoids full cross-shard
+transactions. GPU DB cannot adopt that weaker namespace model for table
+visibility, DDL, or SQL transactions.
+
+The Client Library-driven design assumes trusted application integration and
+tenant-specific code paths. GPU DB can borrow the per-call intent and rate
+limiters, but SQL clients cannot be expected to orchestrate WAL, MVCC,
+resident refresh, or GPU transfer correctness. The database runtime must own
+those protocols.
+
+The evaluation is for exabyte filesystem storage with HDD-backed chunks and
+metadata services, not low-latency OLTP. Reported PB-scale resource sharing
+and metadata QPS behavior should inform policy shape, not absolute GPU DB
+latency targets. Tectonic also accepts temporary durability tradeoffs for blob
+quorum appends because geo-replication and later re-encoding cover the use
+case; GPU DB must preserve WAL-before-visibility for committed SQL changes.
+
+**Benchmark candidates:**
+
+- Add a no-GPU tier-admission simulator with route classes for retained
+  lookup, cold point fetch, cold scan, resident refresh, COPY append, and
+  background compaction. Compare FIFO, per-session queues, and
+  TrafficClass-style grouped admission under bursty workloads.
+- Measure budgets in "tier time" rather than only bytes: NVMe queue wait,
+  host decode time, PCIe transfer time, GPU queue wait, kernel time, and
+  pinned-buffer hold time. Gate: overload rejections happen before expensive
+  fallback or repair paths amplify the load.
+- Prototype sealed-generation route metadata for resident P8 segments:
+  `relation_id`, `segment_id`, `sealed_wal_lsn`, `visibility_generation`,
+  `checksum`, `resident_tier`, `route_cache_epoch`, and `invalidated_at`.
+  Failure condition: a mutable or unsealed segment is routed as immutable.
+- Add a cold-tier hedged reservation experiment for large refresh batches:
+  reserve NVMe/host staging slots before issuing reads, then send data only to
+  admitted slots. Measure p99 refresh time and impact on Gold retained lookup
+  latency.
+- Add an "expensive reconstruction cap" benchmark: limit CPU fallback decode,
+  refetch, or refresh repair to a fixed fraction of read traffic and measure
+  whether p99 latency stays bounded during simulated device or segment
+  overload.
+- Add integrity checks around tier transformations: compressed page decode,
+  host-to-device staging, resident segment build, and repair/refetch. Gate:
+  corrupted transformation output is caught before resident publication.
+
+### 2026-06-04 - Cross-paper synthesis: retained resources need typed admission from metadata to GPU memory
+
+QueCC, the GPU multiversion B-tree, and Tectonic converge on the same systems
+lesson from different layers: high throughput comes from publishing intent
+early enough that the runtime can choose the right lane before scarce resources
+are consumed. QueCC needs declared read/write ranges to plan contention.
+MVGpuBTree needs snapshot scope and allocator epoch to make a resident GPU
+index safe. Tectonic needs TrafficGroup, TrafficClass, durability choice, and
+sealed metadata to keep a shared cold-storage fabric efficient.
+
+The design track for GPU DB should make route descriptors the shared language
+across these mechanisms. A prepared write route declares template, ranges,
+dependency edges, WAL batch, and visibility generation. A resident index route
+declares snapshot scope, supported predicates, versioned-node bytes, and
+epoch lag. A cold-tier route declares tier budget, expected bytes, checksum
+contract, and overload/fallback cap. All three become admission inputs, not
+just telemetry after the work has already hurt p99 latency.
+
+The remaining category gap is heterogeneous execution scheduling under mixed
+CPU/GPU pressure. The next high-value queue item should be a heterogeneous
+runtime/planning paper rather than another pure GPU analytics mechanism, with
+the specific benchmark priority of proving that route descriptors can choose
+between immediate CPU execution, GPU micro-batch, cold-tier fetch, and rejection
+under a latency budget.
+
+Benchmark priority: build a descriptor-driven scheduler simulator that combines
+the last three tracks. It should admit prepared writes, retained GPU index
+lookups, and cold-tier refreshes into bounded class queues, then report commit
+latency, read p99, retained-resource lifetime, epoch lag, and rejected work.
+The proof gate is not maximum throughput alone; it is stable p99 latency and
+correct visibility while background work is deliberately overloaded.
