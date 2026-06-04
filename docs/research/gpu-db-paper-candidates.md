@@ -2697,7 +2697,7 @@ Append new candidates here as each paper is processed.
   Why: cited as distributed OLTP concurrency-control work that links caching
   and timestamp visibility; useful for GPU DB's coherent retained snapshots and
   owner-visible generation routing.
-- `queued` — **STAR: Scaling Transactions through Asymmetric Replication**,
+- `reviewed` — **STAR: Scaling Transactions through Asymmetric Replication**,
   Lu, Yu, and Madden, PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p1316-lu.pdf`
   arXiv: `https://arxiv.org/abs/1811.02059`
@@ -2710,6 +2710,18 @@ Append new candidates here as each paper is processed.
   Why: the CIDR 2023 paper names Falcon as a modern alternative to directory
   invalidation; useful for comparing timestamped coherence with explicit
   invalidation for GPU/host resident-object directories.
+- `queued` — **Doppel: A Framework for Transactional Data Structures in
+  Modern Database Systems**, Neumann, Freitag, and Kemper, PVLDB 2018.
+  URL: `https://doi.org/10.14778/3275366.3275371`
+  Why: STAR cites Doppel as a related commutative-update direction; useful for
+  deciding when GPU DB write routes can safely treat increments, appends, or
+  aggregate maintenance as operation deltas instead of full value rewrites.
+- `queued` — **TAPIR: Building Consistent Transactions with Inconsistent
+  Replication**, Zhang et al., SOSP 2015.
+  URL: `https://doi.org/10.1145/2815400.2815404`
+  Why: STAR contrasts against transactional replication approaches that reduce
+  coordination; useful for comparing commit/replication boundaries when GPU DB
+  eventually adds replicated owners or remote accelerator pools.
 - `reviewed` — **Massively Parallel Multi-Versioned Transaction Processing**,
   Qian and Goel, OSDI 2024.
   URL: `https://www.usenix.org/conference/osdi24/presentation/qian`

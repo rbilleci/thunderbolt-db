@@ -34939,3 +34939,145 @@ untrusted user logic.
 - Keep any GPU-resident point index as rebuildable acceleration state. Proof
   gate: after crash/replay, CPU truth and route metadata can rebuild the same
   visible key set without trusting GPU memory or stale in-place records.
+
+### 2026-06-04 - STAR phase-switches ownership instead of paying distributed commit on every transaction
+
+**Citation:** Yi Lu, Xiangyao Yu, and Samuel Madden. "STAR: Scaling
+Transactions through Asymmetric Replication." PVLDB 12(11), 2019,
+pp. 1316-1329. doi:10.14778/3342263.3342270. Retrieved 2026-06-04
+from `https://www.vldb.org/pvldb/vol12/p1316-lu.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale; MVCC / snapshot / visibility.
+
+**Relevance tags:** asymmetric replication; transaction ownership;
+single-partition fast path; cross-partition fallback; epoch fences; Thomas
+write rule; phase switching; serializable OCC; high availability.
+
+**Core idea:** STAR starts from a useful asymmetry: keep both partitioned
+replicas and at least one full replica, then change which replica is master
+depending on the workload phase. Single-partition transactions run in a
+partitioned phase where each partition has one owner and can execute without
+distributed commit. Cross-partition transactions are deferred to a
+single-master phase where one full replica owns the whole database and can run
+those transactions locally with Silo-like OCC, again avoiding 2PC.
+
+The important transfer is the phase boundary. STAR does not try to make every
+transaction pay for the worst ownership pattern. It batches requests by
+partitionability, switches mastership at epoch-like fences, and uses the fence
+to drain asynchronous replication before the next phase begins. On YCSB and
+TPC-C experiments on four EC2 nodes, the paper reports that STAR can beat
+partitioning-based distributed OCC/S2PL by up to about 10x, beat synchronous
+replication baselines by at least 7x on YCSB and 15x on TPC-C, and outperform
+Calvin configurations by 4-11x. The authors also show a 10 ms phase iteration
+has about 2% overhead on a 4-node YCSB run.
+
+**Concrete mechanisms:**
+
+- Maintain asymmetric replicas: `f` full replicas that store every partition
+  and `k` partial replicas that collectively store partitioned copies.
+- During the partitioned phase, each partition is mastered by one partial node.
+  A single worker thread executes transactions for that partition serially, so
+  single-partition transactions need no record locks, read validation, or 2PC.
+- Cross-partition requests are deferred until the single-master phase. The
+  designated full replica becomes primary for all records and executes them
+  with a Silo-style OCC protocol: read TIDs into a read set, compute a local
+  write set, lock writes at commit, validate reads, assign a TID, install
+  writes, unlock, then replicate the write set.
+- Phase transitions use a replication fence. Nodes exchange committed-count
+  statistics, learn how many outstanding writes they must receive, wait until
+  replicated writes have been applied, and only then switch phase.
+- Phase lengths `tau_p` and `tau_s` are chosen from measured partitioned
+  throughput, single-master throughput, workload cross-partition fraction, and
+  a user-supplied iteration time. With uniformly arriving requests, expected
+  mean latency is roughly half the full iteration.
+- Replication inside a phase is asynchronous for throughput. Correctness across
+  out-of-order replicated writes uses record TIDs and the Thomas write rule:
+  apply a replicated write only if its TID is newer than the record's current
+  TID.
+- Partitioned-phase replication can use operation replication because each
+  partition has one writer and the replication stream preserves that serial
+  order. Single-master replication uses value replication because multiple
+  threads can update a partition and replicas may receive writes out of order.
+- Recovery uses per-worker local logs containing key, value, and TID, plus
+  checkpoints that need not be transactionally consistent. Replay repairs the
+  checkpoint with the Thomas write rule.
+- Failure detection occurs at replication fences. STAR reverts to the last
+  committed epoch, keeps two versions per record so current-phase writes can be
+  ignored, and degrades depending on which full or partial replica sets remain.
+- STAR supports serializability by default, can skip read validation for read
+  committed, and can support snapshot isolation by retaining committed versions,
+  but the paper does not make SI the central evaluated path.
+
+**GPU DB mapping:** STAR is a strong design analogy for GPU DB owner domains.
+The current runtime target already separates mutation, catalog, residency, GPU
+execution, and optional partition owners. STAR suggests those owners should
+not be static when workload shape changes. A hot single-partition or single-key
+lane can run on a partition owner with minimal synchronization, while
+multi-partition writes, DDL, residency publication, and route metadata changes
+can be deferred to a stronger owner phase instead of forcing every write
+through a global owner all the time.
+
+For write throughput, the phase idea maps to typed mutation batches:
+`partition_local_write`, `cross_partition_write`, `catalog_residency_write`,
+and `global_barrier_write`. The runtime can keep cheap single-owner work fast,
+then use explicit fences for the smaller set of operations that require global
+visibility or multiple owners. That is more promising than either one
+mutation owner forever or eager 2PC-like coordination for every multi-owner
+case.
+
+For snapshot and visibility design, STAR's fence is a useful publication
+frontier. GPU DB can treat WAL-safe generation boundaries, resident refresh
+publication, and old-snapshot retirement as named fences. Reads should report
+whether they waited for a visibility fence, a residency fence, or a response
+buffer/GPU queue. This keeps latency attribution honest and prevents
+cross-owner correctness work from being mislabeled as GPU saturation.
+
+For replication and cache placement, the asymmetric full/partial copy pattern
+looks like a future CPU/GPU tiering layout. A full CPU truth copy remains the
+recovery authority; partitioned GPU or host-resident copies own hot local
+execution; global or cross-partition work can route to a complete CPU owner or
+complete resident generation when the partitioned route would need too much
+coordination. Operation replication also maps to GPU cache maintenance:
+partition-local deltas can be compact operation descriptors, while
+multi-writer or out-of-order paths need full value/version payloads plus a TID
+or generation guard.
+
+**Risks and mismatches:** STAR assumes a full in-memory database copy on a
+single node. That is not acceptable as the only design for larger-than-memory
+GPU DB, where the full truth may span WAL/checkpoint/archive, CPU memory, and
+NVMe. Its phase switching deliberately defers cross-partition work, so p50/p99
+latency depends on the iteration time and may be wrong for interactive
+transactions that require immediate cross-owner execution. Partitioned-phase
+execution is serial per partition, which is great for simple local writes but
+may underuse CPU/GPU parallelism for expensive stored procedures.
+
+The paper's operation replication requires user-defined operation semantics and
+single-writer partition order. SQL updates with predicates, triggers, indexes,
+and MVCC old versions need stricter guards. The evaluation supports only
+selected YCSB and TPC-C transaction types and no range scans. Unknown from
+this read: how STAR behaves with high skew on the single master, large values,
+secondary-index-heavy workloads, and long read-only snapshots.
+
+**Benchmark candidates:**
+
+- Add a write-route classifier benchmark with `partition_local`,
+  `cross_partition`, and `catalog/residency` classes. Gate: each class exposes
+  owner queue time, fence wait, WAL wait, and abort/retry counts separately.
+- Prototype a phase-fenced mutation mode for two partition owners: local writes
+  execute on owners; cross-partition writes wait for a global phase and run
+  through one stronger owner. Compare against always-global ownership and
+  eager two-owner coordination.
+- Add fence telemetry for retained reads: visibility fence wait, residency
+  publication wait, GPU queue wait, and response-ring wait. Failure condition:
+  a blocked visibility frontier is reported as accelerator saturation.
+- Test operation-delta versus value-delta cache refresh for partition-local
+  GPU resident segments. Operation deltas are allowed only when one owner
+  provides a deterministic order; otherwise use full value/version deltas with
+  generation checks.
+- Build a cross-partition fraction sweep for write-heavy benchmarks, varying
+  0%, 1%, 5%, 10%, 25%, and 50% cross-owner mutations. Measure throughput,
+  p50/p99 latency, aborted/redeferred work, and fence overhead.
+- Add recovery proof for phase-fenced metadata: replay WAL/checkpoint state,
+  ignore uncommitted current-fence cache updates, and reconstruct the same
+  route metadata generation before any GPU cache is trusted.
