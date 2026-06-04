@@ -618,7 +618,7 @@ Append new candidates here as each paper is processed.
   Why: combines learned optimizer search with DBMS operator restrictions and
   beam search; relevant to adding learned GPU route suggestions without
   surrendering deterministic planner guardrails.
-- `queued` — **Robust Query Processing in Co-Processor-Accelerated
+- `reviewed` — **Robust Query Processing in Co-Processor-Accelerated
   Databases**, Bress et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2882936`
   Why: SiliconDB contrasts adaptive runtime scheduling with static
@@ -758,6 +758,21 @@ Append new candidates here as each paper is processed.
   Why: follow-up to PARQO that focuses on parametric robust query
   optimization and plan-penalty profile caching; relevant to repeated retained
   GPU route templates and admission-time route reuse.
+- `queued` — **Fluid Co-processing: GPU Bloom-filters for CPU Joins**,
+  Gubner et al., DaMoN 2019.
+  URL: `https://doi.org/10.1145/3329785.3329934`
+  PDF: `https://t1mm3.github.io/assets/papers/damon19.pdf`
+  Why: modern follow-up to robust co-processor placement that uses GPU work as
+  selective early pruning for CPU joins; relevant to split CPU/GPU fragments,
+  predicate-transfer placement, and transfer-aware route budgets.
+- `queued` — **Architecting a Pluggable Query Executor for Emerging
+  Co-Processors**, Gurumurthy, PhD thesis 2024.
+  URL: `https://opendata.uni-halle.de//handle/1981185920/117483`
+  DOI: `https://doi.org/10.25673/115529`
+  Why: recent co-processor query executor design that decomposes operators into
+  reusable task/device layers; useful for deciding whether GPU DB route
+  descriptors should expose device-specific kernels, portable fragments, or a
+  layered execution abstraction.
 - `reviewed` — **Hints for Robust Query Performance Tuning**, Xiu et al.,
   PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p5327-xiu.pdf`

@@ -33099,3 +33099,176 @@ rather than letting dependency chains grow without bound.
 - Compare reduced DFS cycle checks with a topological-order maintenance
   variant in a synthetic batch planner. Gate: cycle-check CPU time must remain
   a small fraction of total batch execution time under skewed TPC-C-like keys.
+
+### 2026-06-04 - Robust co-processor routes need data-residency and heap budgets
+
+**Citation:** Sebastian Breß, Henning Funke, and Jens Teubner. "Robust Query
+Processing in Co-Processor-accelerated Databases." SIGMOD 2016, pp. 1891-1906.
+DOI: `https://doi.org/10.1145/2882903.2882936`. Retrieved 2026-06-04 from
+the ACM DOI page, the TU Dortmund publication page,
+`https://dbis.cs.tu-dortmund.de/en/publications/2016/robust-query-processing/`,
+and an accessible PDF mirror,
+`https://readingxtra.github.io/docs/db_GPU/BrebSIGMOD2016.pdf`.
+
+**Category:** query optimization / planning; GPU execution / analytics;
+multi-tier cache / data placement.
+
+**Relevance tags:** CPU/GPU route choice; accelerator memory residency;
+device-cache thrashing; heap contention; runtime operator placement;
+operator-level admission; CPU fallback; PCIe transfer avoidance; robust
+co-processor scheduling.
+
+**Core idea:** The paper argues that GPU acceleration is unsafe as a static
+"GPU is faster" decision because two resource failures dominate real workloads:
+the working set may not fit in accelerator memory, and concurrent operators may
+exhaust device heap/intermediate-result memory. Their remedy is to route
+operators to the accelerator only when their inputs are already resident, then
+limit accelerator operator concurrency through a runtime "query chopping"
+layer.
+
+The strongest transferable idea is that route choice needs two different
+budgets: a residency budget for source data and a temporary-state budget for
+operators in flight. A GPU route can be locally faster and still make the whole
+system slower if it triggers repeated CPU-GPU transfers, evicts useful resident
+columns, or admits too many intermediate-producing operators at once.
+
+**Concrete mechanisms:**
+
+- CoGaDB uses a CPU fallback handler for each operator. On accelerator memory
+  allocation failure, it aborts and restarts only the failed operator on CPU
+  instead of aborting the full query.
+- The paper identifies cache thrashing when the query working set exceeds the
+  accelerator data cache. In their selection workload, this caused up to a 24x
+  degradation because columns were repeatedly evicted and reloaded.
+- Data-driven operator placement reverses the usual operator-driven placement
+  order: a storage adviser first pins frequently used access structures in
+  accelerator memory, then the query processor sends an operator to the
+  accelerator only if all required input data is resident there.
+- The cache manager uses access counters over columns/access structures and
+  periodically fills accelerator memory with the most frequently used structures.
+  Eviction is protected with reference counters so running operators can finish.
+- Operator chains continue on the accelerator from leaves only while each
+  operator's inputs are resident. When an n-ary operator needs a nonresident
+  input, the remaining plan segment runs on CPU to avoid transfer-driven
+  slowdown.
+- Heap contention appears when multiple accelerator operators execute in
+  parallel and their combined memory footprint exceeds device capacity. In the
+  paper's selection workload, seven or more parallel users crossed the GPU
+  memory limit for their platform.
+- Compile-time placement reacts poorly to an operator abort because downstream
+  operators may still be fixed to the GPU, forcing extra data copies after the
+  failed operator has moved to CPU.
+- Runtime operator placement separates strategic planning from tactical
+  placement. It chooses placement after input relations and current load are
+  known, and can keep downstream work on CPU after an accelerator abort.
+- Query chopping is a progressive runtime optimizer. It inserts leaf operators
+  from multiple queries into a global operator stream; parent operators enter
+  the stream only after children finish.
+- Physical processors have ready queues pulled by worker threads. This creates
+  an operator-level concurrency cap for the co-processor without admitting only
+  one whole query at a time.
+- Data-driven chopping combines both ideas: execute only resident-input
+  operators on the co-processor, bound co-processor operator concurrency, and
+  continue on CPU after faults because the output is no longer resident on the
+  co-processor.
+- Evaluation uses CoGaDB on SSBM and selected TPC-H queries with a GTX 770 and
+  4 GB device memory. Reported effects include up to 24x cache-thrashing
+  degradation, up to 6x heap-contention slowdown, up to 48x lower CPU-to-GPU
+  transfer time for SSBM under many users, and better average robustness than
+  GPU-only or static hybrid routes. Absolute numbers are old-hardware and OLAP
+  specific.
+
+**GPU DB mapping:** P8 already treats GPU memory as a versioned performance
+cache rather than durable truth. This paper sharpens the planner contract:
+`resident_valid` is not enough. A retained route should also prove that all
+required columns, indexes, text buffers, visibility metadata, and output layout
+fragments are already resident or cheap enough to transfer under a stated
+latency budget.
+
+The temporary-state budget maps directly to GPU execution workers. Each route
+family should declare expected scratch bytes, pinned-buffer bytes, output bytes,
+and intermediate cardinality risk. Admission should reject, delay, split, or CPU
+fallback before multiple "valid" GPU routes collectively exhaust scratch memory
+and cause allocator-level failure.
+
+Query chopping maps well to the runtime's command and execution rings. Instead
+of scheduling a whole SQL plan to the GPU, the planner can expose GPU-capable
+fragments with dependencies. Ready fragments enter per-device/per-route rings;
+parents are admitted only after child fragments publish outputs and updated
+placement facts. This gives the runtime a natural place to cap accelerator
+concurrency while keeping short CPU work and fallback paths moving.
+
+The data-driven idea also fits multi-tier placement. GPU DB should route work to
+data, not data blindly to work: hot generation-resident columns in HBM, warm
+compressed segments in host memory, cold segments on NVMe, and CPU fallback when
+the transfer plus eviction cost would damage the route budget. The cost model
+should include the opportunity cost of evicting a resident snapshot needed by
+other sessions.
+
+For 1M logical sessions, the operator-level lesson is stronger than the OLAP
+benchmark itself. Session admission should not only count sessions or requests;
+it should count scarce per-route resources: resident bytes, scratch bytes,
+pinned staging buffers, queued GPU fragments, and expected response bytes.
+
+**Risks and mismatches:** The paper evaluates an operator-at-a-time OLAP engine,
+not a transactional MVCC database. It assumes materialized operators and does
+not address WAL-before-visibility, write conflicts, snapshot invalidation, or
+GPU-resident MVCC generations. Its access-counter data placement is simple and
+may be too coarse for skewed transactional hot sets, mixed write/read
+visibility, or text-heavy layouts.
+
+The hardware is dated and PCIe/GPU memory behavior has changed, so the absolute
+speedups should not be imported. The mechanism remains relevant because modern
+GPUs still have bounded HBM, bounded scratch/pinned memory, and expensive
+movement relative to resident execution. CPU fallback must also be bounded; if
+all rejected GPU work falls into one mutation owner or CPU worker pool, the
+system merely moves the bottleneck.
+
+**Benchmark candidates:**
+
+- Add a route-budget simulator with two resource dimensions: resident input
+  bytes and temporary scratch/output bytes. Gate: admission avoids artificial
+  OOM/fallback storms under mixed retained scans, lookups, and aggregates.
+- Extend retained route telemetry with `required_resident_bytes`,
+  `scratch_bytes`, `pinned_bytes`, `output_bytes`, `eviction_cost`, and
+  `fallback_reason`. Failure condition: a GPU route is admitted with unknown
+  temporary-state demand.
+- Implement a CPU-only query-fragment scheduler that admits ready fragments
+  through per-route rings and unlocks parents on completion. Compare whole-query
+  GPU admission, fragment-level chopping, and CPU fallback under a mixed
+  retained-read workload.
+- Create a transfer-thrash benchmark: alternate same-shape queries over column
+  sets larger than a synthetic HBM budget. Gate: data-driven routing avoids
+  repeated promotion/eviction and reports explicit CPU fallback.
+- Add a scratch-contention benchmark for batched retained aggregates with
+  configurable intermediate cardinality. Gate: p95 latency remains bounded
+  because admission caps concurrent scratch-heavy fragments.
+- Tie P8 eviction experiments to route opportunity cost: evicting a valid hot
+  snapshot should be charged against subsequent query latency, not treated as
+  free memory recovery.
+
+### 2026-06-04 - Cross-paper synthesis: robust routes need separate truth, residency, and scratch contracts
+
+Eigen, GaccO, No False Negatives, and Robust Co-Processor Query Processing
+converge on a common design track: the engine should separate durable truth,
+execution placement, and transient execution capacity. Eigen makes capacity a
+layered resource flow, GaccO keeps the CPU database primary while batching
+same-shape GPU work, No False Negatives makes conflict acceptance explicit, and
+Breß/Funke/Teubner show that accelerator routes collapse when residency and
+heap budgets are treated as afterthoughts.
+
+The next GPU DB route descriptor should therefore carry four typed contracts:
+truth boundary, visibility/conflict boundary, resident-input boundary, and
+temporary-state boundary. A route is admissible only when all four are known
+or when an explicit fallback owns the unknown. Queue depth alone is not a
+sufficient admission signal; two queued requests can have radically different
+effects if one reuses a resident key vector and the other forces eviction plus
+large intermediate buffers.
+
+Category gaps after this cluster remain transaction recovery under GPU-resident
+acceleration, index/predicate protection for retained snapshots, and modern
+multi-device/network-aware placement. Benchmark priority should move toward a
+route-budget harness before real GPU benchmarking resumes: simulate resident
+bytes, scratch bytes, pinned buffers, conflict edges, and fallback pools in one
+admission model so that later CUDA kernels cannot hide a broken scheduling
+contract.
