@@ -31028,3 +31028,184 @@ uncertainty, recency windows, and deterministic fallback thresholds.
 - Compare residual-cost learning against cardinality learning as separate
   planner signals. The DACE hypothesis is that residual latency correction
   should be useful before a full learned cardinality estimator is trustworthy.
+
+### 2026-06-04 - Heterogeneous aggregations split a pipeline by calibrated fragments
+
+**Citation:** Artem Kroviakov, Petr Kurapov, Christoph Anneser, and
+Jana Giceva. "Heterogeneous Intra-Pipeline Device-Parallel
+Aggregations." DaMoN 2024. Retrieved 2026-06-04 from the TUM author
+PDF, `https://www-db.cs.tum.edu/~anneser/heterogeneous_aggregations.pdf`;
+DOI: `https://doi.org/10.1145/3662010.3663441`.
+
+**Category:** GPU execution / analytics and query optimization /
+planning.
+
+**Relevance tags:** CPU/GPU co-execution; fragment scheduling; grouped
+aggregation; route choice; calibrated cost model; morsel-driven
+parallelism; result merge cost; GPU caching; interconnect pressure.
+
+**Core idea:** The paper argues against treating an analytical operator
+as exclusively CPU-owned or GPU-owned. For morsel-driven systems, a
+single aggregation pipeline can be split horizontally across CPU cores
+and a GPU by assigning fixed-size table fragments to each device, then
+merging partial aggregation results on the CPU. The reported benefit is
+up to 1.5x over the fastest exclusive executor when the table is large,
+the GPU input is cached or cheap to transfer, computation dominates
+transfer, and the output is not so large that merge or result transfer
+erases the gain.
+
+The important lesson is not "always split work." The authors show a
+heterogeneity valley: depending on group count, table size, fragment
+count, interconnect generation, cache state, and per-device
+implementation quality, the best point may be CPU-only, GPU-only, or a
+specific CPU/GPU proportion. This makes the paper a good companion to
+the recent robust-route and planner-residual papers: the route should
+declare the split and its uncertainty instead of hiding it inside a
+single GPU yes/no decision.
+
+**Concrete mechanisms:**
+
+- A fragment is a fixed-size horizontal table partition whose columns
+  are expected to be contiguous during execution. Unlike a classic
+  morsel-to-task mapping, the GPU may process multiple fragments in one
+  kernel to amortize launch overhead.
+- The execution policy assigns fragment proportions to devices, such as
+  30% GPU and 70% CPU. The scheduler passes kernels over fragment
+  buffers to CPU or GPU processing units and collects device-local
+  partial results.
+- Aggregations require a CPU-side merge step for overlapping group
+  results. The paper observes that result-group cardinality and merge
+  overhead can dominate even when device execution is fast.
+- The prototype in HDK/OmniSciDB compiles a query through an HDK IR to
+  LLVM JIT for CPU and device-specific representations such as NVVM or
+  SPIR-V for GPU. CPU kernels and GPU kernels are launched
+  asynchronously, then joined before result merge.
+- The cost model detects computational graph patterns, called dwarfs,
+  calibrates their execution time for each device across input sizes and
+  parameters, fits hyperplanes, and searches for the fragment
+  distribution with minimal estimated execution time.
+- Calibration is expensive and hardware-specific. The authors explicitly
+  name adaptive scheduling as a likely future complement because fixed
+  fragments can leave stragglers, especially when the GPU transfer or
+  final fragment blocks the merge.
+- HDK's original GPU-centric infrastructure assumed few large fragments.
+  More CPU-friendly fragment counts exposed buffer-manager free-slot
+  search overhead and metadata-copy overhead, which the prototype
+  addressed with a free-buffer index and shared fragment metadata.
+- Experiments use two aggregation queries over 64-bit grouping columns
+  and double aggregates, with up to hundreds of millions of rows and
+  group counts from hundreds to millions. Machine 1 uses PCIe 3.0 and an
+  NVIDIA Quadro RTX 6000; Machine 2 uses PCIe 5.0 and an Intel GPU Max
+  1100. The paper reports that better interconnect and transfer logic
+  reduce the cold-data penalty, while hot cached runs are more favorable
+  to co-execution.
+
+**GPU DB mapping:** The immediate GPU DB mapping is a split-route
+descriptor for retained aggregate and scan families. Instead of choosing
+only `CPU_AGG` or `GPU_RESIDENT_AGG`, the planner can represent
+`CPU_GPU_SPLIT_AGG` with fragment count, GPU fragment set, CPU fragment
+set, resident/cache state, merge bytes, expected result groups,
+temporary HBM bytes, pinned host bytes, and fallback legality. That
+route should be valid only after deterministic snapshot and residency
+checks pass.
+
+The fragment abstraction fits P8 resident column groups if the storage
+engine aligns resident chunks with scheduler fragments. A fragment
+should not be only a planner fiction; it should map to a stable resident
+segment, host column chunk, or cold-transfer unit so cache invalidation,
+refresh, and transfer accounting stay observable. The paper's warning
+about metadata-copy overhead is directly relevant to 1M-session scale:
+fragment descriptors must be shared, immutable, and small enough that
+admission does not allocate or copy per request.
+
+For retained reads, the strongest transferable idea is opportunistic
+co-execution under a latency ceiling. A hot aggregate can run CPU-only
+when the GPU queue is saturated or result groups are tiny, GPU-only when
+the resident data and output shape favor it, and split when CPU work can
+cover GPU transfer/launch/merge tails. The same idea can apply to
+over-resident cold scans: CPU can process warm host fragments while GPU
+processes resident fragments, but only if the merge contract preserves
+snapshot boundaries.
+
+The cost-model pattern calibration also maps to route templates. The GPU
+DB does not need a universal learned optimizer before exploiting this.
+It can calibrate a small set of route dwarfs: resident scan, resident
+grouped aggregate, cold-transfer scan, CPU host aggregate, response
+merge, and result encoding. DACE-style residual learning could then
+correct those deterministic estimates after telemetry accumulates.
+
+**Risks and mismatches:** This is an analytical aggregation paper, not a
+transaction-processing or MVCC design. It does not address WAL,
+visibility publication, write admission, SQL constraints, long-running
+snapshot retirement, or many concurrent network sessions. The prototype
+also focuses on cached data for many favorable cases; cold input transfer
+can eliminate the co-execution advantage.
+
+The merge step is the biggest mismatch for low-latency retained reads.
+Large group counts can make CPU merge and result transfer dominate, so a
+split route can be slower than a simpler exclusive route. Fixed
+fragments also risk tail latency unless adaptive draining or
+late-fragment reassignment is added. Finally, calibration cost and
+hardware specificity mean this should be a benchmark-driven route, not a
+default planner assumption.
+
+**Benchmark candidates:**
+
+- Add a no-GPU route-control benchmark that simulates
+  `CPU_AGG`, `GPU_RESIDENT_AGG`, and `CPU_GPU_SPLIT_AGG` with configurable
+  fragment counts, group counts, transfer latency, GPU queue delay, and
+  merge cost. Gate: the planner chooses split only inside the measured
+  heterogeneity valley.
+- When GPU hardware is available, benchmark resident grouped aggregates
+  over aligned column-group fragments with CPU-only, GPU-only, and split
+  execution. Measure p50/p99 latency, total throughput, GPU utilization,
+  CPU utilization, merge time, launch count, and result bytes.
+- Add fragment metadata telemetry:
+  `route_fragment_count`, `gpu_fragment_count`, `cpu_fragment_count`,
+  `fragment_descriptor_bytes`, `fragment_metadata_copy_count`,
+  `merge_input_groups`, `merge_time_us`, and `split_route_reason`.
+- Test cold versus hot split routes. Failure condition: the planner picks
+  a split route when cold H2D transfer erases the CPU-side gain or when
+  the GPU queue is already saturated beyond the latency target.
+- Add an adaptive tail benchmark where the last few fragments may be
+  reassigned from GPU to CPU or CPU to GPU based on remaining-time
+  telemetry. Proof gate: reassignment lowers p99 without violating
+  snapshot generation, result ordering, or response ownership.
+- Validate storage alignment: resident P8 column chunks should be usable
+  as scheduler fragments without per-query materialization. Failure
+  condition: fragment materialization or descriptor copying dominates
+  the retained-read path.
+
+### 2026-06-04 - Cross-paper synthesis: split routes need semantic gates before learned correction
+
+DACE, NWR, and heterogeneous intra-pipeline aggregation point toward a
+route system that separates semantic eligibility from performance
+ranking. DACE can correct planner residuals, but only after the
+deterministic planner has proved a route is legal. NWR can omit or
+coalesce writes, but only for explicitly non-visible blind overwrites.
+Heterogeneous aggregation can split work across CPU and GPU, but only
+when fragment alignment, snapshot boundaries, transfer state, and merge
+cost make the route valid.
+
+The converging design track is typed route eligibility followed by typed
+route budgeting. A route descriptor should first answer: is this
+snapshot visible, is this write omittable, is this resident layout
+compatible, is this CPU/GPU split mergeable, and is fallback allowed?
+Only after those answers are deterministic should cost residuals,
+fragment proportions, or adaptive feedback decide whether the route is
+worth taking.
+
+The category gap after this mini-batch is still write-heavy transaction
+execution under mixed route pressure. NWR helps a narrow blind-write
+class, while the planner and aggregation papers mostly improve read-side
+route choice. The next few reviews should keep a transaction,
+concurrency, MVCC, or runtime-admission bias unless a GPU paper directly
+answers a resident index or cold-tier execution question.
+
+Benchmark priorities should therefore combine legality and performance
+in the same harness: invalid snapshot routes must be rejected even if the
+learned residual likes them; non-omittable writes must go through WAL and
+visibility even if coalescing would reduce churn; split aggregates must
+fall back when merge or transfer budgets exceed the latency target. The
+first proof gate is stable correctness under adversarial route hints, not
+peak aggregate throughput.

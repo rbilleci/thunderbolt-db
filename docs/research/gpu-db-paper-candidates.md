@@ -325,9 +325,10 @@ Append new candidates here as each paper is processed.
   Why: follow-up GPU join work on scaling join state and data movement across
   RDMA-connected GPUs; relevant to future multi-device and network-aware
   route planning.
-- `queued` — **Heterogeneous Intra-Pipeline Device-Parallel Aggregations**,
+- `reviewed` — **Heterogeneous Intra-Pipeline Device-Parallel Aggregations**,
   Kroviakov et al., DaMoN 2024.
   URL: `https://doi.org/10.1145/3662010.3663441`
+  PDF: `https://www-db.cs.tum.edu/~anneser/heterogeneous_aggregations.pdf`
   Why: recent aggregation work across CPU/GPU devices; useful follow-up for
   deciding when grouped aggregation stays on GPU, splits by fragment, or falls
   back to CPU under mixed route pressure.
@@ -536,6 +537,13 @@ Append new candidates here as each paper is processed.
   Why: FileScale contrasts namespace partitioning and caching approaches with
   distributed-transaction metadata; useful for evaluating route-cache
   placement, replication, and cache-invalidation options.
+- `queued` — **A Morsel-Driven Query Execution Engine for Heterogeneous
+  Multi-Cores**, Dursun et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p2218-dursun.pdf`
+  DOI: `https://doi.org/10.14778/3352063.3352137`
+  Why: SiliconDB-style adaptive push scheduling and queueing model for
+  heterogeneous processing units; useful for comparing fixed GPU/CPU fragment
+  proportions with adaptive queue sizing under accelerator pressure.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
