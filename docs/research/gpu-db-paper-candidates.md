@@ -899,7 +899,7 @@ Append new candidates here as each paper is processed.
   Why: decentralized logging and checkpointing foundation used by Umbra;
   relevant to WAL-before-visibility, batch commit, replay, and separating
   durable authority from rebuildable GPU residency state.
-- `queued` — **Understanding Manycore Scalability of File Systems**,
+- `reviewed` — **Understanding Manycore Scalability of File Systems**,
   Min et al., USENIX ATC 2016.
   URL:
   `https://www.usenix.org/conference/atc16/technical-sessions/presentation/min`
@@ -918,6 +918,12 @@ Append new candidates here as each paper is processed.
   Why: hybrid disk/in-memory transactional architecture cited by the Umbra
   MVCC paper; useful as a contrast point for hot working-set placement and
   contention reduction across CPU memory and durable storage.
+- `queued` — **SpanFS: A Scalable File System on Fast Storage Devices**,
+  Kwon et al., USENIX ATC 2015.
+  URL: `https://www.usenix.org/conference/atc15/technical-session/presentation/kwon`
+  Why: manycore file-system scalability follow-up using partitioning to reduce
+  lock contention; useful for comparing partitioned cold-tier metadata and
+  resident-placement ownership against locality loss.
 - `reviewed` — **Eiffel: Efficient and Flexible Software Packet Scheduling**,
   Saeed et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/saeed`

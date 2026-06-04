@@ -38397,3 +38397,190 @@ visibility, and snapshot invalidation.
   DB this means index pages, row-id maps, visibility vectors, string
   offsets, and segment directories. Benchmark whether placing metadata in
   HBM and payload in host/NVMe beats all-or-nothing segment residency.
+
+### 2026-06-04 - Manycore file systems expose hidden cold-tier contention
+
+**Citation:** Changwoo Min, Sanidhya Kashyap, Steffen Maass, Woonhak
+Kang, and Taesoo Kim. "Understanding Manycore Scalability of File
+Systems." USENIX ATC 2016, pages 71-85. Retrieved 2026-06-04 from the
+USENIX publication page and PDF,
+`https://www.usenix.org/conference/atc16/technical-sessions/presentation/min`.
+
+**Category:** Runtime / HFT / session scale; multi-tier cache / data
+placement.
+
+**Relevance tags:** manycore scalability; filesystem contention;
+metadata locks; page cache; dentry cache; direct IO; journaling;
+copy-on-write; log-structured storage; cold-tier placement; benchmark
+methodology.
+
+**Core idea:** The paper shows that file systems can be the hidden
+scalability bottleneck for otherwise parallel applications, even when
+storage bandwidth is not saturated and application-level contention
+looks low. FXMARK isolates file-system components with 19
+microbenchmarks, then checks application behavior with Exim, RocksDB,
+and DBENCH on ext4, XFS, btrfs, F2FS, and tmpfs.
+
+The strongest transferable lesson for GPU DB is that cold-tier and
+metadata routes must be benchmarked for shared-kernel-object
+contention, not only for bandwidth. Faster SSDs, NVMe, GPUDirect, or
+CXL-like tiers do not remove global journal locks, inode locks,
+directory locks, page-reference counters, dentry reference counters, or
+rename serialization. A route that looks embarrassingly parallel at SQL
+or storage-segment level can still collapse if many sessions touch the
+same filesystem object, directory, page-cache line, journal transaction,
+or metadata tree root.
+
+**Concrete mechanisms:**
+
+- FXMARK stresses seven components: pathname resolution, page cache for
+  buffered IO, inode management, disk block management, file-offset to
+  block mapping, directory management, and consistency mechanisms.
+- The benchmark varies sharing level. Examples include private-file
+  block reads, private offsets in one shared file, the same block in one
+  shared file, private versus shared-directory creates/unlinks, and
+  private versus shared-directory renames.
+- The evaluation runs one process per core pinned up to 80 physical
+  cores and drops memory caches before each run. It profiles user,
+  system, idle, iowait, perf events, and selected kernel functions.
+- A page-cache hit can still fail to scale. Reading the same cached
+  block from one shared file contends on per-page reference counters and
+  cache-line coherence rather than storage bandwidth.
+- Dentry-cache hits can fail similarly. Shared pathname resolution
+  contends on `dentry->d_lockref`, so the hottest cached path can become
+  slower than less-local paths under many cores.
+- Linux serializes rename through a system-wide `rename_lock` seqlock to
+  preserve dentry consistency. Concurrent rename-heavy transactional
+  update patterns therefore hit a global route, not just a directory or
+  file route.
+- Shared-directory operations are serialized by a per-directory inode
+  mutex in VFS. Even directory reads such as `readdir()` are sequential
+  when many workers use one directory.
+- Concurrent updates to one shared file are serialized by an exclusive
+  file lock in tested file systems. The paper calls this especially
+  relevant to databases and virtual machines that use a large file with
+  multiple IO threads, including direct-IO paths.
+- Consistency mechanisms are core bottlenecks. ext4/XFS journaling,
+  btrfs copy-on-write B-tree updates, and F2FS log-structured
+  checkpointing/segment metadata introduce file-system-wide or
+  tree-root contention.
+- The paper reports 25 bottlenecks across VFS and the five tested file
+  systems, including `rename_lock`, `inode_sb_list_lock`,
+  `inode->i_mutex`, `page->_count`, `dentry->d_lockref`,
+  `journal->j_state_lock`, XFS log locks, btrfs tree locks, F2FS NAT/SIT
+  locks, and tmpfs capacity/cgroup counters.
+- Faster storage does not guarantee scalability. For buffered reads and
+  contending operations, RAMDISK/SSD/HDD differences are not dominant;
+  the lock and reference-counter path dominates.
+- Partitioning can reduce RAMDISK contention for Exim and RocksDB, but
+  on HDD it can hurt RocksDB by destroying spatial locality. The paper
+  treats partitioning as a useful but workload- and device-sensitive
+  tool rather than a universal fix.
+
+**GPU DB mapping:** P8 already treats WAL/checkpoint/archive and CPU
+canonical state as durable authority while GPU residency is rebuildable
+acceleration state. This paper argues that the cold-tier authority path
+needs the same owner and route discipline as GPU memory. Putting WAL
+segments, checkpoints, archive manifests, resident segment files, or
+cold partitions into a conventional filesystem can reintroduce global
+or per-object contention that the GPU runtime carefully avoided.
+
+For WAL and checkpointing, the actionable mapping is preallocation,
+segmentation, and owner-local append paths. A million logical sessions
+should not indirectly create, rename, unlink, grow, or fsync many files
+through a shared directory or shared journal hot spot. The mutation
+owner should publish durable work through bounded log segment ownership,
+then hand off archival, compaction, and cleanup through separate lanes
+with visible filesystem-operation budgets.
+
+For cold data placement, this is a warning against using "one big file"
+or "one hot directory" as an unmeasured implementation detail. A single
+shared file can serialize writes or contend on inode/page-cache
+metadata; many small files in one directory can serialize directory
+operations and dentry updates; many partitions can reduce lock
+contention but harm spatial locality. The P8 cold-tier layout should
+choose segment granularity with both route-locality and kernel-object
+contention in mind.
+
+For retained snapshots and resident metadata, pathname and dentry
+contention maps to route-cache and catalog naming. Snapshot handles,
+resident segment directories, and row-id maps should be stable in
+process memory and referenced by immutable generation IDs on hot paths,
+not repeatedly resolved through filesystem names or global metadata
+structures during query admission.
+
+For runtime/session scale, the paper reinforces typed admission. Cold
+route admission should include filesystem metadata operations, journal
+or fsync lanes, page-cache/dentry-cache hit contention, and direct-IO
+inode contention as separate resources. Queue depth alone is not enough
+if every queued item will hit the same kernel lock.
+
+**Risks and mismatches:** The paper studies Linux 4.2-era file systems
+on an 80-core CPU machine, not a modern kernel with io_uring, newer XFS
+and ext4 changes, NVMe arrays, SPDK, GPUDirect Storage, CXL tiers, or a
+GPU database engine. Some specific lock names and bottlenecks may have
+changed. The durable lesson is the measurement shape and the warning
+against hidden shared objects, not the exact 2016 throughput ranking of
+filesystems.
+
+FXMARK is a microbenchmark suite. It deliberately isolates components,
+so a production GPU DB still needs end-to-end WAL, checkpoint, archive,
+refresh, cold-scan, and recovery tests. The paper also does not provide
+a database storage-engine design; it tells us which kernel/file-system
+paths can sabotage one if left unmeasured.
+
+**Benchmark candidates:**
+
+- Add a cold-tier filesystem-contention benchmark that varies one shared
+  file, per-partition files, many files in one directory, and sharded
+  directories. Measure p50/p95/p99 for reads, appends, preallocated
+  overwrites, renames, unlinks, fsyncs, and recovery scans.
+- Add WAL/checkpoint segment tests with preallocated fixed-size files
+  versus growing files. Proof gate: write throughput and p99 commit
+  latency do not collapse as IO worker count rises.
+- Measure directory and manifest churn separately from payload IO:
+  create/rename/unlink resident segment manifests while retained reads
+  run. Failure condition: metadata operations stall short retained
+  lookups or mutation commit publication.
+- Compare buffered IO, `O_DIRECT`, mmap, and any future SPDK/GPUDirect
+  path for the same cold-partition route. Required metrics: CPU system
+  time, lock/profile hot spots, page-cache hits, HBM/host/NVMe bytes,
+  and tail latency under concurrent sessions.
+- Add kernel-object contention telemetry to route experiments:
+  per-file/per-directory operation counts, fsync lane depth, open file
+  count, page-cache hit/miss counters where available, and perf lock
+  samples during cold-tier stress.
+- Test segment partitioning against locality. Vary segment shard count
+  and directory fanout; require both high manycore throughput and stable
+  sequential scan efficiency before adopting a layout.
+- Keep hot route names out of the filesystem path. Benchmark generation
+  ID lookups in process memory versus repeated pathname/manifest lookups
+  for resident snapshot admission.
+
+### 2026-06-04 - Cross-paper synthesis: storage routes need hidden-contention budgets
+
+Stage, Hyperion, and FXMARK describe different layers of the same
+problem. Stage says route prediction should be hierarchical and
+uncertainty-aware; Hyperion says GPU/NVMe routes need explicit pipeline
+budgets for submission, completion, cache lookup, and PCIe movement;
+FXMARK says the storage layer beneath those routes can still collapse on
+kernel locks, reference counters, directory serialization, and
+consistency metadata.
+
+The converging design track is a route envelope that prices invisible
+shared state before admission. For GPU DB, a route is not just
+CPU-versus-GPU or resident-versus-cold. It is a reservation over snapshot
+generation, HBM bytes, pinned buffers, GPU stream time, IO-submission
+lanes, completion lanes, NVMe queues, response buffers, filesystem
+metadata operations, and mutation/WAL publication. Learned or cached
+route decisions are useful only if the key includes those correctness
+and resource dimensions.
+
+Category gaps remain around modern DB-owned storage stacks, SPDK or
+GPUDirect Storage in database systems, and OLTP-oriented cold-tier
+recovery under many sessions. The next benchmark priority is a
+mixed-route stress harness: short retained lookups plus long cold scans,
+checkpoint/archive churn, and concurrent WAL appends. The proof gate is
+stable retained-read p99 and commit-publication latency while the system
+names the bottlenecking resource instead of merely reporting that a GPU
+or disk route is slow.
