@@ -2322,10 +2322,12 @@ Append new candidates here as each paper is processed.
   Why: AOCC cites BCC as a low-overhead false-abort reduction baseline; useful
   for GPU DB contention handling where serializable write lanes should avoid
   unnecessary aborts without weakening visibility guarantees.
-- `queued` — **CRDV: Conflict-free Replicated Data Views**, Faria and Pereira,
+- `reviewed` — **CRDV: Conflict-free Replicated Data Views**, Faria and Pereira,
   PACMMOD 2025.
-  URL: `https://doi.org/10.1145/3725291`
-  Author page: `https://nuno-faria.github.io/publications`
+  URL: `https://doi.org/10.1145/3709675`
+  Author page: `https://nuno-faria.github.io/crdv/`
+  PDF:
+  `https://repositorio.inesctec.pt/bitstreams/2fe68b69-5453-4943-bc3c-a42b9a78c8e3/download`
   Why: MRVs leaves open whether randomized splitting generalizes beyond
   numeric bounded counters; CRDV appears to continue the same line of
   application-visible replicated/derived data structures for reducing
@@ -2561,3 +2563,14 @@ Append new candidates here as each paper is processed.
   Why: FastLanes contrasts decompression-first layouts with scan-first
   bit/byte-sliced layouts; useful for resident predicate scans and point
   lookups when full materialization is unnecessary.
+- `queued` — **Keep CALM and CRDT On**, Laddad et al., PVLDB 2022.
+  URL: `https://doi.org/10.14778/3574245.3574268`
+  Why: CRDV cites it as prior work on analyzing arbitrary queries over
+  CRDTs; useful for deciding which retained/replicated derived views are
+  monotonic enough to run without owner coordination.
+- `queued` — **Conflict-free Replicated Relations for Multi-Synchronous
+  Database Management at Edge**, Yu and Ignat, IEEE SMDS 2020.
+  URL: `https://doi.org/10.1109/SMDS49396.2020.00020`
+  Why: CRDV contrasts against relational CRDT approaches with simpler
+  conflict semantics; useful as a baseline for SQL-native replicated route
+  tables, derived counters, and edge/session-local state.

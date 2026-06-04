@@ -29954,3 +29954,158 @@ predictions for query execution throughput.
   segments and cold chunks. Compare prefix/subtree maintenance
   convenience against storage overhead, rename/repartition cost, and
   hot route lookup latency.
+
+### 2026-06-04 - CRDV makes replicated conflict resolution a queryable view stack
+
+**Citation:** Nuno Faria and Jose Pereira. "CRDV: Conflict-free
+Replicated Data Views." Proc. ACM Manag. Data 3(1), Article 25,
+SIGMOD 2025. doi:10.1145/3709675. Retrieved 2026-06-04 from
+`https://repositorio.inesctec.pt/bitstreams/2fe68b69-5453-4943-bc3c-a42b9a78c8e3/download`;
+project page `https://nuno-faria.github.io/crdv/`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; query optimization / planning.
+
+**Relevance tags:** conflict-free replicated data; asynchronous
+replication; coordination avoidance; derived views; materialized views;
+vector clocks; causal present; query optimizer; local transactions;
+hotspot writes; edge/local-first data.
+
+**Core idea:** CRDV argues that conflict-free replicated data should
+not be hidden inside opaque CRDT blobs when a SQL engine can express
+and optimize the merge itself. It represents replicated data as three
+relational layers: History stores local and remote writes, Present
+filters History down to the causal present, and Value applies
+application-specific conflict-resolution rules as SQL views. This keeps
+merge semantics, indexes, materialization, and user queries inside the
+optimizer's scope.
+
+The paper is not a strong-consistency OLTP design. It targets eventual
+convergence under asynchronous replication, with local ACID semantics
+at each site and cross-site ACID left as future work. The transferable
+idea is narrower and useful: when coordination can be avoided safely,
+store the update history and resolution metadata in queryable
+structures instead of making conflict resolution an external black box.
+
+**Concrete mechanisms:**
+
+- Writes to the application-facing Value layer are redirected by
+  rules/triggers into inserts on the History layer. The stored row
+  includes application key/data plus operation metadata such as add or
+  remove, originating site, logical timestamp, and optional physical
+  timestamp for last-writer-wins rules.
+- Logical timestamps are vector clocks. A new local write computes its
+  timestamp from the current Present maximums and increments the local
+  site component, avoiding a separate central clock table.
+- Present filters obsolete versions by causality. A row is obsolete
+  when another row for the same key has a strictly later vector
+  timestamp; concurrent rows remain visible to the Value layer.
+- Present can be implemented as `no-mat`, `sync`, or `async`. `no-mat`
+  filters History at read time. `sync` eagerly materializes Present
+  inside the same transaction as the History write. `async` combines a
+  materialized snapshot with recent History and periodically merges
+  batches.
+- Value views encode conflict resolution in SQL: last-writer-wins via
+  ranking by physical timestamp, add-wins/remove-wins filters,
+  multi-value registers with aggregation, numeric average/min/max, and
+  counter sums over split per-site values.
+- PostgreSQL logical replication propagates History inserts between
+  sites. The implementation publishes only local inserts; after rows
+  are materialized into Present they can be removed from local History
+  without delete propagation.
+- Remote merge work is batched by a background worker. Rows from the
+  same transaction are grouped using PostgreSQL `xmin`, and obsolete
+  History cleanup is done atomically with materialization.
+- Timestamp encoding is benchmarked as a first-class design choice.
+  The paper compares relational rows, arrays, JSON, and geometry/cube
+  encodings; array timestamps are chosen for low latency and storage
+  overhead in the implementation.
+- Planner visibility matters. A predicate on a Value view can be pushed
+  into Present and use an index; adding an index on a conflict-resolved
+  attribute improves a range query from a table scan to indexed access
+  in the reported plan example.
+- Evaluation in PostgreSQL compares CRDV with native SQL, ElectricSQL,
+  Pg_crdt, and Riak KV. The reported results favor `sync` for read-heavy
+  workloads and `async` for write-heavy or high-contention workloads;
+  CRDV's row-granular representation avoids full-object rewrites and
+  whole-object reads that affect opaque CRDT implementations.
+
+**GPU DB mapping:** CRDV maps cleanly to derived state inside GPU DB:
+retained route tables, per-session or per-tenant counters, materialized
+hot aggregates, invalidation summaries, and conflict-tolerant
+denormalized metadata. These are not the canonical WAL/MVCC table
+state, but they can reduce owner coordination if their merge and
+visibility semantics are explicit and queryable.
+
+The History/Present/Value split is a useful shape for retained derived
+state. History corresponds to durable append records or per-owner
+update logs. Present corresponds to the currently causally valid
+frontier for a route, cache entry, counter, or derived view. Value
+corresponds to the SQL-visible or planner-visible projection that
+readers actually use. Keeping those layers queryable means the planner
+can still push predicates, choose indexes, and decide whether a GPU
+resident view is valid for a request.
+
+For write throughput, CRDV's `sync` versus `async` materialization knob
+maps to refresh policy. A hot derived view can either update its
+Present state in the mutation transaction, paying write latency to make
+reads cheap, or append History and let a background merge publish a new
+retained generation. GPU DB should expose this as a policy per derived
+route, not as one global cache rule.
+
+For session concurrency, conflict-free derived state could avoid
+central owner traffic for commutative or monotonic updates. Examples
+include approximate session counters, admission telemetry, route hit
+counts, and possibly application-visible bounded counters when the
+semantics are acceptable. The important guard is that user data still
+needs WAL-before-visibility and the configured isolation model; CRDV is
+a tool for selected derived/replicated structures, not a replacement
+for MVCC correctness.
+
+For multi-tier placement, the view-stack model suggests keeping cold
+History in durable storage, warm Present materialization in host memory,
+and hot Value projections or indexes in GPU memory. Promotion and
+demotion should be decided at the layer that actually pays: if reads
+only touch Value, keep Value resident; if merge backlog dominates, keep
+Present materialization and timestamp indexes hot.
+
+**Risks and mismatches:** CRDV is eventually consistent across sites.
+It explicitly does not solve cross-site ACID transactions, serializable
+isolation, WAL-before-visibility for canonical table data, GPU
+execution, or SQL phantom safety. Vector clocks grow with the number
+of sites and add storage/index overhead. `async` materialization can
+make reads more expensive while recent History accumulates, while
+`sync` can serialize hotspot writes. Conflict-resolution rules must be
+chosen by application semantics; using add-wins or last-writer-wins on
+ordinary SQL rows can lose business invariants. The implementation and
+numbers are PostgreSQL-based, not GPU-resident.
+
+**Benchmark candidates:**
+
+- Add a no-GPU derived-view harness with History/Present/Value layers
+  for route-hit counters, invalidation summaries, and one materialized
+  hot aggregate. Compare `sync` materialization, `async` batch merge,
+  and no materialization under read-heavy and write-heavy mixes.
+- Prototype row-granular derived counters for session/admission
+  telemetry. Gate: commutative updates avoid a global owner queue while
+  exact SQL-visible counters still fall back to WAL/MVCC authority.
+- Add a retained route-table experiment where route History is durable,
+  Present is generation-filtered, and Value is an indexed projection
+  used by admission. Gate: planner/route predicates must push into the
+  materialized layer and reject stale generations.
+- Benchmark vector-clock-like frontier encodings for route ownership
+  and partition freshness: per-owner arrays, relational rows, and
+  compact generation bitsets. Metrics: storage bytes, lookup latency,
+  merge cost, and stale-route rejection accuracy.
+- Test `sync` versus `async` refresh publication for a derived hot
+  aggregate backed by WAL history. Failure condition: async backlog
+  makes read latency unbounded, or sync refresh drops write throughput
+  below the owner-lane target.
+- Add a negative benchmark for non-commutative or invariant-sensitive
+  updates. Gate: the route-contract simulator must refuse CRDV-style
+  coordination avoidance unless the merge rule is declared and its
+  invariant risk is explicit.
+- Measure a three-tier derived-state layout: durable History on disk,
+  host-memory Present with timestamp indexes, and GPU-resident Value
+  projection. Metrics: merge backlog, HBM bytes, read p50/p99,
+  promotion/demotion events, and correctness after crash replay.
