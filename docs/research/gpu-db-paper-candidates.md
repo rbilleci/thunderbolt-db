@@ -2216,14 +2216,22 @@ Append new candidates here as each paper is processed.
   Why: Tiered-Indexing cites F2 as skewed log-structured storage work; useful
   for comparing record hotness, write buffering, and skew adaptation against
   GPU DB hot/cold resident lookup placement.
-- `queued` — **Spooky: Granulating LSM-Tree Compactions Correctly**,
+- `reviewed` — **Spooky: Granulating LSM-Tree Compactions Correctly**,
   Dayan et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p3071-dayan.pdf`
-  DOI: `https://doi.org/10.14778/3551793.3551843`
+  DOI: `https://doi.org/10.14778/3551793.3551853`
   Why: F2 contrasts against LSM compaction policies; Spooky is a modern
   compaction-granularity baseline for deciding whether GPU DB cold-tier
   segment refresh should move whole runs, partitions, pages, or smaller
   key-range fragments.
+- `queued` — **DLC: A New Compaction Scheme for LSM-tree with High Stability
+  and Low Latency**, Jin et al., EDBT 2021.
+  URL: `https://edbt2021proceedings.github.io/docs/p137.pdf`
+  DOI: `https://doi.org/10.5441/002/edbt.2021.65`
+  Why: Spooky cites DLC as related LSM stability work; useful for comparing
+  compaction scheduling that reduces latency spikes against Spooky's
+  granularity-oriented write/space amplification control for cold-tier segment
+  refresh.
 - `queued` — **RocksDB: Evolution of Development Priorities in a Key-value
   Store Serving Large-scale Applications**, Dong et al., ACM TOS 2021.
   URL: `https://doi.org/10.1145/3483840`

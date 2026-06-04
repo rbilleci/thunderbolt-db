@@ -33422,3 +33422,135 @@ saved launch overhead beats occupied SMs, polling overhead, and queueing delay.
 - For future hardware, run a GPUDirect/GDS topology probe before full DB
   benchmarks: CPU-to-CPU, CPU-to-GPU, GPU-to-CPU, and storage-to-GPU bandwidth,
   with NIC/GPU locality recorded as part of benchmark metadata.
+
+### 2026-06-04 - Spooky granulates LSM compaction by largest-level boundaries
+
+**Citation:** Niv Dayan, Tamar Weiss, Shmuel Dashevsky, Michael Pan,
+Edward Bortnikov, and Moshe Twitto. "Spooky: Granulating LSM-Tree
+Compactions Correctly." PVLDB 15(11): 3071-3084, 2022. Retrieved
+2026-06-04 from the VLDB PDF,
+`https://www.vldb.org/pvldb/vol15/p3071-dayan.pdf`; DOI
+`https://doi.org/10.14778/3551793.3551853`.
+
+**Category:** multi-tier cache / data placement, with write-path storage
+maintenance.
+
+**Relevance tags:** LSM compaction; cold-tier segment refresh; write
+amplification; space amplification; SSD garbage collection; sequential file
+lifetime; partitioned merge; tier-aware storage maintenance.
+
+**Core idea:** Spooky argues that LSM compaction granularity is a first-order
+storage-engine design variable, not an implementation detail. Full-level merge
+has low write amplification but needs nearly duplicate space while the largest
+level is rewritten. Partial merge reaches high device utilization, but it
+rewrites non-overlapping edge data and physically intermixes files with
+different lifetimes, increasing both compaction work and SSD garbage-collection
+work as the device fills.
+
+Spooky's answer is to partition the largest level into equally sized files and
+partition selected smaller large levels using those same largest-level key
+boundaries. Compaction can then merge one perfectly overlapping partition group
+at a time. Smaller levels still use full preemptive merge, where transient
+space is cheap because those levels are small. The design also limits how many
+files are written simultaneously and writes/deletes within each level
+sequentially, so SSD erase blocks are less likely to mix hot and cold file
+lifetimes.
+
+In RocksDB experiments, the paper reports that Spooky stores the same logical
+data size as partial merge while reducing total write amplification by about
+2.5x in the highlighted uniform experiment. It also reports more than 2x lower
+space amplification than full merge and more than 2x lower write amplification
+than partial merge in the headline tradeoff. The exact constants are SSD- and
+configuration-dependent; the transferable claim is the boundary-aligned
+granularity policy.
+
+**Concrete mechanisms:**
+
+- Use the largest level's file boundaries as the partition contract for several
+  large lower levels, so merged groups overlap exactly instead of dragging in
+  non-overlapping edge keys.
+- Introduce a tuning parameter `X`: below `X`, use full preemptive merge; from
+  `X` upward, use partitioned preemptive merge based on largest-level
+  boundaries. The paper finds `L - 2` practical in its RocksDB setup because it
+  reduces transient space without exploding open-file count.
+- Split or coalesce largest-level files during partitioned merge so file sizes
+  remain near `N_L / T` bounds despite skewed deletes or changing data size.
+- Trigger dynamic capacity adaptation after level growth/shrink to keep durable
+  space amplification bounded.
+- Restrict concurrent file-writing classes: buffer flush, full preemptive
+  merge, and partitioned merge. This reduces physical interleaving of files with
+  different lifetimes inside SSD erase units.
+- Implement as a RocksDB compaction picker plus output partitioning policy,
+  using background compaction threads and sub-compactions rather than changing
+  point/range read semantics.
+
+**GPU DB mapping:** For P8, the main transfer is that cold-tier maintenance
+should be boundary-aligned with future read and refresh routes. If CPU/WAL
+truth, compressed host segments, NVMe runs, and GPU resident snapshots all use
+different boundaries, refresh will repeatedly move edge data that does not
+belong to the hot route. Spooky suggests choosing a stable boundary contract for
+cold segments first, then deriving host and GPU refresh chunks from it.
+
+This maps cleanly to retained GPU snapshots. A resident refresh should be able
+to say "refresh partition group 42 at visibility generation G" rather than
+"scan whatever files overlap this table today." That boundary can carry key
+range, source WAL frontier, tombstone/version metadata, compressed byte budget,
+and estimated GPU transfer cost. Partition groups then become schedulable units
+for admission, invalidation, refresh, and eviction.
+
+Spooky also reinforces that write amplification and read latency interact. A
+background cold-tier refresh policy that keeps rewriting unneeded edges will
+not only waste NVMe bandwidth; it will interfere with retained reads, WAL
+replay, checkpointing, and GPU warmup. The runtime should therefore expose
+maintenance bandwidth and cold-tier write amplification as route pressure, not
+hide it under a generic storage thread.
+
+For 1M logical sessions, the useful shape is not an LSM tree per se. It is the
+idea that many sessions can share coarse immutable boundary descriptors while
+maintenance updates one boundary group at a time. Session admission can then
+bound work by active groups, dirty groups, refresh groups, and pinned snapshots
+instead of by raw connection count.
+
+**Risks and mismatches:** Spooky is an LSM key-value compaction paper, not a
+relational MVCC engine or GPU database paper. It does not solve SQL visibility,
+WAL-before-visibility, secondary indexes, DDL invalidation, GPU kernel
+scheduling, or multi-version tuple semantics. Its RocksDB implementation uses
+background compaction threads and file-level metadata; P8 may use columnar
+segments, compressed chunks, and resident GPU layouts instead.
+
+The experiments use one writer thread, one query thread for read measurements,
+a 960GB Samsung NVMe SSD, 16 background compaction threads, 16-byte keys, and
+512-byte values. Those constants do not directly predict GPU DB behavior.
+Spooky's SSD garbage-collection benefit also depends on physical file placement
+and device firmware, both opaque. If P8 stores cold data on object storage,
+CXL-backed memory, ZNS SSDs, or explicit GPUDirect paths, the same boundary idea
+still needs separate validation.
+
+There is also a metadata tradeoff. Moving `X` lower creates smaller partitions
+and lower transient space, but increases open files and metadata. For GPU DB,
+the analogous danger is too many tiny refresh groups, which can increase route
+metadata, launch overhead, compression dictionaries, and snapshot-retirement
+state.
+
+**Benchmark candidates:**
+
+- Build a cold-segment simulator with three policies: whole-run refresh,
+  arbitrary overlapping chunks, and largest-boundary-aligned chunks. Measure
+  rewritten bytes, edge bytes moved, transient bytes, and p95 read latency under
+  mixed append/update/delete plus retained reads.
+- Add a P8 route-descriptor field for `segment_boundary_id` and require
+  retained refresh, eviction, and cold fallback telemetry to report boundary
+  group, source WAL frontier, and bytes moved.
+- Test `X`-like granularity for GPU refresh: table, coarse partition, fine
+  partition, and page/chunk. Failure condition: metadata/open-handle overhead or
+  kernel-launch overhead erases the saved transfer bytes.
+- Add a maintenance-interference benchmark where cold compaction/refresh runs
+  beside retained point lookups and scans. Gate: route latency remains bounded
+  and maintenance bandwidth is visible as a separate pressure metric.
+- For NVMe tiers, compare sequential boundary-group writes/deletes against
+  interleaved small writes using real device counters where available. Minimum
+  proof gate: lower device write amplification or lower p99 read latency under
+  the same logical update rate.
+- Simulate skewed hot/cold key movement and verify that boundary-group refresh
+  can split/coalesce groups without breaking snapshot visibility or producing
+  unbounded tiny groups.
