@@ -44682,3 +44682,128 @@ workload management before returning to GPU analytics.
   retained-read active window.
 - Add telemetry that separates queue wait caused by beneficial conflict
   avoidance from queue wait caused by false positive scheduling delays.
+
+### 2026-06-04 - DINT keeps frequent transaction steps inside the kernel datapath
+
+**Citation:** Yang Zhou, Xingyu Xiang, Matthew Kiley, Sowmya
+Dharanipragada, and Minlan Yu. "DINT: Fast In-Kernel Distributed
+Transactions with eBPF." NSDI 2024, pp. 401-417. Retrieved
+2026-06-04 from the USENIX publication page and PDF,
+`https://www.usenix.org/conference/nsdi24/presentation/zhou-yang`.
+
+**Category:** runtime / high-concurrency networking / transaction
+processing.
+
+**Relevance tags:** eBPF; XDP; transaction admission; kernel datapath;
+distributed OLTP; lock manager; write-back cache; per-CPU logging;
+rare-path fallback; CPU-efficient networking.
+
+**Core idea:** DINT shows that kernel networking does not have to mean
+slow transaction processing if the frequent transaction path is moved to
+early kernel hooks and the uncommon path remains in user space. Instead
+of treating the kernel as a packet pipe into a user-space transaction
+server, DINT runs lock, small key-value, and log operations in eBPF maps
+at XDP/TC hooks, rewrites request packets into responses, and sends only
+overflow or unsupported cases to a normal UDP user-space backup process.
+
+The paper's most transferable idea is a split admission contract:
+accelerate only operations whose state shape is verifier-friendly,
+bounded, and common, while making fallback explicit and measurable. On
+TATP and SmallBank, DINT reports higher maximum throughput than a
+Caladan/DPDK-style baseline, with modest unloaded latency penalties from
+interrupt-driven processing. The exact numbers are not directly
+portable to SQL or GPU execution, but the shape is useful for million
+logical sessions: put stable request classification and tiny admission
+state close to packet arrival, then hand off only legal route
+descriptors to owner rings.
+
+**Concrete mechanisms:**
+
+- XDP handles frequent request packets before normal socket traversal;
+  TC egress performs bookkeeping for responses that went through the
+  user-space rare path. eBPF cannot generate arbitrary packets, so DINT
+  modifies request packets into response packets.
+- The lock manager uses fixed-size eBPF array maps and lock sharing
+  instead of dynamic hash-table collision chains. Shared lock state is
+  synchronized with low-level eBPF atomics. Same-client collisions are
+  treated specially to avoid self-deadlock on exclusive locks.
+- DINT supports both read-write locks for 2PL-style workloads and
+  version-based locks for OCC-style workloads. Read validation still
+  depends on version rechecks; the kernel path is an acceleration of
+  protocol operations, not a weaker isolation model.
+- The key-value path uses an in-kernel set-associative cache with
+  fixed-size value slots, per-bucket locks, valid bits, dirty bits, and
+  overflow buckets in user space. Dirty entries are lazily written back.
+- A per-bucket Bloom filter avoids sending many non-existing key lookups
+  through the user-space rare path.
+- The log manager uses per-CPU in-kernel log buffers for frequent-path
+  logging while leaving recovery/replay to user space. The prototype did
+  not implement full failure recovery.
+- CPU placement matters: DINT keeps rare-path user-space threads away
+  from cores receiving NIC interrupts/eBPF work. The paper reports a
+  severe throughput drop when interrupt processing and application work
+  are naively collocated.
+
+**GPU DB mapping:** DINT should not push SQL execution into eBPF. The
+useful mapping is an edge admission and routing layer before pgwire work
+enters heavier engine owners. A GPU DB packet or protocol-edge worker
+could maintain fixed-size, bounded route metadata for common operations:
+session id, route class, relation/partition id, key hash, snapshot
+requirement, priority, and response-ring target. If the request is a
+single-packet, same-shape retained lookup or mutation admission probe,
+the edge layer can classify it, apply cheap saturation/priority checks,
+and enqueue a compact descriptor to the right owner ring. Anything that
+requires parsing complex SQL, allocating variable state, consulting
+catalog state, or touching MVCC version chains remains a user-space
+owner responsibility.
+
+The lock-sharing lesson maps to route-class admission, not database
+locks: bounded hashed counters for hot keys or route classes can be
+allowed to over-conservatively collide if collisions only cause delay or
+fallback, never false visibility. The write-back-cache lesson maps to
+protocol-edge metadata caches: dirty or route-changing state must have a
+clear publication path back to the owner, and Bloom filters are useful
+only when false positives cause extra fallback rather than incorrect
+answers. Per-CPU logging suggests measuring per-worker admission logs or
+trace buffers for debugging route decisions without serializing every
+packet through one global queue.
+
+**Risks and mismatches:** DINT targets sharded in-memory key-value
+transactions over UDP, with small requests that fit in one Ethernet
+packet. SQL parsing, prepared statements, result sets, TLS, multi-packet
+messages, and arbitrary row sizes do not fit the same eBPF shape. eBPF's
+fixed-size maps, bounded loops, lack of dynamic allocation, and limited
+synchronization make it a poor place for catalog, MVCC, planner, or GPU
+residency logic. The prototype assumes failure recovery off the critical
+path and does not implement full recovery. The use of UDP and
+client-side timeouts is also a mismatch for pgwire/TCP unless the design
+is limited to classification and telemetry rather than transaction
+execution.
+
+**Benchmark candidates:**
+
+- Build a protocol-edge classifier benchmark that parses only enough
+  frontend state to tag requests as retained lookup, write admission,
+  refresh, complex SQL, or fallback. Minimum gate: identical behavior to
+  the current pgwire path when classification is disabled.
+- Add a bounded route-class counter table keyed by relation, partition,
+  route shape, and key hash. Collisions may delay or fall back but must
+  never allow stale snapshot use. Measure p50/p99 admission latency and
+  false-delay rate under hot-key skew.
+- Compare three network-worker paths under many idle/logical sessions:
+  current thread-per-connection baseline, epoll/io_uring user-space
+  multiplexing, and an XDP/eBPF prefilter that only counts and tags
+  packets before user-space parsing. Track CPU usage at low load and
+  throughput at saturation.
+- Prototype per-worker admission trace buffers rather than a global log:
+  request id, route class, queue depth, snapshot generation, fallback
+  reason, and enqueue timestamp. Failure condition: telemetry changes
+  hot-path throughput by more than 5%.
+- Measure interrupt/core placement for future IO workers: collocated
+  protocol parsing plus readiness handling versus separated NIC/parse
+  and owner-ring cores. Use p99 queue wait and CPU burn as the primary
+  gate, not only peak throughput.
+- Test a Bloom-filter-like negative route cache for unsupported
+  predicates or nonresident partitions. False positives may send work to
+  fallback; false negatives must not bypass the owner or read stale
+  resident data.

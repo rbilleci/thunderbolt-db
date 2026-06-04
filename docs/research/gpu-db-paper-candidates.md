@@ -2042,12 +2042,26 @@ Append new candidates here as each paper is processed.
   baseline; useful for evaluating whether decentralized commit coordination
   can reduce owner or shard-leader bottlenecks without speculative rollback
   machinery.
-- `queued` — **DINT: Fast In-Kernel Distributed Transactions with eBPF**,
+- `reviewed` — **DINT: Fast In-Kernel Distributed Transactions with eBPF**,
   Zhou et al., NSDI 2024.
   URL: `https://www.usenix.org/conference/nsdi24/presentation/zhou-yang`
+  PDF: `https://www.usenix.org/system/files/nsdi24-zhou-yang.pdf`
   Why: Mako cites DINT among recent fast distributed transaction systems;
   relevant to comparing kernel/eBPF-assisted transaction routing with GPU DB's
   user-space rings, admission queues, and protocol-edge ownership.
+- `queued` — **Electrode: Accelerating Distributed Protocols with eBPF**,
+  Zhou, Wang, Dharanipragada, and Yu, NSDI 2023.
+  URL: `https://www.usenix.org/conference/nsdi23/presentation/zhou`
+  Why: DINT builds on the broader idea of moving distributed-protocol
+  frequent paths into eBPF; useful for deciding whether GPU DB should use
+  kernel-side protocol classification or keep all route-state transitions in
+  user-space owner rings.
+- `queued` — **Xenic: SmartNIC-Accelerated Distributed Transactions**,
+  Schuh et al., SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483565`
+  Why: DINT contrasts against SmartNIC transaction offload; useful for
+  comparing eBPF/kernel-side admission with future NIC/DPU-side transaction
+  routing and request steering.
 - `queued` — **Ocean Vista: Gossip-based Visibility Control for Speedy
   Geo-Distributed Transactions**, Fan and Golab, PVLDB 2019.
   URL: `https://doi.org/10.14778/3342263.3342644`
