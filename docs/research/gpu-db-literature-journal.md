@@ -36960,3 +36960,135 @@ queue interference and publication risk.
   but unpublished, then verify no stale route becomes selectable after replay.
 - Measure when speculative refresh or compressed/offloaded execution pays back
   before invalidation by counting queries served per publication generation.
+
+### 2026-06-04 - RTIndeX maps resident indexes onto RTX BVH traversal
+
+**Citation:** Justus Henneberg and Felix Schuhknecht. "RTIndeX:
+Exploiting Hardware-Accelerated GPU Raytracing for Database Indexing."
+PVLDB Vol. 16 preprint / arXiv 2303.01139v2, 2023. Retrieved
+2026-06-04 from `https://arxiv.org/abs/2303.01139`.
+
+**Category:** GPU execution / analytics; resident indexing.
+
+**Relevance tags:** GPU-resident indexes; ray-tracing cores; BVH traversal;
+OptiX; point lookups; range lookups; read-only snapshots; resident route
+selection; hardware-specialized execution; batched lookup joins.
+
+**Core idea:** RTIndeX asks whether a DBMS can stop hand-building every GPU
+index from scratch and instead map database lookup to hardware already present
+on RTX GPUs. The paper represents indexed integer keys as objects in a
+ray-tracing scene, builds an OptiX bounding volume hierarchy over them, and
+answers point or range lookups by firing rays through the key space. The
+ray-tracing hardware performs BVH traversal and intersection tests; the hit
+program returns row ids.
+
+The result is not a universal GPU index replacement. RTIndeX is competitive
+with comparison-based GPU indexes for point lookups, does especially well for
+high-miss and high-skew point workloads because BVH traversal can abort early,
+and improves faster than traditional baselines across RTX hardware
+generations. But the paper is equally clear that build time, temporary memory,
+final memory footprint, and updates are weak points. The authors conclude that
+RX should be used in a read-only fashion.
+
+**Concrete mechanisms:**
+
+- Each indexed key is converted into a 3D primitive in an OptiX scene. The
+  primitive's position encodes the key, and its position in the vertex buffer
+  corresponds to the row id returned on intersection.
+- Lookups are launched as an OptiX pipeline, similar to a CUDA kernel launch.
+  A ray-generation program converts each lookup into ray parameters and calls
+  `optixTrace`; an any-hit program records intersected row ids.
+- Point lookups can be expressed as single-key range rays or perpendicular
+  rays. The selected configuration uses perpendicular rays for point lookups.
+- Range lookups are expressed as rays across the interval. In the 64-bit key
+  mode, wide ranges may require multiple rays because key bits are split
+  across dimensions.
+- OptiX uses `float32` coordinates, so the paper evaluates key encodings.
+  Naive mode only supports a restricted contiguous key range; extended mode
+  reaches more distinct keys through an order-preserving float-bit mapping;
+  3D mode splits a 64-bit key into three coordinate components.
+- The selected RX configuration uses 3D mode, compacted triangle BVHs, and
+  lookup-performance-oriented settings. AABB primitives reduce memory pressure
+  in some cases but need software intersection code, while triangles exploit
+  hardware intersection directly.
+- The evaluation is fully GPU-resident: key arrays, index structure, value
+  arrays, lookups, and aggregation of returned values stay on the GPU.
+- Baselines include WarpCore GPU hash tables, a state-of-the-art GPU B+-tree,
+  and a sorted-array binary-search baseline.
+- Batch size matters. The paper reports that small lookup batches underutilize
+  GPU resources; saturation occurs only once enough lookup work is submitted.
+- Updates through OptiX dynamic update support are problematic. Updates cannot
+  add or remove primitives, require extra memory, and can degrade BVH quality
+  badly when keys move far. Full rebuilds preserve lookup performance better.
+- For point lookups, hash tables are usually strongest, but RX is competitive
+  with order-based indexes. RX benefits from misses and skew because the BVH
+  can prune traversal early and reduce memory traffic.
+- For range lookups, B+-tree and sorted-array layouts are stronger as
+  selectivity grows because they find the lower bound and then scan adjacent
+  entries, while RX still identifies qualifying entries through intersections.
+- RX uses substantially more memory than the compared indexes in the reported
+  2^26-key setup, both during build and after compaction.
+- The paper reports better relative RX improvement from Turing to Ampere/Ada
+  GPUs than several traditional baselines, but future hardware trends remain
+  an extrapolation, not a guarantee.
+
+**GPU DB mapping:** RTIndeX is most useful as a route-design warning and a
+benchmark target for resident secondary indexes. It says an RTX/BVH path could
+be a specialized retained-read route for immutable generations, not a
+general-purpose mutable index. GPU DB should only consider it for published
+resident snapshots where the key vector, row-id mapping, and source visibility
+boundary are frozen until the next generation.
+
+The strongest transferable idea is to treat alternative GPU hardware units as
+route families with explicit workload envelopes. An RT-core route might be
+eligible for batched equality lookups with high miss rates, skewed probe
+distributions, or index-join probe batches, but not for write-heavy indexes,
+large range scans, or low-batch interactive reads that cannot amortize launch
+and traversal setup.
+
+The paper also reinforces that resident index metadata needs to be part of the
+snapshot descriptor. An RX-like index would need table identity, column
+identity, source WAL/visibility boundary, row-id mapping, key encoding mode,
+primitive type, BVH build options, device architecture, memory footprint,
+supported predicates, and invalidation generation. If any of those differ from
+the incoming query route, CPU/GPU hash/B-tree/scan fallback should win.
+
+For the P8 storage design, RTIndeX argues against trying to update a GPU BVH in
+place on each mutation. The safer design is generation rebuild or delta-plus-
+base routing: build the RT/BVH index from an immutable resident segment, route
+newer deltas through CPU or conventional GPU structures, and publish a merged
+generation only after rebuild crosses the durable publication frontier.
+
+**Risks and mismatches:** RTIndeX is a stand-alone index benchmark rather than
+a complete DBMS design. It does not cover SQL planning, MVCC visibility,
+concurrent sessions, WAL/recovery, DDL invalidation, GPU memory pressure,
+joins beyond lookup-batch motivation, text keys, composite keys, nulls, or
+mixed CPU/GPU execution. It assumes GPU-resident data and large batches; that
+does not automatically fit p50-sensitive OLTP reads. The OptiX/BVH internals
+are proprietary, so behavior under future hardware, driver versions, and
+multi-tenant GPU sharing needs direct measurement. The memory footprint and
+poor update story make it unsuitable for first-line mutable OLTP indexes.
+
+**Benchmark candidates:**
+
+- Add a resident-index route matrix comparing CPU index lookup, GPU scan, GPU
+  hash table, GPU B-tree or sorted array, and an RT/BVH prototype if hardware
+  support exists. Measure p50/p95 latency, throughput, HBM bytes, build time,
+  temporary memory, and route eligibility.
+- Benchmark RT/BVH-style lookups only on immutable published generations.
+  Proof gate: any mutation or publication-boundary mismatch invalidates the
+  route before execution; stale row ids must never be returned.
+- Use batched equality probes with controlled hit rate, skew, and batch size.
+  Expected win condition: high-miss or high-skew batches reduce memory traffic
+  enough to beat comparison-based resident lookup.
+- Test range predicates separately. Failure condition: range selectivity makes
+  RT/BVH slower than sorted-array, B-tree, bitmap, or plain resident scan
+  routes after result scattering.
+- Measure rebuild economics under append/update rates: queries served per
+  resident generation, BVH build time, peak memory, and invalidation frequency.
+  Reject the route if rebuild cost consumes the generation before enough reads
+  amortize it.
+- Add a planner guardrail for specialized hardware routes: require device
+  architecture support, sufficient batch depth, immutable snapshot identity,
+  supported key encoding, and memory-budget admission before the route is
+  considered.

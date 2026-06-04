@@ -487,7 +487,7 @@ Append new candidates here as each paper is processed.
   Why: RTCUDB cites RTScan as the main RT-core scan baseline; useful for
   isolating predicate-only ray tracing from RTCUDB's fused scan/group/aggregate
   mapping.
-- `queued` — **RTIndex: Exploiting Hardware-Accelerated GPU Raytracing for
+- `reviewed` — **RTIndex: Exploiting Hardware-Accelerated GPU Raytracing for
   Database Indexing**, Henneberg and Schuhknecht, arXiv 2023.
   URL: `https://arxiv.org/abs/2303.01139`
   Why: RTCUDB cites RTIndex as related RT-core indexing work; useful for
@@ -532,6 +532,17 @@ Append new candidates here as each paper is processed.
   Why: RTScan's main CPU/CUDA baseline; useful for comparing two-layer bitmap
   filtering, refinement cost, memory footprint, and update limitations against
   GPU-resident predicate-index experiments.
+- `queued` — **A GPU Multiversion B-Tree**, Awad, Porumbescu, and Owens,
+  PACT 2022.
+  URL: `https://doi.org/10.1145/3559009.3569681`
+  Why: RTIndeX compares against the Owens group GPU B+-tree line; a
+  multiversion GPU tree is directly relevant to resident index snapshots,
+  batched lookups, and update/version support that RTIndeX lacks.
+- `queued` — **Learned Index on GPU**, Zhong et al., ICDE Workshops 2022.
+  URL: `https://doi.org/10.1109/ICDEW55742.2022.00024`
+  Why: RTIndeX identifies learned GPU indexes as a related accelerator-friendly
+  route; useful for comparing BVH/RT-core lookup against model-guided
+  resident lookup and route-cost calibration.
 - `reviewed` — **Facebook's Tectonic Filesystem: Efficiency from Exascale**,
   Pan et al., FAST 2021.
   URL: `https://www.usenix.org/conference/fast21/presentation/pan`
