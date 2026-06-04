@@ -2347,7 +2347,7 @@ Append new candidates here as each paper is processed.
   Why: the GPU OLTP concurrency-control study identifies GaccO as the
   strongest high-conflict/write-heavy GPU-oriented baseline; useful for
   transaction batching, CPU/GPU co-execution, and conflict staging.
-- `queued` — **An Analysis of Concurrency Control Protocols for
+- `reviewed` — **An Analysis of Concurrency Control Protocols for
   In-Memory Databases with CCBench**, Tanabe et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3531-tanabe.pdf`
   DOI: `https://doi.org/10.14778/3424573.3424575`
@@ -2440,3 +2440,17 @@ Append new candidates here as each paper is processed.
   Why: Epic contrasts its shared-memory initialization and direct version
   lookup with Caracal's sorted-array version allocation; relevant to
   high-contention MVCC batch planning and direct version slot assignment.
+- `queued` — **The Tale of 1000 Cores: An Evaluation of Concurrency Control
+  on Real(ly) Large Multi-Socket Hardware**, Bang, May, Petrov, and Binnig,
+  DaMoN 2020.
+  URL: `https://doi.org/10.1145/3399666.3399916`
+  Why: CCBench cites it as a modern thousand-core concurrency-control
+  evaluation; useful for deciding whether GPU DB owner-thread and
+  partition-owner experiments should emulate many-core effects or require
+  real multi-socket validation.
+- `queued` — **NWR: Rethinking Thomas Write Rule for Omittable Write
+  Operations**, Nakazono et al., arXiv 2020.
+  URL: `https://arxiv.org/abs/1904.08119`
+  Why: CCBench points to non-visible writes as a version-lifetime direction;
+  NWR is relevant to blind-write and stale-version elision without weakening
+  WAL-before-visibility or SQL-visible conflict behavior.

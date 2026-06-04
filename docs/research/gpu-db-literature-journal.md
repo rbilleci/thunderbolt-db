@@ -28385,3 +28385,156 @@ not hide that cost behind throughput averages.
   initialization as a separable worker: initialization/planning time,
   transfer bytes for plans, CPU write-back time, and the benefit of
   pipelining adjacent epochs.
+
+### 2026-06-04 - CCBench exposes cache, delay, and version-lifetime factors in concurrency control
+
+**Citation:** Takayuki Tanabe, Takashi Hoshino, Hideyuki Kawashima,
+and Osamu Tatebe. "An Analysis of Concurrency Control Protocols for
+In-Memory Databases with CCBench." PVLDB 13(13), 2020, pp. 3531-3544.
+doi:10.14778/3424573.3424575. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol13/p3531-tanabe.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; runtime / HFT / session scale.
+
+**Relevance tags:** concurrency-control benchmarking; OCC; MVCC; 2PL;
+cache-line contention; invisible reads; adaptive waits; long transactions;
+version lifetime; garbage collection; many-core OLTP.
+
+**Core idea:** CCBench is less important as "one more benchmark" than as
+a warning about what has to be measured before choosing a CPU mutation-owner
+or GPU write-batch protocol. The paper implements Silo, TicToc, MOCC, SI,
+ERMIA, Cicada, and 2PL on one shared platform with shared Masstree access,
+read/write sets, allocator behavior, workload generator, and pinned worker
+threads. That common platform lets the authors separate protocol claims from
+implementation artifacts.
+
+Their main analysis classifies performance effects into cache, delay, and
+version lifetime. On a 224-thread, four-socket server, the paper shows that
+centralized ordering and read-side metadata updates can dominate protocol
+differences, that the choice between waiting and abort/retry is workload
+dependent, and that even rapid MVCC garbage collection does not protect
+throughput when one long transaction pins visible versions. The useful lesson
+for GPU DB is that concurrency-control experiments must report the shape of
+contention, cache footprint, wait policy, and version lifetime, not just
+transactions per second.
+
+**Concrete mechanisms:**
+
+- CCBench shares basic modules across protocols: workload generation,
+  Masstree access, read/write sets, memory allocation/reuse, and thread
+  pinning. This avoids comparing a protocol plus its whole implementation
+  stack against another unrelated stack.
+- The platform exposes seven workload parameters: skew, cardinality, payload
+  size, transaction size, read ratio, read-modify-write behavior, and worker
+  thread count.
+- The evaluated protocols cover pessimistic locking, optimistic protocols,
+  MVCC/snapshot protocols, and hybrid protocols: 2PL, Silo, TicToc, MOCC,
+  SI, latch-free SSN/ERMIA, and Cicada.
+- Optimization methods can be attached independently where compatible:
+  decentralized ordering, invisible reads, wait versus no-wait, adaptive
+  backoff, read-phase extension, assertive version reuse, and rapid GC.
+- Decentralized ordering avoids a shared counter hot spot. The paper's
+  fetch-add experiment shows that a single contended ordering counter stops
+  scaling across sockets because cache-line ownership bounces between cores.
+- Invisible reads avoid updating metadata during read operations. This lets
+  Silo outperform TicToc in some write-intensive and high-cardinality cases
+  even though TicToc has a larger theoretical scheduling space.
+- Wait/no-wait is not a universal choice. NoWait can win for short or
+  OCC-style cases, while waiting can win as transaction size and abort cost
+  rise.
+- ReadPhaseExtension deliberately adds read-phase delay based on local
+  conflict information. It is motivated by the paper's observation that
+  extra reads caused by concurrent updates can throttle validation pressure
+  and sometimes improve throughput.
+- AssertiveVersionReuse gives MVCC protocols thread-local reusable version
+  storage so allocator cost does not obscure version-chain and GC behavior.
+- RapidGC helps only while the oldest relevant snapshot can advance. With one
+  long non-read-only transaction mixed into otherwise short work, versions
+  remain visible until that long transaction finishes; CCBench reports that
+  RapidGC cannot hold version count down in this case.
+- AggressiveGC is proposed as a direction where even visible versions may be
+  collected, forcing read failures/retries or other protocol support. The
+  paper also points at overwriting and non-visible writes as version-lifetime
+  mechanisms, but it does not implement a complete production-safe protocol
+  for them.
+- The paper's TPC-C support is partial in the reviewed version. The authors
+  note that a subset showed index traversal dominating execution time, but
+  full TPC-C and logging/recovery integration are future work.
+
+**GPU DB mapping:** CCBench should shape the GPU DB benchmark harness before
+it shapes a specific concurrency-control choice. The current architecture
+needs separate measurements for CPU mutation-owner serialization, retained
+read snapshot routing, deterministic GPU write batches, and MVCC cleanup. A
+single throughput chart will be misleading unless it also names contention
+skew, key cardinality, row payload size, read/write mix, transaction size,
+active snapshot length, and whether reads update shared metadata.
+
+The invisible-read result maps directly to retained snapshots. Read-only
+routes should not touch mutation-owner metadata, cache-line-hot global
+timestamps, or per-row read timestamps on their normal path. A retained GPU
+lookup that increments shared per-row visibility or routing counters can lose
+the benefit of running outside the owner. Telemetry should distinguish
+observability counters from hot-path metadata writes, and sampling should be
+preferred where exact counters would create coherence traffic.
+
+The wait/no-wait and ReadPhaseExtension results are a useful caution for
+admission control. GPU DB should not hard-code "abort immediately" or "always
+wait" for contended writes. Route descriptors should carry conflict class,
+operation count, expected write-back cost, queue age, and retry legality so
+the runtime can choose owner-serialized waiting, deterministic batching,
+abort/retry, or explicit overload. The artificial-delay lesson maps to
+micro-batching: a few microseconds of deliberate grouping can improve write
+throughput only when the benchmark reports the latency cost and conflict
+reduction together.
+
+The long-transaction MVCC result is the strongest storage warning. A single
+long snapshot, GPU scan, COPY transaction, or interactive pgwire transaction
+can keep versions alive and erase MVCC performance even if ordinary short
+transactions are fast. This reinforces the existing journal direction:
+snapshot classes need separate watermarks, old-snapshot side structures, and
+explicit failure/retry policies. Aggressive collection may be acceptable only
+for route classes that can retry or fall back with SQL-correct behavior; it
+must not silently make committed versions disappear from a snapshot that SQL
+requires to remain valid.
+
+**Risks and mismatches:** CCBench is a CPU many-core benchmark, not a GPU
+database and not a production SQL runtime. Its main workloads are YCSB-like,
+with partial TPC-C support in the reviewed paper. The evaluation omits the
+durable logging, recovery, DDL, pgwire transaction state, portal behavior,
+and GPU residency invalidation rules that GPU DB must preserve. Some proposed
+directions, especially AggressiveGC over visible versions, are research
+directions rather than drop-in mechanisms; adopting them without precise
+snapshot/error semantics would violate correctness. The results also come
+from one four-socket server, so the transferable claim is the measurement
+shape and mechanisms, not the exact throughput numbers.
+
+**Benchmark candidates:**
+
+- Add a CCBench-style no-GPU concurrency harness around the mutation-owner and
+  MVCC tuple store. Sweep skew, cardinality, payload size, transaction size,
+  read ratio, RMW behavior, and worker count. Gate: every throughput chart
+  includes aborts, retries, queue wait, cache-touch counters where available,
+  and version counts.
+- Test read-only retained routes for invisible-read behavior. Compare exact
+  per-row/per-route counters against sampled counters and no counters.
+  Failure condition: observability metadata writes materially reduce retained
+  read throughput or raise p99 latency.
+- Build a wait/no-wait/adaptive admission experiment for contended updates.
+  Compare immediate retry, owner-queue waiting, deterministic batch grouping,
+  and microsecond read/write delay. Gate: report both throughput and p99
+  latency, plus conflict count and wasted work.
+- Add a long-snapshot MVCC stress test: one long retained snapshot or GPU-like
+  scan remains open while short update transactions run. Metrics: live
+  versions, GC backlog, fresh lookup latency, write latency, and old-snapshot
+  side-structure reads.
+- Prototype version-reuse pools for MVCC update records and CPU/GPU staging
+  metadata. Gate: allocator calls leave the hot path without changing replay
+  correctness or snapshot visibility.
+- Define an "aggressive cleanup allowed" route flag only for retry-safe route
+  classes. Proof gate: when cleanup removes a version still needed by a
+  retry-safe route, the route produces an explicit retry/fallback outcome;
+  ordinary SQL snapshots remain correct.
+- For future GPU write batches, record whether reads and writes touch shared
+  metadata on every row. Failure condition: a larger scheduling space loses
+  to a simpler owner path because of cache-line churn.
