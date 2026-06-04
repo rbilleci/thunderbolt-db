@@ -2612,9 +2612,10 @@ Append new candidates here as each paper is processed.
   Why: Helland's CIDR 2024 paper responds to this cloud OLTP design analysis;
   useful for comparing single-writer shared storage, multiple-writer coherent
   caching, shared-nothing partitioning, and hot-tuple cache-coherence tradeoffs.
-- `queued` — **Eigen: End-to-End Resource Optimization for Large-Scale
+- `reviewed` — **Eigen: End-to-End Resource Optimization for Large-Scale
   Databases on the Cloud**, Li et al., PVLDB 2023.
-  URL: `https://doi.org/10.14778/3611540.3611556`
+  URL: `https://doi.org/10.14778/3611540.3611565`
+  PDF: `https://www.vldb.org/pvldb/vol16/p3795-zhou.pdf`
   Why: cited by the Azure SQL DBaaS resource-allocation paper as a related
   cloud database resource optimizer; useful for comparing workload-level
   resource recommendation and control-loop design with GPU DB admission,
@@ -2758,3 +2759,17 @@ Append new candidates here as each paper is processed.
   Why: discovered while following GPU index literature around MVGpuBTree; uses
   hardware-accelerated coarse-granular indexing ideas that may compete with or
   complement resident GPU B-tree/hash indexes for selective predicates.
+- `queued` — **Autopilot: Workload Autoscaling at Google**, Rzadca et al.,
+  EuroSys 2020.
+  URL: `https://doi.org/10.1145/3342195.3387524`
+  PDF: `https://dl.acm.org/doi/pdf/10.1145/3342195.3387524`
+  Why: Eigen uses Autopilot as a baseline for resource prediction; useful for
+  comparing smoothed resource limits, safety margins, and control-loop
+  stability for GPU DB active-session, pinned-buffer, and cache budgets.
+- `queued` — **Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL
+  Database Serverless**, Poppe et al., PVLDB 2022.
+  URL: `https://doi.org/10.14778/3514061.3514069`
+  Why: Eigen contrasts serverless database pause/resume and proactive
+  provisioning work; useful for session-admission and cold/warm route
+  provisioning policies when dormant tenants or idle logical sessions become
+  active quickly.

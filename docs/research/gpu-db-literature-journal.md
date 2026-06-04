@@ -32647,3 +32647,171 @@ measure how often the runtime can reuse, renew, refresh, or reject work under
 mixed skewed reads and writes. The proof gate is a measurable reduction in
 owner trips and p95 latency without stale reads, unbounded renewals, or hidden
 temporary-memory cliffs.
+
+### 2026-06-04 - Eigen manages database capacity as a three-layer resource flow
+
+**Citation:** Ji You Li, Jiachi Zhang, Wenchao Zhou, Yuhang Liu,
+Shuai Zhang, Zhuoming Xue, Ding Xu, Hua Fan, Fangyuan Zhou, and
+Feifei Li. "Eigen: End-to-end Resource Optimization for Large-Scale
+Databases on the Cloud." PVLDB 16(12):3795-3807, 2023. DOI:
+`https://doi.org/10.14778/3611540.3611565`. Retrieved 2026-06-04
+from the VLDB PDF, `https://www.vldb.org/pvldb/vol16/p3795-zhou.pdf`.
+
+**Category:** Runtime / HFT / session scale; multi-tier cache / data
+placement.
+
+**Relevance tags:** admission control; multidimensional resource vectors;
+resource stranding; warm buffers; cold stock; scheduling latency;
+serverless database scaling; local trylock; cold-instance eviction;
+capacity forecasting; tenant/session placement; cache budget control.
+
+**Core idea:** Eigen treats cloud database capacity as a resource flow instead
+of a single scheduling decision. A node pool has non-empty online machines,
+empty warm machines, and offline cold machines. The online layer packs
+heterogeneous database instances tightly without stranding one resource
+dimension; the warm layer keeps just enough empty online capacity for
+short-term bursts; the cold layer maintains long-lead-time stock for future
+demand.
+
+The transferable idea for GPU DB is not the cloud procurement machinery. It is
+the separation between fast local admission, short-term warm buffers, and
+long-term stock control. A runtime aiming at 1M logical sessions has the same
+shape at smaller scale: active requests consume multidimensional resources
+such as owner queue slots, response buffers, pinned host buffers, HBM, CPU
+DRAM bandwidth, WAL batch capacity, and GPU stream time. Keeping one dimension
+full while another is idle creates resource stranding and p99 cliffs, even
+when total utilization looks healthy.
+
+**Concrete mechanisms:**
+
+- Eigen models scheduling as multidimensional vector bin packing over CPU,
+  memory, disk, and other database-instance resources.
+- Its online Vectorized Resource Optimization (VRO) scheduler first filters
+  feasible machines, scores residual capacity with a loss function, and then
+  chooses among close candidates using a skewness heuristic.
+- The VRO loss function combines residual-capacity size with fragmentation
+  terms. Fragmentation parameters are tuned from historical request sizes, so
+  a small leftover fragment that is rarely useful is penalized.
+- The second VRO step reduces resource skewness using one of three policies:
+  diagonal direction, bottleneck resource, or dot product between request and
+  residual resource vectors.
+- Offline VRO consolidates clusters under a migration-cost constraint. It
+  migrates instances from low-cost machines, uses VRO online allocation for
+  placement, and rolls back once the migration budget is exceeded.
+- Offline VRO also exchanges instances between machines to reduce skewness
+  before migration, then binary-searches an exchange threshold to maximize
+  emptied machines without exceeding the migration-cost budget.
+- Eigen's warm layer uses Exponential Smoothing with Smoothed Adaptive Margins
+  to predict short-term resource demand. Margins rise quickly when allocated
+  memory accelerates upward, but decay smoothly when demand falls, avoiding
+  unsafe rapid capacity removal.
+- The cold layer uses probabilistic Temporal CNN forecasting and a
+  Minimum-stock Policy. It simulates future stock with lead time and pipeline
+  stock, then adds or removes cold machines to avoid insufficient-resource
+  events while minimizing idle stock.
+- Master-agent collaborative scheduling splits central placement from local
+  autoscaling. The master chooses a target node, then an agent performs a
+  local trylock against current resources before the allocation commits.
+- Local agents can satisfy some autoscaling requests without a master round
+  trip. If local resources are insufficient, they may evict cold instances
+  from the node before escalating to cross-node migration.
+- Cold-instance eviction uses a temperature metric based on factors such as
+  CPU usage, memory usage, database size, and connection count.
+- Scheduler instances run in parallel and use optimistic concurrency control
+  over node-state snapshots; node states are updated asynchronously to trade
+  scheduling throughput against rare placement conflicts.
+- In production evaluation across Alibaba cloud database clusters, Eigen
+  reports average memory allocation ratio improving from about 60% to 87.0%,
+  delayed resource provisions under 0.1%, and no failed requests due to
+  insufficient provision in the reported end-to-end clusters.
+
+**GPU DB mapping:** VRO maps directly to route admission. A retained lookup,
+COPY chunk, refresh, over-resident scan, GPU aggregate, or response-encoding
+batch should declare a resource vector rather than only a queue name. The
+vector should include owner slots, read-snapshot references, response bytes,
+temporary memory, pinned bytes, expected HBM bytes, CPU DRAM bandwidth,
+transfer bytes, GPU stream occupancy, WAL batch space, and timeout budget.
+Admission can then penalize stranded fragments, for example a route that
+leaves enough GPU stream time but consumes the last pinned buffer or response
+ring slot.
+
+The warm/cold split is also useful. GPU DB should separate hot active capacity
+from warm reserve capacity and cold rebuild/provisioning capacity. Warm
+capacity might mean preallocated response buffers, CUDA pinned staging blocks,
+empty command-ring slots, retained snapshot references, and a small HBM
+headroom reserve. Cold capacity might mean resident segment rebuild work,
+NVMe-to-host staging, cache promotion, checkpoint/archive fetch, or logical
+session state that is cheap while idle but expensive to activate.
+
+Smoothed adaptive margins are a good fit for overload control. If queue wait,
+COPY bytes, response bytes, or pinned-buffer demand is accelerating upward,
+the runtime should add safety margin quickly by shrinking admitted batches,
+reserving buffers, or rejecting lower-priority work. When pressure falls, the
+margin should decay gradually so the system does not immediately refill the
+same bottleneck and oscillate.
+
+Master-agent collaborative scheduling maps to owner-local admission. A central
+planner can choose a candidate route, but the owner of the actual resource
+should perform a cheap trylock-like check before work becomes visible as
+admitted. For example, a GPU execution owner should confirm stream slots,
+pinned buffers, scratch memory, and snapshot compatibility; a mutation owner
+should confirm WAL batch space and visibility ordering; a network worker
+should confirm response-buffer and socket-backpressure capacity.
+
+Cold-instance eviction maps to demotion under pressure. Instead of evicting a
+random resident object, GPU DB should maintain route temperature using access
+frequency, last use, bytes, rebuild cost, open snapshot count, write
+invalidation rate, and session count. Low-temperature resident segments,
+prepared response templates, or warm pinned buffers can be demoted before a
+high-value hot route is rejected.
+
+**Risks and mismatches:** Eigen schedules database instances across cloud
+nodes, not SQL requests inside a database engine. It does not address
+WAL-before-visibility, MVCC correctness, GPU kernel launch overhead, query
+planning, or SQL result encoding. Its timescales range from seconds to weeks,
+while GPU DB hot-path admission may need microseconds to milliseconds. The
+paper's production results are for Alibaba serverless database clusters and
+memory allocation ratios, not in-engine p99 latency or GPU throughput.
+
+The learned and statistical forecasting pieces are control-plane mechanisms.
+They should not be allowed to decide SQL correctness, snapshot validity, or
+commit ordering. For GPU DB, predictions should set budget margins and
+preallocation levels; final route admission still needs deterministic owner
+checks.
+
+VRO-style packing can also over-consolidate if the objective ignores latency.
+Filling every resource vector tightly may maximize utilization while leaving
+too little burst slack for sessions, response buffers, or short reads. Any
+GPU DB adaptation must optimize for latency SLO and rejection quality, not
+only resource occupancy.
+
+**Benchmark candidates:**
+
+- Build a no-GPU route-admission simulator where each request has a resource
+  vector: owner slots, response bytes, pinned bytes, HBM bytes, CPU bandwidth,
+  GPU stream time, WAL bytes, and deadline. Compare FIFO, single-dimensional
+  queue-depth admission, and VRO-style vector admission. Gate: lower p95/p99
+  latency and fewer stranded-resource rejections at equal correctness.
+- Add "resource stranding" telemetry to the benchmark endpoint: available
+  owner slots, response bytes, active sessions, pinned-buffer budget,
+  retained snapshot refs, and GPU queue slots. Failure condition: work is
+  rejected or tail-latency spikes while another major resource dimension is
+  still idle and unreported.
+- Prototype smoothed adaptive margins for active-session and buffer budgets.
+  Inputs: acceleration of queue wait, response bytes, COPY bytes, and
+  pinned-buffer occupancy. Gate: margins rise before overload and decay
+  without oscillating under bursty retained reads.
+- Add owner-local trylock checks to one retained-read route prototype:
+  planner selects GPU or CPU, then the target owner confirms snapshot
+  compatibility and buffer/queue availability before admission. Gate: no
+  admitted work can later fail only because the selected owner lacked a
+  resource that was measurable at admission time.
+- Benchmark temperature-based demotion for resident or warm resources:
+  evict/demote by recency only, by bytes only, and by Eigen-style weighted
+  temperature including access count, rebuild cost, invalidation rate, open
+  snapshots, and session count. Gate: lower refresh work and p99 latency under
+  mixed reads, writes, and memory pressure.
+- Add a warm-reserve experiment for pinned buffers and response buffers:
+  compare no reserve, fixed percentage reserve, and smoothed adaptive reserve.
+  Failure condition: the reserve improves throughput but makes short retained
+  reads or error responses miss their latency target.
