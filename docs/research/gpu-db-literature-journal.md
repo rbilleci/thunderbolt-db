@@ -49484,3 +49484,197 @@ respect WAL-before-visibility and the requested isolation level.
   reacquiring per-row/per-page locks. A read touching a recovering generation
   should wait, fall back, or reject explicitly, never observe partial rollback
   state.
+
+### 2026-06-05 - RackSched makes request routing a line-rate admission layer
+
+**Citation:** Hang Zhu, Kostis Kaffes, Zixu Chen, Zhenming Liu,
+Christos Kozyrakis, Ion Stoica, and Xin Jin. "RackSched: A
+Microsecond-Scale Scheduler for Rack-Scale Computers." OSDI 2020,
+pp. 1225-1240. Retrieved 2026-06-05 from the USENIX publication page
+and PDF, `https://www.usenix.org/conference/osdi20/presentation/zhu`
+and `https://www.usenix.org/system/files/osdi20-zhu.pdf`.
+
+**Category:** runtime / HFT / session scale; high-concurrency
+admission; network/runtime co-design.
+
+**Relevance tags:** microsecond scheduling; tail latency; request
+admission; line-rate routing; power-of-k choices; request affinity;
+in-network telemetry; bounded queues; multi-queue scheduling; priority
+lanes; locality constraints; rack-scale dispatch.
+
+**Core idea:** RackSched treats a rack of machines as a rack-scale
+computer for microsecond-scale requests. The key move is to split
+scheduling into two layers: a programmable top-of-rack switch performs
+per-request inter-server load balancing at line rate, while each server
+uses a dataplane OS scheduler such as Shinjuku for intra-server
+scheduling and preemption. This avoids a single software scheduler for
+hundreds or thousands of cores while still reducing rack-level temporal
+load imbalance.
+
+The strongest transferable idea for GPU DB is that high logical session
+count should not imply expensive per-session scheduler work. Admission
+should happen at the narrowest line-rate or near-line-rate boundary using
+compact request descriptors and current queue telemetry. The switch in
+RackSched is a network device; the GPU DB analog is the pgwire IO worker
+and route-admission edge that chooses among mutation owners, read
+snapshot workers, GPU execution queues, CPU fallback, and overload
+responses before work reaches an expensive owner.
+
+RackSched's evaluation uses a twelve-server testbed with a Barefoot
+Tofino switch and a Shinjuku-based server runtime. Reported end-to-end
+experiments show up to 1.44x higher throughput than cluster-level
+Shinjuku/random dispatch while maintaining the same tail-latency target
+until saturation, and near-linear scale-out in the tested rack. RocksDB
+experiments with GET and SCAN requests show the same pattern: load-aware
+request routing preserves lower 99th percentile latency at higher load.
+
+**Concrete mechanisms:**
+
+- Inter-server scheduling is performed by the ToR switch at per-request
+  granularity. The switch forwards the first packet of a request to a
+  selected server, and later packets follow the same server through a
+  request-affinity table.
+- Intra-server scheduling remains software-owned. Each server maintains
+  request queues and worker threads; the RackSched prototype extends
+  Shinjuku and preempts requests that exceed a 250 microsecond threshold
+  in the experiments.
+- The switch keeps two small pieces of on-chip state: `LoadTable` for
+  server queue lengths and `ReqTable` for request-id to server-ip
+  mappings. The prototype uses a 64K-slot request table.
+- Server selection approximates join-the-shortest-queue with
+  power-of-k choices. The switch samples a small number of candidate
+  servers and chooses the one with the lowest reported load, avoiding
+  both random-dispatch imbalance and herding from always choosing the
+  currently shortest queue.
+- Request affinity is implemented in the switch data plane with a
+  multi-stage hash table over request IDs. It supports insert for the
+  first request packet, read for remaining packets, and remove when the
+  reply packet returns.
+- Servers piggyback their current queue length in reply packets using an
+  in-network telemetry style. The switch updates `LoadTable` from normal
+  traffic instead of polling servers through a slower control plane.
+- Multi-queue support lets applications distinguish request classes with
+  different service-time distributions. The switch tracks queue length
+  per request type and balances each class separately.
+- Locality constraints are represented by request metadata that restricts
+  the candidate server set. Request dependency can force related requests
+  to the same server by sharing request-affinity state.
+- Priority and weighted-sharing policies are handled by per-priority or
+  per-client queues on servers, with the switch balancing load for each
+  queue family.
+- Switch failure does not preserve in-flight request-affinity state; the
+  paper argues this is acceptable for microsecond requests that have
+  already missed their deadlines after switch failover. Server
+  reconfiguration is handled by updating candidate-server metadata while
+  keeping ongoing request mappings.
+
+**GPU DB mapping:** RackSched maps directly to the production runtime
+target in `11-high-throughput-query-runtime.md`: IO workers should behave
+like a compact admission and steering layer, not like full query owners.
+Each parsed pgwire request should carry a route descriptor with request
+type, estimated service class, snapshot generation, locality/partition
+constraints, response-buffer budget, and priority. The IO edge can then
+sample eligible queues or owners and choose the least-loaded compatible
+route without entering a global mutex or owner thread.
+
+The power-of-k lesson is important for GPU queues. Always choosing the
+apparently shortest GPU execution queue can herd a burst of retained
+reads into one stream before telemetry catches up. Random dispatch wastes
+capacity. Sampling a few compatible GPU/CPU/owner queues and choosing by
+queue wait, outstanding bytes, and pinned-buffer pressure is a simpler
+middle ground that is likely safer than a heavy centralized scheduler.
+
+Request affinity maps to multi-message pgwire state and COPY/batch
+ownership. Once a request or COPY chunk is admitted to a mutation owner,
+GPU execution owner, or CPU fallback worker, all continuation messages,
+result fragments, cancellation handling, and buffer-release events need
+to follow the same selected domain until completion. That state should be
+compact and bounded, more like `ReqTable` than a per-request heap of
+unowned references.
+
+The multi-queue mechanism maps to route lanes: point lookup, retained
+aggregate, COPY chunk, mutation validation, refresh, over-resident scan,
+CPU fallback, and response writeback should not share one opaque queue.
+Per-lane telemetry gives the admission edge a chance to reject, defer,
+or fallback at the right boundary instead of discovering saturation only
+after expensive staging.
+
+**Risks and mismatches:** RackSched assumes replicated or locality-bounded
+services whose requests can be moved among servers. Many GPU DB requests
+are tied to a transaction state, table partition, snapshot generation,
+catalog generation, resident device, or WAL owner, so route sampling must
+respect correctness constraints before considering load. The paper's
+switch data plane is not a SQL protocol engine and does not address WAL,
+MVCC, DDL, plan reuse, or GPU memory residency.
+
+The request-affinity failure model is also too weak for database
+transactions. A microservice request can time out after a switch failure;
+a SQL transaction or COPY stream must recover, abort, or release resources
+deterministically. GPU DB can borrow the compact mapping and explicit
+cleanup, but not the idea that in-flight state may simply disappear.
+
+Finally, the reported gains come from rack-level dispatch on a Tofino
+switch and Shinjuku. The GPU DB near-term target is likely in-process IO
+workers over TCP/pgwire. The transferable claim is the structure:
+line-rate-ish admission, sampled load-aware steering, request affinity,
+and per-lane telemetry. The absolute request rates and switch resource
+numbers should not be treated as engine predictions.
+
+**Benchmark candidates:**
+
+- Add a route-admission simulator with random dispatch, exact shortest
+  queue, and power-of-2 choices across read snapshot workers, GPU
+  execution queues, CPU fallback workers, and mutation owners. Gate:
+  power-of-2 keeps lower p99 queue wait than random dispatch without
+  herding under bursty same-shape retained reads.
+- Add compact in-flight request-affinity state to the pgwire benchmark
+  endpoint: selected owner/worker, request id, route lane, response buffer
+  id, cancellation flag, and cleanup generation. Failure condition:
+  cancel, disconnect, or overload leaves buffers or owner slots pinned.
+- Split runtime queues by route lane and expose queue-depth and queue-wait
+  telemetry per lane. Minimum lanes: mutation, retained point lookup,
+  retained aggregate, refresh, COPY chunk, CPU fallback, response
+  writeback.
+- Test queue telemetry freshness. Inject stale queue-depth samples and
+  compare exact-shortest, power-of-k, and round-robin admission. Failure
+  condition: exact-shortest creates larger p99 spikes than sampled
+  admission under bursty loads.
+- Add locality-aware route sampling for partition owners and resident GPU
+  partitions. A sampled candidate is eligible only if it satisfies table
+  identity, snapshot generation, policy generation, and resident device
+  constraints.
+- Compare one shared response ring against per-lane or per-priority
+  response queues for short retained reads mixed with long scans. Gate:
+  short-read p99 remains bounded without starving scan progress.
+
+### 2026-06-05 - Cross-paper synthesis: admission needs compact frontiers and sampled queues
+
+MD-MVCC, Constant Time Recovery, and RackSched converge on one runtime
+principle: fast paths stay fast when the admission record is compact, but
+still names the frontier that makes the work safe. MD-MVCC makes schema
+and route metadata snapshot-visible. CTR makes rollback and recovery
+visible through transaction state instead of physical undo work.
+RackSched makes request steering cheap by keeping only the request-to-route
+mapping and current load needed for scheduling.
+
+For GPU DB, the design track is a compact route certificate plus sampled
+admission. A request should enter the system with a small descriptor:
+route lane, table/partition locality, snapshot generation, schema/policy
+generation, WAL or owner frontier, selected worker/queue, buffer budget,
+and cleanup owner. The scheduler should sample a few eligible queues and
+choose by observed pressure. It should not centralize all requests through
+a heavyweight owner just to make a routing decision, and it should not
+choose a queue whose frontier cannot prove correctness.
+
+The category gap after these entries is still direct high-concurrency
+session admission under SQL protocol state: pgwire parsing, prepared
+statements, portals, COPY, cancellation, response ownership, and transaction
+state. The next runtime paper should preferably cover request scheduling,
+kernel/NIC bypass, coroutine/event-loop mechanics, or bounded queue
+fairness unless a stronger transaction-recovery paper is queued.
+
+Benchmark priority: before adding GPU-specific scheduling, build a CPU-only
+admission harness that exercises 1M idle logical sessions, a bounded active
+request subset, route-lane queues, power-of-k selection, stale telemetry,
+cancellation, and disconnect cleanup. Passing that gate would make GPU
+execution-worker scheduling much less speculative.

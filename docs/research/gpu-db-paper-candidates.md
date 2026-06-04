@@ -1590,7 +1590,7 @@ Append new candidates here as each paper is processed.
   Why: RingLeader builds on R2P2's request-level dispatch and JBSQ lineage;
   useful for deciding whether GPU DB should expose request descriptors,
   route classes, and response steering below the SQL execution layer.
-- `queued` — **RackSched: A Microsecond-Scale Scheduler for
+- `reviewed` — **RackSched: A Microsecond-Scale Scheduler for
   Rack-Scale Computers**, Zhu et al., OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/zhu`
   PDF: `https://www.usenix.org/system/files/osdi20-zhu.pdf`
@@ -2259,10 +2259,12 @@ Append new candidates here as each paper is processed.
   Why: AutoSteer builds on query-span and steering ideas from this work; useful
   for comparing random, greedy, and expert-guided exploration of bounded
   optimizer knobs before applying route learning to GPU DB planner decisions.
-- `queued` — **RackSched: A Microsecond-Scale Scheduler for Rack-Scale
-  Computers**, Sreekanti et al., arXiv 2020.
+- `reviewed` — **RackSched: A Microsecond-Scale Scheduler for Rack-Scale
+  Computers**, Zhu et al., OSDI 2020.
   URL: `https://arxiv.org/abs/2010.05969`
-  Why: Shinjuku follow-up direction for rack-scale request scheduling;
+  PDF: `https://www.usenix.org/system/files/osdi20-zhu.pdf`
+  Why: duplicate RackSched queue entry; reviewed from the OSDI 2020 primary
+  source in the journal. Shinjuku follow-up direction for rack-scale request scheduling;
   relevant to comparing centralized, partitioned, and rack-aware admission
   when GPU DB eventually spans multiple owners, devices, or nodes.
 - `queued` — **SLOG: Serializable, Low-latency, Geo-replicated
