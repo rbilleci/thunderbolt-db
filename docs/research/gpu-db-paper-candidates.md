@@ -2569,7 +2569,7 @@ Append new candidates here as each paper is processed.
   and this modern GPU OLTP testbed directly compares OCC, MVCC, 2PL,
   conflict-graph ordering, launch parameters, and conflict-resolution overhead
   for batched transaction execution.
-- `queued` — **GaccO - A GPU-accelerated OLTP DBMS**, Boeschen and
+- `reviewed` — **GaccO - A GPU-accelerated OLTP DBMS**, Boeschen and
   Binnig, SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3517876`
   Metadata: `https://www.dfki.de/web/forschung/projekte-publikationen/publikation/14413`
@@ -2773,3 +2773,17 @@ Append new candidates here as each paper is processed.
   provisioning work; useful for session-admission and cold/warm route
   provisioning policies when dormant tenants or idle logical sessions become
   active quickly.
+- `queued` — **LTPG: Large-Batch Transaction Processing on GPUs with
+  Deterministic Concurrency Control**, Wei, Gu, Li, and Yu, ICDE 2024.
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00196`
+  Why: GaccO motivates same-type GPU transaction batching; LTPG is a newer
+  deterministic GPU transaction-processing follow-up for testing whether
+  larger batches and conflict planning can preserve latency while improving
+  throughput.
+- `queued` — **GalOP: Towards a GPU-accelerated OLTP DBMS**, Boeschen and
+  Binnig, DaMoN 2021.
+  URL: `https://doi.org/10.1145/3465998.3466007`
+  Metadata: `https://www.dfki.de/en/web/research/projects-and-publications/publication/14419`
+  Why: precursor to GaccO with a deterministic GPU concurrency scheme;
+  useful for isolating which design choices came from the smaller prototype
+  versus the later CPU/GPU co-execution storage design.
