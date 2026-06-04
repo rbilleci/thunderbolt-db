@@ -596,6 +596,31 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up on approximating programmable scheduling with a single
   FIFO-style queue; relevant to bounded high-concurrency response shaping
   without expensive per-session queues.
+- `reviewed` — **Low-Latency Transaction Scheduling via Userspace
+  Interrupts: Why Wait or Yield When You Can Preempt?**, Huang et al.,
+  PACMMOD/SIGMOD 2025.
+  URL: `https://doi.org/10.1145/3725319`
+  PDF: `https://www2.cs.sfu.ca/~tzwang/preemptdb.pdf`
+  Code: `https://github.com/sfu-dis/preemptdb`
+  Why: modern best-paper transaction scheduling work using userspace
+  interrupts and optimistic concurrency to preempt long low-priority
+  transactions for short high-priority work; selected because recent synthesis
+  called for more transaction/runtime papers after HTAP/GPU scheduling work.
+- `queued` — **Shinjuku: Preemptive Scheduling for Microsecond-scale Tail
+  Latency**, Kaffes et al., NSDI 2019.
+  URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
+  PDF: `https://www.usenix.org/system/files/nsdi19-kaffes.pdf`
+  Why: PreemptDB's related work contrasts Shinjuku's hardware-virtualization
+  preemption for microsecond services; useful for comparing DB-internal
+  preemption with runtime-level request preemption for mixed point/range query
+  latency.
+- `queued` — **CoroBase: Coroutine-Oriented Main-Memory Database Engine**,
+  He, Lu, and Wang, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol14/p431-he.pdf`
+  arXiv: `https://arxiv.org/abs/2010.15981`
+  Why: PreemptDB contrasts cooperative coroutine scheduling with preemptive
+  scheduling; useful for evaluating whether GPU DB should use cooperative
+  latency hiding for memory/NVMe stalls, preemption for urgent routes, or both.
 - `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`

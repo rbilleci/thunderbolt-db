@@ -50338,3 +50338,164 @@ owner generations or partition vectors with lower overhead.
   statements from multi-statement transactions, prepared statements, and
   portals; do not allow a statement-level freshness advance to leak across a
   broader transaction snapshot.
+
+### 2026-06-05 - PreemptDB uses userspace interrupts for low-latency transaction scheduling
+
+**Citation:** Kaisong Huang, Jiatang Zhou, Zhuoyue Zhao, Dong Xie, and
+Tianzheng Wang. "Low-Latency Transaction Scheduling via Userspace
+Interrupts: Why Wait or Yield When You Can Preempt?" Proceedings of the ACM
+on Management of Data 3(3), SIGMOD 2025, Article 182.
+doi:10.1145/3725319. Retrieved 2026-06-05 from
+`https://www2.cs.sfu.ca/~tzwang/preemptdb.pdf`.
+
+**Category:** runtime / HFT / session scale; transaction processing and
+scheduling.
+
+**Relevance tags:** transaction scheduling; preemption; userspace interrupts;
+priority admission; HTAP latency; optimistic concurrency; context switching;
+non-preemptible regions; starvation control; mixed OLTP/OLAP.
+
+**Core idea:** PreemptDB revisits a piece of database folklore: preempting a
+running transaction was traditionally considered too expensive or unsafe,
+especially when long transactions might hold locks. The paper argues that two
+things have changed. Modern memory-optimized engines often use optimistic or
+multi-version concurrency where reads do not hold pessimistic locks during
+forward processing, and recent x86 userspace interrupts can deliver control to
+user code without a kernel signal path.
+
+PreemptDB uses those two facts to let short, high-priority transactions
+interrupt long, low-priority transactions without aborting the long work. A
+scheduler thread enqueues high-priority transactions and sends a userspace
+interrupt to a worker. The worker saves the current transaction context, runs
+one or more high-priority transactions on a second context, then resumes the
+preempted transaction. In the paper's TPC-C/TPC-H mixed workload, this reduces
+high-priority New-Order latency by 88-96% over non-preemptive waiting at the
+reported percentiles, while a pure interrupt-overhead TPC-C run shows about a
+1.7% throughput reduction.
+
+**Concrete mechanisms:**
+
+- Each worker has separate high-priority and low-priority transaction queues,
+  plus two transaction contexts. The default design handles two priority
+  levels, but the authors note that additional contexts could represent finer
+  priority classes.
+- A scheduler thread dispatches low-priority work normally. When high-priority
+  work arrives, it pushes a batch into a worker's high-priority queue and sends
+  one `senduipi` userspace interrupt.
+- The interrupt handler performs a passive context switch by saving register
+  state, stack state, SIMD/floating-point state, and context-local state into a
+  transaction control block, then switches the stack pointer to the high-
+  priority context.
+- Return from high-priority work uses an active userspace `swap_context`
+  routine. Because an interrupt during that routine could corrupt partially
+  switched state, PreemptDB combines temporary interrupt disablement with an
+  instruction-pointer range check that makes the handler return immediately if
+  it interrupted inside the active switch.
+- The system introduces context-local storage (CLS) because ordinary thread-
+  local storage would be shared by both contexts on the same OS thread. The
+  implementation creates a separate TLS-shaped storage area for the second
+  context and swaps the exposed TLS base during context switches.
+- PreemptDB marks latch-sensitive code as non-preemptible. Nested
+  `TXCB::lock()` / `TXCB::unlock()` regions maintain a context-local counter;
+  if an interrupt arrives while the counter is nonzero, the handler returns to
+  the current context instead of switching.
+- Non-preemptible regions include index APIs, memory allocation, validation,
+  commit, and abort logic. This is necessary because two contexts on the same
+  worker can otherwise deadlock when one is paused while holding a latch needed
+  by the other.
+- The batched on-demand policy limits interrupt overhead by draining a bounded
+  high-priority queue per worker rather than interrupting for every individual
+  request.
+- The starvation policy tracks the fraction of cycles a paused low-priority
+  transaction has lost to high-priority work. If that starvation level exceeds
+  a threshold, the scheduler stops adding more high-priority work to that
+  worker or the worker returns early to the paused context.
+- Evaluation uses ERMIA as the base engine, a patched Linux kernel with user
+  interrupt support, 16 default workers, TPC-H Q2 as long low-priority work,
+  and TPC-C New-Order/Payment as short high-priority work. The benchmark calls
+  storage-engine C++ APIs directly, so SQL parsing, networking, optimizer, and
+  storage IO are intentionally outside the measured path.
+
+**GPU DB mapping:** The strongest transferable idea is not "add userspace
+interrupts immediately." It is that urgent route work needs an explicit
+preemption contract, not just a FIFO queue and hope that long work yields soon.
+In GPU DB terms, a short retained lookup, commit-critical validation step, or
+freshness-sensitive point read should not sit behind a long CPU fallback scan,
+refresh build, over-resident decompression run, or analytical GPU route when
+the long work can be safely paused at a defined boundary.
+
+The mechanism maps first to CPU owner/runtime lanes. IO workers and route
+owners can keep distinct urgent and background queues, where urgent work gets
+bounded preemption rights and background work reports whether it is
+preemptible. Some boundaries are naturally non-preemptible: WAL append and
+flush publication, visibility publication, catalog generation swaps, resident
+snapshot publication, CUDA buffer ownership changes, and response-buffer
+handoff. Those regions should be explicit in route metadata rather than hidden
+inside generic tasks.
+
+PreemptDB's CLS lesson maps to GPU DB's per-owner state. If one OS worker can
+host multiple logical execution contexts, thread-local log buffers, staging
+buffers, scratch allocators, telemetry counters, prepared-statement state, and
+error state must become context-local or owner-local. This is also relevant if
+future runtime code uses coroutines, fibers, or user-level tasks before a full
+userspace-interrupt design.
+
+The starvation counter is a useful admission primitive. GPU DB can track the
+share of CPU cycles, GPU stream time, pinned-buffer occupancy, HBM scratch, and
+queue capacity consumed by urgent retained reads versus background refresh,
+COPY, and scans. Preemption without starvation control simply moves the tail
+latency problem from short transactions to maintenance and analytical routes.
+
+For GPU execution, hardware preemption is less direct and may not be available
+at a useful granularity. The practical near-term mapping is to split long GPU
+routes into resumable chunks or morsels, keep urgent short routes in separate
+CUDA streams/owners when possible, and make chunk boundaries carry the same
+non-preemptible contract as CPU critical sections.
+
+**Risks and mismatches:** PreemptDB depends on x86 userspace interrupt support,
+a patched or otherwise enabled kernel path in the evaluation, and pinned worker
+threads. That is a deployment constraint for a general GPU DB server. The
+paper's measurements exclude SQL parsing, network protocol work, optimizer
+cost, WAL IO, and GPU execution, so its absolute latencies should not be
+projected onto pgwire or CUDA paths.
+
+The design assumes optimistic or multi-version concurrency where long reads do
+not hold blocking locks through forward processing. GPU DB must not preempt
+inside WAL-before-visibility, catalog mutation, resident publication, CUDA
+allocation/free, or response ownership sections unless those sections are made
+restartable or marked non-preemptible. CLS also increases runtime complexity;
+any missed TLS user or library critical section can become a correctness bug.
+
+The evaluation has low logical contention by design, which focuses on
+scheduling overhead. Hot-key writes, high abort rates, GPU refresh lag, and 1M
+logical sessions could change the tradeoff. The paper also treats only two
+priority levels and leaves automatic starvation-threshold tuning as future
+work.
+
+**Benchmark candidates:**
+
+- Add a CPU-only route-lane benchmark with short urgent retained lookups mixed
+  with long CPU fallback scans or refresh planning. Compare FIFO, cooperative
+  chunk-yield, and explicit urgent-lane preemption at safe boundaries. Gate:
+  urgent p99 improves without changing SQL-visible results or WAL ordering.
+- Annotate runtime tasks with `preemptible`, `non_preemptible_reason`, and
+  `safe_yield_boundary` metadata. Minimum proof: WAL flush, visibility
+  publish, catalog generation swap, residency publication, buffer handoff, and
+  CUDA ownership transitions cannot be interrupted by an urgent lane.
+- Prototype per-context runtime state for a multiplexed worker: error state,
+  staging buffer handle, response buffer handle, telemetry counters, and route
+  token. Failure condition: two logical contexts on one OS thread share mutable
+  state accidentally.
+- Add starvation telemetry by route class: urgent retained read, write
+  admission, COPY chunk, refresh, over-resident scan, CPU fallback, and
+  response encoding. Measure cycle or service-time share and queue delay, then
+  reject or defer urgent work once a background starvation threshold is hit.
+- Build a resumable long-route harness where analytical scans and refresh work
+  run in morsels. Urgent point reads may run between morsels but not inside a
+  marked critical section. Gate: bounded urgent p99 and bounded refresh lag
+  under sustained mixed load.
+- For a future userspace-interrupt experiment, isolate it behind a feature
+  probe and compare against cooperative boundaries first. Passing condition:
+  the interrupt path beats cooperative chunking on urgent p99 while preserving
+  non-preemptible correctness and showing negligible overhead when no urgent
+  work is present.
