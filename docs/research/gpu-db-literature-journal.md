@@ -36360,3 +36360,158 @@ workloads with pgwire sessions and mixed transactional visibility.
   B-tree readers finish on an old generation. Failure condition: old readers
   are forced to block behind refresh, or new readers can observe an invalidated
   generation.
+
+### 2026-06-04 - SMF schedules hot conflicts before concurrency control sees them
+
+**Citation:** Audrey Cheng, Aaron Kabcenell, Jason Chan, Xiao Shi, Peter
+Bailis, Natacha Crooks, and Ion Stoica. "Towards Optimal Transaction
+Scheduling." PVLDB 17(11): 2694-2707, 2024. doi:10.14778/3681954.3681956.
+Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** transaction scheduling; hot-key contention; MVTSO;
+schedule-first concurrency control; conflict-aware admission; OLTP tail
+latency; micro-batching; application hints.
+
+**Core idea:** The paper argues that much OLTP throughput is left on the table
+because systems let transactions arrive in FIFO order and only react to
+conflicts after locking, validation, or abort. It frames scheduling as a
+makespan minimization problem: for a finite batch, a lower makespan means
+higher throughput. Optimal transaction scheduling is impractical, so the
+authors propose Shortest Makespan First (SMF), a greedy policy that appends the
+transaction with the smallest incremental conflict cost among a small random
+sample of in-flight transactions.
+
+The practical observation is that a small set of hot keys often dominates
+conflict cost. R-SMF therefore predicts only hot-key access patterns from
+transaction type and initial arguments, chooses a low-conflict order, and then
+uses MVSchedO to enforce the chosen order at operation granularity. The system
+is implemented by modifying RocksDB and reports up to a 3.9x throughput
+increase and 3.2x tail-latency reduction across benchmarks and real workloads.
+
+**Concrete mechanisms:**
+
+- SMF models a transaction schedule by makespan, considering intra-transaction
+  operation order and inter-transaction conflicts imposed by the isolation
+  protocol.
+- The greedy scheduler starts with one transaction, samples a small number of
+  unscheduled or in-flight transactions, estimates how much each one increases
+  makespan, and appends the least costly candidate.
+- The default online policy uses a sample size of five and focuses only on hot
+  keys. The paper reports that richer variants with no sampling and all-key
+  access knowledge change makespan only modestly on most evaluated workloads.
+- R-SMF accepts application hints: transaction type plus known hot keys from
+  initial arguments. The paper notes these hints can be explicit, as in a
+  modified `START TRANSACTION`, or inferred from metadata such as stack traces
+  or client endpoints.
+- A simple KNN-style classifier maps transaction metadata vectors to clusters
+  and stores a canonical set of hot-key operations for each cluster. The model
+  is retrained periodically from recent traces.
+- Non-hot-key transactions execute immediately; the scheduler only keeps
+  in-flight transactions and the latest conflicting operation per hot key to
+  bound memory and runtime overhead.
+- MVSchedO adapts multi-version timestamp ordering. Instead of only assigning
+  a serial timestamp and letting operations race, it maintains predicted
+  operation queues per hot key so later conflicting operations wait for earlier
+  scheduled operations to finish.
+- The enforcement is partial and fine grained: the system orders the hot
+  operations that matter for conflict cost while preserving parallelism for
+  unrelated operations.
+- The paper also evaluates SMF as a bolt-on layer over existing locking and
+  OCC implementations, showing that scheduling can help even without adopting
+  MVSchedO.
+- The evaluation spans YCSB, SmallBank, TPC-C, Epinions, TAOBench, and Meta's
+  social graph workload. It reports less than a 5% throughput drop on
+  low-contention workloads and production-style gains up to 2.5x throughput
+  with a 2.1x tail-latency decrease on TAO.
+
+**GPU DB mapping:** This paper is directly useful for the GPU DB mutation path
+because the current runtime already plans bounded owner queues and natural
+micro-batches. SMF suggests that those queues should not be drained purely
+FIFO when hot keys are declared or predictable. A mutation owner can maintain a
+small hot-key scheduler over admitted write requests, COPY chunks, and
+transaction fragments, then feed the WAL/MVCC path in an order that reduces
+abort, validation, or lock wait cost.
+
+The "hot keys only" result maps well to SQL route descriptors. For prepared
+statements, retained route templates, and common OLTP procedures, the planner
+or protocol edge can attach a transaction type, table id, partition id, and
+declared hot key fields before the mutation reaches the owner. That is a
+better fit than trying to predict every read/write set. The same metadata can
+drive both admission and route choice: hot conflicting writes go through a
+conflict-aware mutation lane, while cold writes and retained reads keep the
+low-latency path.
+
+MVSchedO is also a useful warning for GPU-side write batching. If a GPU batch
+contains many transaction fragments, the engine should not only group by kernel
+shape; it should also preserve operation order for hot conflicting keys. GPU
+parallelism is helpful only if the database can prove that scheduled operation
+dependencies, WAL-before-visibility, and MVCC publication boundaries remain
+intact.
+
+For 1M logical sessions, SMF points to admission as scheduling, not just queue
+capacity. Idle sessions remain cheap, but active transactions should carry
+metadata that lets network workers and owners avoid flooding the write path
+with mutually antagonistic hot-key work. The first practical feature could be a
+small conflict-class field in internal command messages, not a new global
+transaction scheduler.
+
+**Risks and mismatches:** R-SMF depends on useful hot-key hints or predictable
+metadata. Ad hoc SQL, unknown parameters, skew shifts, multi-statement
+transactions, and stored procedures with hidden reads may weaken the schedule
+or produce unnecessary waiting. The paper's implementation is a modified
+RocksDB system, not a PostgreSQL-compatible SQL engine with WAL replay, DDL,
+resident GPU snapshots, and pgwire session state. MVSchedO is based on
+MVTSO-style reasoning, so mapping it to the current tuple-store visibility
+model requires careful proof. Finally, a scheduler that waits to make a better
+batch can improve throughput while harming p50 latency; GPU DB needs explicit
+latency ceilings and fallback behavior.
+
+**Benchmark candidates:**
+
+- Add a no-GPU mutation-owner scheduling benchmark with FIFO, hot-key round
+  robin, and SMF-style sampled makespan scheduling. Measure throughput,
+  aborts/retries, queue wait, and p95/p99 latency under YCSB-like and TPC-C-like
+  skew.
+- Extend internal command descriptors with optional transaction class and hot
+  key fields. Proof gate: missing hints fall back to FIFO correctness, while
+  present hints only affect ordering before WAL/MVCC visibility publication.
+- Run a retained-read plus hot-write workload where write admission schedules
+  hot keys but read snapshots remain immutable. Failure condition: scheduling
+  improves write throughput by delaying snapshot publication enough to hurt
+  retained read p95 beyond the latency ceiling.
+- Compare GPU write micro-batches grouped by kernel shape only versus grouped
+  by kernel shape plus hot-key conflict class. Measure CUDA occupancy, WAL
+  batch size, validation cost, and conflict-induced retries.
+- Add classifier telemetry rather than a complex model first: per transaction
+  class, declared hot keys, observed conflicts, waiting time, and schedule
+  decision. Use it to decide whether learned classification is worth building.
+- Stress low-contention workloads to ensure the scheduler's sampling,
+  bookkeeping, and waiting cost stays below a small fixed overhead budget.
+
+### 2026-06-04 - Cross-paper synthesis: hot routes need typed service and conflict contracts
+
+**Converging design tracks:** Database Kernels, GPU B-Trees, and SMF all push
+the engine away from opaque queues and byte ranges. The cold tier should expose
+typed service capabilities, the GPU index should expose generation and update
+contracts, and the mutation path should expose conflict metadata before work
+enters the owner. In all three cases, the transferable design is not a bigger
+monolithic executor; it is route metadata that says what the work touches, what
+ordering it needs, which tier can serve it, and when publication is safe.
+
+**Category gaps:** The queue is now healthy on recent transaction scheduling,
+multi-tier placement, and GPU index execution, but it still needs more modern
+work on PostgreSQL-compatible MVCC visibility, high-session network admission
+under ordinary TCP, and query planning that combines latency risk with
+resource budgets. The next selected paper should avoid another GPU-index-only
+entry unless it clearly advances OLTP or tiered placement.
+
+**Benchmark priorities:** The highest-value benchmark track is a unified route
+descriptor experiment: attach snapshot generation, hot-key class, tier-service
+capability, and GPU execution shape to each request, then compare FIFO routing
+against conflict-aware and tier-aware routing. Success requires better write
+throughput or lower p95 latency without weakening WAL-before-visibility,
+invalidating the wrong retained generation, or letting cold-tier pushdown hide
+queueing costs.

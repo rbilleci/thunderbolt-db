@@ -780,7 +780,7 @@ Append new candidates here as each paper is processed.
   Why: modern hybrid deterministic/OCC design with global validation and
   logging integration; useful for deciding whether GPU DB write batches should
   route through deterministic or optimistic lanes by workload.
-- `queued` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
+- `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
   DOI: `https://doi.org/10.14778/3681954.3681956`
