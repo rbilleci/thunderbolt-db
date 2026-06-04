@@ -44514,3 +44514,171 @@ public artifact for mechanisms.
   should be faster to allocate but should lose observability and promotion
   precision; the benchmark should quantify whether that simplicity is ever
   acceptable for GPU DB route certificates.
+
+### 2026-06-04 - Schedule-first OLTP turns hot-key conflict order into an admission primitive
+
+**Citation:** Audrey Cheng, Aaron Kabcenell, Jason Chan, Xiao Shi, Peter
+Bailis, Natacha Crooks, and Ion Stoica. "Towards Optimal Transaction
+Scheduling." PVLDB 17(11), 2024, pp. 2694-2707.
+doi:10.14778/3681954.3681956. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale; concurrency control.
+
+**Relevance tags:** transaction scheduling; hot-key contention; MVTSO;
+schedule-first concurrency control; admission ordering; tail latency;
+application hints; request batching; conflict-cost prediction.
+
+**Core idea:** The paper argues that transaction systems leave throughput on
+the table when they only react to conflicts after operations arrive or execute.
+Instead, the system should choose a low-conflict schedule before execution and
+then enforce the schedule precisely enough that hot operations do not race in a
+way that causes aborts or stalls. Optimal scheduling is infeasible, but the
+paper shows that a simple greedy policy can find useful schedules when it has
+enough information about hot-key access patterns.
+
+The system, R-SMF, combines Shortest Makespan First (SMF) scheduling with a
+schedule-first multiversion timestamp ordering protocol called MVSchedO. In a
+RocksDB implementation, the paper reports up to 3.9x throughput improvement
+and up to 3.2x tail-latency reduction across OLTP benchmarks and real-world
+style workloads. A TAO prototype reports up to 2.5x throughput improvement and
+2.1x tail-latency reduction. The strongest transferable claim is not the exact
+factor; it is that hot-key order can be treated as an explicit runtime resource
+instead of an incidental outcome of FIFO arrival.
+
+**Concrete mechanisms:**
+
+- SMF builds a schedule greedily. At each step it samples a small number of
+  unscheduled in-flight transactions and appends the one that creates the
+  smallest incremental makespan increase.
+- Makespan is used as a conflict-cost proxy: a schedule is better when
+  conflicting operations stall fewer later operations and the batch finishes
+  sooner.
+- The scheduler focuses on hot keys rather than full read/write sets. The
+  paper observes that a small fraction of hot keys dominates conflict cost in
+  many transactional workloads.
+- Online scheduling uses application hints such as transaction type and known
+  hot-key arguments. A classifier maps those hints to predicted hot-key
+  read/write operation patterns.
+- The classifier is intentionally lightweight: it clusters metadata vectors
+  from recent traces and chooses a canonical hot-key operation set for each
+  cluster. It can be retrained periodically as workload shape changes.
+- MVSchedO adapts multiversion timestamp ordering. Transactions receive
+  timestamps from SMF rather than FIFO arrival order.
+- For predicted hot keys, MVSchedO maintains per-key scheduling queues.
+  A read or write to a hot key waits until conflicting operations with lower
+  scheduled timestamps have executed.
+- Reads, writes, write-dependency tracking, and commit validation otherwise
+  follow MVTSO. If a predicted hot-key operation never occurs, queued
+  dependents are released when the transaction commits or aborts.
+- The implementation includes barriers in scheduling queues to prevent
+  starvation.
+- The paper also evaluates bolt-on SMF over existing RocksDB OCC and locking
+  protocols. That version only delays transaction start, so it gives smaller
+  gains than MVSchedO but requires fewer protocol changes.
+- Classifier accuracy is a hard requirement. With no useful hints, scheduling
+  adds small overhead; with badly wrong hints, false delays and missed
+  conflicts can reduce throughput.
+
+**GPU DB mapping:** This fits the GPU DB runtime because the current target
+already has owner domains, bounded command rings, route certificates, and
+micro-batching. R-SMF suggests that write admission and retained read routing
+should not be purely FIFO when hot keys, hot partitions, or hot resident
+segments are known. The scheduler should be allowed to reorder compatible work
+within a correctness envelope to reduce aborts, owner stalls, refresh
+conflicts, and GPU queue churn.
+
+For the mutation owner, the direct mapping is a hot-key or hot-partition
+admission lane. Requests carry a route template, key class, predicted hot
+keys, isolation certificate, and freshness boundary. The owner can choose an
+SMF-like order for a bounded in-flight window, then publish commits at normal
+WAL-before-visibility boundaries. This should be tested before attempting
+distributed or GPU-side write execution.
+
+For retained GPU reads, the idea is to schedule around conflict cost, not only
+GPU occupancy. A point lookup or prefix scan against a hot key range may be
+better delayed briefly until a preceding conflicting mutation, refresh, or
+local-delta merge finishes, rather than admitted immediately and forced into
+abort, fallback, or stale-stable execution. Per-key or per-segment scheduling
+queues could live beside route certificates and snapshot generation metadata.
+
+MVSchedO's per-hot-key queues also clarify the boundary between planner and
+runtime. The planner can attach predicted hot-key operations and route shape;
+the runtime enforces only the small subset that affects conflict cost. That is
+compatible with 1M logical sessions because idle sessions do not need large
+state, while active conflicting requests consume bounded scheduling slots.
+
+**Risks and mismatches:** R-SMF assumes enough application or workload metadata
+to predict hot-key conflicts. Generic SQL over pgwire may not provide this
+unless prepared statements, route templates, parameter extraction, and recent
+trace classification are built. The paper's strongest implementation uses
+RocksDB and key-value style transaction access; GPU DB has SQL planning,
+MVCC visibility, WAL, resident refresh, DDL invalidation, and GPU execution
+workers.
+
+Schedule-first execution must not weaken WAL-before-visibility or externally
+promised isolation. Reordering is only acceptable inside an explicitly declared
+admission window and must still produce a legal serial order for the selected
+isolation level. False positives are also dangerous operationally: delaying a
+nonconflicting request may hurt p50 latency, while false negatives can leave
+the engine paying the original abort or fallback cost.
+
+The evaluation demonstrates large gains under contention, but low-contention
+workloads see little benefit and some overhead. GPU DB should therefore gate
+the scheduler on measured contention, hot-key confidence, queue depth, and
+fallback rate rather than enabling it globally.
+
+**Benchmark candidates:**
+
+- Add a hot-key admission simulator for the mutation owner. Compare FIFO,
+  random defer, and SMF-like bounded-window ordering under YCSB-style skew,
+  TPC-C-like warehouse keys, and mixed read/write route templates. Measure
+  throughput, abort/fallback count, p50/p99 latency, and queue wait.
+- Extend route certificates with optional predicted hot-key or hot-segment
+  operations. Proof gate: any reordered request records the serial/admission
+  order that made the route legal.
+- Build a retained-read conflict benchmark where hot-key reads race against
+  mutations and resident refresh. Compare immediate CPU fallback, wait for
+  preceding hot-key operation, stable-only GPU read, and GPU-plus-delta merge.
+- Add scheduler confidence telemetry: classifier hit rate, false delay rate,
+  missed conflict rate, barrier releases, starvation-prevention releases, and
+  per-key queue depth.
+- Test low-contention overhead explicitly. Failure condition: enabling
+  schedule-first admission costs more than 5% throughput or materially worsens
+  p50 latency when conflict telemetry is low.
+- Implement a bolt-on first slice before protocol-level scheduling: delay only
+  transaction or retained-read start in a bounded active window. If that moves
+  abort/fallback rates without correctness changes, then consider deeper
+  per-operation ordering.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates now need scheduling intent
+
+MVRC robustness, tiered buffer placement, and schedule-first OLTP converge on
+the same control-plane shape: a route should not only say what data and
+freshness boundary it can see, but also why it is allowed to execute now. The
+certificate now needs static isolation safety, physical tier state, freshness
+clocks, and scheduling intent for hot keys or hot segments.
+
+The design track is a bounded active-request window rather than global
+reordering. Within that window, the engine can attach route template, key or
+segment class, predicted conflict set, resident boundary, local-delta boundary,
+and required isolation level. Admission then chooses FIFO, delay, fallback, or
+SMF-like ordering based on measured conflict cost and confidence. WAL commit
+order and MVCC visibility remain the authority; scheduling only chooses a
+legal order earlier.
+
+**Category gaps:** The journal has recently strengthened MVCC certification,
+tiering, and transaction scheduling. Next high-value papers should fill
+priority-aware concurrency control, high-concurrency admission, or adaptive
+workload management before returning to GPU analytics.
+
+**Benchmark priorities:**
+
+- Build a route-certificate fixture that includes isolation certificate,
+  durable/resident/local boundaries, physical tier state, and optional
+  scheduling order.
+- Compare FIFO, random defer, and SMF-like ordering for a bounded mutation or
+  retained-read active window.
+- Add telemetry that separates queue wait caused by beneficial conflict
+  avoidance from queue wait caused by false positive scheduling delays.

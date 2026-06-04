@@ -244,6 +244,30 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
 
 Append new candidates here as each paper is processed.
 
+- `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
+  PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
+  DOI: `https://doi.org/10.14778/3681954.3681956`
+  Code: `https://github.com/audreyccheng/transaction-scheduling`
+  Why: modern schedule-first OLTP work selected because the queue lacked a
+  strong 2023-present full paper in transaction scheduling; directly relevant
+  to hot-key admission, abort/fallback reduction, and route ordering under
+  contention.
+- `queued` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
+  Cao et al., PACMMOD/SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3603164`
+  PDF:
+  `https://www.pure.ed.ac.uk/ws/portalfiles/portal/360117816/Transaction_Scheduling_CAO_DOA16082022_AFV.pdf`
+  Why: schedule-first OLTP work contrasts static/runtime conflict scheduling
+  and proactive deferral; useful for comparing bounded SMF-style admission
+  with lighter runtime probes for hot writes.
+- `queued` — **Polaris: Enabling Transaction Priority in Optimistic
+  Concurrency Control**, Ye et al., PACMMOD/SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3588724`
+  PDF: `https://chenhao-ye.github.io/publication/polaris/polaris.pdf`
+  Why: priority-aware optimistic concurrency control with lightweight
+  reservation; useful follow-up for protecting high-priority retained reads,
+  writes, refreshes, or latency-sensitive sessions under hot-key contention.
 - `skipped` — **The Yin and Yang of Processing Data Warehousing Queries on GPU
   Devices**, Yuan et al., PVLDB 2013.
   URL: `https://www.vldb.org/pvldb/vol6/p817-yuan.pdf`
