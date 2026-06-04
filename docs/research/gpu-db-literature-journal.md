@@ -32324,3 +32324,162 @@ memory bandwidth, pinned buffers, or eviction attention at the wrong time.
   by tier, transfer bytes by path, queue wait by path, p50/p99 latency,
   HBM-retained bytes, CPU-stage bytes, and "cached but no latency benefit"
   bytes.
+
+### 2026-06-04 - SiliconDB adapts morsel scheduling to heterogeneous accelerators
+
+**Citation:** Kayhan Dursun, Carsten Binnig, Ugur Cetintemel, Garret Swart,
+and Weiwei Gong. "A Morsel-Driven Query Execution Engine for Heterogeneous
+Multi-Cores." PVLDB 12(12), 2019. Retrieved 2026-06-04 from the PVLDB PDF:
+`https://www.vldb.org/pvldb/vol12/p2218-dursun.pdf`.
+
+**Category:** Runtime / HFT / session scale and query optimization / planning.
+
+**Relevance tags:** heterogeneous scheduling; CPU/accelerator co-execution;
+morsel-driven execution; function-specific queues; adaptive push scheduling;
+queueing model; NUMA locality; work stealing; cache-local follow-up work;
+route descriptors; CPU/GPU fallback.
+
+**Core idea:** SiliconDB takes the morsel-driven execution idea and changes the
+scheduler for a machine where general CPU cores and specialized accelerators
+share memory but do not have identical capabilities. The important shift is
+that a query is not simply assigned to "CPU" or "accelerator." It is split into
+sub-pipelines, each sub-pipeline is tagged by the functions it can run on, and
+small work elements move through queues that expose both pipeline stage and
+eligible compute resources.
+
+The strongest transferable idea is adaptive co-execution rather than static
+CPU/GPU split ratios. SiliconDB keeps accelerator-capable work available to CPU
+workers when CPUs would otherwise idle, while an accelerator handler pushes
+enough work to passive accelerator queues to keep them busy without making them
+stragglers. That is close to the GPU DB runtime problem: a fast GPU path should
+not become a blocking sink for work when CPU execution, fallback, or immediate
+short reads can preserve p99 latency.
+
+**Concrete mechanisms:**
+
+- SiliconDB groups CPU cores and accelerators that share a NUMA region into
+  processing units. Tables are partitioned across processing units so local
+  work mostly touches local memory.
+- The compiler splits a query pipeline into sub-pipelines and labels each one
+  as accelerator-capable or core-only. On the SPARC M7 DAX target, accelerator
+  functions include scan, select, and translate/semi-join over in-memory
+  column buffers.
+- Each processing unit has one core-only queue plus function-specific queues
+  such as scan, select, and join queues. Function-specific queues can be
+  drained by CPU workers or by accelerator handlers; core-only queues are
+  drained only by CPU workers.
+- Worker threads use a priority map: drain core-only work first, then pull
+  accelerator-capable work if the core-only queue is empty. This keeps CPUs
+  useful when accelerators cannot consume all eligible work.
+- Passive accelerators are served by handlers. SiliconDB evaluates a dedicated
+  handler thread and a piggybacked model where worker threads also observe and
+  refill accelerator queues.
+- The accelerator handler controls a `q-size` parameter: the maximum number of
+  work elements allowed in the accelerator's internal hardware queue.
+- `q-size` is adjusted at runtime using observed arrival rates, service rates,
+  CPU and accelerator throughput, and a limited-capacity queueing model
+  (`M/M/s/k`) that estimates utilization and queued items.
+- The cost model searches nearby `q-size` values and chooses the one with the
+  lowest estimated runtime for the remaining work, balancing accelerator
+  utilization against queue buildup and straggler risk.
+- Follow-up work can be fused instead of always materialized through a queue
+  when a CPU worker finishes an accelerator-capable morsel and the next
+  sub-pipeline is core-only.
+- When a DAX handler completes a work element, it can push the follow-up item
+  to the front of the core-only queue to improve last-level-cache locality
+  between accelerator output and CPU consumption.
+- Processing units may steal from remote queues only after local queues are
+  empty, reducing idle time while preserving locality as the common case.
+- Concurrent-query support in the paper is deliberately basic: work elements
+  carry query identity and outputs route back to the right query, but FIFO
+  scheduling and no work sharing are used.
+- Query rewrite heuristics deliberately add work when it unlocks more hardware
+  utilization: extra materialization can create late accelerator-filterable
+  work, and join recoding can split a semi-join into supported encoding widths.
+- Evaluation on SPARC M7 with SSB reports up to 3.2x over an
+  operator-at-a-time baseline, 2.3x over static data partitioning for SSB, and
+  up to 2x over alternative heterogeneous strategies in the paper's summary.
+  The exact numbers are hardware-specific.
+
+**GPU DB mapping:** The runtime should treat GPU execution as one lane in a
+heterogeneous route graph, not as the only accelerated destination. A retained
+read descriptor can compile into sub-pipelines such as CPU visibility check,
+resident GPU lookup, CPU fallback filter, GPU aggregate, CPU encode, and
+response scatter. Each sub-pipeline should declare eligible resources, input
+shape, output shape, snapshot generation, and whether it may be fused with the
+next step.
+
+SiliconDB's function-specific queues map well to bounded rings. GPU DB should
+not have only "read queue" and "GPU queue." It needs rings by route family:
+core-only snapshot work, GPU lookup, GPU scan, GPU aggregate, CPU encode,
+residency refresh, cold-tier transfer, and mutation admission. CPU workers may
+steal accelerator-capable work only when doing so is semantically allowed and
+when it protects latency; GPU workers should not be fed a static fraction of
+all morsels regardless of current queue wait.
+
+The `q-size` idea maps directly to GPU micro-batch depth. The runtime can
+adapt per route shape using observed CPU throughput, GPU throughput, queue
+wait, kernel time, transfer time, pinned-buffer occupancy, and remaining batch
+work. The target is not maximum GPU utilization by itself. The target is the
+smallest batch depth that keeps the device useful without making it the tail
+latency straggler or starving immediate CPU-retained reads.
+
+The cache-local follow-up mechanism also matters. If a CPU worker performs
+visibility or sparse late materialization for a GPU-produced bitset or row-id
+vector, that follow-up should have affinity to the worker or NUMA domain that
+owns the staged output. For GPU DB, the equivalent is not just LLC locality; it
+is pinned-buffer, NUMA-node, CUDA stream, and response-ring locality.
+
+The optimizer lesson is that some plans that look more expensive locally may
+be better globally because they expose useful work to scarce resources later
+in the pipeline. GPU DB's planner should allow controlled rewrites that add
+materialization, pre-filtering, or recoding only when the route descriptor
+predicts lower end-to-end latency under current CPU/GPU/tier pressure.
+
+**Risks and mismatches:** SiliconDB targets analytical SSB-style workloads on
+SPARC M7 DAX engines, not transactional SQL with WAL-before-visibility, MVCC,
+DDL invalidation, high logical session counts, or discrete PCIe GPU transfer
+costs. Its accelerators share memory and sometimes LLC with CPU cores, so the
+transfer economics differ from an NVIDIA GPU with HBM, PCIe/NVLink, pinned
+buffers, and kernel launch overhead.
+
+The paper's concurrent-query model is intentionally minimal and does not solve
+fair admission, tenant isolation, or p99 protection. GPU DB must add priority,
+overload rejection, and per-route budgets rather than simply mixing all query
+morsels FIFO.
+
+The query rewrites are heuristics evaluated on DAX capabilities. GPU DB can
+borrow the shape of capability-aware rewrites, but every rewrite must preserve
+SQL semantics, snapshot compatibility, and deterministic fallback. Extra
+materialization can also increase memory pressure and should be rejected when
+it consumes pinned buffers, HBM, or CPU bandwidth needed by short reads or
+mutation work.
+
+**Benchmark candidates:**
+
+- Add a descriptor-driven scheduler simulator with queues for core-only
+  retained reads, GPU lookup, GPU scan, CPU encode, cold transfer, and refresh.
+  Compare static CPU/GPU split, GPU-first drain, and SiliconDB-style adaptive
+  co-execution. Gate: lower p99 at equal correctness and bounded queue depth,
+  not only higher device utilization.
+- Prototype adaptive GPU micro-batch depth using a `q-size` analogue per route
+  shape. Inputs: observed CPU throughput, GPU kernel throughput, H2D/D2H
+  bytes, queue wait, pinned-buffer occupancy, and remaining compatible work.
+  Failure condition: the scheduler keeps increasing batch depth while p99
+  latency worsens or CPU fallback would have met the latency budget.
+- Add route-family rings rather than one generic read queue in a no-GPU model:
+  `core_snapshot`, `gpu_lookup`, `gpu_scan`, `gpu_aggregate`,
+  `cpu_encode`, `residency_refresh`, and `cold_transfer`. Measure queue wait,
+  steal count, rejected work, and latency by family.
+- Benchmark cache/NUMA affinity for follow-up work before GPU hardware returns:
+  produce intermediate row-id or bitset buffers on one worker and compare
+  local front-of-queue follow-up, FIFO global queue, and remote steal. Later
+  repeat with pinned host buffers and CUDA streams.
+- Add a capability-aware rewrite experiment for retained routes: compare
+  direct CPU filter, GPU filter plus CPU aggregate, and extra materialization
+  that exposes a second GPU filter. Gate: rewrite is selected only when the
+  route descriptor predicts and telemetry confirms an end-to-end latency win.
+- Track "accelerator straggler" telemetry: work pushed, in-flight depth,
+  completed batch count, queue wait, kernel/handler idle time, CPU steal
+  count, and tail contribution. Gate: overload control can shrink GPU batch
+  depth or route to CPU before GPU work dominates p99.

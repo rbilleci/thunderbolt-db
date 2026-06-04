@@ -537,7 +537,7 @@ Append new candidates here as each paper is processed.
   Why: FileScale contrasts namespace partitioning and caching approaches with
   distributed-transaction metadata; useful for evaluating route-cache
   placement, replication, and cache-invalidation options.
-- `queued` — **A Morsel-Driven Query Execution Engine for Heterogeneous
+- `reviewed` — **A Morsel-Driven Query Execution Engine for Heterogeneous
   Multi-Cores**, Dursun et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p2218-dursun.pdf`
   DOI: `https://doi.org/10.14778/3352063.3352137`
@@ -618,6 +618,25 @@ Append new candidates here as each paper is processed.
   Why: combines learned optimizer search with DBMS operator restrictions and
   beam search; relevant to adding learned GPU route suggestions without
   surrendering deterministic planner guardrails.
+- `queued` — **Robust Query Processing in Co-Processor-Accelerated
+  Databases**, Bress et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882936`
+  Why: SiliconDB contrasts adaptive runtime scheduling with static
+  co-processor decisions; useful for route robustness when GPU queue,
+  transfer, or selectivity estimates are wrong.
+- `queued` — **Pipelined Query Processing in Coprocessor Environments**,
+  Funke et al., SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3183736`
+  Why: SiliconDB cites it as coprocessor query processing background; relevant
+  to deciding how much CPU/GPU pipeline state should be fused versus
+  materialized across transfer and queue boundaries.
+- `queued` — **Adaptive NUMA-Aware Data Placement and Task Scheduling for
+  Analytical Workloads in Main-Memory Column-Stores**, Psaroudakis et al.,
+  PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol10/p37-psaroudakis.pdf`
+  Why: related NUMA placement and task scheduling work cited by SiliconDB;
+  useful for CPU-side partition owners, route-local memory placement, and
+  fallback scheduling when GPU work is saturated.
 - `queued` — **Azure Data Lake Store: A Hyperscale Distributed File Service
   for Big Data Analytics**, Ramakrishnan et al., SIGMOD 2017.
   URL: `https://doi.org/10.1145/3035918.3056100`
