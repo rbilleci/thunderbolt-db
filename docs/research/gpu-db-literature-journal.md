@@ -37396,3 +37396,184 @@ resident state and fallback latency.
 - Add fallback accounting for prediction: default admission, default eviction,
   and default maintenance schedules must remain available when telemetry is
   missing, invalid, too new, or recently inaccurate.
+
+### 2026-06-04 - BGHT makes GPU hash indexes a probe-budgeted route, not just a lookup primitive
+
+**Citation:** Muhammad A. Awad, Saman Ashkiani, Serban D.
+Porumbescu, Martin Farach-Colton, and John D. Owens. "Analyzing
+and Implementing GPU Hash Tables." APOCS 2023, pp. 33-50. DOI
+`10.1137/1.9781611977578.ch3`. Also available as "Better GPU Hash
+Tables," arXiv:2108.07232v3, 2022. Retrieved 2026-06-04 from
+`https://arxiv.org/abs/2108.07232` and the authors' artifact page
+`https://owensgroup.github.io/BGHT/`.
+
+**Category:** GPU execution / analytics; resident indexing.
+
+**Relevance tags:** GPU hash tables; resident equality indexes; static
+indexes; bucketed cuckoo hashing; negative lookups; probe budgets; high
+load factor; batched lookup routes; GPU memory layout; immutable
+generation rebuilds.
+
+**Core idea:** BGHT revisits static GPU hash tables and shows that the
+table's in-memory representation can be separated from its probing
+scheme. Once memory access is made efficient and lock-free, the dominant
+route facts are simple: bucket size, number of probes/hash functions,
+load factor, and whether the workload is dominated by successful or
+unsuccessful lookups. The paper's recommended default is a bucketed
+cuckoo hash table with bucket size 16 and three hash functions; the
+reported design reaches very high load factors while keeping average
+probe counts low.
+
+For GPU DB, the transferable idea is not "use a hash table everywhere."
+It is to expose resident equality indexes as explicit route families with
+probe budgets. A retained hash-index route should know its load factor,
+bucket size, hash count, positive/negative lookup mix, batch depth,
+build cost, and immutable generation boundary before the planner chooses
+it over CPU index lookup, GPU B-tree lookup, RT/BVH lookup, or resident
+scan.
+
+**Concrete mechanisms:**
+
+- The paper evaluates static hash tables for one NVIDIA GPU, assuming the
+  dataset fits in GPU memory and the table is built once from keys or
+  key-value pairs before lookup.
+- It studies three bucketed designs: bucketed cuckoo hashing, bucketed
+  power-of-two-choices hashing, and iceberg hashing.
+- Bucket size is treated as a hardware-facing parameter. Larger buckets
+  reduce load variance and can improve achievable load factor; the paper
+  notes that bucket size can be chosen to match cache-line behavior.
+- Bucketed cuckoo hashing maps a key to multiple candidate buckets. With
+  three hash functions and bucket size 16, the paper reports the strongest
+  combined insertion/query recommendation for high load factors.
+- The arXiv abstract reports that at load factors as high as 0.99, BCHT
+  averages 1.43 probes for insertion; with three hash functions, positive
+  and negative queries require at most 1.39 and 2.8 average probes per key,
+  respectively.
+- Iceberg hashing optimizes the common case by filling a primary bucket up
+  to a threshold and using extra hash functions only when the threshold is
+  exceeded. The paper positions it as a stability-oriented option with a
+  lower achievable load factor than the high-load BCHT recommendation.
+- Power-of-two-choices-style placement chooses among candidate buckets by
+  load, improving stability and some query behavior at the cost of
+  placement overhead and lower load-factor targets than BCHT.
+- Insertions rely on atomic exchanges and therefore serialize when many
+  insertions target the same bucket, but still expose large parallelism
+  across independent buckets.
+- The authors compare against prior GPU hash-table and key-value designs,
+  including Mega-KV, WarpCore/WarpDrive-style work, DyCuckoo, and dynamic
+  GPU hash-table lines. The exact full PDF was available via arXiv; the
+  SIAM DOI page supplied the published APOCS citation and abstract.
+- The official BGHT artifact exposes host-side and device-side APIs, with
+  cooperative-group tile use for device insertion and lookup. It describes
+  itself as a header-only library of high-performance static GPU hash
+  tables.
+- The artifact limitations are important: cuckoo-based tables do not
+  support concurrent insertion and queries, keys must be unique for
+  non-iceberg probing schemes, and table construction can fail at some
+  load factors/key distributions unless capacity is increased or load
+  factor reduced.
+
+**GPU DB mapping:** BGHT fits the P8 storage design as a candidate
+resident equality-index implementation for immutable generations. A hash
+index over a published resident segment could map keys to row ordinals
+or compact row-id lists, then route the result through normal visibility
+and predicate checks. Because the table is static, the first safe shape is
+generation rebuild after refresh, not per-mutation GPU index maintenance.
+
+The planner contract should include hash-index facts instead of treating
+the index as an opaque "GPU lookup." For each resident generation, record
+hash family, bucket size, hash count, load factor, build success/failure,
+estimated positive and negative probe counts, memory footprint, key
+domain, duplicate-key handling, source visibility boundary, and supported
+predicate shape. If mutation invalidates the generation, or if duplicate
+keys, range predicates, text-prefix predicates, or low batch depth violate
+the route envelope, CPU index, GPU B-tree, sorted-vector, or scan fallback
+should be selected instead.
+
+The negative-lookup result is especially relevant to OLTP-style probes.
+Many retained equality lookups may miss because sessions query absent
+keys, stale prepared parameters, or anti-join filters. A route that bounds
+negative probe cost can avoid wasting GPU memory traffic on misses, but
+only if the planner tracks miss rate and batch size. This suggests
+separate benchmark lanes for hit-heavy, miss-heavy, and skewed lookup
+batches rather than a single average lookup test.
+
+For concurrency, BGHT reinforces a base-plus-delta design. Let the static
+GPU hash table serve a frozen resident generation, while recent inserts,
+updates, and deletes stay in CPU/MVCC state or a small mutable delta
+structure until the next refresh publishes a new hash index. That keeps
+WAL-before-visibility and snapshot invalidation simple while still testing
+whether static GPU lookup pays back enough reads per generation.
+
+**Risks and mismatches:** BGHT is a static data-structure paper, not a
+DBMS storage engine. It does not cover MVCC visibility, duplicate SQL
+keys, composite keys, NULL semantics, range predicates, DDL invalidation,
+WAL/recovery, long snapshots, memory pressure, or concurrent table updates
+inside a database. The main results assume a single GPU and resident data;
+over-resident execution, CPU/GPU transfer, and 1M logical sessions are
+outside its scope. High load factor also raises route risk: construction
+failure or distribution-sensitive probe inflation must become an explicit
+admission/fallback reason, not a runtime surprise.
+
+**Benchmark candidates:**
+
+- Build a resident equality-index benchmark with four routes: CPU index,
+  resident GPU scan, resident GPU hash table, and resident GPU B-tree or
+  sorted-vector lookup. Measure p50/p95 latency, throughput, HBM bytes,
+  build time, temporary memory, load factor, and construction failure.
+- Split lookup workloads into hit-heavy, miss-heavy, skewed, and mixed
+  batches. Proof gate: the planner must record miss-rate assumptions and
+  reject a hash route when negative probes, low batch depth, or memory
+  pressure make scan/CPU fallback cheaper.
+- Test generation rebuild economics: queries served per hash-index build,
+  build milliseconds, peak HBM, invalidation frequency, and refresh
+  overlap with active routes. Failure condition: the hash index is rebuilt
+  more often than it is used.
+- Add duplicate-key and SQL semantics tests. If the hash structure only
+  supports unique keys, route it to primary-key/equality predicates only
+  until row-list or duplicate-chain handling is specified.
+- Compare base-plus-delta routing: static GPU hash index for the published
+  generation plus CPU/delta checks for newer mutations. Proof gate:
+  post-mutation reads never miss visible delta rows and stale resident hits
+  are filtered by snapshot/generation boundary.
+- Add a route descriptor field for expected probes per key and observed
+  probes per batch. The planner should learn when a high-load hash index is
+  still useful versus when probe inflation or construction retries erase
+  the GPU advantage.
+
+### 2026-06-04 - Cross-paper synthesis: resident indexes need route envelopes and rebuild economics
+
+The last four reviewed papers point at a tighter resident-route contract.
+RTIndeX makes specialized GPU hardware useful only inside a narrow workload
+envelope. Moneyball and Seagull say scarce warm resources should be kept
+only when decision-specific history pays for them. BGHT adds that a
+resident index must expose simple physical facts such as load factor, probe
+count, hit/miss mix, and construction risk before the planner can trust it.
+
+The converging design track is an explicit "resident route envelope" for
+each accelerated path. A route should state what it supports, what it costs
+to build, what batch depth or predictability it needs, what invalidates it,
+and what fallback is allowed. For indexes, the envelope should include the
+index family, source snapshot boundary, key semantics, duplicate handling,
+build/rebuild cost, memory footprint, expected probes or traversal depth,
+and observed hit/miss behavior. For warm route state, it should include
+reuse probability, idle byte-time, wrong-warmup cost, and active-route
+interference.
+
+Category gaps remain around query optimization and admission across these
+envelopes. The next useful papers should cover route ranking under
+uncertainty, hybrid CPU/GPU pipeline scheduling, or non-analytics OLTP/MVCC
+work that makes the publication boundary and delta handling more concrete.
+
+**Benchmark priorities:**
+
+- Implement route-envelope telemetry before adding more resident index
+  families: build cost, resident bytes, invalidation cause, expected probe
+  count/traversal cost, hit/miss mix, queries served per generation, and
+  fallback reason.
+- Compare hash, B-tree/sorted-vector, RT/BVH, and scan routes on the same
+  immutable resident snapshot with controlled hit rate, skew, duplicates,
+  batch size, and update frequency.
+- Add a route warmup simulator that uses those same envelope facts, so
+  warm-idle decisions are based on measured reuse and rebuild economics
+  instead of generic cache-hit counters.

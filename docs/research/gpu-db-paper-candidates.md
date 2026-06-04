@@ -532,7 +532,7 @@ Append new candidates here as each paper is processed.
   Why: RTScan's main CPU/CUDA baseline; useful for comparing two-layer bitmap
   filtering, refinement cost, memory footprint, and update limitations against
   GPU-resident predicate-index experiments.
-- `queued` — **A GPU Multiversion B-Tree**, Awad, Porumbescu, and Owens,
+- `reviewed` — **A GPU Multiversion B-Tree**, Awad, Porumbescu, and Owens,
   PACT 2022.
   URL: `https://doi.org/10.1145/3559009.3569681`
   Why: RTIndeX compares against the Owens group GPU B+-tree line; a
@@ -2848,14 +2848,26 @@ Append new candidates here as each paper is processed.
   Why: QueCC cites transaction chopping and constrained parallel execution as
   related fragment models; useful for deciding when GPU DB should expose
   template-level dependency constraints instead of only route-local queues.
-- `queued` — **Analyzing and Implementing GPU Hash Tables**, Awad et al.,
+- `reviewed` — **Analyzing and Implementing GPU Hash Tables**, Awad et al.,
   APOCS 2023.
-  URL: `https://doi.org/10.1137/1.9781611977561.ch4`
+  URL: `https://doi.org/10.1137/1.9781611977578.ch3`
   Author/code page: `https://github.com/owensgroup/BGHT`
   Why: the GPU multiversion B-tree project identifies BGHT as a companion
   GPU data-structure design with device-side APIs; useful for comparing
   retained B-tree versus hash-index lookup routes, probe bounds, and
   snapshot-friendly index rebuild options.
+- `queued` — **Mega-KV: A Case for GPUs to Maximize the Throughput of
+  In-Memory Key-Value Stores**, Zhang et al., PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol8/p1226-zhang.pdf`
+  Why: compared by the BGHT paper as a GPU key-value/hash-table baseline;
+  useful for deciding whether resident point-lookup indexes should be a DBMS
+  route only or a GPU-side key-value service boundary.
+- `queued` — **Data-Parallel Hashing Techniques for GPU Architectures**,
+  Lessley and Childs, IEEE TPDS 2020.
+  URL: `https://doi.org/10.1109/TPDS.2019.2926406`
+  Why: BGHT compares against broader GPU hashing approaches; useful for
+  separating probing/layout effects from application-specific database lookup
+  behavior.
 - `reviewed` — **More Bang For Your Buck(et): Fast and Space-efficient
   Hardware-accelerated Coarse-granular Indexing on GPUs**, Henneberg et al.,
   arXiv 2024.
