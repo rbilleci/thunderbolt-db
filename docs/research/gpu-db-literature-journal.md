@@ -33272,3 +33272,153 @@ route-budget harness before real GPU benchmarking resumes: simulate resident
 bytes, scratch bytes, pinned buffers, conflict edges, and fallback pools in one
 admission model so that later CUDA kernels cannot hide a broken scheduling
 contract.
+
+### 2026-06-04 - Distributed GPU joins hide network shuffle under GPU work
+
+**Citation:** Lasse Thostrup, Gloria Doci, Nils Boeschen, Manisha Luthra, and
+Carsten Binnig. "Distributed GPU Joins on Fast RDMA-capable Networks."
+PACMMOD 1(1), 2023, article 29. DOI: `https://doi.org/10.1145/3588709`.
+Retrieved 2026-06-04 from the ACM DOI metadata and the author-version chapter
+in Thostrup's thesis, `https://tuprints.ulb.tu-darmstadt.de/26755/`.
+
+**Category:** GPU execution / analytics; runtime / HFT / session scale;
+multi-tier cache / data placement.
+
+**Relevance tags:** distributed GPU joins; GPUDirect RDMA; one-sided RDMA;
+persistent kernels; streaming shuffle; GPU memory budgeting; hybrid CPU/GPU
+fallback; skew-aware partitioning; multi-device route planning.
+
+**Core idea:** The paper's main claim is that GPU acceleration in a distributed
+DBMS should not be judged as "copy to GPU, then run operator." In a scale-out
+join, the data has to be shuffled over the network anyway. With GPUDirect RDMA,
+that shuffle can target remote GPU memory at roughly the same bandwidth as
+remote CPU memory, so the useful design is to overlap network shuffle with GPU
+build/probe work instead of serializing shuffle, transfer, and kernel phases.
+
+The resulting pipelined join keeps CPU memory as the table source, streams
+small RDMA-written chunks into GPU buffers, and uses active GPU kernels to poll,
+validate, and consume incoming chunks. The paper extends this with a hybrid
+CPU/GPU join for build sides larger than aggregate GPU memory: partitions that
+fit are routed to GPUs, while overflow partitions run through a CPU radix join.
+In evaluation on V100 GPUs and 100 Gbps RDMA, the pipelined GPU join is around
+2x faster than a blocking GPU join in the large-probe case and up to 6.8x faster
+than the CPU baseline for selected SSB multi-join queries. Absolute speedups are
+hardware- and OLAP-specific; the transferable idea is the resource pipeline.
+
+**Concrete mechanisms:**
+
+- Tables remain partitioned in CPU memory. The distributed join repartitions
+  input tuples by join key and sends resulting chunks directly to target GPUs
+  with GPUDirect RDMA.
+- The paper contrasts CPU-driven two-sided RDMA, where CPUs poll completions and
+  launch kernels per chunk, with GPU-driven one-sided RDMA, where a persistent
+  GPU kernel polls GPU-local buffers. The GPU-driven design avoids repeated
+  kernel-launch and receiver-CPU overhead.
+- Sender CPUs first build local histograms, exchange them, and derive global
+  partition sizes. The global histogram reserves GPU resources and decides which
+  partitions fit in GPU memory for the hybrid route.
+- Incoming RDMA writes to GPU memory can be partially visible or unordered from
+  the GPU kernel's perspective. The implementation appends a lightweight checksum
+  per chunk; the active kernel retries until the checksum validates.
+- The join over-partitions data relative to GPU count. The evaluated design uses
+  configurable fan-out and found 16 partitions per GPU robust for its setup,
+  while 4 partitions per GPU was enough to saturate the tested network in a
+  microbenchmark.
+- GPU resources are assigned by partition size derived from the histogram, not
+  a fixed equal grid per partition. Larger partitions receive more thread blocks
+  to avoid skew-driven stragglers.
+- Build-side hash tables use preallocated arrays and CUDA atomics. A chain array
+  stores collision chains without runtime allocation; probing is read-only and
+  avoids atomics after build.
+- Successive operations can remain on the GPU. The paper chains multiple hash
+  probes and aggregation in SSB queries so extra computation is hidden under the
+  streaming shuffle.
+- Result materialization streams back to CPU memory using UVA-backed CPU
+  allocation and double output buffers per partition, avoiding full result
+  materialization in GPU memory.
+- The hybrid algorithm increases partition fan-out when the build side exceeds
+  GPU memory, assigns the best-fitting partitions to GPU memory using the global
+  histogram, and executes remaining partitions with a CPU radix join.
+- The evaluation includes concurrent joins and skew microbenchmarks. GPU and CPU
+  relative runtimes both grow with concurrent joins, while adaptive grid sizing
+  prevents high-skew partitions from dominating until network skew itself
+  becomes the bound.
+
+**GPU DB mapping:** This paper is a direct fit for the runtime's "route work to
+data and overlap scarce resources" target. For GPU DB, a retained route should
+not be modeled as a monolithic GPU request. It should expose a pipeline of
+source movement, resident/scratch admission, kernel work, and response/result
+materialization, with each stage able to overlap only when ownership and
+visibility boundaries are explicit.
+
+The GPUDirect result matters for future multi-node or multi-device P8, but the
+same shape also applies inside one node: if rows, WAL-derived deltas, cold NVMe
+segments, or CPU canonical pages must move before GPU work, the scheduler should
+try to hide GPU computation under unavoidable movement instead of adding a
+separate GPU phase after movement completes. That suggests benchmarks for
+chunked refresh and retained scan routes where CPU-side encoding, H2D transfer,
+kernel execution, and response materialization all stream through bounded rings.
+
+The active-kernel design maps to GPU execution owners, not IO workers. A GPU
+owner can keep a persistent route kernel or long-lived stream context for
+compatible batches, while network/session workers only publish buffers and
+completion metadata. The checksum workaround is also a reminder that GPU-visible
+producer/consumer queues need explicit memory-consistency proof. Future
+GPUDirect, GDS, or peer-memory paths cannot assume that "buffer written" means a
+polling GPU can safely consume it.
+
+The hybrid CPU/GPU join is a concrete fallback model for P8. Instead of treating
+non-fitting data as a failed GPU route, the planner can partition the work:
+hot/resident partitions on GPU, overflow or low-benefit partitions on CPU, with
+histogram- or telemetry-derived placement. This is exactly the kind of
+resident-input boundary and temporary-state boundary the last synthesis entry
+called for.
+
+For 1M logical sessions, the paper reinforces that concurrent query admission
+must count partitions, chunks, active kernels, GPU scratch, output buffers,
+network/H2D queues, and CPU fallback lanes. A session count alone says little:
+four compatible retained batches may share a pipeline, while one wide skewed
+join can consume partition fan-out, scratch, and output bandwidth.
+
+**Risks and mismatches:** The paper is squarely OLAP and distributed join
+oriented. It does not address WAL-before-visibility, MVCC snapshots, serializable
+predicate protection, write conflicts, DDL invalidation, pgwire response
+ordering, or crash recovery. Its CPU-memory source model is compatible with P8,
+but the GPU hash tables are operator-local structures, not durable or
+snapshot-retired indexes.
+
+The reported hardware uses V100 GPUs, ConnectX-5, 100 Gbps RDMA, Linux 4.15, and
+CUDA 11.3. Modern PCIe, NVLink, GDS, and HBM behavior may change the constants.
+The paper also depends on GPUDirect-capable network placement; it notes prior
+contradictory findings can arise when NICs and GPUs are not under a favorable
+PCIe topology. GPU DB should benchmark topology explicitly before treating
+remote GPU memory as equivalent to remote CPU memory.
+
+Persistent kernels can reserve GPU resources and interfere with short routes if
+used too broadly. They are promising for high-volume compatible pipelines, but
+bad for sporadic low-latency point queries unless admission can prove that the
+saved launch overhead beats occupied SMs, polling overhead, and queueing delay.
+
+**Benchmark candidates:**
+
+- Build a CPU-only pipeline simulator for retained scans and joins with stages:
+  source chunk production, transfer/H2D queue, GPU worker, result materializer,
+  and response ring. Gate: p95 latency and memory stay bounded while throughput
+  improves versus blocking stage execution.
+- Add a route descriptor field for `pipeline_mode`: blocking, streaming,
+  persistent-kernel-compatible, or hybrid CPU/GPU. Failure condition: a route
+  enters a streaming GPU lane without known chunk size, scratch budget,
+  visibility boundary, and fallback lane.
+- Prototype chunk checksums or sequence stamps for GPU-consumed producer buffers
+  in a no-GPU model. Gate: stale/partial/reordered chunk consumption is detected
+  under injected reorder and delayed-write tests.
+- Add a hybrid partition-placement benchmark: use histograms to assign hot or
+  fitting partitions to a synthetic GPU budget and overflow partitions to CPU.
+  Compare first-fit, largest-fit, histogram-aware, and route-cost-aware
+  placement.
+- Measure skew-aware batch sizing for retained lookup/join fragments: allocate
+  simulated GPU worker slots by partition/key frequency and report straggler
+  time versus network/transfer bound.
+- For future hardware, run a GPUDirect/GDS topology probe before full DB
+  benchmarks: CPU-to-CPU, CPU-to-GPU, GPU-to-CPU, and storage-to-GPU bandwidth,
+  with NIC/GPU locality recorded as part of benchmark metadata.

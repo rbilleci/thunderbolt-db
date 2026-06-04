@@ -319,7 +319,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
   Why: cost-based CPU/GPU placement and execution orchestration for
   heterogeneous DBMS designs.
-- `queued` — **Distributed GPU Joins on Fast RDMA-capable Networks**,
+- `reviewed` — **Distributed GPU Joins on Fast RDMA-capable Networks**,
   Thostrup et al., PACMMOD 2023.
   URL: `https://doi.org/10.1145/3588709`
   Why: follow-up GPU join work on scaling join state and data movement across
@@ -2810,3 +2810,24 @@ Append new candidates here as each paper is processed.
   pessimistic/optimistic hot-tuple handling; useful for deciding when GPU DB
   should switch hot keys or route families from optimistic batch admission to
   owner-serialized or lock-like handling.
+- `queued` — **Zero-sided RDMA: Network-driven Data Shuffling for
+  Disaggregated Heterogeneous Cloud DBMSs**, Jasny, Thostrup, Tamimi,
+  Koch, Istvan, and Binnig, PACMMOD 2024.
+  URL: `https://doi.org/10.1145/3639291`
+  Why: follow-up from the same network/accelerator line that offloads RDMA
+  data movement to programmable switches; useful for future GPU DB
+  accelerator-pool shuffling, global-order replication, and CPU-free
+  producer/consumer rings.
+- `queued` — **Zero-sided RDMA: Network-driven Data Shuffling**, Jasny,
+  Thostrup, and Binnig, DaMoN 2023.
+  URL: `https://doi.org/10.1145/3592980.3595302`
+  Why: compact workshop version of switch-driven RDMA shuffling; useful if the
+  loop needs the smaller source before the full PACMMOD 2024 version.
+- `queued` — **Efficiently Joining Large Relations on Multi-GPU Systems**,
+  Maltenberger, Tolovski, and Rabl, PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p4653-maltenberger.pdf`
+  DOI: `https://doi.org/10.14778/3749646.3749720`
+  Why: recent multi-GPU join follow-up that cites distributed GPU RDMA joins;
+  useful for comparing network-scale partitioned joins with intra-node
+  multi-GPU sort-merge, P2P interconnect use, out-of-core joins, and transfer
+  scheduling.
