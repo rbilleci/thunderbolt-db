@@ -39866,3 +39866,162 @@ Benchmark priorities:
 - monotonic versus non-monotonic route mutation barriers;
 - p99 latency accounting across owner lookup, route cache, GPU queue, and
   response scattering.
+
+### 2026-06-04 - Semantic repair beats full OCC restart when conflict scope is small
+
+**Citation:** Yingjun Wu, Chee-Yong Chan, and Kian-Lee Tan.
+"Transaction Healing: Scaling Optimistic Concurrency Control on Multicores."
+SIGMOD 2016, pp. 1689-1704. DOI `10.1145/2882903.2915202`.
+Retrieved 2026-06-04 from the author PDF,
+`https://yingjunwu.github.io/papers/sigmod2016.pdf`.
+
+**Category:** Transaction processing / write path; MVCC / snapshot /
+visibility; runtime / HFT / session scale.
+
+**Relevance tags:** optimistic concurrency control; semantic repair;
+stored procedures; dependency graph; access cache; validation order;
+false aborts; commit timestamps; contention; hot records.
+
+**Core idea:** Transaction Healing starts from a practical observation about
+contended OLTP: many OCC validation failures are caused by a small part of a
+transaction's read set, but conventional OCC throws away the whole command and
+restarts from scratch. The paper adds a healing phase between validation and
+write installation. When validation finds an inconsistent read, the system uses
+stored-procedure dependencies and recorded operation effects to restore only the
+operations whose outputs would change under a fresh serial execution.
+
+The transferable idea for GPU DB is not "repair arbitrary SQL" but "make the
+conflict scope explicit." If a transaction envelope has enough semantic shape,
+the engine can avoid replaying CPU parsing, route lookup, GPU batch admission,
+and unaffected reads after a hot-record conflict. This is especially relevant
+for future stored procedures, prepared command envelopes, batched writes, and
+owner-local mutation programs where dependency graphs can be generated or
+declared ahead of execution.
+
+**Concrete mechanisms:**
+
+- T HE DB performs compile-time static analysis over predefined stored
+  procedures and builds a program dependency graph. It distinguishes key
+  dependencies, where an earlier operation determines a later access key, from
+  value dependencies, where an earlier operation determines a later non-key
+  update value.
+- During execution, each worker maintains a thread-local read/write set and an
+  access cache. The access cache records each operation's inputs, outputs,
+  access set, and links back to read/write-set entries, so healing can reuse
+  memory addresses and prior operation effects without repeated index lookups.
+- Validation locks records in a global order, compares record timestamps
+  against read/write-set timestamps, and invokes healing rather than immediate
+  abort when a read inconsistency is detected.
+- For value-dependent children, healing restores outputs or write effects by
+  directly visiting the cached record addresses. For key-dependent children,
+  healing re-executes the operation because the access set itself may change;
+  that can partially update read/write-set membership.
+- Membership updates can violate the global lock order. The system uses a
+  no-wait deadlock-prevention rule: if healing must insert and lock a newly
+  discovered earlier-ordered record and the lock cannot be acquired, the
+  transaction aborts.
+- The protocol recursively traverses dependent operations in breadth-first
+  order so each affected operation is restored once, then resumes validation.
+  The paper argues serializability from locked inconsistent records, later
+  validation of still-unlocked later records, and abort-on-deadlock during
+  membership change.
+- T HE DB reduces false aborts by checking whether a concurrent update changed
+  a column actually read by the current transaction. It also rearranges
+  validation order using schema access patterns, such as TPC-C's tree-shaped
+  Warehouse-to-District-to-Customer ordering, to lower the chance that healing
+  inserts records earlier than the current validation point.
+- Independent transactions, whose read/write sets can be determined from input
+  parameters before execution, get a tighter path that combines validation and
+  write installation because they do not need key-dependency membership repair.
+- Inserts use invisible records or dummy empty records so conflicting reads and
+  insertions can be healed or rejected correctly. Deletes use a visibility bit
+  plus reference counting for safe cleanup. Range-query phantom checks reuse
+  Silo-style B+-tree leaf version numbers.
+- Commit timestamps combine a periodically advanced global epoch with
+  thread-local timestamp sequences. Threads persist committed transactions
+  independently, and transactions in the same epoch can be flushed as a group.
+- Evaluation uses TPC-C and Smallbank on a 48-core AMD Opteron machine. Under
+  high-contention TPC-C, baseline OCC variants spend large fractions of time
+  aborting and restarting; T HE DB sustains much higher throughput and lower
+  latency. On Smallbank with high Zipf skew, the paper reports no T HE DB
+  aborts because validation failures are resolved by healing. Access-cache and
+  read-copy overheads are measured as small in a low-contention TPC-C setup.
+
+**GPU DB mapping:** The clean adaptation is a repairable command envelope for
+known transactional shapes. The mutation owner can annotate a stored procedure,
+prepared write batch, or deterministic command template with operation nodes,
+read/write keys, value dependencies, route dependencies, and output
+dependencies. If validation fails for one hot tuple, the owner can repair only
+the affected suffix of the envelope and reuse unchanged parse state, catalog
+route descriptors, resident snapshot handles, and response buffers.
+
+For P8, this points to a conflict-scope descriptor next to MVCC metadata. A
+tuple-version read should be able to say which command operations consumed it,
+which writes and query outputs depend on it, and whether a changed value affects
+only a value update or also a key/route choice. Value-only repair can stay
+owner-local and cache-friendly. Key-dependent repair must be treated as a route
+change, because it may touch a different partition, index entry, resident
+segment, or GPU batch.
+
+The runtime implication is that validation failure should not automatically
+mean a full session-level retry. The response-ring and command-ring protocol
+can expose a middle result: repaired, repaired-with-route-change, rejected for
+membership deadlock, or full retry required. This fits the target runtime's
+bounded queues better than blind restart loops under a hot-row storm, because
+queue admission can distinguish cheap local repair from expensive reissue.
+
+For GPU execution, healing is mainly useful on the CPU/owner side before
+publishing visibility. GPU kernels should not try to mutate live transaction
+state in place. A safe first experiment is to keep repair metadata in host
+memory, repair a write batch before WAL visibility, invalidate or refresh GPU
+resident generations only after the repaired commit boundary, and then measure
+how many parse/plan/route and access-cache entries survive conflicts.
+
+**Risks and mismatches:** The paper targets predefined stored procedures. It
+explicitly falls back to conventional OCC for ad-hoc transactions, because
+runtime dependency extraction can be too expensive or incomplete. That mismatch
+matters for a PostgreSQL-compatible engine where interactive SQL and arbitrary
+transactions are first-class. GPU DB should restrict healing to prepared,
+declared, or generated command templates until dependency extraction is proven
+cheap and correct.
+
+The design relies on per-record locks during validation/healing/write phases.
+That is not a lock-free fast path, and lock thrashing still appears under high
+contention. The reported hardware and storage assumptions are old, and the
+results should be treated as mechanism evidence rather than throughput targets.
+The paper's serializability argument is for T HE DB's metadata, indexes, and
+stored-procedure model; GPU resident snapshots, DDL invalidation, cross-device
+queues, text collation, and PostgreSQL protocol effects would need a separate
+correctness proof.
+
+Repair can also increase tail latency when key-dependent operations change
+membership or route, especially if the new key belongs to another owner or
+resident partition. The no-wait abort rule is simple but may still create
+visible retry spikes. False-invalidation elimination requires column-level
+read/write knowledge, which must remain aligned with SQL semantics, triggers,
+indexes, constraints, and generated columns.
+
+**Benchmark candidates:**
+
+- Add a host-only repairable-command benchmark for stored-procedure-like
+  transactions with a hot counter or balance row. Compare full OCC retry,
+  value-only repair, and key-dependent repair. Proof gate: committed histories
+  match serial CPU execution and WAL-before-visibility is unchanged.
+- Measure conflict-scope telemetry: inconsistent read count, repaired operation
+  count, reused operation count, membership-change count, route-change count,
+  no-wait abort count, and full retry count. Failure condition: repair hides
+  conflict cost without explaining tail latency.
+- Test a P8 route-change case where a healed key selects a different resident
+  segment or partition. Required result: the old route is not reused unless its
+  descriptor still proves compatibility with the repaired key and visibility
+  boundary.
+- Compare per-command access caches against owner-local read/write-set rebuilds
+  under 1M logical-session simulation with a bounded active subset. Measure
+  memory footprint, cache reuse, owner queue time, and p99 latency.
+- Add a false-invalidation benchmark with row-level timestamps but
+  column-level reads. Measure whether column-aware validation reduces
+  unnecessary repair/retry without breaking index, constraint, or visibility
+  semantics.
+- Evaluate validation order policies for prepared write batches: address order,
+  schema/tree order, partition-owner order, and hot-record-last order. Minimum
+  gate: deadlock-prevention aborts and p99 validation time are visible.

@@ -2614,7 +2614,7 @@ Append new candidates here as each paper is processed.
   Why: Bolt contrasts against ExpressPass-style credit scheduling; useful for
   comparing explicit admission credits with delay/queue feedback for GPU DB
   ingress, response rings, and bounded micro-batch launch.
-- `queued` — **Transaction Healing: Scaling Optimistic Concurrency Control on
+- `reviewed` — **Transaction Healing: Scaling Optimistic Concurrency Control on
   Multicores**, Wu, Chan, and Tan, SIGMOD 2016.
   URL: `https://dl.acm.org/doi/10.1145/2882903.2915202`
   PDF: `https://yingjunwu.github.io/papers/sigmod2016.pdf`
@@ -2628,6 +2628,14 @@ Append new candidates here as each paper is processed.
   Why: AOCC cites BCC as a low-overhead false-abort reduction baseline; useful
   for GPU DB contention handling where serializable write lanes should avoid
   unnecessary aborts without weakening visibility guarantees.
+- `queued` — **O|R|P|E - A Data Semantics Driven Concurrency Control**,
+  Hemm et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2308.09121`
+  Why: follow-up discovered while reviewing Transaction Healing; explores
+  choosing optimistic, reconciliation, pessimistic, or escrow-style
+  concurrency classes from data semantics, useful for comparing semantic
+  conflict repair with route-level isolation classes for hot GPU DB write
+  paths.
 - `reviewed` — **CRDV: Conflict-free Replicated Data Views**, Faria and Pereira,
   PACMMOD 2025.
   URL: `https://doi.org/10.1145/3709675`
