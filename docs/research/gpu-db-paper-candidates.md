@@ -2703,9 +2703,11 @@ Append new candidates here as each paper is processed.
   Why: cited as Azure SQL infrastructure for measuring database resource
   contention; useful for shaping no-GPU scalability probes that measure active
   session budgets, cache pressure, and resource contention per logical route.
-- `queued` — **ScaleStore: A Fast and Cost-Efficient Storage Engine using
+- `reviewed` — **ScaleStore: A Fast and Cost-Efficient Storage Engine using
   DRAM, NVMe, and RDMA**, Ziegler, Binnig, and Leis, SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526187`
+  PDF:
+  `https://www.informatik.tu-darmstadt.de/media/systems/pdf_publications/ScaleStore_preprint.pdf`
   Why: the CIDR 2023 cloud OLTP paper uses ScaleStore as the shared-cache
   blueprint; useful for resident-object directory design, RDMA/NVMe cache
   placement, and page-level coherence tradeoffs.
@@ -2984,3 +2986,10 @@ Append new candidates here as each paper is processed.
   Why: Zero-sided RDMA uses RDMA shuffle/join literature as its DBMS baseline;
   useful for comparing classic rack-scale RDMA repartitioning with future GPU
   DB accelerator-pool shuffle and resident-partition movement.
+- `queued` — **Zeus: Locality-aware Distributed Transactions**,
+  Katsarakis et al., EuroSys 2021.
+  URL: `https://doi.org/10.1145/3447786.3456245`
+  Why: ScaleStore contrasts Zeus' ownership/movement approach with its
+  coherent DRAM/NVMe page protocol; useful for deciding when GPU DB should
+  move hot objects to owner lanes versus run distributed commit or remote
+  accelerator access.

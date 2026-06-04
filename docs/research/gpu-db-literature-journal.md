@@ -35938,3 +35938,158 @@ a hard byte budget and observability.
 - Use retained resident snapshots as a mismatch test: after recovery, all GPU
   snapshots must start invalid or be rebuilt from CPU truth plus logged segment
   metadata. No adaptive shortcut may publish GPU visibility directly.
+
+### 2026-06-04 - ScaleStore treats DRAM, remote memory, and NVMe as one coherent page tier
+
+**Citation:** Tobias Ziegler, Carsten Binnig, and Viktor Leis. "ScaleStore: A
+Fast and Cost-Efficient Storage Engine using DRAM, NVMe, and RDMA." SIGMOD
+2022, pp. 685-699. doi:10.1145/3514221.3526187. Retrieved 2026-06-04 from
+DBLP/DOI metadata and the TU Darmstadt preprint,
+`https://www.informatik.tu-darmstadt.de/media/systems/pdf_publications/ScaleStore_preprint.pdf`.
+
+**Category:** Multi-tier cache / data placement.
+
+**Relevance tags:** distributed buffer management; RDMA; NVMe; coherent page
+caching; hot-set placement; eviction; owner stability; page-level consistency;
+elasticity; OLTP point workloads.
+
+**Core idea:** ScaleStore combines the two usual answers to oversized OLTP
+working sets: keep the hot set in aggregated cluster DRAM, but spill cold pages
+to cheaper NVMe instead of requiring the whole database to fit in memory. The
+paper exposes this as a transparent page abstraction: data structures issue
+ordinary page-id accesses, while the system decides whether the page is local,
+remote in DRAM, or only on local/remote SSD.
+
+The important transfer is not "use RDMA" by itself. ScaleStore makes placement
+dynamic and coherent. Hot read-mostly pages may be replicated on multiple
+nodes; partition-local pages migrate toward the node using them; cold pages are
+evicted to SSD; and write ownership invalidates incompatible cached copies. In
+the evaluation on a five-node cluster, ScaleStore reports up to about 50M
+read-only YCSB operations/sec and 20M update-heavy operations/sec for a
+partitionable 280 GB data set, adapts to deliberate workload shifts within a
+few seconds, and still handles data sets larger than aggregate memory by
+falling through to SSD.
+
+**Concrete mechanisms:**
+
+- Every page has a directory node encoded in the page id. The directory tracks
+  page location, ownership mode, dirty state, and which nodes cache copies.
+- Local page access has a hot path through a translation table. A cached page
+  can be used without remote messages if its node-level ownership mode permits
+  the requested access.
+- Ownership modes are node-exclusive and node-shared. Worker-level access uses
+  exclusive, shared, or optimistic guards; optimistic reads use a version
+  counter to detect concurrent modification or eviction.
+- Remote access first asks the directory for ownership. If no incompatible
+  owner exists, the directory updates metadata and returns or transfers the
+  page.
+- Exclusive conflicts transfer the page from the current node-exclusive owner.
+  Shared conflicts pick one shared owner as the page source and invalidate the
+  remaining shared owners before granting exclusive ownership.
+- Anticipatory chaining handles multiple conflicting requests. The directory
+  immediately updates metadata to the anticipated next owner, so requesters
+  form an ordered predecessor chain instead of busy-polling the directory.
+- A per-page conflict epoch preserves owner stability. If a predecessor is in
+  the middle of a conflict chain, eviction is declined so the next requester
+  can still find the page where metadata predicted it would be.
+- The RDMA path uses small mailbox-style messages for protocol traffic and
+  RDMA writes for page transfers so the sender can complete transfer and
+  unlatch without an extra completion round trip.
+- Eviction uses a low-overhead epoch-based LRU approximation. Workers update a
+  page's last-access epoch only when the global epoch has advanced, avoiding
+  constant cache-line invalidation on every access.
+- A dedicated page-provider thread samples translation-table entries, chooses
+  cold pages by epoch threshold, batches up to 100 eviction candidates per
+  directory, persists dirty pages with async direct NVMe I/O, and keeps worker
+  threads focused on query work.
+- The programming model hides distributed placement behind page guards. Their
+  B-tree implementation remains close to a single-node optimistic-lock-coupled
+  B-tree; other fixed-page data structures can use the same abstraction.
+- The paper sketches, but does not implement, distributed DBMS extensions:
+  tuple-resident locks, data movement to processing nodes to avoid 2PC for some
+  transactions, per-node distributed ARIES-style WAL, and high availability.
+
+**GPU DB mapping:** ScaleStore is a useful physical analogue for P8's future
+tier model: GPU HBM, CPU DRAM, peer/remote memory, and NVMe should be visible
+as explicit placement states under one route contract, not as ad hoc fallback
+cases. The current P8 rule that GPU resident state is acceleration state still
+holds; the transferable piece is a directory-owned map from object generation
+to allowed owners, resident copies, dirty/invalid state, and cold-tier home.
+
+For GPU resident snapshots, "node-shared" maps to immutable read generations
+that many sessions or GPU workers can hold locally. "Node-exclusive" maps to
+mutation, refresh, compaction, or index-rebuild ownership. A write or refresh
+route should invalidate or supersede incompatible resident copies before
+publishing visibility, while old retained readers finish on their generation
+under an explicit lease.
+
+Anticipatory chaining suggests a better policy for contested resident objects
+than repeated queue retries. If many owners want exclusive access to the same
+segment, route descriptor, hot index page, or refresh target, the residency
+owner can publish an ordered successor chain and preserve owner stability until
+the chain drains. That is close to the engine's owner-domain model, but with
+per-object fairness instead of one global owner queue.
+
+The epoch-based eviction policy maps well to GPU/host cache telemetry. Updating
+exact LRU state on every lookup would create the same physical contention MOCC
+warned about. A per-segment or per-route coarse access epoch, sampled by a
+background cache owner, is a better first benchmark for resident segment
+eviction, demotion to compressed host memory, and cold NVMe placement.
+
+**Risks and mismatches:** ScaleStore is a CPU distributed storage engine, not a
+GPU execution engine. Its unit is a 4 KB mutable page, while P8 may prefer
+immutable column groups, compressed vectors, key vectors, and MVCC generation
+metadata. Its consistency is sequential page consistency, not SQL MVCC or
+serializable transaction isolation. The evaluation uses embedded YCSB point
+lookups/updates, no SQL planner, no pgwire, no GPU kernels, and no durability
+protocol in the measured path. RDMA assumptions also may not apply to a
+single-node GPU box until peer GPU memory, CXL, NVLink, or remote accelerator
+pools become part of the target.
+
+**Benchmark candidates:**
+
+- Add a tier-directory simulation for resident segments with states:
+  CPU-truth-only, host-cached, GPU-shared, GPU-exclusive-refresh, dirty/stale,
+  and cold-NVMe. Proof gate: route decisions are explainable from directory
+  state and never publish a stale GPU generation.
+- Compare exact LRU, clock/second-chance, and epoch-sampled eviction for
+  retained GPU segments under shifting hot-key and scan workloads. Failure
+  condition: eviction metadata updates become a visible hot cache line.
+- Build a workload-shift cache test: move the hot partition every N seconds
+  and measure time to restore retained read throughput, bytes moved, and
+  p95/p99 latency during refill.
+- Prototype per-object exclusive-access chaining for refresh/eviction of one
+  contended resident segment. Compare against retrying through a single
+  residency owner queue.
+- Measure cold-tier fallback by forcing a retained route through host memory
+  and NVMe-sized chunks. Track whether the route should demote, promote,
+  reject, or CPU-fallback based on queue wait, transfer bytes, and reuse epoch.
+- For future distributed or multi-GPU tests, compare "move data to execution"
+  with "move execution to data" for point lookups and refresh tasks; the proof
+  metric is latency under hot-set shifts, not just peak bandwidth.
+
+### 2026-06-04 - Cross-paper synthesis: placement and write safety both need budgeted route state
+
+MOCC, adaptive logging, and ScaleStore converge on one design rule: a route
+cannot be described only by SQL shape and target device. It also needs typed
+state for conflict temperature, recovery debt, and physical placement. MOCC
+shows when a cold optimistic write route should promote because conflicts are
+wasting work. Adaptive logging shows when a route should spend more foreground
+bytes because replay debt is getting too expensive. ScaleStore shows when a
+route should move, replicate, or evict data because the hot set has shifted.
+
+The common implementation track is a route descriptor with budget fields:
+conflict budget, WAL/replay budget, placement budget, and lease/owner state.
+Those fields should be approximate and sharded on hot paths, then sampled by
+owners that make promotion, logging, eviction, or fallback decisions. Exact
+per-request accounting is likely to become the bottleneck.
+
+Current category gap: the queue has strong coverage for conflict control,
+runtime admission, and GPU analytical execution, but the next tiering work
+should keep pulling in storage placement papers that include consistency under
+updates, not only analytical cache heuristics.
+
+Benchmark priority: build a no-GPU route-control harness that can replay a
+mixed sequence of hot-key writes, retained reads, cache shifts, and crash-replay
+simulation. The pass/fail question is whether route state predicts the right
+promotion or demotion before latency collapses.
