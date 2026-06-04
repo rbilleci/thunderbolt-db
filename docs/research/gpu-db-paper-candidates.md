@@ -632,7 +632,7 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up to early GPU learned-index work; useful for comparing
   PGM-on-GPU with a more engineered GPU learned-index design before choosing a
   resident point-lookup index family.
-- `queued` — **The PGM-index: a fully-dynamic compressed learned index with
+- `reviewed` — **The PGM-index: a fully-dynamic compressed learned index with
   provable worst-case bounds**, Ferragina and Vinciguerra, PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p1162-ferragina.pdf`
   DOI: `https://doi.org/10.14778/3389133.3389135`
@@ -701,6 +701,13 @@ Append new candidates here as each paper is processed.
   contrasting range-partitioned metadata, relational/distributed-system
   integration, and data-lake scale metadata routing with Tectonic's
   hash-partitioned design.
+- `queued` — **FITing-Tree: A Data-aware Index Structure**, Galakatos et al.,
+  SIGMOD 2019.
+  URL: `https://doi.org/10.1145/3299869.3319860`
+  arXiv: `https://arxiv.org/abs/1801.10207`
+  Why: bounded-error piecewise-linear learned-index predecessor to PGM; useful
+  for comparing B-tree-indexed segments with fully learned recursive routing
+  and for understanding update/retraining costs.
 - `queued` — **Pangea: Monolithic Distributed Storage for Data Analytics**,
   Ghosh et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p681-ghosh.pdf`

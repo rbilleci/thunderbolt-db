@@ -41327,3 +41327,189 @@ visible anomaly.
 - For 1M logical sessions, keep graph state tied to active commands only, not
   idle sessions. Measure bytes per active graph vertex/edge and ensure idle
   session count does not inflate resolver memory.
+
+### 2026-06-04 - PGM gives learned indexes a bounded route certificate
+
+**Citation:** Paolo Ferragina and Giorgio Vinciguerra. "The PGM-index: a
+fully-dynamic compressed learned index with provable worst-case bounds."
+PVLDB 13(8), 2020, pp. 1162-1175. DOI
+`10.14778/3389133.3389135`. Retrieved 2026-06-04 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol13/p1162-ferragina.pdf`.
+
+**Category:** query optimization / planning; resident indexing; multi-tier
+cache / data placement.
+
+**Relevance tags:** learned index; predecessor search; range query;
+bounded-error segments; dynamic updates; compression; distribution-aware
+routing; auto-tuning; resident index metadata; route certificates.
+
+**Core idea:** PGM-index turns learned indexing into a bounded-error access
+method. It approximates the rank function of sorted keys with an optimal set
+of piecewise-linear segments, then recursively indexes those segments with the
+same idea. The result is still a learned index, but each prediction carries a
+worst-case local search bound controlled by `epsilon`, and the paper extends
+the static design with dynamic, compressed, distribution-aware, and
+multi-criteria variants.
+
+For GPU DB, the strongest transferable idea is that learned-index routing
+should expose a certificate, not just a model. A resident learned index can
+declare its snapshot generation, key order, segment count, `epsilon`, final
+search radius, metadata bytes, update mode, and expected batch shape. That
+lets the planner and admission controller know exactly how much last-mile work
+the route can create before the GPU route is allowed to bypass a CPU B-tree or
+owner-side lookup path.
+
+**Concrete mechanisms:**
+
+- PGM models rank over an ordered array `A`. Point queries, predecessor
+  queries, and range endpoints reduce to finding the rank of a key, then
+  checking a bounded neighborhood in `A`.
+- A segment is represented by its first key, slope, and intercept. For all
+  covered keys, the segment predicts position within `epsilon`; the final
+  search needs only the bounded interval around the prediction.
+- The bottom-level segments are computed from an optimal piecewise-linear
+  approximation algorithm. The paper stresses that this reduces the number of
+  segments compared with greedy bounded-error approaches such as FITing-tree.
+- The recursive PGM indexes segment first keys with another PGM level instead
+  of using a B-tree over segments. A query walks the recursive levels, then
+  performs bounded binary search near the predicted data position.
+- The space footprint depends on the regularity of the key distribution rather
+  than directly on row count. The paper reports that segment counts on tested
+  datasets are multiple orders of magnitude smaller than the number of keys.
+- Static PGM has worst-case time and I/O bounds for predecessor/range access;
+  RMI is explicitly not included in the bound table because it does not expose
+  equivalent guarantees.
+- Append-mostly time-series inserts can update the last segment
+  incrementally. If the new key no longer fits the existing segment within the
+  error bound, the structure creates a new segment and recursively updates
+  upper levels.
+- General inserts use a logarithmic-method design: maintain multiple
+  exponentially sized sorted containers, rebuild a PGM over a merged container
+  on overflow, and use tombstones for deletes. Range queries search all
+  containers and merge results.
+- Compression targets segment metadata. Intercepts are stored as integers
+  with succinct encoding, and slopes are compressed by grouping overlapping
+  feasible slope intervals while preserving the same error guarantee.
+- The distribution-aware variant assigns smaller error ranges to more common
+  queries so hot keys can be found faster, aiming for search time tied to the
+  query-distribution entropy.
+- The multi-criteria variant auto-tunes `epsilon` under a space constraint or
+  latency constraint. It models segment count as a power law in `epsilon` and
+  uses measured query time when hardware effects make closed-form latency too
+  weak.
+- Evaluation uses large web-log, longitude, IoT, and synthetic key datasets.
+  Reported highlights include matching a fast CSS-tree with about `83x` less
+  space, matching a fast B+ tree with far less space in a static setting,
+  building a 715M-key web-log index in a few seconds, and improving dynamic
+  query/update latency versus B+ trees by `13-71%` for most tested mixes while
+  using much less space.
+
+**GPU DB mapping:** PGM is a good source design for a resident `int4` key
+index over immutable retained snapshots. The CPU canonical state remains the
+source of truth; the resident route publishes a compact segment hierarchy tied
+to a table OID, schema generation, key-order vector generation, and visible
+transaction boundary. A lookup batch can use the segment hierarchy to predict
+candidate ordinals, then perform a bounded final search and MVCC visibility
+check against the same snapshot generation.
+
+The important planner hook is the `epsilon` contract. A route with small
+segment metadata but large `epsilon` may save GPU memory while creating too
+much last-mile search, D2H candidate traffic, or CPU visibility work. A route
+with small `epsilon` may fit latency but consume too much resident metadata.
+PGM's multi-criteria tuning maps directly to a GPU DB policy knob: choose
+`epsilon` per table/partition so the segment hierarchy fits a residency budget
+or meets a retained-lookup latency target.
+
+The logarithmic dynamic design is useful as a refresh-delta sketch, but it
+should be wrapped by GPU DB's WAL and generation rules. Instead of arbitrary
+in-place learned-index updates, the safe first design is immutable PGM
+segments per retained snapshot, plus optional delta containers built only
+after WAL-visible CPU truth exists. New readers choose a new route generation;
+old readers finish on the old immutable route.
+
+PGM also clarifies the split between CPU and GPU index families. A CPU PGM can
+be a compact fallback or route-planning source even before a GPU kernel exists.
+A GPU resident PGM should be admitted only for sufficiently large same-shape
+lookup batches, where bounded prediction work and result scattering amortize
+kernel launch and queue overhead.
+
+**Risks and mismatches:** PGM is an access method, not an MVCC protocol. It
+does not solve WAL-before-visibility, snapshot isolation, serializable
+predicate reads, invalidation, or GPU memory pressure. The route must add
+those guarantees explicitly.
+
+The dynamic variant's logarithmic containers and tombstones may amplify search
+fan-out and complicate range results. In GPU DB, that means delta containers
+need explicit caps, merge triggers, and fallback rules before they are allowed
+on hot retained routes.
+
+The paper's performance claims are CPU-centric. GPU DB must re-measure the
+same structure under kernel launch cost, warp divergence, memory coalescing,
+resident metadata placement, H2D/D2H traffic, and mixed workload pressure.
+The distribution-aware variant is theoretically attractive, but it requires a
+stable query distribution. Under adversarial or rapidly shifting session
+loads, it can encode stale assumptions unless telemetry forces retuning or
+fallback.
+
+**Benchmark candidates:**
+
+- Build a CPU PGM route over one sorted `int4` key-order vector and expose the
+  route certificate: table generation, key vector generation, `epsilon`,
+  segment count, segment bytes, final-search bound, and fallback reason.
+- Compare CPU B-tree/key-order binary search, CPU PGM, and GPU PGM metadata
+  prediction for retained point lookups. Measure p50/p95/p99 latency,
+  throughput, metadata bytes, last-mile search steps, and queue wait.
+- Sweep `epsilon` under fixed resident metadata budgets. Proof gate: the
+  planner rejects a route when predicted final-search work exceeds the CPU
+  fallback cost or latency target.
+- Prototype immutable PGM snapshot rebuild after COPY/INSERT batches. Compare
+  full rebuild, logarithmic delta containers, and conservative invalidation.
+  Failure condition: a route generation becomes visible before WAL-visible CPU
+  truth and invalidation have been published.
+- Add adversarial and skewed key distributions. Measure segment count,
+  prediction error, last-mile work, and route misprediction under both uniform
+  and Zipf-like lookup batches.
+- Test distribution-aware routing only after baseline PGM is stable. Required
+  result: hot-key latency improves without starving cold-key sessions or
+  breaking fairness under 1M logical-session admission.
+- For range/prefix routes, require a stricter certificate that covers endpoint
+  prediction, final candidate scan, predicate visibility, and phantom-safe
+  isolation class.
+
+### 2026-06-04 - Cross-paper synthesis: fast routes now need certificates, not hints
+
+The last four reviewed papers converge on a route-certification design track.
+Mixed isolation allocation says a fast route needs a template-level isolation
+certificate. G-Learned Index says a GPU index route is useful only as a
+batch-shaped residency contract. Detock says multi-owner work needs explicit
+conflict edges and deterministic resolution. PGM-index adds the missing access
+method piece: even a learned model should publish a bounded-error certificate
+before it enters the hot path.
+
+For GPU DB, the emerging route descriptor should now name four proof classes:
+isolation proof, residency proof, conflict/owner proof, and access-method
+proof. The descriptor should include snapshot generation, schema generation,
+route family, key/order vector generation, `epsilon` or equivalent bounded
+search radius, batch limits, conflict keys, fallback class, and measured
+resource budgets. Routes that cannot populate these fields should remain on
+the conservative owner or CPU path.
+
+The current category gap is integration: transaction scheduling, learned
+resident indexes, MVCC isolation certificates, and multi-tier placement are
+well represented individually, but not yet tested together. The next benchmark
+priority is a small end-to-end route-certificate harness that admits retained
+point reads, write batches, refresh publication, and owner-conflict fallback
+under one telemetry schema.
+
+Benchmark priorities:
+
+- route-certificate schema with required isolation, residency, owner/conflict,
+  and access-method fields;
+- retained point-lookup benchmark comparing CPU B-tree, CPU PGM, GPU PGM, and
+  conservative owner fallback;
+- write/refresh benchmark that invalidates and republishes learned-index route
+  generations without exposing stale visibility;
+- multi-owner conflict harness that records unresolved dependency edges and
+  demotes cyclic or incomplete work to deterministic fallback;
+- 1M logical-session admission test where idle sessions do not allocate route
+  state and active batches are bounded by certificate budgets.
