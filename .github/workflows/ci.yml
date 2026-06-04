@@ -38,7 +38,7 @@ jobs:
           PSQL_GOLDEN_BOOT_CMD: cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen 127.0.0.1:55432
           PSQL_GOLDEN_WAIT_HOST: 127.0.0.1
           PSQL_GOLDEN_WAIT_PORT: 55432
-          PSQL_GOLDEN_WAIT_TIMEOUT_SEC: 30
+          PSQL_GOLDEN_WAIT_TIMEOUT_SEC: 120
           PSQL_GOLDEN_REPORT: target/compat/psql-golden-report.json
         run: scripts/run_psql_golden.sh
       - name: compatibility scorecard

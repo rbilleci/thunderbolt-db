@@ -12845,7 +12845,7 @@ impl Engine {
             let values = values.into_iter().map(Option::unwrap).collect::<Vec<_>>();
             new_rows.push(values);
         }
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile.as_mut() {
             profile.row_prepare_micros += row_prepare_started.elapsed().as_micros();
         }
 
@@ -12859,7 +12859,7 @@ impl Engine {
             )?;
             candidate_rows.extend(new_rows.clone());
             Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
-            if let Some(profile) = profile.as_deref_mut() {
+            if let Some(profile) = profile.as_mut() {
                 profile.unique_preflight_micros += unique_preflight_started.elapsed().as_micros();
             }
         }
@@ -12873,7 +12873,7 @@ impl Engine {
             )?;
             candidate_rows.extend(new_rows.clone());
             Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
-            if let Some(profile) = profile.as_deref_mut() {
+            if let Some(profile) = profile.as_mut() {
                 profile.check_preflight_micros += check_preflight_started.elapsed().as_micros();
             }
         }
@@ -12893,7 +12893,7 @@ impl Engine {
                     read_txn_id: txn_id,
                 },
             )?;
-            if let Some(profile) = profile.as_deref_mut() {
+            if let Some(profile) = profile.as_mut() {
                 profile.foreign_key_preflight_micros +=
                     foreign_key_preflight_started.elapsed().as_micros();
             }
@@ -12916,7 +12916,7 @@ impl Engine {
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             inserted_rows.push((row_key, values));
         }
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile.as_mut() {
             profile.mvcc_insert_micros += mvcc_insert_started.elapsed().as_micros();
         }
         let value_index_started = Instant::now();
@@ -12928,7 +12928,7 @@ impl Engine {
                 .or_default()
                 .append(&mut row_keys);
         }
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile.as_mut() {
             profile.value_index_append_micros += value_index_started.elapsed().as_micros();
         }
         Ok(())
@@ -16734,7 +16734,7 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let byte_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
@@ -18233,9 +18233,9 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let group_offset = resident_device_int4_column_offset(&snapshot, &table, group_idx)?;
-        let value_offset = resident_device_int4_column_offset(&snapshot, &table, value_idx)?;
-        let filter_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let group_offset = resident_device_int4_column_offset(snapshot, &table, group_idx)?;
+        let value_offset = resident_device_int4_column_offset(snapshot, &table, value_idx)?;
+        let filter_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
@@ -18687,7 +18687,7 @@ impl Engine {
         let filter_offsets = filters
             .iter()
             .map(|(filter_idx, needle)| {
-                resident_device_int4_column_offset(&snapshot, &table, *filter_idx)
+                resident_device_int4_column_offset(snapshot, &table, *filter_idx)
                     .map(|offset| (offset, *needle))
             })
             .collect::<Result<Vec<_>, ExecuteError>>()?;
@@ -18717,7 +18717,7 @@ impl Engine {
         for idx in std::mem::take(&mut projected_columns) {
             match table.columns[idx].ty {
                 SqlType::Int4 => {
-                    let byte_offset = resident_device_int4_column_offset(&snapshot, &table, idx)?;
+                    let byte_offset = resident_device_int4_column_offset(snapshot, &table, idx)?;
                     let values = device_memory
                         .project_i32_rows_from_payload(byte_offset, &matching_row_indices)
                         .map_err(|err| {
@@ -18733,7 +18733,7 @@ impl Engine {
                     column_values.insert(idx, values);
                 }
                 SqlType::Text => {
-                    let layout = resident_device_text_column_layout(&snapshot, &table, idx)?;
+                    let layout = resident_device_text_column_layout(snapshot, &table, idx)?;
                     let values = device_memory
                         .project_text_rows_from_payload(
                             layout.offsets_byte_offset,
@@ -21566,15 +21566,14 @@ impl Engine {
             "partitioned_int4_equality_projection".to_string()
         } else if query_shape == "int4_equality_multi_column_projection" {
             "partitioned_int4_equality_multi_column_projection".to_string()
-        } else if query_shape == "partitioned_int4_equality_sum" {
-            query_shape
-        } else if query_shape == "partitioned_int4_between_avg" {
-            query_shape
-        } else if query_shape == "partitioned_int4_filtered_avg" {
-            query_shape
-        } else if query_shape == "partitioned_int4_filtered_min" {
-            query_shape
-        } else if query_shape == "partitioned_int4_filtered_max" {
+        } else if matches!(
+            query_shape.as_str(),
+            "partitioned_int4_equality_sum"
+                | "partitioned_int4_between_avg"
+                | "partitioned_int4_filtered_avg"
+                | "partitioned_int4_filtered_min"
+                | "partitioned_int4_filtered_max"
+        ) {
             query_shape
         } else if query_shape == "int4_filtered_scalar_aggregate"
             && matches!(select.projection, SelectProjection::Avg { .. })
@@ -21719,25 +21718,10 @@ impl Engine {
             for filter in select.filter_groups.iter().flatten() {
                 required_int4_columns.insert(filter.column.clone());
             }
-        } else if decision.query_shape == "partitioned_int4_between_avg" {
-            let SelectProjection::Avg { column } = &select.projection else {
-                decision.cache_state = "Absent".to_string();
-                decision.valid = false;
-                decision.reason =
-                    "partitioned resident routing requires AVG(int4_column)".to_string();
-                return decision;
-            };
-            required_int4_columns.insert(column.clone());
-            if let Some(filter) = &select.filter {
-                required_int4_columns.insert(filter.column.clone());
-            }
-            for filter in &select.filters {
-                required_int4_columns.insert(filter.column.clone());
-            }
-            for filter in select.filter_groups.iter().flatten() {
-                required_int4_columns.insert(filter.column.clone());
-            }
-        } else if decision.query_shape == "partitioned_int4_filtered_avg" {
+        } else if matches!(
+            decision.query_shape.as_str(),
+            "partitioned_int4_between_avg" | "partitioned_int4_filtered_avg"
+        ) {
             let SelectProjection::Avg { column } = &select.projection else {
                 decision.cache_state = "Absent".to_string();
                 decision.valid = false;

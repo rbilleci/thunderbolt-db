@@ -42439,3 +42439,658 @@ over another pure GPU scan paper unless the queue becomes stale.
 - Keep WAL visibility and resident read certificates separate: a commit can be
   durable and CPU-visible while GPU predicate indexes are still invalidated or
   refreshing.
+### 2026-06-04 - Serval keeps contended deterministic writes local until publication
+
+**Citation:** Haowen Li, Rina Onishi, and Hideyuki Kawashima. "Serval: A
+Wait-free Multi-version Deterministic Concurrency Control Scheme." CANDAR
+2024, pages 169-175. Retrieved 2026-06-04 from
+`https://doi.org/10.1109/CANDAR64496.2024.00028`, metadata page
+`https://keio.elsevierpure.com/ja/publications/serval-a-wait-free-multi-version-deterministic-concurrency-contro/`,
+and APsys 2024 poster
+`https://apsys2024.github.io/posters/apsys24posters-paper58.pdf`. The IEEE PDF
+endpoint listed by CiNii returned HTTP 418 during this run, so concrete details
+below are limited to the public metadata abstract and poster.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility.
+
+**Relevance tags:** deterministic concurrency control; MVCC; wait-free
+initialization; contended writes; bitmaps; local version arrays; NUMA-aware
+writes; owner-local publication; write batching; hot-key admission.
+
+**Core idea:** Serval is a Caracal follow-up for deterministic,
+multi-version transaction processing under skew. Caracal preorders batches and
+can append multiple pending versions for the same row, but its contended path
+still writes into a global version array with latch acquisition. Serval moves
+the contended pending-version append into per-core local version arrays and
+uses compact row/core and transaction bitmaps to describe which local arrays
+contain writes for a row.
+
+The transferable point is not the exact data structure alone. It is the
+publication shape: a deterministic write batch can gather row-local update
+intent without forcing every core through one remote, latched version-array
+slot. The global visibility structure can be derived from bounded local
+metadata after the hot initialization phase instead of being the place where
+all contention is paid.
+
+**Concrete mechanisms:**
+
+- Serval targets Caracal's initialization phase, where pending versions for
+  transactions are prepared before deterministic execution.
+- Caracal's contended path uses per-core, per-row buffers but still requires a
+  latch when remote writes append into the global version array for that row.
+- Serval introduces a core bitmap inside each row. Its length is the total
+  number of cores, and a set bit means the corresponding core has a write
+  operation for that row.
+- Serval introduces a transaction bitmap inside each local version array. Its
+  length is the number of transactions assigned to the corresponding core, and
+  a set bit means that transaction writes the corresponding row.
+- Pending versions are appended to local version arrays instead of directly to
+  the global version array. The corresponding bitmaps summarize which local
+  lanes must be consulted.
+- The poster frames the technique as NUMA-aware local writes: remote writes to
+  the global version array are avoided during the contended append path.
+- The authors compare the approach to a chunked parallel radix-partitioning
+  style optimization, where local writes and later sequential remote reads
+  amortize the cost of remote memory access.
+- The public poster reports up to `4x` better total latency than Caracal at
+  skew `0.99` for a write-only workload of `4,096,000` transactions. The exact
+  machine, thread/core count, transaction shape, and full parameter table were
+  not available from the public poster/metadata.
+- Public metadata states that the design provides wait-free conditions during
+  the initialization phase and improves execution-phase efficiency under
+  contention. The available sources do not expose the full proof or execution
+  algorithm.
+
+**GPU DB mapping:** Serval maps directly to the planned owner-domain write
+pipeline. For hot rows or partitions, GPU DB should avoid a single global
+version-chain append latch during mutation preparation. Partition owners can
+collect pending row versions in owner-local chunk arrays, publish a compact
+row-to-owner bitmap or write-summary vector, and merge into the visible MVCC
+front only at deterministic generation boundaries.
+
+This is especially attractive for GPU snapshot refresh. A mutation batch can
+invalidate resident GPU snapshots using compact dirty-row, dirty-segment, or
+dirty-owner bitmaps before CPU visibility is exposed, while the heavy pending
+version payload remains local until the merge/publication step. Retained GPU
+reads then see either the old generation or the new published generation, not a
+half-populated global version array.
+
+Serval also reinforces a queue/admission rule: hot-key contention should be
+identified before all writers enter the same cache line or latch. A session
+admission controller can route hot update batches into owner-local lanes,
+bound the local array capacity, and apply backpressure when a row's core bitmap
+or pending-version payload grows beyond the merge budget.
+
+For 1M logical sessions, the bitmap idea should stay in the engine layer, not
+the session layer. Many logical sessions can enqueue writes, but the hot path
+should collapse them into a small number of partition-owner update lanes with
+preallocated local buffers. Response rings can be notified after publication
+without letting each session contend on the global MVCC structure.
+
+**Risks and mismatches:** The available public source during this run was a
+one-page poster plus metadata abstract, not the full IEEE paper. Unknowns
+include the full transaction model, read/write-set assumptions, merge order,
+memory reclamation, exact wait-free proof, NUMA topology, durability handling,
+and whether the execution phase introduces other bottlenecks once global
+version-array writes are removed.
+
+Deterministic concurrency control often assumes batches and sometimes known
+write sets before execution. GPU DB's SQL path may include interactive
+transactions and statements whose write footprint is not known until execution.
+Serval is therefore a candidate for COPY, stored procedures, generated
+benchmarks, partition-owned batched updates, and hot-key admission first, not a
+complete replacement for MVCC validation.
+
+The bitmap overhead may also become large if the number of cores, owner lanes,
+or transactions per core is high and sparsity is poor. A GPU DB design would
+need compressed or chunked dirty summaries, deterministic overflow behavior,
+and benchmarks for skew changes over time. Finally, the reported `4x` result is
+against Caracal under one public poster workload; it should shape our
+microbenchmark, not a performance forecast.
+
+**Benchmark candidates:**
+
+- Build an owner-local pending-version microbenchmark for hot-row updates:
+  compare a single global version-chain append latch against per-owner local
+  arrays plus row/owner dirty bitmaps and deterministic merge. Proof gate:
+  identical final visibility order and no WAL-before-visibility violation.
+- Add a dirty-bitmap invalidation prototype for retained GPU snapshots. A
+  mutation batch should publish dirty row/segment summaries before exposing CPU
+  visibility, then refresh or reject resident reads by generation. Failure
+  condition: a resident route serves a row whose owner-local pending version
+  was not reflected in the published generation.
+- Measure bitmap density and overflow behavior under Zipf skew from `0.0` to
+  `0.99`, varying owner lanes, transactions per batch, and rows per segment.
+  Required metrics: bitmap bytes, local-array bytes, merge time, p50/p95
+  mutation latency, and aborted/rejected overflow batches.
+- Compare deterministic batch sizes for write-heavy hot keys: small batches
+  reduce publication latency but increase merge overhead; large batches improve
+  locality but may delay read freshness and GPU snapshot refresh.
+- Add an admission experiment where hot update sessions are multiplexed into
+  bounded owner lanes. Expected result: bounded queue memory and lower global
+  version-append contention; failure condition: owner-local queues create
+  worse tail latency than the global-latch baseline at moderate skew.
+- For future GPU execution, test whether dirty bitmaps can feed a GPU refresh
+  kernel that updates only affected resident segments, while still keeping the
+  CPU MVCC chain as the source of truth.
+
+### 2026-06-04 - Cross-paper synthesis: publication certificates need local staging and explicit durability clocks
+
+The last three reviews form a coherent write-path track. X-SSD says storage
+devices can expose fast-tier durability as counters and credits; Correct Remote
+Persistence says those counters are only correct if they name the actual
+persistence domain and ordering recipe; Serval says hot deterministic writes
+should be staged locally and summarized compactly before they touch the global
+visibility structure.
+
+**Converging design tracks:** GPU DB's mutation path should separate four
+frontiers: local pending-version staging, durable WAL/replica certification,
+CPU MVCC visibility publication, and GPU resident-snapshot refresh. Each
+frontier needs a named certificate or generation counter. A response should not
+implicitly mean all four are complete.
+
+**Category gaps:** This synthesis is still write-path heavy. The next useful
+paper should probably come from runtime/session scheduling, query
+optimization, or multi-tier cache placement unless a very strong MVCC/GC paper
+is queued.
+
+**Benchmark priorities:** The next write benchmark should model owner-local
+pending arrays plus WAL durability credits. The pass condition is bounded
+memory and correct visibility ordering under hot-key skew; the failure
+condition is any path where API completion, local staging, durable replay, or
+GPU freshness is reported as the wrong frontier.
+
+### 2026-06-04 - PRICE separates portable cardinality priors from database-specific tuning
+
+**Citation:** Tianjing Zeng, Junwei Lan, Jiahong Ma, Wenqing Wei, Rong Zhu,
+Pengfei Li, Bolin Ding, Defu Lian, Zhewei Wei, and Jingren Zhou. "PRICE: A
+Pretrained Model for Cross-Database Cardinality Estimation." arXiv 2024.
+Retrieved 2026-06-04 from `https://arxiv.org/abs/2406.01027` and
+`https://arxiv.org/pdf/2406.01027`.
+
+**Category:** query optimization / planning; route-cost estimation.
+
+**Relevance tags:** cardinality estimation; pretrained optimizer component;
+cross-database transfer; histograms; join scaling factors; self-attention;
+fine-tuning; route certificates; CPU/GPU route choice.
+
+**Core idea:** PRICE tries to make learned cardinality estimation deployable
+like traditional statistics. Instead of training a separate model from scratch
+for every database, it uses transferable low-level features: per-attribute
+value distributions, join scaling-factor distributions, predicate features,
+table-level auxiliary estimates, and coarse query-level estimates. A
+self-attention model learns how to combine those features into a multi-table
+cardinality estimate across databases.
+
+The strongest transferable idea for GPU DB is the separation between a portable
+prior and local calibration. GPU route choice should not start with a bespoke
+learned model for each table or GPU. It can begin with cheap, typed statistics
+that every route already needs, then add a small learned or calibrated residual
+only where live measurements prove value.
+
+**Concrete mechanisms:**
+
+- PRICE represents continuous attributes with normalized histogram vectors and
+  categorical attributes with SpaceSaving summaries.
+- It represents each join condition with a histogram of scaling factors:
+  how many tuples on one side match each tuple or value on the other side.
+- Predicate features include bounds or categorical-bin ids plus single-attribute
+  selectivity.
+- Auxiliary table/query features include table sizes, simple single-table
+  selectivity estimates, number of joins/tables, and PostgreSQL's traditional
+  cardinality estimate.
+- The model has an embedding stage, a joining stage, and a filtering stage.
+  The joining stage uses multi-head self-attention over join-attribute tokens
+  to summarize inter-table scaling and correlation. The filtering stage uses
+  another attention block over join, predicate, table, and special summary
+  tokens, then an MLP predicts log cardinality.
+- The authors pretrain on 26 of 30 collected datasets, holding out IMDB, STATS,
+  ErgastF1, and VisualGenome for testing. They generate `5e4` training queries
+  per dataset and use true cardinalities from execution.
+- Reported pretraining uses `1.3e6` SQL queries, about five hours on an
+  eight-A100 server, and produces an approximately `40MB` model. The deployed
+  model is shared across databases.
+- In PostgreSQL 13.1 experiments via PilotScope, pretrained PRICE generally
+  improves end-to-end plan quality over PostgreSQL histograms and several
+  learned baselines on unseen datasets. On STATS, the paper reports PRICE's
+  end-to-end time as `1.67x` faster than PostgreSQL's histogram estimator.
+- Fine-tuning with database-specific queries can push plan performance close
+  to the "optimal cardinality" baseline in their setup; the paper reports less
+  than `0.4%` relative deviation from optimal end-to-end time after fine-tuning
+  with `5e4` queries.
+- The paper also evaluates data updates, data scaling, and query workload
+  drift, arguing that the pretrained model is more stable than methods that
+  bind tightly to one database and one workload.
+
+**GPU DB mapping:** PRICE reinforces that GPU DB should keep cardinality,
+residual runtime, and route ranking as separate planner signals. A GPU route
+certificate can carry histogram or sketch ids, join scaling summaries, expected
+rows, queue-depth class, resident bytes, transfer bytes, and fallback risk.
+Those are useful even without ML, and they are exactly the features a
+calibration layer can consume later.
+
+For retained GPU snapshots, the cheap transferable feature layer should be
+segment-scoped. Each resident or warm segment can publish value histograms,
+dirty-generation state, join-key scaling summaries where available, and route
+support flags. A CPU/GPU planner can first produce a deterministic route
+estimate, then optionally apply a PRICE-like residual model trained on observed
+GPU scan, lookup, join, and transfer timings.
+
+The join scaling-factor idea is especially relevant to GPU joins and predicate
+transfer. A selectivity estimate that knows only per-column histograms can
+choose a resident GPU route that explodes after a join. A route-aware planner
+should track per-generation join fanout summaries for admitted hot relations,
+then price GPU build/probe memory, output cardinality, and result scattering
+before assigning work to a GPU execution owner.
+
+For 1M logical sessions, PRICE is a warning against per-session learned state.
+The learned component should sit at the route-template or table-generation
+level, with bounded feature extraction and cacheable predictions. Session
+admission should read a small route certificate rather than asking a large
+model to optimize every request independently.
+
+**Risks and mismatches:** PRICE estimates cardinality, not GPU latency. The
+paper evaluates PostgreSQL plan choices, not CPU/GPU split execution, GPU queue
+pressure, resident snapshot validity, refresh cost, or transfer overlap. Its
+query model focuses on select-project-join queries with equality joins and
+comparison predicates; non-equi joins, outer joins, `LIKE`, strings beyond
+simple categorical summaries, UDFs, and MVCC visibility predicates are listed
+as future work or outside the main focus.
+
+The reported pretraining environment uses eight A100 GPUs. That is acceptable
+for an offline research model, but not a requirement GPU DB should add to its
+planner path. Feature collection also depends on true-cardinality workloads
+for pretraining and fine-tuning; GPU DB must define a bounded measurement
+budget so calibration cannot become a hidden production workload.
+
+Finally, high cardinality accuracy is not the same as correct route choice.
+For GPU DB, a slightly worse row estimate may still be safe if the route
+certificate includes memory pressure, visibility generation, transfer bytes,
+and fallback gates. Conversely, a good cardinality estimate can still pick a
+bad GPU route if it ignores queue delay or refresh invalidation.
+
+**Benchmark candidates:**
+
+- Add a planner-metadata benchmark that records, for each retained route,
+  per-column histogram id, optional join-scaling summary id, estimated rows,
+  actual rows, resident bytes, transfer bytes, queue wait, and chosen CPU/GPU
+  route. Proof gate: every route decision is explainable without ML.
+- Build a PRICE-inspired residual estimator for a tiny query family only:
+  equality lookup, range scan, and one join over resident segments. Compare
+  deterministic cost rules, cardinality-only residuals, latency residuals, and
+  route-ranking residuals. Failure condition: learned routing violates any
+  explicit memory, visibility, or queue backpressure gate.
+- Measure whether join fanout summaries change GPU route choices. Use TPC-H or
+  JOB-style joins with skewed foreign-key distributions and compare column
+  histograms alone against histogram plus scaling-factor summaries.
+- Add a drift test where data is appended and hot segments are refreshed while
+  old snapshots remain retained. Proof gate: estimates are tied to the correct
+  snapshot generation, and stale statistics cannot certify a resident route.
+- Test feature-extraction overhead at high session counts. Expected result:
+  route-template caching should amortize model inputs; failure condition:
+  per-request feature building adds measurable p95 latency or unbounded memory.
+- Keep calibration optional and bounded. A pass condition for any learned
+  estimator is that disabling it falls back to deterministic rules with the
+  same correctness envelope and only a performance change.
+
+### 2026-06-04 - Adaptive HTAP makes freshness a resource-scheduling input
+
+**Citation:** Aunn Raza, Periklis Chrysogelos, Angelos Christos Anadiotis,
+and Anastasia Ailamaki. "Adaptive HTAP through Elastic Resource Scheduling."
+SIGMOD 2020. Retrieved 2026-06-04 from
+`https://arxiv.org/abs/2004.05437`,
+`https://arxiv.org/pdf/2004.05437`, and
+`https://doi.org/10.1145/3318464.3389783`.
+
+**Category:** hybrid HTAP; runtime / admission / resource scheduling;
+multi-tier data placement.
+
+**Relevance tags:** freshness-aware scheduling; HTAP; OLTP/OLAP isolation;
+resource exchange; NUMA locality; snapshot switching; delta transfer;
+memory-bandwidth interference; route certificates; refresh admission.
+
+**Core idea:** The paper treats HTAP as a runtime scheduling problem rather
+than a fixed storage-design choice. A query may need only a small part of the
+fresh transactional delta, a full fresh snapshot, or a batch-friendly copied
+snapshot. Instead of always choosing unified storage, copy-on-write,
+periodic ETL, or dual-format storage, the system moves among co-located,
+isolated, and hybrid states by changing CPU ownership, memory ownership, and
+fresh-data access paths.
+
+The strongest transferable idea is that freshness is not just a visibility
+predicate. It is a schedulable resource demand. A read route should know how
+much fresh data it needs, how much total fresh data exists, whether the query
+is part of a batch, and how much OLTP interference is allowed before it
+chooses remote access, resource borrowing, or a full refresh/copy.
+
+**Concrete mechanisms:**
+
+- The system models HTAP with three components: an OLTP engine, an OLAP
+  engine, and a Resource and Data Exchange engine that owns resource and data
+  movement decisions.
+- The OLTP storage manager keeps two columnar instances plus multiversion
+  storage. One instance is active for writes; the other can be handed to OLAP
+  after an active-instance switch.
+- The OLTP engine maintains an index that points to the newest record in
+  either instance, a delta/version store for older versions, per-column
+  statistics, hierarchical update-presence flags, and per-record update
+  indication bits.
+- On switch, the RDE synchronizes instances by scanning update indication
+  bits and copying updated records when needed. The paper reports about
+  `10ms` to synchronize around one million modified tuples in a database of
+  more than `1.8` billion records while TPC-C NewOrder transactions continue.
+- The OLAP engine uses generated pipelines and pluggable access methods. It
+  can scan one contiguous memory region, scan multiple contiguous regions, or
+  combine OLAP-local data with fresh data from the OLTP side.
+- The scheduler can choose state `S1`, co-located OLTP/OLAP, where OLAP reads
+  the inactive OLTP instance and both engines share sockets and memory
+  bandwidth.
+- It can choose state `S2`, isolated OLTP/OLAP, where fresh data is copied
+  from OLTP to OLAP before the query or batch runs; this protects OLTP compute
+  isolation and amortizes copy cost across repeated queries.
+- It can choose state `S3`, hybrid OLTP/OLAP, where OLAP reads only the fresh
+  data it needs from the OLTP side, either remotely over the interconnect or
+  by borrowing some OLTP-local CPUs for data-local reduction.
+- The scheduling heuristic uses `N_fq`, the amount of fresh data required by
+  the current query, `N_ft`, the total fresh data in the database, a batch
+  flag, elasticity availability, elasticity mode, and an ETL sensitivity
+  threshold `alpha`.
+- If `N_fq < alpha * N_ft` and the query is not a batch, the scheduler avoids
+  full ETL and selects a hybrid or co-located route depending on isolation
+  constraints. Otherwise it migrates to the isolated-copy state.
+- In sensitivity experiments, copying roughly `500MB` of fresh data per batch
+  had a cost comparable to query execution over about `160MB` per query, so
+  larger query batches amortized the copy cost.
+- Borrowing too many OLTP-local CPUs helped OLAP only until memory bandwidth
+  saturated; beyond that point, OLTP throughput kept falling without further
+  OLAP gain.
+- In a CH-Benchmark query-sequence experiment, adaptive scheduling improved
+  OLAP sequence execution over static states while keeping OLTP degradation
+  controlled. The paper reports the adaptive benefit reaching up to about
+  `50%` compared with static schedules for 100 query sequences in its setup.
+
+**GPU DB mapping:** GPU DB should treat retained GPU reads, CPU fallback,
+snapshot refresh, and write admission as one resource-scheduling problem.
+The runtime already wants bounded rings, immutable snapshots, resident route
+validity, and explicit saturation metrics. Adaptive HTAP adds the missing
+freshness variable: how much of the current mutation frontier a query must
+observe, and whether that frontier is cheaper to access as a remote/delta
+route, a borrowed-resource route, or a newly published resident generation.
+
+For P8, `N_fq` maps to dirty bytes or dirty rows in the columns and segments a
+query touches. `N_ft` maps to the full dirty frontier for a table, partition,
+or resident generation. A retained route certificate can carry dirty-segment
+coverage, touched fresh bytes, total fresh bytes, batch membership, current
+GPU queue pressure, refresh cost, and allowed OLTP/write-path interference.
+That certificate lets the planner choose among serving an older snapshot,
+refreshing the GPU resident generation, executing a CPU/host delta path,
+borrowing GPU/CPU resources for a fresh partial route, or rejecting/falling
+back with an explicit freshness reason.
+
+The paper's `S2` state maps to full resident refresh or host-to-GPU copy before
+a batch of compatible reads. Its `S3` state maps to split execution: stable
+resident GPU segments plus fresh CPU/host delta segments, or a GPU kernel that
+reduces only the dirty tail before merging with resident results. Its `S1`
+state maps to aggressive co-location where analytical reads share mutation
+resources; for GPU DB this should be gated carefully because write admission,
+WAL publication, residency refresh, and query kernels can all contend for
+memory bandwidth and pinned buffers.
+
+For 1M logical sessions, the scheduling decision must be per route template or
+micro-batch, not per session. Sessions enqueue requests with a freshness
+requirement; owner domains aggregate compatible requests by snapshot
+generation, dirty frontier, route shape, and latency budget. A batch of
+dashboard reads may justify one refresh/copy, while scattered ad-hoc reads may
+need split routes or CPU fallback until enough work accumulates.
+
+**Risks and mismatches:** The evaluated system is CPU/NUMA-centered and uses a
+columnar in-memory prototype. It explicitly leaves hardware accelerators as
+future work, so GPU stream contention, HBM pressure, PCIe/NVLink transfer,
+pinned-buffer budgets, and GPU kernel launch overhead are not measured.
+
+The scheduling heuristic assumes scan-heavy analytical operators and does not
+include index maintenance or route-specific resident indexes. GPU DB must add
+index refresh, MVCC visibility checks, output materialization, and queue delay
+to the cost surface before adopting the same threshold shape.
+
+The double-instance design is useful as a snapshot publication pattern, but it
+is not a complete durability or MVCC design. GPU DB cannot let instance
+switching bypass WAL-before-visibility, replay, DDL invalidation, or
+long-reader retention. Also, split access is described as safe for inserted
+fresh data and more constrained for updates; GPU DB needs generation-tagged
+delta segments or row-version visibility before split routes can serve updates
+and deletes.
+
+Finally, a single `alpha` threshold is unlikely to be stable across GPU DB
+workloads. The threshold should be measured per route family and bounded by
+hard correctness gates: freshness, memory budget, queue wait, write-path
+interference, and fallback policy.
+
+**Benchmark candidates:**
+
+- Add a freshness-aware route benchmark with `N_fq / N_ft` as a first-class
+  variable. Compare full resident refresh, split resident-plus-delta route,
+  CPU fallback, and stale-snapshot rejection across insert-only and
+  update/delete workloads.
+- Build a dirty-frontier route certificate for P8: touched dirty rows/bytes,
+  total dirty rows/bytes, snapshot generation, resident bytes, refresh cost,
+  GPU queue depth, and allowed write-path interference. Proof gate: every
+  read either certifies freshness or reports the exact missing frontier.
+- Test an adaptive `alpha` rule for retained reads. Expected result: full
+  refresh wins for repeated compatible batches, while split routes win for
+  small fresh tails. Failure condition: the rule hurts p95 latency or write
+  throughput versus a static baseline without explaining the tradeoff.
+- Measure resource borrowing separately from data movement. Let read refresh
+  or delta-reduction work borrow CPU threads, GPU streams, pinned buffers, or
+  memory bandwidth under a fixed write-throughput floor. Pass condition:
+  borrowed resources improve read latency only while the write floor and WAL
+  visibility ordering remain intact.
+- Add a batch-amortization test for dashboard-style retained queries: vary
+  compatible query count from `1` to `64` over the same freshness frontier and
+  measure refresh/copy cost per query, p50/p95 latency, and GPU occupancy.
+- Add a split-update safety test. Insert-only deltas may be easy, but updates
+  and deletes require visibility-aware merge. Failure condition: a split route
+  serves a stale deleted row or misses a newer visible version.
+- Track OLTP interference explicitly: mutation queue wait, WAL flush latency,
+  publication delay, dirty-frontier growth, GPU refresh queue wait, memory
+  bandwidth where available, and rejection/fallback reason. A scheduling rule
+  is not accepted unless it preserves these counters within declared bounds.
+
+### 2026-06-04 - CD-search makes GPU co-scheduling a classified resource-partition problem
+
+**Citation:** Xia Zhao, Zhiying Wang, and Lieven Eeckhout.
+"Classification-Driven Search for Effective SM Partitioning in Multitasking
+GPUs." ICS 2018, pp. 65-75. doi:10.1145/3205289.3205311. Retrieved
+2026-06-04 from `https://users.elis.ugent.be/~leeckhou/papers/ics18.pdf`,
+with metadata cross-checked at
+`https://biblio.ugent.be/publication/8589946`.
+
+**Category:** GPU execution / runtime scheduling / admission.
+
+**Relevance tags:** GPU multitasking; SM partitioning; co-scheduling;
+bandwidth-aware admission; GPU execution owners; micro-batching; queue
+fairness; power-aware scheduling; route certificates.
+
+**Core idea:** CD-search argues that equal GPU sharing is often the wrong
+default. In spatial GPU multitasking, a memory-sensitive kernel may stop
+benefiting from more SMs once the off-SM system is saturated, while a
+compute-sensitive kernel may still scale almost linearly with additional SMs.
+The system first classifies co-running applications by their sensitivity to SM
+count, then uses a small workload-specific search rather than exhaustively
+trying SM partitions.
+
+For GPU DB, the transferable idea is not literal SM control. It is the shape of
+the admission decision: classify route work by its limiting resource before
+co-scheduling it. A retained lookup batch, decompression scan, grouped
+aggregate, refresh kernel, or split delta-reduction route should carry enough
+telemetry to decide whether it wants more GPU compute slots, more memory or
+L2/off-chip bandwidth, more copy-engine capacity, or fewer concurrent kernels.
+
+**Concrete mechanisms:**
+
+- CD-search uses spatial multitasking: independent applications execute on
+  disjoint sets of SMs rather than sharing each SM at fine granularity.
+- The algorithm starts with workload classification, then chooses performance
+  mode for heterogeneous mixes of compute-sensitive and memory-sensitive
+  applications, power mode for homogeneous memory-sensitive mixes, or even
+  partitioning for homogeneous compute-sensitive mixes.
+- Classification relies on an off-SM bandwidth model rather than DRAM
+  bandwidth utilization alone. The model includes NoC, LLC, and DRAM capacity
+  and compares total SM bandwidth demand against off-SM bandwidth supply.
+- The total SM demand estimate uses per-SM bandwidth demand multiplied by SM
+  count. Per-SM demand depends on maximum IPC, LLC accesses per thousand
+  instructions, cache-line size, and SM frequency.
+- The off-SM supply estimate takes the minimum of NoC bisection bandwidth and
+  an LLC/DRAM bandwidth term derived from LLC bandwidth, memory bandwidth,
+  cache hit/miss rates, and effective memory utilization.
+- Hardware performance counters provide the online workload-specific inputs:
+  LLC accesses per instruction, hit rate, and miss rate. Most other terms are
+  hardware constants known ahead of time.
+- Classification uses a warmup phase and profiling phase, each `20K` cycles in
+  the paper. During classification, two co-running applications each receive
+  half the SMs.
+- In performance mode, CD-search gradually stalls SMs assigned to the
+  memory-sensitive application in steps of two and measures IPC. It stops when
+  the memory-sensitive application's performance stays within a configured
+  threshold, then gives the freed SMs to the compute-sensitive application.
+- In power mode, CD-search aggressively finds the smallest SM count that
+  preserves each memory-sensitive application's performance and power-gates
+  the unused SMs.
+- The paper validates the compute-sensitive versus memory-sensitive behavior
+  on an NVIDIA P100 by using a shadow kernel to occupy selected SMs while the
+  main kernel runs on a separate stream.
+- Main evaluation uses modified GPGPU-Sim with a 24-SM GPU, GPUWattch power
+  modeling, 91 two-application CUDA workload mixes, and STP/ANTT metrics.
+- The off-SM model classifies all 91 workload mixes correctly in the paper's
+  setup; using memory-bandwidth utilization alone would misclassify 36 of
+  them under the paper's best threshold.
+- In heterogeneous performance-mode workloads, CD-search improves system
+  throughput by `10.4%` on average and up to `62.9%` over even partitioning.
+  ANTT improves by `22%` on average in that mode.
+- In memory-sensitive power-mode workloads, it reduces power by `25%` on
+  average and up to `41.2%`, while roughly preserving performance on average.
+- Profiling overhead is reported as `0.92%` for performance mode and `2.5%`
+  for power mode relative to offline-optimal partition choice.
+- The benefit grows when memory bandwidth is constrained and when the GPU has
+  more SMs, because extra SMs are more likely to be wasted on saturated
+  memory-sensitive kernels.
+- Against SMK-style intra-SM sharing, CD-search avoids severe interference for
+  some mixes; the paper also notes that CD-search is orthogonal to Maestro-like
+  designs that combine SMK with spatial multitasking.
+
+**GPU DB mapping:** The immediate mapping is to GPU execution-owner admission.
+Today the runtime target already calls for compatible micro-batches by
+snapshot generation, relation or partition identity, query shape, predicate
+family, and output shape. CD-search adds a second compatibility dimension:
+resource class. A batch should be labeled as compute-limited, memory-bandwidth
+limited, transfer-limited, launch-limited, or refresh/visibility-limited before
+the scheduler decides whether to co-run it, serialize it, or assign it to a
+separate stream.
+
+For retained GPU reads, equality lookups may be launch- or index-access
+limited at small batch sizes but become memory- or scatter-limited as batches
+grow. Scans over compressed resident columns may be bandwidth-limited after
+decompression saturates HBM or L2. Grouped aggregates may be compute-, shared
+memory-, or global-memory-limited depending on cardinality. A route certificate
+should therefore include measured bytes, cache behavior where available,
+kernel time, queue wait, occupancy hints, transfer bytes, and observed scaling
+with batch size.
+
+The off-SM model is a useful design pattern even if the exact counters differ
+on modern NVIDIA hardware. GPU DB can start with a software analog: each route
+family publishes a small profile from calibration runs and live telemetry:
+device bytes per row, host/device transfer bytes, expected instructions or
+kernel family, result scatter bytes, and whether throughput saturates when
+batch size or concurrent streams increase. That profile can drive conservative
+co-scheduling without a learned scheduler.
+
+The performance mode maps to pairing complementary work: run a memory-saturated
+scan or refresh with a compute-heavy kernel only if measurements show the pair
+does not worsen p95 latency or write-path freshness. The power mode maps less
+directly to current goals, but its lesson still matters: sometimes fewer active
+GPU lanes or streams can preserve throughput while reducing contention. For a
+database, that means "use all streams" should not be the default if it harms
+tail latency, HBM pressure, or copy-engine availability.
+
+For 1M logical sessions, CD-search reinforces that GPU resources should be
+allocated to route batches, not sessions. Logical sessions submit work into
+bounded rings; the GPU owner classifies and co-schedules batches by resource
+class. A session does not get an implicit share of SMs, streams, pinned
+buffers, or resident memory merely because it is connected.
+
+**Risks and mismatches:** The paper targets architectural GPU multitasking, not
+SQL execution. It assumes the ability to preempt, stall, reassign, and
+power-gate SMs in ways ordinary CUDA applications may not control directly.
+The main evaluation is simulation on a 24-SM model with older CUDA benchmark
+kernels; only the performance-sensitivity phenomenon is validated on real P100
+hardware.
+
+The off-SM bandwidth model is not a complete GPU DB cost model. It does not
+include PCIe/NVLink transfers, copy-engine overlap, CUDA graph launch overhead,
+resident snapshot invalidation, MVCC visibility checks, output encoding,
+network response pressure, or WAL/write-path interference. It also assumes
+long-running kernels where profiling overhead is small; many database kernels
+may be short micro-batches where an extra profiling phase would cost more than
+the saved work.
+
+Finally, the objective functions differ. CD-search optimizes STP, ANTT, and
+power across independent GPU applications. GPU DB must optimize SQL latency,
+freshness, fairness, and correctness under bounded queues. Any co-scheduling
+rule must be subordinate to visibility generation, memory budget, response
+ordering, and overload policy.
+
+**Benchmark candidates:**
+
+- Add a route resource-class microbenchmark for retained lookup, scan,
+  decompression, grouped aggregate, refresh, and split delta-reduction kernels.
+  Vary batch size and concurrent streams; classify each route as launch-,
+  compute-, memory-, transfer-, or scatter-limited. Proof gate: every GPU route
+  has a stable measured class before co-scheduling policy uses it.
+- Compare naive stream co-running against resource-class-aware co-scheduling:
+  pair compute-heavy and memory-heavy routes where possible, serialize two
+  memory-saturated routes, and cap active streams under HBM pressure. Measure
+  p50/p95 latency, GPU occupancy, H2D/D2H bytes, and throughput.
+- Build a "fewer active lanes can win" test for resident scans and refresh
+  kernels. Expected result: under memory saturation, reducing concurrent
+  batches or streams can preserve throughput while lowering p95 latency or
+  write-path interference. Failure condition: the cap only reduces throughput
+  without improving any latency, queue, or freshness counter.
+- Add route certificates with measured resource class, resident generation,
+  touched bytes, transfer bytes, expected output bytes, queue wait, and
+  fallback reason. A scheduler decision should be explainable from these fields
+  without hidden per-session state.
+- Test co-scheduling under freshness pressure: run retained reads, refresh
+  work, and mutation-driven invalidations together. Pass condition: GPU
+  co-running never delays WAL visibility publication or stale-route rejection
+  beyond declared bounds.
+- For future hardware with MPS/MIG or similar partitioning, compare whole-GPU
+  streams, software stream caps, and hardware partitions for database route
+  classes. Mark absolute performance unknown until the newer GPU is available.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates should combine freshness, estimates, and measured resource class
+
+The last three reviewed papers converge on a planner/runtime contract for
+choosing GPU work safely. PRICE says a route needs portable cardinality and
+fanout features plus local calibration. Adaptive HTAP says the route must name
+its freshness demand and dirty frontier. CD-search says the scheduler should
+also know the measured resource class before co-running GPU work.
+
+**Converging design tracks:** A GPU DB route certificate should include
+cardinality/fanout estimates, snapshot generation, dirty frontier coverage,
+resident bytes, transfer bytes, output bytes, queue pressure, freshness
+requirement, and measured resource class. Deterministic planner rules can use
+that certificate first; learned or adaptive layers should only refine choices
+inside those correctness and budget gates.
+
+**Category gaps:** The queue has enough GPU analytics follow-ups. The next
+high-value pick should come from multi-tier storage placement, indexing, or
+metadata/cold-tier routing unless a newer transaction-processing paper is
+added.
+
+**Benchmark priorities:** The next benchmark design should log route
+certificates for a small family of retained reads and refreshes. The pass
+condition is that route choice, fallback, and stale-snapshot rejection are
+explainable from recorded certificate fields. The failure condition is any
+planner or scheduler decision that depends on implicit session state,
+unbounded profiling, or stale statistics.

@@ -155,6 +155,8 @@ prepared-statement/portal/cursor parity beyond the current supported subset.
   guardrails.
 - [docs/architecture/10-p8-gpu-optimized-storage-engine.md](docs/architecture/10-p8-gpu-optimized-storage-engine.md):
   P8 storage/cache architecture.
+- [docs/architecture/12-acid-isolation-and-gpu-memory.md](docs/architecture/12-acid-isolation-and-gpu-memory.md):
+  code-sourced ACID, isolation-level, and GPU memory-management design.
 - [docs/testing/benchmarks/README.md](docs/testing/benchmarks/README.md): P8
   benchmark methodology, commands, artifacts, accepted evidence, and blockers.
 - [docs/testing/reports/](docs/testing/reports/): durable report artifacts for

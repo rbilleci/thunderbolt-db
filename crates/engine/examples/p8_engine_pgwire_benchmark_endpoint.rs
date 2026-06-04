@@ -405,11 +405,9 @@ impl EndpointState {
             .engine
             .execute_relational_copy_rows_profiled(txn_id, copy, rows)?;
         let elapsed_ms = started.elapsed().as_millis();
-        let rows_per_sec = if elapsed_ms == 0 {
-            copied as u128
-        } else {
-            (copied as u128 * 1000) / elapsed_ms
-        };
+        let rows_per_sec = (copied as u128 * 1000)
+            .checked_div(elapsed_ms)
+            .unwrap_or(copied as u128);
         self.fact("copy_rows_committed_to_engine_wal_mvcc", true)?;
         self.fact("copy_chunk_rows", copied)?;
         self.fact("copy_chunk_elapsed_ms", elapsed_ms)?;
@@ -826,9 +824,7 @@ fn handle_client_io(
                 )?;
             }
             FrontendMessage::Terminate => break,
-            other => {
-                return Err(format!("unsupported benchmark frontend message: {other:?}").into())
-            }
+            other => return Err(format!("unsupported benchmark frontend message: {other:?}")),
         }
     }
     Ok(true)

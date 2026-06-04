@@ -325,9 +325,10 @@ Append new candidates here as each paper is processed.
   PDF: `https://cccp.eecs.umich.edu/papers/jasonjk-asplos17.pdf`
   Why: GPU Maestro-style dynamic resource partitioning for multitasking GPUs;
   useful follow-up to kernel/batch concurrency scheduling for GPU DB streams.
-- `queued` — **Classification-Driven Search for Effective SM Partitioning in
+- `reviewed` — **Classification-Driven Search for Effective SM Partitioning in
   Multitasking GPUs**, Zhao, Wang, and Eeckhout, ICS 2018.
   URL: `https://doi.org/10.1145/3205289.3205311`
+  PDF: `https://users.elis.ugent.be/~leeckhou/papers/ics18.pdf`
   Why: low-overhead SM partitioning search for multitasking GPUs; relevant to
   GPU execution-owner admission, resident query co-scheduling, and fairness.
 - `queued` — **Fast Equi-Join Algorithms on GPUs: Design and Implementation**,
@@ -733,6 +734,17 @@ Append new candidates here as each paper is processed.
   layered filesystem designs; useful for evaluating whether GPU DB cold-tier
   placement should centralize data placement, caching, and failure recovery or
   keep them as explicit route-owned tiers.
+- `queued` — **HSM: A Hybrid Slowdown Model for Multitasking GPUs**,
+  Choi, Kim, and Eeckhout, ASPLOS 2020.
+  URL: `https://users.elis.ugent.be/~leeckhou/papers/asplos2020.pdf`
+  Why: modern follow-up from the same GPU multitasking line that models
+  cross-kernel slowdown; relevant to route resource-class calibration and
+  conservative GPU co-scheduling.
+- `queued` — **NUBA: Non-Uniform Bandwidth GPUs**, Zhao et al., ASPLOS 2023.
+  URL: `https://doi.org/10.1145/3575693.3575745`
+  Why: newer off-chip/on-chip bandwidth-aware GPU architecture work from the
+  CD-search authors; relevant to treating GPU bandwidth locality and
+  partitioning as route-certificate inputs for future hardware.
 - `reviewed` — **Oze: Decentralized Graph-Based Concurrency Control for
   Long-Running Update Transactions**, Nemoto et al., PVLDB 2025.
   URL: `https://vldb.org/pvldb/vol18/p2321-nemoto.pdf`
@@ -2155,13 +2167,22 @@ Append new candidates here as each paper is processed.
   Why: BOHM-adjacent deterministic two-phase planning/execution design for
   many-core transaction processing; useful for comparing queue-oriented
   planning against owner-local placeholder-first MVCC batches.
-- `queued` — **Serval: A Wait-free Multi-version Deterministic Concurrency
+- `reviewed` — **Serval: A Wait-free Multi-version Deterministic Concurrency
   Control Scheme**, Li, Onishi, and Kawashima, CANDAR 2024.
   URL: `https://doi.org/10.1109/CANDAR64496.2024.00028`
+  Metadata: `https://keio.elsevierpure.com/ja/publications/serval-a-wait-free-multi-version-deterministic-concurrency-contro/`
+  Poster: `https://apsys2024.github.io/posters/apsys24posters-paper58.pdf`
   Why: Caracal follow-up that replaces global version-array latch pressure for
   contended rows with bitmaps and dynamic local version arrays; useful for
   deciding whether GPU DB write batches should keep per-owner local version
   arrays before publishing a merged visibility front.
+- `queued` — **Dodo: A scalable optimistic deterministic concurrency control
+  protocol**, Li et al., Future Generation Computer Systems 2024.
+  URL: `https://doi.org/10.1016/j.future.2024.05.004`
+  Why: modern deterministic concurrency control design that removes some
+  state-of-the-art scalability bottlenecks; useful as a follow-up after
+  Serval/Caracal for comparing deterministic batch ordering when full
+  read/write sets are not always known.
 - `queued` — **Cheetah: An Efficient Deterministic Concurrency Control Scheme
   with Non-Visible Write Elimination and Re-Designed Garbage Collection**, Li,
   Onishi, and Kawashima, IEEE CLUSTER Workshops 2024.
@@ -2222,12 +2243,20 @@ Append new candidates here as each paper is processed.
   Why: hierarchical production query-time prediction with cache, local model,
   global model, and uncertainty; useful for routing GPU/CPU work, admission,
   and resource control without relying on one monolithic learned estimator.
-- `queued` — **PRICE: A Pretrained Model for Cross-Database Cardinality
+- `reviewed` — **PRICE: A Pretrained Model for Cross-Database Cardinality
   Estimation**, Zeng et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2406.01027`
   Why: cross-database cardinality estimation is the counterpart to DACE's
   residual-cost path; useful for deciding whether GPU route choice should keep
   cardinality and residual-latency learning as separate planner signals.
+- `queued` — **Learned Cardinality Estimation: A Design Space Exploration
+  and A Comparative Evaluation**, Sun et al., PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol15/p752-sun.pdf`
+  DOI: `https://doi.org/10.14778/3503585.3503586`
+  Why: PRICE compares against the learned-cardinality-estimation design space;
+  useful for stress-testing whether a GPU DB planner should learn
+  cardinality, residual latency, or route ranking, and for choosing benchmark
+  metrics beyond raw q-error.
 - `reviewed` — **Your Read is Our Priority in Flash Storage**, An et al.,
   PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1911-lee.pdf`
@@ -3385,7 +3414,7 @@ Append new candidates here as each paper is processed.
   Why: Stage compares against Redshift's prior workload-manager predictor;
   useful for understanding the production queue, priority, concurrency-scaling,
   and resource-control hooks that a GPU DB route predictor would influence.
-- `queued` — **Adaptive HTAP through Elastic Resource Scheduling**, Raza,
+- `reviewed` — **Adaptive HTAP through Elastic Resource Scheduling**, Raza,
   Chrysogelos, Anadiotis, and Ailamaki, SIGMOD 2020.
   URL: `https://arxiv.org/abs/2004.05437`
   DOI: `https://doi.org/10.1145/3318464.3389783`
@@ -3400,6 +3429,24 @@ Append new candidates here as each paper is processed.
   useful historical-but-eligible baseline for deciding which GPU DB benchmark
   gates must include hybrid transactions, freshness, and semantic schema
   overlap instead of only concurrent OLTP plus OLAP streams.
+- `queued` — **Heracles: Improving Resource Efficiency at Scale**, Lo et al.,
+  ISCA 2015.
+  URL: `https://doi.org/10.1145/2749469.2749475`
+  Why: Adaptive HTAP points to hardware/software resource controls for limiting
+  interference; useful for GPU DB admission rules that cap memory-bandwidth,
+  CPU, and accelerator-resource theft while protecting OLTP p95 latency.
+- `queued` — **PerfIso: Performance Isolation for Commercial
+  Latency-Sensitive Services**, Iorgulescu et al., USENIX ATC 2018.
+  URL: `https://www.usenix.org/conference/atc18/presentation/iorgulescu`
+  Why: Adaptive HTAP suggests live performance monitoring to bound elastic
+  resource sharing; PerfIso is a primary systems follow-up for interference
+  control and isolation when query, refresh, and mutation work compete.
+- `queued` — **Columnstore and B+ Tree - Are Hybrid Physical Designs
+  Important?**, Dziedzic et al., SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3190660`
+  Why: Adaptive HTAP contrasts runtime resource scheduling with hybrid access
+  methods; useful for deciding when GPU DB should adapt physical route shape
+  versus moving resources or freshness boundaries.
 - `queued` — **Deferred Runtime Pipelining for Contentious Multicore Software
   Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
   URL: `https://doi.org/10.1145/3302424.3303966`
