@@ -2823,7 +2823,7 @@ Append new candidates here as each paper is processed.
   Why: discovered while following GPU index literature around MVGpuBTree; uses
   hardware-accelerated coarse-granular indexing ideas that may compete with or
   complement resident GPU B-tree/hash indexes for selective predicates.
-- `queued` — **RTIndeX: Exploiting Hardware-Accelerated GPU Raytracing for
+- `reviewed` — **RTIndeX: Exploiting Hardware-Accelerated GPU Raytracing for
   Database Indexing**, Henneberg and Schuhknecht, PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p4268-schuhknecht.pdf`
   DOI: `https://doi.org/10.14778/3625054.3625061`
@@ -2925,3 +2925,15 @@ Append new candidates here as each paper is processed.
   Why: direct baseline for GPredictor's concurrent-query model; useful for
   comparing single-plan latency prediction against GPU DB route descriptors
   that must incorporate shared cache, lock, and accelerator-resource edges.
+- `queued` — **DyCuckoo: Dynamic Hash Tables on GPUs**, Li et al.,
+  ICDE 2021.
+  URL: `https://doi.org/10.1109/ICDE51399.2021.00070`
+  Why: RTIndeX compares against static GPU index baselines and highlights
+  update/rebuild limits; DyCuckoo is a modern dynamic GPU hash-table follow-up
+  for point-lookup routes that need device-side updates.
+- `queued` — **GPU LSM: A Dynamic Dictionary Data Structure for the GPU**,
+  Ashkiani et al., IPDPS 2018.
+  URL: `https://doi.org/10.1109/IPDPS.2018.00053`
+  Why: RTIndeX's update weakness raises the question of log-structured GPU
+  indexes; useful for comparing rebuild-heavy resident structures with
+  mutable GPU dictionary layers under MVCC generation boundaries.

@@ -35081,3 +35081,180 @@ secondary-index-heavy workloads, and long read-only snapshots.
 - Add recovery proof for phase-fenced metadata: replay WAL/checkpoint state,
   ignore uncommitted current-fence cache updates, and reconstruct the same
   route metadata generation before any GPU cache is trusted.
+
+### 2026-06-04 - RTIndeX turns RT cores into a read-mostly GPU secondary index
+
+**Citation:** Justus Henneberg and Felix Schuhknecht. "RTIndeX:
+Exploiting Hardware-Accelerated GPU Raytracing for Database Indexing."
+PVLDB 16(12), 2023, pp. 4268-4281. doi:10.14778/3625054.3625061.
+Retrieved 2026-06-04 from the arXiv version
+`https://arxiv.org/abs/2303.01139` and the PVLDB PDF
+`https://www.vldb.org/pvldb/vol16/p4268-schuhknecht.pdf`.
+
+**Category:** GPU execution / analytics; multi-tier cache / data placement;
+query optimization / planning.
+
+**Relevance tags:** GPU-resident indexes; ray-tracing cores; OptiX; BVH;
+point lookup; range lookup; read-only resident snapshots; route costing;
+GPU memory footprint.
+
+**Core idea:** RTIndeX asks whether a database index can be mapped onto a
+hardware feature that GPUs already optimize: ray tracing. The RX design turns
+indexed keys into primitives in an OptiX scene, builds a bounding volume
+hierarchy over them, and answers point or range lookups by firing rays whose
+intersections return row ids. The paper is valuable because it treats RT cores
+as a possible resident-index accelerator, then measures where that mapping
+works and where it does not.
+
+The strongest transferable result is not "use RT cores everywhere." It is a
+route-shape rule: RT-core indexes are plausible for read-mostly, GPU-resident,
+batched point probes, especially when misses are common, lookup skew improves
+cache locality, or 64-bit ordered keys matter. They are a poor default for
+high-update paths, build-heavy routes, and memory-constrained resident
+snapshots. The paper reports that RX is competitive with comparison-based GPU
+indexes for point lookups, can outperform baselines in high-miss and high-skew
+cases, but has worse build time, higher memory footprint, and weak update
+support. It therefore recommends RX primarily as a read-only index.
+
+**Concrete mechanisms:**
+
+- Build one primitive per indexed key and store the primitive at the key's row
+  id position in the vertex buffer so OptiX intersection results identify rows.
+- Use OptiX `optixAccelBuild()` to construct a BVH over the primitives. The
+  ray-tracing pipeline launches one CUDA thread per lookup, converts the lookup
+  predicate into ray parameters, calls `optixTrace()`, and uses an any-hit
+  program to process matching row ids.
+- Avoid naive integer-to-float conversion. OptiX coordinates are `float32`, so
+  direct integer coordinates lose precision for larger keys. RX's selected
+  3D mode decomposes a 64-bit key into three coordinates: 23 low bits for `x`,
+  23 bits for `y`, and 18 bits for `z`.
+- Use perpendicular rays for point lookups because they miss most bounding
+  boxes by geometry instead of relying on `tmin`/`tmax` exclusion along a long
+  parallel ray. Use offset parallel rays for range lookups.
+- Prefer compacted triangle BVHs when optimizing lookup throughput. Triangles
+  use hardware ray-triangle intersection; spheres and AABBs can reduce or
+  change memory costs but need software intersection programs and were slower
+  in the paper's experiments.
+- Treat updates cautiously. OptiX supports in-place BVH updates only with
+  restrictions: no adding/removing primitives, extra temporary memory, and the
+  update flag prevents compaction benefits. The paper found update time
+  independent of changed-entry count because the whole buffer is passed, and
+  lookup quality can degrade badly when relocated triangles stretch bounding
+  volumes. Full rebuild is preferred for lookup performance.
+- Compare RX against WarpCore-style GPU hash tables, a GPU B+-tree, and a
+  sorted array. Hash tables dominate many point-hit workloads; B+-trees and
+  sorted arrays remain better for larger range scans because they can traverse
+  ordered result regions instead of detecting every qualifying primitive
+  individually.
+- RX benefits from large enough lookup batches to saturate the GPU. The paper
+  observes saturation around large batches and warns that many tiny batches pay
+  launch overhead and underutilize GPU resources.
+- Sorting lookup batches can materially improve locality for all indexes,
+  including RX, but it needs extra GPU memory and is not worth it for small
+  batches.
+- RX has favorable behavior for misses because BVH traversal can abort early
+  when no bounding volume covers the searched key. In outside-range misses,
+  traversal can stop near the root.
+- RX's 32-bit and 64-bit lookup costs are similar because both are represented
+  in the same 3D coordinate scheme, while some baseline structures pay larger
+  comparison and memory costs for 64-bit keys.
+- The evaluated hardware includes RTX 2080Ti, 3090, A6000, and 4090 systems.
+  RX improves faster across generations than some baselines in sorted lookup
+  experiments, which the authors attribute to newer and more numerous
+  ray-tracing cores.
+
+**GPU DB mapping:** P8 should treat RTIndeX as a candidate resident-index
+route, not as CPU truth or durable storage. A resident `int4`/`int8` key column
+could expose several route families: GPU hash for high-hit point probes,
+GPU B-tree or sorted vectors for ordered/range access, and RT-core/BVH lookup
+for batched point probes with high miss rates, skew, or key widths where
+comparison costs dominate. The planner should choose among them with explicit
+cost fields: resident bytes, build/rebuild time, expected hit rate, expected
+range width, update invalidation rate, batch size, and RT-core availability.
+
+For MVCC, RX fits only behind immutable generation boundaries. Building a BVH
+over a retained snapshot is acceptable because the BVH is acceleration state
+derived from CPU/WAL truth. Trying to update the BVH for every SQL mutation
+would fight the paper's own evidence. The safer design is to invalidate or
+rebuild RT-core resident indexes at segment or generation boundaries, possibly
+with a small CPU/GPU delta route for fresh mutations until the next rebuild.
+
+For session concurrency, the batch-size lesson matters. A million logical
+sessions will not all produce huge compatible batches, so the runtime needs a
+route admission rule that only sends RT-core lookups when enough same-shape
+requests are waiting or when latency budgets allow a short micro-batch window.
+Single interactive point reads may be better on CPU, GPU hash, or cached
+response routes.
+
+For tiering, RX's memory footprint makes it a hot-tier structure. It should
+not displace canonical column buffers, visibility metadata, or write-admission
+buffers in HBM unless benchmark telemetry shows the saved lookup work is worth
+the resident bytes. It is more plausible for hot, read-mostly indexes on
+admitted partitions than for all tables.
+
+**Risks and mismatches:** RX depends on NVIDIA RT cores and OptiX, so it is
+not portable across all GPUs or datacenter deployments. It evaluates
+standalone GPU-resident arrays, not a full SQL engine with MVCC visibility,
+NULL ordering, collations, DDL, WAL replay, prepared statements, or mixed
+write/read concurrency. The paper's 3D key encoding supports ordered 64-bit
+keys, but SQL text, composite keys, collations, and NULL semantics need extra
+software filtering or separate encodings. The update path is a poor match for
+write-heavy OLTP unless RX is rebuilt only at safe snapshot boundaries. Unknown
+from this read: exact behavior with SQL-style secondary-index duplicates under
+multi-column predicates, how OptiX build concurrency interacts with other CUDA
+streams in a busy DBMS, and whether future datacenter GPUs preserve the same
+RT-core performance trend.
+
+**Benchmark candidates:**
+
+- Add a resident-index route shootout for one admitted table: GPU hash,
+  sorted vector, GPU B-tree if available, RTIndeX-style BVH, and CPU fallback.
+  Sweep hit rate, lookup skew, key width, batch size, and range width.
+- Gate any RT-core route on rebuild safety: build from a WAL-safe retained
+  snapshot, mutate the CPU truth, prove old readers keep the old BVH while new
+  readers reject or route around it until a new generation is published.
+- Add HBM budget accounting for BVH resident bytes and temporary build bytes.
+  Failure condition: RT-core admission evicts canonical column buffers or
+  pinned staging buffers without exposing the cause in telemetry.
+- Measure micro-batch thresholds for RT-core point lookups: single request,
+  32, 128, 1K, 32K, and larger compatible batches. The proof gate is a route
+  rule that improves throughput without violating p50 latency targets.
+- Add a miss-heavy benchmark with in-range misses and outside-range misses.
+  Compare RT-core early-abort behavior against hash-table miss probe cost and
+  CPU index fallback.
+- Test rebuild versus delta-overlay strategies after append/update/delete
+  bursts. The RT-core BVH may remain read-only while a small fresh-delta index
+  handles mutations until refresh; correctness must match MVCC visibility.
+
+### 2026-06-04 - Cross-paper synthesis: hot routes need separate write, point-state, and resident-index contracts
+
+**Papers covered:** FASTER embedded state stores, STAR, and RTIndeX.
+
+**Converging design tracks:** These papers separate three different kinds of
+hot path instead of forcing one structure to serve all of them. FASTER keeps
+hot point-state updates close to the owner and lets colder records fall through
+a log-shaped tier. STAR keeps partition-local transactions cheap, then uses
+phase fences for work that truly needs a stronger global owner. RTIndeX keeps
+GPU point lookups fast only when the resident index is read-mostly, batched,
+and rebuilt at generation boundaries.
+
+For GPU DB, this argues for explicit route contracts. A write route should say
+which owner publishes visibility and whether it needs a fence. A point-state
+route should say whether it is mutable owner-local state or snapshot-visible
+SQL state. A resident-index route should say whether it is rebuildable
+acceleration state, which generation it covers, how many HBM bytes it consumes,
+and which batch shape makes it profitable.
+
+**Category gaps:** Recent reviews have good coverage across concurrency,
+runtime, point-state storage, and GPU indexing, but the queue should continue
+to pull in modern OLTP/GPU transaction papers before doing many more
+analytics-only GPU papers. LTPG and GalOP are the strongest queued candidates
+for that next balance move.
+
+**Benchmark priorities:** First, add route telemetry that distinguishes owner
+queue wait, fence wait, GPU queue wait, resident-index rebuild wait, and
+response-ring wait. Second, benchmark partition-local writes versus
+cross-owner fenced writes before choosing a permanent owner split. Third,
+benchmark resident point-index families under the same MVCC generation and HBM
+budget harness so RT-core, hash, B-tree, and sorted-vector routes compete on
+the same truth boundary.
