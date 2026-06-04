@@ -2884,13 +2884,29 @@ Append new candidates here as each paper is processed.
   provisioning work; useful for session-admission and cold/warm route
   provisioning policies when dormant tenants or idle logical sessions become
   active quickly.
-- `queued` — **Seagull: An Infrastructure for Load Prediction and Optimized
-  Resource Allocation**, Poppe et al., PVLDB 2020.
-  URL: `https://doi.org/10.14778/3421424.3421436`
+- `reviewed` — **Seagull: An Infrastructure for Load Prediction and Optimized
+  Resource Allocation**, Poppe et al., PVLDB 2021.
+  URL: `https://doi.org/10.14778/3425879.3425886`
+  PDF: `https://www.vldb.org/pvldb/vol14/p154-poppe.pdf`
   Why: Moneyball transfers lessons from Azure SQL provisioned-database load
   prediction; useful for comparing per-tenant/session historical route demand,
   lightweight predictors, and maintenance overhead for GPU DB admission and
   warm-cache budgeting.
+- `queued` — **Resource Central: Understanding and Predicting Workloads for
+  Improved Resource Management in Large Cloud Platforms**, Cortez et al.,
+  SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132772`
+  Why: Seagull cites Resource Central as model-serving and workload-prediction
+  infrastructure; useful for comparing fleet-scale resource prediction,
+  model/version management, and prediction-service overhead before GPU DB
+  builds ML-driven admission or warm-cache controllers.
+- `queued` — **Predictive Provisioning: Efficiently Anticipating Usage in
+  Azure SQL Database**, Viswanathan et al., ICDE 2017.
+  URL: `https://doi.org/10.1109/ICDE.2017.164`
+  Why: Seagull cites Azure SQL predictive provisioning as a database-specific
+  resource anticipation baseline; useful for comparing idle detection,
+  overbooking, and pre-provisioning policies against GPU DB warm-route and
+  logical-session admission loops.
 - `reviewed` — **LTPG: Large-Batch Transaction Processing on GPUs with
   Deterministic Concurrency Control**, Wei, Gu, Li, and Yu, ICDE 2024.
   URL: `https://doi.org/10.1109/ICDE60146.2024.00296`

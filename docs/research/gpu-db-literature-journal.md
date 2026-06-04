@@ -37244,3 +37244,155 @@ would invert the intended benefit.
   introducing ML. The minimum proof gate is that the simple model already
   beats fixed keepalive/teardown on representative traces; otherwise the
   added predictor maintenance is not justified.
+
+### 2026-06-04 - Seagull makes prediction useful by optimizing the decision, not the whole curve
+
+**Citation:** Olga Poppe, Tayo Amuneke, Dalitso Banda, Aritra De,
+Ari Green, Manon Knoertzer, Ehi Nosakhare, Karthik Rajendran,
+Deepak Shankargouda, Meina Wang, Alan Au, Carlo Curino, Qun Guo,
+Alekh Jindal, Ajay Kalhan, Morgan Oslake, Sonia Parchani,
+Vijay Ramani, Raj Sellappan, Saikat Sen, Sheetal Shrotri,
+Soundararajan Srinivasan, Ping Xia, Shize Xu, Alicia Yang, and
+Yiwen Zhu. "Seagull: An Infrastructure for Load Prediction and
+Optimized Resource Allocation." PVLDB 14(2):154-162, 2021. DOI
+`10.14778/3425879.3425886`. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol14/p154-poppe.pdf`.
+
+**Category:** Runtime / HFT / session scale; multi-tier cache / data
+placement.
+
+**Relevance tags:** load prediction; resource allocation; maintenance
+scheduling; session admission; warm cache budgeting; telemetry validation;
+prediction confidence; low-load windows; per-tenant history; fallback to
+default policy.
+
+**Core idea:** Seagull is an Azure production infrastructure for predicting
+future database-server load and using the prediction to schedule resource-
+intensive work. Its most useful lesson is that the system does not optimize
+for a generic time-series score. For backup scheduling, it asks a narrower
+question: did the prediction choose a low-load window long enough for the
+operation, and was the load inside that window accurate enough to trust?
+
+That decision-specific framing matters for GPU DB. A cache or session
+controller does not need perfect per-session or per-table forecasts to make
+useful decisions. It needs predictions that are good enough for the next
+action: keep a route warm, prebuild a resident generation, delay a refresh
+until a low-load slot, start a background compaction, or shed an idle
+session's heavy state. Seagull also shows that simple history often beats
+operational complexity: persistent forecast from the previous day was good
+enough for production backup scheduling because most long-lived servers were
+stable or patterned.
+
+**Concrete mechanisms:**
+
+- Seagull consumes production telemetry, validates schema and bounds,
+  extracts features, trains/deploys a model, exposes prediction through a
+  service endpoint, tracks model versions, runs inference, evaluates
+  accuracy, and stores results for operational consumers.
+- The deployed backup use case uses average customer CPU load per server in
+  five-minute intervals as the activity signal. The paper notes that memory,
+  IO, active connections, and other signals could be added for other
+  scenarios.
+- Input data is partitioned by Azure region. A data-science pipeline runs per
+  region, with input sizes ranging from hundreds of kilobytes to a few
+  gigabytes.
+- The system classifies servers as short-lived or long-lived, stable or
+  unstable, daily-patterned, weekly-patterned, predictable, or unpredictable.
+  A server is considered predictable only if recent history shows both
+  correct low-load-window choices and accurate load inside those windows.
+- The production backup scheduler only changes backup time for servers that
+  were predictable for the previous three weeks. Unpredictable or new servers
+  fall back to the default schedule.
+- Low-load prediction accuracy is defined with two use-case metrics: whether
+  the predicted lowest-load window is good enough compared with the true
+  lowest-load window, and whether predicted load inside that window falls
+  within an acceptable error bound.
+- The paper uses an asymmetric acceptable error bound for load prediction,
+  tolerating more overprediction than underprediction because underestimating
+  load can cause maintenance work to collide with customer activity.
+- Persistent forecast variants compare previous day, previous equivalent
+  weekday, and previous-week average. The deployed model uses previous-day
+  persistent forecast because it scales best and reaches nearly the same
+  decision accuracy as heavier models for this workload.
+- More complex time-series models were evaluated: NimbusML, GluonTS, Prophet,
+  and ARIMA in earlier consideration. ARIMA and Prophet were rejected for
+  scalability reasons; NimbusML and GluonTS were competitive but not enough
+  better to justify the operational cost for the deployed scenario.
+- Dask parallelism is used where the pipeline bottleneck is per-server
+  accuracy evaluation. The paper reports up to roughly 3-4.6x speedups for
+  evaluating each day one week ahead per server.
+- In production evaluation, Seagull avoided a fraction of backup collisions
+  with high customer load for busy PostgreSQL/MySQL servers, while most
+  default windows were already as good as predicted low-load windows. This is
+  important: prediction value is concentrated where default policy is wrong,
+  not across the whole fleet.
+- The paper explicitly warns to keep version one simple and to verify
+  assumptions, because target mechanisms such as reactive autoscaling may
+  improve while the predictive infrastructure is being built.
+
+**GPU DB mapping:** Seagull should shape the GPU DB control loops around
+decision-specific metrics. For 1M logical sessions, the useful classifier is
+not "predict every session's next request perfectly." It is "which tenant,
+route shape, table generation, or prepared query family is predictable enough
+to receive scarce warm resources?" New or unpredictable identities should
+stay on default teardown, default admission, or CPU fallback until history
+justifies heavier state.
+
+For P8 cache and data placement, the low-load-window idea maps to maintenance
+work: resident generation rebuilds, cold-tier compaction, GPU index rebuilds,
+NVMe prefetch, statistics refresh, and snapshot retirement should prefer
+windows where active route pressure is predicted low enough. The proof gate
+must be tied to the decision: a predicted refresh window is correct if the
+extra work does not violate active-route latency or queue budgets, not if the
+entire load curve is perfectly forecast.
+
+For the high-throughput runtime, Seagull argues for telemetry-first admission
+features: per-tenant and per-route queue depth, resume frequency, active
+connection count, HBM/DRAM/pinned-buffer pressure, D2H/H2D bytes, refresh
+cost, and recent fallback causes. A simple persistent forecast over those
+features should be benchmarked before ML. If previous-window or previous-day
+signals select good warm-hold or maintenance windows, heavier predictors are
+unnecessary.
+
+The three-week predictability guard is also transferable in spirit. GPU DB can
+use a shorter horizon, but it should still require repeated correct decisions
+before trusting prediction for scarce resources. For example, a route family
+may need N successful warm reuse windows before it is allowed to reserve HBM
+or pinned buffers proactively. Otherwise it remains a logical-session entry
+with cheap cold-start handling.
+
+**Risks and mismatches:** Seagull is about cloud database maintenance
+scheduling, not microsecond query routing or GPU execution. Its time windows
+are minutes to days, while GPU DB route admission may need microseconds to
+seconds. The main signal in the paper is CPU load, which is not enough for
+GPU DB decisions involving HBM, pinned buffers, NVMe queue depth, CUDA stream
+pressure, WAL publication frontiers, or response-ring saturation. Its
+production results are specific to Azure PostgreSQL/MySQL backup scheduling,
+and the paper does not provide a reusable predictor for all resource
+allocation problems. A naive transfer could delay necessary refresh or
+compaction too long while waiting for predicted low load, increasing stale
+resident state and fallback latency.
+
+**Benchmark candidates:**
+
+- Build a decision-specific prediction harness for route warm hold and
+  maintenance scheduling. Compare fixed policy, previous-window persistent
+  forecast, previous-day/period forecast, and a simple learned predictor.
+  Measure correct decisions, wrong warmups, active-route latency impact, and
+  bytes/time held idle.
+- Add a "low-pressure window" metric for resident generation rebuilds and
+  index rebuilds: the predicted window is correct if refresh work finishes
+  without exceeding active read/write queue wait, CUDA stream occupancy, HBM,
+  pinned-memory, or NVMe queue-depth budgets.
+- Simulate 1M logical sessions with stable tenants, daily-pattern tenants,
+  weekly-pattern tenants, bursty tenants, and short-lived tenants. Proof gate:
+  prediction state grows by tenant/route family, not by every logical session.
+- Gate proactive warm resources behind a predictability streak. A route family
+  must show repeated successful reuse within its warm interval before it can
+  reserve HBM or pinned buffers; failure demotes it to default cold behavior.
+- Benchmark asymmetric error costs. Underpredicting active-route pressure
+  should be penalized more heavily than overpredicting it because it can cause
+  background work or warm idle state to interfere with live queries.
+- Add fallback accounting for prediction: default admission, default eviction,
+  and default maintenance schedules must remain available when telemetry is
+  missing, invalid, too new, or recently inaccurate.
