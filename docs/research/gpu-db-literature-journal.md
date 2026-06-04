@@ -48659,3 +48659,125 @@ Benchmark priorities:
 - Keep future-tier benchmarks object-family based: control state, hot indexes,
   old snapshots, cold column bytes, and scan intermediates should each have a
   separate placement policy and failure condition.
+
+### 2026-06-04 - HyBench frames HTAP as freshness-bound mixed pressure, not OLAP plus OLTP in isolation
+
+**Citation:** Chao Zhang, Guoliang Li, and Tao Lv. "HyBench: A New
+Benchmark for HTAP Databases." PVLDB 17(5), 2024, pp. 939-951.
+doi:10.14778/3641204.3641213.
+Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol17/p939-zhang.pdf`.
+
+**Category:** hybrid HTAP; benchmark design; route and freshness evaluation.
+
+**Relevance tags:** HTAP benchmark; data freshness; mixed OLTP/OLAP pressure;
+isolation-visible reads; query latency; route choice; scheduler evaluation;
+multi-tier placement telemetry.
+
+**Core idea:** HyBench argues that HTAP systems should not be evaluated by
+running an OLTP benchmark and an OLAP benchmark side by side with unrelated
+schemas. The paper builds a benchmark around an online finance workload where
+transactional writes and analytical reads share one database, then scores the
+system with freshness-aware metrics. For GPU DB, the transferable point is not
+the exact schema; it is the evaluation contract: a route is not good just
+because it is fast on a stale or isolated analytical copy. It must state how
+fresh the analytical result is, how much it disturbs transactional throughput,
+and what latency the mixed workload sees.
+
+HyBench also broadens the benchmark surface beyond long scans. It includes
+operational transactions, analytical queries, and an OLXP workload that mixes
+analytical transactions with interactive queries for risk-control-like cases.
+That distinction maps well to retained GPU snapshots, CPU fallback, and future
+tiered placement: some queries need the newest committed boundary; others can
+use an older resident generation if the route certificate honestly records its
+staleness.
+
+**Concrete mechanisms:**
+
+- The workload is modeled as a business process instead of disconnected
+  microbenchmarks. OLTP and OLAP operations share table state so transactional
+  updates affect analytical answers.
+- HyBench divides work into OLTP, OLAP, and OLXP phases. OLXP is the important
+  pressure point because it combines analytical transactions and interactive
+  queries that need recent operational data.
+- The benchmark defines 18 read/write transactions, 13 analytical queries, and
+  an OLXP mix of 6 analytical transactions and 6 interactive queries.
+- Data generation simulates an online finance scenario with time-dependent
+  generation and anomaly generation, avoiding fully independent random data
+  that would make hot spots and risk-analysis cases too easy.
+- The metric design combines OLTP throughput, OLAP throughput, OLXP throughput,
+  and freshness. The paper's key warning is that a system can score well on raw
+  analytical speed while serving data that is too stale for operational
+  analytics.
+- HyBench defines a freshness interval between committed transactional data and
+  what analytical queries can observe. It treats that interval as an explicit
+  measurement target rather than a footnote.
+- A graph-based parameter curation method controls access patterns such as
+  skew, data contention, and relationships between queries and transactions.
+- The paper is a benchmark paper, not a concurrency-control design paper. It
+  does not prescribe one MVCC, snapshot, replication, or GPU execution
+  mechanism.
+
+**GPU DB mapping:** HyBench fits the current route-certificate direction. A
+retained GPU route should carry the resident snapshot generation, source WAL or
+transaction boundary, observed freshness lag, route class, and fallback reason.
+Without those fields, benchmark results could accidentally reward a stale
+resident cache that is fast only because it ignores recent writes.
+
+The OLTP/OLAP/OLXP split is directly useful for P8. An OLXP query or
+analytical transaction should either execute from a resident generation whose
+boundary satisfies the requested freshness, trigger refresh, or fall back to
+CPU. Less freshness-sensitive analytical work can use an older GPU snapshot or
+cold-tier segment if it matches the requested time boundary. This gives tier
+placement a semantic input instead of only a byte budget.
+
+For concurrency, HyBench suggests a mixed pressure test where write admission,
+snapshot publication, GPU refresh, and retained reads run together. The engine
+should measure whether a long GPU scan delays WAL visibility, whether refresh
+work starves small writes, and whether retained reads force mutation owners to
+keep too many old versions or tombstones hot.
+
+The benchmark also helps avoid a common GPU trap. If only analytical kernels
+are measured, the engine may optimize for large scan throughput while hiding
+the cost of refresh, invalidation, response draining, and write interference.
+HyBench's mixed-worker model makes those costs visible.
+
+**Risks and mismatches:** HyBench is not a GPU database paper and does not
+provide implementation details for MVCC, buffer management, CUDA scheduling, or
+write-path correctness. Its schema and query set are benchmark choices, not a
+product workload guarantee. The paper evaluates existing HTAP databases, while
+GPU DB currently has a narrower int4/text resident slice and a benchmark
+endpoint that is not the target production runtime.
+
+The freshness metric also needs careful adaptation. A PostgreSQL-compatible GPU
+DB cannot report "fresh enough" unless the query's isolation level, snapshot
+boundary, and resident generation are part of the route contract. Historical
+analytics may accept older snapshots, but ordinary read-committed or
+transaction-scoped reads must follow SQL-visible semantics. Finally, a HyBench-
+style workload may become too broad for early P8 slices; the first benchmark
+should be a reduced version that still couples writes, refresh, retained reads,
+and freshness telemetry.
+
+**Benchmark candidates:**
+
+- Build a reduced HyBench-style mixed workload with shared account/transfer
+  tables, using only currently supported types first. Include one write-heavy
+  transaction, one OLXP point/aggregate read, and one less freshness-sensitive
+  analytical scan.
+- Add route-certificate fields for `source_txn_boundary`,
+  `resident_generation`, `freshness_lag_ms`, `freshness_requirement_ms`, and
+  `freshness_fallback_reason`.
+- Compare three freshness policies: always CPU for newest reads, retained GPU
+  snapshot if within freshness SLO, and refresh-on-demand before GPU route.
+  Measure write throughput, read p50/p99, refresh cost, and stale-route
+  rejections.
+- Stress one long analytical GPU scan while short OLXP reads and writes
+  continue. Failure condition: the long scan pins versions,
+  tombstones, response buffers, or refresh resources enough to grow fresh-read
+  p99 or write p99 without explicit admission telemetry.
+- Add a freshness-aware planner gate: a resident route is valid only if its
+  generation satisfies the read's requested boundary. Proof gate: injected
+  mutations are either observed by freshness-sensitive reads or produce a
+  documented CPU fallback/refresh route.
+- Report an HTAP score only as a tuple: write throughput, OLAP latency, OLXP
+  latency, freshness lag, and rejected/fallback work. Do not collapse these
+  into a single throughput number for early design decisions.

@@ -3988,3 +3988,22 @@ Append new candidates here as each paper is processed.
   Why: Homa compares against NDP's receiver-side pulling and bounded queues;
   useful for evaluating how much GPU DB should trade bandwidth utilization for
   low queueing delay at network, response-ring, and owner-ingress boundaries.
+- `reviewed` — **HyBench: A New Benchmark for HTAP Databases**, Zhang et al.,
+  PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p939-zhang.pdf`
+  DOI: `https://doi.org/10.14778/3641204.3641213`
+  Why: selected after the recent synthesis called for HTAP freshness and route
+  evaluation; useful for measuring mixed write/read pressure with explicit
+  freshness rather than treating stale analytical speed as sufficient.
+- `queued` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p3313-yang.pdf`
+  DOI: `https://doi.org/10.14778/3415478.3415540`
+  Why: HyBench compares HTAP systems and motivates real-time analytical
+  freshness; F1 Lightning is a production HTAP service paper useful for
+  contrasting serving-time freshness, ingestion, and resource isolation.
+- `queued` — **TiDB: A Raft-based HTAP Database**, Huang et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p3072-huang.pdf`
+  DOI: `https://doi.org/10.14778/3415478.3415535`
+  Why: HyBench evaluates HTAP tradeoffs across systems; TiDB/TiFlash provides
+  a primary-source HTAP design with MVCC, Raft replication, and analytical
+  replicas to compare against retained GPU snapshots.
