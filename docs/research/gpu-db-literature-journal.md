@@ -28538,3 +28538,191 @@ shape and mechanisms, not the exact throughput numbers.
 - For future GPU write batches, record whether reads and writes touch shared
   metadata on every row. Failure condition: a larger scheduling space loses
   to a simpler owner path because of cache-line churn.
+
+### 2026-06-04 - FastLanes makes compressed column layout a route-level choice
+
+**Citation:** Azim Afroozeh and Peter Boncz. "The FastLanes
+Compression Layout: Decoding >100 Billion Integers per Second with
+Scalar Code." PVLDB 16(9), 2023, pp. 2132-2144.
+doi:10.14778/3598581.3598587. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf`.
+
+**Category:** multi-tier cache / data placement; GPU execution /
+analytics; query optimization / planning.
+
+**Relevance tags:** compressed execution; columnar layout; bit-packing;
+DELTA; RLE; FOR; DICT; vectorized execution; SIMD portability; GPU
+resident segments; CPU/GPU shared layout; transfer reduction; route
+costing.
+
+**Core idea:** FastLanes redesigns lightweight integer-compression
+layout so decoding exposes independent work to data-parallel hardware
+instead of depending on a particular SIMD width. The paper's important
+database lesson is that compression should not be a cold-storage-only
+detail. If decoding is cheap enough and produces compact in-flight
+vectors, compression becomes part of the execution route: fewer bytes
+move through memory, disk, network, PCIe, and GPU staging, while
+operators can often continue on narrow values instead of eagerly
+materializing full SQL-width integers.
+
+For GPU DB, this argues against treating resident snapshots as only
+uncompressed device arrays. The storage/runtime contract should be able
+to name a physical encoding, decoded lane width, vector order, and
+whether a route can operate on compressed or partially decoded vectors.
+That choice belongs in route planning because it changes transfer bytes,
+kernel input shape, CPU fallback cost, and cache residency value.
+
+**Concrete mechanisms:**
+
+- FastLanes works on 1024-value vectors and targets a virtual 1024-bit
+  register abstraction, `FLMM1024`, rather than committing the format to
+  current 128-, 256-, or 512-bit CPU SIMD widths.
+- Its bit-packed layout interleaves logical values across many lanes so
+  bit-unpacking can use independent load, store, shift, mask, boolean,
+  and add operations.
+- The virtual instruction set is deliberately simple: load/store,
+  left/right shift with masking, AND, OR, XOR, ADD, and SET. The authors
+  implement scalar paths and show modern compilers can auto-vectorize
+  them, reducing architecture-specific intrinsic debt.
+- DELTA decoding avoids sequential lane dependencies by reordering each
+  1024-value vector into a transposed order. Values that would normally
+  depend on their immediate predecessor become independent per lane.
+- Because a table scan must keep all columns aligned even when columns
+  have different lane widths, the paper defines one Unified Transposed
+  Layout for 8-, 16-, 32-, and 64-bit values using eight 8x16 tiles in
+  `04261537` order.
+- FastLanes-RLE maps run-length decoding into a dictionary-like run-value
+  vector plus an index vector. The index vector is DELTA encoded, so RLE
+  can reuse the same transposed, dependency-breaking decode machinery.
+- FOR and DICT can often remain as compact vectors rather than eagerly
+  expanding to full-width SQL values. This matches modern vector engines
+  that pass compressed vectors through the pipeline.
+- Fusing bit-unpacking with FOR, DELTA, RLE, or DICT decoding avoids an
+  intermediate store/load pair. The paper reports that fusion improves
+  decompression speed when decoding would otherwise become store-bound.
+- Microbenchmarks run on Intel, AMD, Apple, and AWS ARM CPUs. The paper
+  reports very high bit-unpacking and DELTA throughput, with performance
+  depending on bit width and hardware execution capability rather than
+  column values.
+- In a Tectorwise `SUM` scan over a RAM-resident 10 GB integer column,
+  FastLanes-compressed scans can beat uncompressed array scans because
+  reduced memory bandwidth dominates the cheap decode cost.
+
+**GPU DB mapping:** The first P8 layout currently uses CPU-owned MVCC
+truth plus generated GPU column-group snapshots. FastLanes suggests the
+generated snapshot should record more than "int4 dense buffer" versus
+"text offsets." It should also record the encoding family, bit width,
+vector order, decoded lane width, and whether a CPU or GPU route can
+consume the compact representation directly. A retained `COUNT`,
+`SUM`, filter, or equality probe may not need full-width decompression
+if the operator supports FOR, DICT, DELTA, or RLE-style vectors.
+
+The `FLMM1024` abstraction is also a useful compatibility layer for a
+CPU/GPU engine. GPU DB can initially implement CPU scalar/auto-vectorized
+decoders and later add CUDA kernels without changing the on-disk or
+resident segment contract. That is attractive for the hardware waiting
+period: the engine can benchmark encoded resident segments, route costs,
+and fallback semantics on CPU now, then map the same vector layout to GPU
+kernels when device memory and throughput are available.
+
+The Unified Transposed Layout is a reminder that row identity and result
+scattering need to be explicit. Reordering within a 1024-value vector is
+fine for many scans, but retained lookups, selection vectors, MVCC row
+ordinals, and response ordering must preserve SQL-visible tuple identity.
+For GPU DB, any compressed resident vector should carry a row-id or
+selection mapping when the route can return individual rows rather than
+only aggregate results.
+
+Compression should feed the tiering model. FastLanes-like segments may
+raise effective GPU-memory and host-memory capacity while reducing NVMe
+and PCIe traffic, but only if decode and operator fusion stay cheaper
+than extra route complexity. The planner should compare uncompressed GPU
+resident arrays, compressed GPU resident vectors, CPU compressed vectors,
+and cold transfer routes using transfer bytes, decode cost, expected
+operator support, and fallback risk.
+
+**Risks and mismatches:** FastLanes is focused on integer lightweight
+compression in analytical vectorized execution, not on MVCC tuple
+visibility, text-heavy SQL, transaction updates, WAL replay, DDL, or
+point-index maintenance. Its tuple reordering is local to 1024-value
+vectors and usually safe for relational scans, but GPU DB must still
+preserve row identity, pgwire response order, stable portals, and
+snapshot visibility. The paper states that the layout may map well to
+GPUs, but it does not evaluate a complete GPU implementation here. Its
+end-to-end experiment is a narrow `SUM` scan, so the transferable claim
+is the physical-layout mechanism and bandwidth tradeoff, not a blanket
+promise that compressed execution wins for all predicates or updates.
+
+**Benchmark candidates:**
+
+- Add a CPU-only compressed resident segment prototype for one `int4`
+  column: FastLanes-like bit-packed vectors plus metadata for bit width,
+  vector order, row count, source visibility boundary, and checksum.
+  Gate: retained scans produce the same SQL result as dense CPU/MVCC
+  state under the same snapshot.
+- Compare dense resident `int4` arrays against compressed vectors for
+  `COUNT`, `SUM`, min/max, equality filter, and range filter. Metrics:
+  resident bytes, decode cycles/value, route latency, transfer bytes,
+  branch misses where available, and p99 under mixed retained reads.
+- Test operator-on-compressed-vector routes before full decompression:
+  FOR base plus narrow codes, DICT codes plus dictionary, and RLE-style
+  run values plus indexes. Failure condition: full decompression plus
+  ordinary operator execution is faster or simpler for the target mix.
+- Prototype row-id/selection-vector scattering for transposed 1024-value
+  chunks. Gate: retained point lookups and filtered scans return rows in
+  pgwire-visible order without corrupting MVCC row identity.
+- Add planner cost fields for compressed routes: `encoded_bytes`,
+  `decoded_lane_width`, `decode_cycles_per_value`, `operator_support`,
+  `selection_vector_required`, `gpu_kernel_available`, and
+  `cpu_fallback_decode_cost`.
+- Evaluate compression as a tier-placement multiplier: hot uncompressed
+  GPU vectors versus compressed GPU vectors versus compressed host
+  vectors with transfer. Gate: compressed residency must improve either
+  effective capacity or p99 latency without increasing stale/fallback
+  outcomes.
+
+### 2026-06-04 - Cross-paper synthesis: write batches, snapshots, and compressed routes all need explicit physical intent
+
+**Papers synthesized:** Epic deterministic MVCC planning; CCBench
+concurrency-control factor analysis; FastLanes compressed column layout.
+
+**Converging design tracks:** These papers all push against opaque hot
+paths. Epic says a high-throughput write batch should know its record ids,
+read slots, write slots, dependencies, and publication boundary before
+execution. CCBench says concurrency-control results are meaningless unless
+the system exposes contention shape, cache-line effects, wait policy, and
+version lifetime. FastLanes says physical encoding and vector order are not
+storage trivia; they determine whether memory bandwidth, decode cost, and
+operator fusion make a route viable.
+
+The shared design track is an execution descriptor that carries physical
+intent. For GPU DB, a route descriptor should not only say "read table T" or
+"write key K." It should name visibility boundary, row/version locations
+when known, scratchpad or published-generation state, physical encoding,
+decoded lane width, row-order/scatter requirements, retry legality, and
+admission class. That descriptor can feed the mutation owner, retained read
+workers, GPU execution workers, cache manager, and planner without each
+layer reconstructing partial truth.
+
+**Category gaps:** The journal now has strong recent coverage for MVCC,
+deterministic OLTP, runtime scheduling, and GPU/compressed execution. The
+next useful gap is still route optimization and admission under uncertainty:
+when to choose compressed versus dense residency, deterministic batch versus
+owner serialization, and wait versus reject under contention. A runtime or
+optimizer paper should be preferred next unless the queue has a clearly
+superior modern MVCC/cache-coherence candidate.
+
+**Benchmark priorities:**
+
+- Extend the route descriptor prototype with physical layout fields:
+  encoding family, decoded lane width, vector order, row-id mapping, and
+  operator-on-compressed support.
+- Build a no-GPU benchmark matrix that crosses contention and layout:
+  owner-serialized writes, deterministic epoch planning, dense retained
+  reads, compressed retained reads, and one long snapshot.
+- Require every route benchmark to report correctness outcomes together
+  with physical counters: version count, resident bytes, decode cost,
+  transfer bytes, queue wait, retry/fallback count, and publication lag.
+- Treat deliberate delay as a first-class knob. Compare micro-batching for
+  writes and compressed reads with explicit p50/p99 latency budgets instead
+  of optimizing throughput alone.

@@ -387,7 +387,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`
   Why: program-analysis and contention-aware execution ideas that complement
   MV3C's dependency-annotated transaction repair path.
-- `queued` — **The FastLanes Compression Layout: Decoding >100 Billion
+- `reviewed` — **The FastLanes Compression Layout: Decoding >100 Billion
   Integers per Second with Scalar Code**, Afroozeh and Boncz, PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf`
   DOI: `https://doi.org/10.14778/3598581.3598587`
@@ -2454,3 +2454,21 @@ Append new candidates here as each paper is processed.
   Why: CCBench points to non-visible writes as a version-lifetime direction;
   NWR is relevant to blind-write and stale-version elision without weakening
   WAL-before-visibility or SQL-visible conflict behavior.
+- `queued` — **Velox: Meta's Unified Execution Engine**,
+  Pedreira et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p3372-pedreira.pdf`
+  Why: FastLanes explicitly targets in-flight compressed vectors used by
+  engines such as Velox; useful for comparing vector representation,
+  operator reuse, and CPU/GPU route compatibility for compressed execution.
+- `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage Using
+  Both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882925`
+  Why: FastLanes cites it as compressed execution context; useful for deciding
+  whether GPU DB should keep one compressed storage representation that serves
+  OLTP lookups, retained scans, and compiled/vectorized operators.
+- `queued` — **ByteSlice: Pushing the Envelope of Main Memory Data Processing
+  with a New Storage Layout**, Feng et al., SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2747642`
+  Why: FastLanes contrasts decompression-first layouts with scan-first
+  bit/byte-sliced layouts; useful for resident predicate scans and point
+  lookups when full materialization is unnecessary.
