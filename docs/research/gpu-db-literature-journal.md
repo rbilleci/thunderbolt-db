@@ -44038,3 +44038,190 @@ format is designed.
   pollution, and write-combining effects separately from logical WAL cost.
   Until such hardware is present, model this as an explicit latency/bandwidth
   parameter rather than assuming NVMe behavior.
+
+### 2026-06-04 - TOPSI makes fresh local snapshots converge to scalar global history
+
+**Citation:** Nuno Faria and Jose Pereira. "Totally-Ordered Prefix Parallel
+Snapshot Isolation." PaPoC@EuroSys 2021. doi:10.1145/3447865.3457966.
+Retrieved 2026-06-04 from
+`https://repositorio.inesctec.pt/server/api/core/bitstreams/67827bf5-65e9-490a-b1d5-a4b976a732f4/content`.
+
+**Category:** MVCC / snapshot / visibility; hybrid HTAP; disaggregated
+storage.
+
+**Relevance tags:** parallel snapshot isolation; snapshot freshness; local
+cache visibility; scalar timestamps; disaggregated execution/storage; version
+certification; stable-prefix convergence; long-distance update propagation.
+
+**Core idea:** TOPSI targets distributed systems that want Snapshot
+Isolation-like usability without forcing every site to wait for remote update
+propagation before starting fresh local transactions. Ordinary Generalized
+Snapshot Isolation can start from stale snapshots, which avoids waiting but
+creates false conflicts when the same site repeatedly updates local data.
+Prefix-Constant Snapshot Isolation avoids those false conflicts by waiting for
+local predecessors to become stable, but the wait can be dominated by unrelated
+remote updates that appear earlier in the global total order.
+
+TOPSI's compromise is a restricted Parallel Snapshot Isolation model where each
+site may temporarily order its own recently certified local transactions ahead
+of not-yet-stable remote transactions, while the stable prefix eventually
+converges to one common global total order. The important storage property is
+that stable versions can still be represented with a single scalar timestamp in
+a shared multiversion store, avoiding Walter-style vector clocks and static
+site-owned partitions.
+
+**Concrete mechanisms:**
+
+- The system model has sites with local transactional middleware and cache, a
+  logically shared transactional oracle (TxO), and a shared multiversion
+  key-value store (KVS).
+- The TxO totally orders and certifies committed transactions. It replies
+  synchronously to the originating site, then asynchronously flushes updates to
+  the KVS and notifies sites when updates are stable and locally visible.
+- Each KVS version is labeled by a scalar global timestamp. Reads ask for the
+  latest value up to a timestamp; writes specify key, value, and timestamp.
+- Each site tracks two clocks: `global_t`, advanced when the TxO reports a new
+  stable transaction, and `local_t`, advanced when a local transaction commits
+  or when a remote transaction becomes stable.
+- Transaction start and commit timestamps are pairs `(local_t, global_t)`.
+  A local commit receives a new local component and the global timestamp
+  assigned by the TxO.
+- A transaction first reads its private writes, then the site shared cache, then
+  the KVS. A cached version is readable if its local component is not in the
+  transaction's local future and its global component is not too old for the
+  transaction's global snapshot.
+- The second cache-read condition prevents a long-lived cached local value from
+  hiding a newer stable KVS value after remote propagation has caught up.
+- On commit, the site submits each written item with the relevant global
+  version timestamp. For values read from the local cache, the cache supplies
+  that global timestamp; otherwise the start snapshot's global timestamp is
+  used, avoiding an extra KVS round trip.
+- TxO certification remains close to SI: abort if a written item has a newer
+  committed global version than the timestamp supplied for that item; otherwise
+  assign a new global timestamp, make the write set durable, and return success.
+- Site cache entries can be discarded after their global timestamp is stable
+  and no active local transaction still needs the older global snapshot. The
+  KVS needs stable-version GC based on the minimum global timestamp of active
+  transactions across the system.
+- The proof-of-concept uses C++ middleware and TxO with PostgreSQL 12 as the
+  database engine. The paper evaluates TOPSI, GSI, PCSI, and SI on TPC-C with
+  32 warehouses on Google Cloud instances.
+- With one site, the isolation variants behave similarly because there is no
+  remote update delay. With four sites and locality-aware warehouse assignment,
+  TOPSI reports better scaling: SI/PCSI lose throughput to waiting, while GSI
+  loses useful throughput to high abort rates.
+
+**GPU DB mapping:** TOPSI is useful even though GPU DB is not currently a
+geo-distributed shared-KVS system. It gives a precise shape for a problem the
+engine will face locally: a request domain may have fresh, locally certified
+state that is not yet reflected in a globally stable GPU-resident or cold-tier
+snapshot. For example, a mutation owner may have committed writes visible to
+short CPU transactions, while a residency owner, GPU worker, or cold-tier
+snapshot still waits for refresh, compaction, or publication.
+
+The transferable idea is to distinguish a fast local visibility frontier from a
+stable global publication frontier, then require routes to prove which frontier
+they use. A retained GPU read should not be described only by table generation.
+Its route certificate should identify the stable global boundary represented by
+the resident buffers, any local/cache boundary being merged, and whether the
+request is allowed to observe local-but-not-yet-resident changes.
+
+The paired timestamp structure maps to owner domains in
+`11-high-throughput-query-runtime.md`. A partition or mutation owner can expose
+an owner-local freshness counter for recently committed work, while residency
+and cold-tier publication expose a stable scalar boundary. Reads that stay in
+the same owner-local lane can be fresh without waiting for refresh, but reads
+routed to GPU snapshots must either merge a local delta cache or use the older
+stable boundary honestly.
+
+For P8, TOPSI suggests that resident snapshot metadata should not collapse all
+freshness into one generation number. A resident segment may be globally stable
+up to WAL/transaction boundary `G`, while a hot owner cache has local writes up
+to `L` with global commit identifiers assigned but not yet reflected in the
+segment. Point lookups and small aggregates could choose among stable-only GPU
+execution, CPU/local-delta merge, or wait-for-refresh based on this certificate.
+
+The cache GC rule is also relevant to long retained snapshots. Local deltas,
+deleted-key side structures, and refresh-pending versions can be dropped only
+after they are both represented in the stable publication prefix and no active
+request still uses a start boundary that needs the transient ordering.
+
+**Risks and mismatches:** TOPSI relaxes ordinary SI into a restricted PSI
+model. That may be acceptable for geo-distributed applications that already
+accept PSI, but GPU DB must be explicit before exposing any route that changes
+SQL isolation semantics. The immediate use should be internal route freshness
+and cache-publication accounting, not weakening externally promised isolation.
+
+The paper assumes a TxO that totally orders and certifies writes, plus a shared
+multiversion KVS. GPU DB's durable authority is WAL/checkpoint/archive replay
+into CPU state, while GPU HBM is volatile acceleration state. The TxO/KVS split
+therefore maps only by analogy to mutation-owner certification and resident
+publication.
+
+The implementation is a proof of concept, not a production DBMS. The evaluation
+uses PostgreSQL 12 through middleware on small cloud VMs, three-minute runs, and
+four sites at most. The figures support the mechanism's direction under update
+propagation delay and locality, but they do not provide absolute throughput
+targets for GPU DB.
+
+Finally, paired timestamps and local caches add visibility complexity. If a
+route merges stable GPU buffers with owner-local deltas, it must prevent cached
+stale values from hiding newer stable versions, exactly the bug TOPSI's second
+cache-read condition avoids.
+
+**Benchmark candidates:**
+
+- Add a dual-frontier visibility simulator: stable resident boundary `G` plus
+  owner-local committed boundary `L`. Compare stable-only reads, local-delta
+  merged reads, and wait-for-refresh reads under repeated same-key updates.
+  Proof gate: no route observes a value outside its declared frontier.
+- Build a retained point-lookup benchmark with locality: one partition receives
+  repeated updates and reads while resident GPU refresh lags by controlled
+  milliseconds. Measure abort/fallback rate, p50/p99 latency, and stale-read
+  exposure for CPU-only, GPU-stable-only, and GPU-plus-delta routes.
+- Extend route certificates with two freshness fields: source durable boundary
+  and local/transient merge boundary. Failure condition: any retained or GPU
+  route can return a row without identifying which freshness boundary made it
+  visible.
+- Add a cache-GC test for local deltas and deleted-key side structures. Hold an
+  older retained read open while refresh catches up, then verify that GC waits
+  until both stable-prefix publication and active-snapshot retirement permit
+  removal.
+- Test stale-cache overshadowing explicitly: keep an older local cached version,
+  publish a newer stable version from another owner, and require the read path
+  to select the newer stable version whenever its global boundary allows it.
+- For future distributed or replica-backed durability, compare scalar global
+  timestamp certificates with vector or per-replica certificates. The pass
+  condition is that storage, GPU resident segments, and WAL replay can answer
+  visibility with bounded metadata.
+
+### 2026-06-04 - Cross-paper synthesis: freshness is now a route-certificate dimension
+
+The last three papers tighten one design track. Modern NVMe work says cold-tier
+access is a hot-path scheduling problem; write-behind logging says durability
+can be represented as clean boundaries plus visibility gaps; TOPSI says local
+freshness can safely outrun stable publication only when the route can prove
+how transient local order converges back to a scalar global prefix.
+
+The converging design is a route certificate with at least four clocks or
+classes: durable WAL/recovery boundary, resident GPU or cold-tier publication
+boundary, owner-local committed boundary, and unresolved gap or refresh-pending
+state. A route should be admitted only when it can state which boundaries it
+uses, whether it merges local deltas, and when the transient metadata can be
+garbage collected.
+
+**Category gaps:** Recent work is strong on storage/tiering, write durability,
+and visibility. The next useful non-analytics papers should continue around
+transaction scheduling, snapshot GC, high-concurrency request admission, or
+optimizer/runtime selection under concurrent pressure. GPU analytics follow-ups
+can wait unless they directly test route certificates or multi-tier placement.
+
+**Benchmark priorities:**
+
+- Implement a route-certificate fixture that records durable boundary,
+  resident boundary, local merge boundary, queue/tier class, and gap state.
+- Run a controlled refresh-lag benchmark for hot local writes plus retained GPU
+  reads, proving when CPU fallback, GPU stable-only execution, or GPU-plus-delta
+  merge is correct.
+- Add crash/restart assertions that any published resident generation either
+  belongs to a clean durable prefix or is rejected before serving new reads.

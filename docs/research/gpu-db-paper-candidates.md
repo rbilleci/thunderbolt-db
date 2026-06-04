@@ -1127,7 +1127,7 @@ Append new candidates here as each paper is processed.
   Why: TiQuE cites this as an earlier layered-isolation direction for
   polystores; useful for future multi-engine GPU DB routes where transactional
   metadata may span CPU, GPU-resident, and cold-tier execution engines.
-- `queued` — **Totally-Ordered Prefix Parallel Snapshot Isolation**, Faria and
+- `reviewed` — **Totally-Ordered Prefix Parallel Snapshot Isolation**, Faria and
   Pereira, PaPoC@EuroSys 2021.
   DOI: `https://doi.org/10.1145/3447865.3457966`
   PDF:
@@ -1136,6 +1136,18 @@ Append new candidates here as each paper is processed.
   Isolation model that orders a prefix of history; useful for comparing
   low-wait distributed snapshot freshness against GPU DB's snapshot generation
   and route-validity rules.
+- `queued` — **On Reading Fresher Snapshots in Parallel Snapshot Isolation**,
+  Javidi Kishi and Palmieri, ICDCS 2020.
+  URL: `https://doi.org/10.1109/ICDCS47774.2020.00127`
+  Why: cited by TOPSI as a PSI freshness direction; useful for comparing
+  snapshot freshness and abort-rate tradeoffs against scalar-prefix visibility
+  certificates.
+- `queued` — **Amazon Aurora: Design Considerations for High Throughput
+  Cloud-Native Relational Databases**, Verbitski et al., SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3056101`
+  Why: TOPSI names Aurora as a disaggregated-storage target; useful for
+  comparing GPU DB's WAL/storage-publication boundaries with a log-structured
+  cloud relational storage service.
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
