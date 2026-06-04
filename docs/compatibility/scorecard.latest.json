@@ -3,8 +3,8 @@
     "durability.invariants": {
       "failed": 0,
       "ignored": 0,
-      "passed": 138,
-      "total": 138
+      "passed": 133,
+      "total": 133
     },
     "execution.gpu_routing_and_batching": {
       "failed": 0,
@@ -15,14 +15,14 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 138,
-      "total": 138
+      "passed": 76,
+      "total": 76
     },
     "protocol.error_paths": {
       "failed": 0,
       "ignored": 0,
-      "passed": 105,
-      "total": 105
+      "passed": 95,
+      "total": 95
     },
     "protocol.extended_query": {
       "failed": 0,
@@ -39,8 +39,8 @@
     "replication.role_and_log": {
       "failed": 0,
       "ignored": 0,
-      "passed": 231,
-      "total": 231
+      "passed": 178,
+      "total": 178
     },
     "sql.catalog_schema_types": {
       "failed": 0,
@@ -53,12 +53,6 @@
       "ignored": 0,
       "passed": 23,
       "total": 23
-    },
-    "sql.parser_features": {
-      "failed": 0,
-      "ignored": 0,
-      "passed": 66,
-      "total": 66
     },
     "sql.relational_foundation": {
       "failed": 0,
@@ -81,8 +75,8 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 194,
-      "total": 194
+      "passed": 230,
+      "total": 230
     }
   },
   "top_failing_categories": [],
@@ -105,7 +99,6 @@
       "replication.role_and_log": 0,
       "sql.catalog_schema_types": 0,
       "sql.gpu_bridge": 0,
-      "sql.parser_features": 0,
       "sql.relational_foundation": 0,
       "sql.transaction_flows": 0,
       "storage.indexing": 0,
