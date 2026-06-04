@@ -1086,7 +1086,7 @@ Append new candidates here as each paper is processed.
   Why: HATtrick classifies isolated/hybrid HTAP designs and evaluates TiDB-style
   split engines; F1 Lightning gives a production loose-coupling design for
   fresh analytical copies, CDC, compaction, and federated query integration.
-- `queued` — **OLxPBench: Real-time, Semantically Consistent, and
+- `reviewed` — **OLxPBench: Real-time, Semantically Consistent, and
   Domain-specific are Essential in Benchmarking, Designing, and Implementing
   HTAP Systems**, arXiv 2022.
   URL: `https://arxiv.org/abs/2203.16095`
@@ -3281,6 +3281,21 @@ Append new candidates here as each paper is processed.
   Why: Stage compares against Redshift's prior workload-manager predictor;
   useful for understanding the production queue, priority, concurrency-scaling,
   and resource-control hooks that a GPU DB route predictor would influence.
+- `queued` — **Adaptive HTAP through Elastic Resource Scheduling**, Raza,
+  Chrysogelos, Anadiotis, and Ailamaki, SIGMOD 2020.
+  URL: `https://arxiv.org/abs/2004.05437`
+  DOI: `https://doi.org/10.1145/3318464.3389783`
+  Why: OLxPBench cites elastic HTAP scheduling as a related design point;
+  useful for comparing static resident route allocation against runtime
+  resource exchange among OLTP, OLAP, and refresh/freshness work.
+- `queued` — **HTAPBench: Hybrid Transactional and Analytical Processing
+  Benchmark**, Coelho et al., ICPE 2017.
+  URL: `https://doi.org/10.1145/3030207.3030228`
+  PDF: `https://rmpvilaca.github.io/assets/pdf/CPVPO17.pdf`
+  Why: OLxPBench explicitly contrasts against HTAPBench's benchmark model;
+  useful historical-but-eligible baseline for deciding which GPU DB benchmark
+  gates must include hybrid transactions, freshness, and semantic schema
+  overlap instead of only concurrent OLTP plus OLAP streams.
 - `queued` — **Deferred Runtime Pipelining for Contentious Multicore Software
   Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
   URL: `https://doi.org/10.1145/3302424.3303966`
