@@ -531,7 +531,7 @@ Append new candidates here as each paper is processed.
   Why: FileScale contrasts Tectonic's sharded metadata/key-value approach with
   cross-partition transaction support; useful for comparing exascale storage
   metadata efficiency, placement, and bounded consistency tradeoffs.
-- `queued` — **CalvinFS: Consistent WAN Replication and Scalable Metadata
+- `reviewed` — **CalvinFS: Consistent WAN Replication and Scalable Metadata
   Management for Distributed File Systems**, Thomson and Abadi, FAST 2015.
   URL: `https://www.usenix.org/conference/fast15/technical-sessions/presentation/thomson`
   Why: FileScale cites CalvinFS as the deterministic-transaction metadata

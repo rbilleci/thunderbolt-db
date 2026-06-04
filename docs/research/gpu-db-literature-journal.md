@@ -34631,3 +34631,177 @@ generations, or non-NVIDIA accelerators.
 - Add planner telemetry for `resident_index_kind`, `bucket_size`,
   `expected_hit_rate`, `range_width`, `index_bytes`, `payload_bytes`,
   `batch_size`, `rt_core_required`, and `fallback_reason`.
+
+### 2026-06-04 - CalvinFS makes namespace metadata a deterministic transaction workload
+
+**Citation:** Alexander Thomson and Daniel J. Abadi. "CalvinFS: Consistent WAN
+Replication and Scalable Metadata Management for Distributed File Systems."
+FAST 2015. Retrieved 2026-06-04 from the USENIX publication page and PDF,
+`https://www.usenix.org/conference/fast15/technical-sessions/presentation/thomson`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale; multi-tier cache / data placement.
+
+**Relevance tags:** deterministic transactions; metadata scaling; ordered
+command log; snapshot reads; namespace cache; distributed transaction routing;
+WAN replication; immutable blocks; route-cache invalidation.
+
+**Core idea:** CalvinFS treats file-system metadata as a shared-nothing,
+replicated database workload instead of a single-master metadata service. File
+and directory metadata are hash-partitioned across metadata shards, operations
+that touch multiple metadata records become distributed transactions, and a
+Calvin-style total order lets replicas execute the same requests
+deterministically without a distributed commit protocol after the request is
+durably ordered.
+
+The useful transfer is not the file system API. It is the split between a
+strongly ordered mutation lane and cheaper read modes. CalvinFS accepts slow
+linearizable metadata updates when they require WAN ordering, but keeps low
+latency read paths by serving recent local snapshots or caller-specified
+snapshot versions. That shape maps well to a GPU DB where catalog, residency,
+cold-tier namespace, and route-cache mutations need strong ordering, while most
+retained reads should avoid the mutation owner when a compatible snapshot is
+already published.
+
+The paper reports metadata-focused experiments on EC2 across Oregon, Virginia,
+and Ireland. It claims linear read scalability into millions of reads per
+second, hundreds of thousands of updates per second, approximately 40,000
+appends per second on a 300-machine deployment, 3 billion files in 1.3 TB of
+metadata memory, and availability through a datacenter failure with read
+latency mostly stable while update latency roughly doubles because the WAN
+quorum changes.
+
+**Concrete mechanisms:**
+
+- Store file contents as immutable, variable-size blocks in a non-transactional
+  block store. Metadata records map logical byte ranges to immutable block IDs
+  and offsets.
+- Keep metadata in a partitioned multiversion key-value store. Keys are
+  absolute paths; values store entry type, permissions, ancestor permissions,
+  and either directory children or file block mappings.
+- Hash metadata by full path for load balance, but keep a directory's immediate
+  children in that directory metadata entry so listing a directory can read one
+  shard.
+- Convert metadata updates to Calvin transactions. Reads, resize, and writes
+  touch one metadata entry; create and delete touch the new/deleted entry plus
+  the parent directory; recursive permission changes may touch many entries.
+- Append requests through log front-ends that batch transactions into a block
+  store, then append batch IDs through a Paxos-replicated metalog. Metadata
+  shards sort arriving requests by metalog order before execution.
+- Use deterministic locking: a transaction requests all known local locks
+  atomically in log order. Each participating shard performs local reads,
+  exchanges needed remote read results, executes deterministically, and releases
+  locks.
+- Avoid a distributed commit protocol for metadata transactions because the
+  durable request log and deterministic execution let failed nodes recover by
+  replaying the same ordered requests.
+- For recursive operations whose read/write set is not known upfront, run an
+  optimistic Analyze phase without isolation to discover affected records, then
+  Run with that annotation. If the set grows, abort deterministically and
+  restart with the enlarged set.
+- Expose three read modes: fully linearizable reads through the same ordering
+  path as updates, very recent snapshot reads with bounded staleness, and
+  caller-specified snapshot reads that may block or dig through older metadata
+  versions.
+- Cache block-bucket placement maps at every node and refresh on misses when a
+  global configuration change makes a cached map stale.
+- Compact small immutable file blocks asynchronously by writing larger blocks,
+  then updating metadata only if the logical file contents did not change while
+  compaction ran.
+
+**GPU DB mapping:** CalvinFS is a good model for metadata-like GPU DB state:
+catalog entries, resident-generation descriptors, cold-tier segment maps,
+route-cache entries, placement maps, and snapshot frontiers. Those objects
+should be partitionable and cacheable, but their mutations still need an
+ordered authority. A deterministic owner lane or partitioned command log could
+make catalog/residency transitions replayable without putting every read
+through a global owner.
+
+The read-mode split is directly useful. A SQL write, DDL change, residency
+publish, or tier-placement mutation should go through the strong ordered lane.
+A retained read can use a recent immutable snapshot if the requested visibility
+boundary permits it. A caller that requires read-your-write or exact
+linearizability can either wait for the relevant frontier or route through the
+owner. That gives the runtime a vocabulary richer than "GPU cache hit" versus
+"fallback": it can distinguish `linearizable_owner_read`,
+`recent_snapshot_read`, and `explicit_snapshot_read`.
+
+For session concurrency, CalvinFS reinforces that metadata lookups should not
+become a hidden per-session bottleneck. One million logical sessions should
+share cached placement and route maps with generation checks, not each hold
+large per-session copies. Cache misses or stale placement hits should refresh
+the map and retry with explicit telemetry, similar to CalvinFS bucket-map
+refresh.
+
+For tiering, immutable blocks resemble cold immutable segments. GPU DB can
+write durable WAL and checkpoint/archive segments as truth, publish immutable
+CPU/GPU resident descriptors for reads, and run background compaction or
+segment rewrite only if the source generation remains unchanged. The important
+rule is that the metadata update, not the rewritten block itself, is the
+visibility event.
+
+**Risks and mismatches:** CalvinFS is optimized for single-file metadata
+operations and tolerates high WAN update latency; GPU DB cannot afford WAN-like
+latency on local OLTP writes. Its hash-by-full-path layout gives good balance
+but does not preserve range locality, which may be wrong for table partitions,
+LSM ranges, or key-order scans. The paper relies on known read/write sets for
+deterministic locking except when OLLP retries, so arbitrary SQL transactions
+would need templates, static analysis, or a fallback path.
+
+The block store is explicitly non-transactional and file contents are outside
+the metadata transaction except through immutable block references. GPU DB
+cannot apply that literally to row writes: WAL-before-visibility and MVCC
+state still need database recovery semantics. Also, the evaluation is a
+file-system metadata stress test on 2015 EC2 instances, not a low-latency GPU
+database benchmark.
+
+**Benchmark candidates:**
+
+- Add a route-metadata cache benchmark: cache table/resident-generation/tier
+  placement maps at network or read workers, invalidate by generation, and
+  measure owner-queue avoidance versus stale-map retry cost.
+- Prototype three read modes in telemetry for retained reads:
+  linearizable/owner, recent snapshot, and explicit snapshot frontier. Gate:
+  every read exposes why it did or did not bypass the mutation owner.
+- Build a deterministic metadata-mutation log for catalog/residency/tier
+  descriptors only. Proof gate: crash/replay reconstructs the same route
+  metadata and invalidation generations before GPU cache warmup.
+- Test snapshot-frontier waits separately from GPU queue waits. A read that is
+  blocked on visibility should not be reported as GPU saturation.
+- Add a cold-segment compaction proof: rewrite immutable cold segments in the
+  background, publish a new descriptor only if the source generation is still
+  current, and retire old descriptors by retained snapshot epoch.
+- Compare hash partitioning versus range/table partitioning for route metadata
+  under workloads with hot tables, hot tenants, and many small partitions.
+
+### 2026-06-04 - Cross-paper synthesis: route metadata should be cached, ordered, and explainable
+
+**Papers covered:** GPredictor, cgRX, and CalvinFS.
+
+**Converging design tracks:** The last three papers point at the same runtime
+contract from different angles. GPredictor says active work needs explicit
+interference edges. cgRX says a resident route should expose its memory
+footprint, batch shape, hit-rate assumptions, and hardware dependency. CalvinFS
+says metadata updates should be strongly ordered while reads choose a cheaper
+snapshot mode when their freshness contract allows it.
+
+Together they argue for a typed route descriptor as the central object between
+planner, runtime, and cache manager. A descriptor should carry immutable
+snapshot identity, route metadata generation, resident bytes, scratch/pinned
+budget, expected batch size, hit-rate/range assumptions, active interference
+edges, and required freshness mode. The runtime can then cache descriptors at
+read workers, batch compatible work, and reject or fallback with a specific
+reason instead of bouncing everything through an owner thread.
+
+**Category gaps:** Recent work is still heavy on GPU route execution and
+optimizer/admission mechanics. The next review should prefer OLTP write-path,
+MVCC/version storage, or transaction-runtime papers unless a newly discovered
+tiering paper is unusually strong.
+
+**Benchmark priorities:** First, instrument route descriptors with isolated
+cost plus live-interference cost. Second, split stale-generation, visibility,
+GPU-memory, pinned-buffer, and response-ring rejection reasons. Third, add a
+metadata-cache microbenchmark that proves route lookup does not scale with
+logical session count. Fourth, keep GPU indexes like cgRX behind explicit
+route predicates so miss-heavy or update-heavy workloads can choose another
+path.
