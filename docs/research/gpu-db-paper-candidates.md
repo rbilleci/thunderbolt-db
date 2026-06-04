@@ -3519,12 +3519,26 @@ Append new candidates here as each paper is processed.
   Why: modern learned cardinality estimator for dynamic workloads; useful for
   comparing data-update-aware route estimates against simpler DBMS-statistics
   correction and explicit route telemetry.
-- `queued` — **CardOOD: Robust Query-driven Cardinality Estimation under
-  Out-of-Distribution Workloads**, 2024.
+- `reviewed` — **CardOOD: Robust Query-driven Cardinality Estimation under
+  Out-of-Distribution Workloads**, Li, Zhao, Yu, and Wang, arXiv 2024 /
+  VLDB Journal 2026.
   URL: `https://arxiv.org/abs/2412.05864`
+  DOI: `https://doi.org/10.1007/s00778-026-00979-3`
   Why: direct follow-up on out-of-distribution robustness for query-driven
   cardinality estimation; useful for GPU DB when tenant workloads, resident
   cache contents, or mixed CPU/GPU route families drift from training logs.
+- `queued` — **Data-Agnostic Cardinality Learning from Imperfect
+  Workloads**, Wu et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p2519-wu.pdf`
+  Why: modern query-driven cardinality estimator for incomplete and
+  imbalanced join templates; useful follow-up for GPU DB route models when
+  training logs do not cover all tenant query shapes.
+- `queued` — **Updateable Data-Driven Cardinality Estimator with Bounded
+  Q-error**, Li et al., arXiv 2024.
+  URL: `https://arxiv.org/abs/2408.17209`
+  Why: updateable cardinality estimator with bounded-error claims; useful
+  counterpoint to offline query-driven retraining when GPU DB table updates
+  and resident snapshots shift faster than route logs can be relabeled.
 - `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
   Learning**, Zhang et al., AIDB@VLDB 2020.
   URL:
@@ -3701,9 +3715,9 @@ Append new candidates here as each paper is processed.
   Why: follow-up by the Three-Tree first author on larger-than-memory range
   indexing; useful for comparing page-granular tiering with an index design
   that explicitly balances reads, writes, concurrency, and cold storage.
-- `queued` — **Tiered-Indexing: Optimizing Access Methods for Skew**, Zhou,
+- `reviewed` — **Tiered-Indexing: Optimizing Access Methods for Skew**, Zhou,
   Hao, Yu, and Stonebraker, VLDB Journal 2025.
-  URL: `https://doi.org/10.1007/s00778-025-00909-3`
+  URL: `https://doi.org/10.1007/s00778-025-00928-6`
   Code: `https://github.com/zxjcarrot/2-Tree`
   Why: follow-up to Two-Tree/Three-Tree on access-method tiering under skew;
   relevant to GPU DB hot/cold resident index placement and selective

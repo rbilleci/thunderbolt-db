@@ -45106,3 +45106,143 @@ transaction-control candidate. The benchmark priority is now a single
 admission simulator that can compare edge classification, priority,
 runtime-conflict scheduling, and bounded deferment under the same
 workload and latency gates.
+
+### 2026-06-04 - CardOOD treats route-estimator drift as a first-class optimizer risk
+
+**Citation:** Rui Li, Kangfei Zhao, Jeffrey Xu Yu, and Guoren Wang.
+"CardOOD: Robust Query-driven Cardinality Estimation under
+Out-of-Distribution." arXiv:2412.05864, 2024; later published in The
+VLDB Journal 35, article 28, 2026. Retrieved 2026-06-04 from the
+Springer landing page, `https://doi.org/10.1007/s00778-026-00979-3`,
+and the arXiv full text, `https://arxiv.org/abs/2412.05864`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** learned cardinality estimation; out-of-distribution
+workloads; route choice; CPU/GPU fallback; query-template drift; tenant
+drift; robust training; PostgreSQL integration; q-error tails.
+
+**Core idea:** CardOOD focuses on query-driven learned cardinality
+estimators whose training workload no longer matches test queries. That
+is the likely failure mode for a GPU DB route model: tenant workloads,
+query templates, join shapes, resident-cache state, and CPU/GPU tier
+availability will drift after training. CardOOD does not claim one magic
+model; it frames robustness as a training discipline over existing
+query-driven estimators.
+
+The strongest transferable idea is that GPU route selection should
+optimize tail robustness under distribution shift, not only average
+cardinality or latency error on logged queries. A planner that predicts
+resident GPU scan cardinality, CPU index fallback cost, refresh cost, or
+queue delay from stale training logs needs explicit OOD gates and
+conservative fallback when the query shape is outside the model's
+comfort zone.
+
+**Concrete mechanisms:**
+
+- CardOOD targets select-project-join queries with conjunctive
+  predicates and trains query-driven neural estimators from query/cardinality
+  pairs. It evaluates q-error, especially high quantiles, because a few
+  badly wrong cardinalities can dominate plan quality.
+- The framework separates robust training methods into representation
+  learning, data manipulation, and learning-strategy approaches. These
+  are applied to ordinary query-driven estimators rather than replacing
+  the optimizer wholesale.
+- Deep CORAL aligns covariance matrices of intermediate query embeddings
+  across training sub-distributions such as predicate-count groups, join
+  groups, or query-template groups.
+- DANN adds an adversarial group discriminator so the feature extractor
+  learns embeddings that make the training sub-distributions harder to
+  distinguish while preserving regression accuracy.
+- Group DRO maintains weights over training groups and shifts learning
+  pressure toward high-loss groups, approximating a worst-group training
+  objective.
+- Query Mixup augments training by interpolating query encodings and
+  labels, with pair sampling biased toward similar cardinalities. The
+  paper notes that such interpolated encodings may not correspond to
+  semantically valid SQL queries.
+- Query Masking randomly drops predicate features during training so the
+  estimator is less brittle when predicates or templates change.
+- OrderEmb is the paper's cardinality-specific method. It samples
+  contrastive queries by narrowing predicates or removing categorical
+  filter values, then adds an auxiliary loss that preserves the partial
+  order induced by predicate containment in the embedding space.
+- CardOOD evaluates MLP and MSCN-style estimators over forest, IMDB,
+  DSB, and JOB-light workloads. It reports that robust methods usually
+  improve 95th and 99th percentile q-error over plain ERM, while the best
+  method varies by query type and model.
+- In PostgreSQL experiments, the learned estimates are injected into the
+  optimizer. The paper reports end-to-end execution-time improvements up
+  to 5.6% on IMDB, 36.6% on DSB, and 4.6% on JOB-light, but also notes
+  that lower q-error does not always imply faster execution.
+
+**GPU DB mapping:** GPU DB should treat CPU/GPU route estimation as an
+OOD-prone cardinality and latency problem. The route certificate for a
+query should carry not only estimated rows and bytes, but also the
+training-domain features that made the estimate believable: query shape,
+predicate family, relation or partition identity, resident generation
+class, queue-pressure bucket, tenant/workload bucket, and model version.
+
+OrderEmb is the most natural first transfer. Predicate containment gives
+a cheap invariant for route sanity: narrowing a predicate should not
+increase estimated qualifying rows or transfer bytes for the same
+snapshot and resident layout. The engine can test this invariant offline
+against generated query pairs before trusting a learned route model in
+production planning.
+
+Deep CORAL and Group DRO suggest a practical offline retraining policy.
+Instead of one global GPU cost model, train and evaluate across explicit
+groups: resident versus nonresident, fresh versus stale snapshot, small
+lookup versus scan, low versus high queue pressure, tenant A versus
+tenant B, and CPU fallback versus GPU execution. A candidate model should
+be rejected if its worst-group tail error or route-regret exceeds a fixed
+budget, even when its average error improves.
+
+CardOOD also reinforces the current architecture's preference for
+guardrailed learned planning. The model may rank or adjust route choices,
+but it must not bypass deterministic checks for snapshot compatibility,
+catalog generation, resident validity, memory budgets, or overload
+policy. When a query is OOD, the route should degrade to anchored DBMS
+statistics, explicit CPU fallback, or a conservative owner path.
+
+**Risks and mismatches:** CardOOD is about cardinality estimation, not
+GPU kernel scheduling, WAL/MVCC correctness, or multi-tier cache
+management. Its PostgreSQL integration is experimental and uses injected
+estimates; it does not prove a production control loop for learned route
+models. The arXiv PDF has pre-publication ACM placeholder metadata, and
+the 2026 VLDB Journal full text was not open without subscription in this
+run; the accessible mechanism details came from the arXiv version.
+
+The paper's own results warn against over-trusting one metric. Better
+q-error can still produce slower plans, and the best robust method varies
+by workload. Query Mixup may generate invalid query encodings, DANN and
+Group DRO can be harder to train, and OrderEmb adds online contrastive
+sampling overhead during training. For GPU DB, learned estimates must be
+measured by route regret, queue impact, fallback rate, and correctness
+guards, not q-error alone.
+
+**Benchmark candidates:**
+
+- Build an offline route-estimator drift suite. Train on one mix of
+  retained lookups, scans, resident generations, and queue-pressure
+  states; test on shifted tenant, predicate, snapshot, and residency
+  mixes. Measure q-error, route regret, fallback rate, and p99 latency
+  impact.
+- Add monotonicity tests inspired by OrderEmb: for same table, snapshot,
+  and route family, predicate narrowing must not increase estimated rows,
+  transfer bytes, or GPU work. Failure condition: the model violates this
+  invariant without a deterministic guard overriding it.
+- Add route certificate fields for `estimator_model_id`,
+  `training_group`, `ood_score`, `worst_group_error_budget`, and
+  `fallback_if_ood`. Proof gate: OOD status can only make routing more
+  conservative.
+- Compare plain ERM, worst-group weighting, predicate masking, and
+  OrderEmb-style monotonic training on synthetic GPU DB route logs before
+  considering a heavier planner integration.
+- Evaluate learned cardinality improvements by actual route outcome:
+  resident GPU route chosen correctly, CPU fallback avoided correctly,
+  stale or overloaded GPU route rejected correctly, and no change to
+  snapshot visibility semantics.
+- Track query-template and tenant drift in telemetry. A model should be
+  retrained or demoted when live route descriptors move outside the
+  training distribution for a sustained window.
