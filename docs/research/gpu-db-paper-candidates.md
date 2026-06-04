@@ -1992,13 +1992,31 @@ Append new candidates here as each paper is processed.
   NVMe-array exploitation; useful as a contrasting partitioned KV design for
   queue depth, SPDK usage, and limitations around range queries and small
   database payloads. Skipped as a duplicate of the reviewed KVell queue entry.
-- `queued` — **KVell+: Snapshot Isolation without Snapshots**, Lepers et al.,
+- `reviewed` — **KVell+: Snapshot Isolation without Snapshots**, Lepers et al.,
   OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/lepers`
   PDF: `https://www.usenix.org/system/files/osdi20-lepers.pdf`
   Why: direct KVell follow-up that avoids conventional snapshot version
   retention for OLAP-style scans; relevant to long retained GPU reads, MVCC
   space amplification, and cleanup latency.
+- `queued` — **SILK: Preventing Latency Spikes in Log-Structured Merge
+  Key-Value Stores**, Balmau et al., USENIX ATC 2019.
+  URL: `https://www.usenix.org/conference/atc19/presentation/balmau`
+  Why: KVell+ cites SILK as a fast-storage KV related work item; relevant to
+  bounding cleanup, compaction, and cold-tier latency spikes while retained GPU
+  reads and write-heavy traffic share storage devices.
+- `queued` — **BatchDB: Efficient Isolated Execution of Hybrid OLTP+OLAP
+  Workloads for Interactive Applications**, Makreshanski et al., SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3064039`
+  Why: KVell+ contrasts batch/replica-style HTAP isolation with online
+  commutative scans; useful for deciding when GPU DB should isolate analytics
+  through retained snapshots, replicas, or bounded execution batches.
+- `queued` — **X-Engine: An Optimized Storage Engine for Large-scale
+  E-commerce Transaction Processing**, Huang et al., SIGMOD 2019.
+  URL: `https://doi.org/10.1145/3299869.3314041`
+  Why: KVell+ cites X-Engine's production emphasis on storage-space pressure
+  and garbage collection; relevant to WAL/checkpoint/LSM-tier pressure and
+  write-heavy transactional storage under retained read snapshots.
 - `queued` — **Reaping the Performance of Fast NVM Storage with uDepot**,
   Kourtis et al., FAST 2019.
   URL: `https://www.usenix.org/conference/fast19/presentation/kourtis`

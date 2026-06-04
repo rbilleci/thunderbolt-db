@@ -31496,3 +31496,192 @@ model every logical session as a schedulable flow in the hot path.
   starving lower-priority refresh or COPY work. Failure condition: rank-aware
   batching improves p50 while causing unbounded refresh delay or WAL-visible
   mutation backlog.
+
+### 2026-06-04 - KVell+ propagates old scan versions instead of retaining snapshots
+
+**Citation:** Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy
+Zwaenepoel. "KVell+: Snapshot Isolation without Snapshots." OSDI 2020,
+pp. 425-441. Retrieved 2026-06-04 from the USENIX publication page and
+PDF, `https://www.usenix.org/conference/osdi20/presentation/lepers`.
+
+**Category:** MVCC / snapshot / visibility, with hybrid HTAP and
+multi-tier storage implications.
+
+**Relevance tags:** snapshot isolation; OLTP/OLAP coexistence; old-version
+propagation; scan ranges; point ranges; MVCC garbage collection; space
+amplification; NVMe storage; retained read snapshots; commutative
+processing; update/write latency.
+
+**Core idea:** KVell+ attacks a specific but painful MVCC cost: a long
+analytical scan under snapshot isolation forces the store to retain old
+versions for the lifetime of the scan, causing storage growth and
+post-query garbage-collection spikes. The paper observes that many
+analytical queries are mostly commutative one-pass range scans. For those
+queries, the old value needed by the scan can be pushed to the query when a
+concurrent transaction overwrites it, then discarded, instead of being kept
+in the store until the scan finishes.
+
+The resulting model is Online Commutative Processing, or OLCP. An OLCP query
+declares scan ranges and optional point ranges. Scan-range items are
+processed exactly once and may arrive out of order; point-range items use
+ordinary versioning because they may need ordered or repeated point access.
+The paper argues that an OLCP query observes the same snapshot contents it
+would see under conventional SI, but the storage engine does not need to
+retain most scan-range old versions for the full query duration.
+
+**Concrete mechanisms:**
+
+- An OLCP query registers a `map` callback, payload, scan ranges, and point
+  ranges. The callback is invoked exactly once for every scan-range item
+  belonging to the query's start snapshot.
+- Scan ranges trade ordering for storage efficiency: items can be processed
+  out of lexicographic order when an old value is propagated before the scan
+  reaches its key. Point ranges keep conventional SI versioning.
+- On commit, updated old versions are added to a garbage-collection path
+  after the new versions are persisted. GC propagates an old version only to
+  OLCP queries whose snapshot includes it and whose scan has not already
+  passed the key, then deletes it.
+- Correctness relies on one-pass ordered scan progress plus propagation
+  checks. If an item was already scanned, the propagated old version is
+  ignored; if it has not been scanned, the propagated value is mapped and
+  the later scan will skip processing it again.
+- KVell+ shards key ranges across single-threaded workers. Scan requests and
+  propagations for a shard serialize at the worker, avoiding extra data
+  races in the propagation path.
+- To avoid an extra disk read solely for propagation, KVell+ may delay
+  propagation until the storage slot for an old version is later reused. When
+  the block is read for reuse, the old value can be sent to pending OLCP
+  queries.
+- Delayed propagation needs deleted-but-indexed markers. If a newer old
+  version is overwritten before an older one, the newer version's index entry
+  must remain as a tombstoned boundary so a query does not later accept an
+  older version that does not belong to its snapshot.
+- KVell+ implements conventional SI using logical timestamps, private
+  in-memory write buffers before commit, per-key index locks for
+  write-write conflicts, and a commit protocol that persists a commit marker
+  plus updated items rather than a traditional WAL. The paper explicitly does
+  not add a commit log because it would double update IO in their fast-NVMe
+  KV setting.
+- Evaluation uses YCSB-T, TPC-CH, and Nutanix production workloads. The
+  reported headline is little or no OLCP space amplification and negligible
+  propagation overhead; in the YCSB-T single-scan uniform experiment, OLCP
+  finished the scan in 691s while Steam took 1870s and conventional SI ran
+  out of space after growing by about 350GB. In their tail-latency table,
+  max transaction latency was 9ms for OLCP versus seconds for SI/Steam during
+  cleanup.
+
+**GPU DB mapping:** The direct mapping is not to replace retained snapshots
+with arbitrary out-of-order SQL execution. It is to add a narrow route class
+for commutative one-pass retained scans where the planner can prove that
+input order is irrelevant, each qualifying row is consumed once, and the
+result combiner is deterministic. For those routes, an update to a row that
+has not yet been consumed by a long GPU scan could enqueue the row's old
+projected column values to the scan's side queue and then release the
+version or resident generation earlier than ordinary snapshot retention.
+
+This is especially relevant to P8 resident column segments. A long retained
+GPU aggregate currently suggests holding an immutable generation until the
+query completes. KVell+ suggests a more selective policy: keep immutable
+snapshots as the default, but allow OLCP-style propagation for admitted
+aggregates such as `COUNT`, `SUM`, `MIN`, `MAX`, and commutative grouped
+aggregates over stable segment ranges. The mutation owner or partition owner
+would publish old projected values into a query-specific or batch-specific
+propagation ring before making storage space, host-tier chunks, or resident
+generation state reusable.
+
+The scan-range and point-range split maps cleanly to route eligibility.
+Pure scans over resident fragments can be OLCP candidates; lookups, joins
+with repeated probes, ordered results, window functions, non-commutative
+UDFs, and SQL semantics that require stable row order should stay on
+ordinary retained snapshots. Point-range dependencies would still pin
+versions or snapshot handles.
+
+Delayed propagation is a useful tiering idea. For CPU/NVMe tiers, old values
+may be propagated when a slot, chunk, or log fragment is naturally read for
+reuse or compaction, reducing extra IO. For GPU HBM, the analogous mechanism
+is not slot reuse on disk but update batching: the owner can batch old
+projected values into pinned host buffers or device-side delta queues while
+the mutating row is already hot in CPU cache.
+
+**Risks and mismatches:** OLCP only fits commutative one-pass processing. It
+does not preserve ordered scans, repeated reads, arbitrary SQL operators,
+joins that revisit the same item, or user-visible per-row version history.
+The paper's KVell+ implementation is a key-value store, not a full SQL DBMS,
+and its durability design intentionally avoids a conventional WAL, which
+does not transfer to the current GPU DB's WAL-before-visibility rule.
+
+Propagation also moves work onto the write path. Under many concurrent long
+GPU scans, a single update could need to enqueue old values to multiple
+query queues. The paper reports less than 2% time in propagation for its
+tested workloads, but GPU DB must remeasure this with SQL projection width,
+device transfer cost, pinned-buffer pressure, and response ownership. A bad
+OLCP route could reduce MVCC storage pressure while increasing mutation tail
+latency or GPU/host memory pressure.
+
+Finally, out-of-order processing complicates determinism. Floating-point
+aggregates, top-k, order-sensitive functions, and non-associative reductions
+need explicit semantics before they can use OLCP-style execution. Unknown:
+the paper does not provide a full SQL optimizer implementation; it shows how
+queries can be expressed in OLCP and suggests plan-level integration.
+
+**Benchmark candidates:**
+
+- Add an OLCP-eligibility planner gate for a narrow aggregate subset:
+  unordered full/segment scans with `COUNT`, integer `SUM`, `MIN`, `MAX`, and
+  deterministic grouped aggregates. Proof gate: the same visible snapshot
+  result as ordinary retained snapshot execution under concurrent updates.
+- Build a no-GPU propagation simulator with mutation owners, long retained
+  scans, scan progress keys, propagation rings, and point-range pins. Compare
+  ordinary MVCC retention, eager propagation, and delayed propagation on
+  version bytes, owner queue wait, mutation p99, and cleanup time.
+- When GPU hardware is available, benchmark a long resident aggregate while
+  concurrent updates hit unscanned rows. Compare holding the whole resident
+  generation until completion versus projecting old values into a pinned
+  propagation buffer consumed by the aggregate kernel or CPU merge path.
+- Add negative route tests for ordered `ORDER BY`, repeated point lookups,
+  non-commutative UDFs, floating-point non-deterministic reductions, and
+  joins with repeated probes. Failure condition: any of these are admitted to
+  OLCP-style propagation without an explicit deterministic semantics proof.
+- Add telemetry:
+  `olcp_candidate`, `olcp_reject_reason`, `scan_progress_key`,
+  `propagated_old_values`, `propagation_queue_bytes`,
+  `point_range_pinned_versions`, `delayed_propagation_reuse_hits`, and
+  `mutation_propagation_wait_us`.
+- Test crash/replay boundaries. WAL replay must recover CPU truth first, and
+  any in-flight propagated old values must be either reconstructible from WAL
+  and retained versions or treated as volatile query state that cannot make a
+  committed result visible after restart.
+
+### 2026-06-04 - Cross-paper synthesis: retained resources need leases, ranks, and escape hatches
+
+CacheLib, PIFO, and KVell+ converge on one runtime/storage design track:
+retained resources should be explicit objects with admission policy, lifetime,
+and release mechanics. CacheLib gives the object and handle vocabulary. PIFO
+gives enqueue-time ranking and shaping for bounded shared queues. KVell+ adds
+the missing MVCC angle: sometimes the right release mechanism is not holding
+every old version until a retained reader ends, but proving a narrower query
+class can consume the old value early and release storage.
+
+For GPU DB, the track is a retained-resource contract. A resident segment,
+snapshot generation, propagation buffer, response buffer, GPU scratch region,
+or host/NVMe chunk should have a route-visible type, owner, byte budget,
+reader/handle count, invalidation state, scheduling rank, and release rule.
+Most SQL reads will still use immutable retained snapshots. A smaller
+OLCP-style class can use propagation only after deterministic eligibility:
+commutative, one-pass, unordered, no repeated point access except explicitly
+pinned point ranges, and no weakened WAL-before-visibility.
+
+The category gap is now less about generic caching and more about write-path
+semantics under these retained-resource policies. The next high-value papers
+should keep pulling on transaction scheduling, MVCC/index visibility, and
+write admission under contention so the engine can decide which writes
+coalesce, which versions pin, which readers get leases, and which route queues
+must reject work instead of building hidden cleanup debt.
+
+Benchmark priorities should combine resource lifetime with queue policy:
+simulate retained lookups, long aggregates, COPY/update bursts, refresh, and
+large responses while tracking bytes held by handles, invalid-but-held bytes,
+ranked queue wait, propagation queue growth, and WAL-visible mutation delay.
+The pass condition is not only lower memory growth; it is lower memory growth
+without stale reads, mutation-tail spikes, unbounded propagation queues, or
+planner admission of order-sensitive queries into an unordered route.
