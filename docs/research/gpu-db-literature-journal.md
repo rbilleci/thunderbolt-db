@@ -39069,3 +39069,144 @@ calibration band.
   generation, then applying mutations and refreshes. The safe behavior is
   graceful fallback or bounded correction, not repeated admission into a stale
   GPU path.
+
+### 2026-06-04 - Fluid co-processing should offload narrow pruning, not whole queries by default
+
+**Citation:** Tim Gubner, Diego Tome, Harald Lang, and Peter Boncz.
+"Fluid Co-processing: GPU Bloom-filters for CPU Joins." DaMoN 2019.
+doi:10.1145/3329785.3329934. Retrieved 2026-06-04 from
+`https://t1mm3.github.io/assets/papers/damon19.pdf`.
+
+**Category:** GPU execution / analytics; query optimization / planning.
+
+**Relevance tags:** CPU/GPU co-processing; Bloom filters; selective joins;
+early pruning; dynamic morsel scheduling; heterogeneous route fallback;
+transfer-aware admission; stream count; false-positive budget; resident join
+summaries.
+
+**Core idea:** The paper argues for a narrower and more believable GPU database
+acceleration shape than "move the whole operator pipeline to the GPU." Large
+selective joins can benefit when the GPU receives only the probe keys or key
+extracts, evaluates a large Bloom filter, and returns a compact pass/fail
+result so the CPU avoids later join, payload fetch, decompression, or aggregate
+work for tuples that cannot match. This works because the Bloom filter can be
+much smaller than the full hash table, may fit in GPU memory even when the CPU
+hash table is large, and stresses exactly the GPU strengths: random-access HBM
+bandwidth and parallel hash computation.
+
+The architectural contribution is fluid co-processing. A query pipeline is cut
+into fragments, and alternative fragments can coexist: some tuple ranges run a
+CPU-only Bloom-filter-plus-join path, while others run a CPU/GPU path where the
+GPU probes the Bloom filter and CPU workers consume the returned bitmap to do
+the remaining join work. CPU and GPU draw from shared work queues, but with
+different morsel sizes. In the prototype, CPU morsels are 16 Ki tuples and GPU
+morsels are 1 Mi tuples; 2-4 CUDA streams are enough to overlap transfers and
+kernel execution without inflating per-query footprint. Their experiments on a
+10-core i9-7900X and GTX 1080 report raw GPU Bloom lookups up to 6x faster than
+CPU lookups once the filter exceeds CPU cache, and end-to-end selective join
+speedups up to about 2-3x.
+
+**Concrete mechanisms:**
+
+- Early pruning is installed after hash-join build: create a Bloom filter for
+  build-side keys, then probe it as early as possible on the probe side. If
+  non-key columns are stored separately, failing tuple ranges can avoid payload
+  movement, decompression, or downstream operators.
+- The GPU path transfers only keys or key extracts to the device, probes a
+  blocked/sectorized Bloom filter, and transfers a result bitmap back to host
+  memory. The paper includes H2D, kernel, and D2H work in the GPU measurements.
+- GPU Bloom filters use cache-line-sized blocks suited to GPU global-memory
+  behavior. Larger GPU filters and more hash functions can be practical because
+  GPU HBM bandwidth and hash parallelism reduce the penalty that would make
+  those configurations unattractive on CPU.
+- Fluid scheduling separates CPU workers from GPU+CPU workers. GPU+CPU workers
+  schedule asynchronous GPU probes when streams are free, do CPU work while the
+  GPU runs, and place completed probe results into a queue that any worker can
+  consume for post-GPU join work.
+- Device-specific morsel sizes are part of the design, not an implementation
+  accident. Small CPU morsels improve load balance but too-small morsels add
+  scheduling cost; small GPU morsels waste launch/transfer efficiency, while
+  overlarge GPU morsels leave CPU resources idle.
+- Multiple CUDA streams overlap H2D transfer, kernel execution, and D2H
+  transfer. The paper finds one stream underutilizes the GPU, while more than
+  four streams add little runtime benefit and increase memory footprint.
+- The cost model chooses Bloom filter size and hash count based on inner
+  relation cardinality and downstream pipeline cost. Higher downstream cost
+  justifies a more accurate filter because each false positive carries more
+  wasted CPU work.
+- The design naturally falls back: if the GPU is busy, morsels can execute on
+  the CPU-only pipeline instead of waiting behind a saturated accelerator.
+
+**GPU DB mapping:** This maps directly to the P8 route contract. GPU DB should
+not require a full GPU join engine before exploiting the accelerator. A first
+split-route benchmark can maintain resident or build-time join/key summaries on
+GPU, ship only retained-read key vectors, and return a compact eligibility
+bitmap to CPU workers. The CPU remains responsible for MVCC-visible payload
+fetch, final join correctness, and result encoding unless a stronger resident
+snapshot proves the whole route is valid.
+
+For planner route choice, the transferable unit is a typed pruning fragment:
+input key layout, snapshot generation, filter generation, expected selectivity,
+false-positive budget, transfer bytes, stream budget, and CPU fallback fragment.
+This gives learned or deterministic route models a smaller decision than "CPU
+plan versus GPU plan." The planner can ask whether a GPU pre-filter reduces
+bytes and downstream work enough to justify queue wait and transfer pressure.
+
+For high-concurrency runtime, fluid scheduling is a concrete shape for GPU
+rings. Read workers should not block on GPU admission when a semantically valid
+CPU fragment exists. They should enqueue large GPU morsels only when stream,
+pinned-buffer, and resident-filter budgets are available, then keep draining
+CPU work or post-GPU bitmap work. This preserves the owner/snapshot model while
+letting GPU assistance be opportunistic under 1M logical-session pressure.
+
+For MVCC/snapshots, any Bloom filter must be tied to a visibility boundary. A
+filter built from a newer or older generation than the probe snapshot can cause
+wrong pruning if used as a negative proof. GPU DB can use a stale filter only as
+a positive hint that still verifies on CPU, or it must mark the filter as
+snapshot-compatible before allowing early rejection. False positives are safe;
+false negatives are not.
+
+For multi-tier placement, the paper reinforces the value of resident summaries.
+A compact GPU-resident filter for warm or cold data can reduce NVMe reads,
+host decompression, or CPU payload fetches even when the base relation itself
+is not GPU-resident. The tier manager should price the filter separately from
+the payload: keeping a filter in HBM may be worthwhile when the full table is
+far too large.
+
+**Risks and mismatches:** This is an analytical join prototype, not a general
+transactional database. The paper does not address SQL semantics, MVCC,
+updates, WAL, DDL invalidation, long-running snapshots, multi-tenant admission,
+or result correctness beyond the evaluated join pipeline. The Bloom filter is
+safe for early pruning only if it cannot produce false negatives for the active
+snapshot and key encoding.
+
+The reported hardware is older, and PCIe, GPU memory, and CUDA behavior differ
+on current and future systems. The qualitative lesson should survive, but the
+exact 16 Ki/1 Mi morsel sizes, 2-4 stream choice, and speedup factors need fresh
+measurement on the target GPU. The paper also assumes selective joins; if
+selectivity is high or downstream work is cheap, GPU filtering can become pure
+overhead.
+
+**Benchmark candidates:**
+
+- Build a split-route selective-join benchmark with three paths: CPU-only hash
+  join, CPU Bloom pre-filter, and GPU Bloom pre-filter returning a bitmap to
+  CPU join workers. Vary selectivity, build-side cardinality, filter size, and
+  downstream payload/decompression cost.
+- Add a retained-filter route descriptor: table/partition id, key encoding,
+  snapshot generation, Bloom generation, false-positive target, resident bytes,
+  stream count, pinned-buffer budget, and CPU fallback fragment. Proof gate:
+  no negative pruning unless the filter is snapshot-compatible.
+- Measure opportunistic GPU assistance under queue pressure. When GPU rings are
+  saturated, same-shape morsels should continue on CPU and report fallback
+  reason rather than waiting indefinitely behind the accelerator.
+- Test filter-in-HBM versus payload-in-HBM placement. Keep only compact join or
+  key filters resident for cold/warm partitions and measure avoided NVMe reads,
+  host decompression, CPU join work, and route latency.
+- Sweep CPU and GPU morsel sizes independently on the target GPU. Required
+  metrics: launch count, transfer bytes, stream utilization, CPU idle time,
+  pinned-memory footprint, p50/p99 latency, and throughput.
+- Compare deterministic filter sizing against a route-cost model that increases
+  filter accuracy when downstream CPU or tier cost is high. Failure condition:
+  a larger GPU filter reduces false positives but loses overall due to HBM
+  pressure, queue delay, or transfer contention.

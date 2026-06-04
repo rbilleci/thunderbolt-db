@@ -815,7 +815,7 @@ Append new candidates here as each paper is processed.
   Why: schedule-first concurrency-control approach with fine-grained operation
   ordering; useful for comparing engine-owned transaction scheduling against
   route-level micro-batching and conflict-aware admission.
-- `queued` — **Fluid Co-processing: GPU Bloom-filters for CPU Joins**,
+- `reviewed` — **Fluid Co-processing: GPU Bloom-filters for CPU Joins**,
   Gubner et al., DaMoN 2019.
   URL: `https://doi.org/10.1145/3329785.3329934`
   PDF: `https://t1mm3.github.io/assets/papers/damon19.pdf`
@@ -978,6 +978,18 @@ Append new candidates here as each paper is processed.
   Why: PIFO cites NUMFabric as a flexible bandwidth-allocation use case; useful
   for comparing utility-driven admission and weighted fair queueing when GPU DB
   request classes compete for network, owner-ring, and accelerator capacity.
+- `queued` — **HetExchange: Encapsulating Heterogeneous CPU-GPU Parallelism in
+  JIT Compiled Engines**, Bress et al., CIDR 2019.
+  URL: `https://www.cidrdb.org/cidr2019/papers/p59-bress-cidr19.pdf`
+  Why: Fluid Co-processing contrasts fragment-level GPU assistance with
+  exchange-style whole-pipeline routing; useful for comparing planner-time
+  CPU/GPU placement with runtime split-route fallback.
+- `queued` — **Performance-Optimal Filtering: Bloom Overtakes Cuckoo at High
+  Throughput**, Lang et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p502-lang.pdf`
+  Why: Fluid Co-processing uses performance-optimal Bloom filter modeling as
+  its CPU/GPU filter sizing foundation; relevant to resident join summaries,
+  false-positive budgets, and route-specific filter sizing.
 - `queued` — **Andromeda: Performance, Isolation, and Velocity at Scale in
   Cloud Network Virtualization**, Dalton et al., NSDI 2018.
   URL: `https://www.usenix.org/conference/nsdi18/presentation/dalton`
