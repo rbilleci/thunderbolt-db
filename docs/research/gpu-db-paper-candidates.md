@@ -2868,10 +2868,22 @@ Append new candidates here as each paper is processed.
   useful for comparing network-scale partitioned joins with intra-node
   multi-GPU sort-merge, P2P interconnect use, out-of-core joins, and transfer
   scheduling.
-- `queued` — **Adaptive Concurrency Control: Despite the Looking Glass, One
+- `reviewed` — **Adaptive Concurrency Control: Despite the Looking Glass, One
   Concurrency Control Does Not Fit All**, Tang, Jiang, and Elmore, CIDR 2017.
   URL: `http://cidrdb.org/cidr2017/papers/p63-tang-cidr17.pdf`
   Why: Strife contrasts with adaptive per-cluster concurrency-control
   selection; useful for deciding whether GPU DB hot partitions should switch
   among owner-serialized, optimistic, lock-like, or GPU-batched routes based on
   measured conflict shape instead of one global write-path policy.
+- `queued` — **Clay: Fine-Grained Adaptive Partitioning for General Database
+  Schemas**, Serafini et al., PVLDB 2016.
+  URL: `https://doi.org/10.14778/3007328.3007331`
+  Why: ACC points to fine-grained adaptive partitioning as related dynamic
+  placement work; useful for deciding how GPU DB should migrate hot keys or
+  route boundaries without forcing a global owner-layout rebuild.
+- `queued` — **Leopard: Lightweight Edge-Oriented Partitioning and Replication
+  for Dynamic Graphs**, Huang and Abadi, PVLDB 2016.
+  URL: `https://doi.org/10.14778/2904483.2904495`
+  Why: ACC cites Leopard as online partitioning for dynamic datasets; useful
+  for comparing lightweight scoring and incremental boundary changes against
+  route-descriptor based hot-key clustering.

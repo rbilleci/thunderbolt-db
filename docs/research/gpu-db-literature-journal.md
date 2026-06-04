@@ -34010,3 +34010,147 @@ incremental refresh under bounded latency.
   invalidation. Gate: OLTP-visible commits never wait for RT index rebuild.
 - Keep RTScan behind an explicit feature flag until a portability check proves
   CUDA/OptiX availability and a non-RT fallback is always planned.
+
+### 2026-06-04 - ACC chooses concurrency control per cluster instead of globally
+
+**Citation:** Dixin Tang, Hao Jiang, and Aaron J. Elmore. "Adaptive
+Concurrency Control: Despite the Looking Glass, One Concurrency Control Does
+Not Fit All." CIDR 2017. Retrieved 2026-06-04 from the CIDR PDF,
+`http://cidrdb.org/cidr2017/papers/p63-tang-cidr17.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale; MVCC / snapshot / visibility.
+
+**Relevance tags:** adaptive concurrency control; cluster-local protocol
+selection; dynamic partitioning; mixed OCC/2PL/partitioned locking; workload
+features; hot-key routing; cross-cluster transaction cost; online
+reconfiguration; serializable mixed protocols.
+
+**Core idea:** ACC argues that a transactional engine should not pick one
+concurrency-control protocol for the whole database when workload shape can
+change quickly. Instead, it clusters records and cores, assigns each cluster a
+protocol, and adapts the layout and protocol choices as access patterns change.
+The paper's target protocols are partition-based concurrency control, Silo-like
+OCC, and no-wait 2PL, but the transferable idea is broader: choose the conflict
+management policy at the same granularity as the current hot data shape.
+
+The paper reports preliminary prototype results on YCSB, Smallbank, and TPC-C
+where ACC tracks the best protocol as workloads shift between low-conflict
+non-partitionable, well-partitionable, and highly conflicted
+non-partitionable phases. In the reported tests, ACC's model prediction
+accuracy ranges from 83% to 97%, and ACC reaches at least 95% of the
+throughput of the protocol it selects after reconfiguration. The strongest
+claim for GPU DB is not the specific classifier; it is that protocol choice
+should be measured from live route features rather than fixed at system start.
+
+**Concrete mechanisms:**
+
+- Partition the data store into clusters. Each cluster owns a primary-index
+  partition and records, and receives one or more dedicated cores according to
+  observed load.
+- Maintain a shared cluster routing table mapping primary keys to cluster
+  numbers. Secondary indexes point to primary keys and are either partitioned,
+  replicated when rarely modified, or served by dedicated cores when frequently
+  modified.
+- Train an offline predictive model over synthesized workloads, then use online
+  feature extraction to select the best protocol for each cluster.
+- Use four workload features for the prototype model: read-operation ratio,
+  average records per transaction, record-contention probability, and
+  cross-cluster access cost.
+- Estimate record contention with lightweight sampling. Workers mark sampled
+  record accesses by incrementing per-record counters, then sample counters to
+  detect whether other workers touched the same records during the sampling
+  window.
+- Generate cluster plans with a partition-merge approach. First split into as
+  many clusters as available cores, compute cluster utilization, then merge
+  low-utilization or high-affinity clusters. Affinity includes a protocol
+  weight because cross-cluster access costs differ by protocol pair.
+- Recluster by freezing old indexes, building new indexes, and operating with
+  tiered indexes during migration to reduce latch contention for live
+  transactions.
+- Mix protocols with Data-oriented Mixed Concurrency Control. The cluster that
+  owns a record determines the concurrency-control logic used for that record,
+  even when a transaction's home cluster uses another protocol.
+- Preserve conflict serializability across partition locking, 2PL, and OCC by
+  ordering their wait/validation behavior into phases: preprocess for
+  partition locks, execution for 2PL locks, validation for OCC, and commit for
+  releasing locks and publishing writes.
+- Extend SiloR-style epoch logging across the prototype's protocols by adding
+  timestamps to records or PartCC clusters. The paper still treats support for
+  multiple independent logging/recovery algorithms as open.
+
+**GPU DB mapping:** ACC is a strong fit for GPU DB's route-descriptor and
+owner-lane design. Today it is tempting to assign a table or partition to one
+write policy: owner-serialized, optimistic, deterministic batch, or GPU-batched.
+ACC suggests making that policy a measured cluster property. A route descriptor
+for writes should include conflict family, key/partition cluster, read/write
+set confidence, cross-cluster cost, current hotness, and selected policy. The
+mutation owner can then choose a narrow lane rather than forcing every write
+through the same global concurrency path.
+
+For retained read snapshots, ACC's cluster routing table maps to a snapshot
+route table: primary key or partition range to owner lane, resident generation,
+and conflict policy. A hot key cluster could use owner-serialized writes plus
+immutable retained reads; a low-conflict cluster could admit optimistic or
+deterministic-batch writes; a read-mostly resident cluster could route to GPU
+snapshot execution until invalidation rate crosses a threshold. The protocol
+choice should be visible in telemetry and planner decisions, not hidden inside
+a generic write queue.
+
+For 1M logical sessions, ACC reinforces that admission should depend on active
+conflict shape rather than session count. One million idle sessions are cheap
+only if their requests can be classified into bounded active clusters. Session
+admission can reject, delay, or reroute at the cluster/policy boundary:
+`hot_owner_lane_full`, `optimistic_abort_rate_high`,
+`cross_cluster_cost_high`, `gpu_batch_wait_ceiling`, or
+`recluster_in_progress`.
+
+For GPU execution, ACC should be treated as a CPU-side planner and control-loop
+idea first. The GPU can accelerate same-shape validation, key classification,
+index refresh, or deterministic batch execution only after the CPU route layer
+has selected a cluster-local policy and visibility boundary. The paper's mixed
+protocol phases are a useful warning: if GPU DB mixes CPU owner lanes, GPU
+transaction batches, and retained snapshot reads, each protocol must expose
+where it waits, validates, publishes visibility, logs, and releases resources.
+
+**Risks and mismatches:** ACC is a six-page CIDR vision/prototype paper, not a
+complete production design. It targets multicore main-memory OLTP, not GPU
+memory, MVCC resident snapshots, SQL planner integration, or crash-safe WAL
+with GPU cache rebuild. The prototype uses offline-generated partition plans in
+some experiments, and dynamic reclustering still has hard open questions around
+incremental migration and ACID preservation.
+
+The selected protocols are only PartCC, OCC, and no-wait 2PL. GPU DB's real
+policy space also includes deterministic batch processing, MVCC read-snapshot
+routes, owner-serialized hot lanes, GPU-resident indexes, and CPU fallback.
+Feature extraction may itself become expensive at very high session counts if
+sampling counters are placed in hot cache lines. The paper also acknowledges
+that mixing multiple logging and recovery algorithms remains open; GPU DB
+should not copy mixed protocol routing unless WAL replay and cache rebuild
+have one deterministic visibility order.
+
+**Benchmark candidates:**
+
+- Add a write-route simulator that classifies requests by conflict cluster and
+  switches each cluster among owner-serialized, optimistic, lock-like, and
+  deterministic-batch policies. Gate: policy switching improves throughput
+  without breaking serialized replay order.
+- Track per-cluster features in the runtime: read ratio, write ratio, average
+  keys per transaction, sampled key contention, cross-cluster request rate,
+  abort/retry rate, queue wait, and selected policy.
+- Add a hot-key phase-shift workload: low-conflict point writes, then one
+  well-partitioned hot region, then non-partitionable high contention. Compare
+  one global policy against ACC-style cluster-local policy selection.
+- Prototype a conservative route table that maps key ranges to mutation owner
+  lanes and retained snapshot generations. Proof gate: DDL, DROP/TRUNCATE, and
+  WAL replay invalidate or rebuild the table deterministically.
+- Measure recluster cost with frozen-old/new-index routing. Failure condition:
+  reclustering stalls retained reads or lets a write publish visibility through
+  the wrong cluster boundary.
+- Test sampled contention counters under 1M logical sessions and bounded
+  active requests. Gate: feature collection stays below a fixed microsecond
+  budget and never hides inside generic queue wait.
+- Add protocol-phase telemetry for mixed routes:
+  `preprocess_wait_us`, `execution_lock_wait_us`, `validation_us`,
+  `commit_publish_us`, `wal_epoch`, and `policy_id`. This is needed before any
+  CPU/GPU mixed transaction path can be trusted.
