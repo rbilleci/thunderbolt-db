@@ -30904,3 +30904,127 @@ pivot.
   recover the same visible final value and route generation as normal
   execution, and omitted intermediate states must not be required by any
   SQL-visible invariant.
+
+### 2026-06-04 - DACE learns planner residuals instead of replacing planner expertise
+
+**Citation:** Zibo Liang, Xu Chen, Yuyang Xia, Runfan Ye, Haitian Chen,
+Jiandong Xie, and Kai Zheng. "DACE: A Database-Agnostic Cost Estimator."
+ICDE 2024, pp. 4925-4937. Retrieved 2026-06-04 from Kai Zheng's author
+PDF, `https://zheng-kai.com/paper/icde_2024_liang.pdf`; DOI:
+`https://doi.org/10.1109/ICDE60146.2024.00374`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** learned cost model; route choice; residual correction;
+planner telemetry; cross-database transfer; LoRA fine-tuning; GPU/CPU
+scheduling; admission cost.
+
+**Core idea:** DACE argues that practical learned cost estimation should not
+try to relearn cardinality and physical execution from scratch. Instead, it
+uses the DBMS optimizer's estimated cost and cardinality as compact inputs
+and learns the error distribution of the optimizer's cost estimate across
+databases. That keeps deterministic planner knowledge visible while adding a
+small model that can correct systematic residuals.
+
+The paper's most transferable stance is architectural: cost prediction can be
+a route-local correction layer, not a replacement optimizer. DACE trains as an
+across-database model, can be lightly adapted to a new machine with LoRA, and
+can also provide plan embeddings to within-database models. For the GPU DB,
+this suggests a planner path where the CPU/GPU/tier route descriptor carries
+hand-written cost terms first, then a bounded residual estimator adjusts the
+choice only when enough telemetry exists.
+
+**Concrete mechanisms:** DACE extracts each PostgreSQL query plan with
+`EXPLAIN ANALYZE` for labels, but uses only optimizer-estimated node type,
+cardinality, and cost as model inputs during inference. A depth-first walk
+produces the node sequence, a partial-order adjacency matrix, and per-node
+height. The adjacency matrix becomes a tree-structured attention mask so each
+node attends to itself and descendants instead of treating the DFS sequence as
+flat text.
+
+The model is intentionally small: one transformer encoder layer with 128-wide
+query/key/value dimensions, no multi-head attention, and a three-layer MLP
+predictor. During training, it predicts all sub-plan costs in parallel. To
+avoid over-weighting child information that appears again in every ancestor,
+the loss adjuster multiplies each node's q-error loss by `alpha^height`, with
+`alpha = 0.5` in the experiments. During inference it predicts only the root
+cost, so sub-plan supervision does not add runtime overhead.
+
+For transfer across different machines, DACE freezes the learned MLP weights
+and fine-tunes low-rank LoRA matrices. The evaluation reports DACE at 0.064
+MB, 21,031 training queries/sec, and 33,995 inference queries/sec, compared
+with Zero-Shot at 2.708 MB, 307 training queries/sec, and 426 inference
+queries/sec. DACE-LoRA is reported at 0.080 MB and 29,561 inference
+queries/sec. Accuracy claims include median q-error below 1.48 across all
+held-out databases in the Zero-Shot-style workload, DACE-LoRA below 1.27
+median q-error in the across-more setup, and a data-drift test where median
+and 95th q-error degrade by at most 5% and 29%, respectively.
+
+**GPU DB mapping:** The strongest GPU DB mapping is a typed residual-cost
+estimator for route descriptors. The deterministic planner should still compute
+visibility boundary, resident generation validity, expected transfer bytes,
+resident HBM/host/NVMe tier, predicate support, selected columns, queue depth,
+scratch-memory budget, and fallback risk. A DACE-like residual model can then
+learn when those rules are systematically optimistic or pessimistic for a
+specific query shape, GPU worker, data layout, or tier state.
+
+This fits the P8 and runtime documents because it preserves explicit
+correctness gates. The learned model should never decide whether a snapshot is
+valid, whether WAL-before-visibility was satisfied, or whether a predicate is
+supported by a resident layout. It should only adjust a latency or resource
+estimate after the route has passed deterministic semantic checks.
+
+The tree-structured attention idea maps to SQL plan fragments that include
+CPU scans, resident GPU scans, cold GPU transfer, GPU hash aggregation, CPU
+fallback, and response encoding. Sub-plan supervision is especially attractive
+for GPU execution because a bad root latency estimate may hide which component
+was wrong: transfer setup, kernel launch, queue wait, materialization, or
+response scattering. Training node-local residuals against telemetry can
+expose which route term needs correction.
+
+LoRA-style adaptation maps to hardware and workload changes. A baseline model
+could be trained from generic synthetic and benchmark workloads, then
+fine-tuned per deployment, per GPU generation, or per storage tier without
+discarding the shared plan-shape knowledge. The same mechanism could adapt
+after adding a newer GPU, enabling GPUDirect Storage, changing NVMe devices,
+or introducing compressed resident segments.
+
+**Risks and mismatches:** DACE evaluates PostgreSQL-style CPU execution plans,
+not GPU kernels, MVCC visibility checks, residency invalidation, pinned-buffer
+pressure, or multi-tenant session admission. Its inputs are intentionally
+minimal, which is a strength for portability but insufficient for GPU route
+choice unless extended with route descriptors and runtime telemetry. The paper
+does not prove safe integration into a production optimizer where a bad
+prediction could create tail-latency cliffs or starvation.
+
+The EDQO assumption may also be weaker for GPU routes. PostgreSQL's cost model
+has stable operator semantics; a GPU route can flip abruptly when a resident
+snapshot is invalid, scratch memory spills, a kernel batch is too small, or a
+transfer crosses a tier boundary. The model should therefore be guarded by
+uncertainty, recency windows, and deterministic fallback thresholds.
+
+**Benchmark candidates:**
+
+- Add a no-GPU planner-residual harness that records deterministic route
+  features and actual latency for CPU tuple/index paths, retained encoded
+  cache hits, and simulated resident route choices. Compare hand-written cost
+  only versus a residual correction layer. Gate: no semantic route changes;
+  only ranking among already-valid routes may change.
+- Extend route telemetry with `planner_base_cost`, `estimated_rows`,
+  `route_shape_id`, `snapshot_generation_age`, `resident_bytes`,
+  `transfer_bytes`, `queue_wait_us`, `scratch_bytes`, `fallback_risk`, and
+  `actual_latency_us` so sub-plan residuals have stable inputs.
+- Prototype a tiny route estimator that predicts residual latency for
+  `CPU_INDEX_LOOKUP`, `GPU_RESIDENT_SCAN`, `GPU_COLD_TRANSFER_SCAN`,
+  `GPU_RESIDENT_AGG`, and `RESPONSE_ENCODE` components separately. Failure
+  condition: a root-level improvement hides worse component-level estimates.
+- Add an adaptation benchmark before and after the newer GPU arrives: train on
+  old hardware traces, fine-tune a small adapter on new hardware traces, and
+  measure how many queries are needed before route ranking stabilizes.
+- Add an uncertainty gate: when residual error or drift exceeds a threshold,
+  the planner must fall back to deterministic cost or conservative CPU route
+  choice. Proof gate: deliberately stale training data cannot route invalid
+  snapshots or overload GPU queues.
+- Compare residual-cost learning against cardinality learning as separate
+  planner signals. The DACE hypothesis is that residual latency correction
+  should be useful before a full learned cardinality estimator is trustworthy.

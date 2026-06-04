@@ -1899,13 +1899,26 @@ Append new candidates here as each paper is processed.
   isolation while moving fast-path work out of monolithic kernels; useful for
   future pgwire/network-service split, runtime ownership, and upgradeable
   datapath boundaries.
-- `queued` — **DACE: A Database-Agnostic Cost Estimator**, Liang et al.,
+- `reviewed` — **DACE: A Database-Agnostic Cost Estimator**, Liang et al.,
   ICDE 2024.
   URL: `https://doi.org/10.1109/ICDE60146.2024.00374`
   Why: the 2025 learned-cost-model study found DACE competitive on physical
   operator selection largely because it preserves PostgreSQL cost estimates as
   inputs; useful for a hybrid GPU route-cost model that learns residuals while
   keeping deterministic planner expertise visible.
+- `queued` — **Stage: Query Execution Time Prediction in Amazon Redshift**,
+  Wu et al., SIGMOD 2024.
+  URL: `https://doi.org/10.1145/3626246.3653391`
+  PDF: `https://assets.amazon.science/e6/a8/0f59e3b14ffdbe68f419b3682edb/stage-query-execution-time-prediction-in-amazon-redshift.pdf`
+  Why: hierarchical production query-time prediction with cache, local model,
+  global model, and uncertainty; useful for routing GPU/CPU work, admission,
+  and resource control without relying on one monolithic learned estimator.
+- `queued` — **PRICE: A Pretrained Model for Cross-Database Cardinality
+  Estimation**, Zeng et al., arXiv 2024.
+  URL: `https://arxiv.org/abs/2406.01027`
+  Why: cross-database cardinality estimation is the counterpart to DACE's
+  residual-cost path; useful for deciding whether GPU route choice should keep
+  cardinality and residual-latency learning as separate planner signals.
 - `reviewed` — **Your Read is Our Priority in Flash Storage**, An et al.,
   PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1911-lee.pdf`
