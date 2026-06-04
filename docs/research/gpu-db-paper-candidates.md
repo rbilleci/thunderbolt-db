@@ -261,7 +261,7 @@ Append new candidates here as each paper is processed.
   Why: schedule-first OLTP work contrasts static/runtime conflict scheduling
   and proactive deferral; useful for comparing bounded SMF-style admission
   with lighter runtime probes for hot writes.
-- `queued` — **Polaris: Enabling Transaction Priority in Optimistic
+- `reviewed` — **Polaris: Enabling Transaction Priority in Optimistic
   Concurrency Control**, Ye et al., PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3588724`
   PDF: `https://chenhao-ye.github.io/publication/polaris/polaris.pdf`
@@ -327,6 +327,12 @@ Append new candidates here as each paper is processed.
   PDF: `https://zxjcarrot.github.io/files/libdbos_SIGMOD25.pdf`
   Why: follow-up DB/OS kernel-bypass design from the Looking Glass 2.0 authors;
   directly relevant to low-overhead networking, IPC, and isolation boundaries.
+- `queued` — **CockroachDB: The Resilient Geo-Distributed SQL Database**,
+  Taft et al., SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3386134`
+  Why: Polaris cites CockroachDB as a practical system exposing transaction
+  priorities; useful for contrasting record-level OCC priority with
+  distributed SQL priority, contention handling, and admission behavior.
 - `reviewed` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
   Queries**, Yang et al., CIDR 2024.
   URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`

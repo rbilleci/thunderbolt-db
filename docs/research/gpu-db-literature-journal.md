@@ -44807,3 +44807,130 @@ execution.
   predicates or nonresident partitions. False positives may send work to
   fallback; false negatives must not bypass the owner or read stale
   resident data.
+
+### 2026-06-04 - Polaris adds priority without abandoning optimistic execution
+
+**Citation:** Chenhao Ye, Wuh-Chwen Hwang, Keren Chen, and Xiangyao
+Yu. "Polaris: Enabling Transaction Priority in Optimistic Concurrency
+Control." PACMMOD/SIGMOD 2023, article 44. Retrieved 2026-06-04 from
+the DOI page and author PDF, `https://doi.org/10.1145/3588724`.
+
+**Category:** transaction processing / write path / concurrency control.
+
+**Relevance tags:** optimistic concurrency control; transaction
+priority; tail latency; starvation avoidance; hot-record contention;
+reservation metadata; priority-aware admission; Silo; YCSB; TPC-C.
+
+**Core idea:** Polaris shows that OCC can support transaction priority
+without turning every conflict into lock waiting. The protocol keeps
+same-priority transactions optimistic, but lets a higher-priority
+transaction reserve records so lower-priority writers cannot commit
+updates that would later invalidate it. Reads are not blocked by
+reservations, and a higher-priority transaction can preempt lower-priority
+reservations.
+
+The most transferable idea is "minimal pessimism where tail latency is
+already bad." GPU DB should not make every retained read or mutation pay a
+priority tax. Instead, the default route can stay optimistic/FIFO, while
+requests that have repeated aborts, repeated CPU fallbacks, deadline
+pressure, or user-visible importance earn a small priority token that
+protects them only at the hot record, hot key, or hot resident-segment
+boundary.
+
+**Concrete mechanisms:**
+
+- Polaris extends Silo's per-record TID with priority, priority version,
+  reference count, latch, and data-version fields, updated atomically in a
+  64-bit word in the prototype.
+- A transaction attempts reservation during record access. If record
+  priority equals transaction priority, it joins the same-priority
+  reservation by incrementing the reference count.
+- If the record has lower priority, the transaction preempts by replacing
+  the priority and reference count. If the record has higher priority,
+  a reader may continue without reservation, but a writer aborts.
+- Commit still validates data versions for serializability. Priority
+  metadata controls permission to write, while the data version remains the
+  correctness guard.
+- Cleanup removes read reservations by decrementing the reference count and
+  resetting priority when the count reaches zero. Write cleanup installs the
+  new data version and clears all reservations because old reservations no
+  longer describe the updated record.
+- The lowest priority is optimized to behave almost exactly like Silo:
+  priority-zero transactions do not write reservation metadata when the
+  record is also priority zero.
+- The evaluated DB-assigned policy keeps transactions at priority zero until
+  repeated aborts cross a threshold, then raises priority stepwise. The paper
+  reports that too many high-priority transactions hurt throughput because
+  they create extra metadata writes and force more low-priority aborts.
+- Evaluation used DBx1000, YCSB, and TPC-C. Reported results include 13x
+  lower p999 latency for static high-priority transactions than low-priority
+  ones, 2x lower YCSB-A tail latency at skew 0.99 with 1.8% throughput loss,
+  and 1.9x higher throughput plus 17x lower p999 latency than Silo under
+  very high YCSB-A skew. Exact portability to GPU DB is unknown.
+
+**GPU DB mapping:** Polaris maps cleanly to the route-certificate and
+bounded-admission direction from the recent synthesis. A route certificate
+should be able to carry a priority class and a reason: user priority,
+deadline, repeated aborts, repeated fallback, refresh urgency, or starvation
+avoidance. The default class remains zero and should avoid extra shared-state
+writes.
+
+For writes, a mutation owner could add priority-aware reservation metadata to
+hot-key or hot-partition admission, not to every tuple immediately. A
+priority read or write admission probe would reserve the hot key/segment
+enough to prevent lower-priority writers from publishing conflicting work
+ahead of it, while WAL-before-visibility and MVCC commit order remain the
+authority.
+
+For retained GPU reads, the analogous object is not a row lock but a resident
+segment, local-delta boundary, or hot-key delta slot. A retained lookup that
+has repeatedly fallen back because a refresh or mutation races it could gain
+priority and reserve a compatible boundary briefly. Lower-priority mutation
+refresh or local-delta merge work may delay or fall back, but cannot force the
+priority request into another avoidable stale-route failure.
+
+For 1M logical sessions, the important property is that priority state is
+attached to active conflicting work, not idle sessions. Priority counters and
+reservation tables should live in owner-local bounded structures keyed by
+route class, relation/partition, and hot key hash. Saturation must degrade to
+normal optimistic behavior or explicit fallback, never to unbounded per-session
+state.
+
+**Risks and mismatches:** Polaris is record-oriented in-memory OCC over a
+row-store testbed. GPU DB has SQL planning, WAL durability, MVCC visibility,
+resident snapshots, DDL invalidation, GPU execution queues, and CPU/GPU route
+fallback. A literal per-record priority field in every resident GPU tuple
+would likely create too much coherence and refresh cost.
+
+The protocol also shows a sharp policy risk: if too much traffic becomes
+high-priority, throughput drops and the low-priority class can suffer. GPU DB
+should make priority earned and sparse, with caps per route class and clear
+aging/starvation telemetry. Priority must not bypass isolation checks,
+snapshot compatibility, catalog generation checks, or WAL publication order.
+
+The evaluation is convincing for high-contention OLTP, but it does not answer
+how priority interacts with long analytical GPU kernels, multi-packet SQL
+sessions, distributed partitions, or over-resident tier movement. Those remain
+benchmark questions.
+
+**Benchmark candidates:**
+
+- Add a priority-aware hot-key admission simulator beside the SMF/FIFO
+  simulator. Compare FIFO, SMF-like scheduling, and Polaris-like reservations
+  under skewed YCSB and TPC-C-style hot warehouses. Measure throughput, aborts,
+  p99/p999 latency, and low-priority starvation.
+- Extend route certificates with `priority_class`, `priority_reason`,
+  `abort_or_fallback_count`, and `reservation_scope`. Proof gate: priority
+  changes only admission order or fallback choice; it cannot change snapshot
+  visibility.
+- Benchmark sparse versus broad priority assignment. Failure condition:
+  enabling priority for more than a small active fraction causes more than 5%
+  throughput loss without a compensating p99/p999 improvement.
+- Prototype retained-read reservations at the hot segment or local-delta
+  boundary. Compare immediate fallback, wait-for-refresh, and priority
+  reservation when retained lookups repeatedly race mutations.
+- Add telemetry for reservation attempts, preemptions, reservation cleanup,
+  false priority delays, low-priority aborts, and starvation releases.
+- Test a lowest-priority fast path explicitly. When all active work is
+  priority zero, the route should match the current optimistic path within
+  measurement noise.
