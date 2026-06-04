@@ -3081,9 +3081,10 @@ Append new candidates here as each paper is processed.
   Why: HDCC contrasts deterministic execution against 2PC-like deterministic
   optimistic protocols; useful for measuring whether GPU DB multi-owner write
   batches should avoid 2PC entirely or make the commit path cheaper.
-- `queued` — **Lotus: Scalable Multi-Partition Transactions on Single-Threaded
+- `reviewed` — **Lotus: Scalable Multi-Partition Transactions on Single-Threaded
   Partitioned Databases**, Zhou, Yu, Graefe, and Stonebraker, PVLDB 2022.
-  URL: `https://doi.org/10.14778/3551793.3551851`
+  URL: `https://doi.org/10.14778/3551793.3551843`
+  PDF: `https://www.vldb.org/pvldb/vol15/p2939-zhou.pdf`
   Why: Primo contrasts Lotus' epoch/lock-holding tradeoff with asynchronous
   watermarks; useful for comparing single-threaded partition owners,
   multi-partition write routing, and whether GPU DB should hold or release

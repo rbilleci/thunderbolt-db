@@ -38753,3 +38753,175 @@ change the best route.
   generated kernel count, code-cache memory, and fallback behavior for many
   similar prepared statements. The route should amortize compilation across
   repeated same-shape sessions without blocking IO workers.
+
+### 2026-06-04 - Lotus keeps partition owners single-threaded but multiplexes multi-partition waits
+
+**Citation:** Xinjing Zhou, Xiangyao Yu, Goetz Graefe, and Michael
+Stonebraker. "Lotus: Scalable Multi-Partition Transactions on
+Single-Threaded Partitioned Databases." PVLDB 15(11):2939-2952,
+2022. doi:10.14778/3551793.3551843. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol15/p2939-zhou.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT /
+session scale.
+
+**Relevance tags:** single-threaded partition owners; multi-partition
+transactions; logical granules; MEST; deterministic replay; command
+logging; batch commit; one-phase commit shape; asynchronous replication;
+straggler tolerance; owner-lane queues; WAL-before-visibility batches.
+
+**Core idea:** Lotus revisits the H-Store/VoltDB run-to-completion,
+single-threaded partition-owner model. That model is excellent for
+single-partition transactions because it avoids latches, multicore shared
+state, and scheduler overhead, but it performs poorly when transactions span
+partitions. Lotus keeps the single-threaded owner property and improves
+multi-partition work with three mechanisms: logical granule locks smaller
+than a partition, multiplexed execution of a batch of multi-partition
+transactions while some wait on network replies, and a command-log commit
+protocol that decouples backup replay from the primary commit path.
+
+The strongest transferable idea is not "make everything deterministic"; it
+is "do not abandon owner lanes just because a few requests cross owner
+boundaries." Lotus shows that an owner can stay single-threaded and still
+overlap remote waits by interleaving a local batch of multi-partition
+transactions. The commit publication unit becomes a sequencer-local batch,
+not a global epoch, which is why Lotus is less sensitive to stragglers than
+batch-deterministic systems that need cluster-wide barriers.
+
+In the reported evaluation, Lotus outperforms OCC and 2PL variants with 2PC
+on YCSB and TPC-C multi-partition workloads. Against deterministic systems,
+it is up to 21x faster for single-partition transactions and comparable on
+many multi-partition mixes. It is up to 3.3x faster under straggler
+workloads, and the paper reports near-linear scaling in a 12-node primary
+for YCSB mixes up to 25% multi-partition transactions. These claims come
+from the paper's Google Cloud setup and should be treated as directionally
+useful rather than predictive for this GPU DB.
+
+**Concrete mechanisms:**
+
+- Each partition is owned by a single sequencer thread. Single-partition
+  transactions run to completion from that sequencer's transaction queue.
+  Multi-partition transactions may be submitted to any sequencer, which then
+  acts as coordinator for the transaction.
+- Lotus separates each sequencer batch into a single-partition group and a
+  multi-partition group. The SP group runs RCST. The MP group uses
+  Multiplexed-Execution-Single-Thread (MEST): when one MP transaction waits
+  for a remote granule response, the sequencer switches to another MP
+  transaction or processes remote MP work.
+- Granules are logical lock units derived by hash or range partitioning
+  inside a physical partition. They are not physical data shards. This
+  decouples concurrency-control granularity from storage placement and lets
+  the system change the number of granules without moving data.
+- Lotus uses strict two-phase locking with shared and exclusive modes on
+  granules and a `NO_WAIT` policy. On lock failure, an MP transaction aborts
+  and is rescheduled to a later batch.
+- Writes for MP transactions are held in local write sets until commit. The
+  sequencer records coordinator records and participant records in a log
+  buffer, then persists the batch to the replicated command log. Client
+  results are released only after the log buffer is durable and quorum
+  acknowledged.
+- The participant side does not force separate vote or redo log writes as in
+  classic 2PC. The coordinator record is the commit decision; absence of a
+  coordinator record implies abort. This resembles a one-phase command-log
+  commit shape, with recovery driven by command replay.
+- Participant records capture which transaction locked which granule, the
+  lock type, the last writer, and a per-granule lock sequence number. These
+  records preserve partial order for deterministic replay and log repair.
+- Backups replay command logs asynchronously. They demultiplex log streams
+  into partition/granule queues and replay commands while honoring the
+  recorded partial order, not a total serial order. Shared locks can replay
+  concurrently when they observe the same last-writer boundary.
+- Recovery repairs missing participant records by using durable coordinator
+  records as ground truth. Batch commit records bound how far backward repair
+  needs to scan.
+- Checkpointing uses a system multi-partition transaction that establishes a
+  global consistent point, switches partitions into copy-on-write mode, flushes
+  log buffers, and records snapshot locations in a catalog.
+- The paper's granule experiment shows a tradeoff: 1K granules add only about
+  6% overhead on 0% MP YCSB versus partition-level locking, but very fine
+  granules can make backup replay up to 2.2x slower and consume much more
+  memory for dependency tracking.
+
+**GPU DB mapping:** Lotus maps cleanly to the current owner-domain plan. GPU
+DB should preserve single-writer or partition-owner lanes for mutation,
+visibility publication, and resident-state invalidation, but it should not
+serialize every cross-partition or cross-tier action through one global owner.
+For writes that touch multiple owner domains, a Lotus-like path suggests
+logical route granules: coarser than rows, finer than whole partitions, and
+used for admission and conflict planning rather than as physical storage
+boundaries.
+
+For the high-throughput runtime, MEST is a direct benchmark shape. A mutation
+owner or partition owner can keep two queues: incoming transactions and remote
+work. When a transaction waits on another owner, NVMe, residency refresh, or
+GPU completion, the owner should be able to advance another compatible item
+without exposing uncommitted writes. This is different from throwing work at a
+generic thread pool: the owner remains the sole authority, but its local event
+loop becomes wait-aware.
+
+For WAL/MVCC, the commit lesson is publish after durable batch state, then
+release locks/visibility. GPU DB cannot copy Lotus' command-log-only
+durability blindly, because the current architecture requires
+WAL-before-visibility and CPU recovery truth. But it can test a
+sequencer-local publication batch: collect write-set, invalidation, and
+resident-refresh records; persist the WAL batch; then publish visibility and
+release route granules. Participant records map to route-invalidation records
+that let recovery rebuild which resident snapshots or GPU indexes were made
+invalid by each batch.
+
+For 1M logical sessions, Lotus argues against global batch barriers. Sessions
+should enqueue into owner-local rings, and owner-local batches should commit
+or publish independently when dependencies allow. Long scans, refreshes, and
+remote tier waits must not pin every session behind one cluster-wide epoch.
+The straggler result strengthens the case for separate short-retained-read,
+write-publication, refresh, and cold-route lanes.
+
+For multi-tier placement, logical granules are a useful abstraction for hot
+key movement. A route granule can be the unit for resident key vectors,
+visibility summaries, invalidation counters, and owner assignment without
+forcing data files or GPU buffers to be physically split at the same
+granularity.
+
+**Risks and mismatches:** Lotus is a distributed in-memory OLTP system, not a
+GPU database. It assumes stored procedures in C++, key-based access, fail-stop
+failures, trusted nodes, reliable ordered networking, and no Byzantine faults.
+Its TPC-C subset omits three transaction types because range scans were not
+supported in the implementation, so it is not a full general SQL engine.
+
+The command-log design also differs from GPU DB's WAL/checkpoint/archive
+model. GPU DB should not let command logs replace durable row/version WAL
+until recovery, MVCC visibility, and replay semantics are proven. Lotus'
+asynchronous replication trades instant failover for lower per-transaction
+overhead; GPU DB should treat any asynchronous resident or future replica path
+as acceleration state unless the durability protocol is explicitly upgraded.
+
+Granules are powerful but tunable. Too coarse recreates partition-level
+blocking; too fine makes replay/dependency tracking expensive. Lotus does not
+solve automatic granule sizing, and the paper notes this as future work. A GPU
+DB route-granule design therefore needs telemetry-driven split/merge rules
+before it becomes a production policy.
+
+**Benchmark candidates:**
+
+- Add a multi-owner write-path simulator with partition-owner lanes, logical
+  route granules, `NO_WAIT` abort/reschedule, and MEST-style interleaving while
+  remote owners respond. Compare global serialization, tuple/row OCC, and
+  granule-owner batching under Zipfian hot keys.
+- Measure sequencer-local publication batches for WAL-before-visibility:
+  execute write sets, persist a WAL batch, publish visibility/invalidation, and
+  release route granules. Required metrics: commit p50/p99, abort rate,
+  owner-queue wait, WAL group size, and retained-read invalidation latency.
+- Test straggler isolation with one long cold scan or refresh per batch while
+  short retained reads and small writes continue. Proof gate: no cluster-wide
+  barrier lets one straggler dominate all owner lanes.
+- Vary route-granule count per partition for point writes, batched lookups,
+  and retained GPU index invalidation. Failure condition: finer granules
+  improve primary concurrency but make replay, recovery, or resident metadata
+  memory worse than the throughput gain.
+- Add deterministic replay metadata to a benchmark-only WAL side stream:
+  participant route granules, last-writer generation, and lock sequence.
+  Measure whether recovery can rebuild invalidation order without scanning
+  unrelated rows or GPU-resident artifacts.
+- Compare synchronous participant logging, Lotus-like coordinator-grounded
+  batch logging, and current conservative WAL publication. Keep the production
+  invariant fixed: no visibility publication before durable recovery truth.
