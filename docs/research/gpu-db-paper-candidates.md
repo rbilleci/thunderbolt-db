@@ -408,9 +408,10 @@ Append new candidates here as each paper is processed.
   Why: source design for FastLanes' dependency-free column encodings; useful
   for deciding whether GPU DB resident segments should adopt interleaved
   bit-packing and cascaded encodings before GPU-specific kernels.
-- `queued` — **Tile-Based Lightweight Integer Compression in GPU**,
+- `reviewed` — **Tile-Based Lightweight Integer Compression in GPU**,
   Shanbhag, Yogatama, Yu, and Madden, SIGMOD 2022.
-  URL: `https://dl.acm.org/doi/10.1145/3514221.3517864`
+  URL: `https://doi.org/10.1145/3514221.3526132`
+  PDF: `https://anilshanbhag.com/static/papers/gpufor_sigmod22.pdf`
   Why: direct GPU compression baseline compared by the FastLanes-GPU paper;
   useful for benchmarking tile granularity, global-memory traffic, and
   compression-versus-occupancy tradeoffs.
@@ -418,6 +419,12 @@ Append new candidates here as each paper is processed.
   URL: `https://vldb.org/pvldb/vol18/p4629-afroozeh.pdf`
   Why: modern file-format follow-up that may connect GPU-friendly compressed
   vectors to disk/NVMe cold-tier layout and CPU/GPU shared data placement.
+- `queued` — **A Study of the Fundamental Performance Characteristics of GPUs
+  and CPUs for Database Analytics**, Shanbhag, Yu, and Madden, SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3380595`
+  Why: Crystal's tile-based execution model is the execution substrate used by
+  the SIGMOD 2022 GPU compression paper; useful for separating compression
+  effects from baseline GPU query operator and memory-traffic behavior.
 - `reviewed` — **Chiller: Contention-centric Transaction Execution and Data
   Partitioning for Modern Networks**, Zamanian et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389724`
@@ -1340,9 +1347,10 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol17/p441-cao.pdf`
   Why: Crystal-Opt follow-up discussed by Themis; useful for comparing
   GPU primitive optimization against warp-level pipeline load balancing.
-- `queued` — **Tile-based Lightweight Integer Compression in GPU**,
+- `reviewed` — **Tile-based Lightweight Integer Compression in GPU**,
   Shanbhag, Yogatama, Yu, and Madden, SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526132`
+  PDF: `https://anilshanbhag.com/static/papers/gpufor_sigmod22.pdf`
   Why: GPU compression baseline relevant to temporary and resident integer
   compression when route-local encoding must trade HBM footprint against
   kernel occupancy and memory traffic.

@@ -36515,3 +36515,136 @@ against conflict-aware and tier-aware routing. Success requires better write
 throughput or lower p95 latency without weakening WAL-before-visibility,
 invalidating the wrong retained generation, or letting cold-tier pushdown hide
 queueing costs.
+
+### 2026-06-04 - Tile-based GPU integer compression keeps decode inside the route
+
+**Citation:** Anil Shanbhag, Bobbi W. Yogatama, Xiangyao Yu, and Samuel
+Madden. "Tile-based Lightweight Integer Compression in GPU." SIGMOD 2022,
+pp. 1390-1403. doi:10.1145/3514221.3526132. Retrieved 2026-06-04 from
+`https://anilshanbhag.com/static/papers/gpufor_sigmod22.pdf`.
+
+**Category:** GPU execution / analytics.
+
+**Relevance tags:** GPU compression; resident column layout; tile-based
+execution; HBM footprint; PCIe transfer reduction; fused decompression; shared
+memory; compressed integer columns; over-resident execution.
+
+**Core idea:** The paper argues that GPU database compression should not be
+implemented as a chain of independent decompression kernels that materialize a
+fully decoded column in global memory before query execution. That cascaded
+model pays one global-memory read/write pass per compression layer, plus a
+separate query kernel. Instead, the authors partition compressed columns into
+tiles that fit in a thread block's shared memory, decode all compression
+layers inside that tile, and call the decompression routine from the query
+kernel itself.
+
+They combine the tile model with bit-packed integer schemes designed for GPU
+execution: GPU-FOR for frame-of-reference bit packing, GPU-DFOR for sorted or
+semi-sorted columns using delta plus FOR, and GPU-RFOR for run-heavy columns
+using RLE plus FOR. On SSB, their hybrid GPU-* choice reduces memory footprint
+by about 2.8x versus uncompressed data, has nearly the same compression ratio
+as nvCOMP, and reports 2.2x faster decompression plus 2.6x faster query time
+than nvCOMP. For a co-processor path where data starts in CPU memory and moves
+over PCIe before each query, the compressed route is reported 2.3x faster than
+moving uncompressed data.
+
+**Concrete mechanisms:**
+
+- Tile-based decompression requires two properties: the compressed format must
+  be independently decodable at tile granularity, and each compression layer
+  must be expressible as a shared-memory tile-to-tile routine.
+- Each thread block collectively loads one compressed tile from global memory
+  into shared memory, applies all decoding stages in shared memory, and can
+  execute query logic before writing final results.
+- The intermediate global-memory traffic saved is proportional to the number
+  of compression layers that would otherwise run as separate passes.
+- GPU-FOR partitions integer columns into blocks of 128 values, stores a
+  reference value and bit width per block, and bit-packs deltas from the
+  reference. It targets integer, decimal, and dictionary-encoded string
+  columns.
+- GPU-DFOR groups several blocks into a tile, delta-encodes sorted or
+  semi-sorted values independently per tile, bit-packs with FOR, and fuses
+  bit unpacking with tile-local prefix sums during decode.
+- GPU-RFOR applies RLE per 512-value block and then uses FOR plus bit packing
+  on run values and run lengths. It is useful for long runs but consumes more
+  registers and shared memory than GPU-DFOR.
+- The rule of thumb is to pick the lowest-footprint scheme per column:
+  GPU-DFOR for sorted or semi-sorted high-cardinality columns, GPU-RFOR for
+  long-run or low-distinct columns, and GPU-FOR for other integer-like
+  columns.
+- Random access is not free, but compressed tiles can still win once selectivity
+  is high enough that uncompressed GPU global-memory cache-line behavior reads
+  most of the data anyway.
+- Compression is done on CPU in the evaluated design. For 250 million random
+  entries, the paper reports roughly 1.2s for GPU-FOR compression and 1.3s for
+  GPU-DFOR on a six-core CPU, so recompression cost matters for updated data.
+- The evaluation uses an Nvidia V100 with 16 GB HBM2, PCIe3, CUDA 11.2, SSB
+  scale factor 20, and assumes data is already resident on GPU except in the
+  co-processor experiment.
+
+**GPU DB mapping:** This strengthens P8's idea that compressed resident
+column-group segments should be explicit physical route variants, not an
+opaque storage afterthought. A retained read snapshot should be able to say
+which columns are dense, bit-packed FOR, DFOR, RFOR, dictionary-coded, or
+uncompressed; the planner and GPU worker should then choose a kernel shape
+that decodes only the selected route's tiles.
+
+The paper is especially relevant to over-resident execution. If a partition
+or cold segment must cross PCIe, NVLink, GPUDirect Storage, or a future CXL
+tier boundary, compressed transfer plus tile-local decode can reduce movement
+without forcing the engine to persist a fully decoded HBM copy. That maps to a
+three-way P8 benchmark: resident uncompressed, resident compressed with fused
+decode, and CPU/NVMe compressed transfer with fused decode.
+
+The route descriptor should carry compression metadata with the snapshot
+generation: tile size, scheme per column, supported predicates, selected column
+set, decode scratch requirement, and whether the route can inline decode into
+the query kernel. That keeps compression tied to route validity, memory
+budgets, and response latency rather than making it a global table property.
+
+For writes, the paper is a warning. CPU-side recompression in seconds is fine
+for analytical bulk-loaded columns but too expensive for hot OLTP rows or
+small invalidations. GPU DB should not recompress a whole resident segment on
+every update. The first safe design is immutable compressed generations:
+append or mutate through WAL/MVCC CPU truth, invalidate affected resident
+generations before visibility, and refresh compressed GPU segments only at
+measured batch boundaries.
+
+**Risks and mismatches:** The paper is analytics-focused and evaluates SSB, not
+transaction processing, MVCC updates, joins under many logical sessions, or
+PostgreSQL-compatible semantics. It assumes integer-like columns, including
+dictionary-encoded strings, so text values, NULLs, variable-width payloads,
+and SQL collation rules need separate handling. The decompression routines
+consume shared memory and registers; a route that saves HBM can still reduce
+occupancy or increase p50 latency if the kernel is already resource-bound.
+The compression cost is CPU-side and too high for fine-grained update churn
+unless refresh batches are large. The V100/PCIe3 evaluation numbers are useful
+directionally, but the exact scheme choice may shift on newer GPUs with larger
+shared memory, different cache behavior, and higher interconnect bandwidth.
+
+**Benchmark candidates:**
+
+- Add a P8 resident integer-column layout experiment with dense `i32`,
+  GPU-FOR-style bit packing, GPU-DFOR-style sorted-key deltas, and an RFOR-like
+  run layout. Minimum gate: identical SQL-visible results for `COUNT`, `SUM`,
+  equality, prefix-compatible dictionary filters, and retained snapshot
+  visibility checks.
+- Compare three route variants for the same snapshot: uncompressed resident
+  HBM, compressed resident HBM with fused decode, and compressed CPU/NVMe
+  staging with fused decode. Measure HBM bytes, H2D bytes, kernel time,
+  scratch/shared-memory use, occupancy, p50/p95 latency, and rows/s.
+- Build a same-shape lookup micro-batch that decodes only the tiles touched by
+  a key-order vector or predicate bitset. Failure condition: compressed random
+  access saves memory but increases p95 enough to miss the retained-read
+  latency ceiling.
+- Add refresh-cost accounting for compressed generations: CPU compression time,
+  transfer time, resident bytes saved, invalidation frequency, and queries
+  served before the generation is retired. Proof gate: compression pays back
+  before the next invalidation for the target workload.
+- Expose compression choice as route metadata rather than table metadata:
+  scheme per column, tile size, decode scratch bytes, supported predicates, and
+  fallback reason when a query needs unsupported types or expressions.
+- Test compression under mixed retained reads and writes by holding an old
+  compressed generation while a new CPU/MVCC generation is published. Failure
+  condition: refresh or recompression blocks WAL-before-visibility publication
+  or lets new readers select an invalidated compressed generation.
