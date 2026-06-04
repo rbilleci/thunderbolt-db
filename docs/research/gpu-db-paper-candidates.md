@@ -3734,7 +3734,7 @@ Append new candidates here as each paper is processed.
   Why: modern query-driven cardinality estimator for incomplete and
   imbalanced join templates; useful follow-up for GPU DB route models when
   training logs do not cover all tenant query shapes.
-- `queued` — **Convolution and Cross-Correlation of Count Sketches Enables
+- `reviewed` — **Convolution and Cross-Correlation of Count Sketches Enables
   Fast Cardinality Estimation of Multi-Join Queries**, Heddes et al.,
   PACMMOD 2024.
   URL: `https://doi.org/10.1145/3654932`
@@ -3743,6 +3743,24 @@ Append new candidates here as each paper is processed.
   composition as a compact way to approximate join correlations; useful for
   comparing learned sketches with more direct sketch algebra for GPU DB route
   estimates.
+- `queued` — **JoinSketch: A Sketch Algorithm for Accurate and Unbiased
+  Inner-Product Estimation**, Wang et al., PACMMOD 2023.
+  URL: `https://doi.org/10.1145/3589318`
+  Why: cited as a skew-aware sketching complement; useful for comparing
+  heavy-key separation with count-sketch multi-join estimates for GPU route
+  cardinality and resident predicate-filter sizing.
+- `queued` — **COMPASS: Online Sketch-Based Query Optimization for In-Memory
+  Databases**, Izenov et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457281`
+  Why: direct sketch-based query-optimization baseline for online filtered
+  cardinality estimation; useful for deciding which predicates should be
+  handled at sketch-ingest time versus route-evaluation time.
+- `queued` — **Pessimistic Cardinality Estimation: Tighter Upper Bounds for
+  Intermediate Join Cardinalities**, Cai, Balazinska, and Suciu, SIGMOD 2019.
+  URL: `https://doi.org/10.1145/3299869.3319894`
+  Why: cited as an upper-bound alternative to sketch and learned estimators;
+  useful for guardrailing GPU route choices when an underestimated join could
+  overflow HBM, pinned buffers, or response-ring budgets.
 - `queued` — **ASM: Harmonizing Autoregressive Model, Sampling, and
   Multi-dimensional Statistics Merging for Cardinality Estimation**,
   Kim et al., PACMMOD 2024.

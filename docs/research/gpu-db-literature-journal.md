@@ -51193,3 +51193,147 @@ write-path durability, transaction placement, and future-tier mechanics.
 Upcoming runs should bias toward query optimization under live resource state,
 MVCC/snapshot route certification, or high-concurrency networking/session
 admission rather than another GPU operator paper.
+
+### 2026-06-05 - Count-sketch multi-join estimates should be route-budget inputs, not oracle costs
+
+**Citation:** Mike Heddes, Igor Nunes, Tony Givargis, and Alex Nicolau.
+"Convolution and Cross-Correlation of Count Sketches Enables Fast Cardinality
+Estimation of Multi-Join Queries." PACMMOD/SIGMOD 2024, Article 129.
+doi:10.1145/3654932. Retrieved 2026-06-05 from the arXiv PDF,
+`https://arxiv.org/abs/2402.15953`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** cardinality estimation; count sketches; multi-join
+planning; route costing; streaming updates; skew; approximate query
+processing; GPU route admission; resident-cache sizing; planner telemetry.
+
+**Core idea:** The paper solves a specific but important planner problem:
+fast, incrementally maintainable cardinality estimates for acyclic multi-join
+queries. Older AMS-style sketches can estimate multi-join cardinalities, but
+updating them touches the full sketch and becomes too expensive when higher
+accuracy needs larger sketches. Count sketches have fast sparse updates, but
+a direct Hadamard-product composition loses information because two sparse
+single-item sketches usually place their nonzero counters in different bins.
+
+The authors replace that incompatible composition with circular convolution
+when building tuple sketches and circular cross-correlation during inference.
+This preserves the useful sparse-update property of Count sketches while
+retaining unbiased multi-join estimates and AMS-like error guarantees. The
+result is a planner synopsis that can ingest updates at streaming speed, stay
+compact, and still estimate multi-join intermediate sizes well enough to
+change real PostgreSQL plan execution time.
+
+**Concrete mechanisms:**
+
+- For each joined attribute component, the method samples bin hashes and sign
+  hashes. A tuple update computes one signed counter update by combining the
+  tuple's joined-attribute signs and summing joined-attribute bin positions
+  modulo the sketch size.
+- The key replacement is circular convolution for composing sparse Count
+  sketches of tuple attributes. Unlike element-wise multiplication, convolution
+  maps the operands' nonzero positions to a deterministic modulo-sum position,
+  so the tuple sketch retains information in constant update time with respect
+  to sketch size.
+- Query inference combines relation sketches with Hadamard products and
+  circular cross-correlations. A depth-first traversal over the acyclic join
+  graph factorizes inference, and FFT support reduces inference to roughly
+  `O(r m log m)` rather than exponential work over graph components.
+- The estimator is unbiased for the targeted acyclic multi-join family and has
+  an error bound matching the AMS-based multi-join estimator. Repeated
+  independent estimates can use the standard median trick for confidence.
+- The evaluation uses STATS-CEB and JOB-light over the STATS and IMDB datasets.
+  The paper reports that 97% of benchmark queries contain at least one relation
+  participating in multiple joins, so multi-join support matters beyond toy
+  cases.
+- The implementation uses PyTorch tensors and polynomial hash functions; the
+  authors publish source code and extended results at
+  `https://github.com/mikeheddes/fast-multi-join-sketch`.
+- Reported update throughput for the proposed method stays around 6.3M-7.0M
+  tuples/s across 1 KiB to 10 MiB sketch memory settings, while AMS drops from
+  5.2M tuples/s at 1 KiB to 774 tuples/s at 10 MiB.
+- With a 1,000,000-bin sketch, the proposed estimator averages about 137 MB
+  and 0.30 seconds per sub-query estimate in the learning-method comparison;
+  it reaches q-error below 2 for about 95% of sub-queries.
+- Injecting the paper's estimates into PostgreSQL improves total execution
+  time by 43% across STATS-CEB and JOB-light versus PostgreSQL's default
+  estimates. The best result is not always on every workload, but the method
+  combines competitive accuracy with much cheaper update behavior than
+  learning-based retraining.
+
+**GPU DB mapping:** This is most useful as a route-costing primitive for GPU
+DB, not as a full optimizer replacement. P8 needs to decide whether a query
+uses CPU tuple/index paths, CPU segment paths, GPU cold-transfer paths, GPU
+resident scans, or future resident indexes. Those choices need estimates of
+intermediate rows, output rows, and selectivity under live data updates. A
+compact count-sketch synopsis can provide a continuously updated estimate for
+join-like and predicate-composition shapes without waiting for expensive model
+retraining.
+
+The strongest transferable idea is to attach approximate cardinality synopses
+to route families and resident generations. For a hot table or segment, the
+engine could maintain sketches at mutation-owner or refresh boundaries, publish
+them with the same generation metadata as retained snapshots, and let the
+planner ask: is this route likely to fit HBM, pinned output buffers, response
+rings, and latency budget? The answer should be a budget signal with confidence
+and error telemetry, not a correctness claim.
+
+The streaming-update property fits WAL-before-visibility if sketch updates are
+staged carefully. Mutations can update private or next-generation sketches as
+part of the same owner-owned publication path as table statistics. A sketch
+becomes visible to planners only after the corresponding visibility generation
+or retained resident snapshot is published. Recovery can rebuild sketches from
+WAL/checkpoint CPU truth, keeping them derived performance state.
+
+This also complements the recent synthesis on movement windows. A route
+certificate should not only know that a resident GPU path exists; it should
+estimate whether the intermediate cardinality will exceed the route's memory
+or queue budget. Count-sketch estimates are a candidate low-overhead input for
+that certificate, especially when training logs are sparse or tenant workloads
+shift faster than learned route models can be refreshed.
+
+**Risks and mismatches:** The paper targets acyclic multi-join cardinality
+estimation and approximate query processing, not transaction execution, MVCC
+visibility, GPU kernels, or high-concurrency admission. Cyclic joins, arbitrary
+SQL expressions, NULL semantics, text predicates, and update/delete visibility
+would need additional design before the technique can be used broadly.
+
+The evaluation is CPU-based and uses PyTorch, not an integrated DBMS hot path
+or GPU-resident sketch maintenance. A 137 MB sketch can be reasonable for an
+offline planner experiment but too large for many per-table, per-tenant, or
+per-generation GPU DB route synopses. The right granularity may be table,
+segment, predicate family, or route family rather than every query shape.
+
+Most importantly, cardinality estimates can be wrong. Underestimation is
+especially dangerous for GPU DB because it can over-admit a route that spills
+HBM, saturates pinned buffers, or builds response batches that exceed latency
+ceilings. The planner should pair sketch estimates with conservative upper
+bounds, fallback routes, and runtime rejection when the observed result size
+exceeds the planned envelope.
+
+**Benchmark candidates:**
+
+- Prototype a per-generation route-sketch synopsis for a small join/predicate
+  workload. Compare default statistics, learned route estimates from prior
+  logs, and count-sketch multi-join estimates. Gate: lower route misprediction
+  rate without stale-generation reads after mutation and replay tests.
+- Add a GPU route-budget simulation where estimated intermediate rows decide
+  between resident scan, resident index, CPU fallback, and rejection. Failure
+  condition: underestimated sketches admit routes that exceed configured HBM,
+  pinned-buffer, or response-ring budgets without explicit fallback.
+- Measure sketch update placement: mutation-owner synchronous update,
+  next-generation background update, and refresh-time rebuild. Record write
+  p50/p99, publication lag, sketch staleness, planner accuracy, and recovery
+  rebuild time.
+- Test sketch granularity: one global table sketch, per-segment sketches,
+  per-resident-generation sketches, and per-route-family sketches. Minimum
+  proof: finer granularity improves route choice enough to pay for memory and
+  update overhead.
+- Add adversarial skew and hot-key shift runs. Compare count-sketch estimates
+  with heavy-key side tables or JoinSketch-style follow-ups. Failure condition:
+  skew causes repeated GPU over-admission or hides a CPU index route that would
+  have met latency.
+- Combine sketch estimates with pessimistic upper bounds. The route planner
+  should use the point estimate for ranking but the upper bound for admission
+  into scarce resources. Gate: fewer catastrophic memory/queue overruns with
+  acceptable loss in throughput.
