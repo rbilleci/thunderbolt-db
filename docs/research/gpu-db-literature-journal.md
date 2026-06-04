@@ -29254,3 +29254,170 @@ Benchmark priority: build the no-GPU memory-credit and route-telemetry
 prototype first, because it can prove that large temporary operators do
 not silently evict hot retained snapshots or hide overload. GPU kernels
 can come later once the new hardware is available.
+
+### 2026-06-04 - Centiman watermarks turn OCC validation into an asynchronous frontier
+
+**Citation:** Bailu Ding, Lucja Kot, Alan Demers, and Johannes Gehrke.
+"Centiman: Elastic, High Performance Optimistic Concurrency Control by
+Watermarking." SoCC 2015. doi:10.1145/2806777.2806837. Retrieved
+2026-06-04 from
+`https://www.microsoft.com/en-us/research/wp-content/uploads/2016/07/centiman_socc_2015.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; runtime / HFT / session scale.
+
+**Relevance tags:** optimistic concurrency control; sharded validation;
+watermark frontiers; read-only bypass; elastic validators; timestamp-order
+validation; asynchronous write installation; spurious abort reduction;
+read snapshot detection; commit frontier telemetry; owner boundary scaling.
+
+**Core idea:** Centiman decouples transaction processors, validators, and
+storage while still enforcing serializability over a key-value store. The
+transaction processor executes reads, buffers writes, assigns a timestamp,
+sends partitioned read/write sets to validators, and only installs writes
+after all relevant validators approve. Validators are sharded by key space
+and validate in timestamp order, so validation work can scale independently
+from transaction execution and storage.
+
+The hard problem in that loose coupling is stale validator state. A
+validator may locally accept a transaction that aborts globally because a
+different validator rejected it. If the accepting validator keeps that
+transaction's write set, later transactions can abort against a write that
+never committed. Centiman avoids synchronous commit-decision broadcast by
+propagating conservative watermarks. A record read returns not just a
+version but a watermark frontier saying that all transactions up to that
+frontier have either installed their writes to the record or will never do
+so.
+
+That frontier lets validation skip older write sets and lets some read-only
+transactions prove locally that their reads overlap at one serial snapshot.
+The evaluation reports that watermarks keep spurious aborts low, that
+validator scale-out converges quickly after the new validators build enough
+state, and that read-heavy TATP benefits heavily from the local read-only
+check. The reported throughput claims are system-specific, but the
+transferable idea is the separation of correctness frontier propagation
+from the hot validation and storage paths.
+
+**Concrete mechanisms:**
+
+- Each datastore record carries a version equal to the timestamp of the
+  transaction that wrote it. A stale `put(key, value, timestamp)` is ignored
+  if a newer version is already installed, preserving the timestamp-order
+  write rule without a global write critical section.
+- A processor owns a transaction's read phase, private write workspace,
+  timestamp assignment, validation fan-out, commit/abort decision, write
+  installation, client response, and redo log for committed writes that may
+  need replay after processor failure.
+- Validators receive only their key-space slice of a transaction's read set
+  and write set. They process validation requests in timestamp order and
+  retain accepted write sets for future conflict checks.
+- Naive validation checks each read `(key, version)` against retained write
+  sets for timestamps between the read version and the transaction timestamp.
+  Missing state forces conservative aborts; retained write sets from globally
+  aborted transactions can cause spurious aborts.
+- On each read, the processor computes a conservative watermark from local
+  and cached remote processor watermarks. A processor watermark means all
+  transactions for that processor at or below the frontier have completed:
+  aborted, or committed and installed writes.
+- Validation uses triples `(key, version, watermark)` and starts conflict
+  checking after `max(version, watermark)`. Old polluted write sets age out
+  naturally once all future reads will have larger watermarks.
+- Garbage collection of validator write sets is safe after all in-flight and
+  future read watermarks are greater than the timestamp being collected.
+  More aggressive collection remains safe only by causing conservative aborts
+  when required state is absent.
+- A read-only transaction can bypass validators if the intersection of all
+  per-read version/watermark intervals is nonempty. If the check fails, the
+  transaction still goes through normal validation.
+- Validator scaling runs old and new key-space partitions in parallel during
+  a transition. New validators may return unknown/abort while warming their
+  state; the old partition remains authoritative until decisions converge.
+- Processor recovery replays committed-but-not-completed writes from a WAL.
+  Validators do not need durable logs; pending validations time out, and a
+  replacement validator rebuilds state by rejoining through the scaling
+  protocol.
+- In the experiments, updating processor watermarks every transaction gives
+  the lowest spurious aborts, but every 10K transactions remains effective in
+  the tested workloads. Read-heavy local bypass is strongest when reads are
+  one-shot or their version/watermark intervals overlap.
+
+**GPU DB mapping:** The most useful mapping is a visibility frontier carried
+as a first-class routing key. GPU DB already needs source WAL boundaries,
+snapshot generations, invalidation generations, owner queues, and resident
+route validity. Centiman suggests treating those as a family of monotonic
+frontiers: mutation frontier, installed frontier, resident-refresh frontier,
+validator/owner frontier, and read-safe frontier. A read route should say
+which frontier proves that its resident snapshot or CPU fallback is safe,
+not just which buffer it plans to touch.
+
+For write throughput, sharded validators map to partition or key-range
+owners that validate write batches without global locks. A transaction or
+COPY chunk can fan out read/write-set summaries to the relevant owners, then
+commit only after all owners return deterministic decisions. That is not a
+replacement for WAL-before-visibility; it is a way to avoid one monolithic
+validation owner when key ranges are independent. The WAL publish point can
+still be the final visibility frontier after owner-local validation succeeds.
+
+For read throughput and session concurrency, Centiman's local read-only
+check maps to retained read admission. If a read-only SQL template touches a
+small set of snapshot generations, the runtime can compute whether their
+validity intervals intersect. If they do, the request can bypass mutation
+owners and execute on immutable CPU/GPU snapshots. If not, it falls back to a
+stronger owner or validation path. This is especially attractive for 1M
+logical sessions because most idle or read-mostly sessions should not create
+owner traffic just to prove a stable snapshot.
+
+For GPU execution, the key is not to put general OCC validation on the GPU
+by default. The better first benchmark is a frontier-aware route descriptor:
+snapshot generation, source WAL boundary, read watermark, invalidation
+frontier, resident segment id, and required owner acknowledgements. Compatible
+same-shape reads can then micro-batch only when their frontier intervals
+overlap. Mutation batches can expose commit-frontier lag as admission
+telemetry, so the runtime can choose between immediate validation, batching,
+CPU fallback, or rejection.
+
+For tier placement, watermarks are also a cache-retirement tool. A resident
+GPU segment, host spill page, or cold-tier index generation can be retired
+only when all active read frontiers have advanced past its visibility range.
+That avoids tying cache eviction to wall-clock age and gives long retained
+snapshots an explicit cost in bytes and frontier lag.
+
+**Risks and mismatches:** Centiman is a distributed key-value transaction
+system, not a SQL storage engine with MVCC tuple chains, DDL, joins, GPU
+resident layouts, or WAL/checkpoint/archive semantics. Its validation model
+depends on known read/write sets and timestamp-order validator processing;
+interactive SQL transactions, predicate reads, range scans, and secondary
+indexes require additional phantom and predicate-protection design. The
+read-only bypass check is conservative and works best when reads are simple
+and intervals overlap; complex SQL plans may need predicate-level or
+operator-level proof. The paper allows asynchronous write installation after
+commit decisions, while GPU DB must preserve WAL-before-visibility and must
+not expose a committed result before durable authority is clear. Watermark
+frequency is a tuning knob: stale frontiers preserve correctness but increase
+aborts, validation work, and cache retention.
+
+**Benchmark candidates:**
+
+- Add a no-GPU frontier descriptor to retained read routing:
+  `read_txn`, `source_wal`, `read_watermark`, `invalidation_generation`,
+  `resident_generation`, and `owner_frontier`. Gate: every retained read can
+  explain why it bypassed or touched the mutation owner.
+- Implement the read-only interval-intersection check for same-table retained
+  point lookups and simple aggregates. Metrics: owner bypass rate, false
+  fallback rate, p50/p99 latency, and correctness under concurrent writes.
+- Simulate sharded validation over key-range owners for batched writes:
+  partitioned read/write summaries, timestamp-order owner validation, global
+  commit decision, WAL publish, and conservative abort on missing owner state.
+  Failure condition: any successful read observes data past its proven
+  frontier.
+- Measure watermark update cadence: every transaction, every N commits, every
+  time slice, and queue-depth-triggered updates. Metrics: spurious/conflict
+  aborts, owner messages, retained snapshot lifetime, cache bytes pinned by
+  old frontiers, and validation CPU.
+- Add a frontier-lag overload signal to session admission. When frontiers lag,
+  short reads may route to older safe snapshots, writes may batch, and long
+  analytical routes may be rejected before pinning more resident state.
+- Test resident segment retirement by active read frontiers instead of simple
+  age or LRU. Gate: a segment cannot be evicted while an active route still
+  has an interval that requires it; failure condition is either stale read
+  exposure or unbounded cache retention with no telemetry.

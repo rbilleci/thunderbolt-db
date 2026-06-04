@@ -1027,9 +1027,11 @@ Append new candidates here as each paper is processed.
   Why: modern DBaaS resource-allocation paper cited by Resource-Adaptive Query
   Execution; relevant to pricing or value-of-memory admission policies for
   multi-tenant/session-heavy GPU DB workloads.
-- `queued` — **Centiman: Elastic, High Performance Optimistic Concurrency
+- `reviewed` — **Centiman: Elastic, High Performance Optimistic Concurrency
   Control by Watermarking**, Ding et al., SoCC 2015.
-  URL: `https://doi.org/10.1145/2806777.2806846`
+  URL: `https://doi.org/10.1145/2806777.2806837`
+  PDF:
+  `https://www.microsoft.com/en-us/research/wp-content/uploads/2016/07/centiman_socc_2015.pdf`
   Why: PWV contrasts against watermark-based OCC; relevant to timestamp
   frontiers, elastic admission, and deciding whether GPU DB write batches
   should expose commit/read watermarks instead of only per-transaction
@@ -1038,7 +1040,8 @@ Append new candidates here as each paper is processed.
   Geo-Distributed Databases**, Cui et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p3840-cui.pdf`
   Why: modern low-tail transaction follow-up that cites Plor; relevant to
-  predictable transaction admission and retry behavior under high contention.
+  latency-aware transaction routing, predictable commit paths, and predictable
+  transaction admission and retry behavior under high contention.
 - `reviewed` — **Rebirth-Retire: A Concurrency Control Protocol Adaptable to
   Different Levels of Contention**, Zhang et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p3162-zhang.pdf`
@@ -1416,9 +1419,11 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`
   Why: learned concurrency-control policy selection cited by TSkd; useful as
   a contrast to deterministic owner-queue rules and runtime-conflict telemetry.
-- `queued` — **Centiman: Elastic, High Performance Optimistic Concurrency
+- `reviewed` — **Centiman: Elastic, High Performance Optimistic Concurrency
   Control by Watermarking**, Ding et al., SoCC 2015.
-  URL: `https://doi.org/10.1145/2806777.2806842`
+  URL: `https://doi.org/10.1145/2806777.2806837`
+  PDF:
+  `https://www.microsoft.com/en-us/research/wp-content/uploads/2016/07/centiman_socc_2015.pdf`
   Why: OCC validator/storage architecture cited by the batching paper; useful
   for comparing watermark-based validation, decoupled compute/storage, and
   versioned write installation against GPU DB owner boundaries.
@@ -1434,6 +1439,15 @@ Append new candidates here as each paper is processed.
   Why: hybrid OCC/pessimistic contention handling cited by the batching paper;
   useful for deciding when GPU DB owner queues should switch from optimistic
   validation to contention-aware ordered execution.
+- `queued` — **Using Read Promotion and Mixed Isolation Levels for Performant
+  Yet Serializable Execution of Transaction Programs**, Vandevoort et al.,
+  PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p2846-vandevoort.pdf`
+  DOI: `https://doi.org/10.14778/3746405.3746412`
+  Why: modern mixed-isolation and read-promotion follow-up discovered while
+  reviewing Centiman's read-only bypass path; relevant to route-level choices
+  that keep serializability while letting safe read-heavy templates avoid the
+  strongest validation path.
 - `queued` — **Detock: High Performance Multi-region Transactions at Scale**,
   Li et al., SIGMOD 2023.
   URL:
