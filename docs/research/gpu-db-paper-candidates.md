@@ -543,7 +543,7 @@ Append new candidates here as each paper is processed.
   caching/routing layers to avoid synchronous database round trips while
   preserving distributed transaction support; useful for GPU DB catalog,
   route-cache, and cold-tier namespace scaling.
-- `queued` — **BinDex: A Two-Layered Index for Fast and Robust Scans**,
+- `reviewed` — **BinDex: A Two-Layered Index for Fast and Robust Scans**,
   Li et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3380563`
   PDF: `https://kay21s.github.io/Bindex2020.pdf`
@@ -3465,3 +3465,22 @@ Append new candidates here as each paper is processed.
   Why: Detock cites adaptive physical design for distributed locality changes;
   relevant to tier/partition placement when hot tables move between CPU,
   GPU-resident, NVMe, and future memory tiers.
+- `queued` — **Smooth Scan: Robust Access Path Selection Without
+  Cardinality Estimation**, Borovica-Gajic et al., VLDB Journal 2018.
+  URL: `https://doi.org/10.1007/s00778-017-0477-4`
+  Why: BinDex contrasts against adaptive morphing between index and scan
+  behavior; useful for route designs that degrade smoothly when GPU resident
+  predicate-index selectivity or queue pressure estimates are wrong.
+- `queued` — **Column Sketches: A Scan Accelerator for Rapid and Robust
+  Predicate Evaluation**, Hentschel, Kester, and Idreos, SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3196894`
+  Why: BinDex uses Column Sketches as a main robust-scan baseline; useful for
+  comparing lossy compressed host/GPU predicate filters with binned bitmap
+  refinement under tight memory budgets.
+- `queued` — **Access Path Selection in Main-Memory Optimized Data Systems:
+  Should I Scan or Should I Probe?**, Kester, Athanassoulis, and Idreos,
+  SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3064049`
+  Why: BinDex cites this as the selectivity/concurrency access-path motivation;
+  useful for turning resident scan, predicate-index, and CPU fallback choices
+  into a measured planner route boundary instead of a fixed threshold.

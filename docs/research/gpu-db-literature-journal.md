@@ -42263,3 +42263,179 @@ clear replay boundaries.
 - In 1M logical-session write tests, tie active write credits to the durability
   boundary, not to socket write completion. The expected result is bounded WAL
   memory and explicit backpressure when remote durability lags.
+
+### 2026-06-04 - BinDex turns predicate scans into a memory-budgeted route
+
+**Citation:** Linwei Li, Kai Zhang, Jiading Guo, Wen He, Zhenying He,
+Yinan Jing, Weili Han, and X. Sean Wang. "BinDex: A Two-Layered Index for
+Fast and Robust Scans." SIGMOD 2020, pp. 569-584.
+doi:10.1145/3318464.3380563. Retrieved 2026-06-04 from
+`https://kay21s.github.io/Bindex2020.pdf`.
+
+**Category:** query optimization / planning; resident predicate indexing.
+
+**Relevance tags:** predicate scans; bitmap indexes; robust access paths;
+resident scan routes; memory-budgeted indexes; selectivity uncertainty;
+column-store filters; GPU predicate routing.
+
+**Core idea:** BinDex targets the access-path cliff between sequential scans
+and secondary indexes in in-memory column stores. Sequential scans are robust
+but touch too much data for low-selectivity predicates; B+-tree-style index
+scans avoid irrelevant values but can become dominated by random memory
+accesses once selectivity rises. BinDex builds a two-layer structure that
+mostly answers a predicate from a copied binned bitmap, then fixes the small
+uncertain region through a row-id position array.
+
+The transferable point is not just "use bitmaps." BinDex makes predicate
+access a memory-budgeted route: adding more virtual areas consumes more bitmap
+memory but shrinks the refine work, while a smaller budget can fall back to
+lossy sketches or scan-oriented layouts. That is a useful shape for GPU DB,
+where resident HBM, pinned host memory, compressed warm segments, and CPU
+fallback all need explicit admission rules.
+
+**Concrete mechanisms:**
+
+- A column has a virtual value space: all values sorted ascending, partitioned
+  into `K` equi-depth virtual areas.
+- The area map stores a boundary value and cumulative count for each virtual
+  area, so a predicate constant can be mapped to the uncertain area by binary
+  search.
+- The filter layer stores `K - 1` bit vectors. Filter vector `F_i` marks rows
+  whose value belongs to the first `i` virtual areas, which makes it an
+  approximate result for range predicates.
+- For a predicate such as `x < c`, BinDex chooses the neighboring filter vector
+  that minimizes corrections. Under the paper's uniform-constant assumption,
+  the expected refine work is one quarter of a virtual area, about
+  `N / (4K)` row ids.
+- The refine layer stores row ids in sorted-value order in a position array.
+  It binary-searches inside the chosen virtual area and then sequentially
+  reads the row ids for values whose result bits must be flipped.
+- Result-bit writes are random, so the implementation uses row-id-driven
+  software prefetching. On the evaluated platform, prefetching improved the
+  refine layer by about `14.1-29.9%` and full BinDex scans by about
+  `7.6-15.5%`.
+- Operators `>`, `<=`, `>=`, `BETWEEN`, `=`, and `!=` are built from the same
+  range-filter machinery with bitwise NOT, AND, XOR, all-zero, or all-one
+  draft vectors to avoid extra full-column passes.
+- BinDex can compress redundant filter bitmaps for skewed values that span
+  adjacent areas and would never be selected as useful candidate filters.
+- Incremental append support inserts new row ids into loosely coupled position
+  blocks and extends bitmaps. When virtual-area size skew exceeds a threshold,
+  the index is rebuilt.
+- The performance model separates area-map search, filter-vector copy,
+  position-array search, and refine work. It uses memory budget to choose the
+  number of virtual areas and therefore the performance/space point.
+- Evaluation uses one billion values per column, uniform and Zipf data,
+  18 CPU cores, and all data resident in DRAM. With 32-bit codes, BinDex
+  reports roughly `2.1x`, `2.9x`, and `5.6x` higher performance than Column
+  Sketches, ByteSlice, and Zone Maps respectively; BinDex(512) reports around
+  `2.9x` over Column Sketches. Initial build time is reported as `143s` for
+  one billion values, `36.3%` slower than the tested B+-tree; append updates
+  are reported as `33.4%` slower than B+-tree updates on average.
+- MonetDB integration replaced the select operator with BinDex and added a
+  bitmap-aware fetch operator. The paper reports `7.1x` improvement for
+  TPC-H Q6 and only `4.9%` for Q1 because Q1's time is dominated by
+  aggregation rather than selection.
+
+**GPU DB mapping:** BinDex is a strong candidate for the P8 resident predicate
+index family, especially for retained `int4` range and equality predicates
+where a full GPU scan is too expensive but a random-access tree is fragile
+under high selectivity. A GPU DB version would likely keep the filter layer as
+resident bitmaps or compressed bitmap tiles, with the refine layer as a
+resident or pinned row-id/value-side structure grouped by segment generation.
+
+The memory-budget framing maps directly to the cache manager. Instead of a
+binary choice between "resident scan" and "CPU fallback," the planner could
+have route levels: no predicate index, lossy sketch, BinDex-like low-`K`
+filter, high-`K` filter, or GPU tree/index. Each level needs an HBM/host-memory
+cost, expected refine rows, result-bit materialization cost, and update/rebuild
+cost.
+
+For micro-batching, same-shape retained predicates can share filter-vector
+copies or run bitwise operations over the same resident bitmap tiles. The
+refine phase is the harder part: request-specific constants produce different
+uncertain ranges, so batched kernels should group by snapshot generation,
+column, operator, and nearby virtual-area id before trying to scatter result
+bits.
+
+For MVCC, BinDex must be snapshot-scoped. The paper assumes analytical data
+with infrequent updates; GPU DB cannot let a retained predicate bitmap ignore
+begin/end visibility, tombstones, or resident invalidation generations. A
+safe design would bind each BinDex-like structure to a resident snapshot
+boundary and rebuild or maintain delta overlays after mutation, just like other
+GPU-resident acceleration state.
+
+**Risks and mismatches:** The paper is CPU/in-memory/column-store work, not a
+GPU implementation. Its random-write prefetching lessons may not transfer
+directly to GPU result-bit scatter, where warp divergence, atomics, coalescing,
+and bitmap tile layout dominate. The best reported results also spend
+substantial memory: 32 virtual areas for one billion 32-bit values cost around
+`8GB`, and 128 areas cost around `20GB` before skew compression. That is a real
+HBM budget issue.
+
+Update handling is intentionally analytical and append-heavy. GPU DB's write
+path, deletes, MVCC version chains, and long retained snapshots would need
+generation-specific rebuilds or delta structures. BinDex also outputs a result
+bitmap, so downstream operators must either consume bitmaps efficiently or pay
+materialization/fetch costs. Finally, the paper's "eliminate access-path
+selection" claim holds only when enough memory is available and the workload is
+selection-heavy; GPU DB still needs route choice because transfer, queue delay,
+visibility, and aggregation/join costs can dominate.
+
+**Benchmark candidates:**
+
+- Prototype a CPU-side BinDex-like index for the first P8 `int4` resident
+  table slice. Compare resident scan, CPU B-tree/index lookup, and binned
+  bitmap refinement across selectivities from `0.001%` to `100%`.
+- Build a GPU bitmap-filter microbenchmark with `K = 32, 128, 512` virtual
+  areas. Required metrics: HBM bytes, filter-copy time, refine row count,
+  result-bit scatter time, p50/p95 latency, and rows/s.
+- Add a memory-budget admission test: given HBM and pinned-host limits, choose
+  no index, sketch, low-`K` BinDex, or high-`K` BinDex. Failure condition: a
+  route consumes more resident memory than its declared budget.
+- Test update pressure by holding a retained snapshot open while appending,
+  updating, and deleting rows. Proof gate: new readers never use a stale
+  predicate bitmap, and old readers see the correct snapshot boundary.
+- Measure bitmap-result reuse for same-shape retained predicates and downstream
+  `COUNT`, `SUM`, and row fetch. Expected result: the index only wins when
+  downstream operators can consume bitmaps without expensive materialization.
+- Compare segment-local BinDex structures against table-global structures.
+  Segment-local indexes may rebuild faster and map better to tiered placement;
+  failure condition: too many segment bitmaps make route planning or result
+  merging dominate.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates now need memory-budgeted predicate routes
+
+**Converging design tracks:** X-SSD and Correct Remote Persistence pushed the
+write path toward explicit route certificates: what boundary is durable, what
+counter advanced, and which tier or replica owns recovery. BinDex adds the read
+side complement: a route certificate should also state the memory budget,
+index representation, snapshot generation, and refine/materialization cost for
+predicate reads.
+
+The converging track is a typed route descriptor that covers both safety and
+economics. For writes, it carries WAL/durability boundaries and admission
+credits. For reads, it carries snapshot visibility, resident tier, predicate
+index level, expected refine rows, output representation, and fallback rules.
+That descriptor is what the runtime, planner, and cache manager can measure
+against.
+
+**Category gaps:** The last few reviewed papers improved write durability and
+predicate/index route design. The queue still needs more modern runtime and
+session-scale work, plus CPU/GPU placement papers that connect planner route
+choice with queue pressure. The next high-value candidates should favor
+runtime admission, workload placement, or learned/robust access-path selection
+over another pure GPU scan paper unless the queue becomes stale.
+
+**Benchmark priorities:**
+
+- Implement route certificates with both durability counters and read-route
+  memory budgets before adding more accelerator-specific shortcuts.
+- Add a predicate-route benchmark matrix: resident scan, sketch, binned
+  bitmap/refine, GPU tree, and CPU fallback across selectivity, update rate,
+  HBM pressure, and queue depth.
+- Require every retained read route to report snapshot generation, resident
+  bytes, output representation, refine rows, and fallback/rejection reason.
+- Keep WAL visibility and resident read certificates separate: a commit can be
+  durable and CPU-visible while GPU predicate indexes are still invalidated or
+  refreshing.
