@@ -468,7 +468,7 @@ Append new candidates here as each paper is processed.
   Why: direct OMVCC baseline for transaction repair, with timestamp,
   validation, and version-chain design relevant to serializable MVCC in a
   memory-resident engine.
-- `queued` — **Constant Time Recovery in Azure SQL Database**,
+- `reviewed` — **Constant Time Recovery in Azure SQL Database**,
   Antonopoulos et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p2143-antonopoulos.pdf`
   Why: MD-MVCC depends on SQL Server's versioned recovery infrastructure for
@@ -3866,13 +3866,28 @@ Append new candidates here as each paper is processed.
   Why: WBL's Peloton implementation stores indexes as persistent B+trees;
   useful for deciding whether future host/persistent indexes should be durable
   performance state or rebuilt from WAL and route metadata.
-- `queued` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
+- `reviewed` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
   Larger-Than-Memory Range Index**, Hao and Chandramouli, PVLDB 2024.
-  URL: `https://vldb.org/pvldb/vol17/p3442-hao.pdf`
-  DOI: `https://doi.org/10.14778/3685800.3685831`
+  URL: `https://www.vldb.org/pvldb/vol17/p3442-hao.pdf`
+  DOI: `https://doi.org/10.14778/3681954.3682012`
   Why: follow-up by the Three-Tree first author on larger-than-memory range
-  indexing; useful for comparing page-granular tiering with an index design
-  that explicitly balances reads, writes, concurrency, and cold storage.
+  indexing. Marked reviewed because duplicate journal entries already exist;
+  useful for comparing page-granular tiering with an index design that
+  explicitly balances reads, writes, concurrency, and cold storage.
+- `queued` — **TreeLine: An Update-in-Place Key-Value Store for Modern
+  Storage**, Yu et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol16/p99-yu.pdf`
+  DOI: `https://doi.org/10.14778/3561261.3561267`
+  Why: CTR and Bf-Tree both point toward recoverable hot/cold storage state;
+  TreeLine is a modern storage follow-up for insert forecasting, record
+  caching, and update-in-place behavior on fast storage.
+- `queued` — **WALTZ: Leveraging Zone Append to Tighten the Tail Latency of
+  LSM Tree on ZNS SSD**, Lee, Kim, and Lee, PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p2884-lee.pdf`
+  DOI: `https://doi.org/10.14778/3611540.3611551`
+  Why: modern log-structured storage follow-up for separating write
+  amplification, tail latency, and cold-tier device semantics from
+  page-oriented WAL/checkpoint assumptions.
 - `reviewed` — **Tiered-Indexing: Optimizing Access Methods for Skew**, Zhou,
   Hao, Yu, and Stonebraker, VLDB Journal 2025.
   URL: `https://doi.org/10.1007/s00778-025-00928-6`
