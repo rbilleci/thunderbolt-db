@@ -69,6 +69,13 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   High-Frequency Virtual Snapshotting**, arXiv 2017.
   URL: `https://arxiv.org/abs/1709.04284`
   Why: HTAP-style analytical snapshots without blocking write progress.
+- `reviewed` — **MD-MVCC: Multi-version Concurrency Control for Schema Changes
+  in Azure SQL Database**, Antonopoulos et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p4791-antonopoulos.pdf`
+  DOI: `https://doi.org/10.14778/3750601.3750605`
+  Why: modern production metadata-MVCC design selected after recent reviews
+  called for more MVCC/snapshot work; relevant to versioned route metadata,
+  DDL/read concurrency, snapshot-safe plan reuse, and route-metadata GC.
 
 ### Runtime scale, HFT-style mechanics, and admission
 
@@ -461,6 +468,12 @@ Append new candidates here as each paper is processed.
   Why: direct OMVCC baseline for transaction repair, with timestamp,
   validation, and version-chain design relevant to serializable MVCC in a
   memory-resident engine.
+- `queued` — **Constant Time Recovery in Azure SQL Database**,
+  Antonopoulos et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p2143-antonopoulos.pdf`
+  Why: MD-MVCC depends on SQL Server's versioned recovery infrastructure for
+  data-modifying schema changes; useful for GPU DB recovery frontiers,
+  WAL-before-visibility, and bounded availability under long transactions.
 - `reviewed` — **Exploiting Directly-Attached NVMe Arrays in DBMS**, Haas,
   Haubenschild, and Leis, CIDR 2020.
   URL: `https://www.cidrdb.org/cidr2020/papers/p16-haas-cidr20.pdf`

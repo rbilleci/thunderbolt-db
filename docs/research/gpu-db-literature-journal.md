@@ -49149,3 +49149,158 @@ queue has a clearly stronger 2025+ tier-placement candidate.
   and OLAP data streams.
 - Compare coarse table-generation safe windows against per-partition safe
   windows before adding per-key freshness state.
+
+### 2026-06-04 - MD-MVCC makes schema metadata snapshot-visible instead of globally blocking
+
+**Citation:** Panagiotis Antonopoulos, Mansi Chauhan, Shailender Dabas,
+Rajat Jain, Darshan Kattera, Wonseok Kim, Hanuma Kodavalla, Nikolas Ogg,
+Prashanth Purnananda, Rahul Ranjan, Alex Swanson, and Divyesh Tikmani.
+"MD-MVCC: Multi-version Concurrency Control for Schema Changes in Azure SQL
+Database." PVLDB 18(12), 2025, pp. 4791-4803.
+doi:10.14778/3750601.3750605. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol18/p4791-antonopoulos.pdf`.
+
+**Category:** MVCC / snapshot / visibility; metadata and schema
+concurrency; runtime admission.
+
+**Relevance tags:** metadata MVCC; schema-version visibility; DDL/read
+concurrency; snapshot compilation; versioned metadata caches; deferred
+deallocation; security metadata exceptions; plan-cache version trade-offs;
+secondary-replica redo freshness.
+
+**Core idea:** MD-MVCC extends SQL Server/Azure SQL Database's MVCC model from
+user rows into schema metadata so schema changes no longer need to wait behind
+long snapshot readers, and snapshot readers no longer need to block behind
+schema changes. Instead of mutating metadata caches and system-table rows in
+place, a schema change creates a new metadata version associated with its
+transaction. Concurrent snapshot queries continue using the older metadata
+version until their snapshot completes, following snapshot isolation semantics.
+
+The strongest transferable idea for GPU DB is that route metadata needs the
+same visibility discipline as table data. A resident GPU route is not only a
+device buffer; it is a bundle of table identity, schema generation, layout,
+column mapping, predicate support, security/fallback policy, and source
+generation. If that bundle is globally overwritten during DDL, refresh, or
+eviction, long readers either block the control plane or risk interpreting
+resident data with the wrong schema. Versioning route metadata at the table or
+route-container level is a cleaner shape: new readers see the latest compatible
+route, old readers finish on the route version they pinned, and cleanup follows
+the oldest active snapshot.
+
+**Concrete mechanisms:**
+
+- Metadata system tables become versioned using the existing storage-engine
+  MVCC infrastructure. Schema changes generate new system-table row versions
+  tied to the schema-changing transaction.
+- In-memory metadata caches store version containers rather than a single
+  object. A container keeps a version chain with transaction identifiers and
+  payloads for top-level objects such as tables and views.
+- Azure SQL chose top-level object versioning rather than fully versioning
+  every sub-object. The paper argues that most schema changes are already
+  serialized at object granularity, metadata objects are small at production
+  P99, and object-level containers avoid special handling for many metadata
+  object types.
+- Secondary cache indexes, such as name-to-object lookup, are also versioned
+  because the same name may map to different object IDs at different snapshots.
+- Version metadata is separated from version payload. Under memory pressure,
+  large payloads can be evicted while compact version metadata remains, so a
+  transaction can still determine which version is visible and reload only the
+  needed payload.
+- A metadata-cache GC periodically compares version chains against the oldest
+  active snapshot and removes versions that are no longer visible. Aborted
+  schema-change versions are marked ghosted and removed by the same cleanup
+  path.
+- The locking model keeps schema modification and schema stability concepts but
+  adds `SCH-A` for snapshot metadata access and `SCH-C` for schema creation or
+  change. `SCH-C` can run concurrently with `SCH-A`, but not with non-snapshot
+  reads, data modifications, or other schema changes.
+- Query compilation always uses a consistent metadata snapshot. For an SI
+  transaction it uses the transaction snapshot; for RCSI and other isolation
+  levels it establishes a compilation-only snapshot.
+- Query execution establishes one snapshot for both data and metadata. Plan
+  reuse checks object timestamps using that same snapshot and recompiles if the
+  cached plan does not match the visible schema.
+- The plan cache deliberately remains single-versioned per query. The paper
+  rejects multi-version plan chains as too complex and memory-heavy for the
+  service, accepting rare recompilation instead.
+- Dropped tables and indexes use deferred data deallocation. Physical pages are
+  not reclaimed until the drop timestamp is older than all active snapshot
+  timestamps.
+- Security metadata is not blindly snapshot-versioned. The metadata manager can
+  expose latest committed security state and uses a graph of versioned and
+  non-versioned entities to decide when older snapshot transactions must abort
+  to avoid stale authorization, auditing, or row-level-security behavior.
+- Evaluation reports that MD-MVCC removes long read-induced DDL blocking in a
+  TPC-H-style read workload and a Microsoft Dynamics production workload. The
+  baseline blocked new work for over 150 seconds in the TPC-H-style case and
+  over 200 seconds in the Dynamics case, while MD-MVCC kept reads running and
+  limited the Dynamics throughput dip to less than 10 seconds.
+- Steady-state OLTP overhead is reported as below measurement noise: 0.2%
+  throughput degradation for a TPC-C-like workload and 0.18% for a TPC-E-like
+  workload, both below the stated standard deviations.
+
+**GPU DB mapping:** The immediate mapping is a versioned route-metadata
+container. Each admitted table or partition should publish a route container
+whose versions include schema generation, source WAL/transaction boundary,
+resident layout identity, supported column and predicate families, device
+buffer handles, security/fallback flags, and invalidation state. A reader pins
+one route version before execution; DDL, refresh, eviction, and codec/layout
+changes publish a new version rather than mutating the pinned route in place.
+
+The top-level-object decision is a useful simplification for P8. Instead of
+versioning every column, kernel, cache index, and route knob independently,
+start with table- or partition-route versions. If a future benchmark shows that
+column-level DDL or per-index refresh creates too much churn, add targeted
+sub-object versioning for that route family. The Azure design gives a good
+reason not to overbuild this early: broad sub-object versioning expands test
+surface and cache complexity before it proves useful.
+
+Version metadata versus payload also maps cleanly to GPU tiers. Keep small
+route-version records in CPU memory even when GPU buffers or large route
+payloads are evicted. A reader can then determine whether its requested
+generation is valid, stale, evicted, or reloadable without touching device
+memory. That makes fallback explanations cheaper and avoids conflating
+"metadata forgotten" with "data no longer resident."
+
+The security exception matters for PostgreSQL compatibility. Some metadata
+should be snapshot-visible with the data it describes, but authorization and
+policy changes may need latest-committed semantics or explicit abort/fallback
+rules. GPU route certificates should therefore separate schema/layout
+visibility from policy freshness and record which policy generation was checked.
+
+**Risks and mismatches:** MD-MVCC is focused on schema changes and reads, not
+on concurrent writes. The paper explicitly says the current implementation
+still blocks data modifications during schema changes and lists broader DDL
+plus write concurrency as future work. GPU DB cannot assume this solves write
+path DDL concurrency.
+
+The implementation also relies on SQL Server internals: metadata manager
+accessors, system-table versioning, RCSI/SI semantics, lock modes, and Azure
+SQL production telemetry. GPU DB's current metadata and planner path is much
+smaller, so the right transfer is the container/version discipline, not the
+full lock-mode matrix. Finally, versioned metadata can increase retained memory
+under long readers; route-version GC needs explicit oldest-reader telemetry and
+hard caps.
+
+**Benchmark candidates:**
+
+- Add a route-metadata version-container fixture: publish route version `v1`,
+  start a long retained read, publish DDL/refresh route version `v2`, and prove
+  the first reader finishes on `v1` while new readers choose `v2` or fall back.
+- Separate route metadata from resident payloads. Evict a GPU buffer while
+  retaining compact route-version metadata and verify the planner reports
+  `evicted_reloadable` or `evicted_fallback`, not a stale route hit.
+- Add oldest-active-route telemetry and GC tests. Hold one long snapshot,
+  publish many route versions, then release it and verify old route versions
+  and payload references are retired deterministically.
+- Test schema-generation mismatch at plan reuse: compile a retained route for
+  one table shape, alter the table, and verify execution either pins the old
+  compatible route under a valid snapshot or forces replan/fallback.
+- Add policy-generation checks to route certificates. Change a security or
+  access policy while an old read snapshot exists and verify GPU execution
+  either uses latest policy validation or rejects with an explicit stale-policy
+  reason.
+- Measure table-level versus column-level route versioning under repeated
+  `ADD COLUMN`, index refresh, and resident-codec changes. Failure condition:
+  metadata churn or GC work dominates read p99 before sub-object versioning is
+  justified.
