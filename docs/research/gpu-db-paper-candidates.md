@@ -327,12 +327,19 @@ Append new candidates here as each paper is processed.
   PDF: `https://zxjcarrot.github.io/files/libdbos_SIGMOD25.pdf`
   Why: follow-up DB/OS kernel-bypass design from the Looking Glass 2.0 authors;
   directly relevant to low-overhead networking, IPC, and isolation boundaries.
-- `queued` — **CockroachDB: The Resilient Geo-Distributed SQL Database**,
+- `reviewed` — **CockroachDB: The Resilient Geo-Distributed SQL Database**,
   Taft et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3386134`
   Why: Polaris cites CockroachDB as a practical system exposing transaction
   priorities; useful for contrasting record-level OCC priority with
   distributed SQL priority, contention handling, and admission behavior.
+- `queued` — **GeoGauss: Strongly Consistent and Light-Coordinated OLTP for
+  Geo-Replicated SQL Database**, Li et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2304.09692`
+  Why: modern geo-replicated SQL transaction design that compares against
+  CockroachDB on TPC-C; useful for contrasting closed timestamps, leaseholder
+  ownership, and distributed commit coordination with lighter geo-OLTP
+  protocols.
 - `reviewed` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
   Queries**, Yang et al., CIDR 2024.
   URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`

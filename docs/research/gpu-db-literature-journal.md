@@ -45246,3 +45246,187 @@ guards, not q-error alone.
 - Track query-template and tenant drift in telemetry. A model should be
   retrained or demoted when live route descriptors move outside the
   training distribution for a sustained window.
+
+### 2026-06-04 - CockroachDB makes transaction routing an ownership problem
+
+**Citation:** Rebecca Taft, Irfan Sharif, Andrei Matei, Nathan
+VanBenschoten, Jordan Lewis, Tobias Grieger, Kai Niemi, Andy Woods,
+Anne Birzin, Raphael Poss, Paul Bardea, Amruta Ranade, Ben Darnell,
+Bram Gruneir, Justin Jaffray, Lucy Zhang, and Peter Mattis.
+"CockroachDB: The Resilient Geo-Distributed SQL Database." SIGMOD
+2020, pp. 1493-1509. doi:10.1145/3318464.3386134. Retrieved
+2026-06-04 from the ACM DOI page and Cockroach Labs PDF,
+`https://www.cockroachlabs.com/pdf/cockroachdb-the-resilient-geo-distributed-sql-database-sigmod-2020.pdf`.
+
+**Category:** transaction processing / write path / concurrency
+control.
+
+**Relevance tags:** serializable MVCC; transaction routing; leaseholder
+ownership; write pipelining; parallel commits; read refresh; closed
+timestamps; follower reads; distributed SQL planning; range placement;
+hotspot avoidance.
+
+**Core idea:** CockroachDB shows how a production SQL system turns a
+globally distributed key space into local ownership decisions. SQL can
+enter through any gateway node, but authoritative fresh reads and writes
+for a key range are routed through a range leaseholder. That leaseholder
+owns the short critical section for latches, timestamp movement, intent
+evaluation, and Raft proposal, while the coordinator pipelines
+independent operations and commits without waiting for every earlier
+write to become explicit and cleaned up.
+
+The strongest transferable idea is not geo-replication itself. It is
+that high-throughput transactions need a small number of precise
+authority points, plus weaker cached or historical read paths that are
+only admitted when a timestamp certificate proves they cannot be made
+stale by future writes. GPU DB can use the same shape inside one machine:
+mutation, residency, catalog, and GPU execution owners should be the
+authority for fresh state, while retained GPU reads should run from
+immutable snapshots only when a closed visibility boundary and resident
+generation prove compatibility.
+
+**Concrete mechanisms:**
+
+- CockroachDB stores data in ordered ranges, roughly 64 MiB chunks that
+  split, merge, and move independently. A range has Raft replicas and a
+  leaseholder. The leaseholder is the only replica allowed to serve
+  authoritative up-to-date reads or propose writes.
+- SQL requests begin at a gateway node, which acts as transaction
+  coordinator. The coordinator tracks in-flight operations and a
+  transaction timestamp. Independent operations on different keys can be
+  pipelined instead of waiting for every prior write to finish
+  replication.
+- At the leaseholder, each operation verifies the lease, acquires latches
+  for the operation and dependencies, verifies dependent writes, advances
+  write timestamps past higher read timestamps when needed, evaluates the
+  storage command, and then replicates/applies the command if it is a
+  write.
+- Parallel Commits use a staging transaction status so the coordinator
+  can replicate the commit status in parallel with outstanding writes.
+  In the paper's three-region secondary-index write microbenchmark, this
+  improved throughput by up to 72% and reduced p50 latency by up to 47%.
+- Atomicity is represented through write intents plus a transaction
+  record whose state is pending, staging, committed, or aborted. Readers
+  encountering an intent consult the transaction record, wait or clean up
+  as needed, and can resolve staging status by checking whether all writes
+  replicated.
+- Serializable MVCC relies on timestamp ordering. Write-read and
+  write-write conflicts can push a transaction's commit timestamp
+  forward. The transaction then attempts a read refresh: rechecking the
+  recorded read set over the timestamp interval to prove earlier reads
+  remain valid. If not, the transaction restarts.
+- Read refreshes are bounded by a memory budget for the tracked read
+  set. The paper notes false positives are allowed to avoid a full
+  dependency graph.
+- Follower reads are admitted only at sufficiently old timestamps. The
+  leaseholder periodically publishes a closed timestamp below which it
+  will accept no further writes; followers also need the corresponding
+  Raft log prefix before serving the historical read. The paper says
+  closed timestamps typically trail current time by about two seconds.
+- Hybrid logical clocks and uncertainty intervals avoid relying on
+  specialized clock hardware. A transaction that encounters a value in
+  its uncertainty window restarts at a higher provisional timestamp.
+  Lease disjointness and lease sequence checks preserve serializable
+  isolation even under clock skew, while single-key linearizability
+  depends on clocks staying within the configured offset.
+- The optimizer is distribution-aware. It can infer partition filters
+  from schema, cost replicas by proximity to the gateway, and decide
+  whether a read-only query should stay gateway-local or run as a
+  distributed physical plan near ranges.
+- For vectorized SQL execution, CockroachDB transposes row/KV data into
+  column batches and uses selection vectors so filters avoid physically
+  compacting columns after every predicate. The paper reports up to 4x
+  on TPC-H queries and much larger speedups for individual operators.
+- Lessons learned include two negative design signals: true snapshot
+  isolation was removed because mixed isolation would force pessimism
+  into the common serializable path, and dynamic "follow the workload"
+  lease movement was rarely used because operators preferred predictable
+  performance over adaptive placement surprises.
+
+**GPU DB mapping:** The leaseholder maps directly to the owner-domain
+model in `11-high-throughput-query-runtime.md`. A mutation owner should
+be the only authority that can publish visibility for a partition or hot
+key range. A residency owner should be the only authority that can
+publish, invalidate, refresh, or evict a resident generation. GPU
+execution workers may own streams and buffers, but they should consume
+certified immutable work rather than interpreting mutable visibility
+state themselves.
+
+Write pipelining and Parallel Commits suggest a concrete write-path
+benchmark: separate command evaluation, WAL append/flush, resident
+invalidation, and commit publication so independent operations can be
+in flight while dependent operations preserve ordering. The GPU DB
+version cannot acknowledge before WAL-before-visibility is safe, but it
+can avoid forcing every command to synchronously wait for unrelated
+refresh, cleanup, or response-encoding work.
+
+Closed timestamps are a strong model for retained GPU reads. A retained
+snapshot should carry a closed visibility boundary, source WAL boundary,
+catalog generation, resident generation, and invalidation generation. A
+read worker can bypass the mutation owner only when the requested read
+timestamp is at or below the closed boundary and the resident generation
+is known to include the needed data. Otherwise it should fall back to
+the owner or CPU path.
+
+Read refresh maps to stale-route repair. If a retained route or
+optimistic write has to advance its visibility boundary, the engine can
+attempt a bounded refresh over the recorded key/range/read descriptor
+instead of restarting blindly. The refresh is an optimization only:
+failure must turn into restart, fallback, or explicit retry, not a
+weaker visibility rule.
+
+The production lessons are useful guardrails. Supporting many isolation
+levels may be more expensive than offering a small, strong surface first.
+Similarly, automatic movement of hot resident ownership or data
+placement should be conservative and observable; predictable manual or
+policy-driven placement may beat a clever adaptive scheme that moves
+cache authority at the wrong time.
+
+**Risks and mismatches:** CockroachDB is a distributed CPU SQL system
+backed by RocksDB/Raft, not a GPU-resident single-node engine. Its
+latency tradeoffs include geo-network, consensus, and clock-uncertainty
+costs that may not apply inside one GPU DB process. Conversely, it does
+not solve CUDA stream ownership, pinned-buffer reuse, kernel batching,
+GPU memory pressure, or over-resident NVMe execution.
+
+The transaction protocol is also tied to ordered KV ranges. GPU DB may
+use row/MVCC truth plus generated columnar resident segments, so the
+range leaseholder analogy must become partition, relation, key-space, or
+resident-generation ownership rather than a literal range replica lease.
+Read refreshes depend on knowing and budgeting the read set; ad hoc SQL
+scans, joins, and GPU kernels may need coarser descriptors that increase
+false aborts. The paper reports CockroachDB v19.2 behavior, and some
+implementation details have likely evolved since publication.
+
+**Benchmark candidates:**
+
+- Prototype a closed-visibility certificate for retained reads:
+  `source_wal_boundary`, `visibility_boundary`, `catalog_generation`,
+  `resident_generation`, and `invalidation_generation`. Proof gate:
+  owner-bypassing reads return exactly the same rows as the mutation
+  owner for all insert/update/delete/replay tests.
+- Add a retained-read stale-route benchmark. Compare immediate owner
+  fallback, bounded read-refresh validation, and full restart when a
+  mutation races a retained snapshot. Measure p50/p99 latency,
+  successful refresh rate, false refresh failures, and visibility
+  correctness.
+- Build a write-pipelining simulator for mutation-owner work. Compare
+  synchronous drain, dependency-aware pipelining, and staged publish
+  under independent keys, hot keys, and secondary-index-like fanout.
+  Failure condition: pipelining changes WAL-before-visibility order.
+- Add transaction-record style telemetry for active writes: pending,
+  staging, committed, aborted, expired, and cleanup-needed. The first
+  implementation can be in an admission simulator before changing
+  storage code.
+- Test closed-boundary lag as a tunable for retained GPU reads: 0 us,
+  100 us, 1 ms, 10 ms, and longer windows. Expected result: older
+  snapshots reduce owner contention and invalidation races but can raise
+  staleness or fallback rates for freshness-sensitive queries.
+- Benchmark manual/policy placement versus adaptive movement for
+  resident table ownership. Failure condition: adaptive movement reduces
+  average latency while worsening p99/p999 or creating unpredictable
+  fallback spikes.
+- Add distribution-aware route costing fields for gateway/IO worker
+  locality, owner locality, resident partition, transfer bytes, queue
+  delay, and fallback risk. Use deterministic costs first; learned
+  ranking can only adjust within these guardrails.
