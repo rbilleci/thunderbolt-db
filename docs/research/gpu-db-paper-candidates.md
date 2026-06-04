@@ -491,7 +491,7 @@ Append new candidates here as each paper is processed.
   Why: full DBOS system paper with scheduler, file-system, and IPC experiments;
   useful follow-up for database-owned OS services, stored-procedure runtime
   boundaries, and transaction-backed system state.
-- `queued` — **HopsFS: Scaling Hierarchical File System Metadata Using NewSQL
+- `reviewed` — **HopsFS: Scaling Hierarchical File System Metadata Using NewSQL
   Databases**, Niazi et al., FAST 2017.
   URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/niazi`
   Why: DBOS cites DB-backed file-system metadata; relevant to GPU DB catalog,
@@ -509,6 +509,14 @@ Append new candidates here as each paper is processed.
   Why: system/demo follow-up for FASTER as an embedded state store; useful for
   API, checkpoint, and workload-shaping context if the engine adopts
   HybridLog-like point-state structures.
+- `queued` — **FileScale: Fast and Elastic Metadata Management for
+  Distributed File Systems**, Liao and Abadi, SoCC 2023.
+  URL: `https://doi.org/10.1145/3620678.3624784`
+  PDF: `https://www.cs.umd.edu/~abadi/papers/filescale.pdf`
+  Why: modern follow-up to database-backed file-system metadata that adds
+  caching/routing layers to avoid synchronous database round trips while
+  preserving distributed transaction support; useful for GPU DB catalog,
+  route-cache, and cold-tier namespace scaling.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`

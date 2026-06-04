@@ -29421,3 +29421,162 @@ aborts, validation work, and cache retention.
   age or LRU. Gate: a segment cannot be evicted while an active route still
   has an interval that requires it; failure condition is either stale read
   exposure or unbounded cache retention with no telemetry.
+
+### 2026-06-04 - HopsFS moves metadata scale into transactional shards
+
+**Citation:** Salman Niazi, Mahmoud Ismail, Seif Haridi, Jim Dowling,
+Steffen Grohsschmiedt, and Mikael Ronstrom. "HopsFS: Scaling
+Hierarchical File System Metadata Using NewSQL Databases." FAST 2017.
+Retrieved 2026-06-04 from
+`https://www.usenix.org/system/files/conference/fast17/fast17-niazi.pdf`.
+
+**Category:** multi-tier cache / data placement; runtime / HFT /
+session scale; transaction processing / write path.
+
+**Relevance tags:** database-backed metadata; NewSQL metadata service;
+application-defined partitioning; distribution-aware transactions;
+partition-pruned index scans; path hint cache; hierarchical locking;
+subtree locks; stateless frontends; high-concurrency namespace service;
+metadata analytics.
+
+**Core idea:** HopsFS replaces HDFS' single in-memory active namenode
+with multiple stateless namenodes backed by a distributed transactional
+NewSQL database. The file data path remains HDFS-like, but metadata is
+normalized into relational tables and manipulated through transactions.
+The system gets scale by aligning the physical partitioning of metadata
+with common namespace operations: immediate children of a directory are
+co-located for directory listing, and file-related block/replica metadata
+is co-located by file inode for file reads.
+
+The paper's most transferable point is not "put all metadata in a
+database" by itself. It is the combination of a transactional metadata
+authority, cheap operation shapes, and explicit handling for operations
+that are too large for one transaction. Common operations avoid full
+table scans and all-shard index scans by using primary-key reads,
+batched primary-key reads, partition-pruned scans, partition hints, and
+path hint caches. Rare recursive subtree operations are isolated with
+application-level subtree locks and then broken into smaller
+transactions.
+
+In the evaluation, HopsFS reports 1.25M metadata operations per second
+on a Spotify-derived workload with 60 namenodes and 12 NDB nodes, about
+16x HDFS throughput for that workload, and up to 37x HDFS throughput as
+the synthetic write fraction rises to 20%. It also reports 37x larger
+metadata capacity than HDFS in the modeled highly available deployment
+and no namenode failover downtime, while acknowledging worse latency for
+large subtree move/delete operations and hotspot limits when many
+operations share one ancestor.
+
+**Concrete mechanisms:**
+
+- Metadata is stored in normalized tables for inodes, blocks, replicas,
+  leases, quotas, pending replication, corrupt replicas, invalidations,
+  and related state. Stateless namenodes perform metadata operations as
+  database transactions.
+- Inodes are usually partitioned by parent inode id, so all immediate
+  children of a directory sit on the same database shard. File-related
+  metadata is partitioned by the file inode id so file reads can use
+  partition-pruned scans.
+- Top-level namespace hotspots are handled by pseudo-randomly
+  partitioning children at the first hierarchy levels. The paper states
+  that runtime hotspot detection was not yet built.
+- A distribution-aware transaction starts on the shard that is expected
+  to hold all or most required metadata. Wrong hints preserve
+  correctness but add network traffic.
+- The inode hint cache stores primary keys for path components. On a
+  full hit, path components can be fetched in one batched primary-key
+  request instead of one round trip per path depth. Stale hints fall back
+  to recursive resolution and repair.
+- Inode operations use pessimistic row-level locking. HopsFS rewrites
+  operations to acquire locks in one total tree order and to take the
+  strongest required lock up front, avoiding cyclic deadlocks and lock
+  upgrade deadlocks.
+- Each transaction has lock, execute, and update phases. A
+  per-transaction cache holds read metadata and staged updates, then
+  flushes changes in batches at commit.
+- Recursive move, delete, chmod, chown, and quota changes use subtree
+  locks because millions of rows cannot fit in one OLTP transaction.
+  The protocol marks the subtree root, waits for in-flight operations to
+  drain, traverses the subtree, and performs batched transactions while
+  preserving recoverability if the namenode dies mid-operation.
+- HopsFS can expose metadata to external analytics or search because the
+  metadata authority is already a database. The paper describes
+  asynchronous replication to MySQL/Elasticsearch-style consumers rather
+  than querying the hot cluster for everything.
+
+**GPU DB mapping:** GPU DB has a similar split between durable truth,
+fast resident state, and high-concurrency frontends. HopsFS suggests
+that the catalog, resident-segment registry, cold-tier namespace,
+snapshot lineage, and route metadata should be treated as transactional
+data with deliberate partition keys, not as ad hoc maps under one global
+owner forever. For example, table/partition/segment metadata can be
+partitioned so common route checks and resident lookup admission touch
+one owner or shard, while rare DDL or table-wide cleanup uses an explicit
+subtree-style protocol.
+
+For 1M logical sessions, stateless frontends backed by transactional
+metadata map well to network IO workers and route workers. A session
+should not need to enter the mutation owner just to resolve stable
+catalog and route metadata. A bounded route hint cache can store
+generation-stamped keys for table oid, schema generation, resident
+segment id, source WAL boundary, and partition owner. On a hit, a read
+route can fetch or validate all needed metadata in a batched local owner
+operation; on a miss or stale generation, it falls back to authoritative
+resolution and repairs the hint.
+
+For write throughput, the subtree protocol is a useful analogy for
+maintenance that is too large for one transaction: `DROP TABLE`,
+`TRUNCATE`, resident segment rebuild, cold-tier compaction, index
+retirement, or snapshot-generation cleanup. Instead of holding one
+global lock while millions of metadata records are touched, isolate the
+affected route subtree, reject or redirect new entrants, let active
+readers drain, and perform bounded batches with restartable progress
+markers.
+
+For tier placement, HopsFS reinforces the idea that metadata shape
+drives data movement cost. A GPU/NVMe tier manager should avoid
+all-shard scans for hot decisions like "which resident segment serves
+this route?" or "which cold chunk contains this partition generation?"
+Partition-pruned metadata reads and colocated segment lineage can become
+the storage equivalent of HopsFS directory listing.
+
+**Risks and mismatches:** HopsFS is a file-system metadata service, not
+a SQL execution engine. Its operations are path/inode/block-management
+operations rather than joins, scans, MVCC tuple visibility, or GPU
+kernel scheduling. NDB's read-committed base plus row locks is not a
+drop-in match for GPU DB's WAL-before-visibility and MVCC snapshot
+requirements. The path hint cache is safe because stale hints trigger
+authoritative path repair; GPU DB route hints need equally explicit
+generation checks or they could route to stale resident buffers. The
+paper also reports unresolved runtime hotspot handling and slower large
+subtree operations, so subtree protocols should be benchmarked as
+maintenance paths rather than put in the common read path.
+
+**Benchmark candidates:**
+
+- Build a no-GPU metadata partitioning simulator for catalog, table,
+  partition, segment, and resident-route records. Compare one global
+  owner, table-oid partitioning, partition-id partitioning, and
+  route-shape partitioning. Metrics: route-resolution latency, owner
+  queue depth, cache hit rate, and metadata operations/sec.
+- Add a generation-stamped route hint cache for retained reads. Gate:
+  stale hints must fall back to authoritative owner resolution and
+  repair; no request may execute against an invalid resident generation.
+- Prototype a subtree-style maintenance protocol for `TRUNCATE` or
+  resident segment retirement: mark route subtree blocked, drain active
+  readers, batch metadata updates, publish a new frontier, and recover
+  from mid-operation failure. Failure condition: orphaned resident
+  metadata or stale read admission after the block marker is visible.
+- Measure batched metadata lookup versus per-field owner calls for
+  same-shape retained reads. Inputs: table oid, schema generation,
+  resident segment id, source WAL boundary, predicate family, and output
+  shape. Gate: p99 route-resolution latency improves without increasing
+  stale-route fallbacks.
+- Add hotspot telemetry for metadata owners: top table/partition/segment
+  keys by request rate, queue wait, conflict/retry count, and bytes
+  pinned. Benchmark pseudo-random top-level partitioning versus
+  semantic table/partition ownership for skewed workloads.
+- Evaluate asynchronous metadata export for observability: route
+  history, resident segment lineage, cache pressure, and snapshot
+  retention should be queryable off the hot path without forcing every
+  fast-path decision through a general SQL query.
