@@ -341,7 +341,7 @@ Append new candidates here as each paper is processed.
   CockroachDB on TPC-C; useful for contrasting closed timestamps, leaseholder
   ownership, and distributed commit coordination with lighter geo-OLTP
   protocols.
-- `queued` — **Q-Store: Distributed, Multi-partition Transactions via
+- `reviewed` — **Q-Store: Distributed, Multi-partition Transactions via
   Queue-oriented Execution and Communication**, Qadah, Gupta, and Sadoghi,
   EDBT 2020.
   URL: `https://doi.org/10.5441/002/edbt.2020.08`
@@ -350,6 +350,19 @@ Append new candidates here as each paper is processed.
   distributed transaction processing; useful for evaluating whether GPU DB
   owner rings should become explicit operation queues for multi-partition
   transactions without forcing every route through a single global schedule.
+- `queued` — **QueCC: A Queue-oriented, Control-free Concurrency
+  Architecture**, Qadah and Sadoghi, Middleware 2018.
+  URL: `https://doi.org/10.1145/3274808.3274810`
+  Why: Q-Store's direct predecessor for queue-oriented concurrency inside a
+  node; useful for comparing owner-domain operation queues, contention
+  avoidance, and control-free execution before distributed queue routing.
+- `queued` — **T-Part: Partitioning of Transactions for Forward-Pushing in
+  Deterministic Database Systems**, Wu et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915227`
+  Why: Q-Store contrasts T-Part's dependency-graph scheduling with
+  queue-oriented planning; useful for evaluating whether GPU DB should split
+  hot write plans by dependency graph, fixed owner queue, or runtime conflict
+  class.
 - `reviewed` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
   Queries**, Yang et al., CIDR 2024.
   URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`

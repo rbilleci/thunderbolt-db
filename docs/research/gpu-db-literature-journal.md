@@ -45752,3 +45752,160 @@ weaken WAL-before-visibility or recovery replay checks.
 - Benchmark temporary operator placement separately from table data.
   Failure condition: moving temp state to a slower tier improves capacity
   while worsening p99 latency or causing GPU route fallback spikes.
+
+### 2026-06-04 - Q-Store turns transaction execution into ordered operation queues
+
+**Citation:** Thamir M. Qadah, Suyash Gupta, and Mohammad Sadoghi.
+"Q-Store: Distributed, Multi-partition Transactions via
+Queue-oriented Execution and Communication." EDBT 2020, pp. 73-84.
+doi:10.5441/002/edbt.2020.08. Retrieved 2026-06-04 from
+`https://openproceedings.org/2020/conf/edbt/paper_39.pdf`.
+
+**Category:** transaction processing / write path; runtime /
+concurrency; deterministic scheduling.
+
+**Relevance tags:** queue-oriented execution; deterministic
+transactions; multi-partition transactions; intra-transaction
+parallelism; lock-free metadata; priority-ordered queues; speculative
+execution; conservative execution; batch commit; owner rings.
+
+**Core idea:** Q-Store replaces thread-to-transaction distributed
+execution with queue-oriented execution. A planning phase breaks
+stored-procedure transactions into fragments, places conflicting
+operations in the same execution queue, assigns priorities to server,
+planner, transaction, and queue order, then lets execution threads
+drain local and remote queues while respecting that deterministic
+priority order.
+
+The strongest transferable idea for GPU DB is that a queue can be more
+than a transport primitive. It can be the execution schedule and the
+conflict-control object. Instead of sending every multi-owner command
+through one global mutation owner or treating every transaction as a
+single worker task, GPU DB can experiment with operation-fragment queues
+per owner domain, partition, key range, resident generation, or route
+shape. The schedule must still be certified before visibility is
+published.
+
+**Concrete mechanisms:**
+
+- Q-Store assumes deterministic stored-procedure transactions whose
+  inputs are known before execution. The system logs the input batch
+  before execution and relies on checkpointing for recovery.
+- Transactions are decomposed into fragments. A fragment can contain
+  multiple operations on the same record, or a single operation when the
+  transaction touches different records.
+- Planning threads generate execution queues. They must ensure
+  conflicting operations are placed in the same queue; the paper uses
+  range partitioning as a simple example, while noting that better
+  dependency-minimizing planning is future work.
+- Priorities impose deterministic order across server, planner, and
+  transaction queue levels. Execution threads must process higher
+  priority conflicting queue operations before lower priority ones.
+- Local and remote execution queues are treated uniformly. Remote queues
+  are shipped as ordered queues of operation fragments, not as
+  per-transaction coordination messages.
+- Worker threads can alternate roles: plan a batch, publish its queues,
+  then execute available queues. Communication threads receive client
+  work, ship/receive execution queues, and push incoming remote queues
+  into shared batch metadata.
+- Batch metadata is implemented as a distributed lock-free structure
+  holding local queues, remote queues, dependency counters, and ACKs.
+  Dependency resolution uses atomic decrement of counters.
+- Q-Store supports speculative execution, where fragments may read
+  uncommitted data and cascading abort dependencies are tracked, and
+  conservative execution, where marked fragments stall until commit
+  dependencies resolve.
+- Read-committed isolation is supported by adding read-only execution
+  queues and using copy-on-write for updated records. Serializable
+  execution comes from the deterministic queue-priority proof.
+- Commit can happen after the last operation for conservative execution
+  or at the end of a batch for speculative execution. Batch commit
+  amortizes protocol cost but can increase client latency.
+- The evaluation compares Q-Store with Calvin, NO-WAIT, timestamp
+  ordering, MVCC, and MaaT in a shared code base. It reports up to
+  22.1x higher throughput than Calvin on YCSB, near two orders of
+  magnitude over non-deterministic protocols under high contention, and
+  up to 55.2x over NO-WAIT on TPC-C mixes. The paper evaluates Q-Store's
+  speculative mode; conservative-mode evaluation is left as future work.
+
+**GPU DB mapping:** The high-throughput runtime already wants bounded
+command, response, residency, read snapshot, and GPU execution rings.
+Q-Store argues for making some of those rings semantic: an admitted
+write command could be split into fragments for mutation ownership,
+resident invalidation, index update, refresh scheduling, and response
+publication, with each fragment routed to a deterministic queue whose
+priority is part of the visibility certificate.
+
+For 1M logical sessions, queue-oriented execution also suggests a way to
+avoid thread-per-session and transaction-per-thread paths. IO workers can
+append parsed commands into planner/admission queues; planner workers can
+produce owner-domain execution queues; owners and GPU workers drain
+queues by generation, key range, and route class. This preserves the
+runtime's mechanical-sympathy goal while giving hot-key conflicts an
+explicit schedule instead of relying only on retries or global FIFO.
+
+For retained GPU reads, Q-Store's idea should be used selectively.
+Read-only same-shape requests can remain micro-batched by snapshot
+generation and route shape. Writes and refresh work can be queue-planned
+around affected resident generations so invalidation fragments always
+precede publication fragments. A response should not be emitted until
+all required queue fragments and ACK-like local completions prove the
+query's source WAL, visibility, catalog, residency, and invalidation
+boundaries.
+
+For multi-partition or multi-owner transactions, the benchmarkable
+question is whether GPU DB should plan one global schedule, per-owner
+queues with deterministic priorities, or runtime-conflict queues that
+only isolate hot keys. Q-Store's results make per-owner operation queues
+worth testing, especially where the alternative is repeated 2PC-like
+coordination or retry under hot contention.
+
+**Risks and mismatches:** Q-Store assumes stored-procedure transactions
+with known inputs. GPU DB must serve ad hoc SQL, pgwire sessions, and
+planner-chosen CPU/GPU fallback routes, so it will not always know a
+complete read/write set before execution. Partial planning could still
+help for COPY, prepared statements, retained lookup routes, and
+procedural batches, but unrestricted SQL needs conservative fallback.
+
+The paper is a distributed in-memory OLTP system, not a single-node
+GPU/CPU/NVMe engine. It does not address WAL-before-visibility details
+for GPU resident caches, CUDA stream ownership, MVCC version-chain
+retirement, or tier placement. It also reports only speculative Q-Store
+performance; conservative execution, which is closer to a no-cascading
+abort production guardrail, is not evaluated.
+
+Batching is a double-edged fit. Q-Store's large YCSB batches improve
+throughput, but GPU DB has p50/p99/p999 latency targets and interactive
+sessions. Any queue-planned path needs microsecond ceilings, explicit
+flush triggers, starvation guards, and a proof that batch commit does
+not delay WAL visibility or retained-read invalidation beyond the
+query's contract.
+
+**Benchmark candidates:**
+
+- Build an operation-fragment admission simulator for multi-owner writes:
+  global FIFO owner, per-owner deterministic queues, hot-key queues, and
+  runtime-conflict queues. Measure throughput, p50/p99/p999 latency,
+  abort/retry rate, owner queue depth, and visibility-boundary lag.
+- Prototype deterministic invalidation queues for retained generations.
+  Proof gate: every mutation fragment affecting a resident generation is
+  observed before a newer read snapshot can be published.
+- Compare transaction-as-task versus fragment-as-queue execution for
+  COPY plus index update plus resident refresh workloads. Expected win:
+  better overlap and lower idle time; failure condition: more tail
+  latency or unclear publication order.
+- Add a speculative versus conservative planning experiment for prepared
+  multi-step transactions. Track cascading abort count, dependency stalls,
+  and response latency. Conservative mode should be the only production
+  candidate unless speculative dependencies are fully bounded.
+- Test remote-queue analogs locally: ship batches between mutation,
+  residency, and GPU execution owners as ordered queues rather than
+  individual messages. Measure message count, cache locality, queue wait,
+  and generation publish time.
+- Add queue-priority telemetry: server/owner priority, planner priority,
+  transaction order, fragment queue id, dependency count, stall reason,
+  ACK/completion count, and starvation-release count.
+- Keep an ad hoc SQL guardrail: if the planner cannot identify the
+  needed conflict keys or resident generations, the command must route
+  through the existing owner/CPU path rather than entering a deterministic
+  fragment queue on incomplete information.
