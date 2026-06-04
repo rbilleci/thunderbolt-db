@@ -555,13 +555,19 @@ Append new candidates here as each paper is processed.
   Why: FileScale cites CalvinFS as the deterministic-transaction metadata
   predecessor; useful for comparing route-cache WAL buffering with ordered
   transaction scheduling for namespace/catalog updates.
-- `queued` — **ShardFS vs. IndexFS: Replication vs. Caching Strategies for
+- `reviewed` — **ShardFS vs. IndexFS: Replication vs. Caching Strategies for
   Distributed Metadata Management in Cloud Storage Systems**, Xiao et al.,
   SoCC 2015.
   URL: `https://doi.org/10.1145/2806777.2806844`
   Why: FileScale contrasts namespace partitioning and caching approaches with
   distributed-transaction metadata; useful for evaluating route-cache
   placement, replication, and cache-invalidation options.
+- `queued` — **AsyncFS: Metadata Updates Made Asynchronous for Distributed
+  Filesystems with In-Network Coordination**, Zhou et al., arXiv 2024.
+  URL: `https://arxiv.org/abs/2410.08618`
+  Why: modern follow-up for metadata update admission and coordination;
+  useful for evaluating whether cold-tier namespace, catalog, or route-cache
+  mutations can be made asynchronous without weakening visible ordering.
 - `reviewed` — **A Morsel-Driven Query Execution Engine for Heterogeneous
   Multi-Cores**, Dursun et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p2218-dursun.pdf`

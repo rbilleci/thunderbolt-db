@@ -39676,3 +39676,193 @@ throughput promise for the future hardware.
 - Add a skewed-key benchmark where the PGM error window changes by data
   distribution. Failure condition: a compact learned index produces poor tail
   latency because local refinement probes become imbalanced or non-coalesced.
+
+### 2026-06-04 - Namespace metadata is a route-cache design problem
+
+**Citation:** Lin Xiao, Kai Ren, Qing Zheng, and Garth A. Gibson.
+"ShardFS vs. IndexFS: Replication vs. Caching Strategies for
+Distributed Metadata Management in Cloud Storage Systems." SoCC 2015,
+pp. 236-247. DOI `10.1145/2806777.2806844`. Retrieved 2026-06-04
+from the CMU ISTC/PDL PDF,
+`https://istc-cc.cmu.edu/publications/papers/2015/p236-xiao-SoCC15.pdf`.
+
+**Category:** Multi-tier cache / data placement; runtime / HFT /
+session scale; transaction processing / write path.
+
+**Relevance tags:** metadata caching; server-side replication;
+route-cache placement; namespace lookup; leases; distributed metadata;
+weak scaling; optimistic retry; single-site fast path; cold-tier catalog.
+
+**Core idea:** The paper compares three ways to scale distributed file-system
+metadata: IndexFS dynamically partitions directories and relies on coherent
+client caching of path components, ShardFS replicates directory lookup state to
+all metadata servers while sharding file metadata by pathname, and Giraffa
+stores metadata in a distributed table with relaxed namespace semantics. The
+main tradeoff is where to pay for repeated hierarchical lookup state: in
+clients via leases, in servers via replicated state, or in an underlying table
+system that may not understand metadata access patterns.
+
+For GPU DB, the transferable idea is that route metadata is part of the hot
+path. A table, segment, snapshot, partition, and cold-tier location cache can
+save many internal hops, but mutation cost moves to whichever side owns cache
+coherence. ShardFS shows that server-side replication can make common read-like
+metadata operations deterministic and well balanced under weak scaling, while
+directory-state mutations become slower as the number of replicas grows.
+IndexFS shows the opposite failure mode: client caches reduce normal lookup
+traffic when locality is good, but cache misses and renewals near the top of a
+hierarchy can create load imbalance and tail latency.
+
+**Concrete mechanisms:**
+
+- IndexFS partitions namespace metadata at directory-subset granularity. Small
+  directories start on one metadata server; very large directories are split
+  incrementally with GIGA+ binary hash-range splitting.
+- IndexFS caches path components and permissions in clients using short leases.
+  A server records the largest lease expiration for a pathname component and
+  blocks modifications until leases expire instead of immediately revoking all
+  client copies.
+- IndexFS pushes metadata files and per-server write-ahead logs into HDFS for
+  fault tolerance. Leases are not durable; a standby waits for the maximum
+  timeout after recovery before granting access.
+- ShardFS fully replicates directory lookup state to every metadata server.
+  Each server can resolve paths locally, while file metadata and non-replicated
+  directory metadata are stored at one primary metadata server chosen by a
+  pathname hash.
+- Most ShardFS file metadata operations are single-RPC operations to the
+  primary server. This is the source of its load-balance and lookup-latency
+  benefit.
+- ShardFS treats replication as performance state, not the authoritative
+  durability layer. It relies on the underlying metadata servers and storage
+  for high availability and uses a lock server with redo logs for outstanding
+  directory metadata mutations.
+- ShardFS classifies replicated-state mutations by semantics: monotonically
+  increasing permissions/existence, monotonically decreasing
+  permissions/existence, and non-monotonic changes such as rename or mixed
+  permission updates.
+- For monotonic distributed mutations, ShardFS serializes conflicting
+  distributed mutations but allows optimistic single-RPC operations to continue.
+  If a single-RPC operation observes temporary replicated-state inconsistency,
+  it fails and retries with pessimistic locking.
+- For non-monotonic mutations, ShardFS takes defensive locks at every server and
+  serializes conflicting operations because temporary mixed state could expose
+  wrong semantics.
+- The paper evaluates up to 128 server nodes and 128 client nodes on a
+  256-node cluster, using synthetic namespace shapes and LinkedIn trace replay.
+  Metrics include throughput per server, RPC amplification, load variance, and
+  latency percentiles.
+- In uniform file stat microbenchmarks, ShardFS benefits from local path
+  resolution and even file sharding; IndexFS performance depends strongly on
+  cache effectiveness; Giraffa suffers load imbalance from table partitioning
+  that does not understand large-directory semantics.
+- In strong scaling trace replay, ShardFS is throttled by replicated
+  directory-state mutation overhead, while IndexFS is hurt by cache renewal and
+  load imbalance near hot top-level path components.
+- In weak scaling, where file operations grow with resources but directory
+  metadata mutations remain roughly constant per job, ShardFS scales more
+  linearly and reports lower 50th and 70th percentile read response times than
+  client caching.
+
+**GPU DB mapping:** P8 has the same kind of "metadata before data" path:
+catalog generation, table OID, resident generation, partition identity,
+snapshot boundary, column-group support, device placement, and fallback route
+must be known before a query can touch CPU, GPU, or cold-tier data. If every
+read has to ask a central owner for this route metadata, the engine repeats the
+pathname-lookup bottleneck in database form.
+
+The ShardFS option maps to replicated route descriptors at IO workers, read
+workers, GPU execution owners, and partition owners. A common retained read can
+resolve route compatibility locally and submit directly to the right bounded
+ring. Mutations, DDL, residency refresh, eviction, and cold-tier movement then
+pay the replication or invalidation cost. This is attractive if route-metadata
+reads outnumber route-metadata mutations by a large margin.
+
+The IndexFS option maps to per-session or per-worker route caches protected by
+short validity intervals or generation leases. This can keep mutation cost low
+when locality is good, but at 1M logical sessions it risks a renewal storm:
+many sessions may refresh the same catalog, table, or residency prefix after an
+invalidation. GPU DB should therefore avoid client/session-owned route leases
+that require broad expiry waits or uncontrolled renewals.
+
+ShardFS's monotonic/non-monotonic split is useful for cache invalidation.
+Publishing a new resident generation, adding a supported route, or increasing a
+cache's permitted coverage is different from revoking a route, dropping a
+table, changing schema, or moving a cold partition. Monotonic route additions
+can allow old cache holders to fail closed and retry, while non-monotonic
+changes need stronger barriers before new reads are admitted.
+
+The weak-scaling definition is also a benchmark lesson. GPU DB should measure
+route-cache metadata under workloads where logical sessions and read requests
+grow, but catalog/residency mutations remain tied to jobs, deployments, or
+refresh waves. A design that looks bad under strong scaling may be the right
+choice if route mutations are rare relative to retained reads.
+
+**Risks and mismatches:** This is a 2015 file-system metadata paper, not a
+database storage engine. It does not address SQL planning, MVCC snapshots,
+WAL-before-visibility, GPU memory, CUDA execution, tuple visibility, query
+result correctness, or PostgreSQL protocol state. ShardFS replication assumes
+all metadata servers can hold full directory lookup state; GPU DB route state
+may become too large if it includes per-segment statistics, device handles, and
+fallback histories without compaction.
+
+The evaluated hardware is old by current standards, and the systems are built
+on HDFS, LevelDB, HBase, and Thrift. Treat the results as a comparison of
+coherence shapes, not a performance target. The paper also accepts relaxed
+directory timestamp and `readdir` behavior; GPU DB cannot relax SQL-visible
+snapshot or catalog semantics in the same way.
+
+**Benchmark candidates:**
+
+- Add a route-cache coherence benchmark with three policies: central owner
+  lookup, per-worker generation cache, and replicated route descriptor table.
+  Measure owner queue wait, route lookup p50/p99, invalidation latency, and
+  read throughput under retained-read fanout.
+- Simulate 1M logical sessions with a bounded active subset and a shared route
+  prefix. Trigger catalog or residency invalidation and measure renewal storms,
+  response-ring pressure, and memory footprint for per-session versus
+  per-worker route caching.
+- Classify route metadata mutations as monotonic add, monotonic revoke/fail
+  closed, and non-monotonic schema/placement changes. Proof gate: stale holders
+  either finish on a valid old snapshot or reject/retry before observing stale
+  data.
+- Build a weak-scaling route workload: increase sessions, retained reads, and
+  resident lookup requests while keeping DDL/residency mutation rate fixed per
+  job. Compare it with strong scaling where route mutations remain fixed total
+  work and may dominate.
+- Add route-cache load-variance telemetry across IO workers, read workers, GPU
+  owners, and partition owners. Failure condition: top-level catalog or table
+  route refreshes concentrate on one owner and dominate p99 latency.
+- Test replicated route descriptors with cold-tier placement changes. Required
+  metric: time from WAL-safe invalidation to all new readers avoiding the old
+  route, while old snapshot readers retain correctness.
+
+### 2026-06-04 - Cross-paper synthesis: hot routes need semantic boundaries before caches scale
+
+The last three reviewed papers converge on one practical rule: a hot route is
+not just a pointer to faster execution. STOv2 shows that write-path routes need
+semantic conflict boundaries such as commit-time updates and timestamp groups.
+GPU-PGM shows that resident indexes need batch, transfer, and rebuild
+boundaries before they are allowed onto the fast path. ShardFS shows that route
+metadata itself needs coherence boundaries, because replicating or caching
+lookup state moves cost from reads to mutations.
+
+The converging design track is a typed route descriptor. Each retained route
+should publish its truth boundary, visibility boundary, semantic write or read
+scope, resident/index/scratch budget, batch threshold, and coherence mode:
+central lookup, per-worker cache, or replicated descriptor. The runtime should
+admit work only when the descriptor proves the route is valid and cheap enough
+for the current queue state. This keeps GPU acceleration, MVCC conflict
+avoidance, and metadata caching from becoming three unrelated fast paths.
+
+Category gaps are now less about finding another GPU operator and more about
+the transitions between states: how route descriptors are invalidated, how old
+snapshot holders retire, how cold-tier placement changes avoid renewal storms,
+and how write-heavy workloads keep semantic conflict metadata explainable.
+
+Benchmark priorities:
+
+- route-cache coherence under 1M logical-session simulation;
+- hot-counter and stable-column conflict splitting with WAL replay;
+- resident learned-index break-even by batch size and invalidation rate;
+- monotonic versus non-monotonic route mutation barriers;
+- p99 latency accounting across owner lookup, route cache, GPU queue, and
+  response scattering.
