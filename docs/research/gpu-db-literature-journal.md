@@ -30578,3 +30578,169 @@ should bypass this machinery.
 - Test mixed workload admission where a large join competes with many
   retained point reads. Failure condition: average join throughput
   improves while retained lookup p99 or response-ring ordering regresses.
+
+### 2026-06-04 - Bolt makes admission feedback arrive before the queue is already stale
+
+**Citation:** Serhat Arslan, Yuliang Li, Gautam Kumar, and Nandita
+Dukkipati. "Bolt: Sub-RTT Congestion Control for Ultra-Low
+Latency." NSDI 2023, pages 219-236. Retrieved 2026-06-04 from
+`https://www.usenix.org/system/files/nsdi23-arslan.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** sub-RTT feedback; programmable data planes;
+congestion notification; proactive ramp-up; supply matching; queue
+telemetry; response-ring admission; high-concurrency sessions;
+microsecond tail latency.
+
+**Core idea:** Bolt argues that RTT-scale control is too slow for
+modern datacenter links because many RPCs fit inside only a few BDPs,
+so one delayed or imprecise congestion decision can create tens of
+microseconds of queueing or leave expensive bandwidth idle. Its answer
+is to move the feedback point closer to the bottleneck and shorten the
+control loop: programmable switches emit direct congestion feedback,
+senders adjust more frequently than once per RTT, and the switch also
+signals future under-utilization so other flows can ramp up before
+capacity goes idle.
+
+For GPU DB, the transferable idea is not to depend on coarse periodic
+queue-depth polling once 1M logical sessions are contending for ingress
+rings, response rings, GPU streams, pinned buffers, and cold-tier IO.
+Admission should receive typed feedback from the narrow bottleneck as
+soon as that bottleneck becomes overloaded or under-used. A delayed
+"queue is high" signal is less useful than an immediate "GPU stream 2
+scratch budget saturated", "response lane draining", or "micro-batch
+slot will open in 12 us" signal.
+
+**Concrete mechanisms:**
+
+- Bolt decomposes congestion-control delay into feedback delay and
+  observation period. It argues that receiver-reflected ACK feedback
+  waits behind the congestion it is supposed to report, and that
+  once-per-window updates discard useful per-packet dynamics.
+- Sub-RTT Control sends congestion notifications directly from the
+  bottleneck switch to the sender. The notification is generated in the
+  switch pipeline rather than waiting for the packet to reach the
+  receiver and return in an ACK.
+- The sender applies small per-packet congestion-window adjustments
+  based on precise in-network feedback instead of a large once-per-RTT
+  correction. The paper positions this as a way to limit both
+  overreaction and underreaction.
+- Proactive Ramp-up asks senders to flag packets near flow completion.
+  The switch can then notify other senders about future released
+  bandwidth, so they begin increasing before the link goes idle.
+- Supply Matching tracks available bandwidth with switch-side tokens.
+  Tokens are consumed when packets keep an increase signal, making the
+  total ramp-up follow available capacity rather than every sender
+  independently probing.
+- The lab implementation adds Bolt to a user-space transport and uses a
+  P4 program on the switch. The paper reports four per-queue register
+  arrays for queue occupancy, token values, and last packet arrival
+  time, using a small fraction of available SRAM/TCAM in its prototype.
+- Evaluation combines P4-switch testbed experiments and NS-3
+  simulations. The paper reports 86% median and 81% tail RTT reduction
+  versus Swift in the lab contribution summary, and up to 3x better
+  99th-percentile flow completion time than Swift and HPCC in larger
+  simulations. The USENIX landing page summarizes an 80% 99th-percentile
+  latency reduction and near line-rate utilization at 400 Gbps.
+- Bolt explicitly discusses brownfield deployment. When some switches
+  cannot emit sub-RTT feedback, an end-to-end algorithm such as Swift
+  can run in parallel and the effective cwnd can be the minimum of the
+  two.
+
+**GPU DB mapping:** The runtime already names separate ingress,
+mutation, read-snapshot, residency, GPU execution, and response rings.
+Bolt suggests these rings should not all report one generic queue-depth
+number to a central policy. Each bottleneck should emit a narrow, typed
+feedback event to the admission point: immediate decrement when the
+ring or memory budget is congested, and proactive increment when a
+batch, response lane, or GPU scratch window is about to free capacity.
+
+For 1M logical sessions, this maps to per-lane credits rather than
+per-session threads. Network workers should spend credits for request
+parsing, mutation submission, retained-read submission, GPU launch
+slots, response bytes, and pinned-buffer use. A lane that sees
+microsecond-scale saturation should send direct feedback to the session
+admission table instead of waiting for aggregate p99 latency to drift.
+
+For GPU execution, the proactive ramp-up idea maps to known completion
+events. CUDA events, batch-drain progress, response-ring drain, and
+cold-IO completion estimates can publish future capacity. Waiting until
+the stream is idle is too late; the scheduler can admit compatible
+retained reads or prepare the next micro-batch when the current batch is
+near completion.
+
+For multi-tier placement, supply matching is a useful guardrail:
+promotion, refresh, spill, and cold-transfer routes should only consume
+credits that the tier can actually satisfy. A route that looks fast in
+the planner should still be throttled if HBM scratch, host staging, or
+NVMe queue tokens are exhausted.
+
+**Risks and mismatches:** Bolt is a datacenter networking paper, not a
+database runtime, storage, or GPU paper. Its strongest mechanisms
+depend on programmable switches and custom transport behavior; GPU DB
+may only get analogous feedback inside its own process unless a future
+gateway or NIC path exposes richer signals. Per-packet control is not
+the same as per-query admission: SQL requests have correctness
+boundaries, visibility checks, response ordering, and retry semantics.
+The proactive ramp-up mechanism also needs trustworthy completion
+forecasts; bad forecasts could over-admit and create exactly the queue
+pressure it tries to avoid. Finally, Bolt's fairness/coexistence issues
+remain partly future work, so a GPU DB credit scheme must have
+deterministic starvation and priority tests.
+
+**Benchmark candidates:**
+
+- Add a no-GPU admission simulator with typed bottlenecks for ingress
+  parsing, mutation owner, read snapshot workers, GPU launch slots,
+  pinned buffers, response rings, and cold IO. Compare RTT-style
+  periodic polling, immediate bottleneck feedback, and proactive
+  completion feedback.
+- Implement lane credits for retained-read micro-batches: decrement on
+  saturated queue or scratch budget, increment when a CUDA event or
+  batch-drain watermark predicts near completion. Required metrics:
+  p50/p99, rejected requests, queue wait, batch size, and idle stream
+  time.
+- Add response-ring supply matching where IO workers only admit
+  same-shape reads when response-byte credits exist. Failure condition:
+  GPU throughput improves while response p99 or per-session fairness
+  regresses.
+- Test brownfield fallback by running a coarse global queue-depth policy
+  alongside a typed lane-credit policy, taking the stricter decision
+  when either reports saturation.
+- Record telemetry fields `admission_feedback_source`,
+  `admission_feedback_delay_us`, `lane_credit_delta`,
+  `lane_future_capacity_us`, `lane_supply_tokens`,
+  `admission_brownfield_limit`, and `admission_starvation_count`.
+
+### 2026-06-04 - Cross-paper synthesis: route budgets need fast, typed feedback
+
+HybridQO, Saving Private Hash Join, and Bolt converge on the same
+runtime design pressure from three different directions. HybridQO says
+route choice should be bounded and uncertainty-aware rather than
+opaque. Saving Private Hash Join says execution memory must be a shared
+temporary budget, not private operator scratch. Bolt says the control
+signal for a saturated or soon-to-free budget must arrive before the
+queue state is stale.
+
+The strongest design track is a typed route-budget contract. A route
+descriptor should declare resident bytes, temporary HBM bytes, pinned
+host bytes, response bytes, scratch lifetime, expected completion
+watermark, fallback legality, and prediction uncertainty. Admission
+then consumes lane-specific credits and reacts to direct bottleneck
+feedback instead of treating all overload as one queue-depth number.
+
+The main category gap remains transaction-specific write admission
+under mixed short and long transactions. The recent papers cover
+planning, temporary-state budgeting, and feedback timing well, but the
+next reviews should keep pulling on MVCC, conflict repair,
+deterministic batching, and visibility-aware GPU indexes so the route
+budget does not optimize read-heavy execution while ignoring writes.
+
+Benchmark priority should be a no-GPU route-control harness first:
+simulate retained lookup, large join, refresh, cold transfer, mutation,
+and response lanes with explicit budgets and feedback delays. The pass
+condition is not maximum average throughput. It is stable p99 under
+mixed routes, low idle time when capacity is available, deterministic
+rejection when credits are exhausted, and no WAL/visibility fallback
+being bypassed by an adaptive route hint.

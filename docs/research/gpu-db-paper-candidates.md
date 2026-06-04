@@ -2338,12 +2338,19 @@ Append new candidates here as each paper is processed.
   Why: SMaRTT positions itself as the basis for UEC NSCC; the broader UEC
   design may inform future GPU DB transport assumptions, multipath routing,
   out-of-order placement, and packet-trimming availability.
-- `queued` — **Bolt: Sub-RTT Congestion Control for Ultra-Low Latency**,
+- `reviewed` — **Bolt: Sub-RTT Congestion Control for Ultra-Low Latency**,
   Arslan et al., NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/arslan`
   Why: SMaRTT cites Bolt as a recent sub-RTT congestion-control baseline;
   useful for comparing fast congestion notification with GPU DB response-ring
   and gateway admission telemetry.
+- `queued` — **Credit-Scheduled Delay-Bounded Congestion Control for
+  Datacenters**, Cho, Jang, and Han, SIGCOMM 2017.
+  URL: `https://doi.org/10.1145/3098822.3098840`
+  PDF: `https://keonjang.github.io/papers/sigcomm17ep.pdf`
+  Why: Bolt contrasts against ExpressPass-style credit scheduling; useful for
+  comparing explicit admission credits with delay/queue feedback for GPU DB
+  ingress, response rings, and bounded micro-batch launch.
 - `queued` — **Transaction Healing: Scaling Optimistic Concurrency Control on
   Multicores**, Wu, Chan, and Tan, SIGMOD 2016.
   URL: `https://dl.acm.org/doi/10.1145/2882903.2915202`
