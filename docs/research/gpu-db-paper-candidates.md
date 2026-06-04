@@ -900,7 +900,7 @@ Append new candidates here as each paper is processed.
   Why: modern spatial-multitasking resource allocation follow-up to GPU
   Maestro-style GPU sharing; useful for comparing software-visible GPU
   partition policy with current hardware and cloud scheduling assumptions.
-- `queued` — **Towards Efficient and Practical GPU Multitasking in the Era of
+- `reviewed` — **Towards Efficient and Practical GPU Multitasking in the Era of
   LLM**, arXiv 2025.
   URL: `https://arxiv.org/abs/2508.08448`
   Why: recent GPU multitasking position paper that surveys sharing, isolation,
@@ -1178,6 +1178,24 @@ Append new candidates here as each paper is processed.
   useful counterpoint to FastLanes for whether GPU DB cold/warm segments can
   also serve point lookups and mutation-adjacent routes without separate
   row-store copies.
+- `queued` — **LithOS: An Operating System for Efficient Machine Learning on
+  GPUs**, Coppock et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2504.15465`
+  Why: GPU multitasking paper cites LithOS as a recent GPU OS direction;
+  useful for comparing OS-like GPU scheduling and isolation with database-owned
+  GPU execution owners.
+- `queued` — **Microsecond-scale Preemption for Concurrent GPU-accelerated DNN
+  Inferences**, Han et al., OSDI 2022.
+  URL: `https://www.usenix.org/conference/osdi22/presentation/han`
+  Why: REEF-style GPU preemption is cited by the multitasking paper; useful
+  for evaluating whether retained-read latency can be protected by
+  kernel-boundary or finer-grained preemption.
+- `queued` — **Hardware Compute Partitioning on NVIDIA GPUs**, Bakita and
+  Anderson, RTAS 2023.
+  URL: `https://doi.org/10.1109/RTAS58335.2023.00012`
+  Why: cited by the multitasking paper for SM/control mechanisms; useful for
+  understanding what resource partitioning can be exposed to GPU DB route
+  admission without depending on unsupported driver behavior.
 - `reviewed` — **Polaris: Enabling Transaction Priority in Optimistic
   Concurrency Control**, Ye et al., PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3588724`

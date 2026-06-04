@@ -49828,3 +49828,174 @@ multi-tier storage.
 - Add telemetry for assigned-but-not-started work per lane. Admission should
   reject, defer, or fallback based on active-window pressure before route
   queues hide tail buildup.
+
+### 2026-06-05 - GPU multitasking needs explicit compute, memory, and fault-isolation contracts
+
+**Citation:** Jiarong Xing, Yifan Qiao, Simon Mo, Xingqi Cui,
+Gur-Eyal Sela, Yang Zhou, Joseph Gonzalez, and Ion Stoica.
+"Towards Efficient and Practical GPU Multitasking in the Era of LLM."
+arXiv:2508.08448, submitted 2025-08-11. Retrieved 2026-06-05 from
+`https://arxiv.org/abs/2508.08448` and
+`https://arxiv.org/pdf/2508.08448`.
+
+**Category:** GPU execution / analytics; runtime / HFT / session scale;
+GPU resource management and admission.
+
+**Relevance tags:** GPU multitasking; temporal sharing; spatial sharing;
+SM partitioning; kernel scheduling; memory virtualization; GPU swapping;
+guaranteed and preemptible resources; utility-guided scheduling; fault
+isolation; NVLink and GPUDirect sharing; route admission.
+
+**Core idea:** The paper is a position/design paper arguing that GPUs need
+a resource-management layer analogous to a CPU operating system. Its main
+claim is not a measured database speedup; it is a requirements and mechanism
+map for moving from single-task GPU ownership to practical multitasking:
+high utilization, performance guarantees, fault isolation, and large-scale
+deployment. The authors argue that existing techniques each miss some part
+of this contract: static partitioning wastes capacity, flexible concurrent
+kernel execution often lacks guarantees, MPS-style sharing weakens fault
+isolation, and most work handles compute sharing more than memory sharing.
+
+The strongest transferable idea for GPU DB is to treat a resident GPU route
+as a contract over compute, memory, and isolation, not just a CUDA stream
+choice. A short retained lookup, long scan, refresh build, COPY-derived
+kernel, decompression job, or future ML-assisted planner task may each need
+different latency guarantees and different tolerance for sharing. The runtime
+should expose those requirements before admitting work, then choose temporal,
+spatial, or exclusive execution based on measurable pressure.
+
+This paper also makes memory sharing a first-class part of multitasking.
+For GPU DB, memory is often the scarcer and more correctness-sensitive
+resource than SMs: resident snapshots, pinned staging buffers, decompression
+scratch, result buffers, and over-resident partition windows all interact
+with MVCC generation validity and route fallback. GPU scheduling that ignores
+memory residency and eviction semantics can improve SM occupancy while
+damaging p99 latency or snapshot correctness.
+
+**Concrete mechanisms:**
+
+- The paper compares existing GPU-sharing systems against four requirements:
+  high utilization, performance guarantees, fault isolation, and large-scale
+  deployment. The gap table is useful as a design checklist rather than as a
+  benchmark result.
+- Compute multiplexing is split into temporal sharing, where each task owns
+  the GPU during a time slice or kernel window, and spatial sharing, where
+  kernels run concurrently on subsets of SMs.
+- For temporal sharing, the paper suggests kernel-granularity scheduling by
+  intercepting launches and choosing which task's next kernel runs. Driver
+  time slicing can provide stronger latency bounds when kernel completion
+  alone is too coarse, but context switching has real overhead.
+- For spatial sharing, the paper favors driver-level SM control over kernel
+  rewrites. It points to `libsmctrl`-style SM masking as a transparent way to
+  cap the SMs visible to a launched kernel.
+- Temporal sharing is cleaner for fault isolation because each task can keep
+  a separate CUDA context. Spatial sharing may improve utilization but makes
+  memory-bandwidth isolation, dynamic repartitioning, and fault isolation
+  harder, especially when it depends on one shared MPS context.
+- Memory multiplexing is handled through driver-intercepted allocation APIs,
+  virtual GPU memory, on-demand physical mapping, reclaim, and transparent
+  swap to CPU DRAM over NVLink or PCIe when GPU memory is oversubscribed.
+- The paper argues for semantics-aware memory sharing: framework allocators
+  should tell the resource manager which buffers are inactive or reclaimable,
+  so swap and reclamation do not blindly evict hot state.
+- Resource coordination distinguishes guaranteed resources from preemptible
+  resources. A task keeps guaranteed capacity, while spare capacity can be
+  lent and later reclaimed.
+- Utility-guided allocation uses per-kernel resource-to-performance curves to
+  avoid giving more SMs to kernels that have already saturated.
+- For large-scale deployment, the paper calls out static Kubernetes GPU
+  device assumptions and points toward dynamic resource allocation, plus
+  coordination with routing, autoscaling, memory-tiering, and network-sharing
+  control loops.
+- Network sharing is part of the GPU contract. NVLink, GPUDirect RDMA, and
+  communication kernels may need scheduling or bandwidth controls when tasks
+  spatially share a GPU.
+- The open problems are important for database use: side-channel/security
+  isolation remains unsolved, and current GPUs lack direct memory-bandwidth
+  control; throttling via inserted delays is presented only as a possible
+  workaround.
+
+**GPU DB mapping:** The production runtime in
+`11-high-throughput-query-runtime.md` should treat GPU execution owners as
+resource-contract owners. A route certificate should include not only snapshot
+generation, table/partition identity, and output shape, but also expected SM
+class, HBM budget, scratch/pinned-buffer budget, transfer class, isolation
+requirement, and whether the route may use preemptible capacity. Admission can
+then reject, delay, fallback, or choose a sharing mode before launching work.
+
+Temporal sharing maps well to correctness-sensitive and tail-sensitive routes:
+short retained point lookups, catalog-sensitive reads, post-mutation refresh
+publication, and any operation whose failure must not poison another route's
+CUDA context. Spatial sharing maps better to compatible scans, decompression,
+aggregates, or background refresh work whose kernels are small or do not fully
+occupy the device. The key design question becomes measurable route class,
+not a blanket "concurrent kernels are good" rule.
+
+The guaranteed/preemptible model is a useful admission language. Retained
+read p99 lanes could reserve guaranteed GPU-owner credits, while long scans,
+warmups, refresh rebuilds, and over-resident prefetch/decompression use only
+preemptible GPU capacity. If a guaranteed lane needs capacity, background
+work should stop at a kernel boundary, release scratch and staging budgets,
+or fall back to CPU/NVMe without leaving partially published resident state.
+
+The memory-virtualization discussion maps directly to P8's tier model.
+GPU DB should not rely on transparent GPU memory oversubscription as a
+correctness mechanism, but it can borrow the telemetry contract: each resident
+snapshot and staging allocation needs an owner, activity state, eviction or
+swap eligibility, generation frontier, and cleanup path. The database knows
+which buffers are rebuildable, stale, pinned by readers, or part of WAL-bound
+publication; that semantic information should drive promotion and demotion
+far more safely than generic LRU.
+
+The network-sharing point matters for future multi-GPU and GPUDirect paths.
+If GPU DB eventually streams cold partitions through GPUDirect storage or
+RDMA, the route scheduler must budget interconnect capacity alongside SMs and
+HBM. A scan that is "GPU-light" but NVLink-heavy can still violate latency for
+resident lookup or result-writeback traffic.
+
+**Risks and mismatches:** This is a 2025 arXiv position paper focused on AI
+and LLM workloads, not a database system evaluation. Many mechanisms are
+proposals rather than implemented, measured DBMS designs. GPU DB should use
+it as a checklist and benchmark generator, not as proof that a GPU OS layer
+will improve SQL workloads.
+
+The paper assumes opportunities in driver modification, allocation
+interposition, dynamic MIG-like behavior, and communication-kernel
+scheduling. Near-term GPU DB should probably avoid relying on unavailable
+driver features. It can still implement the higher-level contract in its own
+GPU execution owners: bounded queues, explicit scratch budgets, route classes,
+kernel-boundary yield points, and conservative fallback.
+
+LLM memory behavior is not identical to database resident snapshots. KV cache
+has allocator semantics and token-lifetime patterns; MVCC snapshots have
+visibility frontiers, invalidation, readers, and recovery constraints. Generic
+GPU swapping could make a database route correct but unpredictably slow, so
+explicit placement and fallback remain preferable for production latency.
+
+**Benchmark candidates:**
+
+- Add a GPU route-class benchmark with three lanes: short retained lookup,
+  long scan/aggregate, and background refresh/decompression. Compare exclusive
+  execution, temporal kernel-boundary sharing, and spatial concurrent-kernel
+  sharing. Gate: lookup p99 stays bounded while throughput improves for
+  background work.
+- Track guaranteed versus preemptible GPU credits per execution owner. Proof
+  gate: background refresh or scan work releases capacity at kernel boundaries
+  when retained-read pressure rises, without publishing partial generations.
+- Add per-route HBM, scratch, pinned-host, and transfer budgets to admission
+  telemetry. Failure condition: a route is admitted based on SM availability
+  while memory or interconnect pressure causes p99 collapse.
+- Build a utility-curve microbenchmark for existing kernels: point lookup,
+  prefix filter, aggregate, decompression, refresh build, and result scatter.
+  Use SM allocation or concurrency level as the independent variable and
+  record where each kernel saturates.
+- Compare explicit DB-owned eviction of rebuildable resident snapshots against
+  any transparent GPU-memory oversubscription mode available on the target
+  hardware. Minimum gate: transparent fallback cannot hide p99 spikes or
+  violate resident generation validity.
+- Add a fault-containment fixture for GPU execution owners: inject a failing
+  kernel or CUDA error in background work and verify retained-read lanes,
+  buffer cleanup, and route invalidation behave deterministically.
+- For future GPUDirect/RDMA paths, add interconnect budget simulation that
+  accounts for H2D/D2H, NVLink, GPUDirect storage, and response writeback
+  pressure separately from SM occupancy.
