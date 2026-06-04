@@ -30293,3 +30293,137 @@ the same route-contract and feedback model.
 - Add explicit "steered", "fallback", "refreshing", "rejected", and
   "credit cut" outcomes to route telemetry, so throughput improvements
   cannot hide correctness or overload costs.
+
+### 2026-06-04 - HybridQO keeps learned planning behind bounded hints and uncertainty
+
+**Citation:** Xiang Yu, Chengliang Chai, Guoliang Li, and Jiabin Liu.
+"Cost-based or Learning-based? A Hybrid Query Optimizer for Query Plan
+Selection." PVLDB 15(13):3924-3936, 2022. DOI:
+`10.14778/3565838.3565846`. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol15/p3924-li.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** hybrid optimizer; learned route ranking;
+deterministic planner guardrails; leading hints; Monte Carlo tree
+search; uncertainty-aware plan selection; adaptive workloads; CPU/GPU
+route choice; retained route templates.
+
+**Core idea:** HybridQO argues that cost-based and learned optimizers
+fail in different ways. A traditional optimizer is stable and cheap but
+can pick poor plans for complex joins when cost errors accumulate. A
+learned optimizer can find better plans on familiar workloads but is
+fragile when the incoming workload is out-of-distribution. The paper's
+transferable idea is to let learning propose bounded partial intent,
+then let the native optimizer complete the plan, and finally use an
+uncertainty-aware selector to avoid trusting a low predicted latency
+when the model is not confident.
+
+That is a useful shape for GPU DB route choice. The GPU route selector
+should not become an opaque learned authority that can bypass MVCC,
+residency, or fallback rules. It can instead propose bounded route
+hints such as resident GPU lookup, CPU index fallback, cold-transfer
+scan, compressed GPU decode, or batchable retained aggregate, while the
+deterministic planner checks visibility, supported predicates, tier
+state, queue pressure, and result-shape constraints.
+
+**Concrete mechanisms:**
+
+- HybridQO generates candidate plans by searching a leading-hint tree.
+  Each node is a table prefix; a path represents a join-order prefix or
+  complete order. The selected prefix is passed to PostgreSQL's hint
+  mechanism, so PostgreSQL still supplies the rest of the physical plan.
+- The search uses Monte Carlo tree search with a UCB-style utility that
+  combines node benefit with access frequency. Benefit is based on
+  normalized estimated performance from a join-order estimator, while
+  the access term keeps exploration from collapsing too early into one
+  apparently good prefix.
+- The paper emphasizes short leading hints. In its JOB analysis, random
+  length-2 hints were much less likely to damage the plan than long
+  hints, and shorter hints performed better in both static and dynamic
+  workloads because they leave more work to the native optimizer.
+- Candidate plan selection uses a plan-performance model that predicts
+  both execution time and uncertainty. The selector prefers plans with
+  good predicted latency and low uncertainty; high-uncertainty learned
+  candidates can lose to the cost-based plan.
+- HybridQO updates the join-order estimator and plan estimator
+  incrementally after executing the chosen plan, using the actual plan
+  and runtime as new training evidence.
+- Evaluation is in PostgreSQL 12.4 on JOB, JOB-EXT, JOB-D, and Stack.
+  The paper reports total-latency reductions versus PostgreSQL of about
+  25.1% on JOB and 11.9% on Stack, and reports a 65.52% reduction in
+  JOB 99.5th-percentile latency versus PostgreSQL. It also shows that
+  uncertainty-based selection filters bad learned choices better than
+  selecting the lowest predicted time alone.
+- Planning cost is not free. On JOB, HybridQO's planning path is about
+  3.3x PostgreSQL planning time, though the paper argues this is small
+  relative to total OLAP query runtime. The authors explicitly note that
+  short-running OLTP scenarios may be better served by the cost-based
+  optimizer alone.
+
+**GPU DB mapping:** The closest mapping is a two-layer route optimizer.
+The deterministic layer owns correctness and eligibility: snapshot
+generation, WAL boundary, table identity, resident layout, predicate
+support, queue capacity, and fallback legality. A learned or adaptive
+layer may only produce bounded hints over eligible route families and
+rank candidates using observed latency, transfer bytes, queue wait,
+freshness, and uncertainty.
+
+For retained reads, the hint equivalent is not a join prefix but a
+route prefix: "try resident key-vector lookup", "try compressed
+column-group scan", "try CPU index plus GPU aggregate", or "try cold
+segment prefilter before GPU decode". The planner should complete that
+hint with deterministic checks, just as PostgreSQL completes HybridQO's
+leading hint with legal physical operators.
+
+For 1M logical sessions, the uncertainty signal should influence
+admission. A route with low predicted latency but high uncertainty
+should get fewer credits, smaller micro-batches, or a deterministic
+fallback until more evidence arrives. This aligns with the typed
+feedback track from recent reviews: route selection should include
+confidence, not just predicted time.
+
+For tier placement, HybridQO suggests evaluating a small set of
+candidate placements instead of one global policy. A query template
+could compare "HBM resident", "host-memory compressed", "NVMe cold
+transfer", and "CPU fallback" candidates under a bounded search budget.
+The learned layer can bias the search toward likely winners, while
+uncertainty prevents one stale model from forcing bad cold-tier or
+GPU-saturated routes.
+
+**Risks and mismatches:** HybridQO is evaluated mainly on analytical
+join workloads where extra planning time can be amortized. The paper
+does not address OLTP transaction ordering, MVCC visibility, WAL,
+pgwire protocol ordering, GPU execution, or tiered storage. It relies
+on DBMS hint support and on observing actual runtimes, which may be
+expensive or risky for rare GPU routes. The uncertainty model helps
+filter bad plans but does not prove safety; GPU DB still needs hard
+eligibility rules and negative tests. For short point transactions, the
+paper itself warns that using the native cost-based optimizer may be
+the better choice.
+
+**Benchmark candidates:**
+
+- Add a route-hint experiment where an adaptive selector proposes only
+  bounded route prefixes and the deterministic planner completes or
+  rejects them. Compare deterministic-only, lowest-predicted-latency,
+  and uncertainty-aware selection.
+- Track per-route uncertainty from observed latency variance, queue
+  delay variance, stale-generation repairs, and fallback frequency.
+  Gate: high-uncertainty routes receive lower credits or smaller
+  batches even when predicted latency is attractive.
+- Build a micro-benchmark for repeated retained SQL templates with
+  candidate routes: CPU index, GPU resident key lookup, GPU resident
+  scan, compressed host segment, and cold NVMe transfer. Required
+  measurement: p50/p99, transfer bytes, HBM bytes, planning overhead,
+  fallback count, and wrong-route regret.
+- Add a negative short-transaction benchmark where route-learning
+  overhead must lose to deterministic planning. The policy should learn
+  to stay out of the way for trivial OLTP paths.
+- Test route-prefix length analogs: one coarse hint, two-stage hint
+  including tier plus operator family, and full route prescription.
+  Failure condition: longer hints improve average throughput but cause
+  more stale-route repairs, queue overload, or visibility rejections.
+- Add telemetry fields `route_hint_family`, `route_hint_completed`,
+  `route_hint_rejected_reason`, `route_prediction_uncertainty`,
+  `route_regret_us`, and `route_model_bypass_count`.

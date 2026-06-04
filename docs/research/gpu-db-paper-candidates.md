@@ -1010,12 +1010,21 @@ Append new candidates here as each paper is processed.
   Why: RankPQO cites this concurrent-query learned optimizer work; useful for
   testing whether GPU DB route choice should cache decisions under concurrent
   queue pressure instead of treating each retained query in isolation.
-- `queued` — **Cost-based or Learning-based? A Hybrid Query Optimizer for
+- `reviewed` — **Cost-based or Learning-based? A Hybrid Query Optimizer for
   Query Plan Selection**, Yu et al., PVLDB 2022.
-  URL: `https://www.vldb.org/pvldb/vol15/p3924-yu.pdf`
+  URL: `https://www.vldb.org/pvldb/vol15/p3924-li.pdf`
+  DOI: `https://doi.org/10.14778/3565838.3565846`
   Why: RankPQO cites hybrid plan selection work; relevant to keeping GPU DB
   deterministic cost rules as guardrails while adding measured route-ranking
   hints for CPU/GPU/tier choices.
+- `queued` — **Query Performance Prediction for Concurrent Queries using
+  Graph Embedding**, Zhou et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p1416-zhou.pdf`
+  DOI: `https://doi.org/10.14778/3397230.3397238`
+  Why: Lemo and concurrent-query optimizer work point back to graph-based
+  interference prediction; useful for route admission that estimates shared
+  table/index/tier/GPU-stream contention instead of optimizing each retained
+  query in isolation.
 - `queued` — **AdaptDB: Adaptive Partitioning for Distributed Joins**,
   Lu, Shanbhag, Jindal, and Madden, PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p589-lu.pdf`
