@@ -48116,3 +48116,184 @@ latency and bandwidth constants.
 - Tier cost report: every future CXL/far-memory benchmark should report local
   memory saved, bytes copied, remote queueing, p99 penalty, and fallback rate,
   not just throughput.
+
+### 2026-06-04 - Demystifying CXL Memory with Genuine CXL-Ready Systems and Devices
+
+**Citation:** Yan Sun, Yifan Yuan, Zeduo Yu, Reese Kuper, Chihun Song,
+Jinghan Huang, Houxiang Ji, Siddharth Agarwal, Jiaqi Lou, Ipoom Jeong,
+Ren Wang, Jung Ho Ahn, Tianyin Xu, and Nam Sung Kim. "Demystifying CXL
+Memory with Genuine CXL-Ready Systems and Devices." MICRO 2023, pp.
+105-121. doi:10.1145/3613424.3614256. Retrieved 2026-06-04 from
+`https://arxiv.org/abs/2303.15375`; the ACM PDF endpoint was blocked
+by a Cloudflare challenge during this run.
+
+**Category:** multi-tier cache / data placement; future memory-tier
+architecture.
+
+**Relevance tags:** CXL; tiered memory; memory expansion; bandwidth
+expansion; latency-sensitive workloads; page placement; NUMA emulation;
+cache hierarchy; active memory leases; route certificates.
+
+**Core idea:** The paper measures real CXL-ready hardware rather than
+remote-NUMA emulation and shows that CXL memory is neither simply slow
+DRAM nor simply remote NUMA. Device controller design, instruction type,
+cache-coherence behavior, cache hierarchy interactions, and workload
+latency scale all change whether CXL helps or hurts.
+
+The most useful conclusion for GPU DB is that CXL/future memory tiers
+need measured placement policy. For microsecond-scale, latency-sensitive
+state such as Redis/YCSB, moving pages to CXL increased p99 latency as
+the CXL allocation fraction rose. For memory-bandwidth-bound work such as
+DLRM embedding reduction and SPEC memory-intensive mixes, CXL can help
+when it adds useful bandwidth and the page ratio is tuned. The authors
+therefore propose Caption, a dynamic page-allocation policy that monitors
+memory-subsystem counters and adjusts the percentage of new pages placed
+in CXL memory.
+
+**Concrete mechanisms:**
+
+- The evaluation uses a Sapphire Rapids CXL-ready system with three CXL
+  memory devices from different manufacturers. The devices differ in CXL
+  IP, DRAM generation, and controller implementation, which leads to
+  materially different latency and bandwidth behavior.
+- The paper compares real CXL memory with a remote-DDR NUMA node used as
+  emulated CXL memory. Real CXL can be faster or slower than emulation
+  depending on controller and instruction type, so remote-NUMA emulation
+  is not a reliable source for constants.
+- The memo microbenchmark measures temporal load, non-temporal load,
+  temporal store, and non-temporal store with random parallel accesses
+  after flushing cache lines. This exposes instruction-specific behavior
+  that pointer-chasing-only latency tools can miss.
+- CXL-A shows only about 35% longer temporal-load latency than the
+  emulated remote-DDR node, while CXL-B is almost 2x and CXL-C almost 3x
+  longer. The paper attributes the spread largely to CXL controller
+  design and memory technology.
+- Store and non-temporal-store behavior differs from load behavior
+  because temporal stores trigger write allocation and coherence checks,
+  while non-temporal stores can avoid reading the destination cache line.
+- Maximum bandwidth efficiency is also controller-dependent. In the
+  paper's read-only MLC measurement, DDR5 remote memory reaches about
+  70% of theoretical maximum bandwidth, CXL-A about 46%, CXL-B about
+  47%, and CXL-C about 20%.
+- CXL memory can break sub-NUMA clustering LLC isolation: cache lines
+  loaded from CXL memory can be evicted into LLC slices across SNC nodes.
+  This sometimes gives CXL-backed accesses a larger effective LLC and can
+  partially hide higher memory latency for cache-friendly workloads.
+- Redis/YCSB-A is highly latency-sensitive. At 85 K target QPS, allocating
+  25%, 50%, and 75% of pages to CXL increased p99 latency by about 9%,
+  23%, and 45% over local-DDR allocation, while 100% CXL was about 105%
+  worse.
+- Transparent page migration can hurt latency-sensitive applications.
+  In the Redis experiment, TPP migration caused higher latency than
+  static placement because page copying and page-table updates interfere
+  with urgent memory reads.
+- In DeathStarBench social-network workloads, placing caching/storage
+  pages in CXL had little p99 impact because the end-to-end latency was
+  millisecond-scale and front-end/logic work dominated the critical path.
+- For FIO page-cache experiments, small block sizes were dominated by
+  kernel/page-cache overhead, larger blocks by storage access and CXL
+  bandwidth limits; the memory tier was not the only relevant latency
+  source.
+- DLRM embedding reduction benefits from CXL when memory bandwidth is the
+  bottleneck. With 32 threads, the reported best ratio put 63% of pages
+  in CXL and reached 88% higher throughput than all-local-DDR placement
+  in the paper's constrained two-DDR-channel setup.
+- Caption monitors memory counters such as L1 miss latency, DDR read
+  latency, and IPC through Intel PCM, estimates memory-subsystem
+  performance with a simple linear model, and uses a greedy hill-climbing
+  step that reverses and halves direction when estimated performance
+  declines.
+- Caption tunes only new-page placement ratios between DDR and CXL. It is
+  complementary to migration systems rather than a full object-placement
+  manager.
+- In the evaluated SPEC and mixed Redis/DLRM cases, Caption beat the best
+  static placement by up to 24% for some mixes, while still being
+  imperfect for Redis alone because all-local-DDR remained best for that
+  latency-bound workload.
+
+**GPU DB mapping:** This paper grounds the previous CXL synthesis in
+hardware measurements. GPU DB should treat CXL, pooled memory, and
+future host tiers as route-visible capacity with separate latency,
+bandwidth, controller, cache, and access-mode constants. A route should
+not say only "far memory"; it should specify whether the request uses
+random loads, temporal stores, non-temporal copies, streaming prefetch, or
+promotion into local DRAM before GPU execution.
+
+For the 1M logical-session goal, the Redis and TPP results are a direct
+warning. Per-session state, queue heads, route metadata, prepared
+statement state, transaction visibility stamps, and response-ring control
+structures are microsecond-sensitive. They should stay in local memory,
+with idle sessions reserving no payload tier memory. CXL-like tiers are
+better first candidates for cold payloads, old snapshots, scan-only
+segments, columnar text bytes, or large intermediates whose latency is
+amortized by GPU work or storage work.
+
+For P8, the DLRM and SPEC results suggest a useful positive role:
+bandwidth expansion for scan-heavy or transformation-heavy routes. A
+resident refresh or over-resident scan may benefit from distributing
+cold/warm column pages across DRAM and CXL when the route is bandwidth
+bound and can tolerate higher single-access latency. The route certificate
+should include a measured page/segment placement ratio and should be
+allowed to adjust that ratio based on queue delay, L1/LLC miss telemetry,
+DRAM bandwidth, and CXL bandwidth.
+
+The cache-hierarchy result matters for benchmarks. CXL access can change
+effective LLC capacity under SNC, so a GPU DB experiment that compares
+local DRAM, remote NUMA, and CXL must record CPU topology, SNC mode, LLC
+hit behavior, and controller identity. Otherwise a benchmark may falsely
+attribute a win to far-memory bandwidth when it came from broken LLC
+isolation or larger effective cache.
+
+Caption maps to a DB-owned policy, but not literally. The engine should
+not tune only by OS page ratio. It should tune by object family:
+visibility/control state local; hot index upper levels local; pinned GPU
+staging local and bounded; compressed cold segments possibly CXL; old
+retained snapshots possibly CXL; large scan/intermediate buffers
+CXL-eligible only when bandwidth-bound and observable. The DBMS can use
+Caption-like feedback as a placement controller for new segments,
+refreshes, and intermediates.
+
+**Risks and mismatches:** The paper is a hardware/OS measurement paper,
+not a DBMS paper. It does not evaluate SQL plans, MVCC metadata, WAL,
+GPU transfers, GPUDirect, CUDA pinned memory, or PostgreSQL protocol
+paths. The DLRM/SPEC wins are bandwidth-expansion evidence, not proof
+that transactional database structures belong in CXL. The setup uses one
+CXL device and a constrained local-DDR-channel configuration to make CXL
+matter; production systems may have different channel ratios, controllers,
+and CXL generations.
+
+Caption tunes page allocation for new pages through OS policy. GPU DB's
+storage objects are more structured than generic pages, so object-family
+placement should dominate. Also, the paper's direct counters are CPU-side;
+GPU DB needs GPU queue, transfer, pinned-buffer, residency, and WAL/MVCC
+telemetry too. Finally, CXL memory can interact with LLC topology in
+surprising ways, so simple latency constants are insufficient.
+
+**Benchmark candidates:**
+
+- Add a CXL/far-memory sensitivity harness with separate constants for
+  random load, temporal store, non-temporal copy, streaming read, and
+  promotion-to-local. Proof gate: route decisions change when access mode
+  changes, not only when capacity changes.
+- Extend route certificates with `tier_access_mode`, estimated DRAM/CXL
+  bytes, expected cache behavior, promotion bytes, and local-control-state
+  requirements.
+- Build an object-family placement experiment: session/control metadata,
+  visibility heads, hot index upper levels, cold column bytes, old
+  snapshots, and scan intermediates. Failure condition: a policy places
+  latency-sensitive control structures in far memory because they are small
+  or idle most of the time.
+- Add an active-lease page/segment placement controller inspired by
+  Caption, but driven by DB telemetry: queue wait, p99 route latency, LLC
+  misses, DRAM bandwidth, CXL/far-tier bandwidth, GPU transfer bytes, and
+  fallback rate.
+- Benchmark retained snapshot refresh with local-only DRAM versus mixed
+  DRAM/CXL cold column pages. Expected win condition: mixed placement helps
+  only when refresh/scan work is bandwidth-bound and p99 retained reads do
+  not regress.
+- Add a topology report to tier benchmarks: CPU model, NUMA/SNC mode, LLC
+  capacity visible to the worker, CXL controller/device identity, local
+  memory channels, CXL channels, and instruction/access pattern.
+- Run a page-migration interference test by injecting copy/migration work
+  while measuring short retained reads. Failure condition: migration work
+  creates Redis-like p99 cliffs for session or visibility hot paths.

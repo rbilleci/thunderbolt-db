@@ -3895,13 +3895,39 @@ Append new candidates here as each paper is processed.
   Why: memory-centric database designs cite it as the main cautionary source
   on CXL pooling; useful for stress-testing GPU DB's future memory-pool
   assumptions against networking, failure, and deployment costs.
-- `queued` — **Demystifying CXL Memory with Genuine CXL-Ready Systems and
+- `reviewed` — **Demystifying CXL Memory with Genuine CXL-Ready Systems and
   Devices**, Sun et al., MICRO 2023.
   URL: `https://doi.org/10.1145/3613424.3614256`
+  arXiv: `https://arxiv.org/abs/2303.15375`
   Why: the HotNets CXL-pooling critique relies on this real-hardware CXL
   latency and bandwidth evidence; useful for replacing abstract CXL tier
   assumptions with measured load/store, copy, random-access, and NUMA-like
   behavior.
+- `queued` — **TMO: Transparent Memory Offloading in Datacenters**, Weiner et
+  al., ASPLOS 2022.
+  URL: `https://doi.org/10.1145/3503222.3507731`
+  PDF: `https://www.cs.cmu.edu/~dskarlat/publications/tmo_asplos22.pdf`
+  Why: Demystifying CXL compares against transparent page placement and
+  offloading policy; TMO is a production datacenter memory-offload baseline
+  for deciding which GPU DB objects can be transparently demoted and which
+  require explicit route-owned placement.
+- `queued` — **HeMem: Scalable Tiered Memory Management for Big Data
+  Applications and Real NVM**, Raybuck et al., SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483550`
+  PDF: `https://www.cs.utexas.edu/~witchel/380L/papers/raybuck21sosp.pdf`
+  Why: Demystifying CXL cites HeMem as a tiered-memory management baseline;
+  useful for comparing hardware-event sampling and user-level tier policy
+  against DB-owned placement of hot metadata, cold segments, and old
+  snapshots.
+- `queued` — **Nimble Page Management for Tiered Memory Systems**, Yan et al.,
+  ASPLOS 2019.
+  URL: `https://doi.org/10.1145/3297858.3304024`
+  Author page:
+  `https://normal.zone/publications/2019-04-15-ASPLOS-2019/`
+  Why: Demystifying CXL shows page migration can harm latency-sensitive
+  workloads; Nimble is a primary OS page-migration mechanism for measuring
+  migration throughput, migration interference, and whether GPU DB should avoid
+  opaque page movement on short read paths.
 - `queued` — **Dremel: A Decade of Interactive SQL Analysis at Web Scale**,
   Melnik et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf`
