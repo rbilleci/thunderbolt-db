@@ -48476,3 +48476,186 @@ responses rather than as "short jobs always win."
 - Record route certificate fields for admission: request bytes admitted,
   response bytes admitted, route class, credit issuer, outstanding fragments,
   queue wait, age, priority lane, and rejection reason.
+
+### 2026-06-04 - OCToPus uses semantic fast paths with GPU DAG fallback
+
+**Citation:** dePaul Miller, Hank Korth, and Roberto Palmieri. "POSTER:
+OCToPus: Semantic-aware Concurrency Control for Blockchain Transactions."
+PPoPP 2024, pp. 463-465. doi:10.1145/3627535.3638494. Retrieved
+2026-06-04 from the PPoPP page
+`https://ppopp24.sigplan.org/details/PPoPP-2024-papers/42/POSTER-OCToPus-Semantic-aware-Concurrency-Control-for-Blockchain-Transactions`
+and NSF PAR PDF `https://par.nsf.gov/servlets/purl/10495038`.
+
+**Category:** transaction processing / write path and concurrency control;
+GPU-assisted deterministic fallback.
+
+**Relevance tags:** semantic concurrency control; deterministic execution;
+transaction chopping; compensating actions; GPU DAG construction; hot-account
+contention; fallback path; batch validation.
+
+**Core idea:** OCToPus targets a narrow blockchain transaction model where a
+block contains non-interactive account transfer operations. Because the
+programming model is restricted, many operations commute: independent deposits
+and withdrawals can be applied as atomic account updates without instrumenting
+full read/write sets on the fast path. If the fast path discovers that a
+transaction no longer matches the original sequential semantics, mainly because
+funds are unavailable, OCToPus compensates the partial effects and re-executes
+the aborted transaction plus its dependent transactions through a deterministic
+DAG fallback.
+
+The interesting database lesson is conditional specialization. The paper does
+not claim a general SQL concurrency-control protocol. It shows that when a
+route can certify a small semantic domain, such as transfer-like numeric
+updates with known accounts and compensating inverse operations, the engine can
+replace generic conflict tracking with a cheaper fast path and keep a stronger
+fallback for the cases that break commutativity.
+
+**Concrete mechanisms:**
+
+- OCToPus assumes a send-receive-money model: transactions move value between
+  account-like records and can also update simple metadata such as sequence
+  numbers.
+- Transactions in a block are not interactive and do not externalize output
+  until the block is committed, so partial fast-path effects can be rolled back
+  inside the block without exposing them to clients.
+- The fast path decomposes each transaction into atomic operations and lets
+  operations from different transactions interleave when the semantic model
+  says they commute.
+- The fast path does not track general read/write sets at runtime. It relies on
+  the domain rule that insufficient funds are the abort reason that invalidates
+  an attempted transfer.
+- Compensating actions undo unwanted committed effects. In the SRM model,
+  compensating an aborted transfer can be implemented as depositing value back,
+  which the paper treats as an operation that always succeeds.
+- The fallback path builds a DAG where edges follow the original block order:
+  if earlier transaction `T1` conflicts with later transaction `T2`, the graph
+  contains an edge from `T1` to `T2`.
+- Access sets are known before execution because account identifiers are
+  supplied through the transaction APIs rather than discovered dynamically.
+- When a transaction aborts on the fast path, OCToPus compensates that
+  transaction and all dependent transactions identified in the DAG.
+- Independent DAG components can run in parallel. Transactions inside one
+  connected subgraph execute sequentially to avoid additional conflict
+  resolution, and their writes are buffered until completion because they may
+  still abort from insufficient funds.
+- The paper's GPU use is limited but specific: the GPU builds an upper
+  triangular matrix representing the deterministic conflict DAG in parallel
+  while the CPU executes the fast path.
+- Reported headline claims from the conference abstract are up to 2.3x
+  throughput and 35% latency reduction over existing semantic-aware
+  concurrency controls, and at least 7x throughput over general-purpose
+  concurrency controls. The three-page poster PDF does not provide detailed
+  experimental setup, workload parameters, or full result tables.
+
+**GPU DB mapping:** OCToPus is useful as a route-specialization warning and an
+opportunity. GPU DB should not turn the whole SQL engine into a blockchain
+executor, but it can define narrow certified write routes where semantic
+commutativity is real: inventory decrement with non-negative bound, account
+transfer between known keys, counter add/subtract with invariant, append-only
+ledger rows plus balance materialization, or other prepared statements whose
+read/write keys and inverse actions are known before admission.
+
+For those routes, the mutation owner could admit a micro-batch into a semantic
+fast lane. The request descriptor would need operation class, keys touched,
+numeric invariant, compensation action, WAL batch boundary, and fallback
+policy. Atomic CPU updates may be enough for the fast path; the GPU becomes
+interesting for building or evaluating the fallback dependency graph when a
+large batch has many hot keys or when the same conflict matrix is useful for
+admission, replay, and repair.
+
+The paper also complements O|R|P|E and MRVs in the journal. O|R|P|E supplies a
+semantic vocabulary for operation classes; MRVs shows that numeric invariants
+can be split across records; OCToPus adds a fallback shape: execute the cheap
+semantic path first, then compensate and replay only the dependent slice that
+lost the semantic proof. For GPU DB, that suggests a benchmarkable middle path
+between generic OCC retry and fully deterministic scheduling.
+
+The WAL boundary is stricter for GPU DB than for the blockchain poster. A
+fast-path operation must not become SQL-visible until its WAL record and MVCC
+visibility publication are safe. Compensation inside an uncommitted batch can
+be an internal repair mechanism, but compensation after visibility would be a
+new transaction, not a rollback of the original effect.
+
+**Risks and mismatches:** OCToPus is a three-page poster, so several details
+are unknown: full workload distribution, hardware, GPU kernel design, matrix
+size limits, memory footprint, exact baselines, and how latency was measured.
+The target model is blockchain block validation with deterministic replay, not
+PostgreSQL-compatible interactive transactions, MVCC snapshots, SQL errors,
+foreign keys, triggers, or client-visible partial results.
+
+The semantic assumptions are strong. General SQL transactions can discover
+keys at runtime, read predicates instead of named accounts, execute arbitrary
+logic, and expose errors immediately. A compensating action for a transfer-like
+route is much easier than compensating an arbitrary UPDATE with indexes,
+triggers, secondary effects, and external observations. GPU DAG construction
+may also be overkill for small OLTP batches where CPU admission and conflict
+maps are cheaper than H2D setup.
+
+**Benchmark candidates:**
+
+- Add a semantic-route classifier for a synthetic transfer workload: known
+  source key, destination key, amount, non-negative balance invariant, and
+  compensation action. Minimum gate: routes not matching the certified shape
+  fall back to normal mutation processing.
+- Compare generic OCC retry, deterministic key-order execution, and an
+  OCToPus-like semantic fast path with dependent-slice compensation under hot
+  account contention. Measure committed transactions/s, aborts, compensated
+  rows, wasted work, p50/p99 latency, and WAL bytes.
+- Prototype fallback dependency graph construction for large admitted write
+  batches. Start with CPU graph build; test GPU graph build only after batch
+  sizes are large enough to amortize transfer and launch overhead.
+- Add WAL-before-visibility proof tests for compensation. Failure condition:
+  any compensated fast-path effect can become visible to a SQL reader or
+  survive crash recovery as committed state.
+- Track a route certificate field for `semantic_commutativity_class` plus
+  `compensation_supported`. Use it to reject unsafe prepared statements rather
+  than silently routing arbitrary SQL through the fast lane.
+- Stress the semantic route with long retained read snapshots. Proof gate:
+  compensation inside an unpublished mutation batch does not leak inconsistent
+  balances into retained snapshots, resident refresh, or GPU read routes.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates need placement, credits, and semantic proof
+
+The last three reviewed papers converge on a single runtime contract. CXL
+measurement says object placement must be based on access behavior, not only
+capacity. Homa says saturated boundaries should admit work through
+receiver-issued credits, not sender push. OCToPus says some write routes can
+avoid generic conflict tracking only when the semantic proof and compensation
+boundary are explicit.
+
+Converging design tracks:
+
+- **Route certificates as admission authority:** each request should carry
+  tier placement, access mode, admitted bytes, credit issuer, route class, and
+  semantic commutativity proof where applicable.
+- **Local-hot, remote-cold placement:** session state, visibility heads, queue
+  control words, and hot index heads stay local; cold column bytes, old
+  snapshots, and large scan/intermediate buffers can move to future tiers only
+  when route latency tolerates it.
+- **Receiver-owned credits:** network IO, mutation owners, read snapshot
+  workers, GPU execution owners, and response rings should issue credits based
+  on active drain capacity, not total logical session count.
+- **Semantic write lanes:** transfer-like or counter-like prepared writes can
+  use cheaper fast paths only when keys, invariants, compensation, WAL boundary,
+  and fallback graph policy are certified before admission.
+
+Category gaps: after this synthesis, the queue is healthier on runtime,
+tiering, and transaction scheduling. The next high-value paper should likely
+come from MVCC/snapshot garbage collection, HTAP freshness, or optimizer route
+risk unless the cron needs to rebalance toward GPU execution after several
+transaction/runtime runs.
+
+Benchmark priorities:
+
+- Extend route certificates with placement and admission fields before adding
+  another scheduler: local/far tier, access mode, bytes admitted, credit issuer,
+  semantic class, compensation support, queue wait, and fallback reason.
+- Build a no-GPU semantic write-lane benchmark first, proving
+  WAL-before-visibility and retained-snapshot safety before testing GPU DAG
+  fallback.
+- Add receiver-credit simulations for large COPY, fan-out reads, and response
+  fragments, then test whether four or fewer priority lanes bound p99 without
+  starving refresh or cold-tier movement.
+- Keep future-tier benchmarks object-family based: control state, hot indexes,
+  old snapshots, cold column bytes, and scan intermediates should each have a
+  separate placement policy and failure condition.

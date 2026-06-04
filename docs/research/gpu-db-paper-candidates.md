@@ -3716,13 +3716,26 @@ Append new candidates here as each paper is processed.
   Why: Opportunities for Optimism contrasts manual commit-time updates with
   DRP's lazy/deferred execution; useful for comparing automatic transaction
   chopping against explicit GPU DB route-shape annotations for hot writes.
-- `queued` — **OCToPus: Semantic-aware Concurrency Control for Blockchain
-  Transactions**, Park et al., PPoPP 2024 poster.
+- `reviewed` — **OCToPus: Semantic-aware Concurrency Control for Blockchain
+  Transactions**, Miller, Korth, and Palmieri, PPoPP 2024 poster.
   URL:
   `https://ppopp24.sigplan.org/details/PPoPP-2024-papers/42/POSTER-OCToPus-Semantic-aware-Concurrency-Control-for-Blockchain-Transactions`
+  PDF: `https://par.nsf.gov/servlets/purl/10495038`
   Why: recent semantic-aware concurrency-control work with a GPU-accelerated
   graph fallback path; useful for comparing O|R|P|E-style semantic classes with
   deterministic DAG fallback for constrained transaction domains.
+- `queued` — **Block-STM: Scaling Blockchain Execution by Turning Ordering
+  Curse to a Performance Blessing**, Gelashvili et al., PPoPP 2023.
+  URL: `https://doi.org/10.1145/3572848.3577524`
+  Why: OCToPus cites Block-STM as a deterministic ordered blockchain execution
+  baseline; useful for comparing optimistic parallel execution, dependency
+  tracking, and re-execution costs against semantic fast paths.
+- `queued` — **SPEEDEX: A Scalable, Parallelizable, and Economically Efficient
+  Decentralized EXchange**, Ramseyer, Goel, and Mazieres, arXiv 2021.
+  URL: `https://arxiv.org/abs/2111.02719`
+  Why: OCToPus cites SPEEDEX as a constrained financial-transaction execution
+  model; useful for comparing semantic batching and deterministic ordering when
+  transaction shape is narrower than general SQL.
 - `queued` — **CFS: Scaling Metadata Service for Distributed File System via
   Pruned Scope of Critical Sections**, Wang et al., EuroSys 2023.
   URL: `https://doi.org/10.1145/3552326.3587443`
