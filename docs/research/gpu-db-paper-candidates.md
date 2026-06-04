@@ -1430,12 +1430,19 @@ Append new candidates here as each paper is processed.
   Why: modern parallel logging with dependency vectors; useful follow-up for
   comparing explicit dependency encoding against RFA-style remote-flush
   avoidance in per-owner GPU DB WAL streams.
-- `queued` — **Adaptive logging: Optimizing logging and recovery costs in
+- `reviewed` — **Adaptive logging: Optimizing logging and recovery costs in
   distributed in-memory databases**, Yao et al., SIGMOD 2016.
-  URL: `https://doi.org/10.1145/2882903.2915221`
+  URL: `https://doi.org/10.1145/2882903.2915208`
+  PDF: `https://www.cs.albany.edu/~jhh/courses/readings/yao.sigmod16.pdf`
   Why: distributed in-memory command/data logging tradeoff cited by Taurus;
   useful for deciding whether GPU DB should vary log payloads and recovery
   strategy by transaction class or partition.
+- `queued` — **Let's Talk About Storage & Recovery Methods for Non-Volatile
+  Memory Database Systems**, Arulraj, Pavlo, and Dulloor, SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2749441`
+  Why: recovery-design follow-up cited by Adaptive Logging; relevant to
+  separating volatile GPU/DRAM acceleration state from durable WAL/checkpoint
+  truth as future memory tiers arrive.
 - `queued` — **Guaranteeing Recoverability via Partially Constrained
   Transaction Logs**, Guo et al., arXiv 2019.
   URL: `https://arxiv.org/abs/1901.06491`

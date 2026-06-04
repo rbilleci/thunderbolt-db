@@ -35813,3 +35813,128 @@ collection on their own.
 - Add a long-retained-scan plus hot-update benchmark. Expected behavior:
   protect the small hot update/read conflict without pessimistically locking
   every row touched by the long scan.
+
+### 2026-06-04 - Adaptive logging makes recovery cost a write-path budget
+
+**Citation:** Chang Yao, Divyakant Agrawal, Gang Chen, Beng Chin Ooi, and Sai
+Wu. "Adaptive Logging: Optimizing Logging and Recovery Costs in Distributed
+In-memory Databases." SIGMOD 2016, pp. 1119-1134.
+doi:10.1145/2882903.2915208. Retrieved 2026-06-04 from
+`https://www.cs.albany.edu/~jhh/courses/readings/yao.sigmod16.pdf`.
+
+**Category:** Transaction processing / write path and recovery.
+
+**Relevance tags:** WAL design; command logging; ARIES-style data logging;
+parallel recovery; dependency graphs; footprint logs; checkpoint boundaries;
+transaction-class budgets; distributed in-memory OLTP.
+
+**Core idea:** Adaptive Logging treats log detail as a tunable resource rather
+than a fixed system-wide choice. Command logging is cheap on the foreground
+path because it records the stored procedure and parameters, but it can make
+recovery replay large dependency chains after the last checkpoint. ARIES-style
+data logging records enough value changes to recover independently, but it
+spends more write bandwidth during normal transaction processing.
+
+The paper first extends command logging to distributed recovery by identifying
+only the transactions needed for a failed node and replaying independent
+groups in parallel. It then spends a bounded amount of extra data logging on
+transactions that are likely to cut long recovery dependency chains. In the
+authors' H-Store evaluation, adaptive logging keeps runtime throughput close
+to command logging while reporting roughly a 10x recovery improvement over
+command logging in the distributed setting.
+
+**Concrete mechanisms:**
+
+- Distributed command logging records a lightweight footprint log per
+  committed transaction: transaction id plus the tuple ids read or updated.
+  The paper reports about 450 B per footprint record versus about 3 KiB for an
+  ARIES log record on TPC-C.
+- At recovery time, the system scans footprint logs to build a dependency
+  graph. Transactions that access the same tuple and overlap in the relevant
+  submit/commit interval are grouped so recovery can process independent
+  groups concurrently.
+- A failed node's complete recovery set is the failed node's transactions plus
+  the transitive transactions needed to preserve causality. The recovery
+  algorithm starts from root transactions and recursively replays descendants,
+  processing each transaction at most once.
+- Adaptive logging introduces time-dependent transactions: for each attribute
+  accessed by a transaction, the latest preceding updater and its recursive
+  predecessors define the replay work needed for correctness.
+- Creating an ARIES-style data log for a strategically chosen transaction
+  prunes the recovery work behind that transaction because recovery can start
+  from the materialized after-image for the logged attributes.
+- The ideal selection problem is framed like a knapsack: maximize expected
+  recovery-cost reduction under an I/O budget. The offline algorithm sorts
+  transactions by benefit per ARIES-log cost; the online algorithm estimates
+  future benefit from histograms of recent attribute access.
+- The implementation uses a decision manager and in-memory inverted index
+  keyed by table, tuple, and attribute. The index tracks read/write histories
+  for benefit estimation and dependency discovery, and it may be synchronized
+  approximately because correctness still falls back to the persisted logs.
+- The paper's implementation also uses group commit, dirty-column tracking,
+  footprint-log compression, and non-blocking transaction-consistent
+  checkpoints at a fixed interval.
+
+**GPU DB mapping:** The main transfer is that WAL payload detail should be a
+policy decision tied to recovery SLA, checkpoint age, and transaction shape.
+GPU DB can keep the durable WAL-before-visibility rule while varying auxiliary
+recovery payloads: cheap command/intent records for deterministic,
+stored-procedure-like templates; richer after-image or column-delta records
+for transactions that sit on long dependency chains, hot partitions, or routes
+whose replay would require expensive GPU/CPU reconstruction.
+
+For P8 storage, the footprint-log idea maps to a compact per-transaction
+access summary: table OID, partition/segment id, key or tuple id, touched
+columns, route shape, and source transaction boundary. That summary could feed
+crash recovery, snapshot GC, resident-cache invalidation, and benchmark
+analysis without making the GPU tier authoritative. The expensive data log is
+not a replacement for WAL; it is an optional recovery accelerator attached to
+selected WAL records.
+
+For runtime and session scale, adaptive logging is an admission-control
+pattern. Under light recovery risk or short checkpoint distance, foreground
+throughput can choose compact logging. As dependency depth, checkpoint age, or
+hot-route replay cost grows, the mutation owner can spend a bounded byte
+budget on richer records. That keeps the hot write path honest: each route
+declares its normal latency cost and its worst-case recovery debt.
+
+For GPU execution, the likely high-value cases are bulk COPY chunks, batched
+same-shape writes, hot-key update lanes, and resident-segment refreshes. If
+replaying a command would require rebuilding a large resident segment or
+re-running GPU kernels, log a richer CPU-side delta or segment manifest at
+generation boundaries. Recovery should be able to reconstruct CPU truth first,
+then mark GPU snapshots empty/stale or selectively warm them from logged
+segment metadata.
+
+**Risks and mismatches:** The paper assumes stored-procedure-style
+transactions, H-Store partitioning, and deterministic replayable commands.
+Interactive SQL over pgwire may not always have a compact replay command with
+stable side effects. The evaluation is CPU distributed in-memory OLTP on
+TPC-C and Smallbank, not GPU-resident execution, SQL planning, or NVMe tier
+movement. Footprint logs add write-path bytes and an additional recovery
+analysis phase, so they are only useful if they also improve recovery,
+invalidation, or GC decisions. Finally, adaptive selection based on recent
+histograms can mispredict when workload phases shift; richer logging must have
+a hard byte budget and observability.
+
+**Benchmark candidates:**
+
+- Add a WAL payload-mode benchmark with three modes: compact command/intent
+  record, footprint summary, and richer column-delta record. Measure write
+  throughput, log bytes per transaction, checkpoint age, and replay time.
+- Track recovery debt per route: estimated replay commands, dependency depth,
+  touched segment bytes, and resident-refresh cost since the last checkpoint.
+  Proof gate: the metric predicts replay cost better than raw WAL byte count.
+- Build a dependency-footprint experiment for batched writes. Record table,
+  partition, key range, touched columns, and route shape; then simulate a
+  partition failure and compute which transactions need replay.
+- Add an adaptive logging policy to the benchmark harness, not production
+  code: spend at most X% extra log bytes on routes with the highest estimated
+  recovery debt. Failure condition: foreground p95 write latency rises without
+  reducing replay time.
+- Compare replay from compact commands versus richer deltas for COPY chunks
+  and hot-key update batches. The minimum gate is byte-for-byte identical CPU
+  table state after WAL replay before any GPU cache is trusted.
+- Use retained resident snapshots as a mismatch test: after recovery, all GPU
+  snapshots must start invalid or be rebuilt from CPU truth plus logged segment
+  metadata. No adaptive shortcut may publish GPU visibility directly.
