@@ -32956,3 +32956,146 @@ queries belong on the GPU.
   experiment with parameter vectors and result scattering. Failure condition:
   PCIe/pinned-buffer/update-propagation time dominates kernel savings or
   causes worse p99 than CPU owner execution.
+
+### 2026-06-04 - No False Negatives makes serializable conflict acceptance explicit
+
+**Citation:** Dominik Durner and Thomas Neumann. "No False Negatives:
+Accepting All Useful Schedules in a Fast Serializable Many-Core System."
+ICDE 2019, pp. 734-745. DOI: `https://doi.org/10.1109/ICDE.2019.00071`.
+Retrieved 2026-06-04 from the author PDF,
+`https://db.cs.tum.edu/~durner/papers/no-false-negatives-icde19.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility.
+
+**Relevance tags:** serializability; conflict graph; serialization graph
+testing; many-core concurrency control; commit-order preserving schedules;
+recoverability; long read-only snapshots; epoch GC; abort reduction.
+
+**Core idea:** The paper revisits serialization graph testing and argues that
+graph-based serializable scheduling can be practical on many-core machines if
+the conflict graph is maintained with transaction-local synchronization rather
+than a global critical section. Instead of accepting only the schedules allowed
+by 2PL, timestamp ordering, or OCC validation heuristics, the scheduler tracks
+the actual conflict graph and aborts only when the schedule would violate
+conflict serializability or recoverability.
+
+The most transferable idea is the distinction between correctness classes and
+implementation shortcuts. The system intentionally accepts the useful
+intersection of commit-order preserving conflict-serializable and recoverable
+schedules, then pays engineering effort to make that acceptance scalable. For
+GPU DB, this suggests that high-throughput write lanes should expose the
+conflict model in route metadata rather than hard-coding one coarse OCC or
+lock policy for every mutation shape.
+
+**Concrete mechanisms:**
+
+- Each active transaction is represented as a node in a conflict graph with
+  incoming and outgoing edge sets.
+- Conflicting tuple operations create directed edges between transaction nodes
+  according to local tuple access order for read-write, write-read, and
+  write-write conflicts.
+- Tuple-level conflict detection uses an access-history list plus a local
+  sequence number. The sequence number serializes the individual tuple access,
+  but it is not held until transaction commit.
+- Edge insertion takes a shared transaction-local lock on the source node,
+  checks whether the source transaction is still alive, inserts into both edge
+  sets, and runs a reduced DFS cycle check from the current node.
+- Commit takes the committing node's exclusive lock. The transaction may commit
+  only when its incoming edge set is empty; then it removes outgoing edges from
+  successor nodes and schedules its node for epoch-based reclamation.
+- The empty-incoming-edge commit rule enforces recoverability and commit-order
+  preserving behavior. Transactions with incoming dependencies wait instead of
+  committing in an order that would surprise users.
+- Aborts can cascade along write-read or write-write dependencies because a
+  child may have observed a value from the aborted transaction. The
+  implementation therefore restricts multiple uncommitted writers on one data
+  element to reduce dirty undo complexity.
+- Cycle checks run under shared locks and can miss a concurrently inserted
+  edge, but the final exclusive commit check catches commit-critical conflicts.
+- An online topological-order cycle checker was evaluated, but maintaining the
+  topological order became more expensive than the reduced DFS path in the
+  tested many-core workloads.
+- The MVCC extension favors long read-only transactions. Writers update the
+  base table but snapshot the prior row state with an epoch marker; OLTP
+  writes and short reads use the single-version graph scheduler, while OLAP
+  read-only transactions read a version chosen by the current epoch and do not
+  add conflict edges.
+- The prototype uses pinned worker threads, concurrent epoch garbage
+  collection, transaction node reuse, and transaction-node addresses as
+  transaction identifiers to avoid a global ID counter bottleneck.
+- Evaluation on a four-socket, 60-core server reports competitive or better
+  throughput versus TicToc, 2PL, and a global-lock multi-version OCC
+  implementation under SmallBank, YCSB, and TATP mixes, with notably fewer
+  aborts under high contention and better mixed OLTP/OLAP behavior for the
+  multi-version variant. Absolute numbers are CPU/prototype-specific.
+
+**GPU DB mapping:** This paper gives GPU DB a useful alternative to treating
+contention as either "abort on validation" or "serialize everything through
+one owner." A mutation owner can keep correctness authority while exposing a
+route-local conflict graph for a bounded batch of same-shape writes. If the
+batch's conflicts remain acyclic and dependencies are recoverable, the runtime
+can accept more useful schedules than a simple timestamp/OCC lane without
+weakening serializability.
+
+The transaction-local graph-locking design maps to owner domains and route
+batches. Rather than one global graph, GPU DB could maintain per-partition or
+per-route conflict DAGs for admitted batches. Each request descriptor would
+carry read keys, write keys, tuple or segment access sequence, WAL batch
+identity, and response/fallback policy. The commit step would map to the
+existing WAL-before-visibility boundary: only a dependency-free or
+owner-approved batch frontier may publish visibility.
+
+The tuple access-history mechanism is too heavy to copy directly into every
+row, but the shape is useful for hot keys and write-heavy templates. GPU DB
+could maintain transient per-hot-key conflict histories inside the mutation
+owner, or build batch-local histories for stored-procedure-like routes, then
+discard them after WAL and visibility publication. That keeps graph state as
+bounded scheduling metadata rather than durable storage.
+
+The read-only MVCC extension reinforces the retained snapshot direction in P8.
+Long GPU scans should not insert read dependencies into the hot write graph if
+they can read a chosen immutable generation. Fresh OLTP writes and short reads
+can use current owner state, while long retained reads consume epoch/generation
+snapshots and retire them through explicit reference and GC frontiers.
+
+**Risks and mismatches:** The paper is a CPU in-memory prototype, not a GPU
+transaction engine. Its tuple access-history columns and per-operation edge
+maintenance may be too expensive for broad SQL workloads, especially if every
+short read creates graph metadata. It assumes the system can derive concrete
+tuple conflicts as operations execute; ad-hoc SQL, predicate reads, range
+conflicts, secondary indexes, DDL, and GPU-resident scans need extra conflict
+summaries or predicate protection.
+
+The MVCC extension is deliberately read-only for OLAP transactions and uses a
+coarse epoch state. It does not solve update-heavy multi-version GPU execution,
+serializable predicate reads over resident indexes, WAL recovery of graph
+state, or distributed commit. GPU DB should treat the graph as a bounded batch
+admission and validation tool, not as durable correctness state.
+
+Commit waiting can also hurt tail latency. Accepting fewer aborts by delaying
+transactions is valuable only when wait time stays inside the route's latency
+budget. Under overload, the runtime still needs explicit fallback or rejection
+rather than letting dependency chains grow without bound.
+
+**Benchmark candidates:**
+
+- Build a CPU-only batch conflict-graph simulator for one same-shape update
+  route. Compare strict owner serialization, abort-heavy OCC, deterministic
+  batch order, and graph acceptance. Gate: fewer aborts than OCC at equal
+  serializable results and bounded p95 commit wait.
+- Add route metadata for `read_keys`, `write_keys`, `batch_id`, dependency
+  count, graph edge count, and commit-wait time. Failure condition: a route can
+  enter the graph without enough conflict information to prove its ordering.
+- Prototype per-hot-key access-history telemetry in the mutation owner only,
+  not in durable tuple storage. Measure memory per active transaction, graph
+  edges per batch, conflict check time, and dependency-chain length.
+- Test long retained GPU-style scans as epoch/generation reads that do not add
+  hot write-graph edges. Gate: writes continue with stable p95 latency while
+  long scans see a correct immutable generation.
+- Add an overload rule for graph-based batches: if incoming dependencies or
+  commit wait exceed a route budget, fall back to owner-serialized execution or
+  reject with an explicit conflict/backpressure reason.
+- Compare reduced DFS cycle checks with a topological-order maintenance
+  variant in a synthetic batch planner. Gate: cycle-check CPU time must remain
+  a small fraction of total batch execution time under skewed TPC-C-like keys.

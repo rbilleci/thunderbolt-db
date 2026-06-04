@@ -2695,7 +2695,7 @@ Append new candidates here as each paper is processed.
   Why: CCBench points to non-visible writes as a version-lifetime direction;
   NWR is relevant to blind-write and stale-version elision without weakening
   WAL-before-visibility or SQL-visible conflict behavior.
-- `queued` — **No False Negatives: Accepting All Useful Schedules in a Fast
+- `reviewed` — **No False Negatives: Accepting All Useful Schedules in a Fast
   Serializable Many-Core System**, Durner and Neumann, ICDE 2019.
   URL: `https://doi.org/10.1109/ICDE.2019.00071`
   PDF: `https://db.cs.tum.edu/~durner/papers/no-false-negatives-icde19.pdf`
@@ -2775,7 +2775,8 @@ Append new candidates here as each paper is processed.
   active quickly.
 - `queued` — **LTPG: Large-Batch Transaction Processing on GPUs with
   Deterministic Concurrency Control**, Wei, Gu, Li, and Yu, ICDE 2024.
-  URL: `https://doi.org/10.1109/ICDE60146.2024.00196`
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00296`
+  Metadata: `https://vbn.aau.dk/en/publications/ltpg-large-batch-transaction-processing-on-gpus-with-deterministi`
   Why: GaccO motivates same-type GPU transaction batching; LTPG is a newer
   deterministic GPU transaction-processing follow-up for testing whether
   larger batches and conflict planning can preserve latency while improving
@@ -2787,3 +2788,10 @@ Append new candidates here as each paper is processed.
   Why: precursor to GaccO with a deterministic GPU concurrency scheme;
   useful for isolating which design choices came from the smaller prototype
   versus the later CPU/GPU co-execution storage design.
+- `queued` — **Mostly-Optimistic Concurrency Control for Highly Contended
+  Dynamic Workloads on a Thousand Cores**, Wang and Kimura, PVLDB 2016.
+  URL: `https://doi.org/10.14778/3021924.3021933`
+  Why: No False Negatives contrasts graph-based scheduling with hybrid
+  pessimistic/optimistic hot-tuple handling; useful for deciding when GPU DB
+  should switch hot keys or route families from optimistic batch admission to
+  owner-serialized or lock-like handling.
