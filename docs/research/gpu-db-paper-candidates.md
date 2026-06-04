@@ -1229,12 +1229,20 @@ Append new candidates here as each paper is processed.
   Why: cited by TOPSI as a PSI freshness direction; useful for comparing
   snapshot freshness and abort-rate tradeoffs against scalar-prefix visibility
   certificates.
-- `queued` — **Amazon Aurora: Design Considerations for High Throughput
+- `reviewed` — **Amazon Aurora: Design Considerations for High Throughput
   Cloud-Native Relational Databases**, Verbitski et al., SIGMOD 2017.
   URL: `https://doi.org/10.1145/3035918.3056101`
+  PDF:
+  `https://cdn.amazon.science/dc/2b/4ef2b89649f9a393d37d3e042f4e/amazon-aurora-design-considerations-for-high-throughput-cloud-native-relational-databases.pdf`
   Why: TOPSI names Aurora as a disaggregated-storage target; useful for
   comparing GPU DB's WAL/storage-publication boundaries with a log-structured
   cloud relational storage service.
+- `queued` — **Socrates: The New SQL Server in the Cloud**, Antonopoulos et
+  al., SIGMOD 2019.
+  URL: `https://doi.org/10.1145/3299869.3314047`
+  Why: Aurora-related cloud database storage/compute separation; useful for
+  comparing page-server/log-service roles, checkpointing, and cold-page
+  retrieval against GPU DB's CPU/NVMe/GPU tier publication model.
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`

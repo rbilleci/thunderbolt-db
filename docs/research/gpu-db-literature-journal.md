@@ -46814,3 +46814,174 @@ ORTHRUS-style owners, and Strife-style clusters under the same generated
 workloads. Third, require every fast lane to emit certificate telemetry:
 snapshot generation, owner fan-out, residual ratio, queue wait, batch
 flush reason, WAL/invalidation boundary, and fallback reason.
+
+### 2026-06-04 - Aurora makes the redo log the distributed storage contract
+
+**Citation:** Alexandre Verbitski, Anurag Gupta, Debanjan Saha, Murali
+Brahmadesam, Kamal Gupta, Raman Mittal, Sailesh Krishnamurthy, Sandor
+Maurice, Tengiz Kharatishvili, and Xiaofeng Bao. "Amazon Aurora: Design
+Considerations for High Throughput Cloud-Native Relational Databases."
+SIGMOD 2017:1041-1052. doi:10.1145/3035918.3056101. Retrieved
+2026-06-04 from
+`https://cdn.amazon.science/dc/2b/4ef2b89649f9a393d37d3e042f4e/amazon-aurora-design-considerations-for-high-throughput-cloud-native-relational-databases.pdf`.
+
+**Category:** multi-tier cache / data placement; transaction processing
+/ write path; storage publication and recovery.
+
+**Relevance tags:** redo-log-as-storage-contract; disaggregated storage;
+quorum writes; log sequence numbers; protection groups; segmented
+storage; replica lag; fast recovery; WAL-before-visibility; storage
+offload; connection scaling; cloud OLTP.
+
+**Core idea:** Aurora starts from the observation that, in cloud OLTP,
+the bottleneck shifts from local disk to network traffic between compute
+and a replicated storage fleet. Its answer is to keep SQL processing,
+transactions, locking, buffer cache, access methods, and undo management
+in the database engine, but move redo logging, durable storage, crash
+recovery, and backup/restore into a purpose-built scale-out storage
+service. The engine ships redo records, not dirty database pages, and
+the storage service continuously applies, repairs, backs up, and serves
+the durable page image behind the database interface.
+
+The strongest transferable idea for GPU DB is that the durable
+publication boundary should be a small ordered log contract, while
+expensive tier maintenance can be asynchronous, segmented, and
+self-healing. GPU memory, host compressed segments, NVMe pages, and
+future tiers do not need to participate in a giant synchronous page
+flush. They need a precise WAL/LSN/resident-generation contract that
+says which bytes are durable, which resident snapshots are valid, and
+which tier services may repair or rebuild state in the background.
+
+**Concrete mechanisms:**
+
+- Aurora stores each database volume as 10GB protection groups and
+  replicates each protection group six ways across three availability
+  zones, with two copies in each zone.
+- Its quorum design uses `V = 6`, write quorum `Vw = 4`, and read
+  quorum `Vr = 3`. The paper frames this as tolerating an AZ failure
+  without losing write availability and tolerating an AZ plus one more
+  node without losing read availability.
+- The database engine sends redo records to the storage service. The
+  paper states this reduces network I/O by an order of magnitude versus
+  approaches that propagate full database pages and associated log
+  traffic.
+- Storage nodes own continuous redo processing, page materialization,
+  peer-to-peer repair, garbage collection, backup to S3, and restore
+  from backup. Crash recovery becomes a normal background storage
+  activity rather than a one-time database-engine restart phase.
+- Aurora uses log sequence numbers and consistency points. In the
+  InnoDB variant, mini-transaction redo records are batched, sharded by
+  protection group, and the final log record of each mini-transaction is
+  tagged as a consistency point.
+- The database engine keeps concurrency control. The paper explicitly
+  says standard MySQL isolation levels, including snapshot isolation or
+  consistent reads, are supported in the writer, while read replicas use
+  continuous transaction start/commit information from the writer to
+  support local read-only snapshot isolation.
+- Cluster topology is single-writer plus zero or more read replicas in
+  one region. Database instances, RDS control plane, and storage service
+  communicate through separate network domains; storage nodes manage
+  local SSDs and control metadata is kept in AWS services.
+- Reported benchmark results include linear scaling with instance size,
+  121K writes/sec and 600K reads/sec on an r3.8xlarge SysBench setup,
+  up to 67x higher write-only throughput than MySQL at 100GB, 41K
+  writes/sec at 1TB, and scaling from 40K to 110K writes/sec as
+  connections rise from 50 to 5000.
+- Reported replica lag is very low in the evaluated write-only workload:
+  2.62ms at 1K writes/sec and 5.38ms at 10K writes/sec, measured as
+  time until a committed transaction becomes visible on the replica.
+- The customer lessons are also useful for GPU DB: many SaaS customers
+  consolidate tenants by schema/database, some small databases exceed
+  150K tables, and customers expect high concurrency, reduced jitter,
+  online DDL, and software patching that preserves active sessions.
+
+**GPU DB mapping:** GPU DB should keep the same correctness split in a
+smaller single-node/future-cluster form: the mutation owner publishes a
+durable ordered WAL boundary, while residency and tier owners rebuild
+performance state from that boundary. GPU HBM snapshots, CPU derived
+indexes, compressed host segments, and NVMe pages should be consumers of
+the WAL contract, not independent sources of truth. A route certificate
+therefore needs source WAL LSN or transaction boundary, resident
+generation, protection/partition id, consistency point, and invalidation
+state.
+
+Aurora's protection groups map cleanly to GPU DB resident partitions.
+Instead of one monolithic table cache, an admitted table can be split
+into fixed-size resident or host/NVMe segments with separate validity,
+dirty/rebuild state, and repair/warmup telemetry. Writes append once to
+WAL, invalidate the affected segment generation before visibility, and
+allow the residency owner to refresh only the affected protection group
+or column group. That is a better benchmark target than table-wide
+refresh for every mutation.
+
+For read throughput, Aurora's replica-lag model suggests measuring
+visibility publication latency directly: how long after a commit before
+a retained read snapshot, CPU fallback path, and GPU resident path can
+legally see it. GPU DB can expose this as per-tier commit-to-readable
+lag, not only query latency. A read replica in Aurora is not the same as
+a GPU snapshot, but the same user-facing problem exists: stale reads are
+only acceptable when the route declares its freshness boundary.
+
+For 1M logical sessions, Aurora's 5000-connection and customer
+concurrency discussion supports the runtime direction of separating
+session admission from storage progress. Sessions should enqueue compact
+requests; storage/residency owners should process redo, repair, backup,
+refresh, and eviction without forcing each session to block on page
+flushes or checkpoint work. The critical admission metrics are queue
+depth, commit-to-readable lag, tier repair backlog, and per-segment
+refresh debt.
+
+**Risks and mismatches:** Aurora is a managed cloud OLTP service with a
+large replicated storage fleet. GPU DB is currently a local engine with
+GPU acceleration, so the six-way quorum and AZ model should not be
+copied literally. The transferable piece is the contract shape: ordered
+redo plus segmented repair, not the AWS deployment topology.
+
+Aurora keeps concurrency control in the database engine and has a single
+writer per cluster. That fits GPU DB's conservative owner-domain design,
+but it does not solve multi-writer or partition-owner commit ordering by
+itself. If GPU DB later adds multiple mutation owners, it will need an
+explicit commit-order or dependency protocol above the Aurora-style
+storage contract.
+
+The paper reports high throughput and low replica lag but does not break
+down GPU-style costs: kernel launches, H2D/D2H transfer, resident
+snapshot refresh, response scattering, or NVMe/host/GPU promotion. GPU
+DB must measure those separately before treating redo-only publication
+as enough for end-to-end route latency.
+
+Aurora's offloaded storage assumes storage nodes can apply redo and
+materialize pages independently. GPU DB's resident column groups and
+indexes may require type-aware rebuild work, visibility filtering, text
+offset reconstruction, and GPU memory allocation. A WAL record that is
+cheap to ship may still trigger expensive resident refresh debt.
+
+**Benchmark candidates:**
+
+- Add a commit-to-readable-lag benchmark: commit a write, then measure
+  time until CPU tuple reads, CPU derived indexes, GPU resident
+  snapshots, and any warm host/NVMe segment each become legally readable.
+- Prototype protection-group-style resident segments for one table:
+  fixed-size row/column groups with independent WAL boundary,
+  invalidation generation, refresh debt, resident bytes, and fallback
+  reason. Proof gate: one-row mutations invalidate only the affected
+  group before visibility.
+- Compare table-wide refresh versus segmented refresh after mixed
+  insert/update/delete workloads. Measure refresh bytes, GPU allocation
+  churn, p50/p99 read latency, commit-to-readable lag, and stale-route
+  rejection count.
+- Build a redo-only tier-publication simulator: page-style full refresh,
+  log-record-driven segment refresh, and background repair. Failure
+  condition: reduced write traffic is offset by unbounded refresh debt or
+  stale resident generations.
+- Add route-certificate fields for durable LSN, consistency point,
+  resident/protection group id, tier freshness boundary, refresh debt,
+  repair backlog, and commit-to-readable lag.
+- Stress high logical connection counts with storage maintenance active:
+  many retained reads plus COPY/upsert bursts plus background refresh.
+  Expected result: session admission uses lag/refresh-debt backpressure
+  instead of letting stale GPU routes through.
+- Test a replica-lag analogue for immutable GPU snapshots: allow reads
+  to choose "latest committed CPU", "latest resident generation", or
+  "bounded-staleness resident generation" and measure throughput,
+  latency, and correctness rejection behavior.
