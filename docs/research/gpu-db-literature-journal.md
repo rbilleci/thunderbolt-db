@@ -29043,3 +29043,214 @@ hard backpressure.
   structured-state update plus ring enqueue, and SQL/table-backed
   bookkeeping for one synthetic route. Gate: production hot paths retain
   ring-level latency while preserving queryable metadata out of band.
+
+### 2026-06-04 - Robust external aggregation avoids memory cliffs with spillable intermediate pages
+
+**Citation:** Laurens Kuiper, Peter A. Boncz, and Hannes Muehleisen.
+"Robust External Hash Aggregation in the Solid State Age." ICDE 2024,
+pp. 3753-3766. doi:10.1109/ICDE60146.2024.00288. Retrieved
+2026-06-04 from
+`https://hannes.muehleisen.org/publications/icde2024-out-of-core-kuiper-boncz-muehleisen.pdf`.
+
+**Category:** multi-tier cache / data placement; GPU execution /
+analytics; query optimization / planning.
+
+**Relevance tags:** temporary intermediates; unified memory management;
+external hash aggregation; spillable page layout; NVMe spill; blocking
+operators; memory admission; morsel-driven parallelism; high-cardinality
+group-by; over-resident execution; HBM/DRAM/NVMe budgets.
+
+**Core idea:** The paper attacks a specific performance cliff: modern
+analytical engines often run fast while temporary query intermediates fit
+in memory, then abort or switch to much slower external algorithms when
+hash aggregation state exceeds memory. DuckDB's answer is to make
+temporary intermediate pages first-class buffer-managed objects alongside
+persistent pages, then use one row-major page layout that is good enough
+for in-memory blocking operators and can spill without a separate
+serialization pass.
+
+That combination lets the hash aggregate remain mostly RAM-oblivious
+during thread-local pre-aggregation. The operator materializes
+pre-aggregated rows into radix partitions backed by spillable pages and
+lets the buffer manager evict individual pages when the memory limit is
+hit. The algorithm does not need to switch wholesale from an in-memory
+operator to a separate external operator at a hard threshold.
+
+The evaluation uses TPC-H `lineitem` groupings from low-cardinality to
+nearly input-sized outputs, thin and wide variants, and scale factors up
+to 128 on an 8-core / 32 GB / local-NVMe system. DuckDB remains
+competitive while data fits memory and finishes the large wide groupings
+that other tested systems abort, time out, or handle with sharp runtime
+spikes. The exact numbers are DuckDB-specific, but the transferable
+claim is robust degradation under memory pressure rather than peak
+in-memory speed alone.
+
+**Concrete mechanisms:**
+
+- DuckDB routes persistent data, fixed-size temporary pages, variable-size
+  temporary pages, and non-paged temporary allocations through one memory
+  manager and one memory limit instead of reserving a separate table
+  buffer pool and temporary-work area.
+- Persistent pages are 256 KiB and can be evicted without writing because
+  they already exist in the database file. Temporary fixed-size pages are
+  also 256 KiB, can reuse page buffers, and spill into a separate
+  temporary file.
+- Most temporary intermediates use paged fixed-size allocations. Large
+  strings or special structures may use variable-size pages or non-paged
+  allocations, but those paths are intentionally rarer.
+- The paper evaluates mixed, temporary-first, and persistent-first LRU
+  policies. Persistent-first is best for a single connection in one
+  experiment, but performs poorly with four concurrent connections because
+  repeated persistent-data reloads create thrashing. Mixed LRU is the
+  practical compromise in the paper.
+- The temporary page layout stores fixed-size row records on row pages and
+  variable-size data on separate var pages. It keeps explicit pointers for
+  in-memory performance but stores compact metadata that maps ranges of
+  row pages to var pages.
+- When a var page spills and returns at a different address, explicit
+  pointers are recomputed lazily from the previous base pointer and the
+  new base pointer. This avoids serializing row pages on every unpin and
+  avoids paying deserialization cost on every reload.
+- Hash aggregation uses thread-local pre-aggregation in a small fixed-size
+  linear-probing table with one level of indirection. The table resets
+  when about two-thirds full; only the pointer array is reset while
+  materialized tuples remain in partition pages.
+- The upper unused pointer bits carry a 16-bit hash salt, reducing
+  unnecessary group-key comparisons during linear probing before chasing
+  pointers into tuple data.
+- Tuples are materialized directly into radix partitions using hash bits
+  that do not overlap with the table offset bits or salt bits. The
+  column-major input is converted to row-major temporary pages during this
+  partition materialization.
+- During partition-wise aggregation, over-partitioning is used so each
+  thread's fully aggregated partition can fit within the memory limit.
+  Finished partitions are pushed immediately to the next pipeline, freeing
+  pages early.
+- The paper explicitly leaves OLTP viability, dirty-page handling, smaller
+  page sizes, better temporary-data eviction policies, early adaptive
+  partition exchange, and coordination across multiple memory-intensive
+  operators as future work.
+
+**GPU DB mapping:** The direct P8 lesson is that temporary query state
+needs the same explicit tier contract as persistent and resident table
+state. GPU DB should not treat group-by scratch, join build state,
+materialized lookup batches, result scatter maps, or refresh build
+buffers as untracked mallocs beside the cache manager. They should carry
+route id, snapshot generation, owner, tier, byte budget, spillability,
+and eviction cost just like resident segments.
+
+For HBM/DRAM/NVMe placement, the DuckDB design suggests a three-class
+intermediate model. Some data is non-spillable hot execution state, such
+as CUDA stream-owned scratch, device hash tables during one kernel, or
+response-ring slots. Some data is spillable fixed-page state, such as
+partitioned aggregate rows, join build partitions, refresh chunks, or
+large scatter maps. Some data is variable-size exceptional state, such as
+large text payloads, that must be isolated so it cannot dominate common
+fixed-page paths. Admission can then reject or fall back when the
+non-spillable class is exhausted while still allowing spillable
+intermediates to degrade gracefully.
+
+The page-layout mechanism is not directly GPU-ready because explicit CPU
+pointers are meaningless in device memory and across HBM/DRAM/NVMe.
+The transferable design is stable offset-addressed intermediate pages:
+store fixed-width rows, variable payload pages, and segment metadata so a
+page can move tiers without rewriting logical row identity. GPU DB should
+prefer offsets, page ids, and generation-relative handles over raw
+pointers for any state that may spill, migrate, or survive beyond one
+kernel launch.
+
+For query planning, this paper argues that a route descriptor needs a
+memory-robustness dimension. The fastest in-memory GPU aggregate is not
+necessarily the best route if it falls off a cliff when group cardinality,
+payload width, concurrent sessions, or refresh work exceeds HBM. A robust
+route may start with device-local partial aggregation, partition into
+host spill pages, and complete partition-wise with bounded HBM windows.
+That is especially important for 1M logical sessions because many small
+retained reads plus one bad high-cardinality aggregate should not evict
+all useful resident state or monopolize the GPU.
+
+The runtime mapping is queue admission rather than only operator code.
+Blocking operators should reserve memory credits before launch across
+HBM, pinned host memory, DRAM scratch, and NVMe temporary space. The
+response should be explicit when a query cannot be admitted without
+breaking latency or correctness, instead of trying to finish by silently
+spilling unbounded data.
+
+**Risks and mismatches:** The work is OLAP-focused and evaluated in
+DuckDB on CPU/NVMe, not on GPU kernels or transactional mixed workloads.
+It does not address MVCC visibility checks, WAL-before-visibility,
+write-heavy contention, dirty persistent pages, CUDA stream scheduling,
+device-memory oversubscription, GPUDirect Storage, or pgwire response
+ordering. Its row-major temporary layout is tuned for CPU blocking
+operators; GPU group-by may prefer different layouts depending on
+coalescing, warp divergence, and shared-memory use. The paper's own
+future-work section warns that OLTP has smaller pages, dirty pages, and
+many concurrent writers, so the design should inform benchmarks rather
+than become a default storage layout.
+
+**Benchmark candidates:**
+
+- Add a no-GPU memory-credit model for temporary intermediates with three
+  classes: non-spillable, fixed-page spillable, and variable-size
+  exceptional. Gate: retained reads, COPY chunks, and aggregates must
+  expose exact admission/fallback reasons under constrained budgets.
+- Implement a CPU-only external aggregation simulator over P8-style
+  fixed pages: thread-local pre-aggregation, radix partition pages,
+  over-partitioned second phase, and immediate partition retirement.
+  Metrics: p50/p99 latency, bytes spilled, page reloads, resident segment
+  evictions, and query completion under mixed retained reads.
+- Compare eviction policies for mixed resident and temporary state:
+  resident-first, temporary-first, class-aware mixed LRU, and
+  latency-class-aware eviction. Failure condition: a large aggregate can
+  evict hot retained snapshots without a measured benefit.
+- Design a GPU route benchmark for high-cardinality group-by with bounded
+  HBM: device-only aggregation, device partial plus host spill pages, CPU
+  fallback, and explicit reject. Gate: route choice records group
+  cardinality estimate, payload width, HBM budget, expected spill bytes,
+  and fallback reason.
+- Add spillable scatter-map tests for micro-batched retained lookups.
+  The logical request/result order must survive page movement between
+  DRAM and NVMe, and old snapshot generations must remain readable until
+  their holders release them.
+- Extend planner telemetry with a "memory cliff risk" score for blocking
+  routes. Inputs: estimated groups, projected payload bytes, active
+  concurrent route memory, resident bytes at risk, and available HBM/DRAM
+  credits. Gate: robust routes are chosen when the fastest route would
+  exceed budget under plausible cardinality error.
+- Later, on GPU hardware, test offset-addressed host spill pages versus
+  raw-pointer host structures for a larger-than-HBM aggregate or join
+  build. Required measurement: HBM usage, host memory traffic, NVMe bytes,
+  kernel stalls, CPU copy time, and SQL-visible correctness under
+  concurrent read snapshots.
+
+### 2026-06-04 - Cross-paper synthesis: robust routes need budgeted temporary state, not just resident data
+
+GPU joins/group-by, DBOS, and robust external aggregation converge on
+one design track: route descriptors need to describe the temporary state
+they will create, not only the table or snapshot they read. The join and
+group-by paper says materialization shape determines whether GPU work is
+fast or wasteful. DBOS says runtime state should be queryable and tied to
+capacity and placement. DuckDB's external aggregation says intermediate
+state should share explicit memory management with persistent data so a
+single large operator degrades instead of falling off a cliff.
+
+The strongest benchmark track is now a budgeted route descriptor that
+names snapshot generation, materialization shape, response scatter shape,
+non-spillable HBM, pinned host buffers, spillable DRAM pages, and cold
+temporary bytes. That descriptor should be created before admission and
+updated as the route drains work. It is the common contract across GPU
+operator choice, structured runtime telemetry, and tier-aware temporary
+state.
+
+The category gap is still write-heavy OLTP under GPU or tier pressure.
+Recent entries have covered runtime state, GPU materialization, and
+temporary pages; the next high-value non-analytics pick should come from
+transaction scheduling, MVCC frontiers, or high-concurrency admission if
+the queue offers a modern candidate. For tiering, the next useful
+follow-up is the PVLDB 2025 hash-join successor because it extends the
+same robust-spill idea to multiple concurrent blocking operators.
+
+Benchmark priority: build the no-GPU memory-credit and route-telemetry
+prototype first, because it can prove that large temporary operators do
+not silently evict hot retained snapshots or hide overload. GPU kernels
+can come later once the new hardware is available.

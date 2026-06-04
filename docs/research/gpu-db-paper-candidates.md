@@ -1045,12 +1045,28 @@ Append new candidates here as each paper is processed.
   Why: modern MVCC/concurrency-control work that discusses Plor and adapts to
   changing workload conditions; useful for deciding when GPU DB should switch
   conflict policy by route, contention, or transaction size.
-- `queued` — **Robust External Hash Aggregation in the Solid State Age**,
+- `reviewed` — **Robust External Hash Aggregation in the Solid State Age**,
   Kuiper, Boncz, and Muhleisen, ICDE 2024.
-  URL: `https://doi.org/10.1109/ICDE60146.2024.00211`
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00288`
+  PDF: `https://hannes.muehleisen.org/publications/icde2024-out-of-core-kuiper-boncz-muehleisen.pdf`
   Why: DuckDB external aggregation work cited by Resource-Adaptive Query
   Execution; useful for paged intermediate state, spill-resistant aggregates,
   and over-resident query execution under bounded memory.
+- `queued` — **Saving Private Hash Join**, Kuiper, Gross, Boncz, and
+  Muhleisen, PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p2748-kuiper.pdf`
+  DOI: `https://doi.org/10.14778/3742728.3742762`
+  Why: direct follow-up to robust external hash aggregation for larger-than-
+  memory joins, runtime compression of materialized intermediates, and dynamic
+  memory allocation across concurrent blocking operators.
+- `queued` — **Cooperative Memory Management for Table and Temporary Data**,
+  Lasch et al., SiMoD/SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3596225.3596230`
+  PDF:
+  `https://www.db-thueringen.de/servlets/MCRFileNodeServlet/dbt_derivate_00064480/979-8-4007-0783-4_2023_2.pdf`
+  Why: related cooperative-memory baseline for sharing memory between table
+  caching and temporary query data; useful for comparing DuckDB's unified
+  paged temporary allocations with explicit GPU DB tier budgets.
 - `reviewed` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
   Cao et al., SIGMOD 2023.
   URL: `https://doi.org/10.1145/3603164`
