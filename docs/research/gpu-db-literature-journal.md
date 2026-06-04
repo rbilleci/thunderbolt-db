@@ -29779,3 +29779,178 @@ refresh/retirement events. The first proof gate is not raw throughput;
 it is that every accepted request can explain its visibility proof,
 metadata authority, cache residency, and conflict-intent decision
 without relying on one global owner queue.
+
+### 2026-06-04 - FileScale keeps metadata transactions authoritative while caching the common route
+
+**Citation:** Gang Liao and Daniel J. Abadi. "FileScale: Fast and
+Elastic Metadata Management for Distributed File Systems." SoCC 2023.
+doi:10.1145/3620678.3624784. Retrieved 2026-06-04 from
+`https://www.cs.umd.edu/~abadi/papers/filescale.pdf`.
+
+**Category:** multi-tier cache / data placement; runtime / HFT /
+session scale; transaction processing / metadata write path.
+
+**Relevance tags:** metadata cache; route cache; distributed metadata;
+WAL durability; asynchronous flush; multi-partition transactions;
+mount table; stale routing repair; namespace partitioning; cache miss
+telemetry; elastic metadata service; database-backed metadata.
+
+**Core idea:** FileScale tries to keep the best parts of two metadata
+designs that usually fight each other. A single in-memory HDFS
+NameNode is fast when all metadata fits in memory, but it is hard to
+scale. A database-backed metadata service scales and supports
+multi-partition transactions, but it can be much slower when every
+file-system request performs synchronous database round trips.
+
+FileScale inserts a cache and routing layer between clients and an
+authoritative distributed DBMS. The DBMS remains the durable,
+transactional home for metadata, especially for cross-partition and
+recursive operations. Common single-partition operations run from
+NameNode-local cached metadata after a write-ahead log record is
+durably acknowledged, with database propagation done asynchronously in
+batches. Routing is handled by path-prefix mount tables cached in
+proxies or clients, and stale route entries are repaired by forwarding
+through the NameNode that recently owned the path.
+
+The evaluation claim most relevant to GPU DB is not a universal
+throughput number; it is the shape of the tradeoff. When metadata fits
+in cache, FileScale performs comparably to HDFS and far ahead of
+HopsFS-style synchronous database access in the tested HDFS metadata
+benchmarks. As cache miss rate rises, throughput degrades and latency
+rises smoothly. Multi-partition transactions and cache flushing remain
+the expensive path, and dirty-cache writeback can dominate large
+recursive operations.
+
+**Concrete mechanisms:**
+
+- FileScale maps the inode tree into a relational schema. It stores
+  full paths and uses `(parent_name, inode_name)` as a primary key, so
+  subtree operations can use prefix predicates instead of recursively
+  walking parent-child pointers.
+- The architecture has three metadata layers: a proxy/routing layer, a
+  NameNode cache layer, and a distributed database layer. DataNode
+  storage remains the normal HDFS data path.
+- Each NameNode owns a disjoint namespace partition and is the only
+  eligible cache location for metadata under that path prefix. Paths
+  outside the active mount table can fall back to database processing.
+- Cached objects use globally unique identifiers rather than permanent
+  in-memory pointers, because objects may be evicted. Path resolution
+  can perform parallel hash lookups for path components rather than a
+  serial pointer traversal.
+- Metadata updates are made durable by a remote write-ahead log before
+  becoming visible in cache. The database layer can lag behind cache
+  state until expiration, periodic flush, or a distributed transaction
+  forces propagation.
+- A background process batches recent cache writes into the DBMS.
+  Recovery starts from a database checkpoint and replays log records
+  not incorporated into that checkpoint.
+- Mount-table routing state is stored in ZooKeeper and cached by
+  proxies or clients. FileScale has proxy mode, which keeps the client
+  API unchanged, and watch mode, where clients watch and cache mount
+  table state to avoid a proxy hop.
+- Route caches may become stale after partition moves, splits, or
+  combines. A NameNode keeps a short-TTL memory of recently moved paths
+  so it can forward misrouted requests to the new owner; if that memory
+  misses, it consults ZooKeeper.
+- Multi-partition operations flush dirty affected metadata to the
+  database, remove it from cache, prevent recaching while the operation
+  runs, execute a distributed transaction, then let the destination
+  owner lazily or eagerly load the new subtree.
+- The paper reports that pure cache operations in its chmod mix are 7x
+  faster than single-partition database transactions, and that even a
+  small amount of multi-partition work can drag related single-partition
+  work through the database path.
+- Limitations observed in the paper include slower recursive delete
+  than HDFS because cache-safe identifiers add lookups, cache miss
+  sensitivity to the DBMS implementation, and expensive flushes when
+  many dirty objects must be written before a distributed transaction.
+
+**GPU DB mapping:** FileScale is a direct warning against pushing every
+route, catalog, residency, and cold-tier lookup through an
+authoritative metadata store on the hot path. GPU DB should keep
+metadata authority transactional, but common retained routes should
+resolve through generation-checked cache entries owned by route or
+partition workers. A successful route-cache hit should be enough to
+name the table/schema generation, resident segment, source WAL
+boundary, partition owner, and allowed snapshot class without calling a
+global owner.
+
+The WAL/cache split maps to resident-route publication. A route or
+residency change can become visible only after the required WAL,
+catalog, or snapshot-frontier record is durable. After that, expensive
+metadata export to a colder authoritative store can lag, as long as
+recovery knows which logged route records were reflected in the
+checkpoint and which must be replayed. That is useful for GPU DB
+because route publication and HBM residency should not wait on a slow
+general metadata write when a durable frontier record is already
+available.
+
+For 1M logical sessions, proxy-mode and watch-mode are useful
+analogies. Pgwire or gateway workers can either centralize route
+resolution through IO-worker-local route caches, or let higher-level
+clients/session pools watch a compact route table. Both modes need the
+FileScale repair rule: stale routes are allowed only if they carry a
+bounded fallback to the new owner or authoritative route service.
+
+For multi-tier data placement, FileScale suggests separating "where is
+the authoritative metadata?" from "where is the hot working set?"
+Resident route metadata, cold chunk directories, and catalog snapshot
+records should have explicit cache-miss telemetry and rebalance hooks.
+If route-cache misses or dirty flushes rise, the tier manager should
+change partition ownership, prefetch metadata, or demote a route before
+latency cliffs appear.
+
+For write throughput, the multi-partition protocol is a useful model
+for DDL, `TRUNCATE`, resident segment retirement, and cross-partition
+refresh. Flush affected dirty metadata, block new cache admission for
+the route subtree, execute the authoritative transaction, and republish
+or lazily reload the new generation. The important constraint is that
+ordinary reads should not pay this cost unless they touch the affected
+route.
+
+**Risks and mismatches:** FileScale is a distributed file-system
+metadata paper, not a SQL engine paper. It does not address MVCC tuple
+visibility, GPU kernels, SQL predicate correctness, WAL replay of table
+data, joins, or transaction isolation for user data. The cache layer is
+allowed to be ahead of the DBMS because the remote log is durable; GPU
+DB must prove the same property for route and residency metadata before
+allowing asynchronous propagation. Full-path primary keys make subtree
+prefix operations convenient but may not be the right key shape for
+SQL catalog and resident partition metadata. The paper's evaluation is
+HDFS metadata oriented, so the numeric wins should be treated as
+evidence for avoiding synchronous metadata round trips, not as
+predictions for query execution throughput.
+
+**Benchmark candidates:**
+
+- Extend the no-GPU typed route-contract simulator with a three-layer
+  route path: IO-worker route cache, partition/route owner cache, and
+  authoritative metadata store. Measure route-resolution p50/p99,
+  authoritative lookups avoided, stale-route repairs, and owner queue
+  depth.
+- Prototype WAL-before-route-cache publication. A route cache entry may
+  become visible only after a durable route-frontier record exists; the
+  authoritative metadata store may lag. Gate: crash replay reconstructs
+  exactly the visible route entries or invalidates them before serving.
+- Add stale route forwarding to retained read admission. Simulate
+  partition moves, resident generation changes, and cold-chunk
+  ownership changes. Failure condition: a request executes against an
+  old resident generation instead of forwarding, repairing, or
+  rejecting.
+- Compare proxy-style route resolution with watch-style session route
+  tables for 1M simulated logical sessions. Metrics: per-request route
+  CPU cost, route-table update fanout, stale-entry rate, memory per
+  session, and overload behavior during route churn.
+- Benchmark dirty metadata flush before route-subtree maintenance:
+  segment retirement, `TRUNCATE`, catalog generation change, and
+  cross-partition refresh. Metrics: dirty records flushed, blocked
+  readers, transaction latency, recovery state size, and read-path
+  spillover.
+- Add route-cache miss telemetry to the tier-placement simulator:
+  cache hit rate by table/partition/route shape, miss penalty, rebalance
+  trigger, and post-rebalance latency. Gate: rebalance improves route
+  p99 without violating generation checks.
+- Test full-key versus parent/child metadata keying for resident
+  segments and cold chunks. Compare prefix/subtree maintenance
+  convenience against storage overhead, rename/repartition cost, and
+  hot route lookup latency.

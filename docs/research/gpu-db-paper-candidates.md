@@ -509,7 +509,7 @@ Append new candidates here as each paper is processed.
   Why: system/demo follow-up for FASTER as an embedded state store; useful for
   API, checkpoint, and workload-shaping context if the engine adopts
   HybridLog-like point-state structures.
-- `queued` — **FileScale: Fast and Elastic Metadata Management for
+- `reviewed` — **FileScale: Fast and Elastic Metadata Management for
   Distributed File Systems**, Liao and Abadi, SoCC 2023.
   URL: `https://doi.org/10.1145/3620678.3624784`
   PDF: `https://www.cs.umd.edu/~abadi/papers/filescale.pdf`
@@ -517,6 +517,25 @@ Append new candidates here as each paper is processed.
   caching/routing layers to avoid synchronous database round trips while
   preserving distributed transaction support; useful for GPU DB catalog,
   route-cache, and cold-tier namespace scaling.
+- `queued` — **Facebook's Tectonic Filesystem: Efficiency from Exascale**,
+  Pan et al., FAST 2021.
+  URL: `https://www.usenix.org/conference/fast21/presentation/pan`
+  Why: FileScale contrasts Tectonic's sharded metadata/key-value approach with
+  cross-partition transaction support; useful for comparing exascale storage
+  metadata efficiency, placement, and bounded consistency tradeoffs.
+- `queued` — **CalvinFS: Consistent WAN Replication and Scalable Metadata
+  Management for Distributed File Systems**, Thomson and Abadi, FAST 2015.
+  URL: `https://www.usenix.org/conference/fast15/technical-sessions/presentation/thomson`
+  Why: FileScale cites CalvinFS as the deterministic-transaction metadata
+  predecessor; useful for comparing route-cache WAL buffering with ordered
+  transaction scheduling for namespace/catalog updates.
+- `queued` — **ShardFS vs. IndexFS: Replication vs. Caching Strategies for
+  Distributed Metadata Management in Cloud Storage Systems**, Xiao et al.,
+  SoCC 2015.
+  URL: `https://doi.org/10.1145/2806777.2806844`
+  Why: FileScale contrasts namespace partitioning and caching approaches with
+  distributed-transaction metadata; useful for evaluating route-cache
+  placement, replication, and cache-invalidation options.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
