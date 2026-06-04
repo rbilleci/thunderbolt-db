@@ -41160,3 +41160,170 @@ expose misprediction and last-mile metrics before admitting the route widely.
 - Add a range/prefix experiment only after point lookup is stable. Route range
   scans through a stricter certificate because learned endpoint prediction
   does not by itself prove predicate visibility or phantom safety.
+
+### 2026-06-04 - Detock resolves ordering cycles instead of aborting them
+
+**Citation:** Cuong D. T. Nguyen, Johann K. Miller, and Daniel J. Abadi.
+"Detock: High Performance Multi-region Transactions at Scale." PACMMOD /
+SIGMOD 2023, Article 148. DOI `10.1145/3589293`. Retrieved 2026-06-04
+from the University of Maryland DRUM PDF,
+`https://api.drum.lib.umd.edu/server/api/core/bitstreams/5619e587-270c-4859-8a3e-8947e2bc9928/content`.
+
+**Category:** transaction processing / write path; runtime / concurrency
+admission; distributed commit ordering.
+
+**Relevance tags:** strict serializability; deterministic execution;
+dependency graphs; deadlock resolution; multi-owner transactions; locality;
+admission timestamps; owner migration; high-contention writes.
+
+**Core idea:** Detock targets a hard distributed OLTP case: most work is
+local to a home region, but some transactions span homes and conflict with
+local single-home work. Rather than globally ordering every multi-home
+transaction like SLOG or aborting deadlocks like optimistic systems, Detock
+lets each home log its local part, constructs the same conflict graph at all
+regions, and deterministically rewrites stable cycles into an agreed serial
+order.
+
+For GPU DB, the transferable idea is not geo-replication itself. It is the
+separation between local owner logs, graph-shaped conflict metadata, and a
+deterministic cycle-resolution step. Cross-partition writes, refresh
+publication, and resident-route invalidation can become bottlenecks if every
+multi-owner command is forced through one global owner. Detock suggests a
+middle ground: let owners log local placement edges, then resolve only the
+cycles that actually appear, with deterministic rules and explicit admission
+delay to keep unresolved cycles bounded.
+
+**Concrete mechanisms:**
+
+- Each data item has a home region stored with the item. A Home Directory
+  caches current homes; transactions are annotated with expected home
+  information before forwarding.
+- A coordinator resolves non-deterministic commands, extracts or estimates
+  the read/write set, assigns a globally unique transaction id, and forwards
+  the transaction to all participating homes.
+- Single-home transactions are batched into a Paxos-maintained local log.
+  Regions asynchronously exchange local logs and replay them
+  deterministically; persisting local logs is the durable recovery basis.
+- Multi-home transactions are split into per-home `GraphPlacementTxn`
+  records. Each placement contributes local conflict edges, but the
+  placements share one transaction vertex in the dependency graph.
+- The dependency graph adds an edge from the previous transaction that
+  conflicts on the same `(key, expected_home)` tuple to the new transaction.
+  This lets different regions eventually construct the same graph even when
+  their interleaving of remote logs differs.
+- Transactions execute only when graph topology makes them ready. If stored
+  home metadata no longer matches the expected home annotation, the
+  transaction aborts and restarts deterministically.
+- Multi-home placements can create cycles because two homes may log the same
+  multi-home transactions in different orders. Detock resolves these with
+  deterministic deadlock resolution rather than aborting the transactions.
+- DDR finds a stable subgraph: complete vertices that cannot still be reached
+  from incomplete vertices. It then finds strongly connected components
+  inside that stable subgraph, removes the SCC's internal edges, and replaces
+  them with a deterministic chain ordered by transaction id.
+- The resolver runs periodically in a background thread and communicates
+  graph changes through queues, avoiding direct contention with the scheduler.
+  Partitioned replicas broadcast partial graph views so completeness can
+  include all participating partitions.
+- Opportunistic ordering assigns multi-home transactions a future timestamp:
+  current time plus the estimated one-way delay to the farthest participating
+  region plus a small overshoot. Regions sleep until that timestamp before
+  inserting the placement, reducing inconsistent local orderings.
+- One-way delay estimates include clock offset and are smoothed by periodic
+  messages; inaccurate estimates affect performance, not correctness.
+- Home movement is itself a multi-home transaction that updates the stored
+  home identifier. Concurrent transactions that saw the old home either order
+  before the movement or fail home validation and restart.
+- Evaluation uses a Detock codebase with reimplemented Calvin, SLOG, and
+  Janus variants plus CockroachDB trend comparisons. On high-contention YCSB,
+  Detock retains high throughput as multi-home transactions appear, while
+  CockroachDB's normalized throughput drops below 1% in the worst reported
+  high-contention case; Detock retains at least 76%. On TPC-C, Detock's p99
+  latency is reported 66 ms lower than SLOG's, and many remote multi-home
+  transactions see up to a 5x latency improvement versus SLOG's ordering
+  service path.
+
+**GPU DB mapping:** The engine's owner model currently keeps correctness
+simple by routing mutation, catalog, residency, and GPU execution through
+explicit owner domains. Detock is a useful warning against making every
+cross-owner command wait on a single global sequencing lane forever. For
+partitioned writes, resident refresh, or multi-table invalidation, the engine
+can record local owner edges first: table/partition owner, catalog generation,
+residency generation, and affected route family. A separate deterministic
+resolver could decide whether independent edges can publish locally or whether
+a cycle requires owner-serialized fallback.
+
+The `(key, expected_home)` conflict definition maps to `(relation,
+partition_or_segment, expected_generation)` in GPU DB. A retained read,
+refresh, or mutation should conflict only when it touches the same object and
+expects the same authority/generation. That distinction matters when a table
+or resident partition moves tiers: old-generation readers should not block
+new-generation metadata unless they still need a shared mutable resource.
+
+The stable-subgraph rule is directly relevant to bounded admission. A
+multi-owner GPU DB command should not be resolved while some required
+placement record is still missing from a participating owner, because doing
+so can produce divergent ordering. But waiting forever is equally bad. The
+runtime can use Detock-like completeness counters for participating owners,
+then add an admission guard when unresolved SCCs grow: delay new conflicting
+commands, force owner-serialized fallback, or reject with a named overload
+reason.
+
+Opportunistic ordering is also useful without WANs. A COPY batch,
+multi-partition update, and resident refresh tick can be assigned a
+near-future publication generation so owner-local queues are likely to insert
+compatible work in the same order. On one host this is a microsecond-scale
+queue-alignment problem rather than a millisecond WAN problem, but the
+principle is the same: small deterministic delay can reduce expensive
+cross-owner cycles if the delay is visible and bounded.
+
+For cache and tier placement, home movement suggests modeling ownership moves
+as ordinary logged metadata transactions. Moving a resident partition from GPU
+to host memory, changing a route-cache owner, or remastering a hot table
+should publish the authority change through the same WAL/generation mechanism
+as other visible metadata. Requests with stale owner/generation annotations
+must restart or fall back deterministically; they must not silently use a
+stale resident authority.
+
+**Risks and mismatches:** Detock assumes known or estimated read/write sets
+and stored-procedure-style transactions. The current GPU DB exposes SQL
+queries, MVCC tuple visibility, DDL, retained GPU snapshots, and pgwire
+session state, so conflict extraction is harder. Detock's durable local logs
+and Paxos-within-region design do not replace this engine's WAL-before-
+visibility invariant. Its graph resolver adds metadata, broadcasts, and
+background work that could hurt p50 latency if applied to simple single-owner
+commands.
+
+The paper focuses on geo-partitioned strict serializability, not GPU kernels,
+read snapshot retirement, or memory-tier eviction. Opportunistic timestamps
+depend on reasonably estimated delays; in GPU DB the analogous queue delays
+must be measured per owner and per route. Detock also restarts when home
+metadata is stale; GPU DB needs careful fallback semantics so a stale
+resident generation becomes CPU/MVCC execution or a clear retry, not a user
+visible anomaly.
+
+**Benchmark candidates:**
+
+- Build a no-GPU dependency-graph harness over two or three partition owners.
+  Submit synthetic transactions with declared read/write partition sets and
+  compare owner-serialized execution with Detock-style graph placement and
+  deterministic SCC resolution. Proof gate: identical serializable outcome
+  across randomized arrival orders.
+- Add route conflict keys shaped as `(relation, partition, generation,
+  authority)` and measure how many conflicts disappear when stale-generation
+  reads are separated from new-generation writes. Failure condition: a stale
+  retained route can still observe post-invalidation data.
+- Prototype a bounded unresolved-SCC admission guard. Metrics: incomplete
+  vertices, stable SCC count, maximum SCC size, resolver interval, delayed
+  commands, owner queue wait, abort/retry count, p95/p99 latency.
+- Test microsecond-scale opportunistic ordering for multi-owner COPY,
+  refresh, and invalidation batches. Expected benefit: fewer owner-order
+  inversions and fewer fallback serializations. Failure condition: p50 latency
+  rises without reducing cycles or queue wait.
+- Model resident partition remastering as a logged metadata transaction:
+  old authority, new authority, source WAL boundary, and route generation.
+  Requests annotated with old authority must either order before the movement
+  or restart/fallback after validation.
+- For 1M logical sessions, keep graph state tied to active commands only, not
+  idle sessions. Measure bytes per active graph vertex/edge and ensure idle
+  session count does not inflate resolver memory.

@@ -1757,7 +1757,7 @@ Append new candidates here as each paper is processed.
   Why: extends robustness analysis with functional constraints; useful for GPU
   DB templates where primary keys, unique constraints, and derived keys may
   prove that cheaper route-level isolation is still safe.
-- `queued` — **Detock: High Performance Multi-region Transactions at Scale**,
+- `reviewed` — **Detock: High Performance Multi-region Transactions at Scale**,
   Li et al., SIGMOD 2023.
   URL:
   `https://api.drum.lib.umd.edu/server/api/core/bitstreams/5619e587-270c-4859-8a3e-8947e2bc9928/content`
@@ -3367,3 +3367,15 @@ Append new candidates here as each paper is processed.
   trace-based anomaly debugging; useful for a GPU DB isolation-template
   validation harness that compares static route certification with observed
   weak-isolation anomaly traces.
+- `queued` — **DynaMast: Adaptive Dynamic Mastering for Replicated Systems**,
+  Abebe, Glasbergen, and Daudjee, ICDE 2020.
+  URL: `https://doi.org/10.1109/ICDE48307.2020.00123`
+  Why: Detock contrasts home movement with dynamic mastering; useful for
+  deciding whether GPU DB owner, route-cache, or resident-partition authority
+  should migrate under changing locality or stay fixed with explicit fallback.
+- `queued` — **MorphoSys: Automatic Physical Design Metamorphosis for
+  Distributed Database Systems**, Abebe, Glasbergen, and Daudjee, PVLDB 2020.
+  URL: `https://doi.org/10.14778/3424573.3424578`
+  Why: Detock cites adaptive physical design for distributed locality changes;
+  relevant to tier/partition placement when hot tables move between CPU,
+  GPU-resident, NVMe, and future memory tiers.
