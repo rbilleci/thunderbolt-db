@@ -27857,3 +27857,179 @@ as directly transferable performance targets.
   `resource_recent_access_rate`, `resource_value_per_byte`,
   `resource_eviction_reason`, `owner_hot_lane_count`,
   `active_session_credit_pressure`, and `warm_state_handoff_us`.
+
+### 2026-06-04 - Shared-cache OLTP reframes hot data as coherent acceleration state
+
+**Citation:** Tobias Ziegler, Philip A. Bernstein, Viktor Leis,
+and Carsten Binnig. "Is Scalable OLTP in the Cloud a Solved
+Problem? Analyzing Data Access for Distributed OLTP
+Architectures." CIDR 2023. Retrieved 2026-06-04 from
+`https://www.cidrdb.org/cidr2023/papers/p50-ziegler.pdf`.
+
+**Category:** transaction processing / write path and multi-tier
+cache / data placement, with MVCC and runtime implications.
+
+**Relevance tags:** cloud OLTP; single-writer; partitioned-writer;
+shared-writer; coherent cache; shared storage; cache invalidation;
+hot skew; distributed B-trees; altruistic eviction; storage
+pushdown; decentralized logging; shared-cache isolation.
+
+**Core idea:** The paper argues that the usual shared-nothing
+versus shared-storage taxonomy hides the actual OLTP scalability
+question: which nodes are allowed to read and write each data
+item, and whether hot data can be cached coherently near the
+compute that needs it. Modern cloud databases often use
+disaggregated shared storage with one writer and many readers,
+which gives good failover and read elasticity but leaves write
+throughput bounded by the primary node.
+
+The authors propose three data-access archetypes. Single-writer
+systems scale read replicas but not writes. Partitioned-writer
+systems scale uniform reads and writes but suffer on skew and
+cross-partition coordination. Shared-writer systems with coherent
+caches let multiple compute nodes cache and update hot pages on
+demand. The paper's strongest claim is not that coherence is easy;
+it is that coherent shared caches are the only archetype in their
+taxonomy that can scale uniform writes, skewed reads, and elastic
+compute without requiring application-defined partitioning.
+
+**Concrete mechanisms:**
+
+- The taxonomy classifies systems by their data access path rather
+  than by storage ownership: single-writer, partitioned-writer, and
+  shared-writer with or without coherent caches.
+- Single-writer cloud systems can spawn read-only nodes from
+  shared storage or log replay, but all update transactions remain
+  limited by the primary read-write node.
+- Partitioned-writer systems assign each partition to one update
+  owner. They scale uniform access but need two-phase commit or
+  equivalent coordination for cross-partition transactions and can
+  overload the owner of a hot key or partition.
+- Shared-writer without coherent caches allows any compute node to
+  read or write shared storage, but repeated hot access pays remote
+  storage latency and can bottleneck at the storage layer.
+- Shared-writer with coherent caches keeps hot pages near compute
+  nodes while a coherence protocol invalidates or refreshes stale
+  copies. The paper uses ScaleStore as a blueprint for this path.
+- ScaleStore tracks cached page ownership through directory
+  metadata at storage nodes. Pages may be cached in shared or
+  exclusive mode, and invalidation messages are sent only to nodes
+  known to cache the page.
+- Page granularity amortizes coherence tracking and naturally
+  supports primary and secondary index pages, but it can hurt
+  concurrency when many independent records share a hot page.
+- In the reported ScaleStore proof of concept, a read-uncommitted
+  TPC-C implementation using distributed B-tree indexes scales with
+  up to four compute and four storage nodes over RDMA. Full
+  transaction semantics are explicitly not implemented in that
+  experiment.
+- Local-only eviction can waste aggregate cache capacity by keeping
+  too many duplicate page copies. The paper calls for altruistic
+  eviction that considers whether another node already caches a
+  page, but notes that exact global frequency and copy-count
+  knowledge is too expensive.
+- Storage elasticity can use consistent hashing for pages, but
+  moving the directory and coherence state is harder because two
+  directories must not grant exclusive access to the same page.
+- For ACID, the authors argue that shared-cache systems can make
+  transactions local by caching all needed pages at one compute
+  node, avoiding two-phase commit for a transaction's accessed
+  data. Isolation and recovery remain open design work.
+- Isolation options include distributed lock managers,
+  page-version validation piggybacked with lock requests,
+  page-local lock grants while a page remains cached, contention
+  splitting, record-level locking, and optimistic concurrency
+  control. Aurora multi-master is cited as simpler but vulnerable
+  to delayed conflict detection on write-hot data.
+- Decentralized logging is proposed as a scalable recovery path:
+  each compute node writes a private log, and per-page changes from
+  multiple logs must later be merged by storage during recovery or
+  online.
+
+**GPU DB mapping:** The paper is a useful counterweight to the
+current single mutation-owner benchmark topology. GPU DB can keep
+the first production slice conservative, but the long-term design
+should not assume one writer-like owner can absorb every hot
+mutation, invalidation, and residency decision. A shared-cache lens
+suggests separating correctness ownership from acceleration
+placement: WAL/MVCC truth may remain CPU-owned, while coherent
+GPU, host, and future-tier snapshots act like cache lines or pages
+with explicit shared/exclusive state.
+
+The coherent-cache page maps to a GPU DB resident segment, key-order
+vector, visibility summary, or hot index fragment. Reads can share
+immutable acceleration state. A mutation or refresh that needs
+exclusive authority should invalidate only the cached structures
+that actually cover the affected relation, key range, visibility
+range, or resident generation, rather than flushing a whole table
+or global cache. Directory metadata maps to the residency owner:
+for each resident object, it should know which GPU execution
+owners, IO workers, retained snapshots, or future partitions hold
+references and whether the object is shared, exclusive, invalidated,
+refreshing, or retiring.
+
+Altruistic eviction is directly relevant to P8. If multiple GPU
+devices, host NUMA nodes, pinned-buffer pools, or warm NVMe pages
+hold duplicate copies of the same hot segment, local LRU can waste
+the aggregate cache just as in the paper's shared-cache example.
+The GPU DB cache manager should measure copy count, remote access
+cost, rebuild cost, and route demand before evicting or duplicating
+resident state. This complements the previous Value-of-Memory
+entry: saved time should be discounted when equivalent warm copies
+already exist nearby.
+
+The latency section also reinforces the 1M-session runtime target.
+Synchronous PostgreSQL-style request/response protocols make
+throughput roughly depend on active sessions divided by response
+time, but raising session count increases memory pressure and lock
+holding time. GPU DB should therefore reduce per-command latency
+with retained snapshots, pushdown, batching, and coherent hot
+state instead of relying on enormous active-session counts to mask
+slow owner or storage paths.
+
+**Risks and mismatches:** The paper is mostly architectural
+analysis plus a ScaleStore storage-engine proof, not a full
+production transaction system. Its ScaleStore experiment runs
+TPC-C at read uncommitted isolation, so the throughput result does
+not prove serializable or snapshot-isolated OLTP. Page-level
+coherence may not map cleanly to columnar GPU resident segments,
+MVCC version summaries, or SQL-visible row granularity. Coherence
+protocols can be expensive and dangerous under write-hot skew if
+exclusive ownership bounces between nodes. The paper also omits
+many details GPU DB must preserve: WAL-before-visibility,
+PostgreSQL protocol behavior, snapshot publication, DDL
+invalidation, CUDA memory ownership, and recovery of acceleration
+state.
+
+**Benchmark candidates:**
+
+- Add a resident-object directory prototype for P8 metadata:
+  `(relation, key_range, visibility_range, generation, owner,
+  state, holders, copy_count, invalidation_epoch)`. Gate: mutations
+  invalidate only overlapping resident objects while correctness
+  tests still match CPU MVCC truth.
+- Compare table-wide invalidation against range/generation
+  invalidation for retained lookup and scan workloads. Metrics:
+  fallback rate, refresh bytes, owner queue wait, p50/p99 read
+  latency, and stale-read prevention.
+- Build an altruistic eviction simulation across HBM, host DRAM,
+  pinned buffers, and warm NVMe pages. Policies: local LRU, global
+  copy-count-aware LRU, and VoM discounted by duplicate warm
+  copies. Failure condition: aggregate cache capacity is wasted by
+  duplicate cold copies while hot unique segments fall back.
+- Simulate exclusive-owner bouncing for a hot key range under
+  batched writes. Compare CPU mutation-owner serialization,
+  partition ownership, and range-exclusive resident-object
+  invalidation. Metrics: write throughput, publication lag,
+  invalidation messages, aborts, and p99 read fallback.
+- Add latency-to-session-pressure telemetry for pgwire:
+  active sessions, average response time, owner queue wait,
+  response-ring wait, memory per active session, and lock or
+  snapshot hold time. Gate: adding sessions must not be counted as
+  success if latency and memory pressure rise proportionally.
+- Track `resident_object_copy_count`,
+  `resident_object_directory_lookup_us`,
+  `resident_object_invalidation_fanout`,
+  `resident_object_exclusive_owner_bounce`,
+  `aggregate_cache_waste_bytes`, and
+  `duplicate_copy_discounted_value_us`.

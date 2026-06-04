@@ -2367,7 +2367,7 @@ Append new candidates here as each paper is processed.
   modern RCSI/MVCC scaling thought experiment maps directly to commit-time
   organization, time/key owner partitions, delayed visibility, and scalable
   queue semantics for GPU DB snapshot routing.
-- `queued` — **Is Scalable OLTP in the Cloud a Solved Problem?**,
+- `reviewed` — **Is Scalable OLTP in the Cloud a Solved Problem?**,
   Ziegler, Bernstein, Leis, and Binnig, CIDR 2023.
   URL: `https://www.cidrdb.org/cidr2023/papers/p50-ziegler.pdf`
   Why: Helland's CIDR 2024 paper responds to this cloud OLTP design analysis;
@@ -2392,3 +2392,21 @@ Append new candidates here as each paper is processed.
   Why: cited as Azure SQL infrastructure for measuring database resource
   contention; useful for shaping no-GPU scalability probes that measure active
   session budgets, cache pressure, and resource contention per logical route.
+- `queued` — **ScaleStore: A Fast and Cost-Efficient Storage Engine using
+  DRAM, NVMe, and RDMA**, Ziegler, Binnig, and Leis, SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526187`
+  Why: the CIDR 2023 cloud OLTP paper uses ScaleStore as the shared-cache
+  blueprint; useful for resident-object directory design, RDMA/NVMe cache
+  placement, and page-level coherence tradeoffs.
+- `queued` — **Sundial: Harmonizing Concurrency Control and Caching in a
+  Distributed OLTP Database Management System**, Yu et al., PVLDB 2018.
+  URL: `https://doi.org/10.14778/3282495.3282511`
+  Why: cited as distributed OLTP concurrency-control work that links caching
+  and timestamp visibility; useful for GPU DB's coherent retained snapshots and
+  owner-visible generation routing.
+- `queued` — **Falcon: A Timestamp-based Protocol to Maximize the Cache
+  Efficiency in the Distributed Shared Memory**, Zhang et al., IPDPS 2022.
+  URL: `https://doi.org/10.1109/IPDPS53621.2022.00037`
+  Why: the CIDR 2023 paper names Falcon as a modern alternative to directory
+  invalidation; useful for comparing timestamped coherence with explicit
+  invalidation for GPU/host resident-object directories.
