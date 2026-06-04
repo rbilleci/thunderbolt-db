@@ -36,18 +36,21 @@ This project uses a layered documentation model so implementation can proceed qu
 10. **High-throughput query runtime**
    - `docs/architecture/11-high-throughput-query-runtime.md`
 
-11. **Interfaces and implementation contracts**
+11. **ACID, isolation, and GPU memory**
+   - `docs/architecture/12-acid-isolation-and-gpu-memory.md`
+
+12. **Interfaces and implementation contracts**
    - `docs/interfaces/replication-interfaces.md`
    - `docs/interfaces/execution-interfaces.md`
    - `docs/interfaces/transaction-interfaces.md`
    - `docs/interfaces/error-interfaces.md`
 
-12. **Research journal and candidate techniques**
+13. **Research journal and candidate techniques**
    - `docs/research/gpu-db-literature-review-loop.md`
    - `docs/research/gpu-db-paper-candidates.md`
    - `docs/research/gpu-db-literature-journal.md`
 
-13. **Decision history (ADRs)**
+14. **Decision history (ADRs)**
    - `docs/adr/README.md`
    - `docs/adr/ADR-001-log-boundary-is-wal.md`
    - `docs/adr/ADR-002-deterministic-batch-ordering.md`
@@ -55,19 +58,19 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/adr/ADR-004-replicator-interface.md`
    - `docs/adr/ADR-005-snapshot-install-snapshot-strategy.md`
 
-14. **Delivery scope and sequencing**
+15. **Delivery scope and sequencing**
    - `docs/roadmap/v0-v1.md`
    - `docs/roadmap/no-nvidia-bootstrap-plan.md`
    - `docs/roadmap/no-gpu-bootstrap-closeout-review.md`
 
-15. **Compatibility and validation gates**
+16. **Compatibility and validation gates**
    - `docs/compatibility/matrix.md`
    - `docs/testing/parity-and-jepsen-plan.md`
 
-16. **Operations runbooks**
+17. **Operations runbooks**
    - `docs/operations/runbooks.md`
 
-17. **Process guardrails**
+18. **Process guardrails**
    - `docs/GPU_GUARDRAILS.md`
    - `.github/pull_request_template.md`
 
