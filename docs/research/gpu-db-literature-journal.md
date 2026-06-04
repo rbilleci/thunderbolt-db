@@ -32483,3 +32483,167 @@ mutation work.
   completed batch count, queue wait, kernel/handler idle time, CPU steal
   count, and tail contribution. Gate: overload control can shrink GPU batch
   depth or route to CPU before GPU work dominates p99.
+
+### 2026-06-04 - Sundial logical leases unify serializable ordering and cache coherence
+
+**Citation:** Xiangyao Yu, Yu Xia, Andrew Pavlo, Daniel Sanchez,
+Larry Rudolph, and Srinivas Devadas. "Sundial: Harmonizing Concurrency
+Control and Caching in a Distributed OLTP Database Management System."
+PVLDB 11(10):1289-1302, 2018. DOI:
+`https://doi.org/10.14778/3231751.3231763`. Retrieved 2026-06-04 from
+the VLDB PDF, `https://www.vldb.org/pvldb/vol11/p1289-yu.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; multi-tier cache / data placement.
+
+**Relevance tags:** logical leases; dynamic commit timestamps; distributed
+OLTP; serializability; cache coherence; hot remote reads; timestamped
+snapshots; index phantoms; lease logging; adaptive cache reuse.
+
+**Core idea:** Sundial replaces a fixed physical start timestamp with a
+logical lease interval per tuple. A read observes tuple data plus
+`wts/rts`, and a transaction commits at a logical timestamp that overlaps
+all read leases while landing after leases for tuples it writes. Physical
+commit order may differ from logical serialization order, so a read/write
+race that would abort under ordinary OCC can commit if the reader is
+serialized before the writer.
+
+The same lease metadata also becomes a coherence contract for cached remote
+data. A cached copy does not have to be newest; it only has to be
+serializable for the transaction's chosen commit timestamp. This is the
+transferable point for GPU DB: resident CPU/GPU/host-cache copies can be
+treated as timestamped visibility promises instead of as either perfectly
+fresh data or invalid garbage.
+
+**Concrete mechanisms:**
+
+- Each tuple carries monotonically increasing `wts` and `rts`. `wts` changes
+  when a writer commits a new value; `rts` is extended during prepare or
+  commit. Reads add `(wts, rts, data)` to the read set and advance
+  `commit_ts` to at least `wts`.
+- Writes use pessimistic locking for write/write conflicts. If a transaction
+  writes a tuple it read earlier, the observed `wts` must still match; the
+  transaction's `commit_ts` advances to at least `rts + 1`.
+- Prepare validates read-only read-set entries. If `commit_ts > rts`, the
+  coordinator asks the home server to renew the lease. Renewal aborts if
+  the tuple's `wts` changed or if the tuple is locked and would need
+  extension.
+- Index buckets or B-tree leaf nodes are treated like leased objects, so
+  scans and inserts can serialize by logical time without forcing every
+  concurrent index read to abort. The paper notes finer-grained index leases
+  as a way to reduce false sharing, but the implementation attaches leases
+  to index nodes.
+- Recovery cannot simply reset leases. Sundial logs an upper-bound timestamp
+  greater than the server's leases and restores recovered tuples to
+  `[UT, UT]`, avoiding schedules where a transaction observes only part of a
+  committed distributed write.
+- The cache uses banked metadata with LRU replacement. On a hit, the system
+  either reuses the cached tuple, asks the home server whether the cached
+  `wts` is still current, or chooses adaptively with counters. Failed lease
+  extension removes the cached entry. Read-only tables can amortize renewals
+  with table-level `tab_wts/tab_rts` and speculative lease extension.
+
+**Evaluation claims:** In a four-server DBx1000-based testbed on 10 GbE,
+Sundial reports up to 57% higher YCSB throughput and 34% higher TPC-C
+throughput than the strongest evaluated baseline, with gains mainly from
+reduced abort cost and a cheaper commit path. Its read/write table cache
+improves throughput by up to 4.6x under highly skewed, read-heavy YCSB,
+reduces traffic by 5.24x, and lowers latency by 3.8x. Cache benefit is
+workload-dependent: it does not help when remote accesses are mostly writes
+or when stale cached data creates extra aborts. Reported numbers are from
+CPU-only distributed in-memory OLTP, not GPU execution.
+
+**GPU DB mapping:**
+
+- Treat resident snapshots, host cache entries, and possible GPU index pages
+  as leased objects with `(visible_from, valid_until)` rather than only a
+  boolean valid/stale bit. Retained readers can execute from an older resident
+  copy when their route's logical read timestamp fits the lease.
+- Add a benchmark-only logical lease layer above the current
+  `Visibility { read_txn_id }` model: writes publish at `rts + 1`, reads pick
+  a route timestamp that intersects tuple, index, and resident segment leases,
+  and failed renewals fall back or abort explicitly.
+- Model index and resident-segment phantoms with leased index/page summaries.
+  A GPU equality or range route should validate the key-vector/index lease
+  and data-segment lease together before claiming snapshot correctness.
+- Cache policy should be per route family, not global: "reuse resident copy"
+  for read-mostly hot keys or table sections, "check home owner first" for
+  write-hot keys, and "evict on repeated failed renewal" for stale resident
+  fragments.
+- WAL/checkpoint replay needs a lease upper-bound or generation-frontier
+  equivalent. On recovery, every rebuilt CPU/GPU cache object must restart at
+  a conservative frontier instead of inventing an old valid interval.
+
+**Risks and mismatches:**
+
+- Sundial is single-version for data, while GPU DB already has an MVCC tuple
+  store and retained GPU snapshots. The useful idea is interval-based
+  visibility and cache coherence, not replacing MVCC wholesale.
+- Per-tuple `wts/rts` can be too expensive for narrow columns or tiny GPU
+  keys. The paper suggests a separate lease table and cold aggregate lease;
+  GPU DB should test per-segment, per-index-node, and hot-key-only lease
+  metadata before tuple-level leases.
+- Logical lease renewal creates write-like metadata traffic for reads. On GPU
+  routes this could become a hidden owner bottleneck unless renewals are
+  batched, table-level, or avoided by choosing a smaller read timestamp.
+- Sundial's cache wins on skewed read-heavy remote data. It may hurt
+  write-heavy or rapidly updated resident data by increasing aborts or
+  fallback churn.
+- The paper assumes stored-procedure OLTP and distributed server messaging,
+  not SQL plans with arbitrary operators, GPU kernel launch costs, or
+  out-of-GPU-memory placement.
+
+**Benchmark candidates:**
+
+- Implement a CPU-only logical-lease prototype for one key-value relational
+  table: compare current fixed read timestamp validation with dynamic
+  commit-timestamp selection under read/write races. Minimum gate: identical
+  serializable outcomes in a randomized history checker.
+- Add a retained resident-cache benchmark with three policies: always reuse
+  cached snapshot, always check owner generation, and hybrid reuse/check by
+  failed-renewal counters. Sweep read skew and write percentage; failure
+  condition is higher p95 latency or abort/fallback rate than the no-cache
+  baseline outside read-heavy skew.
+- Test leased index-node summaries for equality/range routes. Insert keys
+  concurrently with retained GPU-style lookups and scans, then verify no
+  phantom-visible result is returned for the chosen route timestamp.
+- Add a recovery/frontier test: after checkpoint/WAL replay, all rebuilt
+  resident-cache and index summaries must start at a conservative upper-bound
+  generation and reject stale retained reads until refreshed.
+- Measure metadata granularity: tuple-level leases, hot-key lease table,
+  segment-level leases, and table-level read-mostly `tab_rts`. Track owner
+  renewals per second, abort/fallback rate, cache hit value, and retained
+  route latency.
+
+### 2026-06-04 - Cross-paper synthesis: leases turn placement into a validity interval
+
+HetCache, SiliconDB, and Sundial converge on a useful design track: a route
+should carry both where the work runs and the interval in which its data,
+resources, and scheduling assumptions are valid. HetCache treats CPU/GPU/NVMe
+placement as an execution-centric cache decision; SiliconDB treats CPU/GPU/
+accelerator scheduling as a morsel-level runtime decision; Sundial shows that
+cached data can remain useful even when it is no longer newest, provided the
+transaction has a valid logical timestamp for that copy.
+
+For GPU DB, that argues against a binary resident/stale cache model. A better
+route descriptor should include relation generation, segment or index lease,
+resource class, expected temporary memory, queue/admission class, and the
+fallback action if the lease cannot be renewed cheaply. The cache manager then
+does not merely evict bytes; it decides whether a resident object still has
+enough visibility interval and expected reuse to justify renewal, refresh, or
+demotion.
+
+**Category gaps:** the queue still needs more modern work that combines
+transactional visibility with heterogeneous placement, especially CPU/GPU or
+future-tier indexes that support writes and snapshots. There is also a gap
+around recovery metadata for resident acceleration state: several papers imply
+frontiers or leases, but few give a direct DBMS design for replaying them into
+GPU/host cache policy.
+
+**Benchmark priorities:** prioritize a CPU-only route descriptor experiment
+before GPU kernels: attach `(generation, lease interval, placement, queue
+class, temporary-memory budget)` to point lookups and retained scans, then
+measure how often the runtime can reuse, renew, refresh, or reject work under
+mixed skewed reads and writes. The proof gate is a measurable reduction in
+owner trips and p95 latency without stale reads, unbounded renewals, or hidden
+temporary-memory cliffs.

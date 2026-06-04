@@ -2637,12 +2637,20 @@ Append new candidates here as each paper is processed.
   Why: the CIDR 2023 cloud OLTP paper uses ScaleStore as the shared-cache
   blueprint; useful for resident-object directory design, RDMA/NVMe cache
   placement, and page-level coherence tradeoffs.
-- `queued` — **Sundial: Harmonizing Concurrency Control and Caching in a
+- `reviewed` — **Sundial: Harmonizing Concurrency Control and Caching in a
   Distributed OLTP Database Management System**, Yu et al., PVLDB 2018.
-  URL: `https://doi.org/10.14778/3282495.3282511`
+  URL: `https://doi.org/10.14778/3231751.3231763`
+  PDF: `https://www.vldb.org/pvldb/vol11/p1289-yu.pdf`
   Why: cited as distributed OLTP concurrency-control work that links caching
   and timestamp visibility; useful for GPU DB's coherent retained snapshots and
   owner-visible generation routing.
+- `queued` — **STAR: Scaling Transactions through Asymmetric Replication**,
+  Lu, Yu, and Madden, PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p1316-lu.pdf`
+  arXiv: `https://arxiv.org/abs/1811.02059`
+  Why: discovered while reviewing Sundial and adjacent PVLDB distributed OLTP
+  work; useful for comparing lease-based cached remote reads with asymmetric
+  replication, locality, and serializable transaction routing.
 - `queued` — **Falcon: A Timestamp-based Protocol to Maximize the Cache
   Efficiency in the Distributed Shared Memory**, Zhang et al., IPDPS 2022.
   URL: `https://doi.org/10.1109/IPDPS53621.2022.00037`
