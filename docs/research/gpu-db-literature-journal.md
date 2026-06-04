@@ -50705,3 +50705,156 @@ lanes, and CoroBase-style cooperative windows over CPU metadata. Measure
 correctness first, then p99 urgent latency, ordinary read throughput, abort
 rate, route-local memory per active request, and cleanup lag for retired
 snapshots/buffers.
+
+### 2026-06-05 - WALTZ moves WAL write serialization into the ZNS device
+
+**Citation:** Jongsung Lee, Donguk Kim, and Jae W. Lee. "WALTZ:
+Leveraging Zone Append to Tighten the Tail Latency of LSM Tree on ZNS
+SSD." PVLDB 16(11), 2023, pp. 2884-2896.
+doi:10.14778/3611479.3611495. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol16/p2884-lee.pdf`.
+
+**Category:** multi-tier cache / data placement; transaction processing /
+write path; storage tail latency.
+
+**Relevance tags:** WAL; ZNS SSD; zone append; write admission; tail latency;
+LSM tree; cold-tier placement; batch-group writes; zone reservation; lazy
+metadata; compaction interference.
+
+**Core idea:** WALTZ targets a narrow but important storage-path problem:
+RocksDB-style batch-group writes reduce many small WAL writes, but the grouping
+itself creates synchronization, fairness, and head-of-line blocking costs.
+Those costs become more visible on fast NVMe/ZNS storage, where host-side
+coordination can dominate the actual device write.
+
+The paper uses Zoned Namespace SSD zone append to let many worker threads
+append WAL records to the same zone without a host-side write-pointer mutex or
+leader/follower batch group. The device chooses the final physical location
+inside the zone and returns the assigned LBA. WALTZ then adds zone reservation,
+zone replacement, and lazy WAL metadata management so the fast path does not
+fall back into allocation or metadata synchronization when a WAL zone fills.
+On db_bench and Facebook MixGraph workloads, the paper reports geomean tail
+latency reductions of 2.19x and 2.45x respectively, maximum reductions of
+3.02x and 4.73x, and up to 11.7% QPS improvement.
+
+**Concrete mechanisms:**
+
+- Baseline RocksDB batch-group writes elect a leader among writer threads,
+  merge follower write batches, issue one WAL write, and notify followers.
+  WALTZ identifies leader election and batch merge as a growing share of write
+  latency as worker count increases.
+- ZNS zones allow random reads but require sequential writes within each zone.
+  Conventional ZNS writes need a correct host-managed write pointer, so writes
+  to the same zone are serialized to avoid invalid pointers.
+- Zone append changes the contract: a thread sends a zone id, buffer, and
+  length rather than a specific LBA. The device serializes appends internally
+  and returns the assigned LBA, allowing higher queue depth against one zone.
+- The paper's write-vs-append microbenchmark shows similar average latency but
+  very different tails: host-serialized writes develop severe lock-fairness
+  tails, while append keeps tail behavior tighter by moving write-pointer
+  synchronization into the device.
+- WALTZ bypasses RocksDB's batch-group write path for WAL records and lets
+  each writer issue its own append command, exposing the latency of its own
+  record rather than the merged group.
+- WAL zone replacement handles the active WAL zone becoming full during
+  parallel append. WALTZ keeps reserved zones available so a writer does not
+  synchronously scan, allocate, close, or reset zones on the put critical path.
+- A background Zone Manager reserves future WAL zones and performs zone
+  post-processing. This keeps compaction-driven fragmentation and zone
+  allocation work from appearing directly in foreground put latency.
+- Lazy metadata management avoids synchronizing shared WAL location metadata
+  before the append completes. WALTZ records the returned assigned LBA and
+  updates metadata only when needed for recovery-visible ordering.
+- The paper notes that simply swapping ZNS write for zone append is not enough
+  if batch-group writing remains enabled: append then still runs effectively
+  single-threaded and cannot remove host grouping tails.
+- Evaluation uses RocksDB over ZenFS with SPDK and real Samsung PM1731a ZNS
+  SSDs. Workloads include write-heavy db_bench variations and Facebook
+  MixGraph distributions. SQL execution, relational MVCC, GPU execution, and
+  network protocol overhead are outside the experiment.
+
+**GPU DB mapping:** WALTZ is a good warning for GPU DB's WAL-before-visibility
+path: batching is not always a latency win. The current architecture expects
+COPY admission, mutation batches, refresh, and response work to benefit from
+micro-batching, but WALTZ shows that a leader/follower batch can impose
+unrelated writers' device latency on a short write. GPU DB should distinguish
+between batching that amortizes CPU/GPU setup and batching that serializes a
+durability boundary.
+
+The strongest transferable design is an append lane where the durable tier
+owns some allocation serialization. For a future NVMe/ZNS cold tier, WAL
+segments, archive fragments, checkpoint deltas, resident-refresh manifests, or
+segment-rewrite logs could be written as device-assigned appends to reserved
+zones. The mutation owner would still preserve WAL-before-visibility, but it
+would not need to make every writer wait behind a host-managed write pointer
+or large merged batch.
+
+Zone reservation maps cleanly to runtime admission. A mutation route should
+not be admitted as "fast durable write" unless it has a reserved log/segment
+append budget, pinned or DMA-safe buffer, and known fallback behavior when the
+active zone fills. That is the storage-tier analog of response-ring or GPU
+scratch admission: reserve before entering the critical section, not after the
+query is already blocking visibility publication.
+
+Lazy metadata is relevant to GPU DB's recoverable acceleration state. The
+engine can publish visibility only after durable WAL ordering is known, but
+auxiliary metadata such as cold-tier extent maps, resident refresh manifests,
+or compaction todo records can be updated lazily if recovery can reconstruct or
+validate them from append results. This matches the broader P8 principle that
+indexes and GPU residency are performance state, while WAL/checkpoint/archive
+remain authoritative.
+
+For over-resident GPU execution, WALTZ suggests a useful benchmark split:
+measure foreground write tail latency separately from background segment
+refresh, compaction, and cold-tier placement. If zone allocation, segment
+rewrite, or compaction metadata work is visible in the foreground mutation
+tail, GPU read throughput may look good only because write admission is hiding
+unbounded storage stalls.
+
+**Risks and mismatches:** WALTZ is a key-value/LSM design, not a relational
+MVCC engine. It optimizes the WAL path for put requests on ZNS SSDs, while GPU
+DB currently uses ordinary files and WAL/checkpoint/archive recovery. The
+paper does not address SQL isolation, tuple visibility, multi-table
+transactions, catalog invalidation, resident GPU snapshot correctness, or
+distributed replication.
+
+The design depends on ZNS SSD support, zone append semantics, SPDK-style access
+in the prototype, and enough reserved zones to keep foreground writers out of
+allocation. If deployed on conventional block devices, the exact mechanism does
+not transfer. Device-managed serialization also returns locations after the
+fact, so recovery metadata and commit ordering must be designed carefully; GPU
+DB cannot publish visibility before the durable append result is known and
+ordered.
+
+Finally, WALTZ optimizes one tail source. Compaction, GC, background flush,
+read amplification, and device contention still matter. The paper's own
+timeline results show tail behavior remains affected by background work, just
+less severely than ZenFS. For GPU DB, zone append would be one piece of a
+larger cold-tier admission and compaction policy, not a complete storage
+engine.
+
+**Benchmark candidates:**
+
+- Build a WAL append simulation with four policies: per-writer fsync/flush,
+  leader/follower group commit, fetch-and-add reserved offsets, and
+  device-assigned append emulation. Measure p50/p99/p99.9 write latency,
+  throughput, and visibility-publication delay under mixed record sizes.
+- Add a storage-tail gate to mutation benchmarks: foreground writes run while
+  background refresh, checkpoint, archive, and compaction-like segment rewrite
+  tasks consume IO. Failure condition: p99 mutation latency inherits
+  background allocation or rewrite stalls.
+- Prototype "reserve before visibility" admission for WAL/segment buffers:
+  a mutation route must hold log bytes, append slot, and recovery metadata
+  budget before entering the non-preemptible WAL publish region.
+- For future ZNS/NVMe experiments, compare host-managed write pointers with a
+  zone-append or append-only extent abstraction. Gate: identical crash replay
+  and committed tuple visibility while p99 write latency improves under
+  parallel writers.
+- Split cold-tier telemetry into foreground append time, allocation/reservation
+  time, metadata publish time, background compaction/rewrite time, and device
+  queue wait. The proof gate is that each tail spike can be attributed to one
+  boundary.
+- Add a MixGraph-like write/read skew workload for GPU DB's relational path:
+  correlated point reads plus writes with background refresh enabled. Measure
+  whether retained GPU read latency stays stable while write admission is
+  protected from storage-zone or segment-allocation stalls.

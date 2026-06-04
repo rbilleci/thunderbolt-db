@@ -3961,13 +3961,31 @@ Append new candidates here as each paper is processed.
   Why: CTR and Bf-Tree both point toward recoverable hot/cold storage state;
   TreeLine is a modern storage follow-up for insert forecasting, record
   caching, and update-in-place behavior on fast storage.
-- `queued` — **WALTZ: Leveraging Zone Append to Tighten the Tail Latency of
+- `reviewed` — **WALTZ: Leveraging Zone Append to Tighten the Tail Latency of
   LSM Tree on ZNS SSD**, Lee, Kim, and Lee, PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2884-lee.pdf`
-  DOI: `https://doi.org/10.14778/3611540.3611551`
+  DOI: `https://doi.org/10.14778/3611479.3611495`
   Why: modern log-structured storage follow-up for separating write
   amplification, tail latency, and cold-tier device semantics from
   page-oriented WAL/checkpoint assumptions.
+- `queued` — **Compaction-aware zone allocation for LSM based key-value store
+  on ZNS SSDs**, Lee et al., HotStorage 2022.
+  URL: `https://doi.org/10.1145/3538643.3539745`
+  Why: WALTZ cites CAZA as a WAF-oriented ZNS allocation design based on
+  adjacent-level key-range overlap; useful for separating tail-latency
+  reservation from cold-tier write-amplification control.
+- `queued` — **Lifetime-leveling LSM-tree compaction for ZNS SSD**, Jung and
+  Shin, HotStorage 2022.
+  URL: `https://doi.org/10.1145/3538643.3539746`
+  Why: WALTZ cites LL-compaction as an SST-splitting approach for reducing
+  ZNS write amplification; useful for GPU DB cold-tier segment compaction and
+  refresh rewrite policy.
+- `queued` — **CruiseDB: An LSM-Tree Key-Value Store with Both Better Tail
+  Throughput and Tail Latency**, Liang and Chai, ICDE 2021.
+  URL: `https://doi.org/10.1109/ICDE51399.2021.00095`
+  Why: WALTZ contrasts CruiseDB's write-admission and tail-latency controls
+  with zone-append WAL design; useful for deciding whether GPU DB should shape
+  writes at admission, WAL append, compaction, or all three.
 - `reviewed` — **Tiered-Indexing: Optimizing Access Methods for Skew**, Zhou,
   Hao, Yu, and Stonebraker, VLDB Journal 2025.
   URL: `https://doi.org/10.1007/s00778-025-00928-6`
@@ -3988,13 +4006,14 @@ Append new candidates here as each paper is processed.
   Why: newer CXL memory benchmark paper for in-memory data processing; useful
   follow-up for separating raw CXL latency/bandwidth effects from
   DBMS-object-placement effects.
-- `queued` — **Database Kernels: Seamless Integration of Database Systems and
+- `reviewed` — **Database Kernels: Seamless Integration of Database Systems and
   Fast Storage via CXL**, Lee, Lerner, Bonnet, and Cudre-Mauroux, CIDR 2024.
   URL:
   `https://www.vldb.org/cidrdb/2024/database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl.html`
   Why: CXL storage/database co-design paper cited by the SAP HANA CXL work;
   useful for comparing simple CXL memory expansion with DBMS-owned storage
-  functions, logging, and cold-tier pushdown.
+  functions, logging, and cold-tier pushdown. Marked reviewed because the
+  same paper already has a journal entry from the earlier queued copy.
 - `queued` — **NeoMem: Hardware/Software Co-Design for CXL-Native Memory
   Tiering**, Zhong et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2403.18702`
