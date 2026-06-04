@@ -1221,7 +1221,7 @@ Append new candidates here as each paper is processed.
   Why: direct follow-up to robust external hash aggregation for larger-than-
   memory joins, runtime compression of materialized intermediates, and dynamic
   memory allocation across concurrent blocking operators.
-- `queued` — **Cooperative Memory Management for Table and Temporary Data**,
+- `reviewed` — **Cooperative Memory Management for Table and Temporary Data**,
   Lasch et al., SiMoD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3596225.3596230`
   PDF:
@@ -1229,6 +1229,12 @@ Append new candidates here as each paper is processed.
   Why: related cooperative-memory baseline for sharing memory between table
   caching and temporary query data; useful for comparing DuckDB's unified
   paged temporary allocations with explicit GPU DB tier budgets.
+- `queued` — **On the Impact of Memory Allocation on High-Performance Query
+  Processing**, Durner, Leis, and Neumann, DaMoN 2019.
+  URL: `https://doi.org/10.1145/3329785.3329918`
+  Why: cited by cooperative memory management for allocation overhead in
+  high-performance query execution; useful for separating allocator latency,
+  temporary-buffer reuse, and query-route setup costs in GPU DB admission.
 - `reviewed` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
   Cao et al., SIGMOD 2023.
   URL: `https://doi.org/10.1145/3603164`

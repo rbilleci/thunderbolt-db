@@ -37577,3 +37577,158 @@ work that makes the publication boundary and delta handling more concrete.
 - Add a route warmup simulator that uses those same envelope facts, so
   warm-idle decisions are based on measured reuse and rebuild economics
   instead of generic cache-hit counters.
+
+### 2026-06-04 - Cooperative memory management turns cache pressure into an admission choice
+
+**Citation:** Robert Lasch, Thomas Legler, Norman May, Bernhard
+Scheirle, and Kai-Uwe Sattler. "Cooperative Memory Management for
+Table and Temporary Data." SiMoD '23, article 2, 2023. DOI
+`10.1145/3596225.3596230`. Retrieved 2026-06-04 from the TU
+Ilmenau repository PDF,
+`https://www.db-thueringen.de/servlets/MCRFileNodeServlet/dbt_derivate_00064480/979-8-4007-0783-4_2023_2.pdf`.
+
+**Category:** Multi-tier cache / data placement; runtime admission.
+
+**Relevance tags:** buffer management; temporary query memory; mixed
+OLTP/OLAP; cache eviction; memory admission; allocation latency; tier
+budgets; query spill; SLO-aware memory policy; vmcache.
+
+**Core idea:** The paper argues that DBMS memory for cached table data
+and temporary query data should not be statically partitioned. A fixed
+buffer-pool size leaves memory idle when analytical operators are not
+running, but can still make queries spill or fail if temporary memory
+needs exceed the reserved non-buffer-pool area. Cooperative memory
+management instead lets table cache and temporary data draw from one
+system-wide memory limit. Table data fills otherwise idle memory; large
+temporary allocations can evict table pages on demand.
+
+The transferable idea for GPU DB is that memory pressure should be a
+first-class admission and placement decision, not a configuration
+constant. HBM, pinned host buffers, host DRAM caches, temporary join or
+aggregation state, decoded response buffers, and resident table snapshots
+should compete through explicit budgets with observable eviction,
+spill, fallback, or rejection decisions.
+
+**Concrete mechanisms:**
+
+- The proposed memory manager replaces a separate buffer manager and
+  temporary allocator with one authority that tracks total memory used
+  for table-cache pages and temporary allocations.
+- The interface keeps ordinary page operations, `pin(pid)` and
+  `unpin(pid)`, and adds `allocateTemporary(size)` and
+  `freeTemporary(pointer, size)` for query intermediates.
+- Page pins need shared read-only and exclusive write variants because
+  table-page access is still synchronized through the memory manager.
+- While total allocation is below the configured memory limit, both
+  table-cache requests and temporary allocations are served directly.
+  Once the limit is reached, the manager evicts cached table pages until
+  a new pin or temporary allocation can be satisfied.
+- Temporary allocation fails only when the requested temporary bytes plus
+  already allocated temporary bytes plus pinned table pages exceed the
+  memory limit. This is later than in a fixed-partition design because
+  unpinned cached pages can give way to temporary data.
+- The authors note that a basic implementation can allocate temporary
+  data by pinning buffer frames exclusively and then unpinning them on
+  free, but page-size granularity and finding contiguous ranges can be
+  inefficient.
+- Their prototype is built over a vmcache-like buffer manager, uses
+  `O_DIRECT`, stores data columnar, uses B+ trees for primary-key
+  indexes, uses 4 KiB pages, and selects table pages for eviction with
+  clock replacement.
+- In the current prototype, temporary bytes are allocated through
+  jemalloc while the memory manager tracks total temporary size and
+  evicts table pages to keep table plus temporary memory below the
+  configured limit.
+- Evaluation uses CH-benCHmark data with 100 warehouses, 64 concurrent
+  OLTP streams, a 2 GiB memory limit, and repeated OLAP-style temporary
+  memory demand equal to half the available capacity.
+- With SATA storage in the synthetic temporary-allocation experiment,
+  cooperative management reaches higher average OLTP throughput than a
+  fixed 50/50 table/temporary split because idle analytical memory is
+  used for table cache between OLAP bursts.
+- With NVMe storage, the same qualitative effect appears but the
+  throughput dip during OLAP activity is smaller because NVMe handles
+  extra page faults better than SATA.
+- The main cost is temporary allocation latency. The paper reports a
+  median OLAP allocation time of 9.50 microseconds in the traditional
+  setting versus 111 milliseconds in the cooperative setting, with more
+  than 90% of the cooperative time spent in `madvise` while returning
+  evicted page memory to the OS.
+- Replacing the synthetic allocation with a real CH-benCHmark Q09 query
+  showed similar or slightly faster median execution under cooperative
+  memory management in the reported setup, because the query was limited
+  by disk bandwidth and better table caching reduced OLTP disk pressure.
+- The paper explicitly leaves writes, dirty-page eviction, SLO policy,
+  replacement-policy comparison, other cache types, optimizer integration,
+  and heterogeneous memory placement as open research directions.
+
+**GPU DB mapping:** This paper maps directly to P8's open question of
+how HBM, host DRAM, pinned buffers, NVMe, resident snapshots, and query
+temporary state should share capacity. A fixed "resident cache budget"
+and a separate "temporary GPU scratch budget" will underuse expensive
+memory during quiet periods and still fail under bursts. The safer shape
+is a central placement/admission authority per memory tier that can lend
+idle cache space to temporary query work, but only with explicit
+latency, eviction, and correctness constraints.
+
+For HBM, cooperative policy should be stricter than the paper's DRAM
+prototype. Evicting a resident table generation to admit a temporary
+hash table may free space, but it can also break route reuse, force CPU
+fallback, or invalidate a warm route envelope. The memory manager should
+therefore price temporary allocations by their victim cost: resident
+bytes evicted, expected rebuild cost, queries served per generation,
+snapshot readers still holding the generation, and whether spill or CPU
+fallback would be cheaper.
+
+For the high-throughput runtime, temporary allocation becomes an
+admission operation. A retained read, GPU join, aggregate, refresh, COPY
+batch, or encoded response burst should request memory from the same
+budgeted authority that knows active snapshots and cache value. The
+result should be one of: admit immediately, wait under a latency ceiling,
+evict specific cache state, spill to host/NVMe, route to CPU, or reject
+with an overload reason. That fits the bounded-ring design better than
+letting kernels or query operators allocate until they surprise the
+cache manager.
+
+The allocation-latency result is the caution. On-demand eviction can
+turn a temporary-buffer request into a 100 ms-scale event if it has to
+return or remap memory synchronously. GPU DB should avoid placing that
+latency in a short retained-read path. Large allocations need
+pre-reservation, async eviction, reusable scratch pools, or admission
+delay before the query enters a latency-sensitive GPU execution queue.
+
+**Risks and mismatches:** The paper is a five-page workshop paper with a
+prototype, not a production storage manager. Its workload is mostly
+read-only; dirty-page writeback, WAL/checkpoint interaction, and update
+latency remain unevaluated. It studies CPU DRAM and disk, not GPU HBM,
+CUDA pinned memory, NVMe GPUDirect-style access, or multi-GPU
+residency. The synthetic OLAP allocation is intentionally simple, and
+the reported throughput gains depend on idle gaps between analytical
+bursts. A naive GPU transfer could evict valuable resident state too
+aggressively and increase tail latency for the very retained routes P8 is
+trying to accelerate.
+
+**Benchmark candidates:**
+
+- Build a tier-budget simulator with table-cache/resident bytes and
+  temporary query bytes sharing one capacity limit. Compare fixed
+  partition, cooperative eviction, cooperative spill, and reject-under-SLO
+  policies.
+- Add a temporary-memory admission path to retained query benchmarks:
+  request HBM scratch, pinned host staging, response buffers, and host
+  temporary bytes before enqueueing GPU work. Proof gate: no execution
+  path allocates scarce memory after it has entered a latency-sensitive
+  queue.
+- Measure victim cost for cooperative HBM eviction: resident generation
+  evicted, rebuild milliseconds, fallback count, queries served per
+  generation, active snapshot blockers, and p95/p99 latency impact.
+- Test async versus synchronous eviction for temporary GPU/host memory.
+  Failure condition: a short retained lookup can inherit a large
+  allocation or memory-return latency from an unrelated scan or refresh.
+- Compare spill choices for a blocking aggregate or join: evict resident
+  HBM state, spill temporary state to host/NVMe, route CPU, or reject.
+  Required metrics: throughput, tail latency, bytes moved, rebuild cost,
+  and correctness under snapshot invalidation.
+- Add SLO-aware cooperative policy: temporary allocations may evict cache
+  only while transactional/read-route throughput and queue-wait budgets
+  remain above their minimum gates; otherwise spill or reject.
