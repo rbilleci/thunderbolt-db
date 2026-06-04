@@ -538,7 +538,7 @@ Append new candidates here as each paper is processed.
   Why: RTIndeX compares against the Owens group GPU B+-tree line; a
   multiversion GPU tree is directly relevant to resident index snapshots,
   batched lookups, and update/version support that RTIndeX lacks.
-- `queued` — **Learned Index on GPU**, Zhong et al., ICDE Workshops 2022.
+- `reviewed` — **Learned Index on GPU**, Zhong et al., ICDE Workshops 2022.
   URL: `https://doi.org/10.1109/ICDEW55742.2022.00024`
   Why: RTIndeX identifies learned GPU indexes as a related accelerator-friendly
   route; useful for comparing BVH/RT-core lookup against model-guided
@@ -618,6 +618,19 @@ Append new candidates here as each paper is processed.
   Tech report: `https://www.labs.hpe.com/techreports/2015/HPL-2015-37.pdf`
   Why: many-core OLTP and NVRAM-oriented storage architecture cited by TicToc;
   relevant to partition ownership, logging, NUMA locality, and future tiers.
+- `queued` — **G-Learned Index: Enabling Efficient Learned Index on GPU**,
+  Liu et al., IEEE TPDS 2024.
+  URL: `https://doi.org/10.1109/TPDS.2024.3384966`
+  Why: modern follow-up to early GPU learned-index work; useful for comparing
+  PGM-on-GPU with a more engineered GPU learned-index design before choosing a
+  resident point-lookup index family.
+- `queued` — **The PGM-index: a fully-dynamic compressed learned index with
+  provable worst-case bounds**, Ferragina and Vinciguerra, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p1162-ferragina.pdf`
+  DOI: `https://doi.org/10.14778/3389133.3389135`
+  Why: source design for the GPU-PGM paper; useful for understanding update,
+  error-bound, and space guarantees before adapting a learned index to MVCC
+  resident snapshots.
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`

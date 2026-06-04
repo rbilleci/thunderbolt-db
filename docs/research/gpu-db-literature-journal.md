@@ -39541,3 +39541,138 @@ basis-factor control, not the specific speedup on GPU hardware.
   allocator/pool choice, index type, backoff, write-lock acquisition,
   abort path, read-only snapshot route, and contention-aware queue/index
   handling must be reported alongside GPU kernel time.
+
+### 2026-06-04 - Learned GPU indexes need batch-shaped admission, not single-query routing
+
+**Citation:** Xun Zhong, Yong Zhang, Yu Chen, Chao Li, and Chunxiao
+Xing. "Learned Index on GPU." ICDE Workshops / HardBDActive 2022.
+DOI `10.1109/ICDEW55742.2022.00024`. Retrieved 2026-06-04 from the
+HardBDActive PDF,
+`https://hardbd-active.github.io/2022/papers/HardBDActive22-Zhong.pdf`.
+
+**Category:** Query optimization / planning; GPU execution / analytics;
+multi-tier cache / data placement.
+
+**Relevance tags:** GPU learned index; PGM-index; resident point lookup;
+batching; HBM placement; CPU/GPU transfer cost; route costing; static
+workloads; index space footprint.
+
+**Core idea:** The paper asks whether learned indexes become a better match
+for GPUs than traditional branch-heavy indexes. It chooses PGM-index because
+PGM stores piecewise linear models in contiguous arrays and provides bounded
+local search ranges, then stores the flattened index in GPU memory. Query keys
+are collected on CPU, transferred as a batch to the GPU, searched in parallel,
+and the predicted positions are copied back for CPU tuple access.
+
+The useful lesson for GPU DB is not "always use a learned index." It is that
+resident index acceleration has a batch threshold and a placement contract.
+The paper's own cost model includes transfer initialization, key transfer,
+kernel execution, and result transfer, and it observes that GPU advantage grows
+with query batch size while PCIe transfer eventually dominates. On four sorted
+datasets, GPU-PGM reports much higher acceleration ratios than CPU-PGM for
+large batches and beats a GPU B-tree by roughly 1.5x to 3x in the reported
+comparison, while preserving PGM's small index footprint. The reported scope is
+static or almost-static datasets; insertions are explicitly left as future work.
+
+**Concrete mechanisms:**
+
+- Build starts with sorted keys on CPU. PGM constructs piecewise linear
+  segments with maximum error `epsilon`, using the standard convex-hull style
+  streaming algorithm to generate an optimal number of segments for the bound.
+- Higher PGM levels are built recursively over the first key covered by each
+  lower-level segment until the top level contains one segment.
+- The hierarchical PGM is flattened into compact arrays, and per-level offsets
+  are recorded so GPU kernels can navigate the structure without pointer-rich
+  node traversal.
+- The GPU-resident index is treated as read-mostly acceleration state. The
+  paper builds on CPU, transfers the index and metadata to GPU memory, and does
+  not implement GPU-side insert/delete maintenance.
+- Before lookup, CPU code collects a batch of query keys. The key batch is
+  copied to GPU memory, dispatched across CUDA threads, and each thread handles
+  one lookup.
+- Each lookup applies the current segment's linear model, searches the bounded
+  range around the prediction to find the next-level segment, and repeats until
+  it reaches the final data-position prediction.
+- Output positions are copied back to host memory, where the CPU can use those
+  positions to reach target tuples.
+- The paper's cost model decomposes GPU query time into key transfer, GPU
+  execution, and result transfer. It predicts better speedups as query count
+  grows, but also names host/GPU bandwidth and initialization costs as major
+  limits.
+- Experiments use `epsilon = 128`, batches from about `10^4` to `10^8` query
+  keys, an RTX 2080 Ti with 11 GB GPU memory, and four sorted real-world key
+  datasets from the learned-index literature.
+- The GPU-PGM index occupies far less memory than the compared B-tree and GPU
+  B-tree baselines in the reported tables, because the flattened model arrays
+  are compact and contiguous.
+
+**GPU DB mapping:** For P8, GPU-PGM suggests a narrow resident point-lookup
+route: immutable sorted key vectors plus a compact learned model in GPU memory,
+attached to a retained snapshot generation. The route should accept batches of
+same-shape equality lookups, produce row ordinals or tuple ids, and scatter
+results back through response rings. It should not be placed on the single-key
+p50 path unless the key is already on GPU or queue depth is high enough to
+amortize transfer and launch overhead.
+
+The flattened PGM structure maps cleanly to the resident snapshot model. A
+residency owner can build the model from a CPU snapshot boundary, transfer it
+with the admitted column group, publish it as immutable acceleration state, and
+invalidate it on mutations that affect the key set. Because PGM encodes an
+error-bounded prediction rather than an exact tree path, the route descriptor
+must carry `epsilon`, search-range cost, key distribution statistics, model
+height, resident byte count, and whether the CPU still owns final tuple
+materialization.
+
+The paper also sharpens route-cost calibration. A learned GPU index is not only
+an execution primitive; it is an admission decision involving batch size, HBM
+residency, H2D/D2H bytes, launch count, and CPU tuple-fetch locality. A planner
+should compare GPU-PGM, resident scan, CPU B-tree/hash lookup, and CPU fallback
+using live batch and residency descriptors rather than assuming any GPU index
+beats a CPU path.
+
+For MVCC, the safe adaptation is snapshot-level rebuilding first. The paper
+does not solve dynamic maintenance, so GPU DB should initially rebuild learned
+resident indexes during refresh and publish them only at WAL-safe visibility
+boundaries. Incremental or log-structured learned-index maintenance should wait
+until the PGM source paper and newer GPU learned-index work are reviewed.
+
+**Risks and mismatches:** The paper is short and workshop-style, and it does
+not describe a complete DBMS integration. It evaluates sorted key lookup
+positions, not SQL-visible MVCC tuple lookup with deletes, updates, duplicate
+keys, NULLs, text collations, visibility checks, or index-only versus heap
+fetch semantics. Range queries are not evaluated. The CPU still fetches target
+tuples after positions return, so end-to-end latency for GPU DB may be
+dominated by CPU materialization or cache misses.
+
+The workload is static or nearly static. Inserts, deletes, update costs,
+snapshot invalidation, and concurrent refresh are explicitly outside the
+implementation. The largest wins appear at large query batches, which may not
+match latency-sensitive single-session point lookups. The reported GPU is an
+RTX 2080 Ti and the results should be treated as mechanism evidence, not a
+throughput promise for the future hardware.
+
+**Benchmark candidates:**
+
+- Add a resident learned-index microbenchmark for immutable `int4` key columns:
+  build CPU PGM, flatten it, transfer it with a resident snapshot, and compare
+  GPU-PGM lookup, CPU hash/B-tree lookup, and resident GPU scan across batch
+  sizes. Proof gate: row ordinals match CPU truth for every visible snapshot.
+- Measure route break-even by batch size and transfer state: cold key batch
+  from host, pinned key batch, GPU-resident key vector, and response-only
+  return. Failure condition: the planner selects GPU-PGM below its measured
+  break-even and hurts p50 latency.
+- Track learned-index route descriptors: `epsilon`, model height, model bytes,
+  search-range probes, H2D/D2H bytes, launch count, batch size, and CPU
+  materialization bytes. Minimum gate: planner decisions are explainable from
+  telemetry.
+- Test mutation invalidation behavior: hold a retained snapshot with GPU-PGM,
+  apply inserts/deletes to the key column, publish a newer generation, and
+  verify old readers finish on the old index while new readers route to the
+  refreshed or CPU path.
+- Compare GPU-PGM against a GPU multiversion B-tree and BinDex-style predicate
+  index for equality and range-like predicates once those candidates are
+  reviewed. Required metric: total query latency including route admission,
+  transfer, lookup, visibility filtering, and response scattering.
+- Add a skewed-key benchmark where the PGM error window changes by data
+  distribution. Failure condition: a compact learned index produces poor tail
+  latency because local refinement probes become imbalanced or non-coalesced.
