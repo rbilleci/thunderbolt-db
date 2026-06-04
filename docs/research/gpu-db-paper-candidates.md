@@ -1303,12 +1303,19 @@ Append new candidates here as each paper is processed.
   Why: lifecycle-aware LSM layout design is a follow-up to universal columnar
   and hot/cold block conversion; useful for comparing row-to-column movement
   by storage level rather than by in-memory block age.
-- `queued` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
+- `reviewed` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3313-yang.pdf`
   DOI: `https://doi.org/10.14778/3415478.3415553`
   Why: HATtrick classifies isolated/hybrid HTAP designs and evaluates TiDB-style
   split engines; F1 Lightning gives a production loose-coupling design for
   fresh analytical copies, CDC, compaction, and federated query integration.
+- `queued` — **Procella: Unifying serving and analytical data at YouTube**,
+  Chattopadhyay et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p2022-chattopadhyay.pdf`
+  DOI: `https://doi.org/10.14778/3352063.3352121`
+  Why: F1 Lightning reuses Procella-like columnar/vectorized ideas; useful for
+  comparing unified serving/analytics layouts, encoded-column execution, and
+  mixed workload routing against GPU-resident column groups.
 - `reviewed` — **OLxPBench: Real-time, Semantically Consistent, and
   Domain-specific are Essential in Benchmarking, Designing, and Implementing
   HTAP Systems**, arXiv 2022.
@@ -3995,9 +4002,9 @@ Append new candidates here as each paper is processed.
   Why: selected after the recent synthesis called for HTAP freshness and route
   evaluation; useful for measuring mixed write/read pressure with explicit
   freshness rather than treating stale analytical speed as sufficient.
-- `queued` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
+- `reviewed` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3313-yang.pdf`
-  DOI: `https://doi.org/10.14778/3415478.3415540`
+  DOI: `https://doi.org/10.14778/3415478.3415553`
   Why: HyBench compares HTAP systems and motivates real-time analytical
   freshness; F1 Lightning is a production HTAP service paper useful for
   contrasting serving-time freshness, ingestion, and resource isolation.

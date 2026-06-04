@@ -48781,3 +48781,173 @@ and freshness telemetry.
 - Report an HTAP score only as a tuple: write throughput, OLAP latency, OLXP
   latency, freshness lag, and rejected/fallback work. Do not collapse these
   into a single throughput number for early design decisions.
+
+### 2026-06-04 - F1 Lightning turns HTAP into safe-time routing over a replicated analytical LSM
+
+**Citation:** Jiacheng Yang, Ian Rae, Jun Xu, Jeff Shute, Zhan Yuan,
+Kelvin Lau, Qiang Zeng, Xi Zhao, Jun Ma, Ziyang Chen, Yuan Gao,
+Qilin Dong, Junxiong Zhou, Jeremy Wood, Goetz Graefe, Jeff Naughton,
+and John Cieslewicz. "F1 Lightning: HTAP as a Service." PVLDB
+13(12), 2020, pp. 3313-3325. doi:10.14778/3415478.3415553.
+Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol13/p3313-yang.pdf`.
+
+**Category:** hybrid HTAP; MVCC snapshots; tiered analytical replica;
+query planning and route choice.
+
+**Relevance tags:** safe timestamps; freshness windows; change data
+capture; snapshot-consistent analytical replica; row-to-column movement;
+LSM deltas; compaction; transparent query rewrite; subplan pushdown;
+table-level fallback; production HTAP operations.
+
+**Core idea:** F1 Lightning is a production HTAP service that leaves OLTP
+systems focused on transactional writes while asynchronously replicating
+committed changes into a read-optimized analytical serving tier. The system is
+not a greenfield HTAP engine; it is a loosely coupled replica that integrates
+with F1 Query so eligible read-only SQL can transparently use Lightning when
+the requested snapshot timestamp is inside Lightning's safe queryable window.
+
+The paper's strongest transferable idea for GPU DB is that a fast analytical
+route must be a timestamped access path, not a vague cache hit. Lightning
+stores changes with their source commit timestamps, tracks a minimum and
+maximum safe timestamp, and only serves snapshots that are known complete with
+respect to the original OLTP database. That maps directly to GPU resident
+generations: a resident route should advertise the exact source transaction or
+WAL boundary it covers, the oldest still-queryable boundary, and the freshness
+trade-off accepted by the planner.
+
+Lightning also shows a practical row-to-column staging design. Fresh changes
+first land in memory-resident row-wise B-tree deltas for ingestion efficiency.
+When size or memory pressure requires it, deltas are transposed into
+read-optimized columnar disk files. Reads merge memory and disk deltas at the
+requested timestamp, while background compaction reduces delta count and
+rewrites old versions outside the queryable window. For GPU DB, this is a
+useful CPU-side analogue to a row mutation path plus GPU-friendly column-group
+publication.
+
+**Concrete mechanisms:**
+
+- Changepump tails the source OLTP change log, converts source-specific CDC
+  into a unified stream, partitions changes by Lightning table/key range, and
+  sends both change rows and checkpoint timestamp updates to subscribers.
+- Lightning safe timestamps define a queryable window. The maximum safe
+  timestamp means all changes up to that time have been ingested; the minimum
+  safe timestamp bounds the oldest retained version. The paper reports a
+  typical production queryable window of about ten hours.
+- Each table is range partitioned. Each partition is stored as a
+  multi-component LSM tree whose components are called deltas.
+- Deltas store partial row versions keyed by primary key and commit timestamp.
+  Inserts contain all columns, updates contain modified non-key columns, and
+  deletes are tombstones.
+- Memory-resident deltas are row-wise B-trees with copy-on-write support for
+  at most two active writers and many readers. They are immediately queryable
+  once consistency permits, but Lightning relies on replay from the source log
+  instead of maintaining its own WAL.
+- Disk-resident deltas are read-optimized columnar files. The paper describes
+  a PAX-like layout with row bundles stored column-wise and a sparse B-tree
+  index on primary-key ranges; the index is much smaller than data and usually
+  cached.
+- Reads perform delta merging and collapsing to reconstruct complete rows at a
+  timestamp. Merge-plan generation determines complete key/timestamp histories
+  that can be safely collapsed without holes, then applies the plan
+  column-by-column.
+- Compaction has active, minor, major, and base forms. Only cheap active
+  compaction runs on Lightning servers; heavier compactions are scheduled by
+  servers but executed on dedicated task workers so they do not compete with
+  critical reads.
+- Schema evolution uses logical and physical schemas connected by mappings.
+  Many schema changes are metadata-only at ingestion/read time, with later
+  compaction rewriting old data into newer physical forms.
+- F1 Query first plans as if reading the OLTP database, preserving semantics
+  and authorization, then considers Lightning as an additional physical access
+  path when the query timestamp is inside the safe window.
+- F1 Query can push leaf subplans such as filters, projections, and partial
+  aggregations into Lightning servers. Lightning embeds the vectorized F1
+  evaluator and uses the same column-oriented in-memory and wire format to
+  reduce conversion costs.
+- Operational fallback is table-granular. Corruption, excessive ingestion lag,
+  or other failures can blacklist a table so F1 Query reads from the OLTP
+  source instead. Owners can choose freshness/fallback policy, including
+  keeping lower-priority traffic on stale Lightning data while fresher
+  high-priority reads fall back.
+- Production evaluation reports single-node query latency around 8 ms p50 and
+  1695 ms p99, distributed query latency around 0.15 s p50 and 9.9 s p99, and
+  CPU-time speedups over the OLTP source of 2.3x/1.5x for small queries,
+  11.8x/16.9x for medium queries, and 7.6x/3.8x for large queries on data
+  source/F1 server CPU respectively.
+
+**GPU DB mapping:** Lightning sharpens the current route-certificate design.
+A GPU resident read should be admitted only when its required timestamp or
+freshness SLO is inside the resident generation's safe window. The route
+certificate should include `min_safe_generation`, `max_safe_generation`,
+`source_wal_boundary`, `freshness_lag_ms`, table blacklist/fallback state, and
+whether the result may use stale-but-fast policy or must fall back to fresh CPU
+execution.
+
+The memory-delta to columnar-delta path is a good first shape for P8. The
+mutation owner can keep WAL-backed row/version state as the correctness tier,
+publish small CPU memory deltas quickly, and let residency workers transpose
+eligible generations into GPU column groups. A GPU read then merges the stable
+resident base generation with one or more bounded deltas, or falls back when
+the delta chain becomes too long for the latency target.
+
+Lightning's checkpoint timestamps are also relevant to 1M-session admission.
+It does not track per-key freshness for every key because that is too
+expensive; it advances routeable time through coarser checkpoints. GPU DB can
+use the same principle: route at partition/table generation boundaries first,
+then add per-key or per-segment freshness only if benchmarks prove the coarse
+boundary rejects too much useful work.
+
+The table-level blacklist maps cleanly to P8 fallback telemetry. A resident
+table, partition, or route family should be able to declare itself unavailable
+because refresh lag, corruption verification, memory pressure, unsupported
+schema, or compaction debt exceeds policy. That is preferable to silently
+serving stale GPU data or forcing all traffic through a degraded owner.
+
+Subplan pushdown suggests a GPU route boundary too. Start with leaf subplans:
+filters, projections, partial aggregates, point/range lookups, and simple
+column expressions that require no shuffle. Use the same logical plan and SQL
+authorization path as CPU execution, then choose GPU only as a physical access
+path with an equivalent snapshot.
+
+**Risks and mismatches:** Lightning is a read-only analytical replica for
+queries over source OLTP data; it does not accelerate the transactional write
+path itself. GPU DB cannot skip its own WAL because, unlike Lightning, it is
+the primary database engine rather than only a derived replica. Lightning can
+recover memory deltas by replaying the upstream OLTP log; GPU DB must preserve
+WAL-before-visibility for every committed write before a resident generation is
+trusted.
+
+The system is also tightly integrated with Google's F1 Query, Spanner/F1 DB
+timestamps, Changepump, BigTable, and internal distributed storage. Some
+reported operational trade-offs, such as choosing the oldest safe timestamp
+across data centers, optimize for Google's availability model and may be too
+conservative for a single-node or single-cluster GPU DB. Finally, Lightning's
+columnar disk files and CPU vectorized pushdown do not prove GPU kernel
+efficiency; they only identify the correctness and route-control shape that a
+GPU implementation should preserve.
+
+**Benchmark candidates:**
+
+- Add a safe-window route test for resident GPU tables: inject writes,
+  publish resident generations, and verify that a read with a requested
+  generation either uses GPU only inside `[min_safe_generation,
+  max_safe_generation]` or returns a CPU/refresh fallback reason.
+- Prototype row-delta plus resident-column merge for one int4/text table:
+  stable GPU column group plus bounded CPU delta chain. Measure p50/p99 point
+  lookup and aggregate latency as delta count grows. Failure condition: stale
+  resident rows are returned after a committed mutation.
+- Add a refresh-lag blacklist policy at table or partition granularity. Trigger
+  it with artificial refresh delay, memory pressure, and unsupported schema;
+  verify planner telemetry records the exact fallback cause.
+- Compare coarse table-generation safe time against per-partition safe time.
+  Measure rejected GPU routes, read latency, and metadata overhead before
+  considering finer per-key freshness state.
+- Build a reduced Lightning-style compaction benchmark: memory row deltas,
+  transposed column groups, minor/major compaction debt, and one long retained
+  snapshot. Measure write throughput, read p99, refresh lag, old-version bytes,
+  and compaction worker interference.
+- Add leaf-subplan pushdown gates for GPU execution: filter, projection,
+  partial aggregate, point lookup, and range scan. Proof gate: the logical plan
+  and authorization path stay CPU-owned; GPU is only a physical route selected
+  after snapshot/freshness validation.
