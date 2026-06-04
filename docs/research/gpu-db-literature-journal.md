@@ -40636,3 +40636,217 @@ admission can proactively aggregate before user-facing reads hit the barrier.
 - Add a DDL/rename-style negative control. Operations that change schema,
   relation identity, or route contract shape must force a synchronous barrier
   instead of taking the delayed metadata path.
+
+### 2026-06-04 - Production workload management needs cheap predictions plus hard guardrails
+
+**Citation:** Gaurav Saxena, Mohammad Rahman, Naresh Chainani, Chunbin Lin,
+George Caragea, Fahim Chowdhury, Ryan Marcus, Tim Kraska, Ippokratis Pandis,
+and Balakrishnan Narayanaswamy. "Auto-WLM: Machine Learning Enhanced Workload
+Management in Amazon Redshift." SIGMOD Companion 2023, pp. 225-237. DOI
+`10.1145/3555041.3589677`. Retrieved 2026-06-04 from Amazon Science,
+`https://assets.amazon.science/5a/9d/338478254f9a9dde672fa84da2b7/auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshif.pdf`.
+
+**Category:** Query optimization / planning; runtime / admission; hybrid
+workload management.
+
+**Relevance tags:** admission control; query scheduling; short-query
+acceleration; multiprogramming level; workload spikes; concurrency scaling;
+local performance models; preemption guardrails; queue latency; 1M logical
+sessions.
+
+**Core idea:** Auto-WLM describes Redshift's production workload manager, where
+a cheap local model predicts each query's time and memory needs, then an
+admission controller decides whether to run the query on the main cluster,
+place it into a short-query resource slice, send it to a concurrency-scaling
+cluster, or queue it by priority. The strongest lesson is that production
+admission is not "learn a perfect scheduler." It is a guarded control loop:
+fast-enough predictions, simple queueing theory, bounded special lanes,
+fallbacks for bad predictions, and operational explainability.
+
+The paper is analytical-warehouse oriented, but its resource-control shape is
+directly useful for a GPU DB. The runtime needs to decide whether an incoming
+request should use mutation owners, immutable CPU snapshots, GPU resident
+routes, over-resident/NVMe routes, short fast lanes, CPU fallback, or explicit
+overload. Auto-WLM's design says those choices should be made with local
+telemetry and hard guardrails before the request consumes scarce GPU streams,
+pinned buffers, owner queue slots, or response memory.
+
+**Concrete mechanisms:**
+
+- Auto-WLM combines five components: an ML predictor for latency and memory,
+  a priority assigner, an admission controller, a utilization monitor, and a
+  local trainer that periodically updates the model.
+- The predictor uses a small XGBoost model trained locally per Redshift
+  cluster. Features come from a linear walk of the physical query plan: counts
+  and sums of operator costs and cardinalities, selected operator-presence
+  flags, data-movement flags, and query type.
+- The training set is bounded with a sliding window, but split into latency
+  bins so frequent short queries do not evict the rare long-query examples
+  needed for safe resource prediction.
+- Inference and training overhead are treated as first-class requirements:
+  many production queries are millisecond-scale, so the model must be small
+  enough to keep prediction overhead near the microsecond/sub-millisecond
+  range. The paper reports training in a few dozen milliseconds.
+- For query classes lacking useful optimizer statistics, such as COPY or
+  arbitrary S3/Spectrum reads, the predictor falls back to conservative
+  historical percentiles rather than pretending the plan features are known.
+- The priority assigner maps predicted latency and resource use into short
+  and non-short priority bands. Short and cheap queries are candidates for
+  Short Query Acceleration (SQA), a reserved resource slice that reduces
+  head-of-line blocking from long queries.
+- SQA has a hard failure path: if a supposedly short query exceeds its time or
+  resource budget, it is cancelled and reprocessed as a long query. To avoid
+  thrash from simultaneous mispredictions, Auto-WLM limits the number of
+  queries that can occupy SQA resources at once.
+- Each cluster's short-query threshold is adapted from recent local behavior:
+  the paper uses the weekly 70th percentile execution time, and splits
+  super-short from merely short queries for clusters where "short" is long in
+  absolute time.
+- Multiprogramming level is adjusted with a Little's-Law-style what-if test.
+  Auto-WLM admits one more query when the predicted throughput with the extra
+  query is higher, but prioritizes decreasing concurrency when increase and
+  decrease signals conflict.
+- The admission controller uses first-fit placement across the main cluster
+  and older concurrency-scaling clusters, so excess clusters naturally become
+  idle and can be released.
+- When queues wait beyond a fixed threshold, Auto-WLM may launch concurrency
+  scaling clusters; when an extra cluster is idle long enough, it is detached.
+- In a detected emergency mode with high memory/CPU usage, high concurrency,
+  and medium-length heavy queries, Auto-WLM falls back to fixed concurrency
+  and shortest-job-first scheduling to avoid live-lock.
+- Queued queries use weighted round-robin across user priorities, giving every
+  priority class nonzero selection probability for starvation control.
+- Priority preemption is guarded. Auto-WLM preempts a lower-priority query
+  with high predicted remaining time, uses exponential cooldown for repeated
+  preemption of the same query, and disables preemption when wasted work over a
+  time window exceeds a threshold relative to useful completed work.
+- Evaluation uses TPC-DS and sampled Redshift fleet data. Reported results
+  include near-optimal or optimal tested multiprogramming levels across TPC-DS
+  scales, SQA false-positive rates of 2% on TPC-DS 100G and 5% on TPC-DS 3T,
+  better throughput than a manual burst-cluster baseline when few concurrency
+  clusters are available, and lower prediction error than a linear regression
+  over optimizer cost on 5 million sampled fleet queries.
+- The lessons section emphasizes production realities: local models beat
+  global models in their setting, long-tail regressions need guardrails and
+  fallbacks, decisions affecting customer cost need explanation, TPC-X
+  workloads miss real workload repetition and spikes, and simple models can be
+  more deployable than heavier ML techniques.
+
+**GPU DB mapping:** GPU DB should treat the route planner and runtime
+admission controller as one control loop. A route descriptor should carry not
+only estimated operator cost, but also predicted queue wait, GPU stream time,
+pinned-buffer bytes, resident snapshot age, CPU fallback cost, mutation-owner
+pressure, refresh/invalidation risk, and response-buffer footprint. The model
+does not have to replace deterministic rules; it can rank or gate routes that
+already satisfy visibility and route-contract checks.
+
+The SQA idea maps to a short retained-read lane. Point lookups, small
+same-shape aggregates, prepared metadata reads, and small catalog-safe queries
+can reserve a tiny fraction of GPU or CPU snapshot resources. If the query
+uses more rows, bytes, time, or result memory than predicted, it should be
+cancelled or transparently re-routed to the ordinary lane before it spills,
+blocks GPU refresh, or monopolizes pinned buffers.
+
+The Little's-Law multiprogramming loop maps to GPU execution owners and
+mutation owners. The runtime can ask whether admitting one more compatible
+lookup batch, COPY chunk, refresh, or over-resident scan improves throughput
+or just increases service time for work already queued. The decrease-first
+rule is important: if telemetry is ambiguous, shrink concurrency before
+letting latency explode.
+
+Auto-WLM's local training result is a warning against a single global GPU cost
+model. Each deployment will have different GPU memory size, CPU/GPU balance,
+NVMe behavior, tenant query repetition, resident cache contents, and write
+freshness pressure. A cheap local correction layer over deterministic planner
+features is likely more practical than a large universal GPU-route model in
+the hot path.
+
+For 1M logical sessions, the paper reinforces that most sessions should not
+own active execution resources. Logical sessions can wait in priority queues
+with bounded credits, while only admitted work consumes GPU streams, owner
+queue entries, pinned buffers, short-lane slots, or response memory.
+
+**Risks and mismatches:** Auto-WLM is built for Redshift data-warehouse
+queries, not OLTP write-path correctness. It does not solve WAL-before-
+visibility, MVCC validation, serializable snapshots, GPU cache invalidation,
+or device memory placement. Its concurrency scaling clusters are a cloud
+warehouse feature; GPU DB's first analog is route fallback, worker admission,
+or future accelerator-pool expansion, not automatic new hardware.
+
+The shortest-job-first and preemption ideas also need caution. Cancelling an
+analytical query is simpler than cancelling a transaction after mutation
+validation, WAL work, or GPU refresh side effects. GPU DB should first
+preempt only read-only or restartable work, and keep mutation-owner work
+nonpreemptive once it reaches WAL-sensitive phases.
+
+Finally, using a learned model in admission can create correctness-looking
+incidents if the fallback path is unclear. Every ML-influenced decision needs
+an explainable reason and a deterministic safe default: CPU truth, owner
+serialization, stale-route rejection, or explicit overload.
+
+**Benchmark candidates:**
+
+- Add a route-admission predictor harness fed by local telemetry: plan shape,
+  estimated rows, resident bytes, snapshot age, queue depth, pinned-buffer
+  budget, GPU stream occupancy, and previous observed latency. Proof gate:
+  prediction adds negligible latency to short retained reads.
+- Build a short retained-read lane with a fixed GPU/CPU resource slice.
+  Mispredicted queries must time out or re-route without consuming unbounded
+  pinned memory, response buffers, or GPU queue slots.
+- Compare static versus adaptive GPU-worker multiprogramming for same-shape
+  lookup batches and mixed long scans. Required metrics: throughput, p50/p95,
+  p99 queue wait, kernel launch count, batch size, and fallback rate.
+- Add a preemption negative control: allow preemption for read-only scans, but
+  forbid preemption after a write command enters WAL-sensitive phases. Failure
+  condition: a preempted write can publish partial visibility or leave a stale
+  resident route.
+- Test local versus global route correction. Train one generic route model and
+  one small per-workload correction model over repeated benchmark templates.
+  The local model only wins if it improves route choice without raising short
+  query overhead.
+- Add guardrail telemetry to every ML-influenced route decision: predicted
+  class, chosen lane, rejected alternatives, resource cap, fallback reason, and
+  observed error after completion.
+- Recreate a workload-spike benchmark with 1M logical sessions but bounded
+  active credits. Measure whether admission keeps active work within owner,
+  GPU, pinned-buffer, and response-ring budgets while idle sessions remain
+  cheap.
+
+### 2026-06-04 - Cross-paper synthesis: guarded route control is now the main runtime track
+
+The last three reviewed papers converge on one design theme: fast routes need
+cheap admission signals plus explicit correctness barriers. O|R|P|E classifies
+data by conflict semantics before choosing optimistic, ownership,
+reconciliation, or escrow behavior. SwitchFS delays metadata updates only
+because every dependent read has a dirty-state oracle. Auto-WLM admits and
+prioritizes work with cheap local predictions, but surrounds the learned
+decisions with timeouts, requeue paths, preemption budgets, and explainable
+fallbacks.
+
+For GPU DB, the common design track is a guarded route descriptor. A route
+should name the data semantics, visible generation, dirty metadata state,
+predicted resource class, queue lane, fallback class, and overload behavior
+before it can consume mutation-owner time, GPU streams, pinned buffers,
+resident snapshots, or cold-tier placement metadata. Learning can help rank or
+budget routes, but it should never replace the descriptor's MVCC, WAL,
+metadata, and invalidation proof.
+
+The category gap is no longer a lack of individual mechanisms. The gap is an
+integrated admission benchmark that combines write conflicts, metadata
+freshness, short reads, long scans, route prediction error, and session-scale
+queue pressure. The next useful papers should strengthen this integration with
+multi-resource scheduling, adaptive partitioning, buffer/cache-aware queues, or
+HTAP freshness under elastic resources.
+
+Benchmark priorities:
+
+- route descriptor audit that rejects missing semantic, visibility, dirty-bit,
+  or fallback contracts;
+- short retained-read lane with misprediction timeout and safe requeue;
+- dirty route-cache summary plus first-dependent-read aggregation barrier;
+- hot-field semantic admission for optimistic, ownership, repairable, and
+  escrow-like updates;
+- adaptive multiprogramming for GPU workers and mutation owners under mixed
+  short/long workloads;
+- 1M logical-session spike test with bounded active credits, pinned-buffer
+  budgets, response-ring budgets, and explainable overload reasons.

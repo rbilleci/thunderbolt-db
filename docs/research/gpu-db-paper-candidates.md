@@ -3278,7 +3278,7 @@ Append new candidates here as each paper is processed.
   Why: Stage identifies buffer-pool and cache state as hard-to-featurize
   environment factors; useful for comparing learned scheduling with explicit
   GPU/host/NVMe residency telemetry and cache-aware admission.
-- `queued` — **Auto-WLM: Machine Learning Enhanced Workload Management in
+- `reviewed` — **Auto-WLM: Machine Learning Enhanced Workload Management in
   Amazon Redshift**, Saxena et al., SIGMOD Companion 2023.
   URL: `https://doi.org/10.1145/3555041.3589677`
   Why: Stage compares against Redshift's prior workload-manager predictor;
@@ -3326,3 +3326,21 @@ Append new candidates here as each paper is processed.
   Why: SwitchFS contrasts with metadata write-back caching; useful for
   comparing client-side delayed metadata visibility against database-owned
   route-cache, catalog, and cold-tier metadata publication rules.
+- `queued` — **Self-Tuning Query Scheduling for Analytical Workloads**,
+  Wagner, Kohn, and Neumann, SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457260`
+  Why: Auto-WLM contrasts production admission and elasticity with
+  self-tuned scheduling policies; useful for comparing low-overhead heuristic
+  tuning against route-specific GPU/CPU/NVMe scheduling knobs.
+- `queued` — **LSched: A Workload-Aware Learned Query Scheduler for
+  Analytical Database Systems**, Sabek, Ukyab, and Kraska, SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526138`
+  Why: Auto-WLM cites learned analytical scheduling as related work; useful
+  for deciding whether GPU DB route scheduling should learn from plan shape
+  and system state or stay with guardrailed heuristics.
+- `queued` — **Database-Agnostic Workload Management**, Jain, Yan, Cruanes,
+  and Howe, CIDR 2019.
+  URL: `https://www.cidrdb.org/cidr2019/papers/p82-jain-cidr19.pdf`
+  Why: Auto-WLM cites database-agnostic workload management as related
+  production-oriented scheduling work; useful for comparing external workload
+  control with an engine-integrated GPU route/admission controller.
