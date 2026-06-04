@@ -35490,3 +35490,193 @@ write-back and visibility publication are complete.
 - Add a no-predeclared-access benchmark for dynamic transactions and compare
   against GaccO-style same-type queues. The expected win is lower preprocessing
   overhead; the expected risk is worse conflict precision.
+
+### 2026-06-04 - Zero-sided RDMA moves accelerator shuffles into the network
+
+**Citation:** Matthias Jasny, Lasse Thostrup, Sajjad Tamimi, Andreas
+Koch, Zsolt Istvan, and Carsten Binnig. "Zero-sided RDMA: Network-driven
+Data Shuffling for Disaggregated Heterogeneous Cloud DBMSs." Proceedings
+of the ACM on Management of Data 2(1), Article 36, 2024, pp. 36:1-36:28.
+doi:10.1145/3639291. Retrieved 2026-06-04 from the TU Darmstadt PDF
+`https://www.informatik.tu-darmstadt.de/media/systems/pdf_publications/zerosided_rdma_sigmod.pdf`
+and DFKI metadata page `https://www.dfki.de/web/forschung/projekte-publikationen/publikation/16460`.
+
+**Category:** Runtime / HFT / session scale; multi-tier cache / data
+placement; GPU execution / analytics.
+
+**Relevance tags:** RDMA; programmable switches; accelerator pools;
+GPU-to-GPU transfer; disaggregated DBMS; shuffle; replication; QoS;
+load balancing; producer/consumer rings; GPUDirect-style memory access.
+
+**Core idea:** The paper proposes zero-sided RDMA: a programmable switch
+initiates and coordinates RDMA READ/WRITE traffic so neither the sender nor
+the receiver actively performs data exchange. Producers and consumers only
+push to or pop from local circular buffers; the switch mirrors buffer state,
+reads items from producer memory, rewrites read responses into writes, and
+places them into consumer memory.
+
+The strongest transferable idea for GPU DB is that accelerator data movement
+can be expressed as bounded buffer contracts and routed by a control element
+that owns flow state. This does not require adopting programmable switches
+now. It sharpens the runtime model for future GPU/host/NVMe/accelerator-pool
+movement: producers and consumers should expose simple queue state, while the
+route owner decides batching, fairness, QoS, elasticity, and backpressure.
+
+The evaluation is mostly analytical/disaggregated rather than OLTP. On a
+four-node cluster with V100 GPUs, ConnectX-5 NICs, and an Intel Tofino switch,
+zero-sided RDMA matches or exceeds CPU-driven and NVSHMEM-style transfer
+baselines in GPU-to-GPU shuffle microbenchmarks, beats CPU shuffle baselines
+for CPU-to-CPU shuffles, supports per-flow prioritization, and improves a
+heterogeneous TPC-H Query 1 setup by load balancing among CPU, GPU, and FPGA
+consumers. The authors also report a distributed join experiment where
+zero-sided shuffling achieves near-linear scaling while using fewer CPU cores
+for communication than the CPU-driven GPU join baseline.
+
+**Concrete mechanisms:**
+
+- Each processing unit participates through a circular buffer with head and
+  tail pointers plus data slots. The paper states that the minimum device-side
+  memory needed for pointers is two 4-byte values plus item storage.
+- The switch keeps mirrored buffer state. It initiates a transfer only when a
+  producer has available items and a consumer has free slots.
+- A data transfer starts with an RDMA READ from the producer buffer. The switch
+  streams the read response through its pipeline, rewrites RDMA headers into
+  an RDMA WRITE, and sends the payload to the consumer buffer without buffering
+  the payload in switch memory.
+- After the consumer-side write is acknowledged, the switch increments the
+  consumer head pointer and producer tail pointer through RDMA WRITEs, then
+  recirculates a control packet to continue the flow.
+- The switch stores static RDMA connection metadata in tables and dynamic
+  packet sequence numbers, virtual-address offsets, and buffer pointers in
+  data-plane registers. The paper estimates roughly 50 bytes of register state
+  and 700 bytes of static table data per producer-consumer pair, with more
+  than 1500 concurrent flows fitting on the first-generation Tofino target.
+- Adaptive batching is performed at the switch by transferring multiple
+  contiguous items in one RDMA READ/WRITE when the producer has many ready
+  items and the consumer has enough space.
+- N:M shuffles reduce receiver-side connection pressure by having producers
+  connect to the switch while consumers poll one incoming buffer; switch logic
+  coordinates multiple producers writing into a consumer in round-robin order.
+- N:M load balancing spawns switch-side recirculating control packets per
+  consumer. A per-producer lock in switch registers prevents simultaneous
+  switch threads from issuing conflicting transfers from the same producer.
+- Replication waits for acknowledgments from all consumers before publishing
+  pointer advancement, which gives consumers a globally ordered stream without
+  endpoint coordination.
+- Buffer-state changes can be detected by switch polling or by a doorbell
+  packet from a capable processing unit. Polling keeps endpoints passive but
+  adds latency; doorbells lower median one-way latency to about 15 microseconds
+  in the paper's CPU ping-pong experiment.
+- The switch can enforce per-flow prioritization by throttling zero-sided data
+  transfers through RoCE congestion-control primitives.
+- Participating devices must expose RDMA-registered memory and preserve item
+  write ordering before head-pointer publication. For GPUs, the paper notes
+  the need for memory fences and uncached or volatile access to buffer
+  pointers to avoid stale state.
+
+**GPU DB mapping:** The immediate CPU/GPU database should not assume a
+programmable switch, but it should adopt the abstraction boundary. Every
+future high-throughput movement path should look like a bounded
+producer/consumer buffer with explicit ownership, head/tail telemetry,
+batching policy, and completion semantics. That applies to pgwire response
+rings, COPY chunk admission, WAL/MVCC staging, GPU H2D/D2H buffers,
+over-resident segment streaming, and future accelerator-pool shuffles.
+
+For session concurrency, zero-sided RDMA reinforces the idea that passive
+participants are cheap only when active buffer budgets are explicit. One
+million logical sessions should not imply one million active dataflow
+endpoints. Network workers and route owners need to allocate scarce ring slots,
+pinned buffers, GPU staging pages, and response buffers only to admitted
+active work, and they need queue-delay telemetry to decide when to batch,
+throttle, shed, or fall back.
+
+For multi-tier placement, the paper is a useful north star for future
+GPU/CPU/NVMe/disaggregated tiers. A storage node or cold-tier owner could
+produce compressed or filtered chunks into a registered ring; a GPU execution
+owner could consume them without the CPU doing per-chunk scheduling. In the
+near term, the same contract can be implemented in process with CPU-owned
+rings and CUDA streams; the benchmark should still measure whether route
+ownership and buffer reuse are clean enough that a NIC, DPU, or switch could
+replace the coordinator later.
+
+For MVCC and snapshots, zero-sided movement must remain below the visibility
+layer. A network or GPU dataflow can move chunks, replicated state, or
+candidate write intents, but it cannot publish SQL visibility. The producer
+item must carry a source WAL/transaction boundary, snapshot generation, table
+identity, and invalidation generation. Consumers may execute only if those
+metadata match the route contract.
+
+For GPU execution, the adaptive batching result maps to query-shape and
+segment-shape batching. The system should batch small transfers enough to
+amortize control overhead but cap batch bytes and wait time to protect tail
+latency and retransmission cost. The paper's warning about large fragments
+under loss is a reminder that "bigger micro-batch" is not monotonic.
+
+**Risks and mismatches:** The evaluation focuses on distributed analytical
+flows, shuffles, joins, TPC-H Query 1, and accelerator-to-accelerator transfer;
+it does not solve SQL transactions, WAL-before-visibility, MVCC GC, DDL,
+catalog invalidation, authentication, or pgwire semantics. The prototype uses
+specific RDMA and programmable-switch hardware, so the exact throughput and
+latency claims are not directly transferable to a single-node TCP benchmark or
+ordinary CUDA copy path. Switch register capacity and flow count are finite;
+the cited 1500-flow figure is far below a 1M logical-session target, so the
+right mapping is active-route multiplexing, not per-session switch flows.
+Endpoint memory ordering is also subtle: GPU pointer publication and cached
+state must be fenced or the coordinator can move stale or partially written
+items.
+
+**Benchmark candidates:**
+
+- Add a generic bounded dataflow-ring harness for CPU producer to GPU consumer,
+  GPU producer to CPU consumer, and CPU producer to CPU consumer. Track head,
+  tail, free slots, batch bytes, queue wait, completion wait, and reuse safety.
+- Implement a route-owner microbenchmark that moves fixed-size chunks from
+  over-resident host memory into GPU execution with adaptive batching. Sweep
+  item sizes from 4 KiB to 1 MiB and cap batches at latency and byte ceilings.
+- Add a passive-session budget test: 1M logical sessions, but only N active
+  ring credits and pinned buffers. Failure condition: idle sessions allocate
+  scarce movement buffers or increase active p99 latency materially.
+- Compare polling versus doorbell-style notification inside the current
+  process: route owner polls ring pointers versus producers enqueue explicit
+  wakeups. Measure p50/p99 latency, CPU burn, and batch size distribution.
+- Add flow-priority experiments for response rings and GPU transfer rings:
+  retained point reads, long scans, COPY refresh, and background warmup should
+  receive measurable bandwidth shares instead of starving one another.
+- Prototype metadata-carrying chunks for tier movement: table OID, snapshot
+  generation, source WAL boundary, partition id, and invalidation generation.
+  The proof gate is that stale chunks are rejected before execution, not after
+  result production.
+- For future hardware, compare CPU-driven, GPU-initiated, NIC/DPU-driven, and
+  switch-driven transfer paths under one dataflow API. The expected output is
+  a route policy, not a hard-coded dependency on any one transport.
+
+### 2026-06-04 - Synthesis: staged writes and bounded movement routes converge
+
+**Converging design tracks:** GPU-TPS, LTPG, and Zero-sided RDMA all argue for
+explicit route contracts rather than generic "send it to the GPU" behavior.
+GPU-TPS groups writes by transaction shape to reduce SIMT divergence. LTPG
+separates speculative execution, conflict detection, and write-back. Zero-sided
+RDMA separates producer/consumer buffers from the coordinator that owns flow
+state, batching, fairness, and elasticity.
+
+For GPU DB, the common track is a route descriptor that declares shape,
+ownership, budget, and publication boundary. Write routes should expose
+transaction template, conflict mode, and WAL publication stage. Read and tier
+movement routes should expose snapshot generation, table/partition identity,
+buffer credits, batch byte caps, and invalidation generation. The runtime then
+chooses CPU owner, GPU worker, resident snapshot, or future network-assisted
+movement based on measurable queue and correctness state.
+
+**Category gaps:** The last three papers improve GPU write batching and
+network/data-movement coverage. The queue should now bias toward CPU/GPU
+admission, adaptive concurrency control, deterministic transaction fallback,
+or multi-tier resource placement before another pure GPU analytics paper.
+Strong next candidates are GalOP, Aria, Caracal, P4DB, ScaleStore, or the
+RDMA synchronization guidelines.
+
+**Benchmark priorities:** First, define one shared dataflow-ring telemetry
+surface used by COPY admission, GPU staging, response rings, and over-resident
+chunk movement. Second, build a staged write-batch harness with separate
+execution, conflict, WAL/write-back, and invalidation timers. Third, make
+active-resource budgets explicit so logical-session scale is measured
+separately from scarce active buffers, GPU slots, and owner queue entries.

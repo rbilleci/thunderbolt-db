@@ -2877,19 +2877,22 @@ Append new candidates here as each paper is processed.
   pessimistic/optimistic hot-tuple handling; useful for deciding when GPU DB
   should switch hot keys or route families from optimistic batch admission to
   owner-serialized or lock-like handling.
-- `queued` — **Zero-sided RDMA: Network-driven Data Shuffling for
+- `reviewed` — **Zero-sided RDMA: Network-driven Data Shuffling for
   Disaggregated Heterogeneous Cloud DBMSs**, Jasny, Thostrup, Tamimi,
   Koch, Istvan, and Binnig, PACMMOD 2024.
   URL: `https://doi.org/10.1145/3639291`
+  PDF:
+  `https://www.informatik.tu-darmstadt.de/media/systems/pdf_publications/zerosided_rdma_sigmod.pdf`
   Why: follow-up from the same network/accelerator line that offloads RDMA
   data movement to programmable switches; useful for future GPU DB
   accelerator-pool shuffling, global-order replication, and CPU-free
   producer/consumer rings.
-- `queued` — **Zero-sided RDMA: Network-driven Data Shuffling**, Jasny,
+- `skipped` — **Zero-sided RDMA: Network-driven Data Shuffling**, Jasny,
   Thostrup, and Binnig, DaMoN 2023.
   URL: `https://doi.org/10.1145/3592980.3595302`
   Why: compact workshop version of switch-driven RDMA shuffling; useful if the
-  loop needs the smaller source before the full PACMMOD 2024 version.
+  loop needs the smaller source before the full PACMMOD 2024 version. Skipped
+  because the full PACMMOD 2024 version has now been reviewed.
 - `queued` — **Efficiently Joining Large Relations on Multi-GPU Systems**,
   Maltenberger, Tolovski, and Rabl, PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p4653-maltenberger.pdf`
@@ -2949,3 +2952,15 @@ Append new candidates here as each paper is processed.
   Why: RTIndeX's update weakness raises the question of log-structured GPU
   indexes; useful for comparing rebuild-heavy resident structures with
   mutable GPU dictionary layers under MVCC generation boundaries.
+- `queued` — **GPUrdma: GPU-side library for high performance networking from
+  GPU kernels**, Daoud, Wated, and Silberstein, ROSS 2016.
+  URL: `https://doi.org/10.1145/2931088.2931091`
+  Why: Zero-sided RDMA contrasts against accelerator-driven RDMA stacks;
+  useful for measuring when GPU-side networking is worth its SIMT/control-flow
+  cost versus CPU-, switch-, or NIC-driven data movement.
+- `queued` — **Rack-Scale In-Memory Join Processing using RDMA**, Barthels,
+  Loesing, Alonso, and Kossmann, SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2750547`
+  Why: Zero-sided RDMA uses RDMA shuffle/join literature as its DBMS baseline;
+  useful for comparing classic rack-scale RDMA repartitioning with future GPU
+  DB accelerator-pool shuffle and resident-partition movement.
