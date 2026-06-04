@@ -45909,3 +45909,207 @@ query's contract.
   needed conflict keys or resident generations, the command must route
   through the existing owner/CPU path rather than entering a deterministic
   fragment queue on incomplete information.
+
+### 2026-06-04 - GRASP makes imperfect route logs useful for cardinality estimates
+
+**Citation:** Peizhi Wu, Rong Kang, Tieying Zhang, Jianjun Chen,
+Ryan Marcus, and Zachary G. Ives. "Data-Agnostic Cardinality
+Learning from Imperfect Workloads." PVLDB 18(8):2519-2532, 2025.
+doi:10.14778/3742728.3742745. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol18/p2519-wu.pdf`.
+
+**Category:** query optimization / planning; route-cost estimation;
+learned cardinality estimation.
+
+**Relevance tags:** query-driven cardinality estimation; imperfect
+workloads; unseen join templates; join-template imbalance; learned
+count sketches; range-predicate drift; route telemetry; optimizer
+fallback; GPU/CPU route choice.
+
+**Core idea:** GRASP targets a production cardinality-estimation
+setting where the optimizer may have query templates and observed
+cardinalities but no direct data access, no complete coverage of join
+templates, and heavily imbalanced workload logs. Instead of training
+one model over every join shape or one model per join template, it
+learns per-table primitive models and composes them across join
+templates.
+
+The strongest transferable idea for GPU DB is that route estimates
+should not require perfect historical coverage before they become
+useful. A GPU/CPU/NVMe route model can learn from sparse observed
+queries, but it should be built from composable primitives tied to
+relations, predicates, join-key groups, resident generations, and route
+families. Missing tenant query shapes should trigger uncertainty and
+fallback, not a brittle global prediction.
+
+**Concrete mechanisms:**
+
+- The paper defines data-agnostic cardinality learning from imperfect
+  workloads: no data access, incomplete join-template coverage,
+  imbalanced join-template frequency, and shifting predicate-value
+  distributions.
+- Its ByteDance workload analysis reports real production skew:
+  workloads rarely cover all table combinations, many have large
+  class-imbalance ratios, new join templates appear week to week, and
+  predicate value distributions shift even for fixed templates.
+- GRASP decomposes estimation into per-table cardinality models and
+  per-table join-correlation primitives. Join estimates are composed
+  from base-table cardinalities and join-key group representations
+  rather than learned as whole-template black boxes.
+- The join-estimation algorithm computes per-table subquery
+  cardinalities, processes schema-derived join-key groups, multiplies
+  learned join-key/count-sketch distributions for participating
+  tables, and reuses intermediate estimates across subqueries.
+- Learned count sketch (LCS) models replace explicit join-key
+  distribution models. They output low-dimensional normalized vectors
+  from query encodings so join correlations can be approximated by dot
+  products without scanning the underlying data or knowing join-key
+  domains.
+- For range predicates, GRASP uses ArCDF, an autoregressive CDF model
+  built with monotonic rational-quadratic splines. This improves
+  robustness to value-distribution shifts and reduces the negative
+  estimate problem seen in earlier neural CDF approaches, although the
+  paper does not claim full theoretical global monotonicity.
+- The system trains from query/cardinality pairs. The authors describe
+  weekly retraining as a pragmatic production response to data and
+  workload shifts.
+- Evaluation uses CEB-IMDb-full, DSB, and an internal ByteDance
+  workload. GRASP is compared with PostgreSQL statistics and
+  query-driven neural baselines, including variants that require data
+  access. It reports consistent accuracy on seen and unseen join
+  templates, robustness to imbalance and range shifts, and improved
+  query latency on the evaluated workloads.
+- For a 16-way CEB-IMDb-full query, GRASP estimates all subqueries
+  with batched inference in under 0.5s on a V100 GPU and about 1.6s on
+  CPU. The paper notes that only 32 primitive model calls are needed
+  for 16 tables before progressive subquery inference reuses outputs.
+- Scope is SPJ queries with inner equi-joins and common predicates
+  such as equality, ranges, LIKE, IN, and NULL checks. Group By,
+  Distinct, nested queries, and cyclic joins beyond an independence
+  assumption are outside the evaluated scope.
+
+**GPU DB mapping:** GPU DB should treat cardinality and route-cost
+estimation as a certified input to route admission, not as a hidden
+optimizer hint. A GRASP-like design maps naturally to a route model
+whose primitives are table/resident-generation cardinality summaries,
+predicate-family models, join-key group sketches, and route-family
+cost residuals. The output should feed route certificates: estimated
+rows, selected bytes, GPU H2D/D2H cost, resident validity, CPU fallback
+cost, and uncertainty reason.
+
+The learned count sketch idea is especially relevant for resident
+joins and multi-table route choice. GPU DB does not need a full
+global learned model before it can test compact per-table route
+sketches. A resident generation could expose a bounded sketch for a
+key group, while query logs train corrections for predicates and
+join-shape drift. Dot-product style sketch composition is attractive
+because it can be batched, cached per snapshot generation, and passed
+to GPU kernels or CPU planners as a compact route fact.
+
+ArCDF points to a guardrail for hot range predicates. If time,
+tenant-id, sequence-id, or price ranges drift week to week, a direct
+query-template regressor can overfit recent literals. GPU DB route
+admission should track whether a range estimate comes from a
+monotonic/selectivity-preserving model, a DBMS statistic, a resident
+sample, or an out-of-distribution fallback. Bad estimates should
+route to CPU or a conservative GPU scan rather than over-admit a
+micro-batch that explodes result rows.
+
+For 1M logical sessions, the production lesson is log quality. Query
+logs will be incomplete and imbalanced by tenant, prepared statement,
+and hot route family. The runtime should record route-shape
+telemetry at the primitive level: table, resident generation,
+predicate family, selected columns, join-key group, estimated rows,
+actual rows, chosen tier, fallback reason, queue wait, and observed
+latency. That makes future learned route models trainable from
+ordinary operation without requiring a full table scan or leaking
+protected tenant data into a global optimizer service.
+
+**Risks and mismatches:** GRASP estimates cardinalities, not full
+GPU route latency. GPU DB must also predict kernel launch overhead,
+resident memory validity, tier transfer bytes, CUDA stream pressure,
+queue wait, cache invalidation, and response scatter cost. A good
+cardinality estimate can still pick the wrong route if these resource
+inputs are missing.
+
+The paper's evaluated scope omits Group By, Distinct, nested queries,
+and broader cyclic join handling. GPU DB already has retained
+aggregate and distinct kernels, so group-cardinality and result-size
+estimation need separate follow-up before using GRASP-like estimates
+as a full route certificate.
+
+The no-data-access setting is useful but not always necessary for GPU
+DB. The engine can often maintain DBMS statistics, resident samples,
+sketches, and execution telemetry directly. The right design may be a
+hybrid: use data-derived facts where the engine owns the data, use
+query-only primitives where tenants or tiers restrict access, and
+surface the source and confidence of every estimate.
+
+Training and inference are not free. The reported inference overhead
+is acceptable for complex analytical joins, but p50 OLTP lookups and
+interactive pgwire sessions cannot wait hundreds of milliseconds for
+route estimation. Any learned estimator needs cached outputs,
+micro-batched inference, stale-safe reuse, or a fast heuristic path for
+latency-sensitive reads.
+
+**Benchmark candidates:**
+
+- Add a route-estimation telemetry table for every accepted and
+  rejected resident route: primitive cardinality estimate, actual
+  rows, selected bytes, join-key group, resident generation, GPU
+  transfer estimate, queue wait, fallback reason, and confidence.
+- Build a small GRASP-inspired route-estimator prototype over query
+  logs only. Compare global model, per-template model, and composable
+  per-table/per-route primitives under missing and imbalanced
+  templates.
+- Test learned count sketch route facts for two-table and three-table
+  joins over resident snapshots. Proof gate: compact sketches improve
+  join row estimates versus independence without requiring a full data
+  scan on every refresh.
+- Add an out-of-distribution guardrail: when a query shape, predicate
+  value range, or resident generation is outside training coverage,
+  route admission must label the estimate uncertain and choose CPU,
+  conservative GPU scan, or explicit fallback.
+- Compare monotonic range models, DBMS histograms, resident samples,
+  and simple recent-query correction for time-ranged predicates.
+  Measure estimate error, route mis-admission rate, p95 latency, and
+  over-transfer bytes.
+- Cache estimator primitives by snapshot generation and route shape.
+  Benchmark whether cached primitive reuse can keep p50 route-choice
+  overhead below the high-throughput runtime budget while still
+  improving p95/p99 route decisions.
+- Extend benchmark coverage for Group By and Distinct estimates
+  before using learned cardinalities to admit retained aggregate or
+  distinct GPU routes.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates need tier, schedule, and estimate provenance
+
+The last three reviewed tracks converge on one design rule: a GPU DB
+route certificate should say why the route is valid, not only that it
+looks fast. The CXL/HANA study makes tier placement object-specific;
+Q-Store makes ordered queues part of the transaction execution proof;
+GRASP makes estimator provenance and training coverage visible. Put
+together, an admitted route needs a tier certificate, a scheduling
+certificate, and an estimate certificate.
+
+The immediate design track is to make admission facts first-class.
+For a retained read, write, refresh, or hybrid route, the runtime
+should record: object family and tier, snapshot/resident generation,
+WAL/catalog/invalidation boundary, owner queue or fragment schedule,
+estimated and actual rows/bytes, estimator source, confidence or OOD
+reason, queue wait, and fallback choice. That data is useful both for
+correctness review and for training better route models later.
+
+Category balance is still healthy, but the next gap is high-concurrency
+runtime/session admission or multi-tier cache policy rather than
+another learned optimizer paper. The optimizer thread now has enough
+recent material to define benchmarkable route-estimator telemetry;
+the next literature pass should preferably stress admission, queueing,
+cache eviction, or storage-tier scheduling.
+
+Benchmark priority: implement a route-certificate trace for one
+bounded workload before adding more model complexity. The trace should
+prove that a route decision can explain its tier inputs, scheduling
+inputs, and estimate inputs, then compare accepted, rejected, and
+fallback executions under skew, stale resident generations, and
+missing query-template coverage.

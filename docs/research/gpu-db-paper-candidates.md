@@ -3557,12 +3557,36 @@ Append new candidates here as each paper is processed.
   Why: direct follow-up on out-of-distribution robustness for query-driven
   cardinality estimation; useful for GPU DB when tenant workloads, resident
   cache contents, or mixed CPU/GPU route families drift from training logs.
-- `queued` — **Data-Agnostic Cardinality Learning from Imperfect
+- `reviewed` — **Data-Agnostic Cardinality Learning from Imperfect
   Workloads**, Wu et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p2519-wu.pdf`
   Why: modern query-driven cardinality estimator for incomplete and
   imbalanced join templates; useful follow-up for GPU DB route models when
   training logs do not cover all tenant query shapes.
+- `queued` — **Convolution and Cross-Correlation of Count Sketches Enables
+  Fast Cardinality Estimation of Multi-Join Queries**, Heddes et al.,
+  PACMMOD 2024.
+  URL: `https://doi.org/10.1145/3654932`
+  arXiv: `https://arxiv.org/abs/2402.15953`
+  Why: GRASP's learned count sketch mechanism points to count-sketch
+  composition as a compact way to approximate join correlations; useful for
+  comparing learned sketches with more direct sketch algebra for GPU DB route
+  estimates.
+- `queued` — **ASM: Harmonizing Autoregressive Model, Sampling, and
+  Multi-dimensional Statistics Merging for Cardinality Estimation**,
+  Kim et al., PACMMOD 2024.
+  URL: `https://doi.org/10.1145/3639300`
+  Why: GRASP contrasts data-agnostic query-driven estimates with
+  statistics/data-assisted estimators; ASM is a modern reference point for
+  deciding when GPU DB should use resident samples, base statistics, or
+  query-only telemetry in route costing.
+- `queued` — **Estimating Filtered Group-By Queries is Hard: Deep Learning
+  to the Rescue**, Kipf et al., AIDB 2019.
+  PDF: `https://db.in.tum.de/~kipf/papers/learnedgroupby.pdf`
+  Why: GRASP leaves Group By and Distinct outside scope, while GPU DB's
+  retained route family already includes aggregates and distinct projections;
+  this is a targeted follow-up for group-cardinality estimates in route
+  selection.
 - `queued` — **Updateable Data-Driven Cardinality Estimator with Bounded
   Q-error**, Li et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2408.17209`
