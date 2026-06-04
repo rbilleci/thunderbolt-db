@@ -37732,3 +37732,138 @@ trying to accelerate.
 - Add SLO-aware cooperative policy: temporary allocations may evict cache
   only while transactional/read-route throughput and queue-wait budgets
   remain above their minimum gates; otherwise spill or reject.
+
+### 2026-06-04 - Schedule-first concurrency turns hot-key contention into an admission problem
+
+**Citation:** Audrey Cheng, Aaron Kabcenell, Jason Chan, Xiao Shi,
+Peter Bailis, Natacha Crooks, and Ion Stoica. "Towards Optimal
+Transaction Scheduling." PVLDB 17(11), 2024, pp. 2694-2707. DOI
+`10.14778/3681954.3681956`. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`. Artifact:
+`https://github.com/audreyccheng/transaction-scheduling`.
+
+**Category:** Transaction processing / write path and concurrency control.
+
+**Relevance tags:** transaction scheduling; hot-key contention;
+MVCC/MVTSO; serializability; operation ordering; admission control;
+mutation owner; tail latency; batching; workload hints.
+
+**Core idea:** The paper argues that many transaction-processing systems
+leave throughput on the table because they accept arrival order and then
+react to conflicts with locks, aborts, retries, or validation. R-SMF
+instead chooses a low-conflict transaction order before execution and then
+uses a schedule-first concurrency-control protocol, MVSchedO, to enforce
+the important operation orders while preserving serializability.
+
+The transferable idea for GPU DB is to treat hot-key write contention as
+an admission and ordering problem, not only as a validation failure. If
+the runtime can identify hot keys from transaction type, prepared
+statement shape, bind parameters, or recent conflict telemetry, it can
+batch and order conflicting mutations before they enter the mutation
+owner, while still letting unrelated reads and writes proceed through
+other bounded routes.
+
+**Concrete mechanisms:**
+
+- The paper frames transaction scheduling as minimizing makespan: for a
+  finite batch, lower makespan corresponds to higher throughput.
+- Shortest Makespan First (SMF) greedily appends the transaction whose
+  placement causes the least incremental execution-time increase, using
+  conflict cost rather than only per-transaction priority.
+- SMF avoids needing full read/write sets by focusing on hot keys, because
+  the authors observe that a small set of hot keys drives much of the
+  conflict cost in common workloads.
+- In the online system, R-SMF has three components: a classifier for hot-key
+  conflict patterns, an SMF scheduler, and MVSchedO for execution.
+- The classifier uses lightweight application hints such as transaction
+  type and initial arguments to predict hot-key accesses when complete
+  access sets are not known in advance.
+- MVSchedO adapts multi-version timestamp ordering. It keeps MVTSO's
+  serializability basis but constrains execution with partial operation
+  orders for predicted hot keys.
+- R-SMF maintains scheduling queues per predicted hot key. Later
+  conflicting operations wait for preceding scheduled operations on that
+  key to complete, instead of racing and relying on abort/retry behavior.
+- Non-hot or non-conflicting operations are not globally serialized; the
+  protocol targets fine-grained operation ordering only where it expects
+  conflicts to matter.
+- The implementation modifies RocksDB 8.5 and evaluates OCC, locking,
+  defer-style scheduling, and R-SMF variants under saturated client and
+  worker configurations on EC2 instances with local NVMe.
+- The paper reports up to 3.9x throughput improvement and up to 3.2x tail
+  latency reduction across benchmarks and real workloads, plus up to 2.5x
+  throughput improvement on Meta TAO. It also reports less than 5%
+  throughput drop on low-contention workloads.
+- The authors show a bolt-on version of SMF over existing OCC and locking
+  implementations, which suggests the scheduler can be tested before a
+  full concurrency-control replacement.
+- In offline comparisons, SMF is reported as close to stronger job-shop
+  scheduling methods while being far cheaper to compute; the paper also
+  notes that some job-shop methods are not compatible with interactive
+  systems because they can reorder already-visible schedule positions.
+
+**GPU DB mapping:** The current runtime target already has bounded ingress,
+mutation, read, residency, GPU execution, and response rings. R-SMF suggests
+adding a conflict-aware lane before the mutation owner: classify incoming
+transactional work by route shape and predicted hot key, then schedule
+compatible or conflicting writes as small batches with explicit ordering
+metadata. This is especially relevant for account-like updates, queue heads,
+catalog hot rows, tenant counters, and any future workload where many
+logical sessions hammer a small key set.
+
+For WAL-before-visibility, the schedule should not replace the mutation
+owner's commit authority. It should produce an intended order and admission
+batch; the mutation owner still validates, writes WAL, publishes visibility,
+and emits errors. The useful boundary is: schedule before expensive work,
+commit only after durable ordering and MVCC checks. That keeps the paper's
+idea compatible with the architecture's owner-domain model.
+
+For retained GPU reads, hot-key write scheduling could reduce invalidation
+thrash. If conflicting writes are grouped into deterministic publication
+boundaries, the residency owner can refresh or invalidate once per ordered
+batch instead of reacting to a noisy stream of interleaved mutations. The
+same scheduling metadata can become a route-envelope input: predicted hot
+key, batch size, conflict depth, expected invalidation cost, and whether a
+read snapshot can be served before or after the write batch.
+
+For 1M logical sessions, this paper reinforces that every active session
+should not be free to inject conflicting writes directly into the owner
+queue. Idle sessions remain cheap, but active hot-key transactions should
+consume per-key or per-route credits, sit in bounded scheduling queues, and
+receive deterministic backpressure when conflict queues grow beyond latency
+or memory budgets.
+
+**Risks and mismatches:** R-SMF is evaluated in RocksDB and TAO-like
+workloads, not a SQL engine with PostgreSQL protocol semantics, DDL,
+COPY, WAL replay, GPU residency, or long retained snapshots. The scheduler
+depends on predicting hot-key accesses; bad predictions can add delay
+without reducing conflicts. The paper's MVTSO-derived protocol is a
+serializable transaction mechanism, while the current engine still has a
+much simpler MVCC tuple store and P8 residency plan. Also, scheduling can
+improve contention but cannot remove fundamental write serialization on a
+single hot key; at high enough skew it must still expose queueing,
+rejection, or application-level aggregation.
+
+**Benchmark candidates:**
+
+- Add a hot-key mutation scheduler simulator in front of the mutation owner.
+  Compare FIFO, per-key FIFO, SMF-like greedy ordering over a bounded window,
+  and random/defer baselines. Measure throughput, abort/retry rate, p95/p99
+  latency, queue wait, and starvation.
+- Build a mixed retained-read/write benchmark where many sessions update a
+  small key set while reads target immutable snapshots. Proof gate:
+  scheduling reduces write aborts or owner stalls without serving stale
+  retained reads across invalidation boundaries.
+- Test route-shape hints as the classifier input: prepared statement id,
+  table id, key parameter, transaction type, tenant id, and observed recent
+  conflicts. Failure condition: prediction state grows per logical session
+  instead of per hot route/key family.
+- Measure deterministic publication batches for hot-key writes: WAL batch
+  size, visibility generation count, residency invalidations per second,
+  refresh cost, and read fallback rate.
+- Add per-key credit and admission telemetry for transactional work:
+  queued operations, conflict depth, schedule window size, oldest wait,
+  rejected-overload count, and hot-key route demotion.
+- Run a low-contention control workload to prove the scheduler's overhead is
+  bounded. Minimum gate: when conflict telemetry stays low, the route
+  bypasses scheduling or pays only a small fixed admission cost.

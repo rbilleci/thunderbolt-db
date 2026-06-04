@@ -618,6 +618,14 @@ Append new candidates here as each paper is processed.
   Tech report: `https://www.labs.hpe.com/techreports/2015/HPL-2015-37.pdf`
   Why: many-core OLTP and NVRAM-oriented storage architecture cited by TicToc;
   relevant to partition ownership, logging, NUMA locality, and future tiers.
+- `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
+  PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
+  DOI: `https://doi.org/10.14778/3681954.3681956`
+  Artifact: `https://github.com/audreyccheng/transaction-scheduling`
+  Why: modern schedule-first transaction processing with hot-key prediction and
+  MVTSO-derived operation-order enforcement; relevant to mutation-owner
+  admission, hot-key write ordering, and contention-aware batching.
 - `reviewed` — **Diva: Making MVCC Systems HTAP-Friendly**, Kim et al.,
   SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526135`
