@@ -47198,3 +47198,233 @@ or remote dependency density is too high.
   sets, dense all-to-all conflicts, long transactions at the front of
   the total order, and volatile SQL. The route should fall back before
   allocating forwarded-value cache entries.
+
+### 2026-06-04 - BtrBlocks chooses compression per block by measured decode value
+
+**Citation:** Maximilian Kuschewski, David Sauerwein, Adnan
+Alhomssi, and Viktor Leis. "BtrBlocks: Efficient Columnar
+Compression for Data Lakes." PACMMOD/SIGMOD 2023, Article 118.
+doi:10.1145/3589263. Retrieved 2026-06-04 from the Zenodo author
+PDF, `https://zenodo.org/records/7936448/files/btrblocks.pdf`.
+
+**Category:** multi-tier cache / data placement; GPU execution /
+analytics.
+
+**Relevance tags:** columnar compression; tiered storage;
+sampling-based encoding selection; cascading compression; fast
+decompression; string layout; floating-point compression; S3/NVMe
+scan economics; resident segment format; route-cost telemetry.
+
+**Core idea:** BtrBlocks argues that open data-lake formats should
+optimize not only compression ratio, but the combined cost of moving
+and decoding compressed columnar data on modern high-bandwidth
+systems. Heavy generic compression can reduce bytes but leave scans
+CPU-bound. BtrBlocks instead builds an open columnar format from a
+pool of lightweight encodings, chooses encodings per fixed-size block
+with a cheap sampling algorithm, and allows encodings to cascade when
+one scheme's output is itself compressible.
+
+The strongest transferable idea for GPU DB is that P8 should treat
+compression as a measured per-segment route property, not a global
+format choice. A cold or warm segment should carry enough metadata to
+say which columns are cheap to decode on CPU, cheap to transfer, cheap
+to decode on GPU, or too slow for a latency-sensitive route. The route
+certificate should therefore include compressed bytes, decoded bytes,
+decode engine, estimated `compressed_bytes/decode_time`, estimated
+`decoded_bytes/decode_time`, and whether the encoding can be processed
+in compressed form.
+
+**Concrete mechanisms:**
+
+- BtrBlocks stores typed columns, including integers, doubles, and
+  variable-length strings, in fixed-size blocks. The paper's default
+  block size is 64,000 entries, so the format can adapt to changing
+  distributions and parallelize compression/decompression.
+- The scheme pool includes RLE, One Value, Dictionary, Frequency
+  Encoding, SIMD-FastPFOR, SIMD-FastBP128, FSST for strings, Roaring
+  bitmaps for nulls and exceptions, and the paper's new
+  Pseudodecimal Encoding for floating-point values.
+- The scheme-selection algorithm first collects simple statistics
+  such as min, max, unique count, and average run length. It then
+  rejects obviously nonviable schemes, compresses a sample with the
+  remaining schemes, and selects the best observed compression ratio.
+- The sampling method uses multiple small runs from random positions
+  in non-overlapping parts of the block. The chosen default is ten
+  runs of 64 values, roughly 1% of a 64K-value block.
+- The paper reports that scheme selection costs 1.2% of compression
+  CPU time, chooses an optimal-or-near-optimal scheme 77% of the time,
+  and compresses only 3.3% worse than the optimum on average.
+- Cascading compression is recursive up to a configured depth, with a
+  default depth of three. For example, RLE may produce value and count
+  arrays; the values may then be dictionary-encoded and the dictionary
+  codes may be bit-packed.
+- Frequency Encoding is specialized for the observed case where one
+  value dominates: store the top value, a bitmap marking top-value
+  positions, and the exception values.
+- Pseudodecimal Encoding converts many doubles into two integer
+  streams: signed significant digits and decimal exponent, while
+  preserving bitwise-identical output and storing non-encodable values
+  as exceptions. BtrBlocks disables it when exception rate is high or
+  dictionary encoding is a better fit for low-cardinality data.
+- String dictionary decompression avoids copying strings when possible
+  by producing offset/length tuples into the dictionary string pool.
+  The implementation also fuses common RLE-plus-dictionary cascades to
+  avoid materializing an intermediate code array.
+- Nulls and internal exceptions use Roaring bitmaps, which lets sparse,
+  dense, and mixed null/exception distributions avoid one fixed bitmap
+  representation.
+- Evaluation uses the Public BI Benchmark and TPC-H on an AWS
+  c5n.18xlarge instance with 100Gbps networking. The paper reports
+  BtrBlocks scans on the largest Public BI datasets are 2.2x faster
+  and 1.8x cheaper than Parquet+Zstd/Snappy-style baselines in its
+  summary figure.
+- In in-memory decompression on Public BI, the paper reports
+  BtrBlocks is 2.6x, 3.6x, and 3.8x faster than Parquet, Parquet
+  with Snappy, and Parquet with Zstd on average. On TPC-H, the
+  corresponding reported factors are 2.6x, 3.9x, and 4.2x.
+- For full-dataset S3 loading of the five largest Public BI datasets,
+  the paper reports BtrBlocks reaches 86.2Gbps compressed-data
+  decompression throughput, close to the S3 client limit they measured
+  with uncompressed data, and is 1.8x cheaper than Parquet with
+  Snappy/Zstd.
+- The authors explicitly note that BtrBlocks mostly optimizes for raw
+  decompression speed in open formats, not direct compressed-data
+  query execution, although some schemes could support processing in
+  compressed form.
+
+**GPU DB mapping:** P8 should start with BtrBlocks' decision loop,
+not necessarily its whole file format. Each CPU host segment or cold
+NVMe segment can be split into column blocks with a small
+encoding-certificate: type, row range, null bitmap kind, root encoding,
+cascade chain, compressed bytes, decoded bytes, decode target, and
+sample-derived confidence. GPU resident promotion can then choose
+between storing decoded columns, GPU-decodable compressed vectors,
+or CPU-decoded pinned batches based on measured route cost.
+
+For write throughput, BtrBlocks reinforces that compressed read
+segments should be immutable products of a visibility boundary.
+Mutation owners should append WAL and invalidate affected segment
+generations, while compression/admission workers rebuild new blocks
+asynchronous to commit. The benchmark target is not "compress every
+write"; it is "publish writes cheaply, then decide which stable
+segments deserve compressed warm/cold layout."
+
+For read throughput, the useful metric is not only decompression
+throughput over decoded bytes. BtrBlocks distinguishes the consumer's
+decoded-byte throughput from compressed-byte throughput, which matters
+when storage or network bandwidth is the bottleneck. GPU DB should
+measure an analogous tier metric: NVMe/HBM/PCIe bytes consumed per
+decode second and decoded tuples per route second. A codec that looks
+fast in decoded GB/s may still fail to saturate NVMe, PCIe, or HBM
+movement.
+
+For query latency, sampling-based encoding selection should be bounded
+and kept off request-critical paths. Use it during segment refresh,
+checkpoint compaction, COPY consolidation, or background promotion.
+Latency-sensitive retained reads should consume a published segment
+certificate rather than evaluate codecs on demand.
+
+For session concurrency, BtrBlocks suggests making decompression a
+bounded shared resource just like GPU streams and response rings. If
+1M logical sessions issue many retained reads over the same warm
+segments, the system should admit based on per-codec decode lanes,
+pinned-buffer budgets, and segment-cache reuse. The same compressed
+block should not be redundantly decoded by many sessions when a
+shared decoded or GPU-resident generation can be published.
+
+**Risks and mismatches:** BtrBlocks is an analytical data-lake format,
+not an OLTP storage engine. It does not solve WAL-before-visibility,
+MVCC version chains, point updates, tuple-level deletes, DDL
+invalidation, or serializable read freshness. GPU DB should use its
+encoding-selection and cost model ideas only for immutable segment
+generations or cold/warm tiers.
+
+The paper targets CPU decompression with SIMD on x86. GPU decode may
+prefer different block sizes, memory alignment, exception layout, and
+string representation. A CPU-optimal cascade such as dictionary plus
+RLE plus FSST may be poor if it causes divergent GPU control flow or
+uncoalesced writes.
+
+The evaluation is heavily scan-oriented. Point lookups, prefix
+predicates, MVCC visibility filtering, small result sets, and mixed
+write/read workloads may favor byte-addressable Data-Blocks-style
+layouts over maximum scan throughput. BtrBlocks itself notes HyPer
+Data Blocks preserve point access with lightweight byte-addressable
+encodings, which may be a better fit for retained OLTP-adjacent
+routes.
+
+Sampling choices are made for compression ratio, not directly for
+query latency or GPU execution cost. GPU DB should choose per-segment
+codecs by a multi-objective score: compressed bytes, decode time,
+GPU transfer bytes, predicate support, refresh cost, update rate, and
+fallback risk.
+
+**Benchmark candidates:**
+
+- Add a P8 segment codec bench for `int4`, `text`, and nullable columns:
+  uncompressed column groups, dictionary, RLE, FOR/bit-pack, FSST, and
+  simple cascades. Measure compressed bytes, CPU decode GB/s, GPU
+  upload bytes, optional GPU decode GB/s, and p50/p99 route latency.
+- Add a BtrBlocks-style sampling selector for offline segment refresh.
+  Proof gate: selector overhead stays below 2% of refresh compression
+  time and chosen codecs are within 5% of best measured route cost on
+  representative segments.
+- Compare table-wide fixed codec versus per-segment codec selection
+  under skewed data, changing distributions, null-heavy columns, and
+  mixed text/int columns. Failure condition: metadata and branch cost
+  erase the decode/space benefit.
+- Introduce route-certificate fields for compressed bytes, decoded
+  bytes, codec chain, null/exception representation, decode target,
+  decode confidence, and whether predicate evaluation can occur before
+  full decode.
+- Benchmark CPU-decoded pinned batches versus GPU-side decode for one
+  integer codec and one string dictionary codec. Reject GPU decode if
+  divergence or scatter writes make it slower than CPU decode plus H2D.
+- Add a freshness-aware compressed refresh test: mutations invalidate
+  only affected segment generations; background refresh rebuilds
+  compressed blocks; retained reads can choose newest CPU truth,
+  newest valid compressed warm segment, or newest GPU-resident segment.
+- Measure 1M-session-style shared decode pressure with many same-shape
+  retained reads over warm compressed segments. Expected result:
+  shared decoded generations or resident promotion reduce redundant
+  decode work without allowing stale segment certificates.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates need tier, schedule, and codec facts
+
+**Converging design tracks:** The last three reviews sharpen one
+combined route-certificate track. Aurora says durability and freshness
+must be expressed as ordered redo/consistency boundaries rather than
+implicit page state. T-Part says admitted work should carry schedule
+and dependency facts so the runtime can move work to data or safely
+push values forward. BtrBlocks adds that tiered data should carry codec
+and decode facts, because compressed bytes, decoded bytes, and decode
+engine determine whether a route is actually fast.
+
+Together, these papers argue for a richer but still bounded route
+certificate: durable LSN or transaction boundary, visibility/freshness
+boundary, resident or protection-group id, owner/sink assignment,
+dependency or pushed-value handles where applicable, tier location,
+codec chain, decode target, compressed/decompressed byte estimates,
+queue/decode resource class, and fallback reason.
+
+**Category gaps:** The recent queue is now fairly strong on write
+scheduling, storage publication, and compressed/tiered layout. The
+next useful paper should probably come from snapshot freshness,
+runtime admission, or query optimization under concurrent resource
+pressure rather than another pure GPU-OLAP scan paper.
+
+**Benchmark priorities:**
+
+- Route-certificate schema bench: generate certificates for CPU truth,
+  compressed warm segment, GPU resident segment, and forwarded-value
+  active-window routes; assert each route can explain freshness,
+  ownership, codec/decode cost, and fallback reason.
+- Commit-to-readable-plus-decode bench: measure write visibility,
+  segment invalidation, compressed refresh, decode, GPU promotion, and
+  final read latency as separate clocks.
+- Active-window plus compressed segment bench: deterministic writes
+  invalidate or delta-refresh only affected segments, while compatible
+  retained reads reuse certified decoded or resident generations.
+- Admission-control bench: combine mutation-owner queue depth,
+  refresh debt, decode-lane saturation, and GPU-stream saturation into
+  explicit reject/fallback decisions.

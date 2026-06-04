@@ -1305,9 +1305,9 @@ Append new candidates here as each paper is processed.
   optimization; useful for comparing cloud/cold-tier column groups,
   metadata layout, and coalesced reads against P8 resident and
   over-resident segment directories.
-- `queued` — **BtrBlocks: Efficient Columnar Compression for Data Lakes**,
+- `reviewed` — **BtrBlocks: Efficient Columnar Compression for Data Lakes**,
   Kuschewski et al., SIGMOD 2023.
-  URL: `https://doi.org/10.1145/3589265`
+  URL: `https://doi.org/10.1145/3589263`
   Why: cited by the columnar-format evaluation as a sampling-based
   encoding-selection design; useful for deciding whether P8 should choose
   compression per segment from measured decode speed instead of fixed
@@ -1650,17 +1650,35 @@ Append new candidates here as each paper is processed.
   useful for deciding when GPU DB should avoid materializing/partitioning
   because memory traffic dominates, especially for selective joins and
   retained resident inputs.
-- `queued` — **BtrBlocks: Efficient Columnar Compression for Data Lakes**,
+- `reviewed` — **BtrBlocks: Efficient Columnar Compression for Data Lakes**,
   Kuschewski, Sauerwein, Alhomssi, and Leis, SIGMOD 2023.
   URL: `https://doi.org/10.1145/3589263`
   Why: modern columnar compression framework referenced by the compressed GPU
   analytics paper; useful for choosing host/cold-tier column encodings before
   deciding which forms are worth promoting into GPU-resident snapshots.
+  Note: duplicate queue seed of the earlier BtrBlocks entry; reviewed once in
+  the literature journal on 2026-06-04.
 - `queued` — **Improving Execution Efficiency of Just-in-Time Compilation
   Based Query Processing on GPUs**, Paul et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol14/p202-paul.pdf`
   Why: Pyper baseline for Themis, with intra-warp shuffle and redistribution
   mechanics relevant to retained GPU pipeline fusion.
+- `queued` — **Chimp: Efficient Lossless Floating Point Compression for Time
+  Series Databases**, Liakos, Papakonstantinopoulou, and Kotidis, PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf`
+  DOI: `https://doi.org/10.14778/3551793.3551848`
+  Why: BtrBlocks compares Pseudodecimal Encoding against Chimp for double
+  compression; useful for deciding whether float-heavy resident/cold segments
+  need decimal-aware compression, time-series-oriented delta compression, or
+  simple dictionary/FOR fallbacks.
+- `queued` — **Towards Cost-Optimal Query Processing in the Cloud**, Leis and
+  Kuschewski, PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p1606-leis.pdf`
+  DOI: `https://doi.org/10.14778/3461535.3461549`
+  Why: BtrBlocks uses cost-per-scan economics rather than only throughput;
+  relevant to GPU DB tier placement because HBM, DRAM, NVMe, and future memory
+  tiers should be evaluated by route cost, freshness, and bandwidth bottleneck,
+  not raw decompression speed alone.
 - `queued` — **Accelerating Multi-way Joins on the GPU**, Lai et al.,
   VLDB Journal 2022.
   URL: `https://doi.org/10.1007/s00778-021-00702-4`
