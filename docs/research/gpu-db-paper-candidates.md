@@ -4082,7 +4082,7 @@ Append new candidates here as each paper is processed.
   existence proof for disaggregated intermediate memory; useful for comparing
   GPU DB response rings, intermediate result placement, and checkpointed
   distributed query stages.
-- `queued` — **Don't Look Back, Look into the Future: Prescient Data
+- `reviewed` — **Don't Look Back, Look into the Future: Prescient Data
   Partitioning and Migration for Deterministic Database Systems**, Lin et al.,
   SIGMOD 2021.
   URL: `https://doi.org/10.1145/3448016.3452827`
@@ -4154,3 +4154,12 @@ Append new candidates here as each paper is processed.
   Why: TiDB cites SQL Server's integrated Hekaton/Apollo HTAP path; useful for
   comparing migration from hot transactional rows into compressed columnar
   structures against GPU DB's resident refresh and safe-generation policy.
+- `queued` — **SLOG: Serializable, Low-latency, Geo-replicated
+  Transactions**, Ren, Li, and Abadi, PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p1747-ren.pdf`
+  DOI: `https://doi.org/10.14778/3324623.3342647`
+  Why: Hermes builds on deterministic execution and partition/locality
+  assumptions; SLOG is a follow-up line for locality-aware routing under
+  strict serializability and may inform owner-placement and route-freshness
+  policy when GPU DB partitions or replicas become geographically or
+  tier-wise distributed.

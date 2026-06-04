@@ -50858,3 +50858,152 @@ engine.
   correlated point reads plus writes with background refresh enabled. Measure
   whether retained GPU read latency stays stable while write admission is
   protected from storage-zone or segment-allocation stalls.
+
+### 2026-06-05 - Hermes routes near-future transactions to avoid partition ping-pong
+
+**Citation:** Yu-Shan Lin, Ching Tsai, Tz-Yu Lin, Yun-Sheng Chang, and
+Shan-Hung Wu. "Don't Look Back, Look into the Future: Prescient Data
+Partitioning and Migration for Deterministic Database Systems." SIGMOD 2021,
+pp. 1268-1281. doi:10.1145/3448016.3452827. Retrieved 2026-06-05 from
+`https://www.cs.nthu.edu.tw/~shwu/pubs/shwu-sigmod-21.pdf`.
+
+**Category:** transaction processing / write path; multi-tier cache / data
+placement; runtime / session scale.
+
+**Relevance tags:** deterministic execution; transaction routing; online
+partitioning; live migration; hot-record placement; owner-domain routing;
+admission windows; workload spikes; scale-out; batch planning.
+
+**Core idea:** Hermes argues that partition placement should not be driven
+only by old workload traces or by the current transaction in isolation. In
+deterministic systems, requests are already batched and ordered before
+execution, and stored-procedure-style systems often know read and write sets
+before execution. Hermes uses that near-future queue to choose transaction
+routes that jointly balance load, reduce distributed transactions, and avoid
+data-migration ping-pong.
+
+The paper targets deterministic, shared-nothing OLTP systems where poor
+partitioning can make conservative ordered execution clog behind remote reads
+or overloaded nodes. Hermes replaces a conventional scheduler route choice
+with prescient routing over queued transactions, then uses transaction-induced
+remote reads and writes as live migration opportunities. It reports 29% to
+137% higher transaction throughput than state-of-the-art baselines under
+complex Google-trace-shaped workloads, and shows faster response to workload
+changes and machine provisioning events.
+
+**Concrete mechanisms:**
+
+- The baseline model is Calvin-like deterministic execution: sequencers order
+  transactions, schedulers decide which nodes participate, and executors use
+  conservative ordered locking so nondeterministic aborts do not change the
+  replicated result.
+- Hermes assumes the read/write set is available before execution, either
+  directly from stored procedures or through Calvin-style lightweight
+  reconnaissance when needed.
+- Prescient routing examines a batch of queued transactions rather than only
+  past access logs or the current request. This lets the router see whether a
+  data movement would help multiple upcoming transactions or merely ping-pong
+  hot records between nodes.
+- Routing and migration are integrated. A distributed transaction already
+  moves read values and applies writes at a chosen owner, so Hermes treats that
+  motion as deterministic data fusion instead of running a separate, delayed
+  migration phase.
+- The route plan jointly optimizes three goals: balance machine workload,
+  minimize distributed transactions, and minimize unnecessary data movement.
+  The deterministic order lets the router foresee how route choices will
+  affect later queued transactions.
+- A fusion table records globally known hot-record placement. During scale-out
+  or consolidation, it lets Hermes move hot records through on-the-fly fusion
+  while keeping cold migration separate from normal hot transaction processing.
+- Cold data migration can proceed in the background, but it skips records held
+  in the fusion table so bulk movement does not block hot records and collapse
+  throughput during provisioning changes.
+- Batch size is a tuning boundary. Larger route windows improve plan quality
+  up to a point, but the paper shows throughput drops when prescient routing
+  itself consumes too much CPU.
+- Evaluation uses Google cluster traces with YCSB to create fluctuating
+  machine workloads, plus TPC-C hot-spot experiments and scale-out
+  experiments. Hermes is compared with Calvin, Clay, G-Store, T-Part, LEAP,
+  and Squall-style migration depending on the experiment.
+
+**GPU DB mapping:** Hermes is directly relevant to future partition owners and
+resident segment placement. GPU DB should not treat owner assignment, GPU
+residency, and cold-tier location as independent after-the-fact policies. A
+small admission window of queued work can reveal that moving a hot partition,
+building a resident segment, or routing a batch to a different owner will help
+several near-future requests rather than just the one currently at the head of
+the queue.
+
+For the current runtime target, the transferable primitive is a route window:
+the scheduler looks at a bounded queue of known-shape requests and decides
+whether to keep them on the mutation owner, execute from an existing retained
+snapshot, build a GPU lookup micro-batch, trigger refresh, or defer a
+background placement change. This complements CoroBase-style cooperative
+windows, but the objective is placement and route stability rather than only
+CPU cache-miss hiding.
+
+The fusion table maps to route metadata for hot keys, hot partitions, resident
+segments, and future tier placement. It should not be a correctness source of
+truth; it is a routing cache that says where hot work is expected to pay off.
+The durable truth remains WAL/checkpoint/archive plus CPU MVCC state, while
+fusion-like metadata can be rebuilt or invalidated after recovery.
+
+The scale-out lesson is important for GPU memory pressure. If the engine adds
+a new GPU, frees HBM, or demotes cold segments to NVMe, it should avoid moving
+hot resident segments through a slow bulk rebalance path that blocks fresh
+reads or writes. Hot movement should be coupled to admitted route windows;
+cold movement can run in the background and explicitly skip currently hot
+entries.
+
+Hermes also offers a warning about lookahead cost. A 1M-logical-session GPU DB
+cannot run an expensive global optimizer over every queued request. The route
+window must be bounded by time, count, and CPU budget, and it must expose a
+fallback path when read/write sets or route shapes are unknown.
+
+**Risks and mismatches:** Hermes assumes deterministic transaction execution,
+known read/write sets, and a shared-nothing distributed OLTP model. GPU DB
+currently has a single-owner correctness baseline, pgwire SQL input, MVCC
+visibility, WAL-before-visibility, and GPU acceleration state; it cannot simply
+adopt deterministic total ordering without changing the product semantics and
+latency profile.
+
+The paper does not cover GPU execution, CUDA streams, pinned buffers, SQL
+planning cost, MVCC snapshot publication, or WAL recovery. Its live migration
+uses transaction-induced data motion between nodes, while GPU DB resident
+segment movement must preserve immutable snapshot handles and device-buffer
+ownership. Known read/write sets are easier for stored procedures than for
+ad-hoc SQL, so near-term route windows should start with prepared or
+same-shape requests.
+
+There is also a latency tradeoff. Waiting for a larger lookahead batch can
+improve route quality but harm p50/p99. Hermes' own batch-size experiment
+shows that route planning can become CPU-bound. GPU DB should enforce a
+microsecond ceiling and count ceiling before treating prescient placement as a
+hot-path default.
+
+**Benchmark candidates:**
+
+- Build a route-window simulator over queued point reads and writes with hot
+  keys that shift over time. Compare FIFO owner routing, recent-history
+  placement, and bounded near-future placement. Gate: fewer owner/segment moves
+  and lower p99 without changing visibility results.
+- Add a fusion-table prototype for hot key or segment route metadata:
+  `key_range`, current owner, resident generation, route confidence, last
+  compatible snapshot, and invalidation generation. Failure condition: fusion
+  metadata can become the only correctness source after recovery.
+- Test hot-versus-cold movement under simulated GPU scale-out or HBM pressure.
+  Hot segments may move only through admitted route windows; cold demotion runs
+  separately and skips hot fusion entries. Measure retained-read p99, write
+  latency, refresh lag, and bytes moved.
+- For prepared statements or known-shape stored procedures, expose optional
+  read/write-set hints to the route scheduler. Minimum proof: hints can improve
+  routing, but missing or wrong hints fall back without stale reads or lost
+  writes.
+- Benchmark route lookahead ceilings: count windows of 1, 4, 16, 64, and 256
+  plus microsecond ceilings. Passing condition: route-planning CPU stays below
+  a fixed budget and p50 latency does not regress for isolated requests.
+- Combine the Hermes window with CoroBase and PreemptDB ideas: cooperative
+  windows for normal work, urgent-lane bypass for short retained reads, and
+  near-future placement only when it fits the queue-delay budget. Measure p99
+  urgent latency, ordinary throughput, movement count, and background
+  starvation.
