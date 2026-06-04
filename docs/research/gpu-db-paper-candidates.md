@@ -4019,14 +4019,21 @@ Append new candidates here as each paper is processed.
   URL: `https://arxiv.org/abs/2403.18702`
   Why: CXL-native tiering design; useful for contrasting OS/hardware-managed
   placement with GPU DB's explicit object-family placement and route telemetry.
-- `queued` — **Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its
+- `reviewed` — **Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its
   Reliability on High Latency Memory**, Mahling, Weisgut, and Rabl, DaMoN 2025.
   URL: `https://doi.org/10.1145/3736227.3736231`
   PDF:
   `https://hpi.de/oldsite/fileadmin/user_upload/fachgebiete/rabl/publications/2025/Mahling-DaMoN25-Prefetching.pdf`
+  Code: `https://github.com/hpides/prefetching`
   Why: CXL Memory Performance points to software prefetching for random
   high-latency memory accesses; useful for deciding whether cold host indexes,
   far-memory B+trees, and route metadata can hide CXL/future-tier latency.
+- `queued` — **How to Be Fast and Not Furious: Looking Under the Hood of CPU
+  Cache Prefetching**, Kuhn, Muhlig, and Teubner, DaMoN 2024.
+  URL: `https://doi.org/10.1145/3662010.3663451`
+  Why: Fetch Me If You Can builds on this CPU-prefetch characterization work;
+  useful for turning coroutine, AMAC, and state-machine prefetching into
+  hardware-calibrated route policies instead of hard-coded prefetch distances.
 - `reviewed` — **Databases in the Era of Memory-Centric Computing**, Chronis
   et al., CIDR 2025.
   URL:

@@ -51007,3 +51007,189 @@ hot-path default.
   near-future placement only when it fits the queue-delay budget. Measure p99
   urgent latency, ordinary throughput, movement count, and background
   starvation.
+
+### 2026-06-05 - CPU prefetching only hides future-tier latency when fill-buffer pressure is bounded
+
+**Citation:** Fabian Mahling, Marcel Weisgut, and Tilmann Rabl. "Fetch Me If
+You Can: Evaluating CPU Cache Prefetching and Its Reliability on High Latency
+Memory." DaMoN 2025. doi:10.1145/3736227.3736231. Retrieved 2026-06-05 from
+`https://hpi.de/oldsite/fileadmin/user_upload/fachgebiete/rabl/publications/2025/Mahling-DaMoN25-Prefetching.pdf`.
+
+**Category:** multi-tier cache / data placement; runtime / HFT / session
+scale; future memory-tier mechanics.
+
+**Relevance tags:** CXL; far memory; NUMA; CPU prefetching; fill buffers;
+B+trees; binary search; coroutine prefetching; route metadata; cold indexes;
+future tiers; high-latency memory.
+
+**Core idea:** The paper tests whether software prefetching can hide the extra
+latency of memory that is not close to the CPU: remote socket memory, Grace
+CPU access to Hopper GPU HBM over NVLink-C2C, A64FX core-group memory, and
+other local/remote memory arrangements. Its main result is not simply
+"prefetch more." Prefetching helps only when the workload has enough
+memory-level parallelism and the CPU has enough fill-buffer capacity to track
+outstanding L1 misses without turning prefetches into their own bottleneck.
+
+The paper adds two practical distinctions GPU DB should care about. First,
+prefetch locality hints are not portable contracts: x86 and ARM CPUs map T0,
+T1, T2, NTA, KEEP, and STREAM differently, and several tested CPUs collapse
+multiple hints into the same behavior. Second, CPUs differ in prefetching
+reliability. Some CPUs drop prefetches when fill buffers are full; others stall
+until a slot is available. Dropped prefetches can be cheaper than guaranteed
+prefetches when the program speculatively fetches more cache lines than it
+will actually touch.
+
+**Concrete mechanisms:**
+
+- The authors provide open-source microbenchmarks that infer target cache
+  levels and eviction behavior for software-prefetch locality hints by
+  comparing access latencies for known cache states against prefetched cache
+  lines.
+- A second microbenchmark detects whether the CPU has weak prefetch
+  reliability, where prefetches may be dropped under fill-buffer pressure, or
+  strong reliability, where the issuing core stalls until resources are
+  available.
+- Fill buffers are treated as the key scarce resource. Every L1 miss heading
+  toward L2, L3, or memory needs a fill-buffer slot; high-latency memory and
+  memory-intensive access patterns need more outstanding requests to cover
+  stalls.
+- The evaluation covers seven systems, including AMD EPYC, Intel Xeon, A64FX,
+  and NVIDIA Grace/Hopper. Remote placement includes remote socket DRAM and
+  GPU HBM reached from the Grace CPU through NVLink-C2C.
+- For B+tree lookups with optimistic lock coupling, the paper evaluates normal
+  lookup, coroutine prefetch of a full node, and coroutine prefetch of a half
+  node. It inserts 50M uint64 key/value pairs and looks up 5M keys.
+- On B+tree nodes up to roughly 1 KiB, coroutine prefetching gives speedups in
+  both local and remote placement. For large nodes, strong-reliability CPUs
+  can slow down badly because prefetching an 8 KiB node requests 128 cache
+  lines, far above the fill-buffer count, and many prefetched lines are never
+  used.
+- Weak-reliability CPUs often behave better in that speculative large-node
+  case because excess prefetches are dropped; the first lines, commonly
+  including node headers, still arrive early without forcing the core to wait
+  for every speculative line.
+- For binary search over a 100M-element sorted array, coroutine and
+  state-machine interleaving hide high-latency memory more reliably. Reported
+  speedups are about 1.4x-2.1x for local placement and 1.9x-2.8x for remote
+  placement, with lower benefit when skew makes the baseline cache-friendly.
+- The paper recommends using T0 or NTA for more consistent cross-CPU behavior,
+  treating T1/T2 as less portable, limiting speculative prefetches to roughly
+  fill-buffer capacity, and ordering speculative cache-line prefetches by
+  access probability.
+
+**GPU DB mapping:** This is directly relevant to the CPU side of GPU DB's
+future tier plan. Even if hot tuples live in GPU HBM and cold partitions live
+on NVMe or CXL-backed memory, the CPU runtime will still touch route metadata,
+MVCC version chains, host indexes, segment maps, catalog-generation tables,
+and admission queues. Those structures should not be assumed fast just because
+they remain load/store addressable.
+
+The strongest transferable idea is a calibrated prefetch budget per route
+family. A cold host B+tree lookup, resident-segment metadata lookup, far-memory
+snapshot descriptor walk, or route-cache probe should declare how many cache
+lines it may speculatively prefetch. That budget should be tied to measured
+fill-buffer behavior, node size, expected touch probability, and queue window
+size rather than hard-coded by CPU family.
+
+For the runtime design, this complements CoroBase and AMAC. Coroutine
+interleaving is a good default when latency is dominated by random memory and
+implementation cost matters. But the paper shows that coroutine prefetching is
+not free: when skew makes the baseline cache-friendly, coroutine overhead can
+erase the benefit, and when prefetching large speculative nodes on a
+strong-reliability CPU, the prefetch itself can become a stall. GPU DB should
+activate coroutine/state-machine metadata paths only for route classes where
+queue depth, random-access intensity, and tier latency justify the switch.
+
+For P8, the resident-cache manager should keep CPU canonical metadata and cold
+indexes in layouts that can prefetch probable fields first. A B+tree or
+segment directory page should put always-read fields, visibility boundaries,
+generation checks, row counts, and child-selection keys in the first cache
+lines. Less-likely payload or statistics fields should not be pulled into the
+same speculative prefetch group.
+
+The Grace/Hopper result is especially useful for future heterogeneous memory.
+CPU reads from GPU HBM or remote memory can be hundreds of nanoseconds slower
+than local DRAM. That does not make load/store access unusable, but it means
+GPU DB should treat "CPU can address that memory" as a route with latency and
+fill-buffer constraints, not as equivalent to local DRAM. The route certificate
+should include whether a metadata path is local DRAM, remote NUMA, CXL, GPU
+HBM accessed by CPU, or ordinary host memory.
+
+**Risks and mismatches:** The paper evaluates CPU-side B+tree and binary
+search workloads, not a full SQL engine, not MVCC visibility publication, and
+not GPU kernels. It does not evaluate PostgreSQL protocol concurrency,
+WAL-before-visibility, retained GPU snapshot correctness, or NVMe I/O. Its
+remote memory tests approximate important future tiers but are not the same as
+real CXL Type-3 devices under database write pressure.
+
+The results are hardware-specific. The exact locality mapping, fill-buffer
+count, and weak/strong reliability differ by CPU and may change across
+generations. GPU DB should not bake the paper's measured thresholds into code.
+The transferable mechanism is to measure and expose the threshold locally,
+then choose conservative per-route prefetch budgets.
+
+Finally, prefetching helps only when there is independent work to run while
+the memory request is in flight. A single urgent read with no compatible
+neighbors may be better served by a direct local route or by keeping its
+metadata resident in ordinary DRAM than by waiting for a coroutine batch that
+improves throughput but harms p50.
+
+**Benchmark candidates:**
+
+- Add a CPU metadata prefetch microbenchmark for GPU DB route descriptors:
+  generation table lookup, segment-map lookup, MVCC chain header walk, and
+  B+tree-style host index probe. Run local DRAM, remote NUMA if available, and
+  any future CXL/far-memory tier. Measure p50/p99, fill-buffer stall counters
+  where available, and route throughput.
+- Build a route-window prefetch experiment with FIFO direct lookup, coroutine
+  interleaving, and hand-coded state-machine interleaving. Gate: coroutine or
+  state-machine mode is enabled only when queue depth and random-access
+  intensity beat direct lookup without p50 regression for isolated requests.
+- Add node-layout tests for route metadata and host index pages: prefetch
+  header-only, probable child keys, full node, and sorted-by-touch-probability
+  cache lines. Failure condition: full-node prefetch regresses p99 on CPUs
+  with strong reliability or large nodes.
+- Expose a startup calibration step for prefetch locality and reliability:
+  local fill-buffer threshold, whether excess prefetch stalls or drops, and
+  whether T1/T2 differ from T0. The result becomes telemetry, not a correctness
+  dependency.
+- Compare local-DRAM route metadata with remote/future-tier metadata under the
+  same query mix. The proof gate is explicit route-cost accounting for
+  metadata placement, not only table-data placement.
+- For mixed read/write runs, measure whether prefetch-heavy cold-index probes
+  steal fill-buffer or cache capacity from mutation owner work. Failure
+  condition: improving cold lookup throughput raises write p99 or visibility
+  publication latency beyond the admission budget.
+
+### 2026-06-05 - Cross-paper synthesis: future routes need calibrated movement windows
+
+WALTZ, Hermes, and Fetch Me If You Can all push the same design rule from
+different layers: movement should happen in bounded windows with measured
+resource contracts. WALTZ moves WAL allocation serialization into a ZNS append
+path but still requires reserved zones and durable append results before
+visibility publication. Hermes moves hot records or partition authority only
+when the near-future transaction window says the movement will pay off. Fetch
+Me If You Can shows that even load/store movement into CPU cache needs a
+bounded fill-buffer budget, or prefetching can become the stall.
+
+For GPU DB, the converging track is "route certificates with movement
+budgets." A retained read, mutation batch, cold-tier lookup, resident refresh,
+or owner migration should carry the same kinds of facts: durability frontier,
+visibility generation, owner/placement target, reserved bytes or zones,
+prefetch/fill-buffer budget, route-window size, and fallback behavior. A route
+is not just eligible because the data exists somewhere; it is eligible because
+movement, publication, and resource consumption fit a measured envelope.
+
+The practical benchmark priority is to split movement from publication. WAL or
+segment appends can be admitted when durable append resources are reserved,
+but visibility waits for the append result. Hot placement can be considered
+over a Hermes-style lookahead window, but isolated reads should bypass the
+window when waiting would hurt p50. Far-memory metadata can use coroutine or
+state-machine prefetching, but only after local calibration proves enough
+memory-level parallelism and bounded fill-buffer pressure.
+
+Category gaps after this batch: the journal has strong recent coverage of
+write-path durability, transaction placement, and future-tier mechanics.
+Upcoming runs should bias toward query optimization under live resource state,
+MVCC/snapshot route certification, or high-concurrency networking/session
+admission rather than another GPU operator paper.
