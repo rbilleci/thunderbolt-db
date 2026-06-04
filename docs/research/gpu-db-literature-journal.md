@@ -34353,3 +34353,139 @@ more accelerator code. It should exercise phase-changing hot keys,
 distributed/multi-owner transactions, optimistic abort/retry, deterministic
 batch admission, and crash/replay of the selected order. Passing that gate
 would make later GPU write batches much less speculative.
+
+### 2026-06-04 - Concurrent query prediction needs explicit interference edges
+
+**Citation:** Xuanhe Zhou, Ji Sun, Guoliang Li, and Jianhua Feng. "Query
+Performance Prediction for Concurrent Queries using Graph Embedding." PVLDB
+13(9), 2020. DOI `10.14778/3397230.3397238`. Retrieved 2026-06-04 from the
+PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p1416-zhou.pdf`.
+
+**Category:** query optimization / planning; runtime / HFT / session scale.
+
+**Relevance tags:** concurrent query prediction; graph embedding; route
+admission; workload graph; data sharing; data conflict; resource competition;
+operator-level latency; dynamic workload updates; graph compaction.
+
+**Core idea:** GPredictor predicts the runtime of concurrent queries by
+turning all active query plans into one workload graph. Vertices are physical
+operators with optimizer, predicate, and sampled-data features. Edges capture
+relationships between operators: parent-child plan flow, shared table/index or
+intermediate data, read-write/write-write conflicts, and memory/CPU/IO
+resource competition. A graph embedding network then predicts operator startup
+and execution time, and root-operator predictions produce query latency.
+
+The paper's strongest transfer to GPU DB is not the neural model itself. It is
+the graph shape: a retained query route should be costed against the work that
+is already active, not only against table statistics and estimated rows. For a
+million logical sessions, most sessions can stay idle, but the active requests
+need explicit interference edges for shared resident generations, host buffers,
+owner lanes, locks/version frontiers, GPU streams, pinned memory, NVMe queues,
+and response rings.
+
+The evaluation uses PostgreSQL 11.1 on JOB, TPC-C, and XuetangX. The authors
+report that GPredictor outperforms BAL, a plan-structured deep learning
+baseline, and a tree-LSTM cost baseline. In the summary, they report 11x-30x
+lower error, 20%-1,227% faster prediction time, and 607%-4,383% faster
+training time than those baselines in their measured scenarios. The model also
+adapts across datasets and database configurations better than baselines,
+though predicate encoding is disabled in the cross-dataset test because
+predicate semantics are dataset-specific.
+
+**Concrete mechanisms:**
+
+- Build a workload graph from active physical plans. Each operator becomes a
+  vertex with normalized estimated cost, operator type, predicate encoding, and
+  sample bitmap features.
+- Add edge types for same-query parent-child flow, index/table/intermediate
+  result sharing, read-write or write-write conflicts, and resource
+  competition. Edge weights include estimated execution-time overlap.
+- Model resource competition with database configuration parameters such as
+  `work_mem`, `shared_buffers`, `effective_io_concurrency`, and
+  `max_connections`, treating some as reducing contention and others as
+  increasing concurrent competition.
+- Predict startup and execution time at the operator level, then derive query
+  latency from the root operator rather than predicting a single opaque query
+  label.
+- Use graph update for dynamic workloads: insert vertices/edges for incoming
+  queries and remove finished operators in batches chosen by predicted finish
+  time.
+- Use incremental prediction when only local graph structure changes, so the
+  model does not recompute every vertex from scratch.
+- Use graph compaction to merge vertices that overlap in time but have no
+  direct parent-child, sharing, or conflict edges. The optimal compaction
+  problem is NP-hard, so the paper uses greedy grouping by time overlap and
+  edge cuts.
+- Explicitly assumes a plan is available before execution, does not model
+  pipelined query execution, and does not consider adaptive plan changes during
+  execution.
+
+**GPU DB mapping:** GPU DB's planner should add a live-interference layer
+above ordinary cardinality and route costs. A retained lookup, scan, aggregate,
+or write batch should carry its normal route descriptor plus edges to active
+work: same resident generation, same partition owner, same GPU stream, same
+GPU memory budget, same pinned-buffer pool, same host/NVMe tier, same response
+ring, and same version or lock frontier. Admission can then distinguish "cheap
+alone" from "expensive now".
+
+For read throughput, the graph model suggests grouping compatible retained
+reads by positive sharing edges: same snapshot generation, relation, predicate
+family, key vector shape, output schema, and resident buffers. Negative edges
+should block or penalize co-scheduling when work competes for the same stream,
+scratch buffer, pinned memory, or cold-tier bandwidth. This gives a more
+truthful basis for micro-batching than queue length alone.
+
+For write throughput and MVCC, conflict edges should not be hidden inside a
+single queue. Read-write and write-write edges can map to owner lane, key
+range, version frontier, deterministic batch id, and WAL epoch. A retained read
+can be admitted immediately if its snapshot frontier is isolated from active
+mutation edges; otherwise it should wait, fall back, or reject with a specific
+reason.
+
+For session concurrency, GPredictor reinforces the distinction between logical
+connections and active interference. One million logical sessions should not
+imply one million graph vertices. The online graph should contain active
+operators or route descriptors, compact idle sessions away, and update in
+batches. Useful admission reasons include `shared_generation_hot`,
+`gpu_stream_conflict`, `owner_lane_conflict`, `pinned_buffer_pressure`,
+`nvme_queue_conflict`, `response_ring_conflict`, and `snapshot_frontier_wait`.
+
+**Risks and mismatches:** The paper is a prediction system, not a scheduler or
+correctness protocol. It does not prove that choosing routes from the graph
+will improve throughput or preserve fairness. The graph neural network may be
+too expensive or opaque for the GPU DB hot path, especially before enough
+training data exists. A simpler hand-built interference graph and calibrated
+cost model should be benchmarked before adopting learned prediction.
+
+The assumptions are also important mismatches. GPU DB will need pipelined
+execution, adaptive fallback, route changes after queueing, GPU kernel
+batching, resident snapshot invalidation, and WAL-before-visibility
+constraints. GPredictor assumes plans do not change during execution and does
+not model GPU streams, HBM occupancy, pinned host buffers, snapshot generations,
+or crash/replay frontiers. Cross-dataset predicate encoding remains an open
+problem in the paper, which matters for reusable route templates.
+
+**Benchmark candidates:**
+
+- Add a live route-interference table for retained reads and writes, initially
+  without ML. Track edges for relation/partition, snapshot generation, owner
+  lane, GPU stream, pinned-buffer pool, memory tier, NVMe queue, and response
+  ring.
+- Compare admission by queue depth only versus admission by interference edges
+  under mixed lookup, aggregate, refresh, and write workloads. Gate:
+  edge-aware admission lowers p99 without reducing committed throughput.
+- Add a same-generation sharing benchmark: many compatible retained lookups
+  should batch together, while same-stream but incompatible scans should be
+  delayed or routed elsewhere.
+- Test a snapshot-frontier conflict workload where writes invalidate a hot
+  resident generation while reads arrive continuously. Gate: edge telemetry
+  explains every wait, fallback, and stale-generation rejection.
+- Prototype graph compaction for runtime telemetry: idle sessions disappear,
+  identical same-shape retained reads merge into counters, and only active
+  route families stay in the graph.
+- Measure prediction overhead budget before any learned model: route
+  interference scoring must stay below a fixed microsecond ceiling and allocate
+  no per-request heap objects on the hot path.
+- Add planner traces that expose both isolated cost and live-interference
+  cost, so route decisions can explain "GPU resident is fast in isolation but
+  rejected because pinned-buffer or stream pressure is already high."

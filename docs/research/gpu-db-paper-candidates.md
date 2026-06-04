@@ -1110,7 +1110,7 @@ Append new candidates here as each paper is processed.
   Why: RankPQO cites hybrid plan selection work; relevant to keeping GPU DB
   deterministic cost rules as guardrails while adding measured route-ranking
   hints for CPU/GPU/tier choices.
-- `queued` — **Query Performance Prediction for Concurrent Queries using
+- `reviewed` — **Query Performance Prediction for Concurrent Queries using
   Graph Embedding**, Zhou et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p1416-zhou.pdf`
   DOI: `https://doi.org/10.14778/3397230.3397238`
@@ -2900,3 +2900,10 @@ Append new candidates here as each paper is processed.
   Why: HDCC contrasts deterministic execution against 2PC-like deterministic
   optimistic protocols; useful for measuring whether GPU DB multi-owner write
   batches should avoid 2PC entirely or make the commit path cheaper.
+- `queued` — **Plan-Structured Deep Neural Network Models for Query
+  Performance Prediction**, Marcus and Papaemmanouil, PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p1733-marcus.pdf`
+  DOI: `https://doi.org/10.14778/3342263.3342646`
+  Why: direct baseline for GPredictor's concurrent-query model; useful for
+  comparing single-plan latency prediction against GPU DB route descriptors
+  that must incorporate shared cache, lock, and accelerator-resource edges.
