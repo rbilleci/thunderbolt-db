@@ -1072,12 +1072,22 @@ Append new candidates here as each paper is processed.
   Why: TiQuE cites MRVs as a way to reduce wasted work around optimistic
   hotspot updates; relevant to GPU DB write admission when many logical
   sessions update counters or bounded inventory-like values.
-- `queued` — **Towards Generic Fine-Grained Transaction Isolation in
-  Polystores**, Faria, Pereira, Alonso, and Vilaca, HDMS 2022.
-  URL: `https://link.springer.com/chapter/10.1007/978-3-031-13216-2_6`
+- `reviewed` — **Towards Generic Fine-Grained Transaction Isolation in
+  Polystores**, Faria, Pereira, Alonso, and Vilaca, Poly@VLDB 2021.
+  URL: `https://link.springer.com/chapter/10.1007/978-3-030-93663-1_3`
+  PDF: `https://rmpvilaca.github.io/assets/pdf/FPAV21.pdf`
   Why: TiQuE cites this as an earlier layered-isolation direction for
   polystores; useful for future multi-engine GPU DB routes where transactional
   metadata may span CPU, GPU-resident, and cold-tier execution engines.
+- `queued` — **Totally-Ordered Prefix Parallel Snapshot Isolation**, Faria and
+  Pereira, PaPoC@EuroSys 2021.
+  DOI: `https://doi.org/10.1145/3447865.3457966`
+  PDF:
+  `https://repositorio.inesctec.pt/server/api/core/bitstreams/67827bf5-65e9-490a-b1d5-a4b976a732f4/content`
+  Why: follow-up from the same authors on a restricted Parallel Snapshot
+  Isolation model that orders a prefix of history; useful for comparing
+  low-wait distributed snapshot freshness against GPU DB's snapshot generation
+  and route-validity rules.
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`

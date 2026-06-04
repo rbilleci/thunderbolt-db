@@ -41655,3 +41655,126 @@ certificate is missing or stale.
   paper's hardware assumptions. Required telemetry: queue wait, batch size,
   model/packing overhead, kernel elapsed time, H2D/D2H bytes, pinned allocation
   time, and fallback count.
+
+### 2026-06-04 - Snapshot reconstruction as an optimizable route
+
+**Citation:** Nuno Faria, Jose Pereira, Ana Nunes Alonso, and Ricardo Vilaca.
+"Towards Generic Fine-Grained Transaction Isolation in Polystores." Poly 2021,
+co-located with VLDB 2021, revised selected papers, LNCS 12921, pages 29-42.
+DOI `10.1007/978-3-030-93663-1_3`. Retrieved 2026-06-04 from the
+author-hosted PDF, `https://rmpvilaca.github.io/assets/pdf/FPAV21.pdf`.
+
+**Category:** MVCC / snapshot visibility; transaction isolation; query
+planning; multi-engine storage.
+
+**Relevance tags:** snapshot isolation; visible-to-all versions;
+visible-to-some version cache; snapshot reconstruction; query rewrite;
+optimizer pushdown; polystore; heterogeneous storage; native-store
+compatibility; read-route certification.
+
+**Core idea:** The paper reframes snapshot reconstruction as a query-planning
+problem. Instead of embedding all MVCC version metadata into every native
+datastore, it keeps base storage rows as the visible-to-all state and adds a
+regular per-table version-cache relation for visible-to-some committed
+versions. A transaction reconstructs its snapshot by querying the cache for
+versions whose validity interval covers the transaction start timestamp, using
+cache keys and tombstones to mask base rows, and unioning in the selected cache
+versions.
+
+The strongest transferable idea for GPU DB is that a snapshot route should be
+an explicit, optimizable plan fragment, not an implicit visibility side
+condition. A retained GPU route can be described as base resident segment plus
+delta/cache segment plus tombstone mask plus visibility boundary. The planner
+then chooses whether to execute reconstruction on CPU, push it into a resident
+GPU kernel, or demote to the conservative owner path.
+
+**Concrete mechanisms:**
+
+- The paper assumes full Snapshot Isolation and MVCC, but deliberately focuses
+  on read-path snapshot reconstruction. Write-write conflict validation,
+  recovery, read-your-own-writes, and visible-to-one temporary versions are
+  simplified away in the proof of concept.
+- It splits usable versions into visible-to-all storage rows, visible-to-some
+  committed cache rows, and visible-to-one temporary rows. The proof of concept
+  implements the first two and leaves temporary versions as future work.
+- Each storage table `S` gets an `S Cache` table with the original key/value
+  shape plus `from`, `to`, and `deleted` fields. The cache primary key combines
+  the original key and `from` timestamp.
+- Base storage rows do not need per-row version metadata because visible-to-all
+  rows are treated as implicitly older than the cache window. Their final
+  visibility is decided by whether cache rows or tombstones override them for
+  the transaction start timestamp.
+- The logical reconstruction plan has three parts: find cache keys valid at the
+  transaction start timestamp, anti-join or filter matching storage rows, and
+  union non-deleted valid cache rows into the result.
+- Physical placement is a planner choice. The cache can live beside the native
+  store when pushdown is possible, in a different datastore optimized for the
+  cache operations, or inside the common query engine.
+- The paper evaluates a PostgreSQL-based mediator with MongoDB and Cassandra
+  wrappers on TPC-C `order_line` and `item` tables. It tests simple reads,
+  filters, joins, and aggregation under different physical plans. Reported
+  results show plan choice can change runtime dramatically, including one case
+  up to `58x` worse, while most tested cases had transactional read overhead
+  below `10%` versus the non-transactional read alternative.
+
+**GPU DB mapping:** For P8, this maps directly to immutable resident snapshot
+publication. A resident table generation can expose a base segment plus a
+bounded delta/cache segment and tombstone mask, all tied to table OID, schema
+generation, WAL boundary, and visibility boundary. Read workers should not
+"just check MVCC"; they should receive a route certificate naming which
+reconstruction plan is valid for the request's isolation class.
+
+This also gives a clean planner contract for incremental refresh. If a write
+batch is small, the route may keep a stable base GPU segment and apply a
+resident delta/tombstone overlay during lookup or scan. If the delta grows past
+a measured threshold, the route is invalidated or rebuilt. The certificate
+needs cache-row count, tombstone count, validity interval coverage, expected
+anti-join/filter cost, resident bytes, and fallback reason.
+
+For 1M logical sessions, the paper reinforces that snapshot state belongs to
+published generations and active route executions, not to idle sessions. A
+session can carry a read timestamp or transaction boundary; the runtime should
+map it to a compatible route generation only when work is admitted.
+
+The query-optimizer angle also fits heterogeneous tiers. CPU canonical rows,
+DRAM delta tables, GPU resident segments, and NVMe/cold fragments can all be
+treated as physical placements for the same logical reconstruction plan. The
+planner should choose pushdown, GPU overlay, CPU merge, or owner fallback based
+on data placement and route validity, rather than hard-coding one MVCC storage
+layout.
+
+**Risks and mismatches:** The paper is a proof of concept over polystore
+mediator queries, not a production GPU storage engine. It omits the write path,
+write-write validation, recovery coordination, read-your-own-writes, native
+writer interaction, and serializable predicate guarantees. GPU DB must keep
+WAL-before-visibility and cannot expose a cache/delta route before the CPU
+truth and invalidation protocol are complete.
+
+The experimental setup is small and remote-datastore oriented. Its overhead
+numbers do not predict GPU kernel launch cost, warp divergence from mixed delta
+states, memory coalescing, pinned-buffer pressure, or long-reader retirement.
+The query-rewrite approach also assumes every native engine can either execute
+the reconstruction plan or return enough data for the mediator to patch the
+snapshot. GPU DB should make unsupported reconstruction shapes explicit
+fallbacks.
+
+**Benchmark candidates:**
+
+- Add a route-certificate field for snapshot reconstruction plan: base segment
+  generation, delta/cache generation, validity interval, tombstone count,
+  supported isolation class, and fallback class.
+- Prototype retained point lookup over base column segment plus delta/tombstone
+  overlay. Compare full rebuild, overlay execution, and CPU fallback as delta
+  cardinality increases.
+- Benchmark scan/aggregate reconstruction with three physical plans: pushdown
+  into GPU overlay kernel, CPU anti-join/union, and conservative owner path.
+  Measure p50/p95/p99 latency, throughput, route bytes, and invalidation rate.
+- Add a correctness gate where a write batch invalidates the old route before
+  publishing new visibility. Failure condition: a retained read observes a
+  stale base row that should have been masked by a committed delta tombstone.
+- Stress long-running read snapshots while deltas accumulate. Required
+  telemetry: oldest active read boundary, retained generation count, bytes held
+  by old snapshots, rebuild pressure, and forced fallback/rejection reasons.
+- Test native/cold-tier interaction by placing base rows on CPU/NVMe and cache
+  rows in DRAM or GPU memory. The planner should select placement-aware
+  reconstruction instead of assuming all MVCC metadata is resident.
