@@ -3889,12 +3889,19 @@ Append new candidates here as each paper is processed.
   Why: CXL Memory Performance cites memory-centric database designs as a
   broader architectural direction; useful for comparing GPU DB's explicit
   owner/tier model with memory-centric pooled designs and database operators.
-- `queued` — **A Case Against CXL Memory Pooling**, Levis, Lin, and Tai,
+- `reviewed` — **A Case Against CXL Memory Pooling**, Levis, Lin, and Tai,
   HotNets 2023.
   URL: `https://doi.org/10.1145/3626111.3628195`
   Why: memory-centric database designs cite it as the main cautionary source
   on CXL pooling; useful for stress-testing GPU DB's future memory-pool
   assumptions against networking, failure, and deployment costs.
+- `queued` — **Demystifying CXL Memory with Genuine CXL-Ready Systems and
+  Devices**, Sun et al., MICRO 2023.
+  URL: `https://doi.org/10.1145/3613424.3614256`
+  Why: the HotNets CXL-pooling critique relies on this real-hardware CXL
+  latency and bandwidth evidence; useful for replacing abstract CXL tier
+  assumptions with measured load/store, copy, random-access, and NUMA-like
+  behavior.
 - `queued` — **Dremel: A Decade of Interactive SQL Analysis at Web Scale**,
   Melnik et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf`

@@ -47904,3 +47904,215 @@ architecture commitment.
 - Add telemetry for tier-route decisions: requested bytes, admitted
   bytes by tier, local/pooled hit ratio, spill reason, remote access
   latency, retry/fallback reason, and cost/performance class.
+
+### 2026-06-04 - CXL pooling is a costed route, not transparent memory
+
+**Citation:** Philip Levis, Kun Lin, and Amy Tai. "A Case Against CXL
+Memory Pooling." HotNets 2023, pp. 18-24. doi:10.1145/3626111.3628195.
+Retrieved 2026-06-04 from the HotNets/SIGCOMM PDF,
+`https://conferences.sigcomm.org/hotnets/2023/papers/hotnets23_levis.pdf`.
+
+**Category:** multi-tier cache / data placement; future memory-tier
+architecture.
+
+**Relevance tags:** CXL; memory pooling; disaggregated memory; far memory;
+tier placement; cost model; latency; bin packing; active memory leases;
+route certificates.
+
+**Core idea:** This paper is the cautionary counterweight to memory-centric
+database designs. It argues that CXL memory pools are unlikely to help
+datacenter or cloud systems under current conditions because the expected RAM
+savings are eaten by cost, complexity, and limited utility. The authors do not
+claim CXL is useless. They explicitly distinguish useful low-latency coherent
+device links for NICs or GPUs from the narrower idea of a large shared DRAM
+pool across servers.
+
+The paper's most useful message for GPU DB is that future CXL-like capacity
+must be treated as an explicit, costed route with measured access patterns.
+Transparent load/store access to pooled memory is too latency-sensitive for
+hot database control paths, and making pooled memory fast enough often turns
+it into an explicitly managed far-memory cache. That means software must
+decide when to copy, prefetch, pin locally, keep remote, or avoid the tier
+altogether.
+
+The evaluation is intentionally skeptical. The cost analysis uses CXL pool
+infrastructure as a switch-like device and argues that a 7%-9% aggregate RAM
+reduction does not map cleanly onto real DIMM/server configurations. The
+trace analysis uses Google and Azure VM traces and finds no utilization gain
+from pooling at original VM sizes. In their sensitivity model, Google-like VMs
+need to be inflated 32x before pooling produces even modest utilization
+benefit, while Azure-like cloud VMs begin showing benefit around 8x.
+
+**Concrete mechanisms:**
+
+- CXL pooling is modeled as a parallel memory network, not a free extension
+  of Ethernet. A pool needs a pool appliance or switch-like device, links,
+  cabling, interface cards, rack space, power, and operating overhead.
+- The paper focuses on a best-case CXL pool where memory is effectively
+  exclusive to one server at a time, avoiding shared cache-coherence overhead.
+  The critique therefore does not depend on worst-case sharing costs.
+- A CXL read path has many latency contributors: cache miss detection,
+  possible socket-to-socket traversal, MMU translation into a CXL request,
+  root-port dispatch, virtual switch/bridge handling, packetization, link
+  propagation, device decoding, memory-controller work, DDR reads, and the
+  symmetric response path. Queueing can appear at many of those boundaries.
+- The paper reports standard server memory latency around 120-140 ns and
+  cites real CXL device measurements where directly attached CXL loads are
+  about 2x local memory latency, around 280 ns on the evaluated server class.
+  A switched pool with retimers and queueing would be slower.
+- CXL bandwidth can still be useful for large transfers. The paper cites
+  early evidence that hardware-accelerated 8 KiB copies between DRAM and CXL
+  memory can approach local DRAM copy throughput, but that implies explicit
+  block movement instead of transparent cache-line loads.
+- The cost argument notes that real servers are provisioned in coarse DIMM
+  steps and memory channels should be populated uniformly for bandwidth.
+  Small theoretical memory reductions cannot always be purchased as small
+  physical reductions.
+- Using an Ethernet switch price as a rough proxy for a CXL pool appliance,
+  the paper estimates that just the switch-like device cost requires very
+  large aggregate RAM savings to break even. It says even free pool RAM still
+  requires a 24-node pool to break even for a standard 4 GB/core memory shape
+  under its assumptions.
+- The utility analysis treats pooling as an optimistic upper bound by
+  modeling a pool as a larger machine for bin packing, which elides real
+  allocation boundaries between compute and pooled memory.
+- The authors use 2019 Google and 2020 Azure VM traces, model VM and machine
+  demands as CPU/memory vectors, and compare optimal packing to a greedy
+  trace-replay packer. The optimal packing was 0%-17% better than the greedy
+  packer, with a median 5% difference, so it is a favorable proxy for pooling.
+- At original VM sizes, both traces show no utilization gain from pooling.
+  Pooling becomes useful only as VM sizes grow large relative to server size.
+- The paper leaves open that CXL pools could become attractive if CXL becomes
+  cheap, nearly as fast as local memory, or workload shapes become difficult
+  to pack into modern large servers.
+
+**GPU DB mapping:** GPU DB should keep CXL and future remote memory out of
+correctness-critical hot paths unless measurements prove otherwise. Mutation
+owner queues, WAL publication metadata, MVCC visibility stamps, route
+certificates, response-ring heads, CUDA stream ownership, and session-credit
+counters should stay in local memory. A future CXL/far-memory tier may hold
+large cold payloads, warm compressed segments, retired snapshots, or
+intermediate fragments, but it should not become invisible backing storage for
+the control structures that determine ordering and visibility.
+
+The strongest transferable mechanism is explicit block movement. If a segment
+or index lives in a future CXL tier, the planner should know whether the route
+uses transparent loads, prefetchable streaming reads, 8 KiB-style copied
+blocks, or local-DRAM promotion before execution. That decision belongs in the
+route certificate alongside GPU HBM, host DRAM, NVMe, and pinned-buffer
+requirements.
+
+For 1M logical sessions, this paper reinforces active leases. Idle sessions
+should not hold local DRAM, CXL memory, pinned memory, or GPU capacity. Active
+requests should lease a specific tier budget for a bounded time and release it
+when the response, snapshot, or intermediate fragment retires. A CXL pool does
+not make per-session memory free; it adds another saturated boundary with its
+own queueing and failure behavior.
+
+For P8 storage, CXL-like tiers should be evaluated as route-visible placement
+targets rather than as a transparent page cache. Candidate placements include
+cold column groups, compressed warm segments, scan-only payloads, checkpointed
+intermediates, and old retained snapshots. Bad first candidates include hot
+B-tree upper levels, hash-table probe metadata, version-chain heads, row-level
+visibility metadata, and response buffers.
+
+The cost analysis also matters even on a single-node GPU box. It warns against
+optimizing for capacity alone. A future tier must earn its place by reducing
+local DRAM/HBM/NVMe pressure enough to justify latency, software complexity,
+hardware availability, and operational cost. The benchmark should report a
+cost/performance class, not only throughput.
+
+**Risks and mismatches:** This paper is a position and methodology paper, not
+a database implementation. It does not benchmark a DBMS on CXL pools and does
+not measure GPU-to-CXL or GPUDirect-style paths. Its cost model uses 2023
+price and hardware assumptions, which may shift as CXL ecosystems mature. The
+server/VM trace analysis is strongest for cloud VM packing; GPU DB may run as
+a dedicated service where the relevant pool is query intermediate memory,
+retired snapshots, or storage cache rather than VM memory.
+
+The paper focuses mainly on pooling across servers. Single-host CXL memory
+expansion, Type 2 devices, CXL-attached storage services, and database-owned
+CXL kernels are different design points. Prior journal entries on SAP HANA CXL
+placement, CXL memory performance, Pasha, and Database Kernels remain useful
+because they test more database-shaped placements. The combined rule is not
+"avoid CXL"; it is "do not hide CXL behind the word memory."
+
+The CXL latency numbers are cited from other hardware work rather than
+measured by this paper. The newly queued "Demystifying CXL Memory with Genuine
+CXL-Ready Systems and Devices" paper should be reviewed before setting any
+numerical tier-latency thresholds.
+
+**Benchmark candidates:**
+
+- Add a tier-route simulator with explicit per-tier costs for local DRAM,
+  pinned DRAM, GPU HBM, CXL/far memory, and NVMe. Include queueing delay,
+  copy block size, bandwidth, latency, failure, and operational cost weights.
+  Failure condition: a policy chooses pooled memory only because it has spare
+  capacity while ignoring route latency or queueing.
+- Add route-certificate fields for future far-memory routes: access mode
+  (`transparent_load`, `prefetch_stream`, `copy_block`, `promote_then_execute`),
+  block size, expected remote bytes, local promotion bytes, lease duration,
+  and fallback reason.
+- Test a cold-segment benchmark with three policies: direct far-memory loads,
+  explicit 8 KiB/64 KiB block copy to local DRAM, and NVMe read into local
+  DRAM. Measure p50/p99 latency, CPU stalls, bandwidth, and memory overhead.
+- Stress hot control-state placement by artificially delaying visibility
+  stamps, route metadata, queue heads, and hash/index upper levels. Expected
+  result: these structures are too latency-sensitive for far memory.
+- Add active memory leases to the session-scale model: idle sessions reserve
+  no tier payload memory; active requests reserve bounded local, pinned, GPU,
+  and optional far-memory budgets. Gate: memory use scales with active work,
+  not logical connection count.
+- Add a CXL-pool cost/performance report template: local DRAM saved, HBM
+  saved, NVMe avoided, extra copies, p99 penalty, queueing, failure handling,
+  and hardware cost class. Reject a tier if it only improves capacity while
+  worsening latency and complexity.
+- Review CXL hardware measurements next before picking constants. The minimum
+  follow-up is load/store latency, random access, sequential copy bandwidth,
+  NUMA comparison, and multi-device or switched-path caveats.
+
+### 2026-06-04 - Cross-paper synthesis: future tiers need local-hot, remote-cold contracts
+
+**Papers covered:** FPSI, LADS, Databases in the Era of Memory-Centric
+Computing, and A Case Against CXL Memory Pooling.
+
+**Converging design tracks:** The last four papers strengthen the same runtime
+boundary from different angles. FPSI says snapshot freshness must be chosen at
+first contact and certified rather than guessed later. LADS says active write
+windows can be decomposed and scheduled before execution when transaction
+shape is known. Memory-centric databases argue that shared memory pools can be
+useful for intermediates and skew if the DBMS controls placement. The CXL
+pooling critique says that pooled memory is expensive, slower than local
+memory for random access, and often less useful than hoped unless the
+application explicitly manages movement.
+
+Together, they point to a stricter route certificate: a request should declare
+freshness boundary, scheduling lane, touched relation/key set where known,
+data tier, access mode, and fallback behavior. The certificate should keep hot
+control state local while allowing cold payloads, compressed segments, old
+snapshots, or intermediates to move into remote/future tiers only when the
+route can stream, prefetch, or copy them in coarse blocks.
+
+**Category gaps:** The journal has good recent coverage of transaction
+scheduling, MVCC freshness, CXL/tiering, and GPU execution. The next gap is
+raw CXL hardware behavior and then either high-concurrency networking or
+query-optimizer robustness. Avoid selecting another purely vision-oriented
+tiering paper until at least one measurement-heavy source has grounded the
+latency and bandwidth constants.
+
+**Benchmark priorities:**
+
+- Route-certificate prototype: freshness boundary, active-window lane,
+  resident/tier placement, access mode, and overload/fallback reason.
+- Active memory leases: prove idle logical sessions reserve no tier payload
+  memory and active requests release local/pinned/GPU/far-memory budgets
+  deterministically.
+- Far-memory sensitivity test: inject 2x-5x local-DRAM latency into route
+  metadata, version heads, queue heads, cold segments, and scan payloads to
+  identify which objects must stay local.
+- Batch write scheduler simulator: combine LADS-style dependency certificates
+  with FPSI-style freshness publication and measure p99 latency under hot-key
+  skew.
+- Tier cost report: every future CXL/far-memory benchmark should report local
+  memory saved, bytes copied, remote queueing, p99 penalty, and fallback rate,
+  not just throughput.
