@@ -42733,3 +42733,166 @@ bad GPU route if it ignores queue delay or refresh invalidation.
 - Keep calibration optional and bounded. A pass condition for any learned
   estimator is that disabling it falls back to deterministic rules with the
   same correctness envelope and only a performance change.
+
+### 2026-06-04 - Adaptive HTAP makes freshness a resource-scheduling input
+
+**Citation:** Aunn Raza, Periklis Chrysogelos, Angelos Christos Anadiotis,
+and Anastasia Ailamaki. "Adaptive HTAP through Elastic Resource Scheduling."
+SIGMOD 2020. Retrieved 2026-06-04 from
+`https://arxiv.org/abs/2004.05437`,
+`https://arxiv.org/pdf/2004.05437`, and
+`https://doi.org/10.1145/3318464.3389783`.
+
+**Category:** hybrid HTAP; runtime / admission / resource scheduling;
+multi-tier data placement.
+
+**Relevance tags:** freshness-aware scheduling; HTAP; OLTP/OLAP isolation;
+resource exchange; NUMA locality; snapshot switching; delta transfer;
+memory-bandwidth interference; route certificates; refresh admission.
+
+**Core idea:** The paper treats HTAP as a runtime scheduling problem rather
+than a fixed storage-design choice. A query may need only a small part of the
+fresh transactional delta, a full fresh snapshot, or a batch-friendly copied
+snapshot. Instead of always choosing unified storage, copy-on-write,
+periodic ETL, or dual-format storage, the system moves among co-located,
+isolated, and hybrid states by changing CPU ownership, memory ownership, and
+fresh-data access paths.
+
+The strongest transferable idea is that freshness is not just a visibility
+predicate. It is a schedulable resource demand. A read route should know how
+much fresh data it needs, how much total fresh data exists, whether the query
+is part of a batch, and how much OLTP interference is allowed before it
+chooses remote access, resource borrowing, or a full refresh/copy.
+
+**Concrete mechanisms:**
+
+- The system models HTAP with three components: an OLTP engine, an OLAP
+  engine, and a Resource and Data Exchange engine that owns resource and data
+  movement decisions.
+- The OLTP storage manager keeps two columnar instances plus multiversion
+  storage. One instance is active for writes; the other can be handed to OLAP
+  after an active-instance switch.
+- The OLTP engine maintains an index that points to the newest record in
+  either instance, a delta/version store for older versions, per-column
+  statistics, hierarchical update-presence flags, and per-record update
+  indication bits.
+- On switch, the RDE synchronizes instances by scanning update indication
+  bits and copying updated records when needed. The paper reports about
+  `10ms` to synchronize around one million modified tuples in a database of
+  more than `1.8` billion records while TPC-C NewOrder transactions continue.
+- The OLAP engine uses generated pipelines and pluggable access methods. It
+  can scan one contiguous memory region, scan multiple contiguous regions, or
+  combine OLAP-local data with fresh data from the OLTP side.
+- The scheduler can choose state `S1`, co-located OLTP/OLAP, where OLAP reads
+  the inactive OLTP instance and both engines share sockets and memory
+  bandwidth.
+- It can choose state `S2`, isolated OLTP/OLAP, where fresh data is copied
+  from OLTP to OLAP before the query or batch runs; this protects OLTP compute
+  isolation and amortizes copy cost across repeated queries.
+- It can choose state `S3`, hybrid OLTP/OLAP, where OLAP reads only the fresh
+  data it needs from the OLTP side, either remotely over the interconnect or
+  by borrowing some OLTP-local CPUs for data-local reduction.
+- The scheduling heuristic uses `N_fq`, the amount of fresh data required by
+  the current query, `N_ft`, the total fresh data in the database, a batch
+  flag, elasticity availability, elasticity mode, and an ETL sensitivity
+  threshold `alpha`.
+- If `N_fq < alpha * N_ft` and the query is not a batch, the scheduler avoids
+  full ETL and selects a hybrid or co-located route depending on isolation
+  constraints. Otherwise it migrates to the isolated-copy state.
+- In sensitivity experiments, copying roughly `500MB` of fresh data per batch
+  had a cost comparable to query execution over about `160MB` per query, so
+  larger query batches amortized the copy cost.
+- Borrowing too many OLTP-local CPUs helped OLAP only until memory bandwidth
+  saturated; beyond that point, OLTP throughput kept falling without further
+  OLAP gain.
+- In a CH-Benchmark query-sequence experiment, adaptive scheduling improved
+  OLAP sequence execution over static states while keeping OLTP degradation
+  controlled. The paper reports the adaptive benefit reaching up to about
+  `50%` compared with static schedules for 100 query sequences in its setup.
+
+**GPU DB mapping:** GPU DB should treat retained GPU reads, CPU fallback,
+snapshot refresh, and write admission as one resource-scheduling problem.
+The runtime already wants bounded rings, immutable snapshots, resident route
+validity, and explicit saturation metrics. Adaptive HTAP adds the missing
+freshness variable: how much of the current mutation frontier a query must
+observe, and whether that frontier is cheaper to access as a remote/delta
+route, a borrowed-resource route, or a newly published resident generation.
+
+For P8, `N_fq` maps to dirty bytes or dirty rows in the columns and segments a
+query touches. `N_ft` maps to the full dirty frontier for a table, partition,
+or resident generation. A retained route certificate can carry dirty-segment
+coverage, touched fresh bytes, total fresh bytes, batch membership, current
+GPU queue pressure, refresh cost, and allowed OLTP/write-path interference.
+That certificate lets the planner choose among serving an older snapshot,
+refreshing the GPU resident generation, executing a CPU/host delta path,
+borrowing GPU/CPU resources for a fresh partial route, or rejecting/falling
+back with an explicit freshness reason.
+
+The paper's `S2` state maps to full resident refresh or host-to-GPU copy before
+a batch of compatible reads. Its `S3` state maps to split execution: stable
+resident GPU segments plus fresh CPU/host delta segments, or a GPU kernel that
+reduces only the dirty tail before merging with resident results. Its `S1`
+state maps to aggressive co-location where analytical reads share mutation
+resources; for GPU DB this should be gated carefully because write admission,
+WAL publication, residency refresh, and query kernels can all contend for
+memory bandwidth and pinned buffers.
+
+For 1M logical sessions, the scheduling decision must be per route template or
+micro-batch, not per session. Sessions enqueue requests with a freshness
+requirement; owner domains aggregate compatible requests by snapshot
+generation, dirty frontier, route shape, and latency budget. A batch of
+dashboard reads may justify one refresh/copy, while scattered ad-hoc reads may
+need split routes or CPU fallback until enough work accumulates.
+
+**Risks and mismatches:** The evaluated system is CPU/NUMA-centered and uses a
+columnar in-memory prototype. It explicitly leaves hardware accelerators as
+future work, so GPU stream contention, HBM pressure, PCIe/NVLink transfer,
+pinned-buffer budgets, and GPU kernel launch overhead are not measured.
+
+The scheduling heuristic assumes scan-heavy analytical operators and does not
+include index maintenance or route-specific resident indexes. GPU DB must add
+index refresh, MVCC visibility checks, output materialization, and queue delay
+to the cost surface before adopting the same threshold shape.
+
+The double-instance design is useful as a snapshot publication pattern, but it
+is not a complete durability or MVCC design. GPU DB cannot let instance
+switching bypass WAL-before-visibility, replay, DDL invalidation, or
+long-reader retention. Also, split access is described as safe for inserted
+fresh data and more constrained for updates; GPU DB needs generation-tagged
+delta segments or row-version visibility before split routes can serve updates
+and deletes.
+
+Finally, a single `alpha` threshold is unlikely to be stable across GPU DB
+workloads. The threshold should be measured per route family and bounded by
+hard correctness gates: freshness, memory budget, queue wait, write-path
+interference, and fallback policy.
+
+**Benchmark candidates:**
+
+- Add a freshness-aware route benchmark with `N_fq / N_ft` as a first-class
+  variable. Compare full resident refresh, split resident-plus-delta route,
+  CPU fallback, and stale-snapshot rejection across insert-only and
+  update/delete workloads.
+- Build a dirty-frontier route certificate for P8: touched dirty rows/bytes,
+  total dirty rows/bytes, snapshot generation, resident bytes, refresh cost,
+  GPU queue depth, and allowed write-path interference. Proof gate: every
+  read either certifies freshness or reports the exact missing frontier.
+- Test an adaptive `alpha` rule for retained reads. Expected result: full
+  refresh wins for repeated compatible batches, while split routes win for
+  small fresh tails. Failure condition: the rule hurts p95 latency or write
+  throughput versus a static baseline without explaining the tradeoff.
+- Measure resource borrowing separately from data movement. Let read refresh
+  or delta-reduction work borrow CPU threads, GPU streams, pinned buffers, or
+  memory bandwidth under a fixed write-throughput floor. Pass condition:
+  borrowed resources improve read latency only while the write floor and WAL
+  visibility ordering remain intact.
+- Add a batch-amortization test for dashboard-style retained queries: vary
+  compatible query count from `1` to `64` over the same freshness frontier and
+  measure refresh/copy cost per query, p50/p95 latency, and GPU occupancy.
+- Add a split-update safety test. Insert-only deltas may be easy, but updates
+  and deletes require visibility-aware merge. Failure condition: a split route
+  serves a stale deleted row or misses a newer visible version.
+- Track OLTP interference explicitly: mutation queue wait, WAL flush latency,
+  publication delay, dirty-frontier growth, GPU refresh queue wait, memory
+  bandwidth where available, and rejection/fallback reason. A scheduling rule
+  is not accepted unless it preserves these counters within declared bounds.

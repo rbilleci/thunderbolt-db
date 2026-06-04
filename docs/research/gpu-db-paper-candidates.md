@@ -3402,7 +3402,7 @@ Append new candidates here as each paper is processed.
   Why: Stage compares against Redshift's prior workload-manager predictor;
   useful for understanding the production queue, priority, concurrency-scaling,
   and resource-control hooks that a GPU DB route predictor would influence.
-- `queued` — **Adaptive HTAP through Elastic Resource Scheduling**, Raza,
+- `reviewed` — **Adaptive HTAP through Elastic Resource Scheduling**, Raza,
   Chrysogelos, Anadiotis, and Ailamaki, SIGMOD 2020.
   URL: `https://arxiv.org/abs/2004.05437`
   DOI: `https://doi.org/10.1145/3318464.3389783`
@@ -3417,6 +3417,24 @@ Append new candidates here as each paper is processed.
   useful historical-but-eligible baseline for deciding which GPU DB benchmark
   gates must include hybrid transactions, freshness, and semantic schema
   overlap instead of only concurrent OLTP plus OLAP streams.
+- `queued` — **Heracles: Improving Resource Efficiency at Scale**, Lo et al.,
+  ISCA 2015.
+  URL: `https://doi.org/10.1145/2749469.2749475`
+  Why: Adaptive HTAP points to hardware/software resource controls for limiting
+  interference; useful for GPU DB admission rules that cap memory-bandwidth,
+  CPU, and accelerator-resource theft while protecting OLTP p95 latency.
+- `queued` — **PerfIso: Performance Isolation for Commercial
+  Latency-Sensitive Services**, Iorgulescu et al., USENIX ATC 2018.
+  URL: `https://www.usenix.org/conference/atc18/presentation/iorgulescu`
+  Why: Adaptive HTAP suggests live performance monitoring to bound elastic
+  resource sharing; PerfIso is a primary systems follow-up for interference
+  control and isolation when query, refresh, and mutation work compete.
+- `queued` — **Columnstore and B+ Tree - Are Hybrid Physical Designs
+  Important?**, Dziedzic et al., SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3190660`
+  Why: Adaptive HTAP contrasts runtime resource scheduling with hybrid access
+  methods; useful for deciding when GPU DB should adapt physical route shape
+  versus moving resources or freshness boundaries.
 - `queued` — **Deferred Runtime Pipelining for Contentious Multicore Software
   Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
   URL: `https://doi.org/10.1145/3302424.3303966`
