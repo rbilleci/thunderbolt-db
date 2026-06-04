@@ -562,11 +562,13 @@ Append new candidates here as each paper is processed.
   Why: FileScale contrasts namespace partitioning and caching approaches with
   distributed-transaction metadata; useful for evaluating route-cache
   placement, replication, and cache-invalidation options.
-- `queued` — **AsyncFS: Metadata Updates Made Asynchronous for Distributed
-  Filesystems with In-Network Coordination**, Zhou et al., arXiv 2024.
+- `reviewed` — **SwitchFS: Asynchronous Metadata Updates for Distributed
+  Filesystems with In-Network Coordination**, Xu et al., EuroSys 2026;
+  arXiv 2024/2025.
   URL: `https://arxiv.org/abs/2410.08618`
+  DOI: `https://doi.org/10.1145/3767295.3769349`
   Why: modern follow-up for metadata update admission and coordination;
-  useful for evaluating whether cold-tier namespace, catalog, or route-cache
+  reviewed for evaluating whether cold-tier namespace, catalog, or route-cache
   mutations can be made asynchronous without weakening visible ordering.
 - `reviewed` — **A Morsel-Driven Query Execution Engine for Heterogeneous
   Multi-Cores**, Dursun et al., PVLDB 2019.
@@ -3311,3 +3313,16 @@ Append new candidates here as each paper is processed.
   Why: recent semantic-aware concurrency-control work with a GPU-accelerated
   graph fallback path; useful for comparing O|R|P|E-style semantic classes with
   deterministic DAG fallback for constrained transaction domains.
+- `queued` — **CFS: Scaling Metadata Service for Distributed File System via
+  Pruned Scope of Critical Sections**, Wang et al., EuroSys 2023.
+  URL: `https://doi.org/10.1145/3552326.3587443`
+  Why: SwitchFS compares against CFS's fine-grained parent/child-separated
+  metadata partitioning; useful for deciding how much route-cache and
+  cold-tier namespace contention can be removed by shrinking the synchronous
+  critical section before adding asynchronous dirty-state coordination.
+- `queued` — **MetaWBC: POSIX-compliant metadata write-back caching for
+  distributed file systems**, Qian et al., SC 2022.
+  URL: `https://doi.org/10.1109/SC41404.2022.00060`
+  Why: SwitchFS contrasts with metadata write-back caching; useful for
+  comparing client-side delayed metadata visibility against database-owned
+  route-cache, catalog, and cold-tier metadata publication rules.

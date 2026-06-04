@@ -40497,3 +40497,142 @@ routes.
   reflect successful repaired/reserved updates only after WAL publication.
 - Track per-field contention telemetry so route choice can be based on hot
   attributes rather than whole-table labels.
+
+### 2026-06-04 - Delayed metadata updates need a dirty-state visibility oracle
+
+**Citation:** Jingwei Xu, Mingkai Dong, Qiulin Tian, Ziyi Tian, Tong Xin, and
+Haibo Chen. "SwitchFS: Asynchronous Metadata Updates for Distributed
+Filesystems with In-Network Coordination." EuroSys 2026; arXiv
+`2410.08618`, version 3 dated 2025-12-30. DOI
+`10.1145/3767295.3769349`. Retrieved 2026-06-04 from arXiv,
+`https://arxiv.org/abs/2410.08618`.
+
+**Category:** Multi-tier cache / data placement; runtime / admission;
+metadata and route-cache consistency.
+
+**Relevance tags:** asynchronous metadata updates; dirty-state tracking;
+programmable switches; change-log compaction; namespace contention;
+route-cache invalidation; cold-tier metadata; visible ordering; recovery.
+
+**Core idea:** SwitchFS argues that many distributed filesystem metadata
+updates do not need to synchronously update parent-directory metadata before
+the client can return. The system applies the target inode update locally,
+records the remote parent-directory update in a per-directory change-log, and
+marks that directory as dirty in an in-network dirty set. A later directory
+read observes the dirty state, aggregates delayed updates, applies them, and
+then returns a current result.
+
+For GPU DB, the transferable idea is a delayed metadata route with a cheap
+visibility oracle. Catalog, cold-tier namespace, route-cache, residency, and
+statistics updates can sometimes be logged and batched away from the critical
+path, but only if every read or route decision can cheaply detect pending
+metadata work and force aggregation before returning a result that depends on
+that metadata.
+
+**Concrete mechanisms:**
+
+- SwitchFS separates parent/child placement for load balance, then avoids
+  putting the remote parent-directory update on the common critical path.
+  Double-inode operations such as create/delete/mkdir/rmdir usually update
+  the target inode locally and append the parent update to a change-log.
+- A directory has two states: normal, where returned updates have been applied
+  to its inode, and scattered, where one or more delayed updates exist in
+  remote change-logs.
+- The dirty state is tracked by a programmable switch using a compact
+  set-associative dirty set keyed by directory fingerprints. Packets can
+  insert, query, or remove dirty fingerprints at line rate.
+- If dirty-set insertion overflows, the operation falls back to synchronous
+  metadata update. The evaluation reports no overflow in its tested setup, but
+  forced overflow dropped create throughput by 69.7% and raised average
+  latency by about 0.85x relative to successful dirty-set insertion.
+- A statdir/readdir packet queries the dirty set. If the directory is dirty,
+  the owner removes the fingerprint from the switch, multicasts an aggregation
+  request, receives change-log entries from other servers, logs and applies
+  them, acknowledges the senders, and only then returns.
+- Change-log compaction exploits commutative directory metadata updates:
+  numeric deltas can be merged, timestamps keep the maximum value, and
+  insert/remove operations on different entries can be applied in any order
+  while same-name operations preserve FIFO order.
+- Proactive aggregation pushes change-log entries when an MTU-sized batch
+  accumulates or when a quiet interval passes, reducing the first-read stall
+  after a burst of updates.
+- Recovery replays server WAL to rebuild key-value state and unapplied
+  change-log entries, then proactively aggregates owned directories before
+  serving normal requests. Switch failure loses the dirty set, so all servers
+  stop serving, aggregate all directories, and restart from an empty dirty set.
+- Rename and reconfiguration are exceptions: rename uses distributed
+  transactions and a centralized coordinator, and reconfiguration is
+  stop-the-world with aggregation before migration.
+- The paper reports, under skewed metadata workloads, up to 13.34x higher
+  throughput and 61.6% lower latency than its emulated InfiniFS baseline, and
+  up to 3.85x higher throughput and 57.3% lower latency than its emulated CFS
+  baseline. Real-world workload speedups vary, including a case where
+  SwitchFS is 0.3x worse than emulated CFS end-to-end.
+
+**GPU DB mapping:** Treat the dirty set as a design pattern, not as a
+requirement to use a programmable switch. GPU DB can maintain dirty-route
+summaries for table/partition/segment/catalog objects in a low-latency owner
+or ring-local structure. A read snapshot worker or planner route decision must
+query that summary before trusting resident GPU buffers, host compressed
+segments, cold-tier placement maps, or route-cache entries.
+
+The strongest mapping is to route-cache and cold-tier namespace metadata. A
+mutation might synchronously append WAL and publish tuple visibility, while
+deferring secondary route metadata such as segment statistics, cold-tier file
+placement, cache index summaries, or resident refresh hints. Any route that
+needs those summaries must see the dirty bit, aggregate pending change-log
+entries, or fall back to the mutation owner/CPU truth.
+
+Change-log compaction maps to route telemetry and placement deltas. Multiple
+updates to the same segment can merge byte-count deltas, last-access or
+freshness timestamps, invalidation generations, and placement-state changes
+before a cache/residency owner publishes a new route descriptor. Same-key or
+same-segment operations still need deterministic ordering, just as SwitchFS
+keeps same-entry insert/remove order in FIFO logs.
+
+The paper also sharpens a recovery rule for GPU DB: dirty-state summaries are
+not durable truth. If a dirty summary is lost, the system must either rebuild
+it from WAL/change-logs or conservatively aggregate and mark affected routes
+stale before serving reads. That matches the existing P8 rule that GPU
+resident state is acceleration state, never the source of correctness.
+
+**Risks and mismatches:** SwitchFS optimizes filesystem metadata, not SQL
+catalog/MVCC state. POSIX directory semantics are not the same as SQL
+isolation, optimizer correctness, WAL-before-visibility, foreign keys, or DDL
+barriers. GPU DB should only defer metadata that is not required for the
+visible write itself, or that has an explicit read-before-use aggregation
+barrier.
+
+The programmable switch is a specialized coordinator with limited memory and a
+single-point-of-failure risk that the paper leaves partly to recovery. GPU DB
+should first test the pattern with owner-local dirty summaries or bounded
+runtime rings before assuming NIC/switch offload is worth the operational
+complexity.
+
+Delayed metadata can move latency from writes to the first dependent read.
+That is acceptable only when route telemetry makes the stall visible and
+admission can proactively aggregate before user-facing reads hit the barrier.
+
+**Benchmark candidates:**
+
+- Add a route-cache dirty-summary harness: mutations append WAL and update CPU
+  truth, then defer route metadata deltas into per-table or per-segment logs.
+  Proof gate: every route decision checks dirty state and either aggregates,
+  uses a newer published route descriptor, or falls back to CPU truth.
+- Compare synchronous route-metadata publication with delayed publication under
+  bursty table/segment updates. Measure write latency, first-read stall,
+  aggregate batch size, route-cache hit rate, and p95/p99 read latency.
+- Add change-log compaction for placement metadata: merge invalidation counts,
+  byte deltas, freshness timestamps, and resident/cold placement transitions.
+  Failure condition: compaction changes the visible ordering of same-segment
+  invalidation and refresh events.
+- Simulate dirty-summary overflow or loss. Required behavior: fall back to
+  synchronous publication or conservatively mark affected routes dirty/stale
+  before reads resume.
+- Combine with the 1M logical-session target by letting many sessions update
+  cold-tier or route-cache metadata for a small set of hot segments. Measure
+  owner queue wait, aggregation fan-in, and whether proactive aggregation
+  prevents first-reader latency spikes.
+- Add a DDL/rename-style negative control. Operations that change schema,
+  relation identity, or route contract shape must force a synchronous barrier
+  instead of taking the delayed metadata path.
