@@ -1530,9 +1530,9 @@ Append new candidates here as each paper is processed.
   Why: Pasha cites this CXL data-management work; relevant to deciding when
   CXL/shared-memory tiers help cross-partition joins versus GPU or CPU
   partition-local execution.
-- `queued` — **Handling Highly Contended OLTP Workloads Using Fast Dynamic
+- `reviewed` — **Handling Highly Contended OLTP Workloads Using Fast Dynamic
   Partitioning**, Prasaad, Cheung, and Suciu, SIGMOD 2020.
-  URL: `https://doi.org/10.1145/3318464.3389708`
+  URL: `https://doi.org/10.1145/3318464.3389764`
   Why: Strife is a key partitioner baseline used by the runtime-conflict
   scheduler; useful for hot-key partitioning, residual transaction handling,
   and contention-aware owner assignment.
@@ -2861,3 +2861,10 @@ Append new candidates here as each paper is processed.
   useful for comparing network-scale partitioned joins with intra-node
   multi-GPU sort-merge, P2P interconnect use, out-of-core joins, and transfer
   scheduling.
+- `queued` — **Adaptive Concurrency Control: Despite the Looking Glass, One
+  Concurrency Control Does Not Fit All**, Tang, Jiang, and Elmore, CIDR 2017.
+  URL: `http://cidrdb.org/cidr2017/papers/p63-tang-cidr17.pdf`
+  Why: Strife contrasts with adaptive per-cluster concurrency-control
+  selection; useful for deciding whether GPU DB hot partitions should switch
+  among owner-serialized, optimistic, lock-like, or GPU-batched routes based on
+  measured conflict shape instead of one global write-path policy.

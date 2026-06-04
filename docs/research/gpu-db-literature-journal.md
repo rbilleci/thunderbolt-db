@@ -33708,3 +33708,167 @@ NVMe/GDS tiering.
   session admission model. Expected improvement: hot conflict shards produce
   explicit overload or retry reasons while unrelated read-only retained routes
   continue to execute.
+
+### 2026-06-04 - Strife turns high-contention OLTP into batch-local owner lanes
+
+**Citation:** Guna Prasaad, Alvin Cheung, and Dan Suciu. "Handling Highly
+Contended OLTP Workloads Using Fast Dynamic Partitioning." SIGMOD 2020:
+527-542. Retrieved 2026-06-04 from the author-hosted PDF,
+`https://homes.cs.washington.edu/~suciu/guna-sigmod-2020-pdfa.pdf`; DOI
+`https://doi.org/10.1145/3318464.3389764`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale.
+
+**Relevance tags:** high-contention OLTP; dynamic partitioning; batched
+transaction execution; hot-key detection; conflict-free clusters; residual
+transactions; union-find clustering; owner-lane assignment; admission by
+conflict shape.
+
+**Core idea:** Strife observes that static partitioning works well only when the
+workload's conflict shape is stable and naturally partitionable. For
+time-varying or skewed OLTP workloads, the paper instead forms a batch of
+transactions, clusters the batch by the data items it actually touches, executes
+conflict-free clusters serially on separate cores without concurrency control,
+and sends only the residual cross-cluster transactions through a conventional
+concurrency-control path.
+
+The key transfer is the batch-local split between "safe to serialize inside an
+owner lane" and "must go through the general conflict path." Strife reports up
+to 2x throughput over lock-based and optimistic protocols on high-contention
+workloads, about 50% overhead versus ideal static partitioning when the static
+partition is already perfect, and better behavior when no static partition fits
+or hot items move. The exact constants are CPU/prototype specific; the design
+signal is that contention can be discovered and routed per batch rather than
+handled by one global protocol.
+
+**Concrete mechanisms:**
+
+- Represent a batch as a data-access graph over transactions and updated data
+  items. Read-only items are ignored for clustering because they do not require
+  write conflict coordination.
+- Partition each batch into conflict-free clusters plus a residual set bounded
+  by a tunable fraction `alpha`. Transactions in different conflict-free
+  clusters do not conflict; residuals may conflict with multiple clusters.
+- Execute conflict-free clusters through a shared worklist. A core drains one
+  cluster serially with no locks or OCC validation, then takes another cluster.
+- Execute residual transactions only after the conflict-free phase, using
+  two-phase locking with no-wait deadlock avoidance in the prototype.
+- Use a five-step clustering algorithm: prepare access metadata, sample
+  transactions to spot hot records as special clusters, fuse ordinary
+  transaction-connected items unless that would merge two special clusters,
+  merge special clusters only when doing so reduces residuals enough, and then
+  allocate each transaction to one cluster or residuals.
+- Maintain clusters with union-find. The paper's runtime model is
+  `O(|B| / n + k^2)`, where `n` is core count and `k` is the number of sample
+  trials, usually a small multiple of cores.
+- Keep load balance separate from cluster discovery by storing conflict-free
+  queues in a concurrent worklist rather than solving a precise bin-packing
+  problem for transaction execution cost.
+- When read/write sets are not known ahead of time, use a reconnaissance query
+  to collect them before clustering. The paper reports this added at most 9%
+  overhead in its full TPC-C payment variant.
+- Evaluate on TPC-C, YCSB, and a hot-record microbenchmark with a default batch
+  size of 10K transactions. The paper reports sub-5ms latency at that batch
+  size in its setup and near-linear analysis scaling within one NUMA socket.
+
+**GPU DB mapping:** Strife is a useful CPU-side design for GPU DB's write
+admission layer. Before sending every conflicting write through one mutation
+owner, the runtime can batch short transactions or COPY/update envelopes, build
+compact touched-partition or touched-key descriptors, and classify them into
+batch-local owner lanes. One lane can serialize hot-key work cheaply, several
+lanes can run in parallel when conflict-free, and only residual transactions
+need the full validation or retry path.
+
+This maps directly to the existing owner model. A conflict/visibility owner can
+publish a batch plan: cluster id, partition ids, source snapshot generation,
+WAL reservation handle, and residual reason. The mutation owner then preserves
+WAL-before-visibility inside each lane, while session admission can expose
+whether a request is waiting on hot-lane serialization, residual validation, WAL
+fsync, or CPU/GPU refresh. That is more actionable than a single write queue
+depth.
+
+For GPU execution, the main lesson is not to run arbitrary OLTP transactions on
+the device immediately. It is to feed the GPU only same-shape, conflict-scoped
+work whose visibility boundary is explicit. If a batch contains many
+same-template updates on disjoint clusters, the CPU can plan lanes and WAL
+order, while GPU kernels accelerate compatible validation, predicate/key
+classification, or bulk derived-layout refresh. Residuals should remain on the
+CPU path until the system can prove deterministic visibility and replay.
+
+For 1M logical sessions, Strife also suggests admission by active conflict
+shape rather than connection count. Millions of idle or read-only sessions are
+not the issue; the issue is how many hot clusters, residuals, pinned snapshots,
+and WAL reservations are live. A session burst that maps to one hot key should
+be serialized or rejected at that lane, while independent clusters continue.
+
+**Risks and mismatches:** Strife is a CPU in-memory OLTP prototype, not a GPU
+database, MVCC storage engine, or distributed WAL protocol. It assumes useful
+read/write-set knowledge or a reconnaissance pass; arbitrary SQL predicates,
+secondary indexes, range conflicts, triggers, and DDL barriers are harder than
+tuple-level keys. The batch phase boundary also creates a latency/throughput
+tradeoff that must be bounded tightly for interactive pgwire traffic.
+
+The paper's conflict-free phase waits before residual execution because
+residuals may conflict with clusters. GPU DB must be careful not to let that
+barrier stall read-only retained routes, residency refresh, or unrelated table
+owners. Strife executes clusters without concurrency control because it proves
+they do not cross-conflict in the batch; copying that idea without exact
+partition/key descriptors would break serializability. Its no-wait 2PL residual
+path is also just one implementation choice, not a requirement.
+
+**Benchmark candidates:**
+
+- Add a write-admission simulator that groups transactions by touched
+  table/partition/key descriptors into conflict-free lanes plus residuals.
+  Compare global mutation owner, hash partition owners, and Strife-like
+  batch-local lanes under moving hot-key workloads.
+- Measure batch-size tradeoffs for writes: 128, 512, 1K, 5K, and 10K command
+  envelopes. Gate: p99 commit latency stays within the chosen service target
+  while throughput improves over immediate serialized validation.
+- Add telemetry counters for `conflict_cluster_count`, `residual_count`,
+  `largest_cluster_len`, `cluster_skew`, `residual_reason`, and
+  `classification_us`. Failure condition: classification cost is hidden inside
+  generic queue wait.
+- Prototype a conservative same-template path where INSERT/UPDATE batches with
+  explicit primary keys are lane-planned before WAL reservation. Proof gate:
+  replay produces the same visibility order as the serialized owner path.
+- Test CPU-only versus GPU-assisted classification for large COPY/update
+  batches. Expected win only when descriptor construction is already dense and
+  transfer/setup costs are amortized; failure condition is worse p50 latency for
+  small batches.
+- Add a retained-read coexistence benchmark: hot write clusters run while
+  read-only snapshot routes continue. Gate: residual barriers do not block
+  unrelated retained reads or serve stale resident generations.
+
+### 2026-06-04 - Cross-paper synthesis: conflict shape should drive routing, not just protocol choice
+
+The last four reviewed modern papers converge on a useful split for GPU DB.
+Distributed GPU joins point toward accelerator throughput from large,
+shape-compatible batches; Spooky argues that maintenance and refresh should use
+stable boundary groups; CCaaS separates conflict resolution from execution and
+storage; Strife shows that high-contention OLTP can be made more predictable
+when each batch exposes its actual conflict graph.
+
+The shared design track is **typed route planning before expensive execution**.
+A request should not enter a generic owner queue with only SQL text and a
+session id. It should acquire or derive compact descriptors: route shape,
+snapshot/visibility boundary, touched partitions or keys, scratch and residency
+needs, WAL reservation class, and fallback or residual reason. Those
+descriptors let the runtime choose between retained read snapshots, owner-local
+serialization, conflict-free write lanes, residual validation, GPU batch
+execution, or CPU fallback.
+
+For P8, boundary identity now matters in three places: cold-tier maintenance
+groups, retained resident refresh groups, and transaction conflict clusters. If
+these use unrelated boundaries, the system will repeatedly classify, move, and
+invalidate edge data. A strong next benchmark track is to give route descriptors
+a stable `boundary_id` and measure whether reads, writes, refresh, and
+compaction can share it without making groups too coarse.
+
+The main gap remains serializable SQL detail. The papers give strong mechanisms
+for batches, conflict ownership, and placement, but GPU DB still needs explicit
+proof gates for predicate/range conflicts, secondary-index maintenance,
+MVCC-version retirement, DDL invalidation, and crash replay. Benchmark priority
+should therefore favor CPU-first correctness simulators with GPU hooks, not a
+premature device-only OLTP route.
