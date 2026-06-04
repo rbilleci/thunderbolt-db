@@ -43685,3 +43685,190 @@ next batch.
   certificates under mixed inserts, retained point reads, and GPU refresh.
 - Measure whether structured result descriptors reduce protocol CPU before
   adding any specialized NIC/RDMA path.
+
+### 2026-06-04 - Modern NVMe makes cold-tier I/O a hot-path scheduling problem
+
+**Citation:** Gabriel Haas and Viktor Leis. "What Modern NVMe Storage Can Do,
+And How To Exploit It: High-Performance I/O for High-Performance Storage
+Engines." PVLDB 16(9), 2023. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`.
+
+**Category:** multi-tier cache / data placement; runtime / HFT / session
+scale; transaction processing / write path.
+
+**Relevance tags:** NVMe arrays; cold-tier placement; 4 KB pages; asynchronous
+I/O; io_uring; SPDK; cooperative multitasking; lightweight tasks; buffer pool;
+page eviction; I/O queue depth; worker-owned polling; CPU-cycle budget;
+out-of-memory OLTP; TPC-C.
+
+**Core idea:** The paper argues that modern NVMe arrays are no longer a slow
+background storage tier. Eight commodity PCIe 4.0 drives can deliver around
+12.5M random 4 KB read IOPS, but conventional out-of-memory DBMS designs waste
+most of that capacity on blocking I/O, oversized pages, kernel overhead,
+centralized I/O metadata, background-thread tuning, and buffer-management hot
+spots.
+
+The storage-engine lesson for GPU DB is that an NVMe cold tier cannot be a
+passive fallback below GPU and host memory. If cold reads, WAL replay, refresh
+builds, or over-resident partition fetches become frequent, the tier needs the
+same ownership discipline as GPU streams and response rings: bounded
+outstanding work, explicit queue-depth telemetry, worker-integrated polling,
+cache/eviction work in the scheduling loop, and route decisions that price CPU
+cycles as carefully as bytes.
+
+**Concrete mechanisms:**
+
+- The paper's hardware study on a 64-core AMD server with eight Samsung PM1733
+  SSDs finds near-linear drive scaling to 12.5M random 4 KB read IOPS. Mixed
+  read/write throughput is lower but still high: the paper reports about 8.9M
+  IOPS at 10% writes and 7.0M IOPS at 25% writes in its setup.
+- It identifies 4 KB pages as the best flash page-size tradeoff for random
+  IOPS, bandwidth, latency, and I/O amplification on the tested enterprise SSDs.
+  Smaller 512-byte requests hurt performance; larger pages increase
+  amplification and latency.
+- Saturating the eight-drive array requires very high outstanding concurrency.
+  The paper reports that roughly 1000 outstanding I/Os are needed for decent
+  performance and around 3000 to fully saturate the system.
+- At 12M IOPS on a 64-core 2.5 GHz CPU, the rough CPU budget is only about
+  13k cycles per I/O before all database work is counted. With kernel I/O
+  interfaces, the paper estimates that about half the cores can be consumed by
+  I/O submission and completion handling, leaving a much smaller DBMS budget.
+- The design replaces thread-per-query blocking I/O with DBMS-managed
+  cooperative tasks implemented with Boost context. User tasks yield on page
+  faults, free-page pressure, completion wait, or latch wait; task switching is
+  reported around tens of cycles rather than kernel-context-switch scale.
+- Worker threads run a symmetric loop that handles user tasks, I/O submission,
+  I/O polling, and page eviction. Background page-provider and dedicated I/O
+  threads are avoided because their ideal count is workload dependent and they
+  consume cores that could otherwise process foreground work.
+- Page eviction is treated as hot-path work. The paper removes central locks,
+  partitions I/O and replacement metadata by page id, shortens critical
+  sections, removes hot-path allocations, and adds optimistic parent pointers to
+  reduce repeated B-tree parent searches during high eviction rates.
+- The I/O backend exposes libaio, io_uring, and SPDK behind a uniform
+  asynchronous abstraction and implements a DBMS-owned RAID0-like striping
+  layer instead of relying on Linux md RAID.
+- The paper compares dedicated I/O threads, SSD assignment, and an all-to-all
+  model where every worker has an I/O channel to all SSDs. It chooses all-to-all
+  because it avoids cross-thread message passing while still matching assigned
+  SSD performance in microbenchmarks.
+- SPDK reaches full read bandwidth with far fewer CPU cores in the paper's
+  microbenchmarks, and SPDK I/O submission accounts for about 2% of CPU time in
+  an out-of-memory TPC-C setting versus roughly 16-19% for tested kernel paths.
+  The paper also notes important deployment costs: SPDK requires polling, root
+  or special setup, and exclusive device access.
+- io_uring with I/O polling can approach full bandwidth in the evaluated
+  system, especially with enough cores, but SQPOLL-style dedicated kernel
+  workers did not improve efficiency in the paper's LeanStore experiments.
+- Evaluation reports LeanStore with the full design reaching about 13.2M random
+  lookups/s in a 160 GB database with a 16 GB buffer pool and more than 1M
+  TPC-C transactions/s for a 4 TB dataset with a 400 GB buffer pool. With a
+  20 TB dataset, it still reports about 0.4M transactions/s.
+- The authors explicitly disable logging and use the weakest available
+  isolation levels for system-comparison experiments to focus on I/O handling.
+  Therefore, the absolute TPC-C numbers are not directly transferable to a
+  WAL-before-visibility SQL engine.
+
+**GPU DB mapping:** P8 currently treats WAL/checkpoint/archive plus CPU state
+as durable truth and GPU memory as an explicit performance cache. This paper
+adds a sharper constraint: the NVMe tier is fast enough that CPU overhead, not
+device bandwidth, can dominate. A GPU DB cold-tier route must therefore expose
+I/O submission cost, completion-poll cost, eviction cost, and outstanding-depth
+requirements just like GPU routes expose launch count, transfer bytes, and queue
+wait.
+
+For over-resident execution, 4 KB becomes the first serious page-size baseline
+for cold partition fetches and host cache refills. Larger CPU or column-group
+blocks may still be better for sequential scans, compression, and GPU transfer,
+but point lookup, WAL replay, and small refresh deltas need a measured
+amplification budget. The route certificate should include physical page or
+segment size and expected I/O count rather than only resident/not-resident.
+
+The worker-integrated model maps cleanly to the high-throughput runtime's owner
+domains. Instead of adding one opaque "storage thread pool," GPU DB should test
+whether network/read/refresh workers can own I/O channels or bounded request
+rings and perform polling/eviction as part of their normal queue-drain loop.
+Dedicated storage workers remain possible, but the benchmark should charge the
+message-passing, core-reservation, and queue-hop costs explicitly.
+
+The cooperative-task idea also matters for 1M logical sessions. Most sessions
+cannot own OS threads, and cold-tier misses must not block network workers or
+GPU execution owners. A retained read that faults to NVMe should become a
+suspended request with an explicit completion callback, queue position, and
+deadline/fallback policy.
+
+For write throughput, the paper's read/write asymmetry is a warning. Dirty-page
+eviction, WAL writes, refresh rebuild reads, and foreground cold reads can
+interfere at the NVMe queue. GPU DB admission should distinguish read IOPS,
+write IOPS, mixed bandwidth, and write-induced tail latency rather than using a
+single cold-tier capacity number.
+
+The DBMS-owned RAID0-like striping result suggests that cold-tier placement
+should initially be engine-visible even if implemented over ordinary files or
+io_uring. Logical partitions, WAL lanes, and resident-refresh segments need a
+placement map that can later map to multiple NVMe devices, not a hidden file
+path that the planner cannot price.
+
+**Risks and mismatches:** The evaluated LeanStore path disables logging and
+weakens isolation in some comparisons, so its million-TPC-C result does not
+include the full correctness surface GPU DB requires. WAL-before-visibility,
+MVCC validation, snapshot retention, GPU invalidation, SQL result encoding, and
+pgwire backpressure all consume cycles from the same budget.
+
+LeanStore is a B-tree storage engine, not a GPU execution engine. GPU DB may
+prefer column-group or compressed segment layouts for resident execution, so
+4 KB pages should be treated as a cold I/O and point-lookup baseline, not a
+universal physical layout.
+
+SPDK's efficiency is attractive but operationally expensive. Exclusive device
+access, polling cores, deployment permissions, and integration with WAL,
+checkpoints, and host filesystems may be mismatched for early GPU DB. io_uring
+with polling is the more realistic first experiment unless benchmark evidence
+shows the CPU budget is already exhausted.
+
+The all-to-all model avoids message passing, but it gives every worker access
+to every SSD. GPU DB must still preserve owner-domain invariants: a worker may
+submit I/O for immutable pages or its owned partition, but mutation visibility,
+WAL ordering, and resident snapshot publication cannot become multi-writer side
+effects.
+
+Finally, very high outstanding I/O depth can hurt latency and foreground
+fairness. The paper optimizes throughput-heavy out-of-memory workloads; GPU DB
+also needs p50/p99 latency under mixed retained reads, writes, refresh, and
+session admission.
+
+**Benchmark candidates:**
+
+- Add an NVMe cold-tier simulator or real-io benchmark mode with 4 KB, 16 KB,
+  and 64 KB page/segment fetches. Measure IOPS, bandwidth, read amplification,
+  CPU cycles per I/O, p50/p99 latency, and effect on retained-read throughput.
+  Proof gate: route costing can explain when 4 KB wins over larger transfer
+  units and when GPU-friendly batching reverses the result.
+- Compare three cold-tier execution models: dedicated I/O workers, partition or
+  SSD-assigned workers, and all-to-all worker-owned I/O channels. Required
+  metrics: queue hops, cores consumed, outstanding I/O depth, cache misses
+  resolved per second, foreground p99, and stale-route rejection correctness.
+- Build a suspended-request path for retained reads that miss host/GPU memory:
+  request enters a bounded cold-I/O state, yields its active worker slot, and
+  resumes after completion or deadline. Failure condition: logical session
+  scale improves only by hiding unbounded memory or queue growth.
+- Add cold-tier interference telemetry: read IOPS, write IOPS, outstanding
+  reads, outstanding writes, WAL fsync/append latency, refresh fetch latency,
+  and dirty-eviction backlog. Use it to decide whether writes, refresh, or reads
+  should be delayed before p99 latency collapses.
+- Benchmark io_uring with and without I/O polling before SPDK. Compare CPU
+  cycles per I/O, setup complexity, latency, and throughput under the same
+  WAL/visibility-correct workload. Pass condition: any kernel-bypass plan must
+  beat io_uring by enough to justify exclusive-device and polling-core costs.
+- Add route-certificate fields for cold-tier layout: device or stripe group,
+  page/segment size, source generation, expected I/O count, read/write class,
+  and maximum allowed queue wait. Reads must prove that cold data fetched into
+  GPU or host memory still matches the requested visibility boundary.
+- Run an over-resident refresh benchmark where GPU-resident snapshots are
+  rebuilt from NVMe while foreground retained point reads continue. Measure
+  refresh throughput, foreground p99, route fallback rate, and GPU publication
+  lag under bounded outstanding I/O.
+- Compare one global cold-tier queue with per-partition or per-lane queues.
+  Required result: the chosen shape preserves WAL ordering and publication
+  boundaries while preventing one hot partition or refresh stream from starving
+  unrelated point reads.

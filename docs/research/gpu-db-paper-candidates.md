@@ -631,7 +631,7 @@ Append new candidates here as each paper is processed.
   Why: command-log recovery with static and dynamic dependency analysis;
   useful for GPU DB WAL replay, checkpoint rebuild, and post-crash CPU/GPU
   cache warmup design.
-- `queued` — **What Modern NVMe Storage Can Do, And How To Exploit It:
+- `reviewed` — **What Modern NVMe Storage Can Do, And How To Exploit It:
   High-Performance I/O for High-Performance Storage Engines**, Haas and Leis,
   PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`
@@ -3579,3 +3579,23 @@ Append new candidates here as each paper is processed.
   Why: BinDex cites this as the selectivity/concurrency access-path motivation;
   useful for turning resident scan, predicate-index, and CPU fallback choices
   into a measured planner route boundary instead of a fixed threshold.
+- `queued` — **PA-Tree: Polled-Mode Asynchronous B+ Tree for NVMe**, Wang,
+  Zhang, He, and Zhang, ICDE 2020.
+  URL: `https://doi.org/10.1109/ICDE48307.2020.00055`
+  Why: Haas and Leis contrast PA-Tree's SPDK/polled-mode B+-tree design with
+  a full storage-engine path; useful for isolating whether GPU DB cold-tier
+  point lookup benefits come from polling alone or from worker-integrated
+  eviction, task scheduling, and partitioned I/O metadata.
+- `queued` — **Append is Near: Log-based Data Management on ZNS SSDs**,
+  Purandare, Wilcox, Litz, and Finkelstein, CIDR 2022.
+  URL: `https://www.cidrdb.org/cidr2022/papers/p28-purandare.pdf`
+  Why: Haas and Leis identify specialized SSD interfaces as a related path;
+  useful for comparing conventional NVMe page ownership with zone-append
+  layouts for WAL, cold partitions, and write-amplification control.
+- `queued` — **Better database cost/performance via batched I/O on
+  programmable SSD**, Do, Picoli, Lomet, and Bonnet, VLDB Journal 2021.
+  URL: `https://doi.org/10.1007/s00778-020-00643-2`
+  Why: Haas and Leis cite database/storage-device co-design; useful as a
+  counterpoint to host-owned SPDK/io_uring paths when evaluating whether GPU DB
+  should keep cold-tier batching in the engine or eventually use near-storage
+  offload for log, scan, or filter work.
