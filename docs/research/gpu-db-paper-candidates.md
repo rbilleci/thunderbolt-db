@@ -3803,8 +3803,8 @@ Append new candidates here as each paper is processed.
   Why: modern empirical CXL-memory placement study for a commercial in-memory
   DBMS; selected because the recent synthesis called for more tier and
   placement work after several transaction-publication reviews.
-- `queued` — **CXL Memory Performance for In-Memory Data Processing**,
-  Weisgut, Benson, Rabl, and Boissier, PVLDB 2025.
+- `reviewed` — **CXL Memory Performance for In-Memory Data Processing**,
+  Weisgut, Ritter, Tozun, Benson, and Rabl, PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p3119-weisgut.pdf`
   Why: newer CXL memory benchmark paper for in-memory data processing; useful
   follow-up for separating raw CXL latency/bandwidth effects from
@@ -3821,3 +3821,19 @@ Append new candidates here as each paper is processed.
   URL: `https://arxiv.org/abs/2403.18702`
   Why: CXL-native tiering design; useful for contrasting OS/hardware-managed
   placement with GPU DB's explicit object-family placement and route telemetry.
+- `queued` — **Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its
+  Reliability on High Latency Memory**, Mahling, Weisgut, and Rabl, DaMoN 2025.
+  URL: `https://doi.org/10.1145/3736227.3736231`
+  PDF:
+  `https://hpi.de/oldsite/fileadmin/user_upload/fachgebiete/rabl/publications/2025/Mahling-DaMoN25-Prefetching.pdf`
+  Why: CXL Memory Performance points to software prefetching for random
+  high-latency memory accesses; useful for deciding whether cold host indexes,
+  far-memory B+trees, and route metadata can hide CXL/future-tier latency.
+- `queued` — **Databases in the Era of Memory-Centric Computing**, Chronis
+  et al., CIDR 2025.
+  URL:
+  `https://www.vldb.org/cidrdb/2025/databases-in-the-era-of-memory-centric-computing.html`
+  PDF: `https://www.vldb.org/cidrdb/papers/2025/p6-chronis.pdf`
+  Why: CXL Memory Performance cites memory-centric database designs as a
+  broader architectural direction; useful for comparing GPU DB's explicit
+  owner/tier model with memory-centric pooled designs and database operators.

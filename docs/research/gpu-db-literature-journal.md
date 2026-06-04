@@ -46279,3 +46279,171 @@ not only contiguous record identifiers.
 - Add skew-aware queue splitting benchmarks for hot integer keys and
   text-prefix ranges. Track whether queue splits reduce contention
   without increasing cache misses or planning overhead.
+
+### 2026-06-04 - CXL memory needs workload-shaped placement, not capacity-only tiering
+
+**Citation:** Marcel Weisgut, Daniel Ritter, Pinar Tozun, Lawrence
+Benson, and Tilmann Rabl. "CXL Memory Performance for In-Memory
+Data Processing." PVLDB 18(9):3119-3133, 2025.
+doi:10.14778/3746405.3746432. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol18/p3119-weisgut.pdf`.
+
+**Category:** multi-tier cache / data placement; runtime / storage
+tiering.
+
+**Relevance tags:** CXL memory; tier-aware placement; column
+placement; page interleaving; access-frequency counters; B+tree node
+sizing; random-read latency; bandwidth-bound scans; write placement;
+future memory tiers; route telemetry.
+
+**Core idea:** The paper evaluates real CXL memory expansion devices
+for database-style memory access, vectorized scans, B+tree operations,
+and an in-memory TPC-H workload. Its main lesson is that CXL memory
+should not be treated as a generic slower DRAM pool. The right
+placement depends on access pattern, write intensity, bandwidth
+pressure, latency pressure, and data-structure shape.
+
+Sequential and bandwidth-bound work can use CXL memory well,
+especially when pages are interleaved across multiple devices. Random
+reads and frequently written data structures pay much more for CXL
+latency and lower write throughput. In the Hyrise TPC-H experiment,
+placing the 16 most frequently accessed columns in CPU memory and the
+rest in CXL memory stores about 77% of encoded table data in CXL while
+retaining 94% of local-memory throughput. The abstract also frames
+this as storing over 80% of table data in CXL with 85% of local-only
+performance under access-frequency placement.
+
+**Concrete mechanisms:**
+
+- CXL memory is exposed as memory-only NUMA nodes. The benchmark uses
+  `mbind` and interleaved allocation to pin pages to CPU or CXL nodes.
+- CXL-Bench measures sequential and random reads/writes across CPU
+  memory and up to four CXL devices. With one CXL device, sequential
+  reads reach roughly 40 GB/s and writes are materially lower; random
+  access is more latency-sensitive.
+- Round-robin interleaving across multiple CXL devices expands
+  bandwidth. For sequential 4 KiB reads with 24 threads, two, three,
+  and four devices reach 1.9x, 2.3x, and 2.5x the throughput of one
+  device. Sequential 4 KiB writes reach 2x, 3x, and 3.7x.
+- Latency measurements show random CXL reads are the worst case. The
+  paper reports average CXL random-read latency around 520 ns and CXL
+  write latency around 350 ns, while sequential reads average about
+  65 ns because hardware prefetching can hide much of the distance.
+- The scan benchmark separates read placement from write placement:
+  columns can be read from CXL while tuple-id output lists are written
+  to CPU memory. For a 100%-selectivity scan on one CXL device, moving
+  TID writes back to CPU memory improves throughput from about
+  10 GB/s to about 40 GB/s.
+- With four CXL devices, low-selectivity sequential scans over CXL
+  columns reach about 92 GB/s, close to the paper's microbenchmark
+  maximum for four devices. High-selectivity scans improve when read
+  columns are in CXL but writes stay CPU-local.
+- Hybrid column placement uses Hyrise access counters. The system
+  counts segment accesses by pattern, sums accesses per column, places
+  the most frequently accessed columns in CPU memory, and places the
+  remaining columns in CXL memory.
+- In the TPC-H scale-factor-100 Hyrise experiment with 10 clients,
+  all-local memory reaches 38.5 queries/hour/client. All-CXL page
+  interleaving reaches about 71%-73% of baseline, and adding more CXL
+  devices does not materially help because the workload is mainly
+  latency-bound. Access-frequency column placement performs much
+  better: the top 16 columns in CPU memory and the rest in CXL memory
+  reach 94% of baseline.
+- The BTreeOLC experiments show that tree shape matters. With 48
+  threads and 1024-byte nodes, all-CXL read-heavy throughput is 38%
+  of CPU baseline on one device and 40% on four devices. Write-heavy
+  throughput is 25% on one CXL device and 39% on four devices.
+- B+tree node size shifts the bottleneck. The best node size differs
+  for CPU memory, one CXL device, and four CXL devices; for the
+  write-heavy workload, four CXL devices improve throughput by 3.2x
+  over one device with 4 KiB nodes.
+- The authors use top-down microarchitecture analysis to distinguish
+  latency-bound and bandwidth-bound behavior. Interleaving across more
+  CXL devices helps when the workload is bandwidth-bound; it does not
+  fix latency-bound random access by itself.
+
+**GPU DB mapping:** This strengthens the P8 tiering model: future
+CXL or far-memory tiers should be placed by object behavior, not by
+simple free-capacity pressure. GPU DB should classify each resident,
+host, CXL, and NVMe object by access pattern: sequential scan column,
+random index node, write-heavy mutation metadata, TID/result buffer,
+join/hash state, cold segment, retained snapshot column, or refresh
+scratch. A tier decision should carry that class in the route
+certificate.
+
+For retained GPU routes, the closest analog is column placement.
+Frequently accessed route-critical columns, indexes, visibility
+summaries, and response-scatter metadata should stay in CPU-local
+DRAM or GPU HBM. Warm sequential columns and cold snapshot segments
+can move to CXL-like tiers if the route can prefetch, stream, or
+batch them. TID/result buffers, WAL staging, MVCC write metadata, and
+invalidation queues should not be casually placed in higher-latency
+memory because writes and random probes dominate those paths.
+
+The scan result maps directly to GPU DB's output-buffer design. It
+may be acceptable to read warm columns or compressed segments from a
+CXL/far-memory tier, but result vectors, response buffers, and
+per-request scatter state should remain in a fast write tier unless a
+benchmark proves otherwise. This is especially important for
+high-selectivity retained scans, where output writes can dominate the
+read path.
+
+For host indexes and future cold-tier indexes, the B+tree result says
+that tiering is also a physical-design problem. If an index moves to
+CXL or another far-memory tier, node size, prefetch policy, and
+interleaving strategy may need to change. GPU DB should avoid one
+global B+tree or bitmap shape assumption across CPU DRAM, CXL memory,
+and NVMe-backed tiers.
+
+For 1M logical sessions, the paper is a placement warning for
+per-session and per-route state. Idle logical-session state might be
+eligible for colder memory, but active credits, queue slots, response
+handles, prepared route descriptors, and owner-ring metadata are
+randomly touched and latency-sensitive. Capacity expansion should not
+move those objects out of CPU-local memory without a measured
+latency budget.
+
+**Risks and mismatches:** The evaluated CXL devices are FPGA-based
+prototypes, not necessarily the exact production CXL hardware GPU DB
+would use. Absolute throughput and latency numbers should be treated
+as hardware-specific. The end-to-end DBMS workload is analytical
+TPC-H in Hyrise, not OLTP-heavy SQL with WAL, pgwire sessions, GPU
+kernels, MVCC validation, and resident invalidation.
+
+The paper studies CPU access to CXL Type 3 memory, not GPU access to
+CXL memory or a CUDA path. GPU DB still needs separate measurements
+for GPU HBM, pinned host memory, CXL-attached host memory, NVMe, and
+any GPU-direct or CXL Type 2 device path. It also does not solve
+placement policy automatically; access-frequency columns are a useful
+baseline, but mutation rate, freshness, queue wait, and estimator
+uncertainty also matter.
+
+**Benchmark candidates:**
+
+- Add an object-family tier-placement benchmark: CPU-local DRAM,
+  simulated far memory, and future CXL if available. Object families:
+  session state, owner-ring entries, response buffers, visibility
+  summaries, retained columns, text bytes, key vectors, and result
+  scatter buffers. Failure condition: capacity wins hide p99 latency
+  regressions for random or write-heavy objects.
+- Build a retained-scan placement experiment that reads selected
+  columns from a slower host tier but writes TID/result vectors to
+  fast CPU memory. Expected result: high-selectivity output-heavy
+  scans should be limited by write placement, not only read placement.
+- Add route-certificate fields for access pattern and tier:
+  sequential, random, point, monotonic, write-heavy, output-heavy,
+  CPU-local, GPU-HBM, host-warm, CXL/far, NVMe/cold, and prefetchable.
+- Prototype access-frequency placement at column or resident-segment
+  granularity. Compare frequency-only, frequency-plus-mutation-rate,
+  and route-critical-column policies under retained lookup, aggregate,
+  and refresh workloads.
+- For CPU host indexes, benchmark node or block sizes separately for
+  CPU-local and far-memory tiers. Proof gate: a cold-tier index shape
+  must beat CPU fallback or a sequential scan on both throughput and
+  p99 latency for its admitted route.
+- Add a per-session memory placement probe: idle session records in
+  a cold tier, active credits and response handles in CPU-local DRAM.
+  Measure memory per 1M logical sessions and activation latency.
+- Test interleaving-style striping for warm sequential host columns
+  and reject it for random metadata unless measured top-down counters
+  show the workload is bandwidth-bound rather than latency-bound.
