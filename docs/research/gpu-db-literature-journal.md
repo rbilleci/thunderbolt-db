@@ -46985,3 +46985,216 @@ cheap to ship may still trigger expensive resident refresh debt.
   to choose "latest committed CPU", "latest resident generation", or
   "bounded-staleness resident generation" and measure throughput,
   latency, and correctness rejection behavior.
+
+### 2026-06-04 - T-Part partitions transactions, then pushes writes forward
+
+**Citation:** Shan-Hung Wu, Tsai-Yu Feng, Meng-Kai Liao, Shao-Kan
+Pi, and Yu-Shan Lin. "T-Part: Partitioning of Transactions for
+Forward-Pushing in Deterministic Database Systems." SIGMOD 2016,
+pp. 1553-1565. doi:10.1145/2882903.2915227. Retrieved 2026-06-04
+from the author page PDF, `https://www.slmt.tw/papers/tpart.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT /
+session scale.
+
+**Relevance tags:** deterministic transaction processing; dependency
+graphs; transaction partitioning; forward-pushed writes; active-window
+scheduling; remote-read stalls; owner placement; hot-key batches; route
+certificates.
+
+**Core idea:** T-Part targets deterministic OLTP systems where all
+replicas execute the same transaction order, but poor data partitioning
+causes distributed transactions to stall while machines wait for remote
+records. Instead of repartitioning the database itself, T-Part looks at
+pending ordered transactions, builds a transaction-dependency graph, and
+partitions transactions over executors. Each transaction is assigned to
+one executor, and writes that will be read by later transactions on
+other executors are pushed forward immediately after the producing
+transaction commits.
+
+The strongest transferable idea for GPU DB is that the active request
+window can decide where work should execute and which values should be
+pre-positioned before future requests stall. This complements the recent
+QueCC/Q-Store/ORTHRUS/Strife thread: the route certificate should not
+only say "this request touches owner X"; it should also describe
+near-future dependencies, forwardable produced values, remote-read risk,
+and when a pre-positioned value becomes safe to consume.
+
+**Concrete mechanisms:**
+
+- T-Part is layered on a Calvin-like deterministic architecture. A
+  sequencer gives every transaction a total-order position, schedulers
+  receive all transactions, and each scheduler routes only the relevant
+  partial work to its local executor.
+- The scheduler periodically groups ordered requests into batches so it
+  can analyze dependencies before executor dispatch. The paper notes
+  that individual arrivals can still be buffered briefly for dependency
+  analysis without changing the transaction footprint.
+- Read/write sets are assumed to be known before execution, as in
+  deterministic stored-procedure systems. The paper follows Calvin's
+  use of reconnaissance queries when needed to discover sets.
+- A T-graph contains transaction nodes, sink nodes for storage
+  partitions, forward-push edges for write-read conflicts, storage-access
+  edges, and later cache-access edges. A forward-push edge from `Ti` to
+  `Tj` means `Ti` writes an object that `Tj` will later read.
+- Sink nodes represent existing data partitions and carry the load of
+  transactions already sent to that executor. Transaction nodes and
+  edges carry weights; edge weights approximate synchronization cost.
+- Partitioning balances node/transaction weight across executors while
+  minimizing cross-partition edge weight. The authors emphasize that
+  T-Part tends to move transactions toward machines holding data they
+  will access, not move the underlying data partitions.
+- Because the graph partitioning has disconnected sink-node constraints,
+  the implementation adapts streaming graph partitioning with a
+  deterministic weighted-greedy algorithm. New transaction nodes are
+  assigned incrementally as they arrive, which avoids expensive global
+  repartitioning.
+- The paper reports that this real-time partitioning usually accounts
+  for less than 0.25% of transaction latency. In the shown comparison,
+  the streaming algorithm is much faster than a METIS-based approach on
+  100, 1K, and 10K transaction graphs while preserving comparable or
+  better cut/skew behavior.
+- Sinking fixes executor assignment for the earliest `sink size`
+  transactions and transforms relevant forward-push edges into cache
+  accesses. Different schedulers deterministically sink the same
+  ordered transactions so fully distributed schedulers can produce
+  consistent plans.
+- Executors maintain an in-memory key-value cache area above the storage
+  engine. Cache entries are keyed by object, source transaction, and
+  destination transaction for forward-pushed values, or by object and
+  sink number for values written back during sinking.
+- A transaction writes locally visible values into the cache, pushes
+  produced values to future readers on other executors after commit, and
+  writes back to storage only when the object will not be overwritten by
+  later transactions in the active graph.
+- T-Part does not use conservative 2PL for concurrency control. It uses
+  versioned cache entries and deterministic execution: a transaction
+  stalls until the specific cache version it needs is present, and a
+  transaction may write a cached value only when it knows it will
+  eventually commit.
+- Essential cache entries are invalidated once consumed so cache size
+  tracks the working set of transactions assigned to a machine. The
+  paper also introduces sticky cache entries for immediately-read-after-
+  write patterns so recent write-back values can be reused for a short
+  interval.
+- Aborts are handled by reading objects that the transaction writes and
+  forwarding those read values, not by forwarding commit/abort decisions
+  through the T-graph. Therefore an abort changes values but not the
+  graph shape.
+- Failure handling inherits deterministic-system recovery properties.
+  T-Part adds that write-back operations need UNDO logging, while normal
+  transactions do not need extra logs; each machine also needs a
+  PUSH-log for received pushed values so local replay can reconstruct
+  transaction execution.
+- Evaluation compares ElaSQL's default Calvin implementation with
+  Calvin plus T-Part. The authors use 46 Amazon EC2 C3.xlarge database
+  instances, 14 client instances, one Zab leader, and also a 20-machine
+  local cluster for partitioning comparisons.
+- On TPC-C NewOrder, Calvin and T-Part both scale to 30 machines, with
+  T-Part adding little overhead when data is easy to partition. On the
+  harder TPC-E workload, Calvin saturates after roughly four machines,
+  while T-Part continues scaling to about 22 machines.
+- In a TPC-E data-placement comparison, T-Part outperforms hash,
+  static graph partitioning, dynamic graph partitioning, and simulated
+  G-Store-style dynamic movement. The paper attributes the advantage to
+  optimizing transaction execution and data movement jointly.
+- Microbenchmarks show T-Part helps most when distributed-transaction
+  rate, remote-operation count, or workload skew is high. The paper
+  reports 60%-120% speedup when distributed-transaction rate or remote
+  operation count becomes significant, and a lower benefit when all
+  transactions are local or conflict rate is so high that the T-graph is
+  dense and hard to partition.
+
+**GPU DB mapping:** T-Part is a useful shape for GPU DB's prepared
+write and refresh lanes. The engine can maintain an active-window
+dependency graph over admitted stored procedures, prepared writes, COPY
+chunks, refresh tasks, and known-key updates. The scheduler can then
+choose executor/owner lanes that minimize remote owner waits and attach
+a forward plan for produced values, invalidation notices, and resident
+segment deltas needed by later work.
+
+For write throughput, this suggests a "forwarded write value" lane
+inside deterministic micro-batches. A producing mutation can publish to
+WAL and visibility in order, but also place certified values or delta
+handles into the destination owner/cache once the producing transaction
+commits. Later transactions should not pull from a generic owner or CPU
+storage path if their exact required version is already in the active
+window's cache.
+
+For read throughput and latency, the read-side analog is pre-positioned
+snapshot work. Same-generation retained reads, refresh consumers, or
+GPU lookup batches can carry explicit dependencies on earlier refresh or
+mutation results. Once a value or resident segment delta is safe, the
+response path should consume it from the local owner/GPU worker cache
+rather than stall on a remote owner hop.
+
+For 1M logical sessions, T-Part reinforces that session count should be
+decoupled from executor placement. Sessions enqueue compact requests;
+active windows are partitioned across owners by dependency shape; idle
+or waiting sessions do not own threads, locks, or cache entries. The
+active-window certificate should record request order, owner assignment,
+graph cut cost, sink batch, pushed-value dependencies, and fallback
+reason.
+
+T-Part also maps to P8 tier placement. The current P8 design treats GPU
+resident snapshots and CPU/NVMe segments as explicit tiers. A T-Part-like
+window can decide whether to move the transaction to the data, push the
+soon-needed value to the transaction owner, or leave the request on a
+generic residual path. That is a more precise rule than "refresh the
+whole table" or "route all hot writes through one mutation owner."
+
+**Risks and mismatches:** T-Part assumes deterministic stored-procedure
+transactions with known read/write sets and total ordering. That is not
+the default shape of ad hoc SQL, volatile functions, triggers, DDL, or
+planner-dependent index probes. GPU DB should use this only when a
+route certificate proves the footprint or after a safe reconnaissance
+pass.
+
+The system is distributed and Calvin-like, while GPU DB is currently a
+local engine with WAL/MVCC and GPU acceleration. T-Part's no-2PC and
+replica-determinism claims do not automatically solve WAL durability,
+MVCC visibility, serializable reads, resident invalidation, CUDA buffer
+ownership, or pgwire error recovery.
+
+Forward-pushed values are powerful but dangerous if they bypass commit
+rules. GPU DB must only expose a pushed value after the producing write
+has crossed the WAL-before-visibility boundary and any affected
+resident generation has been invalidated. A pushed value should be a
+certified version/delta handle, not an informal cache mutation.
+
+The paper also shows limits: low distributed access, fully local
+transactions, extremely dense conflict graphs, and poor sink-size/beta
+settings can erase the benefit. The active-window graph must therefore
+emit cut/skew/density telemetry and fall back early when scheduling cost
+or remote dependency density is too high.
+
+**Benchmark candidates:**
+
+- Build an active-window dependency-graph simulator for prepared writes:
+  compare owner FIFO, QueCC/Q-Store operation queues, Strife conflict
+  clusters, and T-Part-style transaction partitioning plus forward
+  pushed values. Measure throughput, owner waits, graph cut, skew,
+  cache hits, scheduling micros, and p50/p99/p999 latency.
+- Add route-certificate fields for transaction order, read/write-set
+  provenance, owner assignment, sink batch, graph cut/skew/density,
+  pushed-value source/destination, required version, and fallback reason.
+- Prototype a safe forwarded-value cache for one deterministic write
+  micro-batch. Proof gate: no consumer can read a pushed value before
+  WAL append/flush, visibility publication, and resident invalidation
+  for the producer have completed.
+- Test "move work to data" versus "push value to work" for hot-key
+  prepared updates and COPY chunks. Failure condition: remote owner
+  waits or cache-maintenance overhead exceed the generic mutation-owner
+  path.
+- Add a sink-size/beta sweep similar to T-Part for GPU DB windows:
+  16, 64, 256, and 1024 requests; beta values that trade off cut cost
+  versus owner load balance; dual-trigger latency ceilings. Reject
+  settings that improve throughput while damaging p99 visibility lag.
+- Extend refresh benchmarks with forward-pushed invalidation/delta
+  handles: a refresh or retained read should consume a certified delta
+  from the active window when possible, otherwise fall back to CPU truth
+  or full segment refresh.
+- Stress cases where T-Part should lose: local-only work, unknown access
+  sets, dense all-to-all conflicts, long transactions at the front of
+  the total order, and volatile SQL. The route should fall back before
+  allocating forwarded-value cache entries.

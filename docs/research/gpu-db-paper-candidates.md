@@ -357,9 +357,10 @@ Append new candidates here as each paper is processed.
   Why: Q-Store's direct predecessor for queue-oriented concurrency inside a
   node; useful for comparing owner-domain operation queues, contention
   avoidance, and control-free execution before distributed queue routing.
-- `queued` — **T-Part: Partitioning of Transactions for Forward-Pushing in
+- `reviewed` — **T-Part: Partitioning of Transactions for Forward-Pushing in
   Deterministic Database Systems**, Wu et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2915227`
+  PDF: `https://www.slmt.tw/papers/tpart.pdf`
   Why: Q-Store contrasts T-Part's dependency-graph scheduling with
   queue-oriented planning; useful for evaluating whether GPU DB should split
   hot write plans by dependency graph, fixed owner queue, or runtime conflict
@@ -3852,3 +3853,19 @@ Append new candidates here as each paper is processed.
   Why: CXL Memory Performance cites memory-centric database designs as a
   broader architectural direction; useful for comparing GPU DB's explicit
   owner/tier model with memory-centric pooled designs and database operators.
+- `queued` — **Don't Look Back, Look into the Future: Prescient Data
+  Partitioning and Migration for Deterministic Database Systems**, Lin et al.,
+  SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3452827`
+  PDF: `https://www.cs.nthu.edu.tw/~shwu/pubs/shwu-sigmod-21.pdf`
+  Why: T-Part's author/project line evolves dependency-aware transaction
+  placement into future-window routing and migration; useful for comparing
+  active-window route certificates with data movement and owner-boundary
+  changes under shifting hot spots.
+- `queued` — **MgCrab: Transaction Crabbing for Live Migration in
+  Deterministic Database Systems**, Lin et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p597-lin.pdf`
+  Why: direct follow-up from the T-Part/ElaSQL line on live migration during
+  deterministic execution; useful for deciding how GPU DB can move hot
+  partitions, resident segments, or owner assignments without stopping
+  admitted transaction batches.
