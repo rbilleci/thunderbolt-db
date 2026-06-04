@@ -29580,3 +29580,202 @@ maintenance paths rather than put in the common read path.
   history, resident segment lineage, cache pressure, and snapshot
   retention should be queryable off the hot path without forcing every
   fast-path decision through a general SQL query.
+
+### 2026-06-04 - RePMILA allocates isolation per transaction template, then promotes only the reads that pay for themselves
+
+**Citation:** Brecht Vandevoort, Alan Fekete, Bas Ketsman, Frank
+Neven, and Stijn Vansummeren. "Using Read Promotion and Mixed
+Isolation Levels for Performant Yet Serializable Execution of
+Transaction Programs." PVLDB 18(9), 2025. doi:10.14778/3746405.3746412.
+Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol18/p2846-vandevoort.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing /
+write path; query optimization / planning.
+
+**Relevance tags:** mixed isolation levels; serializable guarantees;
+read promotion; transaction templates; robust allocation; MVCC read
+committed; snapshot isolation; SSI; offline route analysis;
+template-level safety; conflict-serializability; hotspot contention.
+
+**Core idea:** RePMILA asks a practical question: can some transaction
+programs run at cheaper isolation levels while the whole application
+still has only serializable executions? The paper extends earlier
+mixed-isolation robustness work from fully known transactions to
+transaction templates whose concrete keys are supplied at runtime. It
+then searches over semantics-preserving read promotions, where a read
+is turned into an identity update so the DBMS takes a write lock or
+write-conflict path earlier.
+
+The important twist is that "lowest isolation everywhere" is not picked
+by instinct. For each promotion choice, the algorithm computes the
+unique lowest robust allocation over PostgreSQL-style RC, SI, and SSI.
+The promotion choice is then measured, because an extra identity update
+can reduce aborts or allow cheaper isolation, but can also add writes
+that make contention worse.
+
+On SmallBank with PostgreSQL 16.2, 100 concurrent clients, 18K accounts,
+and a 20-account hotspot, the best promoted robust allocation is close
+to the unsafe all-RC baseline and can double throughput relative to
+running every transaction at SSI. The exact result is workload- and
+DBMS-specific, but the transferable design is offline safety analysis
+plus runtime measurement, not a blanket rule that all reads should be
+promoted or all templates should use the same isolation level.
+
+**Concrete mechanisms:**
+
+- A transaction template is a sequence of read, write, and atomic update
+  operations over typed tuple variables. Runtime parameters instantiate
+  those variables, so the analysis covers arbitrarily many executions
+  without enumerating concrete keys.
+- The paper models PostgreSQL-style multiversion RC as each read seeing
+  the last committed version relative to the read operation, SI as reads
+  seeing the last committed version relative to transaction start, and
+  SSI as SI plus rejection of dangerous structures among SSI
+  transactions.
+- A robust allocation maps each template to RC, SI, or SSI such that all
+  schedules allowed under the mixed allocation are conflict-serializable.
+- The template robustness algorithm searches for potentially
+  conflicting operation cycles that can be turned into a split-schedule
+  counterexample. The decision procedure is polynomial in template size
+  and independent of the number of concrete transaction instantiations.
+- The lowest robust allocation starts from all-SSI and tries to lower
+  each template to RC, then SI, using the robustness test. The paper
+  proves that a unique lowest robust template allocation exists.
+- Read promotion changes an R operation into an identity U operation.
+  Under the considered isolation levels, dirty writes are not allowed,
+  so the transaction semantics stay the same while conflict timing and
+  the robust allocation may improve.
+- In SmallBank, promoting both savings and checking reads in
+  `WriteCheck` lets `Balance` run at SI and all other templates at RC.
+  This was the strongest reported choice under the tested mix, but the
+  paper also shows that promotions in frequent read-only templates can
+  hurt throughput.
+- The authors recommend pruning the promotion search by ignoring reads
+  from read-only tables, avoiding promotion inside high-frequency
+  read-only templates, and still benchmarking multiple promotion choices
+  that yield the same robust allocation.
+- Limitations are explicit: the template abstraction does not yet cover
+  foreign-key dependencies, branches, loops, inserts, deletes, or
+  predicate reads that cause phantom-sensitive behavior.
+
+**GPU DB mapping:** GPU DB can treat retained SQL templates as
+transaction or route templates with an isolation contract instead of a
+single global visibility path. A small set of hot templates such as
+point lookup, balance-style read-only aggregate, counter update, insert
+chunk, and refresh publication can be classified by required visibility:
+immutable retained snapshot, current RC-like owner read, SI-like
+transaction snapshot, or full owner/SSI-style validation. The safety
+test does not need to run per session; it can run offline for admitted
+template families and emit a route policy.
+
+Read promotion maps to intentional early conflict declaration. For GPU
+DB, that should not mean blindly writing identity tuples. It can mean
+marking a route's read set as write-conflict-relevant before expensive
+GPU, refresh, or tier work begins. For example, a long update template
+that will later modify a hot partition can acquire a partition-owner
+write intent before launching a GPU-side lookup or host spill phase.
+That may reduce wasted work under contention while preserving
+WAL-before-visibility.
+
+For read throughput, the paper is a warning against treating all
+read-only templates equally. Some read-heavy templates should stay pure
+reads on immutable snapshots because promoting them would add conflict
+traffic for every session. Others may benefit from a stronger isolation
+or promotion when they are rare, expensive, and otherwise cause late
+abort or retry. Route admission should therefore carry both semantic
+safety and workload frequency, not only "read" versus "write".
+
+For 1M logical sessions, mixed isolation suggests avoiding owner
+traffic for templates proven safe at a weaker route. Safe retained
+read templates can bypass the mutation owner using generation/frontier
+proofs, while templates with dangerous structures or phantom risk must
+go through stronger validation. The runtime can expose this as a
+per-template route table: allowed snapshot class, required owner
+frontiers, promotion/write-intent policy, and fallback path.
+
+For GPU and tier placement, early conflict declaration is a way to
+avoid wasted cache work. If a promoted template would take a write
+intent, the runtime should do it before pinning HBM, building a spill
+partition, or reading NVMe chunks. If the intent blocks or misses its
+latency budget, reject or route to a cheaper fallback before consuming
+scarce tier resources.
+
+**Risks and mismatches:** The paper is theory-heavy and evaluates only
+SmallBank on PostgreSQL, not a GPU DBMS, not SQL with joins, and not a
+storage engine with explicit WAL, resident snapshots, or GPU kernels.
+The formalism excludes predicate reads, inserts, deletes, control flow,
+and foreign-key/data dependencies, so it cannot yet prove safety for
+many realistic SQL routes or phantom-sensitive range scans. Read
+promotion can reduce throughput when applied to frequent read-only
+templates or when the promoted write does not enable a cheaper robust
+allocation. The assumed isolation semantics are PostgreSQL-style
+multiversion RC/SI/SSI; an internal GPU DB visibility model would need
+its own proof obligations before copying the allocation algorithm.
+
+**Benchmark candidates:**
+
+- Build a no-GPU route-template catalog for five to ten hot SQL shapes:
+  retained point read, retained aggregate, insert chunk, update by key,
+  refresh publication, and simple range read. For each, record read set,
+  write set, predicate family, route frequency, required snapshot class,
+  and owner frontier requirements.
+- Prototype mixed route allocation as a static policy table:
+  immutable-snapshot bypass, RC-like current owner read, SI-like read
+  transaction, and full validation. Gate: every admitted route records
+  why its visibility class is sufficient or why it fell back.
+- Simulate read promotion as early write-intent acquisition on hot
+  partition owners. Compare intent-before-GPU-work versus late conflict
+  detection. Metrics: wasted GPU/DRAM/NVMe work, abort/retry rate,
+  p50/p99 latency, and write throughput under hotspot skew.
+- Add a workload-frequency guard: never promote a read-only template
+  unless measured late-abort or validation savings exceed the added
+  conflict traffic. Failure condition: promotion improves a rare write
+  template but degrades high-frequency retained reads enough to reduce
+  total throughput.
+- Test per-template route policies under 1M simulated logical sessions:
+  many idle/read-mostly sessions, a hotspot write stream, and a few long
+  retained reads. Metrics: owner messages avoided, safe bypass rate,
+  validation queue depth, route rejection rate, and stale-read
+  correctness.
+- Extend the frontier descriptor benchmark with a `conflict_intent`
+  field that can be `none`, `read_only`, `promoted_read`, or
+  `write_set_declared`. Gate: a route cannot pin expensive tier
+  resources until required intents/frontiers are acquired or explicitly
+  waived by policy.
+- Add a negative benchmark for phantom-sensitive range or prefix
+  predicates. Gate: template allocation must refuse weaker routes when
+  the route has predicate reads not covered by the current proof model.
+
+### 2026-06-04 - Cross-paper synthesis: route safety should be a typed contract, not an owner-thread habit
+
+Centiman, HopsFS, and RePMILA converge on the same architectural
+pressure point from three directions. Centiman says validation and read
+bypass work only when frontiers are explicit. HopsFS says metadata
+operations scale only when authority is partitioned and route hints are
+generation-checked. RePMILA says mixed visibility choices are safe only
+when they are attached to transaction templates, not improvised per
+request.
+
+The strongest design track is a typed route contract for every hot SQL
+shape. It should name the template class, snapshot generation, source
+WAL boundary, read/write or predicate footprint, required owner
+frontiers, route-hint generation, residency generation, and conflict
+intent. That single contract can decide whether a request may bypass the
+mutation owner, whether metadata can be resolved from a hint, whether
+GPU work may start, and when old resident or spill state can retire.
+
+The category gap is now less about finding more isolated mechanisms and
+more about composing them: transaction scheduling, route-template
+visibility, and metadata/tier ownership need one benchmark harness.
+The next high-value papers should fill either predicate/range
+robustness for retained reads or hot-key transaction scheduling under
+resource conflicts, with occasional tiering follow-ups only when they
+feed the same contract.
+
+Benchmark priority: build the no-GPU typed route-contract simulator.
+Feed it retained reads, hotspot writes, metadata lookups, and resident
+refresh/retirement events. The first proof gate is not raw throughput;
+it is that every accepted request can explain its visibility proof,
+metadata authority, cache residency, and conflict-intent decision
+without relying on one global owner queue.

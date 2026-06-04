@@ -1447,7 +1447,7 @@ Append new candidates here as each paper is processed.
   Why: hybrid OCC/pessimistic contention handling cited by the batching paper;
   useful for deciding when GPU DB owner queues should switch from optimistic
   validation to contention-aware ordered execution.
-- `queued` — **Using Read Promotion and Mixed Isolation Levels for Performant
+- `reviewed` — **Using Read Promotion and Mixed Isolation Levels for Performant
   Yet Serializable Execution of Transaction Programs**, Vandevoort et al.,
   PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p2846-vandevoort.pdf`
@@ -1456,6 +1456,18 @@ Append new candidates here as each paper is processed.
   reviewing Centiman's read-only bypass path; relevant to route-level choices
   that keep serializability while letting safe read-heavy templates avoid the
   strongest validation path.
+- `queued` — **Detecting Robustness against MVRC for Transaction Programs
+  with Predicate Reads**, Vandevoort et al., EDBT 2023.
+  URL: `https://doi.org/10.48786/edbt.2023.47`
+  Why: read-promotion paper cites this as a direction for transaction programs
+  with predicate reads; relevant to GPU DB route templates that include ranges,
+  prefix predicates, and phantom-sensitive retained scans.
+- `queued` — **When View- and Conflict-Robustness Coincide for Multiversion
+  Concurrency Control**, Vandevoort et al., PACMMOD 2024.
+  URL: `https://doi.org/10.1145/3651593`
+  Why: modern mixed-isolation robustness follow-up; useful for deciding whether
+  GPU DB can rely on conflict-robustness checks for route templates or needs a
+  broader view-robustness model for MVCC-visible retained reads.
 - `queued` — **Detock: High Performance Multi-region Transactions at Scale**,
   Li et al., SIGMOD 2023.
   URL:
