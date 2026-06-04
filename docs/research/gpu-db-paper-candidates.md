@@ -1559,7 +1559,7 @@ Append new candidates here as each paper is processed.
   URL: `https://arxiv.org/abs/2504.19365`
   Why: modern asynchronous GPU-centric SSD access library; useful contrast to
   CAM's CPU-managed control plane and BaM's synchronous GPU polling path.
-- `queued` — **Hyperion: Co-Optimizing SSD Access and GPU Computation for
+- `reviewed` — **Hyperion: Co-Optimizing SSD Access and GPU Computation for
   Cost-Efficient GNN Training**, ICDE 2025.
   URL: `https://doi.org/10.1109/ICDE65448.2025.00031`
   Why: modern GPU-initiated asynchronous SSD access and cache co-optimization;
@@ -1777,6 +1777,20 @@ Append new candidates here as each paper is processed.
   Why: CXL DB position paper cites this as direct IMDBMS evidence; useful
   for quantifying OLTP/OLAP impact from placing hot and cold database state in
   CXL-attached memory.
+- `queued` — **ZNS: Avoiding the Block Interface Tax for Flash-based SSDs**,
+  Bjorling et al., USENIX ATC 2021.
+  URL: `https://www.usenix.org/conference/atc21/presentation/bjorling`
+  Why: Hyperion's GPU-initiated SSD path still pays block-interface and
+  request-granularity costs; ZNS is useful for evaluating whether future GPU
+  DB cold-tier segments should expose zone-aware allocation, append, and
+  placement contracts instead of relying on conventional block IO.
+- `queued` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
+  Stores**, Conway et al., USENIX ATC 2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/conway`
+  Why: Hyperion's argument depends on extracting cheap NVMe bandwidth;
+  SplinterDB is a storage-engine follow-up for comparing write-optimized
+  indexing, compaction, and bandwidth utilization against GPU DB cold-tier
+  point lookup and segment-directory designs.
 - `queued` — **Elastic Use of Far Memory for In-Memory Database Management
   Systems**, Lee et al., DaMoN 2023.
   URL: `https://doi.org/10.1145/3592980.3595311`

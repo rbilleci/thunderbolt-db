@@ -38233,3 +38233,167 @@ likely make confident but wrong GPU route decisions.
 - Track predictor overhead as a first-class metric: cache lookup latency,
   local inference latency, model memory, background training cost, and
   whether prediction work steals CPU from network IO or owner lanes.
+
+### 2026-06-04 - Hyperion treats GPU storage access as a schedulable pipeline
+
+**Citation:** Jie Sun, Mo Sun, Zheng Zhang, Zuocheng Shi, Jun Xie,
+Zihan Yang, Jie Zhang, Fei Wu, and Zeke Wang. "Hyperion:
+Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN
+Training." ICDE 2025, pages 321-335. DOI
+`10.1109/ICDE65448.2025.00031`. Retrieved 2026-06-04 from the
+author-hosted PDF,
+`https://jiesun233.github.io/files/Hyperion_ICDE_25_final.pdf`.
+
+**Category:** Multi-tier cache / data placement; GPU execution /
+analytics.
+
+**Relevance tags:** GPU-initiated IO; asynchronous NVMe access;
+GPU/CPU/SSD hierarchy; static cache placement; pipeline overlap;
+PCIe transactions; cost/performance; over-resident execution;
+GPU worker scheduling; storage-aware admission.
+
+**Core idea:** Hyperion argues that out-of-core GPU workloads should
+not treat SSD access as a serial preprocessing phase or as a GPU-core
+busy-wait activity. Its design separates GPU-initiated NVMe command
+submission, IO completion handling, cache lookup, and model computation
+so that a small slice of GPU parallelism can keep SSDs busy while most
+cores keep doing useful compute.
+
+The strongest transferable idea for GPU DB is that over-resident routes
+need a first-class storage pipeline contract. A route should declare how
+many GPU lanes, completion lanes, cache-lookup lanes, pinned/host-cache
+bytes, and NVMe queue slots it needs before it enters the hot GPU
+execution path. Otherwise, direct SSD access can consume the same GPU
+cores, PCIe bandwidth, and cache-lookup resources that the query kernels
+need.
+
+**Concrete mechanisms:**
+
+- Hyperion disaggregates GPU-initiated disk IO into separate submission
+  and completion kernels instead of binding both to one long-running
+  thread path.
+- The submission kernel writes batches of NVMe commands into GPU-memory
+  submission queues and uses batched doorbells. Each thread can submit
+  multiple commands without waiting for completion.
+- Completion handling is launched later in the pipeline. A leader thread
+  polls completion entries, then the warp copies data from the IO
+  stack's temporary buffer to the output feature buffer with coalesced
+  GPU memory movement.
+- The paper reports that one submission thread block, roughly 1% GPU
+  cores in their setup, can submit enough IO to saturate SSD throughput;
+  completion handling used 32 thread blocks, roughly 30% GPU cores, to
+  approach maximal throughput.
+- Hyperion schedules IO submission after graph sampling and completion
+  after feature lookup, before model training for the current batch,
+  allowing the previous batch's training to overlap with the next batch's
+  SSD/cache work.
+- The cache layer is GPU-managed but disaggregated from disk IO. Cache
+  hits run as separate GPU kernels, while cache misses flow through the
+  asynchronous disk IO path.
+- Cache contents are static during training. A GPU pre-sampling pass
+  measures vertex hotness, then Hyperion avoids cache replacement in the
+  hot path.
+- The cache placement policy treats GPU and CPU memory as one hierarchy.
+  It splits available cache space into chunks, estimates PCIe
+  transactions saved by placing topology or feature chunks in GPU memory
+  first and CPU memory second, and uses dynamic programming to minimize
+  total PCIe transactions.
+- The TPC analytical model predicts throughput per monetary cost from
+  batch size, average batch time, SSD count, component cost, SSD
+  throughput, PCIe throughput, cache-lookup overhead, and model
+  computation time. It frames extra NVMe devices as a cheaper tuning
+  knob than adding full GPU servers.
+- Evaluation uses one A100 machine, one H800 machine, and an eight-node
+  A100 cluster, with up to 12 Intel P5510 SSDs and datasets up to 23 TB.
+- The paper reports up to 3.1x higher throughput-per-cost than
+  state-of-the-art out-of-core baselines on terabyte-scale graphs and up
+  to 60x TPC versus distributed in-memory baselines. It also reports up
+  to 1.74x over a no-pipeline variant because IO and compute overlap.
+- Hyperion's IO throughput scales with SSD count until PCIe saturation.
+  With 12 P5510 SSDs on PCIe 4.0, additional SSDs stop helping because
+  the PCIe link, not the SSDs, becomes the limit.
+- CPU cache improves throughput by up to 1.73x in their cache experiment,
+  GPU cache by up to 1.48x, and topology cache by up to 1.1x. The exact
+  numbers are GNN-specific but the placement lesson is general.
+
+**GPU DB mapping:** P8 currently treats GPU-resident data as explicit,
+versioned, observable acceleration state. Hyperion suggests extending
+that contract to cold and over-resident routes: a route that misses HBM
+should not simply "do IO"; it should reserve an IO-submission budget,
+completion budget, cache-lookup budget, PCIe/NVMe bandwidth budget, and
+scratch/output-buffer budget.
+
+For retained reads, the direct mapping is an over-resident snapshot
+route. Hot segments stay in GPU HBM; warm chunks may live in CPU DRAM;
+cold chunks sit on NVMe. A scan, lookup, or join route can overlap
+resident GPU work with GPU-initiated cold-chunk fetches only if the
+runtime isolates the small IO-control kernels from the main query
+kernels and measures PCIe saturation separately from kernel time.
+
+For session concurrency, Hyperion reinforces the queue contract in the
+runtime doc. A million logical sessions cannot all allocate ad hoc IO
+requests, completion polling, and cache lookups. IO workers and GPU
+execution owners need bounded rings for storage work, and admission
+should reject, delay, or CPU-fallback before storage-side GPU kernels
+steal cores from short retained-read lanes.
+
+For MVCC/snapshots, Hyperion's static cache policy maps only partially.
+GPU DB can use static placement within a visibility generation or
+snapshot epoch, but mutations, DDL, refresh, and invalidation mean the
+cache key must include relation identity, visibility generation,
+resident validity, and cold-chunk generation. No cache placement or
+prefetch policy can bypass WAL-before-visibility.
+
+For cost modeling, Hyperion's TPC model is a useful shape even though
+the workload is not SQL. GPU DB's route model should predict the maximum
+of GPU compute time, PCIe transfer time, NVMe time, queue wait, and
+response encoding time, then price the scarce component. The actionable
+knob may be "add NVMe bandwidth", "increase host cache", "reduce HBM
+resident set", or "route this shape to CPU", not always "buy another
+GPU".
+
+**Risks and mismatches:** Hyperion is a GNN training system, not a
+database engine. Its graph access pattern has heavy skew and stable
+epochs, which makes pre-sampling and static cache placement much easier
+than mutable SQL workloads. SQL predicates, joins, writes, phantoms, and
+DDL can change access hotness and correctness boundaries faster than a
+training epoch.
+
+The completion path still uses meaningful GPU resources. In the reported
+configuration, completion handling can use roughly 30% of GPU cores to
+approach maximal throughput. That is acceptable only if admission and
+scheduling keep those kernels from interfering with latency-sensitive
+retained queries. The paper also focuses on a single-GPU out-of-core
+training design; multi-GPU support is described as extendable but not
+the main evaluation target.
+
+Finally, throughput-per-cost is not the same as database tail latency.
+Hyperion optimizes epoch throughput and TPC, while GPU DB must also
+bound p50/p95/p99 request latency, response-ring delays, transaction
+visibility, and snapshot invalidation.
+
+**Benchmark candidates:**
+
+- Build an over-resident route simulator with separate queues for GPU IO
+  submission, completion, cache lookup, query kernels, and response
+  encoding. Proof gate: cold-chunk fetches overlap with resident compute
+  without increasing retained lookup p99 beyond a fixed budget.
+- Add PCIe/NVMe saturation telemetry to P8 route envelopes: submitted IO
+  count, completion wait, bytes from HBM/host/NVMe, GPU cores or blocks
+  reserved for IO kernels, and time spent copying from staging buffers.
+- Compare three cold-route designs: CPU-orchestrated GPUDirect,
+  GPU-initiated synchronous IO, and GPU-initiated disaggregated
+  submission/completion. Required metrics: throughput, p95/p99, GPU
+  occupancy stolen from query kernels, PCIe utilization, and CPU owner
+  involvement.
+- Test static placement inside a snapshot generation: place hot chunks in
+  HBM, warm chunks in host memory, and cold chunks on NVMe using observed
+  route hotness. Failure condition: a mutation or refresh crosses a
+  generation boundary without invalidating the cached placement decision.
+- Add a cost/performance benchmark that varies SSD count, host cache
+  size, HBM resident budget, and GPU count. The route planner should name
+  which resource is bottlenecking each workload class.
+- Measure topology-like metadata separately from payload columns. For GPU
+  DB this means index pages, row-id maps, visibility vectors, string
+  offsets, and segment directories. Benchmark whether placing metadata in
+  HBM and payload in host/NVMe beats all-or-nothing segment residency.
