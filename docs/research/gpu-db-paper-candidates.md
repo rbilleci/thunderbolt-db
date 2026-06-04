@@ -665,7 +665,7 @@ Append new candidates here as each paper is processed.
   Why: SiliconDB cites it as coprocessor query processing background; relevant
   to deciding how much CPU/GPU pipeline state should be fused versus
   materialized across transfer and queue boundaries.
-- `queued` — **Adaptive NUMA-Aware Data Placement and Task Scheduling for
+- `reviewed` — **Adaptive NUMA-Aware Data Placement and Task Scheduling for
   Analytical Workloads in Main-Memory Column-Stores**, Psaroudakis et al.,
   PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol10/p37-psaroudakis.pdf`
@@ -938,6 +938,18 @@ Append new candidates here as each paper is processed.
   Why: economic and architectural argument cited by Umbra against pure
   in-memory-only systems; useful for setting GPU DB tier-placement budgets and
   cost/performance targets across HBM, DRAM, NVMe, and future memory tiers.
+- `queued` — **Locality-aware Partitioning in Parallel Database Systems**,
+  Zamanian et al., SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2749437`
+  Why: cited by the adaptive NUMA placement paper for copartitioned joins and
+  workload-aware partitioning; useful for comparing static locality-aware
+  partition plans with GPU DB's runtime route and placement telemetry.
+- `queued` — **Scaling Up Mixed Workloads: A Battle of Data Freshness,
+  Flexibility, and Scheduling**, Psaroudakis et al., TPCTC 2015.
+  URL: `https://doi.org/10.1007/978-3-319-28186-9_7`
+  Why: related SAP HANA scheduling work from the same research line; useful
+  for mixed OLTP/OLAP freshness, scheduler, and admission tradeoffs before
+  GPU DB combines retained snapshots with writes.
 - `queued` — **Adaptive Execution of Compiled Queries**, Kohn, Leis, and
   Neumann, ICDE 2018.
   URL: `https://doi.org/10.1109/ICDE.2018.00027`

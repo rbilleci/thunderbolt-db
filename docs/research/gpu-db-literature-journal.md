@@ -39210,3 +39210,175 @@ overhead.
   filter accuracy when downstream CPU or tier cost is high. Failure condition:
   a larger GPU filter reduces false positives but loses overall due to HBM
   pressure, queue delay, or transfer contention.
+
+### 2026-06-04 - NUMA placement should follow measured route pressure, not static partitioning
+
+**Citation:** Iraklis Psaroudakis, Tobias Scheuer, Norman May,
+Abdelkader Sellami, and Anastasia Ailamaki. "Adaptive NUMA-aware
+data placement and task scheduling for analytical workloads in
+main-memory column-stores." PVLDB 10(2), 2016, pp. 37-48.
+Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol10/p37-psaroudakis.pdf`.
+
+**Category:** runtime / HFT / session scale; multi-tier cache / data placement.
+
+**Relevance tags:** NUMA placement; task scheduling; memory bandwidth;
+work stealing; route-local execution; placement telemetry; table groups;
+partition owners; fallback scheduling; tier pressure.
+
+**Core idea:** The paper shows that a main-memory column store should not
+blindly partition every table across every socket or allow all workers to steal
+all tasks. Static full partitioning can add overhead when a table would be
+better kept local, and stealing memory-intensive tasks can overload remote
+memory controllers and interconnects even while CPU utilization looks high.
+
+The proposed SAP HANA prototype tracks CPU load and local memory throughput at
+three levels: task classes, table or table-group partitions, and sockets. A
+background data placer moves or repartitions hot table partitions only after
+their utilization has been stable long enough to justify the movement cost. A
+separate adaptive stealing rule disables inter-socket stealing for task classes
+whose measured memory intensity exceeds a calibrated hardware threshold. The
+evaluation reports up to 2x throughput improvement from adaptive placement,
+1.1x-4x from adaptive task stealing, and a 4x normalized TPC-H throughput
+improvement on a 32-socket machine when initially all data was placed on one
+socket.
+
+**Concrete mechanisms:**
+
+- Tasks are assigned to classes such as scan input-vector phase,
+  materialization phase, aggregation phase, and join phase. Each class keeps an
+  exponential moving average of memory throughput measured with hardware
+  counters over completed local tasks.
+- Table-part and table-group-part resource histories maintain current CPU
+  load, estimated memory throughput, page count, owner pointer, and socket.
+  Histories are sampled periodically; the prototype samples every 100 ms and
+  keeps roughly five minutes of history.
+- Stolen tasks are deliberately excluded from the local utilization attributed
+  to data placement, because stealing is treated as a temporary CPU-balancing
+  mechanism until placement catches up.
+- The data placer runs periodically, snapshots recent resource histories,
+  sorts socket pairs by CPU imbalance, and considers moving before
+  repartitioning so it avoids partition overhead when a whole partition can
+  simply live on a colder socket.
+- A table part is eligible for movement or repartitioning only if past CPU and
+  memory throughput over the estimated move or partition window stays close to
+  recent utilization. This prevents reacting to short-lived spikes.
+- A candidate movement is accepted only if it reduces CPU imbalance and does
+  not push the destination socket over its memory-bandwidth budget.
+- Repartitioning doubles the partition count, capped by socket count, and can
+  split all tables in a table group together so copartitioned joins preserve
+  locality.
+- Cold partitioned tables can be merged and moved to the coldest socket to
+  remove future partition overhead.
+- Adaptive task stealing uses a calibration benchmark to find the memory
+  throughput threshold at which stealing becomes beneficial on a specific
+  NUMA machine. Above that threshold, cross-socket stealing is disabled for the
+  task class; below it, stealing is allowed.
+
+**GPU DB mapping:** The direct lesson for GPU DB is that placement and
+scheduling should be controlled by route-level pressure, not by a permanent
+"spread everything everywhere" rule. P8 resident segments, CPU fallback
+partitions, pinned host buffers, and cold-tier metadata should carry resource
+histories: CPU time, HBM bytes touched, host DRAM bandwidth, H2D/D2H bytes,
+NVMe reads, queue wait, and route count. A placement owner can then decide
+whether to keep a table local, split it across partition owners, move a warm
+segment, or merge cold partitions.
+
+For high-concurrency runtime, the stealing result is a warning about CPU
+fallback. When GPU rings are saturated, blindly letting every IO or read worker
+steal memory-heavy scan work can make latency worse by saturating host-memory
+or NVMe paths. The runtime should classify fallback fragments by memory
+intensity and allow cross-owner stealing only for CPU-heavy or latency-critical
+fragments whose remote data cost is below a calibrated threshold.
+
+The eligibility rule maps well to GPU residency. Refreshing, evicting, or
+repartitioning resident segments should require a stable pressure signal over
+the expected movement window. A one-second hot spike should not trigger an HBM
+rebuild or NVMe reshuffle if the movement cost will outlive the spike. The
+route descriptor should therefore expose both current pressure and a sampled
+history window for each retained route family.
+
+Table groups are also relevant. GPU DB should not decide placement only one
+table at a time once joins, foreign-key lookups, or retained multi-table routes
+arrive. Associated route groups can move or split together so that CPU
+fallback, GPU pre-filtering, and resident joins do not pay avoidable
+cross-owner or cross-tier movement.
+
+**Risks and mismatches:** The system is an analytical SAP HANA prototype on
+NUMA CPUs, not a transactional GPU database. It does not address WAL,
+MVCC visibility, snapshot invalidation, GPU memory, CUDA streams, network IO,
+or SQL session admission. Queries may wait while SAP HANA moves a table part,
+which is not acceptable as a default for latency-sensitive transactional
+routes unless the movement runs behind an immutable old snapshot.
+
+The paper primarily balances CPU utilization while constraining memory
+bandwidth; a GPU DB may need to balance HBM, pinned memory, transfer engines,
+NVMe queues, and mutation-owner latency before CPU load. The task classes are
+manual and the paper leaves complex predicate classification out of scope.
+Finally, the reported thresholds are hardware-specific. The transferable idea
+is calibrated per-route movement and stealing policy, not the specific
+threshold values or partition counts.
+
+**Benchmark candidates:**
+
+- Add route resource histories for retained reads and CPU fallback fragments:
+  CPU time, HBM bytes, host DRAM bytes, H2D/D2H bytes, NVMe bytes, queue wait,
+  and route count. Proof gate: placement and fallback decisions can be
+  explained from telemetry rather than hidden heuristics.
+- Build a CPU fallback stealing benchmark with memory-heavy scans,
+  CPU-heavy post-filter work, and mixed fragments. Compare always-steal,
+  never-steal, and calibrated memory-intensity stealing across p50/p99 latency
+  and throughput.
+- Prototype stable-window residency movement: do not refresh, split, or evict
+  a resident segment unless pressure remains above threshold for at least the
+  estimated movement cost. Failure condition: a short spike triggers movement
+  that increases tail latency or invalidation churn.
+- Test table-group placement for two-table retained routes. Keep associated
+  route groups together, split them together, or place them independently, and
+  measure avoided host/GPU transfer, CPU fallback locality, and route
+  correctness under updates.
+- Add a cold-partition merge experiment for P8: after a hot partitioned table
+  becomes cold, merge or consolidate CPU/GPU metadata and measure future lookup
+  latency, memory footprint, and rebuild cost.
+- Calibrate per-machine thresholds for cross-owner CPU fallback work: memory
+  bytes per microsecond, H2D/D2H bytes per route, and NVMe queue pressure.
+  Minimum gate: the scheduler disables stealing only for fragments whose
+  remote execution measurably worsens throughput or p99 latency.
+
+### 2026-06-04 - Cross-paper synthesis: route placement needs stable pressure before movement
+
+The last group of papers converges on a route envelope that separates
+eligibility, resource pressure, and movement cost. Compound GPU pipelines
+showed that materialization boundaries should be explicit because GPU operators
+consume scratch, reduction state, and output buffers differently. Lotus showed
+that partition owners can stay single-threaded while waits across partitions
+are multiplexed instead of converted into more owner threads. Robust
+cardinality estimation argued that learned route advice should be anchored to
+fresh deterministic statistics. Fluid co-processing showed that GPU work can be
+a narrow pruning fragment with CPU fallback, not a whole-query commitment.
+Adaptive NUMA placement adds the missing rule: do not move or steal work until
+the pressure signal is stable enough to pay back the movement.
+
+The strongest design track is a per-route pressure ledger. A retained route or
+fallback fragment should publish its truth boundary, resident boundary, scratch
+budget, queue budget, CPU/GPU/tier bytes, and a short resource history. The
+runtime can then make three separate choices: admit now, assist opportunistically
+on GPU, or move placement after a stable-window gate. This avoids a static
+policy that either overpartitions every hot object or leaves all data in the
+first place it happened to land.
+
+Category gaps remain around write-heavy placement and mixed OLTP/OLAP
+freshness. Recent reviews have good coverage of GPU pruning, route robustness,
+partition waits, and hidden storage contention, but the queue should continue
+to pull in transactional papers where movement, MVCC cleanup, and snapshot
+publication interact with writes.
+
+Benchmark priorities:
+
+- implement a route pressure ledger before adding another placement heuristic;
+- test opportunistic GPU fragments against CPU fallback under queue pressure;
+- require stable-window gates for refresh, split, merge, and cold-tier movement;
+- measure cross-owner stealing separately for memory-heavy and CPU-heavy
+  fragments;
+- attach every learned or robust route decision to live deterministic
+  descriptors and a fallback policy.
