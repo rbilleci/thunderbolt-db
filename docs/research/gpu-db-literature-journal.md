@@ -48297,3 +48297,182 @@ surprising ways, so simple latency constants are insufficient.
 - Run a page-migration interference test by injecting copy/migration work
   while measuring short retained reads. Failure condition: migration work
   creates Redis-like p99 cliffs for session or visibility hot paths.
+
+### 2026-06-04 - Homa makes receiver admission a latency-control surface
+
+**Citation:** Behnam Montazeri, Yilong Li, Mohammad Alizadeh, and John
+Ousterhout. "Homa: A Receiver-Driven Low-Latency Transport Protocol Using
+Network Priorities." SIGCOMM 2018. doi:10.1145/3230543.3230564. Retrieved
+2026-06-04 from arXiv complete version,
+`https://arxiv.org/abs/1803.09615`.
+
+**Category:** runtime / HFT / session scale; high-concurrency networking and
+admission.
+
+**Relevance tags:** receiver-driven scheduling; RPC transport; tail latency;
+network priorities; SRPT; grants; bounded outstanding work; incast; response
+rings; session multiplexing; admission control.
+
+**Core idea:** Homa is a datacenter transport for RPC-shaped workloads with
+many tiny messages. Its central design choice is to move scheduling authority
+to the receiver: the receiver knows which messages are competing for its
+downlink, so it assigns packet priorities and grants transmission for the
+scheduled part of each message. Small messages send an initial unscheduled
+portion immediately, while longer messages continue only when the receiver
+issues grants.
+
+For GPU DB, the transferable idea is not to replace pgwire with Homa. It is
+that the receiving side of a saturated boundary should issue credits based on
+the work it can actually drain. IO workers, response rings, mutation owners,
+and GPU execution owners should not accept unlimited work just because clients
+can send it. They should advertise bounded credits, route classes, and
+priorities that reflect queue depth, message or result size, deadline, and the
+current conflict or GPU-resource class.
+
+**Concrete mechanisms:**
+
+- Homa is message-oriented and connectionless. RPCs are identified by RPC ids,
+  and a server keeps state proportional to active RPCs rather than total
+  clients. This directly targets large fan-in datacenter services with many
+  clients.
+- Each message has an unscheduled prefix and a scheduled suffix. The sender
+  transmits the unscheduled bytes immediately; scheduled bytes are transmitted
+  only after explicit receiver GRANT packets.
+- The unscheduled prefix is sized to cover roughly one RTT of bytes. The paper
+  reports about 10 KB in its 10 Gbps RAMCloud implementation.
+- Receivers use switch priority queues to approximate shortest-remaining-
+  processing-time scheduling. Shorter remaining messages get higher priority.
+- Priority selection is receiver-controlled. Receivers assign scheduled-packet
+  priorities in GRANTs based on the currently competing inbound messages.
+- For unscheduled packets, receivers periodically disseminate priority
+  thresholds derived from recent inbound message-size distributions. Senders
+  use those thresholds for the blind prefix.
+- Homa grants to a limited number of active messages per receiver. The paper
+  calls this controlled overcommitment: grant to enough senders to keep the
+  downlink busy, but not so many that queues grow without bound.
+- The implementation uses one active message per scheduled priority level as
+  the overcommitment degree. The authors note that dynamic alternatives are
+  plausible but not explored.
+- Homa has explicit incast handling. When a node has many outstanding RPCs, it
+  marks new RPCs so servers use a smaller unscheduled response prefix; larger
+  responses are then receiver-scheduled before they can flood the receiver's
+  top-of-rack queue.
+- Homa avoids sender head-of-line blocking by scheduling outgoing DATA packets
+  by shortest remaining message size and by limiting bytes queued in the NIC
+  transmit queue to about two full-size packets.
+- Control packets such as GRANT and RESEND use highest priority. DATA packet
+  priority is intended for the receiver's final downlink.
+- Homa detects lost packets at the receiver and avoids explicit
+  acknowledgments in the common case; responses can serve as acknowledgments
+  for requests.
+- Homa implements at-least-once transport semantics and leaves duplicate
+  suppression to higher layers. That is acceptable for some RPC systems but is
+  not directly acceptable for SQL mutation semantics.
+- The RAMCloud Homa implementation uses DPDK polling and reports 3660 lines of
+  C++ code. The evaluated implementation did not measure incoming message-size
+  distributions online; benchmark priority thresholds were precomputed.
+- In the RAMCloud implementation on 10 Gbps Ethernet, Homa reports
+  99th-percentile round-trip latency below 15 microseconds for short messages
+  at 80% network load.
+- In the same setup, the paper reports that Homa's 99th-percentile slowdown for
+  small messages was roughly 2-3.5x the unloaded minimum across tested
+  workloads, and that Basic receiver-driven transport without priorities had
+  5-15x higher tail latency.
+- Four priority levels were nearly as good as eight in the implementation
+  experiment; two priority levels increased tail latency noticeably. This
+  suggests a small number of route/admission lanes can be useful if assigned
+  carefully.
+- Simulations compare Homa to pFabric, pHost, PIAS, and NDP. Homa's
+  99th-percentile slowdown for the shortest half of messages was never worse
+  than 2.2 at 80% load in the simulated workloads, and it stayed close to
+  pFabric while requiring fewer idealized switch capabilities.
+- The paper identifies remaining Homa delay largely as link-level preemption
+  lag: a short-message packet arrives while a link is already transmitting a
+  lower-priority packet.
+- Large-message tail latency can be poor under strict SRPT. The authors
+  mention reserving some bandwidth for the oldest message as future work.
+
+**GPU DB mapping:** Homa supports the 1M logical-session target by reinforcing
+active-work accounting. A logical pgwire session should not imply a thread,
+large buffer, or always-admitted request. Like Homa's connectionless RPC
+state, GPU DB should keep memory and queue state proportional to active
+requests, retained snapshots, and outstanding response fragments. Idle
+sessions can hold protocol identity and prepared metadata, but not owner,
+GPU, pinned-buffer, or response-ring capacity.
+
+The receiver-driven GRANT mechanism maps cleanly to runtime owners. A network
+IO worker should receive or decode only as much request body as downstream
+owners can admit. A mutation owner can issue write credits by hot-key lane,
+WAL batch boundary, and visibility-publication budget. A GPU execution owner
+can issue retained-route credits by snapshot generation, query shape, output
+size, stream capacity, and pinned-buffer availability. A response owner can
+issue credits by socket readiness and result-fragment priority.
+
+Homa's unscheduled prefix maps to a small blind ingress allowance. GPU DB can
+allow clients to submit compact parse/describe/bind/execute metadata without a
+round trip, but large COPY payloads, huge result drains, long scans, or
+multi-fragment GPU jobs should switch to credits before they consume owner or
+response capacity. This is especially relevant to COPY, retained scan, and
+over-resident routes where the request or response size is much larger than
+the control message.
+
+The dynamic priority idea maps to route lanes rather than packet priorities:
+small retained reads, short point lookups, commit acknowledgments, and
+invalidation/visibility publications should bypass long scans, large result
+sets, refresh jobs, and cold-tier movement. Homa's warning about large-message
+starvation also applies. GPU DB needs an aging or reserved-capacity rule so
+long refreshes, checkpoints, or analytical scans do not starve forever.
+
+The incast mechanism is a direct benchmark candidate for fan-out retained
+queries and multi-partition reads. If one query fans out to many partition or
+GPU workers, responses should be credit-limited at the collector so thousands
+of fragments cannot flood the IO worker, response ring, pinned-buffer pool, or
+client socket buffer at once.
+
+**Risks and mismatches:** Homa is a transport paper, not a SQL database
+runtime. It assumes RPC messages, network priority queues, DPDK-style polling,
+and at-least-once semantics. GPU DB cannot inherit at-least-once mutation
+execution; SQL writes still need WAL-before-visibility, transaction ids,
+duplicate protection, and exactly-once effects at the database layer.
+
+Homa's switch priority model may not be available for ordinary pgwire over
+kernel TCP, and its 10 Gbps RAMCloud results do not directly predict behavior
+on modern NICs, TLS, proxies, or WAN paths. The implementation's priority
+thresholds were precomputed for benchmarks, so online adaptation cost remains
+partly unknown. The paper also optimizes message latency, not CPU scheduling,
+GPU queueing, CUDA transfer pressure, MVCC visibility, or storage-tier
+placement.
+
+Finally, SRPT-style priority is dangerous if copied naively. It can starve or
+degrade large results and long maintenance jobs. GPU DB should treat priority
+as a bounded service contract with aging, class budgets, and explicit overload
+responses rather than as "short jobs always win."
+
+**Benchmark candidates:**
+
+- Build a receiver-credit admission simulator for GPU DB boundaries: network
+  ingress, mutation owner, read snapshot worker, GPU execution owner, and
+  response ring. Compare unbounded FIFO, static per-session credits,
+  receiver-issued credits, and receiver-issued credits with aging.
+- Add a blind-prefix rule for large requests and responses. Allow compact
+  command metadata immediately, then require credits for COPY chunks, long
+  scans, large result fragments, and multi-partition fan-outs. Measure p50/p99,
+  bytes buffered per boundary, and overload/fallback reason.
+- Add route-priority lanes approximating SRPT with only a few classes: small
+  retained read, commit/visibility publication, medium result, large scan,
+  refresh/cold-tier movement. Proof gate: four lanes materially reduce tail
+  latency without starving large work.
+- Test fan-out/incast response control: one client query fans out to many
+  partitions or retained snapshots. Compare all fragments returning
+  immediately versus collector-issued response credits. Failure condition:
+  response-ring or IO-worker buffers grow with fan-out width instead of active
+  credit count.
+- Add active-session accounting: memory and queue slots should scale with
+  outstanding RPC/request fragments, not with total logical sessions.
+  Stress with 1M idle sessions plus bursts of active retained reads.
+- Add aging to short-job priority. Measure whether long scans, refreshes, and
+  checkpoints complete under sustained point-lookup load while short-read p99
+  remains bounded.
+- Record route certificate fields for admission: request bytes admitted,
+  response bytes admitted, route class, credit issuer, outstanding fragments,
+  queue wait, age, priority lane, and rejection reason.

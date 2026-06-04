@@ -1591,7 +1591,7 @@ Append new candidates here as each paper is processed.
   useful for deciding how much GPU DB can improve pgwire/event-loop tail
   latency through event prioritization and delivery control before adopting
   hardware-assisted preemption or kernel bypass.
-- `queued` — **Homa: A Receiver-Driven Low-Latency Transport Protocol Using
+- `reviewed` — **Homa: A Receiver-Driven Low-Latency Transport Protocol Using
   Network Priorities**, Montazeri, Li, Alizadeh, and Ousterhout, SIGCOMM 2018.
   URL: `https://doi.org/10.1145/3230543.3230564`
   arXiv: `https://arxiv.org/abs/1803.09615`
@@ -2345,13 +2345,11 @@ Append new candidates here as each paper is processed.
   Why: ZygOS follow-up by overlapping authors that exposes RPC request/response
   pairs to endpoints and network scheduling; relevant to pgwire-style request
   admission, response routing, and bounded outstanding request counts.
-- `queued` — **Homa: A Receiver-Driven Low-Latency Transport Protocol Using
+- `skipped` — **Homa: A Receiver-Driven Low-Latency Transport Protocol Using
   Network Priorities**, Montazeri et al., SIGCOMM 2018.
   URL: `https://doi.org/10.1145/3230543.3230564`
   arXiv: `https://arxiv.org/abs/1803.09615`
-  Why: receiver-driven short-message transport and priority scheduling for
-  datacenter RPCs; relevant to future GPU DB network admission and tail-latency
-  budgeting once pgwire sessions are multiplexed over fewer IO workers.
+  Why: duplicate queue entry; reviewed once under the earlier Homa entry.
 - `queued` — **Frequent Background Polling on a Shared Thread, Using
   Lightweight Compiler Interrupts**, Basu, Montanari, and Eriksson, PLDI 2021.
   URL: `https://doi.org/10.1145/3453483.3454049`
@@ -3964,3 +3962,16 @@ Append new candidates here as each paper is processed.
   Why: LADS compares against FOEDUS-style multicore/NVRAM transaction
   engines; useful for storage/runtime design across many cores, logging, and
   future non-volatile or far-memory tiers.
+- `queued` — **PIAS: Practical Information-Agnostic Flow Scheduling for
+  Commodity Data Center Networks**, Bai et al., NSDI 2015.
+  URL:
+  `https://www.usenix.org/conference/nsdi15/technical-sessions/presentation/bai`
+  Why: Homa contrasts sender-side multilevel feedback priority assignment
+  against receiver-driven SRPT approximation; useful for GPU DB request and
+  response scheduling when exact route size is unknown at admission time.
+- `queued` — **NDP: Re-architecting Datacenter Networks and Stacks for Low
+  Latency**, Handley et al., SIGCOMM 2017.
+  URL: `https://doi.org/10.1145/3098822.3098825`
+  Why: Homa compares against NDP's receiver-side pulling and bounded queues;
+  useful for evaluating how much GPU DB should trade bandwidth utilization for
+  low queueing delay at network, response-ring, and owner-ingress boundaries.
