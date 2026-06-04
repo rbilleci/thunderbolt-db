@@ -2298,9 +2298,9 @@ Append new candidates here as each paper is processed.
   Why: modern survey and call-to-action for database/network co-design; useful
   for organizing future pgwire, RDMA, DPDK, and application-specific transport
   benchmark tracks.
-- `queued` — **D-RDMA: Bringing Zero-Copy RDMA to Database Systems**,
+- `reviewed` — **D-RDMA: Bringing Zero-Copy RDMA to Database Systems**,
   Ryser, Lerner, Forencich, and Cudre-Mauroux, CIDR 2022.
-  URL: `https://www.cidrdb.org/cidr2022/papers/p6-ryser.pdf`
+  URL: `https://vldb.org/cidrdb/papers/2022/p77-ryser.pdf`
   Why: database-specific RDMA abstraction cited by the modern-networks paper;
   relevant to future zero-copy COPY admission, remote partition movement, and
   preserving DB-level ordering above DMA completion.
@@ -2322,6 +2322,13 @@ Append new candidates here as each paper is processed.
   Why: programmable-network hot-region OLTP execution cited by the
   modern-networks paper; useful for defining the narrow boundary between safe
   semantic admission/triage and unsafe offloading of full MVCC semantics.
+- `queued` — **Design and Evaluation of an RDMA-aware Data Shuffling Operator
+  for Parallel Database Systems**, Liu, Yin, and Blanas, EuroSys 2017.
+  URL: `https://doi.org/10.1145/3064176.3064217`
+  Why: D-RDMA uses RDMA data shuffle as a motivating fragmented-transfer
+  workload; this paper is a useful source for database-level shuffle operator
+  design before deciding whether GPU DB needs remote partition exchange or
+  zero-copy distributed result routing.
 - `reviewed` — **BMC: Accelerating Memcached using Safe In-kernel Caching and
   Pre-stack Processing**, Ghigoff et al., NSDI 2021.
   URL: `https://www.usenix.org/conference/nsdi21/presentation/ghigoff`

@@ -43313,3 +43313,144 @@ cited papers for deeper validation.
   host compressed, NVMe page, NVMe segment, or CPU tuple/index fallback. A route
   decision should record why the chosen tier satisfies freshness, latency, and
   memory budget.
+
+### 2026-06-04 - D-RDMA makes fragmented database transfer a NIC scheduling problem
+
+**Citation:** Andre Ryser, Alberto Lerner, Alex Forencich, and Philippe
+Cudre-Mauroux. "D-RDMA: Bringing Zero-Copy RDMA to Database Systems." CIDR
+2022. Retrieved 2026-06-04 from
+`https://vldb.org/cidrdb/papers/2022/p77-ryser.pdf`.
+
+**Category:** Runtime / high-concurrency networking / database-network
+co-design.
+
+**Relevance tags:** RDMA; zero-copy networking; smart NICs; scatter-gather;
+DMA scheduling; fragmented result transmission; OLTP projection; OLAP shuffle;
+response buffers; CPU-cycle budget; remote partition movement.
+
+**Core idea:** Conventional RDMA is nominally zero-copy, but the paper shows
+that database layouts often make the NIC fetch many tiny fragments. The host
+then either emits many work requests and scatter-gather elements, which burns
+CPU and causes inefficient small DMAs, or copies fragments into a contiguous
+transmission buffer, which also burns CPU and memory bandwidth. D-RDMA changes
+the interface: the database describes the logical non-contiguous region to
+transmit, while the NIC chooses an efficient DMA schedule.
+
+The transferable idea for GPU DB is not that the first networking path should
+require custom NIC hardware. It is that route and response descriptors should
+preserve data shape. If a result, remote partition transfer, COPY batch, or
+GPU-resident column fragment is naturally strided, bitmapped, or pointer-mapped,
+the runtime should avoid immediately flattening it into per-row copies or
+per-fragment network work. Shape-aware descriptors give later NIC, DPU, RDMA,
+or GPUDirect paths something useful to optimize.
+
+**Concrete mechanisms:**
+
+- The paper uses PCIe protocol analysis to show that a conventional NIC follows
+  the work-request/scatter-gather list literally: one DMA per SGE, even when
+  adjacent fragments or small gaps could have been coalesced.
+- Fragmentation appears in OLAP shuffles because adjacent rows may be destined
+  for different servers, and in OLTP projections because selected attributes
+  often leave regular gaps inside row records.
+- Copying fragments into transmission buffers improves line-rate utilization
+  but consumes CPU cycles and memory bandwidth. In the paper's shuffle setup,
+  copy-out reaches higher throughput than tiny zero-copy fragments but still
+  needs multiple CPU cores to reach 100 Gbps.
+- D-RDMA introduces Non-Contiguous Regions (NCRs), richer descriptors that can
+  describe larger memory areas containing both payload bytes and gaps.
+- A Strided Region describes regular gaps with a base pointer, element width,
+  stride, period, and row-mask semantics. The authors use it for projected OLTP
+  rows and columnar shuffle patterns.
+- A proposed shared-send-queue verb lets one logical operation scatter data to
+  multiple servers, so all-to-all database shuffle can be described as NCR sets
+  rather than one send per destination row.
+- Additional region families include bitmapped regions for columnar data and
+  pointer-mapped regions for row-oriented irregular results.
+- The NIC-side runtime includes an optimizer, DMA engine, segmented memory, an
+  assembler, and packetizer. The optimizer chooses bounding boxes that may pull
+  small gaps if doing so reduces inefficient tiny DMAs.
+- The segmented memory and assembler are designed to absorb larger DMA chunks
+  while emitting the same packet stream the conventional RDMA operation would
+  have produced.
+- Preliminary experiments report a naive zero-copy shuffle at about 1.5 Gbps
+  while spending about half a CPU core issuing RDMA sends, copy-out at about 18
+  Gbps while spending one full CPU core, and the D-RDMA-style transfer reaching
+  close to 98 Gbps on a 100 Gbps card with essentially no host CPU for the
+  transfer initiation path.
+- DMA experiments show small PCIe reads are expensive, while transfers around
+  256 bytes reach peak throughput in their setup. This explains why pulling a
+  small gap can be cheaper than preserving a perfect logical payload boundary.
+
+**GPU DB mapping:** The production runtime already aims to replace
+thread-per-client serving with network IO workers, bounded rings, immutable
+snapshots, response rings, and GPU execution owners. D-RDMA adds a missing
+descriptor lesson: the response ring should be able to carry a structured
+payload plan, not only a fully materialized byte buffer. A result can be
+"columns A and C for these row ids in generation G" or "these strided segments
+from resident partition P" before it becomes pgwire bytes.
+
+For 1M logical sessions, this matters because aggregate CPU cost beats any
+single request cost. Small projected reads are cheap individually, but if every
+response is assembled through row-by-row copying or many tiny scatter-gather
+elements, the protocol edge becomes the bottleneck that Looking Glass 2.0 and
+Tigger already warned about. GPU DB should keep same-shape response metadata,
+row-description caches, and column/row selection masks reusable across
+micro-batches.
+
+D-RDMA also maps to future remote tiering. If cold partitions, resident
+snapshots, or GPU refresh inputs ever move across nodes, the route descriptor
+should preserve table id, partition id, generation, columns, row mask, and
+destination set. That keeps correctness checks at the database layer while
+allowing the transport layer to choose copy-out, gather-write, RDMA, DPU, or
+future smart-NIC execution.
+
+The gap-coalescing idea is useful even without RDMA. GPU DB can benchmark
+whether it is faster to copy exact projected bytes, include harmless padding
+bytes between selected columns, or materialize a compact result. The decision
+should depend on cache-line size, CUDA copy granularity, PCIe transfer size,
+network framing, and result encoding.
+
+**Risks and mismatches:** D-RDMA is an early CIDR design paper with an
+FPGA-based prototype component and a proposed RDMA extension, not deployed
+commodity hardware. It does not solve SQL semantics, pgwire encoding,
+transaction ordering, security isolation, memory registration lifecycle, or
+client compatibility.
+
+The reported benefits depend on fragmented data patterns and high-speed RDMA
+links. Local pgwire over TCP, small single-row responses, or already-contiguous
+encoded result caches may see little benefit. GPU DB should not add complex
+scatter-gather machinery until profiling shows protocol copying, result
+materialization, or remote partition exchange consumes meaningful CPU or memory
+bandwidth.
+
+The paper's NIC can choose to fetch gap bytes that are not payload. That is
+fine for performance but dangerous if descriptors cross protection boundaries,
+uninitialized data, or columns hidden by access policy. Any GPU DB shape-aware
+descriptor must be tied to validated memory regions and column permissions
+before a lower layer may over-fetch.
+
+**Benchmark candidates:**
+
+- Add response-materialization telemetry for retained reads: bytes logically
+  returned, bytes copied, fragments per response, rows per response, encoded
+  bytes, CPU cycles, and queue wait. Proof gate: the runtime can identify when
+  copying or fragmentation, not SQL execution, dominates.
+- Compare three same-shape response paths for projected retained lookups:
+  exact per-column copy, padded/strided copy that includes small gaps, and
+  fully pre-encoded row output. Failure condition: a path wins only because it
+  skips permissions, visibility generation checks, or pgwire correctness.
+- Add a route descriptor for structured output: table id, snapshot generation,
+  column ids, row-id vector or bitmap, physical layout id, and response shape.
+  The descriptor should be usable by CPU encoding today and by RDMA/DPU/GPU
+  transfer experiments later.
+- Benchmark micro-batched projected responses under 10k, 100k, and 1M logical
+  sessions with a bounded number of active sockets. Measure protocol CPU,
+  memory bandwidth, response-ring pressure, and p99 latency.
+- For future distributed or remote-tier tests, implement a synthetic shuffle of
+  resident row ids and column fragments. Compare row-at-a-time sends,
+  contiguous copy-out buffers, and shape-aware scatter descriptors. Required
+  metrics: CPU cores per 100 Gbps equivalent, memory bandwidth, bytes
+  over-fetched, and ordering/visibility failures.
+- Add a safety gate for any over-fetch optimization: the fetched region must be
+  inside one validated relation/column buffer and one snapshot generation, and
+  gap bytes must be non-observable by the receiver.
