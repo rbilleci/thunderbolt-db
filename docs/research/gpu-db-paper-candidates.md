@@ -504,7 +504,7 @@ Append new candidates here as each paper is processed.
   Why: persistent key-value design for high-throughput direct storage and
   multi-core request paths; useful as a contrast to FASTER's HybridLog for
   GPU DB cold-tier point lookups, log replay, and explicit IO ownership.
-- `queued` — **FASTER: An Embedded Concurrent Key-Value Store for State
+- `reviewed` — **FASTER: An Embedded Concurrent Key-Value Store for State
   Management**, Chandramouli et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p1930-chandramouli.pdf`
   Why: system/demo follow-up for FASTER as an embedded state store; useful for

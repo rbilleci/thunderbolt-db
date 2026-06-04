@@ -34805,3 +34805,137 @@ metadata-cache microbenchmark that proves route lookup does not scale with
 logical session count. Fourth, keep GPU indexes like cgRX behind explicit
 route predicates so miss-heavy or update-heavy workloads can choose another
 path.
+
+### 2026-06-04 - FASTER embedded state stores keep hot updates in place while cold state spills
+
+**Citation:** Badrish Chandramouli, Guna Prasaad, Donald Kossmann, Justin
+Levandoski, James Hunter, and Mike Barnett. "FASTER: An Embedded Concurrent
+Key-Value Store for State Management." PVLDB 11(12), 2018, pp. 1930-1933.
+doi:10.14778/3229863.3236227. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol11/p1930-chandramouli.pdf`.
+
+**Category:** transaction processing / write path; multi-tier cache / data
+placement; runtime / HFT / session scale.
+
+**Relevance tags:** state-store integration; read-modify-write updates;
+latch-free hash index; HybridLog; epoch protection; hot-set caching; larger
+than memory state; fuzzy checkpoint; embedded runtime API.
+
+**Core idea:** This short PVLDB demonstration paper packages the FASTER design
+as an embedded state-management component for cloud and streaming
+applications. The full SIGMOD 2018 FASTER paper is already covered in the
+queue, so the incremental value here is the product/runtime framing: update
+heavy applications often need billions of independent state objects, strong
+temporal locality, point reads and read-modify-write updates, and durability
+without paying a socket boundary to Redis-like external caches.
+
+FASTER's answer is to combine a small, latch-free, cache-friendly hash index
+with a HybridLog record allocator spanning memory and storage. Hot records in
+the mutable memory region can be updated in place; colder records move through
+read-only memory and stable storage where updates become read-copy-update
+appends back to the tail. The log therefore acts as a natural cache-shaping
+mechanism without per-record or per-page heat counters. The paper claims up to
+160 million operations per second on one machine for the demonstrated class of
+point-heavy workloads, with recovery from recent index and log snapshots.
+
+**Concrete mechanisms:**
+
+- The exposed operations are `Read`, `Upsert`, `RMW`, and `Delete`. `RMW`
+  accepts application-defined update logic so per-key aggregates and partial
+  value updates do not need a read over the network followed by a separate
+  write.
+- FASTER is embedded in the application/runtime. The C# version uses dynamic
+  code generation for key/value types and callbacks; a C++ version is also
+  mentioned. The goal is to remove the socket/proxy cost of external state
+  stores for hot state operations.
+- Threads execute mostly independently under epoch protection. Epoch trigger
+  actions are used for lazy synchronization of global changes, garbage
+  collection, index resizing, circular-buffer maintenance, page flushing, log
+  page-boundary maintenance, and checkpointing.
+- The hash index is an array of cache-aligned buckets. Each bucket has seven
+  8-byte entries plus one overflow pointer; each entry stores a 48-bit record
+  address and a 15-bit tag rather than the full key.
+- Hash collisions unresolved in the bucket point to reverse linked lists of
+  records. The index supports latch-free reads, deletes, inserts through a
+  tentative-entry protocol, and online resizing coordinated by epochs.
+- HybridLog uses one global logical address space split into stable, read-only,
+  and mutable regions. The stable region is on secondary storage; the
+  read-only and mutable regions are in memory.
+- Records in the mutable region receive in-place updates. Updates to read-only
+  records allocate a new copy at the mutable tail, after which repeated updates
+  can again occur in place while the record remains hot.
+- New allocations use atomic fetch-and-add on the tail offset. Head and
+  read-only offsets are cached per thread and refreshed at epoch boundaries to
+  avoid locking on every read or update.
+- Because threads can have fuzzy views of the read-only boundary, the design
+  defines a safe read-only offset observed by all threads; updates in the fuzzy
+  region are delayed or handled specially to avoid lost updates.
+- Durability uses fuzzy index snapshots and periodic HybridLog consistent
+  points. User calls carry a sequence number used for recovery.
+- Demonstrated workloads include YCSB mixes with reads, blind updates, and
+  read-modify-write operations under changing memory budgets, plus a streaming
+  per-key aggregate state store.
+
+**GPU DB mapping:** The transferable idea is a narrow one: keep hot point-state
+updates close to the execution owner, and let cold state fall through explicit
+tiers without turning every update into append-only churn. For GPU DB, this
+does not replace SQL MVCC, but it can inform point-heavy auxiliary structures:
+per-session counters, route-cache entries, catalog/residency metadata, hot
+aggregate state, compact row-version side records, and possibly future
+partition-owned key/value indexes.
+
+HybridLog maps to a tiered mutation buffer where the mutable head is CPU-DRAM
+truth for hot write amplification control, older read-only regions become
+stable version or checkpoint material, and GPU resident snapshots are rebuilt
+or refreshed from published generation boundaries. The GPU tier should not
+perform durable in-place updates, but a mutation owner can use in-place CPU
+updates for records that remain within one visible generation while publishing
+new immutable GPU snapshots only after WAL safety and invalidation.
+
+The embedded API lesson is also important for the runtime. A future stored
+procedure, COPY aggregation, or retained route admission path should not
+round-trip through a client protocol for each per-key state adjustment. The
+GPU DB equivalent of FASTER's `RMW` is an owner-local operation descriptor:
+typed input, update function, sequence or WAL position, and a completion
+context that can go asynchronous when cold storage, checkpoint, or GPU refresh
+work is needed.
+
+Epoch trigger actions line up with existing snapshot-retirement goals. Instead
+of every request checking expensive global state, threads can periodically
+refresh epochs, and deferred actions can safely reclaim retired resident
+generations, reusable pinned buffers, route descriptors, old hash/index nodes,
+and checkpoint resources after all readers have observed the boundary.
+
+**Risks and mismatches:** FASTER is a key-value state store, not a relational
+SQL engine. It is built around point operations and user-defined update logic,
+not predicates, joins, range-heavy scans, DDL, SQL isolation levels, or
+PostgreSQL protocol semantics. In-place updates are attractive for hot records
+but dangerous if copied directly into SQL-visible MVCC; GPU DB still needs
+WAL-before-visibility and snapshot-consistent old versions. The paper is a
+four-page demo, so several details are delegated to the main SIGMOD paper.
+Unknown from this read: exact recovery latency by dataset size, behavior under
+large values, NUMA effects, and how callback code generation interacts with
+untrusted user logic.
+
+**Benchmark candidates:**
+
+- Add a point-state microbenchmark for a partition-owned hot key/value table:
+  compare append-only version records with an in-place hot-region plus
+  generation-published cold copies. Gate: identical SQL-visible snapshots
+  under retained readers and WAL replay.
+- Prototype owner-local `RMW` descriptors for simple per-key aggregate updates
+  during COPY or ingest. Measure protocol round trips avoided, mutation-owner
+  queue time, and WAL batch size.
+- Add epoch-triggered reclamation for retired route descriptors or resident
+  generation handles. Gate: no generation is freed while any retained read
+  still references it, and reclamation latency is visible in telemetry.
+- Test hot-set drift across DRAM and NVMe-like cold state: vary memory budget,
+  Zipf skew, and update/read mix, then measure p50/p95 update latency,
+  read-copy-update rate, checkpoint bytes, and recovery rebuild time.
+- Compare cache-shaping policies for cold point state: explicit heat counters,
+  LRU-style admission, and HybridLog-style second-chance movement through a
+  read-only region. Failure condition: the policy hides write amplification or
+  produces unbounded tail latency during checkpoint/flush.
+- Keep any GPU-resident point index as rebuildable acceleration state. Proof
+  gate: after crash/replay, CPU truth and route metadata can rebuild the same
+  visible key set without trusting GPU memory or stale in-place records.
