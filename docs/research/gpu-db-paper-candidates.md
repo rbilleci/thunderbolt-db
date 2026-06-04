@@ -2582,12 +2582,20 @@ Append new candidates here as each paper is processed.
   evaluation; useful for deciding whether GPU DB owner-thread and
   partition-owner experiments should emulate many-core effects or require
   real multi-socket validation.
-- `queued` — **NWR: Rethinking Thomas Write Rule for Omittable Write
+- `reviewed` — **NWR: Rethinking Thomas Write Rule for Omittable Write
   Operations**, Nakazono et al., arXiv 2020.
   URL: `https://arxiv.org/abs/1904.08119`
   Why: CCBench points to non-visible writes as a version-lifetime direction;
   NWR is relevant to blind-write and stale-version elision without weakening
   WAL-before-visibility or SQL-visible conflict behavior.
+- `queued` — **No False Negatives: Accepting All Useful Schedules in a Fast
+  Serializable Many-Core System**, Durner and Neumann, ICDE 2019.
+  URL: `https://doi.org/10.1109/ICDE.2019.00071`
+  PDF: `https://db.cs.tum.edu/~durner/papers/no-false-negatives-icde19.pdf`
+  Why: NWR contrasts against graph-based serializable scheduling; useful for
+  deciding whether GPU DB should accept more useful mixed read/write schedules
+  with explicit conflict graphs instead of relying only on abort-heavy OCC or
+  narrow non-visible-write elision.
 - `queued` — **Velox: Meta's Unified Execution Engine**,
   Pedreira et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p3372-pedreira.pdf`

@@ -30744,3 +30744,163 @@ condition is not maximum average throughput. It is stable p99 under
 mixed routes, low idle time when capacity is available, deterministic
 rejection when credits are exhausted, and no WAL/visibility fallback
 being bypassed by an adaptive route hint.
+
+### 2026-06-04 - NWR omits blind writes only when another visible version makes them unreachable
+
+**Citation:** Sho Nakazono, Hiroyuki Uchiyama, Yasuhiro Fujiwara,
+Yasuhiro Nakamura, and Hideyuki Kawashima. "NWR: Rethinking Thomas
+Write Rule for Omittable Write Operations." arXiv:1904.08119v3, 2020.
+Retrieved 2026-06-04 from `https://arxiv.org/abs/1904.08119`.
+
+**Category:** transaction processing / write path and MVCC / snapshot /
+visibility.
+
+**Relevance tags:** write contention; blind writes; non-visible writes;
+strict serializability; recoverability; version orders; epoch group
+commit; lock-free metadata; hot counters; write admission.
+
+**Core idea:** NWR reinterprets the old Thomas write rule as a
+version-order problem rather than a timestamp-ordering trick. A write can
+be omitted only if no future transaction can observe the version it would
+have created, and the system can prove that omitting it still preserves
+strict serializability and recoverability. The authors define a
+Non-visible Write Rule that lets an existing concurrency-control protocol
+try an extra version order at commit time. If that extra order validates,
+the transaction commits while omitting all of its writes; if it does not
+validate, control falls back to the baseline protocol, so the extension
+does not directly add false aborts.
+
+The useful workload shape is narrow but important: highly contended
+blind writes where many transactions overwrite the same item and only the
+latest concurrent blind write needs to become visible. In their C++
+in-memory key-value prototype, Silo+NWR, TicToc+NWR, and MVTO+NWR are
+compared on YCSB and TPC-C. The strongest reported result is more than
+11x better throughput than the original protocol in highly write-
+contended YCSB-A. In TPC-C, where the meaningful writes are mostly
+read-modify-write and therefore not omittable, Silo+NWR and TicToc+NWR
+stay within roughly 10% of their originals, while MVTO+NWR drops to about
+0.84x due to extra version-list traversal.
+
+**Concrete mechanisms:**
+
+- A write operation is defined as omittable if no transaction can ever
+  read the version it would create. Omitting is modeled as indefinitely
+  delaying the write, with no lock, timestamp update, buffer update,
+  index update, or log record for that omitted version.
+- NWR extends a baseline strict-serializable and recoverable protocol at
+  commit time. It first tries to generate an additional version order
+  `NWR` around the transaction's write set. If that order validates, the
+  writes are omitted and the transaction commits; if validation fails,
+  the original protocol handles commit or abort.
+- The extra version order places each candidate omitted version just
+  before a pivot version for the same data item. The pivot must come from
+  another concurrent blind write. Read-modify-write pivot versions make
+  the serializability validation fail, and inserts are not omittable
+  because the only prior version is the initial version from a non-
+  concurrent transaction.
+- NWR's correctness condition has five pieces: non-visible property,
+  preserving unrelated version order, recoverability, serializability,
+  and strict-serializability concurrency between the candidate
+  transaction and reachable pivot transactions.
+- The implementation stores a 128-bit pivot-version object per data
+  item: 32-bit epoch, 32-bit pivot version, 32-bit merged read-set
+  summary, and 32-bit merged write-set summary. On machines with 128-bit
+  compare-and-swap, the pivot object can be updated lock-free.
+- Epoch-based group commit supplies the strict-serializability
+  concurrency test. Transactions in the same epoch are treated as
+  concurrent, and a pivot object with a mismatched epoch fails the NWR
+  validation.
+- Merged read/write summaries are tiny hash tables containing compressed
+  version numbers. Hash collisions and version-number truncation produce
+  false positives: the NWR path gives up and falls back, but does not
+  accept an unsafe omitted write.
+- Silo+NWR can reuse Silo's read-set validation for overwritten reads and
+  expands Silo's transaction-id object into the pivot object. TicToc+NWR
+  compresses timestamp metadata to fit the pivot fields. MVTO+NWR needs
+  additional anti-dependency validation and can pay extra cache traffic.
+- In high-contention YCSB-A, once one visible blind write establishes the
+  pivot for an epoch, many later blind writes can be omitted. In the
+  paper's explanation, this also improves read locality because readers
+  see stable cached versions instead of every overwrite producing a new
+  visible version.
+
+**GPU DB mapping:** NWR is not a general mutation protocol for the GPU
+DB, but it is a sharp candidate for narrow write-admission classes:
+session heartbeat rows, per-route telemetry counters, stale placement
+hints, last-seen timestamps, idempotent cache-status writes, or derived
+metadata where intermediate blind overwrites have no SQL-visible value.
+Those writes currently risk consuming owner-queue slots, WAL bandwidth,
+index maintenance, invalidation generations, and retained snapshot
+retirement work even when only the latest value matters.
+
+The mapping should be conservative. The mutation owner could expose an
+explicit "omittable blind overwrite" route only for table columns or
+internal metadata keys whose SQL semantics prove that skipped
+intermediate versions cannot be observed. A route descriptor would need
+the key, epoch/generation, pivot version, whether the operation is a
+blind write, and why no read-modify-write invariant is being bypassed.
+Ordinary `UPDATE balance = balance + x`, inventory decrements, MVCC user
+rows, catalog writes, and anything that participates in constraints
+should stay on the normal WAL/MVCC path.
+
+The pivot-version object maps well to owner-local metadata. A partition
+owner can keep a compact pivot summary per hot key or per hot metadata
+slot, and a mutation epoch can bound which writes are concurrent. If the
+NWR check passes, the owner can coalesce the write before publishing
+visibility, reducing invalidations and resident-refresh churn. If it
+fails, the request falls back to ordinary commit processing, preserving
+the current WAL-before-visibility rule.
+
+For GPU-resident snapshots, the transferable idea is generation
+coalescing. If ten same-key blind metadata writes arrive in one safe
+epoch, only the visible final value should force a resident generation or
+route-cache update. This could reduce write amplification into the
+residency owner and keep read snapshots from retiring just because
+invisible intermediate states existed.
+
+**Risks and mismatches:** The paper is an arXiv prototype, not a
+production DBMS paper, and its experimental system is an embedded
+in-memory key-value store without networked SQL sessions, full SQL
+constraints, GPU execution, or recovery details for a production WAL.
+NWR helps only blind writes that can be proven non-visible. It is the
+wrong tool for read-modify-write transactions, inserts, constraint-
+checked updates, user-visible version history, or transaction templates
+where applications expect every write to have an observable effect.
+
+The epoch tradeoff is also dangerous for latency. Larger epochs improve
+NWR success because more transactions are concurrent, but they can add a
+commit-delay floor. The GPU DB cannot hide that latency inside retained
+read batching if a client expects a fast write acknowledgment. Finally,
+the 128-bit pivot object and tiny merged read/write summaries are
+CPU-cache-friendly, but they are not free; hot metadata keys could still
+become coherence bottlenecks if every logical session updates the same
+pivot.
+
+**Benchmark candidates:**
+
+- Add a no-GPU blind-overwrite coalescing benchmark for internal
+  metadata keys: session heartbeat, route-cache freshness, and placement
+  hint. Compare normal WAL-visible writes, owner-side last-writer-wins
+  coalescing before WAL, and an NWR-like epoch/pivot path. Gate:
+  identical externally visible final values and no skipped writes for
+  non-omittable routes.
+- Build a negative benchmark with `UPDATE value = value + 1`, inventory
+  decrement, and catalog generation writes. The proof gate is that the
+  NWR/coalescing path rejects or falls back for every read-modify-write
+  and constraint-sensitive operation.
+- Add mutation telemetry fields:
+  `write_route_class`, `blind_write_candidate`, `nwr_pivot_epoch`,
+  `nwr_validation_result`, `omitted_write_count`,
+  `coalesced_visible_write_count`, and `nwr_fallback_reason`.
+- Simulate mutation epoch duration under 1M logical sessions with hot
+  telemetry writes. Measure p50/p99 write acknowledgment latency,
+  owner-queue wait, WAL bytes, invalidation count, and retained snapshot
+  retirements at epoch windows from tens of microseconds to milliseconds.
+- Test resident-generation churn with and without blind-write
+  coalescing. Failure condition: invisible intermediate metadata writes
+  still trigger GPU refresh, route-cache invalidation, or retained
+  snapshot retirement.
+- Add a crash/replay proof for coalesced internal writes. WAL replay must
+  recover the same visible final value and route generation as normal
+  execution, and omitted intermediate states must not be required by any
+  SQL-visible invariant.
