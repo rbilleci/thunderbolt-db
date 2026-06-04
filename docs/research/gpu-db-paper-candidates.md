@@ -606,21 +606,29 @@ Append new candidates here as each paper is processed.
   interrupts and optimistic concurrency to preempt long low-priority
   transactions for short high-priority work; selected because recent synthesis
   called for more transaction/runtime papers after HTAP/GPU scheduling work.
-- `queued` — **Shinjuku: Preemptive Scheduling for Microsecond-scale Tail
+- `reviewed` — **Shinjuku: Preemptive Scheduling for Microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
   PDF: `https://www.usenix.org/system/files/nsdi19-kaffes.pdf`
   Why: PreemptDB's related work contrasts Shinjuku's hardware-virtualization
   preemption for microsecond services; useful for comparing DB-internal
   preemption with runtime-level request preemption for mixed point/range query
-  latency.
-- `queued` — **CoroBase: Coroutine-Oriented Main-Memory Database Engine**,
-  He, Lu, and Wang, PVLDB 2020.
+  latency. Reviewed later in this queue.
+- `reviewed` — **CoroBase: Coroutine-Oriented Main-Memory Database Engine**,
+  He, Lu, and Wang, PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p431-he.pdf`
   arXiv: `https://arxiv.org/abs/2010.15981`
   Why: PreemptDB contrasts cooperative coroutine scheduling with preemptive
   scheduling; useful for evaluating whether GPU DB should use cooperative
   latency hiding for memory/NVMe stalls, preemption for urgent routes, or both.
+- `queued` — **Asynchronous Memory Access Chaining**, Kocberber, Falsafi, and
+  Grot, PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol9/p252-kocberber.pdf`
+  DOI: `https://doi.org/10.14778/2850578.2850581`
+  Why: CoroBase uses AMAC-style hand-crafted state machines as the upper-bound
+  comparison for pointer-stall hiding; useful for deciding whether selected
+  GPU DB metadata paths deserve explicit state-machine optimization instead
+  of general coroutine machinery.
 - `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`

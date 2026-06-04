@@ -50499,3 +50499,209 @@ work.
   the interrupt path beats cooperative chunking on urgent p99 while preserving
   non-preemptible correctness and showing negligible overhead when no urgent
   work is present.
+
+### 2026-06-05 - CoroBase hides pointer stalls by batching transactions as coroutines
+
+**Citation:** Yongjun He, Jiacheng Lu, and Tianzheng Wang. "CoroBase:
+Coroutine-Oriented Main-Memory Database Engine." PVLDB 14(3), 2021.
+doi:10.14778/3430915.3430932. Retrieved 2026-06-05 from
+`https://arxiv.org/pdf/2010.15981` after the VLDB PDF URL timed out.
+
+**Category:** runtime / HFT / session scale; transaction processing and
+MVCC execution.
+
+**Relevance tags:** coroutine scheduling; software prefetching; memory stalls;
+inter-transaction batching; MVCC version chains; Masstree; transaction-local
+state; epoch reclamation; latency/throughput tradeoff.
+
+**Core idea:** CoroBase asks whether coroutine-based software prefetching can
+be applied to a full main-memory transactional engine without forcing
+applications to use multi-key APIs. Its answer is the coroutine-to-transaction
+model: each worker runs a small batch of active transactions as stackless
+coroutines, suspending after prefetch points in index and MVCC version-chain
+traversal and resuming another transaction while the memory access is in
+flight.
+
+The transferable point is that memory-latency hiding can be an execution-model
+property rather than an operator-specific interface. CoroBase does not require
+a client or stored procedure to expose all keys up front. It preserves ordinary
+single-key record APIs while the engine internally creates inter-transaction
+batching opportunities. On a 48-core server, the paper reports close to 2x
+improvement for read-intensive workloads over optimized baselines, weaker but
+sometimes positive gains for writes, and competitive behavior when workloads
+do not expose enough cache misses to hide.
+
+**Concrete mechanisms:**
+
+- CoroBase is built from ERMIA, a shared-everything, multi-version,
+  main-memory engine. Tables use indexes mapping keys to stable record ids,
+  an indirection array mapping record ids to latest versions, and linked MVCC
+  version chains ordered by logical timestamps.
+- Worker threads run a scheduler over a fixed batch of transaction coroutines.
+  A transaction suspends when record access code issues a prefetch before
+  likely cache-missing index-node or version-chain dereferences.
+- The scheduler processes a whole batch before admitting replacements. This
+  preserves locality, avoids irregular transaction-context initialization, and
+  simplifies epoch-based reclamation, at the cost of higher per-transaction
+  latency as batch size grows.
+- A naive fully nested coroutine conversion was too expensive. CoroBase uses a
+  two-level design: transaction coroutines call flattened single-level
+  operation coroutines for get/update/insert paths, reducing coroutine-frame
+  chains and switches while keeping the application-facing API intact.
+- Prefetch/suspend points are inserted only on profiled pointer-chasing paths
+  such as Masstree traversal and MVCC version-chain traversal. Structural
+  modification paths with hand-over-hand locking are not suspended because
+  their cache misses were a small share of insert-only misses and suspension
+  while holding latches would complicate correctness.
+- Epoch reclamation is moved from transaction boundaries to scheduler batch
+  boundaries. The worker enters an epoch before processing the batch and exits
+  after the whole batch completes, preventing one coroutine from freeing memory
+  still needed by another coroutine on the same thread.
+- Thread-local read/write sets, log buffers, scratch areas, and SSN reader
+  bitmaps are expanded into per-batch-slot transaction-local arrays. This keeps
+  low allocation overhead while preventing two active transactions on the same
+  OS thread from sharing mutable transaction state.
+- Snapshot isolation uses ERMIA-style begin and commit timestamps from a
+  global counter. The paper reports no fundamental SI change was needed for
+  shared-everything MVCC, while SSN serializability needed transaction-local
+  reader tracking.
+- The paper warns that coroutine-to-transaction fits optimistic or
+  multi-version systems best. Pessimistic locking can deadlock or widen latch
+  hazards if a transaction suspends while holding a lock.
+- Evaluation uses direct C++ engine APIs rather than SQL or networking. YCSB
+  read-only transactions with 10 reads improve about 1.8x over ERMIA without
+  hyperthreading and about 1.3x with hyperthreading. TPC-CR sees up to 1.55x
+  without hyperthreading and 1.3x with hyperthreading. Write-intensive TPC-C
+  mostly matches ERMIA, and high-skew update/RMW workloads can lose ground
+  because contention and atomic updates dominate memory stalls.
+
+**GPU DB mapping:** CoroBase is a strong complement to PreemptDB. PreemptDB
+says urgent work needs a preemption contract; CoroBase says ordinary pointer
+stalls can be hidden with cooperative suspension if the runtime keeps
+transaction-local state and critical sections explicit. GPU DB should treat
+these as two route classes: cooperative latency hiding for predictable stalls,
+and priority/preemption or fallback for urgent retained reads.
+
+The first mapping is the CPU side of the runtime, especially CPU index lookup,
+MVCC version-chain traversal, resident metadata lookup, cold-tier metadata
+lookup, and route-cache checks before GPU execution. Those paths may miss CPU
+caches or future CXL/NVMe-backed memory. A small active window of retained read
+or point-write tasks could issue prefetches, suspend at safe boundaries, and
+resume another route without requiring SQL clients to batch keys explicitly.
+
+The resource-management lesson is more important than the coroutine syntax.
+If one worker hosts multiple active logical requests, thread-local state is no
+longer request-local. GPU DB route tokens must own error state, transaction or
+statement snapshot state, response buffers, decoded input chunks, WAL/log
+buffers, pinned staging handles, and telemetry slots explicitly. Reusing TLS
+for those fields would be incorrect once coroutines, fibers, or user-level
+tasks enter the hot path.
+
+The batch-level epoch idea maps to retained snapshots and buffer retirement.
+An execution owner can enter a snapshot/epoch lease for an active route window,
+process several cooperative tasks, and retire old MVCC versions, resident
+metadata, or response buffers only after all tasks in the window have crossed a
+safe point. That is a cleaner first prototype than per-coroutine reclamation
+for every read.
+
+For GPU work itself, CoroBase does not solve kernel scheduling, but it suggests
+how to feed kernels. Same-shape lookup and short aggregate requests can be
+collected as a small active window; CPU-side pointer stalls and route checks
+are overlapped before compatible requests are emitted as a GPU micro-batch.
+Long scans should not be mixed into the same cooperative window unless the
+scheduler understands priority and starvation.
+
+**Risks and mismatches:** CoroBase is CPU-only and memory-resident. It does not
+cover pgwire, SQL parsing, optimizer time, WAL IO latency, GPU streams, CUDA
+memory ownership, or NVMe cold-tier stalls. Its evaluation uses benchmark code
+linked directly against the engine, so the absolute latency/throughput numbers
+are not transferable to a networked GPU DB server.
+
+Coroutine batching increases latency as batch size grows. The paper found
+batch size four best for tested YCSB/TPC-C latency and eight often best for
+throughput, but GPU DB may need smaller windows for p99-sensitive retained
+reads. The design also assumes optimistic/MVCC access paths and avoids
+suspending inside latch-heavy structural modification paths. GPU DB must mark
+WAL publication, visibility publication, catalog generation swaps, resident
+snapshot publication, CUDA buffer handoff, and response ownership transitions
+as non-suspendable unless they are made restartable.
+
+Finally, the version-chain and Masstree wins appear when pointer chasing is a
+real bottleneck. If the hot data fits in cache, if hyperthreading already hides
+most stalls, or if high contention/atomics dominate, coroutine machinery can be
+pure overhead. Any implementation should be gated by stall telemetry, not added
+as a default path everywhere.
+
+**Benchmark candidates:**
+
+- Build a CPU-only cooperative route-window harness for retained point reads:
+  active window sizes 1, 2, 4, 8, and 16; route checks over CPU index,
+  MVCC/version metadata, and resident snapshot metadata; measure p50/p99,
+  stalls, queue wait, and throughput. Failure condition: p99 worsens without
+  enough throughput gain at the chosen window.
+- Convert one internal lookup path to an explicit state-machine or coroutine
+  prototype with safe suspend points before pointer-chasing metadata reads.
+  Gate: identical visibility and error behavior under insert/update/delete,
+  retained snapshots, and WAL replay fixtures.
+- Audit runtime TLS candidates before adding user-level scheduling: statement
+  state, transaction snapshot, error context, response buffer, log buffer,
+  scratch allocator, pinned staging, telemetry, and prepared-route state must
+  become route-local or batch-slot-local.
+- Add `may_suspend` and `non_suspendable_reason` metadata alongside the
+  PreemptDB `preemptible` tags. Minimum proof: no suspension inside WAL flush,
+  visibility publish, catalog generation swap, resident publication, CUDA
+  ownership transition, or response-buffer handoff.
+- Compare cooperative route-window scheduling with explicit multi-key SQL
+  batching for same-shape lookups. Expected result: explicit batching should
+  still win when available, but coroutine-to-route should help short single-key
+  requests without changing the client API.
+- Measure hot-skew write/RMW workloads separately. Failure condition:
+  coroutine windows widen conflict windows or abort rates enough to erase
+  memory-stall gains.
+- Add snapshot/epoch lease accounting for a window of retained reads. Old
+  MVCC versions, resident metadata, and buffers may retire only after every
+  active route in the window has released or crossed a declared safe point.
+
+### 2026-06-05 - Cross-paper synthesis: route scheduling needs both urgency and stall hiding
+
+FW-KV, PreemptDB, and CoroBase refine the same runtime question from different
+angles. FW-KV gives a correctness shape for fresher partitioned reads:
+statement tokens can advance per owner on first contact only if later fragments
+respect that compatibility. PreemptDB gives an urgency shape: short,
+high-priority work needs a way around long work, with explicit non-preemptible
+regions. CoroBase gives a throughput shape: normal pointer stalls can be hidden
+by cooperatively interleaving a small active window of transactions without
+changing the external API.
+
+**Converging design tracks:**
+
+- Route tokens should combine visibility and scheduling state: snapshot or
+  partition vector, first-contact/fixed-owner markers, priority class, active
+  window slot, safe suspend/preempt boundaries, buffer handles, and completion
+  owner.
+- The runtime needs two separate controls: cooperative stall hiding for normal
+  retained reads and metadata-heavy point work, and preemptive or priority-lane
+  admission for urgent reads that cannot wait behind long refresh, scan, or
+  CPU fallback work.
+- Per-thread state must shrink into owner-local or route-local state before
+  1M logical sessions are plausible. TLS is fine for immutable worker
+  constants, but mutable request state must belong to a route token or
+  batch-slot context.
+- Freshness, suspension, and preemption boundaries should share one safety
+  vocabulary. The same places that cannot be preempted usually cannot be
+  suspended or freshness-advanced: WAL publish, visibility publish, catalog
+  generation swap, resident snapshot publication, CUDA ownership transfer, and
+  response handoff.
+
+**Category gaps:** The latest set is strong on runtime/MVCC scheduling but
+still light on recovery, online partition movement, and storage-tier write
+amplification. The next selections should prefer transaction/storage movement,
+recovery, or direct cache/tier placement unless a newer concurrency paper is
+exceptionally relevant.
+
+**Benchmark priorities:** Build a route-token harness before CUDA tuning. The
+first gate should mix FW-KV-style partition freshness, PreemptDB-style urgent
+lanes, and CoroBase-style cooperative windows over CPU metadata. Measure
+correctness first, then p99 urgent latency, ordinary read throughput, abort
+rate, route-local memory per active request, and cleanup lag for retired
+snapshots/buffers.
