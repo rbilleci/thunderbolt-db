@@ -485,7 +485,7 @@ Append new candidates here as each paper is processed.
   Why: RTCUDB cites RTIndex as related RT-core indexing work; useful for
   evaluating whether resident equality/range indexes can map to BVH traversal
   without forcing the whole query into a ray-tracing job.
-- `queued` — **DBOS: A DBMS-oriented Operating System**,
+- `reviewed` — **DBOS: A DBMS-oriented Operating System**,
   Skiadopoulos et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf`
   Why: full DBOS system paper with scheduler, file-system, and IPC experiments;
@@ -760,6 +760,13 @@ Append new candidates here as each paper is processed.
   Why: decentralized logging and checkpointing foundation used by Umbra;
   relevant to WAL-before-visibility, batch commit, replay, and separating
   durable authority from rebuildable GPU residency state.
+- `queued` — **Understanding Manycore Scalability of File Systems**,
+  Min et al., USENIX ATC 2016.
+  URL:
+  `https://www.usenix.org/conference/atc16/technical-sessions/presentation/min`
+  Why: DBOS cites file-system global locks and manycore scalability as a
+  storage-service bottleneck; useful for comparing DB-owned cold-tier metadata,
+  partitioned resident-placement state, and kernel/filesystem contention risks.
 - `reviewed` — **Scalable Garbage Collection for In-Memory MVCC Systems**,
   Boettcher et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol13/p128-bottcher.pdf`

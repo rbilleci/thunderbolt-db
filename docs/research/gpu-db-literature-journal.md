@@ -28883,3 +28883,163 @@ route option, not a storage default.
 - Add admission protection for large transformed outputs. A GFTR route
   must reserve scratch/output memory before launch and reject or fall back
   when transforming all payload columns would exceed the GPU memory budget.
+
+### 2026-06-04 - DBOS makes runtime state queryable without making every fast path a table lookup
+
+**Citation:** Athinagoras Skiadopoulos, Qian Li, Peter Kraft, Kostis
+Kaffes, Daniel Hong, Shana Mathew, David Bestor, Michael Cafarella,
+Vijay Gadepally, Goetz Graefe, Jeremy Kepner, Christos Kozyrakis, Tim
+Kraska, Michael Stonebraker, Lalith Suresh, and Matei Zaharia. "DBOS:
+A DBMS-oriented Operating System." PVLDB 15(1), 2022, pp. 21-30.
+doi:10.14778/3485450.3485454. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf`.
+
+**Category:** runtime / HFT / session scale; multi-tier cache / data
+placement.
+
+**Relevance tags:** DB/OS co-design; transactional scheduler state;
+IPC tables; filesystem metadata; placement metadata; capacity
+accounting; serverless task graphs; observability; SQL-managed system
+state; partition locality; admission control.
+
+**Core idea:** DBOS argues that modern operating-system state is a
+large structured-data problem and should be represented as relational
+tables managed by a distributed transactional DBMS. The paper's straw
+prototype implements three OS services on VoltDB: task scheduling, IPC,
+and filesystem operations. The point is not that every byte movement
+should literally become a SQL query on the hot path. The useful idea for
+GPU DB is that capacity, placement, task ownership, messages, file
+blocks, provenance, and service state can share one transactional schema
+instead of being scattered across ad hoc queues, filesystem metadata,
+side logs, and monitoring systems.
+
+The evaluation is deliberately early-stage but concrete. A simple FIFO
+task scheduler implemented as a stored procedure schedules about 750K
+tasks/second with sub-millisecond tail latency in the paper's
+experiment, and the median remains around 200 microseconds near 1M
+tasks/second load. DBMS-backed IPC is slower than bare TCP/IP and often
+slower than gRPC for ordinary ping-pong, but beats gRPC in some batched
+and fan-out patterns. The filesystem experiments show a familiar trade:
+DBOS can beat ext4 for some metadata-heavy operations and saturate a
+25Gbps network quickly for parallel large reads, but VoltDB invocation
+overhead hurts small reads.
+
+**Concrete mechanisms:**
+
+- The proposed stack has user tasks above DBOS services, those services
+  above a distributed transactional DBMS, and a minimal microkernel below
+  it for raw devices, interrupts, and basic communication.
+- DBOS targets serverless-style short tasks whose memory footprint is
+  declared before execution; a task runs only if its footprint can be
+  admitted, avoiding general demand-paging assumptions.
+- Scheduler state is represented by `Task` and `Worker` tables. Workers
+  carry partition keys and unused capacity; scheduling procedures select
+  a worker, decrement capacity, and insert or update the task row
+  transactionally.
+- Scheduler variants are expressed as small SQL/procedure changes:
+  random FIFO partition probing, home-partition locality, deferred
+  assignment under load, or least-loaded worker selection using an
+  `order by unused_capacity desc` clause.
+- VoltDB is partitioned by user-defined keys, and the paper stresses that
+  single-partition stored procedures avoid network traffic and get the
+  highest throughput.
+- IPC is represented as a `Message(sender_id, receiver_id, message_id,
+  data)` table partitioned by receiver. Sending inserts a row; receiving
+  locally reads it; exactly-once delivery is described as deleting the
+  row after receipt.
+- Message replication can make IPC survive node failure without message
+  loss. In-order delivery is handled by indexing on an application or
+  library message id.
+- Filesystem metadata and bytes are stored in tables: `Map`, `User`,
+  `Directory`, `Localized_file`, and `Parallel_file`.
+- The localized file layout partitions a user's files by home partition,
+  favoring small-file locality. The parallel file layout partitions by
+  block number, favoring large reads and writes across many partitions.
+- Fully qualified filenames and a current-path field in the `User` table
+  make `open` and `close` no-ops in the prototype.
+- Large parallel reads fan out stored procedures to partitions holding
+  block ranges and collate responses at the stub.
+- The paper repeatedly frames monitoring, debugging, security, and
+  provenance as SQL queries over structured system tables rather than
+  bolt-on observability systems.
+- The prototype is "DBOS-straw": Linux remains below VoltDB, spilling to
+  disk is future work, and later DBOS-wood/brick stages are proposed
+  rather than evaluated in this paper.
+
+**GPU DB mapping:** DBOS strengthens the case for explicit runtime state
+schemas around the owner-domain architecture in
+`11-high-throughput-query-runtime.md`. GPU DB does not need to route every
+pgwire message through SQL, but it should make session admission,
+owner-queue capacity, GPU work slots, pinned-buffer budgets, resident
+segment placement, and response-ring pressure first-class structured
+state. That lets the engine answer operational questions such as "which
+sessions are pinning old snapshots?", "which resident generations are
+blocked by capacity?", or "which route classes are consuming GPU slots?"
+without reverse-engineering metrics from unrelated counters.
+
+The scheduler tables map naturally to admission and placement. A GPU DB
+`Task` equivalent could be a route descriptor row or in-memory record
+with snapshot generation, target owner, route class, memory footprint,
+deadline/latency class, and admitted resource credits. A `Worker`
+equivalent could describe network IO workers, mutation owners, residency
+owners, GPU execution streams, partition owners, and cold-tier IO lanes
+with explicit unused capacity and locality. The key DBOS warning is that
+single-partition locality matters: the engine should prefer scheduling a
+request at the owner or resident partition that already has the relevant
+state rather than bouncing across global schedulers.
+
+The IPC table is a useful conceptual model for response rings, but not a
+literal replacement for hot rings. For correctness and observability, a
+message has sender, receiver, id, payload, ordering, and completion or
+deletion semantics. The hot implementation can remain bounded rings and
+preallocated buffers; the metadata and telemetry should still expose the
+same concepts, including exactly-once response completion, retry/failure
+state, and oldest unconsumed messages.
+
+The filesystem section maps to P8 tiering. A localized file is analogous
+to keeping a hot table, segment, or tenant's resident snapshot near its
+home owner. A parallel file is analogous to spreading large analytical or
+over-resident scans across partitions and IO/GPU lanes. GPU DB should not
+use one layout for all data: small hot key ranges need locality, while
+large resident or cold scans need partitioned range/block placement with
+collation metadata.
+
+**Risks and mismatches:** DBOS is a broad architecture/prototype paper,
+not a production database runtime for SQL sessions. It does not solve
+MVCC visibility, WAL-before-visibility, pgwire parsing, GPU residency,
+CUDA stream ownership, or high-frequency per-request memory management.
+Several evaluated services run on VoltDB over Linux, so the numbers mix
+DBOS ideas with VoltDB and Supercloud characteristics. IPC can be slower
+than gRPC or TCP/IP, and the paper explicitly notes extra copies,
+polling, and invocation overhead. The claim to avoid flow control because
+DBMSs store massive data should not be copied into GPU DB; pinned
+buffers, GPU memory, response rings, and WAL queues are finite and need
+hard backpressure.
+
+**Benchmark candidates:**
+
+- Add a no-GPU structured runtime-state prototype for admitted work:
+  route id, session id, owner id, snapshot generation, route class,
+  resource credits, queue-enter time, and completion state. Gate:
+  existing retained-read and mutation tests behave identically while
+  state snapshots can explain queue depth and saturation.
+- Compare a locality-aware admission policy against a global FIFO policy
+  for retained reads and COPY chunks. Metrics: owner hops, queue wait,
+  p50/p99 latency, fallback/rejection count, and per-owner imbalance.
+- Build a "logical message table" telemetry view over response rings:
+  sender, receiver, request id, generation, buffer state, bytes, and
+  completion/delete timestamp. Failure condition: buffers can be reused
+  before a visible completion transition exists.
+- Add resident-placement metadata that can represent both localized and
+  parallel layouts: home owner, partition/block range, resident bytes,
+  cold-tier bytes, source WAL boundary, and collation/scatter method.
+  Gate: planner logs can explain why a point lookup chose locality while
+  a scan chose fan-out.
+- Create a session-scale observability probe for 1M logical sessions
+  with only a bounded active subset. Required output: bytes per idle
+  session, active route records, oldest retained snapshot holders, and
+  exact admission reason when capacity is exhausted.
+- Test invocation overhead explicitly. Compare direct ring enqueue,
+  structured-state update plus ring enqueue, and SQL/table-backed
+  bookkeeping for one synthetic route. Gate: production hot paths retain
+  ring-level latency while preserving queryable metadata out of band.
