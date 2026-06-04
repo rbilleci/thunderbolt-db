@@ -1716,9 +1716,11 @@ Append new candidates here as each paper is processed.
   Why: read-promotion paper cites this as a direction for transaction programs
   with predicate reads; relevant to GPU DB route templates that include ranges,
   prefix predicates, and phantom-sensitive retained scans.
-- `queued` — **Allocating Isolation Levels to Transactions in a Multiversion
+- `reviewed` — **Allocating Isolation Levels to Transactions in a Multiversion
   Setting**, Vandevoort, Ketsman, and Neven, PODS 2023.
   URL: `https://doi.org/10.1145/3584372.3588672`
+  PDF:
+  `https://documentserver.uhasselt.be/bitstream/1942/42231/2/main%20%281%29.pdf`
   Why: direct predecessor to the view/conflict robustness result; useful for
   automated RC/SI/SSI route-template allocation before deciding whether a
   retained read or write template can bypass the strongest isolation path.
@@ -3344,3 +3346,11 @@ Append new candidates here as each paper is processed.
   Why: Auto-WLM cites database-agnostic workload management as related
   production-oriented scheduling work; useful for comparing external workload
   control with an engine-integrated GPU route/admission controller.
+- `queued` — **IsoDiff: Debugging Anomalies Caused by Weak Isolation**, Gan,
+  Ren, Ripberger, Blanas, and Wang, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p2773-gan.pdf`
+  DOI: `https://doi.org/10.14778/3407790.3407860`
+  Why: the mixed-isolation allocation paper contrasts static robustness with
+  trace-based anomaly debugging; useful for a GPU DB isolation-template
+  validation harness that compares static route certification with observed
+  weak-isolation anomaly traces.

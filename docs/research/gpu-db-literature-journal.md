@@ -40850,3 +40850,154 @@ Benchmark priorities:
   short/long workloads;
 - 1M logical-session spike test with bounded active credits, pinned-buffer
   budgets, response-ring budgets, and explainable overload reasons.
+
+### 2026-06-04 - Mixed isolation can be a route contract, not just a session default
+
+**Citation:** Brecht Vandevoort, Bas Ketsman, and Frank Neven. "Allocating
+Isolation Levels to Transactions in a Multiversion Setting." PODS 2023,
+pp. 69-78. DOI `10.1145/3584372.3588672`. Retrieved 2026-06-04 from the
+UHasselt peer-reviewed author version,
+`https://documentserver.uhasselt.be/bitstream/1942/42231/2/main%20%281%29.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing /
+concurrency control.
+
+**Relevance tags:** mixed isolation; read committed; snapshot isolation;
+serializable snapshot isolation; robust allocation; transaction templates;
+route certification; retained reads; predicate-sensitive transactions; MVCC
+admission.
+
+**Core idea:** The paper studies when a workload can safely run different
+transaction types at different multiversion isolation levels without losing
+serializability. Rather than treating `SERIALIZABLE` as an all-or-nothing
+setting, it asks whether a specific allocation of transactions to RC, SI, and
+SSI is robust: every interleaving admitted by those isolation levels remains
+conflict-serializable. It then gives polynomial-time procedures for deciding
+robustness and computing an optimal robust allocation that prefers weaker
+levels when they are provably safe.
+
+For GPU DB, the transferable idea is that isolation can become part of a route
+contract. A retained read route, GPU lookup batch, CPU fallback, or mutation
+owner path should not merely inherit a session default. It can carry a
+template-level isolation certificate saying "this shape is safe at RC", "this
+one needs SI", or "this one must go through SSI/owner serialization." That
+fits the current direction toward guarded route descriptors: fast paths are
+allowed only when the visibility proof is explicit.
+
+**Concrete mechanisms:**
+
+- The model considers a finite set of transactions, each represented as an
+  ordered sequence of reads, writes, and commit operations over objects.
+- An allocation maps every transaction to one of the isolation levels available
+  in common MVCC systems: RC, SI, or SSI. The paper treats SSI as the
+  serializable endpoint.
+- Robustness asks whether every schedule allowed under that mixed allocation
+  is conflict-serializable. The allocation problem asks for an optimal robust
+  allocation, preferring RC over SI and SI over SSI where safety permits.
+- Non-robustness is characterized through a multiversion split schedule: one
+  transaction is split into two parts, other conflicting transactions are
+  inserted between the parts, and the resulting dependency pattern witnesses a
+  non-serializable allowed schedule.
+- The characterization incorporates the different constraints imposed by RC,
+  SI, and SSI, including write-write conflict restrictions, read-write
+  antidependencies, and SSI dangerous-structure constraints.
+- Instead of enumerating all possible split schedules, the decision procedure
+  iterates over triples of transactions that can play the split/witness roles
+  and uses an auxiliary mixed-isolation conflict graph to test reachability
+  through other transactions.
+- The paper proves a polynomial-time robustness check for a given allocation
+  over `{RC, SI, SSI}`.
+- It also proves monotonic properties that let robust allocations be combined
+  safely: if a lower allocation is robust, raising isolation remains robust;
+  when two robust allocations differ, individual transactions can inherit the
+  lower safe level.
+- From those properties, it derives a unique optimal robust allocation over
+  `{RC, SI, SSI}` and a polynomial-time algorithm to compute it.
+- For `{RC, SI}` without a serializable endpoint, a robust allocation may not
+  exist, but existence and optimality can still be decided in polynomial time.
+- The discussion explicitly notes a limitation: the core formalism assumes the
+  complete set of transactions is known. The authors point to transaction
+  templates and transaction programs as practical follow-up directions.
+- Predicate reads, key updates, loops, and conditionals are not handled by this
+  paper's core transaction-level formalism. The paper discusses static
+  dependency graphs for programs as a way to derive sufficient conditions.
+- The paper is theoretical. It does not report a DBMS implementation or
+  throughput measurements for the allocation algorithm inside a production
+  engine.
+
+**GPU DB mapping:** GPU DB should compile transaction and query shapes into a
+small isolation-template registry. Each admitted template should record the
+objects or predicate families it can touch, the operation classes it performs,
+the weakest certified isolation level, and the required execution route. A
+simple point lookup against an immutable retained snapshot might be certified
+for a weak read route. A write template that can create write skew or phantoms
+should require stronger owner-side validation or SSI-like tracking. A
+predicate read over a mutable key range should remain conservative until a
+predicate-aware certificate exists.
+
+The route descriptor can then include both visibility generation and certified
+isolation class. Runtime admission would reject a fast GPU path if the query
+shape lacks a certificate, if the table generation invalidates the certificate,
+or if DDL/predicate support changes the conflict graph. This makes the
+isolation proof an input to route choice, alongside GPU residency, queue depth,
+and pinned-buffer budget.
+
+For 1M logical sessions, this also suggests a way to avoid per-session
+isolation overhead. Most sessions submit known templates. The expensive
+analysis can happen offline or at prepare time, while hot admission only checks
+a compact template id, isolation class, table/schema generation, and fallback
+route. Unknown ad hoc transactions can still run, but they should default to
+the conservative owner/SSI path until certified.
+
+The paper's optimal-allocation order maps well to route planning. Prefer a
+cheap retained or CPU snapshot read when the template is robust at RC; prefer
+SI when a stable snapshot boundary is enough; require SSI/owner serialization
+when dangerous structures or unresolved predicate conflicts remain. This keeps
+fast paths from becoming informal exceptions to ACID.
+
+**Risks and mismatches:** The paper reasons over abstract transactions and
+complete workloads, not arbitrary SQL submitted by millions of sessions. GPU
+DB cannot assume every future transaction is known. The practical version must
+be template-based, with conservative fallback for unclassified shapes.
+
+The core formalism does not solve predicate reads, key updates, loops,
+conditionals, or phantom-sensitive range/prefix queries. Those are exactly the
+cases where GPU retained scans and prefix filters can become dangerous. Until
+predicate-aware robustness is implemented, range and prefix fast paths should
+carry stricter isolation requirements.
+
+The paper also does not model WAL ordering, resident cache invalidation,
+refresh races, GPU worker batching, or tier placement. A robust isolation
+allocation is necessary but not sufficient for a GPU route: the route must
+still prove WAL-before-visibility, snapshot compatibility, and resident
+generation validity.
+
+Finally, computing an optimal allocation over a known set of transactions is
+not a hot-path operation. The benchmarkable GPU DB idea is not to run the
+polynomial algorithm per request, but to use it as a certification step for
+templates and route contracts.
+
+**Benchmark candidates:**
+
+- Build an isolation-template registry for prepared transaction/query shapes.
+  Proof gate: every fast retained route has a template id, certified isolation
+  class, schema generation, and fallback route.
+- Add a static conflict-graph harness over a small benchmark workload with
+  point reads, point writes, range reads, and write-skew candidates. Required
+  result: known-safe templates can be assigned weaker isolation while dangerous
+  templates are forced to SSI/owner serialization.
+- Compare all-SSI execution with mixed certified routing under a read-heavy
+  workload. Measure owner queue wait, retained-read throughput, abort/retry
+  rate, p95/p99 latency, and number of templates forced to conservative paths.
+- Add a negative control for predicate reads: prefix/range retained scans must
+  fail certification or require stronger isolation until predicate-aware
+  robustness rules exist.
+- Add DDL invalidation of isolation certificates. A schema, index, or route
+  shape generation change must force template recertification or conservative
+  fallback.
+- Combine with 1M logical sessions by submitting only a small set of known
+  templates from many sessions. Measure whether admission can check compact
+  template certificates without per-session state explosion.
+- Cross-check static certification with a trace-based anomaly detector such as
+  IsoDiff. Failure condition: a route certified as weakly isolated produces an
+  anomaly trace under the supported workload model.
