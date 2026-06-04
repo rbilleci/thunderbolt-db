@@ -2648,8 +2648,9 @@ Append new candidates here as each paper is processed.
   Why: AOCC cites BCC as a low-overhead false-abort reduction baseline; useful
   for GPU DB contention handling where serializable write lanes should avoid
   unnecessary aborts without weakening visibility guarantees.
-- `queued` — **O|R|P|E - A Data Semantics Driven Concurrency Control**,
-  Hemm et al., arXiv 2023.
+- `reviewed` — **O|R|P|E - A Data Semantics Driven Concurrency Control**,
+  Lessner, Laux, and Connolly, International Journal On Advances in Software
+  2016; arXiv 2023.
   URL: `https://arxiv.org/abs/2308.09121`
   Why: follow-up discovered while reviewing Transaction Healing; explores
   choosing optimistic, reconciliation, pessimistic, or escrow-style
@@ -3303,3 +3304,10 @@ Append new candidates here as each paper is processed.
   Why: Opportunities for Optimism contrasts manual commit-time updates with
   DRP's lazy/deferred execution; useful for comparing automatic transaction
   chopping against explicit GPU DB route-shape annotations for hot writes.
+- `queued` — **OCToPus: Semantic-aware Concurrency Control for Blockchain
+  Transactions**, Park et al., PPoPP 2024 poster.
+  URL:
+  `https://ppopp24.sigplan.org/details/PPoPP-2024-papers/42/POSTER-OCToPus-Semantic-aware-Concurrency-Control-for-Blockchain-Transactions`
+  Why: recent semantic-aware concurrency-control work with a GPU-accelerated
+  graph fallback path; useful for comparing O|R|P|E-style semantic classes with
+  deterministic DAG fallback for constrained transaction domains.
