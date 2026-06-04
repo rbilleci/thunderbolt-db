@@ -1078,7 +1078,7 @@ Append new candidates here as each paper is processed.
   admission and response steering for million-session GPU DB deployments.
   The previously queued Shinjuku-Offload title/URL pairing pointed to a
   different paper; the NSDI 2023 primary source is RingLeader.
-- `queued` — **R2P2: Making RPCs First-Class Datacenter Citizens**,
+- `reviewed` — **R2P2: Making RPCs First-Class Datacenter Citizens**,
   Kogias et al., USENIX ATC 2019.
   URL: `https://www.usenix.org/conference/atc19/presentation/kogias-r2p2`
   Why: RingLeader builds on R2P2's request-level dispatch and JBSQ lineage;
@@ -1105,6 +1105,13 @@ Append new candidates here as each paper is processed.
   useful for deciding how much GPU DB can improve pgwire/event-loop tail
   latency through event prioritization and delivery control before adopting
   hardware-assisted preemption or kernel bypass.
+- `queued` — **Homa: A Receiver-Driven Low-Latency Transport Protocol Using
+  Network Priorities**, Montazeri, Li, Alizadeh, and Ousterhout, SIGCOMM 2018.
+  URL: `https://doi.org/10.1145/3230543.3230564`
+  arXiv: `https://arxiv.org/abs/1803.09615`
+  Why: R2P2 names Homa as a compatible congestion/transport direction; useful
+  for comparing receiver-driven credits, message-size-aware priority, and
+  bounded in-flight grants against GPU DB request/response-ring admission.
 - `reviewed` — **CAM: Asynchronous GPU-Initiated, CPU-Managed SSD Management for
   Batching Storage Access**, Song et al., ICDE 2025.
   URL: `https://doi.org/10.1109/ICDE65448.2025.00175`

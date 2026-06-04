@@ -28033,3 +28033,219 @@ state.
   `resident_object_exclusive_owner_bounce`,
   `aggregate_cache_waste_bytes`, and
   `duplicate_copy_discounted_value_us`.
+
+### 2026-06-04 - R2P2 request-response pairs as schedulable runtime units
+
+**Citation:** Marios Kogias, George Prekas, Adrien Ghosn, Jonas Fietz,
+and Edouard Bugnion. "R2P2: Making RPCs First-Class Datacenter
+Citizens." USENIX ATC 2019, pp. 863-880. Retrieved 2026-06-04 from
+`https://www.usenix.org/conference/atc19/presentation/kogias-r2p2`
+and `https://www.usenix.org/system/files/atc19-kogias-r2p2_0.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** request-level scheduling; session admission;
+bounded queues; direct server return; router feedback; RPC load
+balancing; tail latency; in-network scheduling; route classes;
+request/response rings.
+
+**Core idea:** R2P2 argues that datacenter RPC systems lose scheduling
+power when independent request/response pairs are hidden inside TCP
+streams or long-lived proxy connections. The paper introduces a
+UDP-based Request-Response Pair Protocol where the first request packet
+is visible to a router, the remainder of large requests and all replies
+flow directly between client and selected server, and each RPC is
+scheduled independently.
+
+The most transferable mechanism is Join-Bounded-Shortest-Queue
+`JBSQ(n)`: a split-queue policy with one centralized pending queue and
+bounded per-worker queues. Workers tell the router how many outstanding
+requests they can accept, and the router only dispatches to a worker
+below that bound. This approximates a single work-conserving queue while
+keeping enough work at each worker to hide router/server communication
+latency. In the paper's evaluation, the software middlebox adds about
+5us unloaded latency and routes at 10Gbps line rate with two CPU cores,
+while the P4/Tofino proof adds less than 1us. Reported application
+results include 5.7x lower 99th percentile latency than NGINX for
+Lucene++ at 50% load and more than 4.8x Redis throughput at a 200us
+tail-latency SLO versus vanilla Redis/TCP. These numbers are
+deployment-specific; the design shape is the useful part.
+
+**Concrete mechanisms:**
+
+- Each RPC is identified by source IP, source UDP port, and request id,
+  so replies may come from a different server than the initial
+  destination without tying independent RPCs to a byte stream.
+- `REQ0` opens the RPC and is the packet inspected by the router. If the
+  request is larger than one packet, the chosen server sends `REQRDY`
+  and the client streams remaining `REQn` packets directly to that
+  server.
+- Replies bypass the router through direct server return, so the router
+  is limited mostly by short `REQ0` and feedback packets rather than
+  response bytes.
+- R2P2 intentionally provides no ordering guarantee across RPCs. Failure
+  and timeout decisions are exposed to the application, allowing
+  at-most-once or retry behavior by policy.
+- The protocol header includes a policy field. The paper implements
+  unrestricted routing and sticky routing; Redis writes use sticky
+  master routing while reads are load-balanced.
+- `R2P2-FEEDBACK` messages tell the router the worker's current bounded
+  queue depth and served-request counter. The served counter makes
+  feedback idempotent and robust to feedback drops.
+- Workers can join, leave, change their advertised bound, or signal
+  health through unsolicited feedback. If a worker fails, missing
+  feedback stops new dispatch and the bounded queue caps affected RPCs.
+- Choosing `n` is treated like a bandwidth-delay product: enough
+  outstanding work is needed to cover router/server communication, but
+  large `n` moves behavior toward ordinary per-worker queues and raises
+  tail latency under service-time variability.
+- The software router separates `REQ0` and feedback packets on distinct
+  UDP ports and NIC queues, gives feedback strict priority, uses
+  single-writer arrays for request and feedback counters to reduce cache
+  coherence traffic, and batches packet processing up to 64 packets.
+- The software JBSQ router briefly holds up to 32 packets when no idle
+  worker is available, betting that feedback will soon reveal capacity
+  and thereby improving single-queue approximation at medium load.
+- The P4/Tofino router stores worker queue counters in switch registers
+  and uses packet recirculation to search for a worker with outstanding
+  count below the current threshold. This adds races and can reorder
+  routing decisions, but the state is soft scheduling state.
+- Multi-packet requests deliberately pay an extra round trip after
+  `REQ0` so that large payloads do not make the scheduler/router the
+  throughput bottleneck.
+
+**GPU DB mapping:** The current high-throughput runtime doc already
+names bounded ingress, mutation, GPU execution, and response rings.
+R2P2 sharpens the unit that should move through those rings: not a
+socket, thread, or generic SQL string, but a request descriptor with a
+known route class, request id, snapshot/generation needs, deadline or
+SLO class, and response target. That descriptor is the GPU DB version
+of `REQ0`.
+
+For 1M logical sessions, GPU DB should not let every session own a deep
+queue inside the engine. IO workers should parse pgwire enough to emit
+small request descriptors into bounded rings, while direct response
+rings let results flow back without re-entering the mutation owner or a
+global router. Repeated read-only retained routes can be scheduled like
+R2P2 requests: route descriptor first, payload/bind values second,
+response direct to the owning IO worker.
+
+`JBSQ(n)` maps to GPU execution owners, retained read workers, and
+possibly partition owners. Each owner should advertise a small dynamic
+credit bound based on queue wait, service time, CUDA stream occupancy,
+pinned-buffer availability, and snapshot-holder pressure. The scheduler
+should dispatch only within those bounds, leaving excess requests in a
+central or per-route pending queue where they can still be rejected,
+fallback-routed, reprioritized, or combined into a micro-batch.
+
+The policy field maps to SQL route classes. Writes, DDL, and
+snapshot-publishing work are sticky to the mutation/catalog/residency
+owners. Read-only retained lookups can be unrestricted across eligible
+snapshot workers or GPU execution owners. Long scans, refresh work, and
+cold-tier routes need separate classes so they cannot occupy the same
+bounded queue slots as short point lookups.
+
+The feedback path is the key operational lesson. GPU DB should feed back
+owner capacity explicitly: outstanding slots, recent service time,
+queue wait, pinned-buffer credits, response-ring credits, and overload
+reason. Queue depth alone is too crude when route shapes have very
+different service-time distributions.
+
+**Risks and mismatches:** R2P2 is a transport protocol for datacenter
+RPCs, not a SQL database runtime. It assumes no ordering across RPCs,
+whereas GPU DB must preserve transaction ordering, WAL-before-visibility,
+snapshot semantics, portal/extended-query behavior, and DDL invalidation.
+The Redis and Lucene++ evaluations do not prove transactional SQL
+correctness. UDP, DPDK, P4, direct server return, and in-network routing
+may be inappropriate for a first pgwire implementation. Exposing
+application retry policy is useful for reads and idempotent requests,
+but transaction retries must be coordinated with SQL-visible errors and
+server-side state. Finally, bounded scheduling can reject too
+aggressively if service-time estimates, snapshot eligibility, or GPU
+resource feedback are stale.
+
+**Benchmark candidates:**
+
+- Add a no-GPU runtime simulator for `JBSQ(n)` owner admission across
+  retained lookup workers, mutation owners, and long scan workers.
+  Compare random, round-robin, JSQ, `JBSQ(1)`, and adaptive `JBSQ(n)`.
+  Gate: p99 queue wait improves without losing throughput under
+  bimodal route service times.
+- Represent pgwire requests as route descriptors before execution:
+  `(session, request_id, route_class, snapshot_generation,
+  relation/partition, shape_hash, bind_size, deadline_class,
+  response_worker)`. Gate: descriptor routing preserves existing SQL
+  results and error behavior in focused protocol tests.
+- Prototype owner feedback credits for retained read execution:
+  outstanding slots, queue wait, service time, pinned-buffer credits,
+  and response-ring credits. Failure condition: queue depth alone beats
+  the richer policy in p99 latency under mixed short lookup and long
+  scan load.
+- Test direct response-ring routing where read snapshot workers and GPU
+  workers return encoded or partially encoded responses to the IO worker
+  that owns the socket, bypassing the mutation owner. Gate: no stale
+  reads, no response reordering within a pgwire session, and bounded
+  response memory per active session.
+- Add overload/drop semantics for impossible SLO requests before they
+  enter owner queues. Measure rejected-before-work count, late failures,
+  queue wait, and successful p99 latency.
+- Track `route_descriptor_bytes`, `owner_advertised_slots`,
+  `owner_feedback_lag_us`, `jbsq_n_current`, `route_pending_count`,
+  `direct_response_ring_wait_us`, `route_class_overload_rejects`, and
+  `late_deadline_failures`.
+
+### 2026-06-04 - Cross-paper synthesis: route descriptors should carry value, visibility, and scheduling intent
+
+**Papers synthesized:** RCSI scale comes from treating time and versions
+as first-class routing keys; Flexible resource allocation needs
+database-visible value metrics; Shared-cache OLTP reframes hot data as
+coherent acceleration state; R2P2 request-response pairs as schedulable
+runtime units.
+
+**Converging design tracks:** These four papers point at the same missing
+abstraction from different layers. Visibility work says a request must
+name the snapshot or timestamp boundary it can read. Resource-placement
+work says cached or resident state must expose its saved time and
+rebuild cost. Shared-cache OLTP says acceleration state needs directory
+metadata, holders, and invalidation scope. R2P2 says the network/runtime
+must schedule a small request descriptor before payloads, replies, and
+long work consume scarce queues.
+
+For GPU DB, those should become one route contract. A retained read,
+write, refresh, scan, or cold-tier query should enter the runtime as a
+descriptor carrying route class, visibility boundary, value/resource
+needs, resident-object scope, owner preference, and deadline/admission
+intent. The same descriptor can drive cache admission, invalidation,
+micro-batch grouping, queue selection, response routing, and overload
+rejection. Without that shared contract, each subsystem will invent its
+own partial key: snapshot generation in MVCC, relation generation in
+residency, plan hash in the optimizer, queue class in the runtime, and
+resource value in cache policy. That fragmentation is where stale reads,
+duplicated warm state, and tail-latency surprises hide.
+
+**Category gaps:** The journal still has many GPU analytics and storage
+tiering entries, but the runtime side now needs more explicit protocol
+and admission work around deadline-aware rejection, request steering, and
+transport feedback. Transaction processing remains covered by many OCC,
+MVCC, and scheduling papers, but fewer entries connect those protocols to
+pgwire session semantics and response ordering. Future selections should
+keep alternating among runtime/admission, MVCC/write-path, and optimizer
+route-choice papers rather than returning immediately to GPU OLAP.
+
+**Benchmark priorities:**
+
+- Define and measure a `RouteDescriptor` hot path before adding more GPU
+  kernels: parse cost, allocation count, descriptor bytes, route lookup
+  time, and response-worker handoff time.
+- Build a mixed route simulator with short retained lookups, write
+  batches, long scans, refresh jobs, and cold-tier reads. Compare
+  per-owner FIFO, JSQ, adaptive `JBSQ(n)`, priority classes, and
+  deadline-aware rejection.
+- Couple resident-object directory metadata with the route descriptor and
+  test range/generation invalidation against table-wide invalidation.
+- Add a resource-value ledger that can be queried by the scheduler:
+  saved microseconds, rebuild cost, bytes, copy count, owner, and
+  invalidation generation.
+- Treat stale or unavailable acceleration state as a route outcome, not a
+  hidden fallback. The proof gate is correct SQL results plus explicit
+  telemetry for fallback, reject, rebuild, and direct response paths.
