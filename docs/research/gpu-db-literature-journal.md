@@ -47593,3 +47593,150 @@ to justify smaller GPU batches or extra route-certification work.
 - Extend retained snapshot telemetry with "snapshot age at first
   owner contact" and "age at result publication" so stale reads can be
   measured instead of inferred from transaction start time alone.
+
+### 2026-06-04 - LADS makes single-threaded owners dynamic per batch
+
+**Citation:** Chang Yao, Divyakant Agrawal, Gang Chen, Qian Lin,
+Beng Chin Ooi, Weng-Fai Wong, and Meihui Zhang. "Exploiting
+Single-Threaded Model in Multi-Core In-Memory Systems." IEEE
+Transactions on Knowledge and Data Engineering 28(10), 2016,
+pp. 2635-2650. doi:10.1109/TKDE.2016.2578319. Retrieved
+2026-06-04 from the author-hosted accepted manuscript,
+`https://www.comp.nus.edu.sg/~wongwf/papers/TKDE16.pdf`.
+
+**Category:** transaction processing / write path and concurrency
+control.
+
+**Relevance tags:** single-threaded execution; dynamic partitioning;
+dependency graphs; batched OLTP; cross-partition transactions; lock-free
+execution phase; contention avoidance; owner-domain scheduling.
+
+**Core idea:** LADS starts from the useful property of H-Store-style
+single-threaded partitions: if one thread owns a partition, execution can
+avoid ordinary locking inside that partition. The problem is that static
+partition ownership collapses under skew and cross-partition transactions,
+because hot partitions overload some threads while multi-partition work
+forces blocking or coordination. LADS keeps the single-threaded execution
+property but makes ownership a result of the current batch rather than a
+fixed database layout.
+
+For each batch, LADS separates dependency resolution from execution. It
+turns transactions into record actions, builds dependency graphs over
+conflicting actions, partitions those graphs into balanced subgraphs, and
+then executes each independent subgraph sequentially on one worker. The
+execution phase therefore runs without locks/latches for record actions
+owned by a worker, while cross-subgraph dependencies are already known and
+ordered. The paper reports substantially better robustness than H-Store,
+DORA, and SILO under skew and cross-partition workloads, with the headline
+claim of up to 20x higher throughput in its experiments.
+
+**Concrete mechanisms:**
+
+- A record action is a consecutive sequence of atomic operations on one
+  tuple within a transaction. LADS uses record actions, not whole
+  transactions, as graph vertices so it can expose parallelism inside
+  multi-record transactions.
+- Incoming transactions are processed in batches. The dependency-resolution
+  phase creates dependency graphs that represent ordering constraints
+  between conflicting record actions in the batch.
+- Dependency graphs are decomposed into subgraphs that are roughly balanced
+  in size while minimizing cross-subgraph edges.
+- Actions on the same record are assigned to the same worker and executed
+  sequentially in transaction order, avoiding runtime locking on that
+  record.
+- Dependencies between subgraphs are preserved with ordering constraints so
+  cross-subgraph pieces of a transaction complete consistently.
+- LADS dynamically partitions the workload according to observed record
+  access distribution rather than statically partitioning the database by
+  key range or warehouse.
+- The implementation is locality-aware and attempts to reduce cache
+  coherence overhead by mapping work to the memory hierarchy.
+- The paper covers range queries and logging within the same two-phase
+  framework, though the most transferable details are the batched
+  dependency graph and subgraph execution model.
+- Durability is provided by separate logging threads. Each logging thread
+  maintains a buffer and flushes its log file before transaction commit; the
+  reported YCSB logging overhead is about 15%.
+- Batch size is a first-class latency/throughput knob. Larger batches expose
+  more parallelism and improve throughput until resources saturate, but
+  average latency rises; LADS adapts maximum batch size using statistics and
+  user requirements.
+- In TPC-C, LADS still hits inherent serialization limits around hot fields
+  such as warehouse updates, but can execute record actions on other tables
+  in parallel.
+
+**GPU DB mapping:** LADS is a useful middle point between "one global
+mutation owner" and "fully concurrent optimistic writes." GPU DB already
+wants owner domains and bounded rings. LADS suggests that some write batches
+should carry an explicit active-window dependency graph: which record or
+partition actions are independent, which must stay ordered, and which owner
+or worker should execute each subgraph.
+
+The strongest mapping is for prepared or shape-known writes, bulk ingest,
+and hot-key transactions. Instead of sending every write through one owner
+or letting many workers discover conflicts late, the admission path could
+form a small dependency graph for a batch, assign record-action lanes to
+partition owners, and publish visibility only after all WAL-safe ordered
+pieces have completed. That preserves WAL-before-visibility while allowing
+parallel CPU work around nonconflicting records and leaving GPU refresh work
+to consume an ordered change certificate.
+
+For 1M logical sessions, LADS also reinforces batching at the boundary where
+requests become expensive. Idle sessions should not imply execution state;
+active write requests can be grouped by relation, key, transaction shape,
+and conflict class. The runtime can then decide whether a request enters a
+fast owner queue, a dependency-graph batch, or a fallback single-owner path.
+
+The dynamic partitioning idea maps to GPU residency and partition owners.
+Owner assignment should not be permanently keyed only by table ranges if
+hot spots move. A route certificate could name the current batch's owner
+assignment, dependency edges, and visibility publication boundary so a later
+refresh, invalidation, or replay step can explain why the route was legal.
+
+**Risks and mismatches:** LADS assumes the system can inspect or decompose
+transactions into record actions before execution. That is practical for
+stored procedures, prepared statements, COPY-style ingest, and known
+transaction templates, but not for arbitrary interactive SQL transactions
+whose read/write sets are discovered online. GPU DB should not force every
+statement through graph construction; the overhead and latency would be
+wrong for simple point reads and single-row writes.
+
+Batching is also a tradeoff, not a free win. LADS reports higher latency as
+batch size grows, and the current GPU DB target cares about low p50/p99
+query latency as well as throughput. Dependency-graph admission therefore
+needs a microsecond ceiling, a small-batch escape path, and a proof that the
+graph builder does not become the new central bottleneck.
+
+The paper is CPU in-memory OLTP work, not a GPU, MVCC, or PostgreSQL
+protocol design. It does not solve retained read snapshots, GPU memory
+placement, SQL planner route validity, arbitrary MVCC serializability, or
+multi-tier recovery. Its useful claim is the scheduling shape: resolve hot
+write dependencies before execution when a batch has enough known structure.
+
+**Benchmark candidates:**
+
+- Add an active-window write scheduler simulator: compare single mutation
+  owner, static partition owners, LADS-style record-action graph batches,
+  and runtime OCC under skewed YCSB and TPC-C-like hot fields. Measure
+  throughput, p50/p99 latency, abort/fallback rate, graph-build cost, and
+  queue wait.
+- Prototype dependency certificates for prepared multi-step writes:
+  relation/key action list, ordered dependency edges, owner assignment,
+  WAL batch id, and visibility publication generation. Proof gate: replay
+  and concurrent reads see the same outcome as serial execution.
+- Test batch-size ceilings for write admission with 8, 32, 128, and 512
+  active write requests. Failure condition: graph batching improves
+  throughput but violates a target p99 latency ceiling for simple writes.
+- Add a hot-warehouse or hot-account benchmark where one field serializes
+  but surrounding record actions can run in parallel. Expected result:
+  dependency-aware scheduling keeps the hot record ordered while preserving
+  useful parallelism elsewhere.
+- Compare dynamic owner assignment with fixed partition ownership under
+  shifting hot spots. Measure rebalance cost, cache locality, resident
+  invalidation churn, and owner-ring saturation.
+- For COPY or ingest batches, group rows by key conflict class before WAL
+  publication and GPU refresh. Reject the approach if grouping cost exceeds
+  the saved conflict/refresh work.
+- Add telemetry for active-window scheduling: batch size, graph vertices,
+  graph edges, cross-owner edges, longest dependency chain, owner imbalance,
+  build time, execution time, WAL wait, and visibility publish wait.

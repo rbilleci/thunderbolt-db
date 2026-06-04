@@ -527,7 +527,7 @@ Append new candidates here as each paper is processed.
   Why: ORTHRUS separates concurrency-control work from transaction execution;
   useful contrast to QueCC's no-control execution and GPU DB's owner-domain
   command rings under hot-key contention.
-- `queued` — **Exploiting Single-Threaded Model in Multi-Core In-Memory
+- `reviewed` — **Exploiting Single-Threaded Model in Multi-Core In-Memory
   Systems**, Yao et al., IEEE TKDE 2016.
   URL: `https://doi.org/10.1109/TKDE.2016.2578319`
   Why: QueCC contrasts LADS dependency-graph execution with priority queues;
@@ -3905,3 +3905,15 @@ Append new candidates here as each paper is processed.
   deterministic execution; useful for deciding how GPU DB can move hot
   partitions, resident segments, or owner assignments without stopping
   admitted transaction batches.
+- `queued` — **Squall: Fine-Grained Live Reconfiguration for Partitioned
+  Main Memory Databases**, Elmore et al., SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2749446`
+  Why: cited by LADS as related elastic partitioning work; useful for comparing
+  dependency-graph batch routing with online movement of hot partitions,
+  owner domains, and resident segment assignments.
+- `queued` — **Foedus: OLTP Engine for a Thousand Cores and NVRAM**, Kimura,
+  SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2746480`
+  Why: LADS compares against FOEDUS-style multicore/NVRAM transaction
+  engines; useful for storage/runtime design across many cores, logging, and
+  future non-volatile or far-memory tiers.
