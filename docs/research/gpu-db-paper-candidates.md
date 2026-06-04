@@ -4077,9 +4077,21 @@ Append new candidates here as each paper is processed.
   Why: HyBench compares HTAP systems and motivates real-time analytical
   freshness; F1 Lightning is a production HTAP service paper useful for
   contrasting serving-time freshness, ingestion, and resource isolation.
-- `queued` — **TiDB: A Raft-based HTAP Database**, Huang et al., PVLDB 2020.
+- `reviewed` — **TiDB: A Raft-based HTAP Database**, Huang et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3072-huang.pdf`
   DOI: `https://doi.org/10.14778/3415478.3415535`
   Why: HyBench evaluates HTAP tradeoffs across systems; TiDB/TiFlash provides
   a primary-source HTAP design with MVCC, Raft replication, and analytical
   replicas to compare against retained GPU snapshots.
+- `queued` — **Oracle Database In-Memory: A dual format in-memory database**,
+  Lahiri et al., ICDE 2015.
+  URL: `https://doi.org/10.1109/ICDE.2015.7113300`
+  Why: TiDB contrasts dual-format in-memory replicas with Raft learners;
+  useful for comparing transaction-owned row truth plus queryable column
+  acceleration when the analytical copy is updated inside the primary DBMS.
+- `queued` — **Real-Time Analytical Processing with SQL Server**, Larson et
+  al., PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol8/p1740-larson.pdf`
+  Why: TiDB cites SQL Server's integrated Hekaton/Apollo HTAP path; useful for
+  comparing migration from hot transactional rows into compressed columnar
+  structures against GPU DB's resident refresh and safe-generation policy.
