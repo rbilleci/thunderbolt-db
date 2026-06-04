@@ -3398,7 +3398,7 @@ Append new candidates here as each paper is processed.
   Why: X-SSD contrasts device-managed log propagation with Active Memory's
   RDMA-based fresh replica path; useful for comparing storage-owned durability
   with replica-owned visibility and freshness.
-- `queued` — **Write-behind Logging**, Arulraj, Perron, and Pavlo,
+- `reviewed` — **Write-behind Logging**, Arulraj, Perron, and Pavlo,
   PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol10/p337-arulraj.pdf`
   DOI: `https://doi.org/10.14778/3025111.3025116`
@@ -3599,3 +3599,22 @@ Append new candidates here as each paper is processed.
   counterpoint to host-owned SPDK/io_uring paths when evaluating whether GPU DB
   should keep cold-tier batching in the engine or eventually use near-storage
   offload for log, scan, or filter work.
+- `queued` — **Let's Talk About Storage & Recovery Methods for
+  Non-Volatile Memory Database Systems**, Arulraj, Pavlo, and Dulloor,
+  SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2749441`
+  Why: WBL builds on this NVM storage/recovery survey; useful for choosing
+  which GPU DB tiers should use byte-addressable persistence, WAL, checkpoints,
+  shadowing, or explicit recovery rebuilds.
+- `queued` — **FOEDUS: OLTP Engine for a Thousand Cores and NVRAM**, Kimura,
+  SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2746480`
+  Why: WBL contrasts FOEDUS's dual-page hybrid DRAM/NVM design; useful for
+  comparing volatile mutable pages plus durable snapshots with GPU DB's CPU
+  truth, GPU-resident snapshots, and future persistent tiers.
+- `queued` — **Persistent B+-Trees in Non-Volatile Main Memory**, Chen and Jin,
+  PVLDB 2015.
+  URL: `https://doi.org/10.14778/2735479.2735489`
+  Why: WBL's Peloton implementation stores indexes as persistent B+trees;
+  useful for deciding whether future host/persistent indexes should be durable
+  performance state or rebuilt from WAL and route metadata.

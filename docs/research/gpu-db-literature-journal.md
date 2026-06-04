@@ -43872,3 +43872,169 @@ session admission.
   Required result: the chosen shape preserves WAL ordering and publication
   boundaries while preventing one hot partition or refresh stream from starving
   unrelated point reads.
+
+### 2026-06-04 - Write-behind logging makes durability a visibility-gap contract
+
+**Citation:** Joy Arulraj, Matthew Perron, and Andrew Pavlo.
+"Write-Behind Logging." PVLDB 10(4), 2016. Retrieved 2026-06-04
+from `https://www.vldb.org/pvldb/vol10/p337-arulraj.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; multi-tier persistence.
+
+**Relevance tags:** write-behind logging; NVM; persistent memory; commit
+timestamp gaps; group commit; instant recovery; dirty tuple table; persistent
+indexes; replication; CLWB; WAL-before-visibility contrast; durable publication
+boundaries.
+
+**Core idea:** Write-behind logging (WBL) revisits logging for hybrid DRAM plus
+byte-addressable non-volatile memory. Instead of writing tuple after-images to
+a log before database pages become durable, the DBMS writes changed table and
+index state to NVM first, then appends compact log metadata that identifies
+which commit timestamp range is known clean and which range may contain
+uncommitted effects after a crash.
+
+The transferable lesson is not to weaken GPU DB's current WAL-before-visibility
+rule today. It is that future fast persistent tiers may let the engine publish
+durability as a compact visibility certificate instead of replaying a large
+physical log. WBL turns recovery into a question the MVCC visibility path can
+answer: which committed boundary is durable, and which timestamp gaps must be
+treated as invisible until cleanup finishes?
+
+**Concrete mechanisms:**
+
+- Runtime updates still execute in DRAM first, but each modification is tracked
+  in an in-memory dirty tuple table (DTT). DTT entries identify the transaction,
+  table, tuple locations, and operation metadata; they do not contain tuple
+  after-images and are not themselves persisted.
+- During group commit, the DBMS scans DTT entries for the committing group,
+  flushes dirty table and index blocks to durable NVM, then appends a WBL record
+  containing two commit timestamps: `cp`, the latest transaction whose updates
+  and all earlier updates are safely persisted, and `cd`, a future timestamp the
+  DBMS promises not to assign before the next group commit completes.
+- On restart, transactions before `cp` are durable. Effects whose begin/end
+  timestamps fall inside `(cp, cd)` are treated as a commit timestamp gap and
+  ignored by MVCC visibility. A background garbage collector later removes gap
+  effects and then drops the gap from the visibility checks.
+- Recovery is an analysis-only path over the most recent WBL metadata. There is
+  no redo phase because committed updates are already in the durable table heap,
+  and there is no WAL-style undo phase on the critical restart path because
+  timestamp gaps hide uncommitted effects.
+- Long-running transactions that span a group-commit window need extra commit
+  timestamp metadata in the WBL log; otherwise `cp` cannot advance safely.
+- For single-version systems, the paper requires durable before-images so
+  uncommitted in-place updates can be rolled back and torn writes avoided.
+- WBL's own log is bounded because each record carries the current gap set and
+  long-running transaction timestamps. WAL-style physical checkpoints are not
+  required to cap recovery work, although the implementation still needs durable
+  table and index structures.
+- Replication cannot simply stream WBL records because they lack after-images.
+  The primary constructs additional WAL-style physical records for replicas.
+  Synchronous replication moved the bottleneck to network round trips in the
+  paper's setup; asynchronous replication kept overhead low but can lose recent
+  commits on media failure.
+- Evaluation in Peloton used snapshot isolation on Intel's persistent-memory
+  evaluation platform, configured with NVM at 4x DRAM latency and 8x lower
+  bandwidth. With NVM, WBL improved transactional throughput by about 1.2-1.3x
+  on balanced/write-heavy YCSB and about 1.3x over NVM-WAL on TPC-C.
+- Recovery time for WAL grew with transactions after the last checkpoint; WBL
+  recovery stayed nearly constant because committed effects were already
+  persisted. The paper reports more than 100x recovery-time reduction and
+  roughly 1.5x smaller NVM storage footprint overall.
+- WBL performs worse on SSD/HDD because random writes to table/index locations
+  become expensive. The mechanism is specifically for fast byte-addressable
+  persistence, not block devices.
+- Efficient cache-line flush matters. In the paper's NVM-WBL experiments, CLWB
+  materially outperformed CLFLUSH on write-heavy workloads because it writes
+  back dirty cache lines without invalidating them.
+
+**GPU DB mapping:** Today, GPU DB should keep WAL as the durable authority and
+GPU memory as rebuildable performance state. WBL is still useful because it
+separates durability into three explicit clocks: durable clean boundary,
+possible dirty gap, and cleanup completion. That shape maps directly to the
+route-certificate work already emerging from Mako, X-SSD, and the NVMe papers.
+
+A future persistent host tier or CXL/NVM tier could maintain committed CPU
+truth and indexes in place, while the conventional WAL becomes smaller,
+semantic, or checkpoint-like. Reads would not just ask "is this snapshot
+current?" They would ask whether the requested MVCC boundary is below the
+durable `cp`, outside all dirty gaps, and compatible with the resident GPU
+generation. GPU-resident snapshots should never include rows from an unresolved
+gap unless the route certificate marks them invisible and kernels enforce that
+visibility predicate.
+
+For write throughput, WBL argues for measuring data duplication separately from
+fsync latency. GPU DB currently pays for WAL records, CPU state changes, index
+maintenance, resident invalidation, and future refresh publication. A benchmark
+should count how many bytes are written to each tier per committed row and how
+often the same value is written as WAL, CPU tuple, index entry, checkpoint, host
+segment, and GPU-resident column.
+
+For restart and failover, the commit-gap idea suggests a practical test oracle:
+after a crash at every point in the publication pipeline, recovered reads must
+prove whether they use a durable clean boundary, hide a dirty gap, or force CPU
+fallback. GPU snapshots published from a boundary later discovered to be inside
+a gap must be retired before serving new reads.
+
+The paper's replication section also maps to 1M-session durability. If durable
+publication depends on remote acknowledgement, the route certificate needs a
+replica or persistence-domain field. If asynchronous replication is allowed,
+the certificate must distinguish local visibility from media-failure-safe
+visibility.
+
+**Risks and mismatches:** WBL intentionally reverses WAL's ordering, while GPU
+DB currently relies on WAL-before-visibility as a correctness anchor. Treat WBL
+as a future-tier experiment, not an immediate replacement for the production
+write path.
+
+The implementation assumes byte-addressable persistent memory with durable
+table heap and persistent indexes. It is a poor fit for ordinary NVMe, SSD, or
+HDD and does not directly solve GPU HBM residency, which remains volatile and
+must be invalidated/rebuilt from durable CPU state.
+
+Timestamp-gap visibility adds work to every visibility check until cleanup
+finishes. GPU kernels would need a compact gap predicate or a guarantee that
+resident generations are built only from cleaned boundaries. Multiple crashes
+can accumulate multiple gaps, so cleanup lag must be visible to admission and
+planner fallback.
+
+The reported numbers use an emulated NVM platform and Peloton's storage model,
+not modern commodity persistent memory or the current GPU DB architecture.
+Replication experiments used 1 Gb Ethernet with 150 us latency, so the absolute
+replication overheads are not directly transferable.
+
+Constructing WAL-style physical records for replicas reduces WBL's simplicity.
+If GPU DB needs both local WBL-style persistence and remote WAL shipping, the
+write path may carry two durability formats unless a unified certificate/log
+format is designed.
+
+**Benchmark candidates:**
+
+- Add a publication-boundary crash matrix for the write path: after WAL append,
+  after WAL flush, after CPU MVCC apply, after index update, after resident
+  invalidation, after GPU refresh build, and after GPU snapshot publication.
+  Required result: recovered reads identify the exact durable boundary and never
+  serve rows from an unresolved dirty gap.
+- Prototype a visibility-gap simulator without replacing WAL. Inject synthetic
+  `(cp, cd)` gaps into MVCC visibility, run retained CPU/GPU reads, and measure
+  per-row or per-batch overhead, p99 latency, and fallback rate.
+- Track per-commit byte duplication across tiers: WAL bytes, CPU tuple bytes,
+  CPU index bytes, checkpoint/archive bytes, host segment bytes, GPU refresh
+  bytes, and response bytes. Proof gate: write-path optimization names which
+  duplicate write is being removed and what recovery invariant replaces it.
+- Compare three resident-publication contracts: WAL-only durable boundary,
+  WBL-style clean-plus-gap boundary, and remote-replica-ack boundary. Measure
+  throughput, freshness, GPU invalidation lag, restart time, and failover-safe
+  visibility.
+- Add a long-transaction benchmark where one transaction spans many group
+  commits while short writes continue. Measure how much it delays `cp`, how
+  many snapshots are withheld, and whether admission should isolate long writers
+  into a separate lane.
+- Test GPU gap filtering versus boundary-only publication. One variant allows
+  kernels to evaluate a compact gap list; the other publishes GPU snapshots only
+  below cleaned boundaries. Failure condition: kernel-side filtering improves
+  freshness but makes stale or uncommitted rows observable under crash replay.
+- For future persistent tiers, benchmark CLWB-like flush granularity, cache
+  pollution, and write-combining effects separately from logical WAL cost.
+  Until such hardware is present, model this as an explicit latency/bandwidth
+  parameter rather than assuming NVMe behavior.
