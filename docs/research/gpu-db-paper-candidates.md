@@ -2804,13 +2804,19 @@ Append new candidates here as each paper is processed.
   GPU data-structure design with device-side APIs; useful for comparing
   retained B-tree versus hash-index lookup routes, probe bounds, and
   snapshot-friendly index rebuild options.
-- `queued` — **More Bang For Your Buck(et): Fast and Space-efficient
+- `reviewed` — **More Bang For Your Buck(et): Fast and Space-efficient
   Hardware-accelerated Coarse-granular Indexing on GPUs**, Henneberg et al.,
   arXiv 2024.
   URL: `https://arxiv.org/abs/2406.03965`
   Why: discovered while following GPU index literature around MVGpuBTree; uses
   hardware-accelerated coarse-granular indexing ideas that may compete with or
   complement resident GPU B-tree/hash indexes for selective predicates.
+- `queued` — **RTIndeX: Exploiting Hardware-Accelerated GPU Raytracing for
+  Database Indexing**, Henneberg and Schuhknecht, PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p4268-schuhknecht.pdf`
+  DOI: `https://doi.org/10.14778/3625054.3625061`
+  Why: cgRX generalizes RTIndeX/RX and measures against it; useful as the
+  fine-grained RT-core index baseline before adopting coarse resident buckets.
 - `queued` — **Autopilot: Workload Autoscaling at Google**, Rzadca et al.,
   EuroSys 2020.
   URL: `https://doi.org/10.1145/3342195.3387524`

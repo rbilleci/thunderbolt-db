@@ -34489,3 +34489,145 @@ problem in the paper, which matters for reusable route templates.
 - Add planner traces that expose both isolated cost and live-interference
   cost, so route decisions can explain "GPU resident is fast in isolation but
   rejected because pinned-buffer or stream pressure is already high."
+
+### 2026-06-04 - cgRX trades exact GPU index entries for bucketed RT-core lookups
+
+**Citation:** Justus Henneberg, Felix Schuhknecht, Rosina Kharal, and Trevor
+Brown. "More Bang For Your Buck(et): Fast and Space-efficient
+Hardware-accelerated Coarse-granular Indexing on GPUs." arXiv:2406.03965v2,
+2025 revision of 2024 preprint. DOI `10.48550/arXiv.2406.03965`. Retrieved
+2026-06-04 from `https://arxiv.org/pdf/2406.03965`.
+
+**Category:** GPU execution / analytics; multi-tier cache / data placement;
+query optimization / planning.
+
+**Relevance tags:** GPU-resident indexes; RT cores; range lookups; point
+lookups; bucketed indexes; resident memory footprint; batched lookup;
+updatable GPU index; OptiX; route choice; hit-rate sensitivity.
+
+**Core idea:** cgRX takes the RTIndeX idea of encoding database keys as
+triangles in an OptiX scene and makes it coarse-grained. Instead of
+materializing one triangle per key, it stores one representative triangle per
+bucket of sorted key-rowID pairs, finds the bucket with RT-core ray traversal,
+then post-filters or scans the bucket with CUDA. The design directly attacks
+three limits of fine-grained RX: high memory overhead, poor range lookup
+behavior, and lookup degradation after updates.
+
+The paper's strongest transferable idea is that a GPU-resident index does not
+need to make every key an accelerator-visible object. For a database cache,
+especially one bounded by HBM, a compact representative structure plus a
+contiguous bucket payload may buy better throughput per byte than a more exact
+device index. The evaluation reports up to 6.9x higher throughput per memory
+footprint than comparable range-supporting baselines, up to 15x faster range
+lookups than RX, and up to 5.6x faster update handling than rebuilding cgRX
+from scratch.
+
+**Concrete mechanisms:**
+
+- Store the sorted key-rowID array separately and logically partition it into
+  equal-sized buckets. Materialize only the final key of each bucket, or a
+  moved/auxiliary representative, as a triangle in the OptiX scene.
+- Use ray traversal to find the next representative greater than or equal to a
+  lookup key. A naive point lookup may fire an x-axis ray in the current row,
+  then a y-axis ray to find the next populated row, then a z-axis ray to find
+  the next populated plane.
+- Add row and plane markers in the naive representation so misses in the
+  current row or plane can find the next populated position without scanning
+  unrelated space.
+- Optimize the representation by moving representatives within the gap before
+  the next key and adding auxiliary representatives when needed. These implicit
+  markers reduce extra rays and can avoid a separate marker buffer.
+- After locating a bucket, search bucket contents in row layout with binary
+  search. The authors found this combination worked best even for both small
+  and very large buckets.
+- Answer range lookups by finding the first bucket whose representative covers
+  the lower bound, then scanning the sorted key-rowID array until the first key
+  greater than the upper bound. A separate CUDA kernel uses 16 threads per
+  lookup to scan and aggregate neighboring entries.
+- Choose bucket size by throughput per memory footprint, defined as entries
+  looked up per second divided by index bytes. Across 4,560 tested scenarios,
+  bucket size 32 is the default; bucket size 256 remains a space-efficient
+  alternative.
+- Add cgRXu for updates. Each representative points to a fixed-size node that
+  is the head of a linked list for that bucket. Nodes store sorted keys,
+  rowIDs, `next`, `maxKey`, and current size.
+- Bulk-load cgRXu by filling representative nodes half full from the sorted
+  input and adding an overflow bucket with `maxKey = infinity` for future keys.
+- Process inserts and deletes in sorted batches on the GPU. One CUDA thread
+  owns each bucket, so bucket-local updates need no locks or atomics; deletions
+  are applied before insertions so freed space can avoid splits.
+- Avoid updating the BVH for each inserted key. If a node fills, split it and
+  link in a new physical node; lookups follow `next` pointers after ray
+  traversal.
+
+**GPU DB mapping:** For P8, cgRX argues for a resident-index family that is
+explicitly route-shaped. A hot `int4` equality/range predicate does not
+necessarily need a full GPU B-tree or hash table first. A retained snapshot
+could publish a compact representative index over sorted key-rowID buckets,
+with device kernels doing the final bucket search or range scan against
+resident column groups. That fits the current cache-manager design because the
+representative scene and payload buckets are rebuildable acceleration state
+tied to a table OID, schema generation, and visibility boundary.
+
+For read throughput, the bucketed design is most attractive when lookups are
+hit-heavy, batched, and range-capable. It should sit beside a hash route, not
+replace it. The paper shows cgRX loses some benefit on in-range misses because
+it still finds a representative and only detects the miss during bucket search.
+That maps directly to planner route choice: exact-key routes with high miss
+rates may prefer a hash table, Bloom prefilter, CPU index, or a resident
+negative-cache summary before invoking cgRX.
+
+For session concurrency, cgRX reinforces the need to cost active batches by
+resident bytes and batch shape. Very small batches underutilize the GPU across
+all tested indexes, while medium and large batches stabilize. A production
+route should expose `lookup_count`, `expected_hit_rate`, `range_width`,
+`bucket_size`, and `resident_index_bytes` so the runtime can micro-batch
+compatible retained lookups without hiding p50 latency.
+
+For MVCC and updates, cgRXu is useful but not a complete transactional index.
+Its one-thread-per-bucket update kernel suggests a clean owner-like update
+domain for GPU resident indexes: sort mutation deltas by key, route each bucket
+to one update thread, delete before insert, then publish a new resident
+generation only after CPU/WAL visibility is safe. The GPU DB should still treat
+cgRXu as cache maintenance, not as the durable index of record.
+
+**Risks and mismatches:** cgRX depends on NVIDIA RT cores and OptiX, so it is a
+specialized route rather than a portable baseline. The paper targets
+GPU-resident indexes over sorted key-rowID arrays, not SQL MVCC semantics,
+crash recovery, catalog invalidation, joins, text predicates, or mixed
+transactional writes. Its best use case is hit-heavy batched lookup and range
+work; in-range misses are detected late, and update-heavy workloads still show
+B+ and hash baselines with better post-update lookup times in the authors'
+experiment.
+
+The updatable design avoids BVH rebuilds for bucket-local changes, but it also
+introduces linked-list traversal inside buckets. That may be awkward for
+long-lived retained snapshots unless old versions, deleted keys, and node
+retirement are tied to snapshot generation and reclamation epochs. Unknown from
+this read: how cgRX behaves with many duplicate SQL keys, NULL ordering,
+composite keys, concurrent reader/update overlap, multiple resident
+generations, or non-NVIDIA accelerators.
+
+**Benchmark candidates:**
+
+- Add a no-RT prototype of the route contract first: sorted resident key-rowID
+  buckets with configurable bucket size, binary bucket search, and range scan.
+  Gate: identical point/range results to the CPU relational index under
+  inserts, deletes, duplicates, and retained snapshot boundaries.
+- When RT hardware is available, compare resident hash, GPU B-tree, sorted
+  array, and cgRX-like representative routes for `int4` point lookup and range
+  predicates. Measure throughput per resident byte, not only lookup latency.
+- Add hit-rate-sensitive route selection. Workloads should vary in-range miss
+  rate, out-of-range miss rate, Zipf skew, and range width. Failure condition:
+  cgRX is chosen for high in-range miss workloads where a hash or CPU route is
+  cheaper.
+- Test micro-batch thresholds for resident key lookups: `512`, `4K`, `32K`,
+  and `1M` logical requests with bounded active work. Gate: the runtime can
+  explain when batches are too small for GPU admission.
+- Prototype bucket-local delta refresh: sort inserted/deleted keys by bucket,
+  apply deletes before inserts, publish a new resident generation, and retire
+  old bucket nodes by snapshot epoch. Gate: WAL replay rebuilds the same
+  visible generation without trusting GPU state.
+- Add planner telemetry for `resident_index_kind`, `bucket_size`,
+  `expected_hit_rate`, `range_width`, `index_bytes`, `payload_bytes`,
+  `batch_size`, `rt_core_required`, and `fallback_reason`.
