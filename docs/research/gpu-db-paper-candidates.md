@@ -1492,9 +1492,9 @@ Append new candidates here as each paper is processed.
   Why: OCC validator/storage architecture cited by the batching paper; useful
   for comparing watermark-based validation, decoupled compute/storage, and
   versioned write installation against GPU DB owner boundaries.
-- `queued` — **QueCC: A Queue-Oriented, Control-Free Concurrency
+- `reviewed` — **QueCC: A Queue-Oriented, Control-Free Concurrency
   Architecture**, Qadah and Sadoghi, Middleware 2018.
-  URL: `https://doi.org/10.1145/3274808.3274820`
+  URL: `https://doi.org/10.1145/3274808.3274810`
   Why: queue-oriented transaction execution cited by the batching paper;
   relevant to deterministic owner queues, queue-local ordering, and whether
   control-free execution can coexist with WAL-before-visibility.
@@ -1854,7 +1854,7 @@ Append new candidates here as each paper is processed.
   Why: dynamic timestamp baseline discussed by Rebirth-Retire; useful for
   deciding whether GPU DB should allocate commit/order ranges per owner or
   transaction class rather than relying on a single global timestamp path.
-- `queued` — **QueCC: A Queue-oriented, Control-free Concurrency
+- `reviewed` — **QueCC: A Queue-oriented, Control-free Concurrency
   Architecture**, Qadah and Sadoghi, Middleware 2018.
   URL: `https://doi.org/10.1145/3274808.3274810`
   PDF: `https://expolab.org/papers/quecc.pdf`
@@ -2678,3 +2678,15 @@ Append new candidates here as each paper is processed.
   Why: CRDV contrasts against relational CRDT approaches with simpler
   conflict semantics; useful as a baseline for SQL-native replicated route
   tables, derived counters, and edge/session-local state.
+- `queued` — **Exploiting Single-Threaded Model in Multi-Core In-Memory
+  Systems**, Yao et al., IEEE TKDE 2016.
+  URL: `https://doi.org/10.1109/TKDE.2016.2578319`
+  Why: QueCC contrasts against LADS-style dependency-graph-driven execution;
+  useful for comparing deterministic queue planning with graph partitioning
+  when GPU DB splits stored-procedure fragments across owner lanes.
+- `queued` — **Scaling Multicore Databases via Constrained Parallel
+  Execution**, Wang et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882934`
+  Why: QueCC cites transaction chopping and constrained parallel execution as
+  related fragment models; useful for deciding when GPU DB should expose
+  template-level dependency constraints instead of only route-local queues.

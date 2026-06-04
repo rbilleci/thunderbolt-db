@@ -31685,3 +31685,151 @@ ranked queue wait, propagation queue growth, and WAL-visible mutation delay.
 The pass condition is not only lower memory growth; it is lower memory growth
 without stale reads, mutation-tail spikes, unbounded propagation queues, or
 planner admission of order-sensitive queries into an unordered route.
+
+### 2026-06-04 - QueCC makes write contention a planning problem, not an execution surprise
+
+**Citation:** Thamir M. Qadah and Mohammad Sadoghi. "QueCC: A
+Queue-oriented, Control-free Concurrency Architecture." Middleware 2018,
+pp. 13 pages. Retrieved 2026-06-04 from the DOI page and author-hosted
+PDF, `https://doi.org/10.1145/3274808.3274810` and
+`https://expolab.org/papers/quecc.pdf`.
+
+**Category:** transaction processing / write path and runtime / queue
+scheduling.
+
+**Relevance tags:** deterministic execution; queue-oriented scheduling;
+known read/write sets; stored procedures; high-contention writes; batch
+planning; priority groups; serializability; execution queues; commit
+dependencies; write visibility; owner lanes.
+
+**Core idea:** QueCC separates the job of deciding a serial order from the
+job of executing transaction logic. A batch of stored-procedure
+transactions is first decomposed into prioritized execution queues, then
+execution threads run those queues without ordinary lock/OCC validation in
+the transaction hot path. The serial order is encoded by planner priority
+and queue order, so execution can focus on direct record access and
+fragment progress.
+
+The paper is especially relevant after the recent retained-resource
+synthesis because it gives a write-path counterpart: if the engine knows a
+transaction template's accessed record ranges and dependencies, it can turn
+contention into an explicit planned queue shape before execution starts.
+This is not the same as general SQL concurrency, but it is a useful model
+for admitted stored procedures, COPY/update batches, and GPU-assisted
+write lanes where the current owner thread should not discover hot-key
+contention only after work has already been queued.
+
+**Concrete mechanisms:**
+
+- Transactions are modeled as DAGs of fragments. A fragment contains a
+  sequence of read/write operations over records in a contiguous RID range
+  plus optional integrity constraints. Edges represent intra-transaction
+  data dependencies and commit dependencies.
+- Each batch has multiple planner threads. Every planner consumes its own
+  client transaction queue, acts as a local sequencer, and has a fixed
+  priority. The execution queues it produces inherit that priority as a
+  priority group.
+- Planning is range-based over logical RIDs. A planner maps each fragment
+  into an execution queue for the fragment's RID range, splits full ranges
+  into smaller queues, recycles queues from thread-local pools, and can
+  reuse learned range partitioning across batches.
+- Correctness is expressed as execution-priority invariance: for each
+  record, operations from higher-priority queues must execute before lower
+  priority operations that overlap the same record. Within one queue,
+  fragments execute in planned order.
+- Execution threads receive partitions of priority groups through a
+  latch-free `BatchQueue`. Planning and execution can be pipelined so one
+  batch is planned while another is executed.
+- Execution threads may switch away from a queue when the head fragment's
+  intra-transaction data dependency is not ready, rather than blocking the
+  entire worker. A private per-queue counter tracks consumed fragments.
+- QueCC supports speculative write visibility within a batch and tracks
+  commit dependencies when a fragment reads another transaction's
+  uncommitted write. Commit counters are decremented when dependencies
+  commit; if an earlier transaction aborts due to an integrity constraint,
+  dependent transactions abort too.
+- Recoverability is handled by persisting the information needed to
+  recreate execution queues after planning and by a second persistence
+  point after execution, similar to group commit. The implementation uses
+  undo buffers for abortable in-place updates, with a discussion of early
+  write visibility to avoid unnecessary undo work when a writer is already
+  guaranteed to commit.
+- Evaluation uses ExpoDB on a 32-core Azure G5 instance with YCSB and
+  TPC-C variants. Reported results include nearly 40 million YCSB
+  operations per second, up to 4.5x better YCSB throughput for
+  write-intensive high-contention workloads, and up to 6.34x better TPC-C
+  throughput under a single-warehouse high-contention workload. With
+  batches below 20K transactions in the high-skew YCSB experiment, average
+  latency is reported under 3 ms. Network/client effects are intentionally
+  removed by generating workloads in memory.
+
+**GPU DB mapping:** The transferable shape is a planned write/admission
+lane for known templates. GPU DB should keep ordinary SQL on conservative
+owner/MVCC paths, but admitted stored procedures, prepared write batches,
+COPY transforms, and maintenance jobs can declare enough access shape to
+be planned into deterministic queues before execution. That lets the
+mutation owner publish a batch boundary, assign fragments to owner lanes
+or partition queues, and avoid per-fragment lock/OCC discovery on the hot
+path.
+
+For P8, the logical-RID idea maps to tuple ids, key ranges, segment ids,
+resident partition ids, or index page/mini-page ids. A queue route could
+carry `template_id`, read/write RID ranges, priority group, WAL batch
+boundary, visibility generation, and dependency counters. Hot ranges can
+split into smaller execution queues; cold or sparse ranges can merge so
+they do not waste workers. This complements retained snapshots: write
+queues publish deterministic visibility fronts, while read snapshots route
+against those fronts.
+
+The strongest GPU-specific implication is not "run all transactions on the
+GPU." It is that GPU batches need planned contention lanes just as much as
+scan kernels need planned route shapes. A GPU-assisted update or index
+maintenance batch should know whether it is executing independent RID
+ranges, a hot-key queue, or a dependency-bearing stored procedure fragment
+before it consumes pinned buffers or launches kernels.
+
+**Risks and mismatches:** QueCC depends on stored procedures whose
+read/write sets, or enough information to derive them, are known before
+execution. It does not solve fully interactive SQL transactions,
+cursor-style access, nondeterministic functions, or application logic that
+discovers arbitrary write sets late. The paper notes passive pre-play as a
+possible way to infer sets, but that would add latency and complexity.
+
+Batching improves throughput but creates an admission and latency
+tradeoff. The evaluation removes network and client costs, so its
+throughput numbers should not be mapped directly to pgwire session
+throughput. The storage model in the paper is in-memory and uses in-place
+updates with undo buffers; GPU DB must preserve WAL-before-visibility and
+MVCC replay semantics instead of adopting QueCC's persistence shape
+directly.
+
+The priority invariant may also create fairness and tail-latency hazards.
+A lower-priority route that overlaps many higher-priority queues can make
+progress only after those queues complete. GPU DB would need explicit
+priority aging, queue depth caps, and rejection rules before using this
+for mixed OLTP plus long maintenance work.
+
+**Benchmark candidates:**
+
+- Add a no-GPU deterministic queue simulator for prepared write templates:
+  input transactions with declared key ranges, split them into
+  priority-group execution queues, and compare owner-serialized execution,
+  OCC retry, and QueCC-style planned queues under Zipfian hot-key writes.
+  Gate: identical final table state and visibility fronts.
+- Measure batch size versus latency for COPY/update admission: 1K, 5K,
+  10K, and 20K logical transactions, tracking planner time, queue wait,
+  WAL fsync grouping, p50/p95/p99 commit latency, and abort/reject count.
+- Prototype a route descriptor for write templates:
+  `template_id`, `rid_ranges`, `write_ranges_known`, `dependency_edges`,
+  `priority_group`, `visibility_generation`, and `wal_batch_id`. Failure
+  condition: any unknown-write-set template enters the control-free route.
+- Build a hot-range split/merge benchmark over P8 segment ids or logical
+  tuple ids. Measure whether queue splitting improves mutation throughput
+  without increasing invalidation lag or retained-snapshot pin time.
+- Add negative tests for interactive transactions, nondeterministic
+  functions, late discovered writes, ordered cursor semantics, and DDL.
+  These must fall back to the ordinary mutation owner path.
+- When GPU hardware returns, test whether a GPU-assisted index or resident
+  refresh batch benefits from deterministic RID-range queues versus a
+  single owner queue. The proof gate is lower queue wait and stable p99
+  mutation latency without stale resident reads.
