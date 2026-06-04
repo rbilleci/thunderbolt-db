@@ -2876,13 +2876,21 @@ Append new candidates here as each paper is processed.
   Why: Eigen uses Autopilot as a baseline for resource prediction; useful for
   comparing smoothed resource limits, safety margins, and control-loop
   stability for GPU DB active-session, pinned-buffer, and cache budgets.
-- `queued` — **Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL
+- `reviewed` — **Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL
   Database Serverless**, Poppe et al., PVLDB 2022.
-  URL: `https://doi.org/10.14778/3514061.3514069`
+  URL: `https://doi.org/10.14778/3514061.3514073`
+  PDF: `https://www.vldb.org/pvldb/vol15/p1279-poppe.pdf`
   Why: Eigen contrasts serverless database pause/resume and proactive
   provisioning work; useful for session-admission and cold/warm route
   provisioning policies when dormant tenants or idle logical sessions become
   active quickly.
+- `queued` — **Seagull: An Infrastructure for Load Prediction and Optimized
+  Resource Allocation**, Poppe et al., PVLDB 2020.
+  URL: `https://doi.org/10.14778/3421424.3421436`
+  Why: Moneyball transfers lessons from Azure SQL provisioned-database load
+  prediction; useful for comparing per-tenant/session historical route demand,
+  lightweight predictors, and maintenance overhead for GPU DB admission and
+  warm-cache budgeting.
 - `reviewed` — **LTPG: Large-Batch Transaction Processing on GPUs with
   Deterministic Concurrency Control**, Wei, Gu, Li, and Yu, ICDE 2024.
   URL: `https://doi.org/10.1109/ICDE60146.2024.00296`

@@ -37092,3 +37092,155 @@ poor update story make it unsuitable for first-line mutable OLTP indexes.
   architecture support, sufficient batch depth, immutable snapshot identity,
   supported key encoding, and memory-budget admission before the route is
   considered.
+
+### 2026-06-04 - Moneyball keeps serverless databases warm only when history pays for it
+
+**Citation:** Olga Poppe, Qun Guo, Willis Lang, Pankaj Arora,
+Morgan Oslake, Shize Xu, and Ajay Kalhan. "Moneyball: Proactive
+Auto-Scaling in Microsoft Azure SQL Database Serverless." PVLDB
+15(6):1279-1287, 2022. DOI `10.14778/3514061.3514073`. Retrieved
+2026-06-04 from `https://www.vldb.org/pvldb/vol15/p1279-poppe.pdf`.
+
+**Category:** Runtime / HFT / session scale; multi-tier cache / data
+placement.
+
+**Relevance tags:** session admission; proactive warmup; cold-start
+avoidance; resource-control loops; idle capacity budgets; per-tenant
+history; logical pause; cost index; serverless database operations;
+cache and pinned-buffer provisioning.
+
+**Core idea:** Moneyball studies Azure SQL Database serverless
+pause/resume behavior and asks how to reduce cold-start delay without
+giving up the cost advantage of pausing idle databases. It combines two
+control ideas. First, it proactively resumes a database before expected
+activity using historical pause/resume patterns. Second, it introduces a
+"logical pause" interval after logout: the database is treated as idle
+for billing/control purposes, but physical resources are not immediately
+taken away, avoiding wasteful pause/resume cycles for short idle gaps.
+
+The useful transfer for GPU DB is not cloud billing. It is the shape of
+the admission problem: warm resources are valuable only when expected
+near-future demand is likely enough to amortize idle capacity. For a
+database with 1M logical sessions, GPU resident generations, pinned
+buffers, prepared route descriptors, and IO/session state should not be
+binary on/off resources. They need historical demand signals, bounded
+warm-hold intervals, and explicit cost indices for being too cold versus
+too warm.
+
+**Concrete mechanisms:**
+
+- The paper separates reactive resume from proactive resume. A proactive
+  resume is counted as correct if the database uses the resumed resources
+  within the chosen time window; otherwise it is a wrong proactive resume
+  that wastes capacity.
+- It defines stable, patterned, and unpredictable databases from
+  historical state traces. In the sampled serverless data, many databases
+  are predictable with simple stability or recurring weekday/window
+  criteria, while a remaining class is hard even for stronger models.
+- The evaluated telemetry spans half a year, tens of Azure regions, and
+  tens of thousands of serverless databases. The detailed experiments use
+  randomly sampled long-lived databases with at least three weeks of
+  history.
+- The probabilistic resume algorithm scans weekday/time windows and
+  recommends proactive resume when the historical probability of resume
+  within a window exceeds a threshold. The default evaluation uses a
+  5-hour window sliding every 10 minutes and a probability threshold of
+  0.9.
+- The predictive resume variant uses predicted pause/resume patterns
+  from an ML model. NimbusML is selected because it is most accurate in
+  the paper's comparison, but the paper also notes that simple historical
+  heuristics can be competitive for many predictable workloads.
+- Resume cost index is defined as wasted cost from wrong or early
+  proactive resumes divided by total pause-derived savings. This makes
+  the QoS/cost tradeoff visible rather than hiding it behind hit rate.
+- To avoid ineffective short pauses, the paper evaluates budget-based
+  pause avoidance and logical-pause-based pause avoidance. Budgeting
+  restricts the number of physical pauses per database and day; logical
+  pause waits for a duration before actually releasing resources.
+- Greedy logical pause is deliberately simple: after logout, keep
+  resources available for duration `l`; if the customer returns during
+  that interval, avoid the physical pause entirely, otherwise shorten the
+  eventual physical pause by `l`.
+- Predictive logical pause tries to avoid predicted short pauses without
+  shortening predicted long pauses, but prediction error can make it more
+  expensive than the simple greedy variant.
+- The paper reports that predictive proactive resume can make roughly
+  70-80% of resumes proactive and correct for long-lived databases, with
+  99% of long-lived databases seeing correct proactive resumes. It also
+  reports that logical pause can avoid up to about half of pauses; a
+  4-hour logical pause example avoids 53% of pauses at a 0.1 pause-cost
+  index. Combining proactive resume and logical pause reaches up to 80%
+  proactive/correct resumes while still avoiding up to half of pauses, at
+  a reported combined cost index of 0.26.
+
+**GPU DB mapping:** Moneyball maps cleanly to a warm-route controller for
+logical sessions and resident data. A logical session may be "physically
+cold" at the protocol edge, with no owned buffers, no prepared response
+metadata, and no active admission slot, while still being cheap to resume
+through compact session identity. Conversely, a recently active or
+historically patterned tenant/query route can remain logically paused but
+physically warm for a short interval: IO worker affinity, prepared
+statement state, pinned response buffers, resident snapshot references, or
+GPU route descriptors remain available until a cost budget expires.
+
+For P8, the logical-pause mechanism suggests a cache state between
+`Valid` and `Evicted`: `WarmIdle` or equivalent. A table/tenant/query
+shape that has just gone idle should not be evicted immediately if recent
+history predicts reuse within the warm-hold window. But the warm-hold
+decision needs an explicit byte-time or resource-time cost index, because
+holding HBM, pinned memory, CPU route caches, or NVMe prefetch windows can
+starve active work.
+
+The probabilistic resume design also suggests how to scale toward 1M
+logical sessions without per-session heavy state. Keep long-lived,
+low-cardinality history per tenant, route shape, table, and time window;
+promote only the sessions or route families whose resume probability
+crosses a threshold. The rest stay represented as compact logical state
+until activity arrives. For GPU DB, "resume" means restoring the narrow
+resources needed for fast service: protocol parser state, prepared-plan
+cache entries, resident generation handles, pinned staging buffers, or
+prewarmed CPU/GPU execution queues.
+
+The paper's cost-index framing should become benchmark telemetry. Route
+warmup should report wrong warmups, wait time until first use, queries
+served before eviction, byte-time held idle, and active work blocked by
+warm idle state. That gives the planner/admission layer a way to compare
+QoS gains against lost capacity instead of only counting cache hit rate.
+
+**Risks and mismatches:** Moneyball optimizes serverless pause/resume at
+database granularity, not per-query GPU execution or OLTP transaction
+latency. Its windows are hours, while GPU DB admission and resident-route
+warmup may need milliseconds to minutes depending on resource class. Azure
+SQL serverless telemetry and billing economics do not directly transfer to
+single-node HBM, pinned memory, NVMe queue depth, or pgwire session state.
+The reported ML model details are intentionally operational rather than a
+general reusable predictor recipe. A naive implementation could keep too
+much state warm for dormant logical sessions and harm active tenants, which
+would invert the intended benefit.
+
+**Benchmark candidates:**
+
+- Add a warm-idle policy simulator for logical sessions and route shapes:
+  immediate teardown, fixed logical pause, probability-threshold warm hold,
+  and predictive warm hold. Measure p50/p95 resume latency, warm-state
+  byte-time, wrong warmups, active-route rejections, and queries served per
+  warm interval.
+- Extend residency telemetry with a cost index: idle HBM/DRAM/pinned bytes
+  held because of warm prediction divided by bytes/time saved or latency
+  avoided by successful reuse. Proof gate: warm idle state cannot evict or
+  block admitted active routes beyond a configured budget.
+- Use synthetic 1M-logical-session traces with diurnal tenants, bursty
+  tenants, and unpredictable tenants. Expected win condition: patterned
+  tenants regain fast route state without keeping heavy state for the whole
+  population.
+- Test route-family proactive warmup at multiple granularities: session,
+  tenant, prepared query shape, resident table generation, and pinned GPU
+  batch buffer. Failure condition: per-session history or warm state grows
+  linearly with logical sessions.
+- Add a "wrong warmup" counter to cache/admission experiments. A warmup is
+  wrong if no compatible query uses the resource before the hold interval
+  expires or before pressure forces eviction.
+- Compare simple probabilistic windows against heavier predictors before
+  introducing ML. The minimum proof gate is that the simple model already
+  beats fixed keepalive/teardown on representative traces; otherwise the
+  added predictor maintenance is not justified.
