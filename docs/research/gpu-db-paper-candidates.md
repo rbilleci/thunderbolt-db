@@ -333,13 +333,23 @@ Append new candidates here as each paper is processed.
   Why: Polaris cites CockroachDB as a practical system exposing transaction
   priorities; useful for contrasting record-level OCC priority with
   distributed SQL priority, contention handling, and admission behavior.
-- `queued` — **GeoGauss: Strongly Consistent and Light-Coordinated OLTP for
-  Geo-Replicated SQL Database**, Li et al., arXiv 2023.
+- `reviewed` — **GeoGauss: Strongly Consistent and Light-Coordinated OLTP for
+  Geo-Replicated SQL Database**, Zhou et al., PACMMOD/SIGMOD 2023.
   URL: `https://arxiv.org/abs/2304.09692`
+  DOI: `https://doi.org/10.1145/3588916`
   Why: modern geo-replicated SQL transaction design that compares against
   CockroachDB on TPC-C; useful for contrasting closed timestamps, leaseholder
   ownership, and distributed commit coordination with lighter geo-OLTP
   protocols.
+- `queued` — **Q-Store: Distributed, Multi-partition Transactions via
+  Queue-oriented Execution and Communication**, Qadah, Gupta, and Sadoghi,
+  EDBT 2020.
+  URL: `https://doi.org/10.5441/002/edbt.2020.08`
+  PDF: `https://openproceedings.org/2020/conf/edbt/paper_39.pdf`
+  Why: GeoGauss compares against Q-Store's deterministic queue-oriented
+  distributed transaction processing; useful for evaluating whether GPU DB
+  owner rings should become explicit operation queues for multi-partition
+  transactions without forcing every route through a single global schedule.
 - `reviewed` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
   Queries**, Yang et al., CIDR 2024.
   URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`

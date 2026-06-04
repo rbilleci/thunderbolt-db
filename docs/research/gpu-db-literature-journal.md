@@ -45430,3 +45430,189 @@ implementation details have likely evolved since publication.
   locality, owner locality, resident partition, transfer bytes, queue
   delay, and fallback risk. Use deterministic costs first; learned
   ranking can only adjust within these guardrails.
+
+### 2026-06-04 - GeoGauss batches replica consistency without per-transaction coordination
+
+**Citation:** Weixing Zhou, Qi Peng, Zijie Zhang, Yanfeng Zhang, Yang
+Ren, Sihao Li, Guo Fu, Yulong Cui, Qiang Li, Caiyi Wu, Shangjun Han,
+Shengyi Wang, Guoliang Li, and Ge Yu. "GeoGauss: Strongly Consistent
+and Light-Coordinated OLTP for Geo-Replicated SQL Database."
+PACMMOD/SIGMOD 2023, article 62. doi:10.1145/3588916. Retrieved
+2026-06-04 from arXiv, `https://arxiv.org/abs/2304.09692`.
+
+**Category:** transaction processing / write path / concurrency
+control.
+
+**Relevance tags:** epoch-based OCC; multi-master replication;
+delta-state CRDT; write-set merge; weak isolation; snapshot
+publication; epoch barriers; asynchronous execution; synchronous
+validation; cross-region OLTP.
+
+**Core idea:** GeoGauss chooses a full-replica, multi-master SQL
+architecture instead of CockroachDB-style sharded leaseholders. Each
+region executes local SQL optimistically, ships write sets at epoch
+boundaries, merges all local and remote write sets with a deterministic
+delta-CRDT-style rule, and only returns write transactions once the
+replica has generated the globally consistent snapshot for that commit
+epoch.
+
+The transferable idea is epoch-granular publication. Coordination is
+not paid for every transaction or every shard; it is paid to prove that
+an epoch's update set is complete and that every replica applies the
+same deterministic conflict winners to the same prior snapshot. Inside
+GPU DB, this maps less to geo-replication and more to commit-generation
+publication: mutation, resident refresh, invalidation, and read-snapshot
+release can be grouped at explicit generation boundaries while execution
+continues speculatively ahead of the latest published generation.
+
+**Concrete mechanisms:**
+
+- GeoGauss keeps a full SQL replica in each region. Local transactions
+  execute on the most recent consistent local snapshot, producing read
+  sets and write sets rather than shipping SQL statements for remote
+  deterministic execution.
+- Each transaction records a start epoch `sen`, latest snapshot number
+  `lsn`, commit epoch `cen`, commit sequence number `csn`, read set, and
+  write set. Write sets are exchanged among replicas at epoch boundaries.
+- A transaction with writes cannot return committed or aborted until
+  snapshot `cen` is generated locally, which requires receiving and
+  merging the relevant remote updates for that epoch.
+- The merge rule uses per-row header metadata `{sen, lsn, csn, cen}`.
+  If multiple writes touch the same row in the same epoch, shorter
+  transactions win first by larger `sen`; ties use smaller `csn`, giving
+  a deterministic first-write-wins order. Insert conflicts use a
+  temporary table because ordinary index lookup cannot find a missing
+  row.
+- The merge is designed to be associative, commutative, and idempotent
+  for write-set dissemination: duplicate, reordered, or partially
+  merged updates converge as long as every replica applies the same epoch
+  update set to the same prior snapshot.
+- Execution and validation are split. A node may execute epoch `i`
+  transactions before snapshot `i - 1` is available, but validation and
+  write-back for epoch `i` wait for the prior snapshot and all same-epoch
+  local/remote updates.
+- Read-only transactions return from local snapshots. RC accepts
+  committed snapshot reads that may not be the freshest. RR and SI use
+  read-set validation; SSI is discussed but not implemented because it
+  would require exchanging read keys for dependency detection.
+- Implementation details include openGauss MOT as the in-memory storage
+  base, Protocol Buffers plus Gzip for compressed write sets, ZeroMQ
+  publish-subscribe instead of heavier gRPC, pipelined mini-batch writes
+  within an epoch, EOF markers to prove epoch completeness, and zero-copy
+  send/receive optimizations.
+- Fault tolerance options range from local write-set backup, to remote
+  write-set backup, to per-epoch Raft replication of write sets. Raft is
+  also used for membership changes so failed nodes do not block epochs
+  forever.
+- The paper's cross-region evaluation uses YCSB and a TPC-C mix. It
+  reports up to 7.06x higher throughput and 17.41x lower latency than
+  CockroachDB on TPC-C, and shows that GeoGauss's wait time in a TPC-C
+  transaction breakdown is much lower than the synchronous-execution
+  variant. Results depend on weak isolation defaults and the specific
+  geo/WAN setup.
+
+**GPU DB mapping:** The GPU DB write path should consider an explicit
+commit-generation pipeline: execute or prepare commands ahead, collect
+their write sets, perform deterministic conflict/admission decisions at
+a generation boundary, append/flush WAL, invalidate resident generations,
+and publish a new visibility boundary. The critical transfer is not
+GeoGauss's geo protocol; it is the separation between optimistic
+execution and synchronous publication.
+
+For retained GPU reads, the epoch snapshot is a close cousin of the
+closed visibility certificate from CockroachDB. A resident read snapshot
+should become routable only after the engine can prove a complete
+generation: WAL boundary, visibility boundary, catalog generation,
+resident generation, and invalidation generation. Reads that do not
+require the newest data can target older certified generations without
+queuing behind mutation-owner work.
+
+GeoGauss's deterministic row-header conflict winner suggests a simple
+first benchmark for write admission. Instead of committing every
+mutation immediately, batch same-partition write sets by short
+microsecond epochs and compare FIFO, first-write-wins, shorter-job-wins,
+priority-aware, and runtime-conflict-aware winner rules. The merge rule
+must remain a scheduling and abort policy; WAL-before-visibility still
+owns correctness.
+
+The pipelined write-set exchange maps to local owner rings. Even on a
+single node, large COPY chunks, refresh updates, invalidation messages,
+and response publication should stream through bounded mini-batches with
+end-of-generation markers instead of forming one burst at the end of a
+long batch.
+
+**Risks and mismatches:** GeoGauss deliberately favors weak isolation
+levels; it supports RC, RR, and SI but not SSI in the implementation
+described. GPU DB cannot weaken its intended SQL isolation or MVCC
+visibility semantics just to inherit the throughput shape. Its row-level
+merge rule is also application-policy-sensitive: choosing "shorter
+transaction wins" may be useful for latency but can starve long writes
+or refresh work unless bounded by fairness and priority rules.
+
+The system is geo-distributed and full-replica, while the current GPU DB
+target is primarily a single-node GPU/CPU/NVMe engine with future
+multi-device tiers. GeoGauss uses one thread per transaction in its
+openGauss MOT base, which is the opposite of GPU DB's desired
+1M-logical-session IO-worker design. Its evaluation compares different
+consistency and feature surfaces: CockroachDB offers serializable
+distributed SQL, while GeoGauss's strongest reported results use weaker
+isolation by default. Treat the numbers as motivation for generation
+batching, not as an apples-to-apples performance promise.
+
+**Benchmark candidates:**
+
+- Build a generation-batched write-path simulator. Compare immediate
+  commit publication with 10 us, 100 us, 1 ms, and adaptive generation
+  boundaries under YCSB and TPC-C-like hot-key mixes. Measure throughput,
+  p50/p99/p999 latency, abort/retry rate, and WAL flush grouping.
+- Add deterministic merge-policy experiments for same-generation writes:
+  FIFO, first-write-wins by commit sequence, shorter-job-wins,
+  priority-aware, and runtime-conflict-aware. Failure condition: any rule
+  changes durable visibility ordering without an explicit abort/retry.
+- Prototype end-of-generation markers for resident invalidation and
+  refresh queues. Proof gate: a retained read can only bind to a resident
+  generation after all invalidations for the source visibility boundary
+  are known complete.
+- Add a stale-generation retained-read benchmark. Route read-only
+  requests to current owner, newest certified generation, or older
+  certified generation by freshness budget. Measure owner-queue bypass,
+  staleness window, fallback rate, and correctness against CPU MVCC.
+- Test streaming mini-batches for COPY and refresh work with an explicit
+  EOF marker. Compare burst-at-boundary versus pipelined publication for
+  queue depth, memory use, and latency spikes.
+- Add fairness counters to any epoch-style admission path:
+  generation_wait_us, skipped_generations, long_txn_abort_count,
+  priority_override_count, starvation_release_count, and
+  publish_boundary_lag.
+- Keep an SSI/MVCC guardrail test: if an optimization only works under RC
+  or weak SI, it must be flagged as a benchmark-only mode until the
+  serializable/read-snapshot semantics are explicitly proven.
+
+### 2026-06-04 - Cross-paper synthesis: publish certified generations, not mutable shortcuts
+
+CockroachDB and GeoGauss now give two useful extremes for transaction
+publication. CockroachDB centralizes fresh authority in leaseholders and
+lets older closed timestamps escape to cheaper follower reads. GeoGauss
+executes optimistically at every master, then synchronizes at epoch
+boundaries so every replica publishes the same next snapshot. CardOOD
+adds the planner caution: any route model that chooses among those paths
+must know when it is out of distribution and fall back conservatively.
+
+The converging design track for GPU DB is a certified-generation model.
+Mutation owners, residency owners, and GPU execution workers should not
+share mutable truth directly. They should publish immutable generations
+with explicit source WAL, visibility, catalog, resident, invalidation,
+and model/route-certification metadata. Fast paths may execute from
+older certified generations or prepare work speculatively, but response
+publication must wait for the certificate required by the query's
+freshness and isolation contract.
+
+Category gaps are now less about transaction-control ideas and more
+about how to place and index the certified generations across GPU HBM,
+host DRAM, NVMe, and future memory tiers. The next high-value reviews
+should lean toward tiered indexes, storage placement, or GPU/CPU route
+execution unless a newer MVCC paper directly sharpens snapshot
+publication. Benchmark priority should combine the active-window
+admission simulator with generation certificates: measure when bounded
+batching helps, when it hurts tail latency, and when older retained
+snapshots safely bypass owners.
