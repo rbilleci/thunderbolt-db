@@ -3309,7 +3309,7 @@ Append new candidates here as each paper is processed.
   Why: Database Kernels points to coherent virtually materialized views and
   persistence-layer coherence mechanisms; useful for future row/column view
   invalidation across CPU, CXL, and GPU-resident representations.
-- `queued` — **Correct, Fast Remote Persistence**, Kashyap et al., arXiv 2019.
+- `reviewed` — **Correct, Fast Remote Persistence**, Kashyap et al., arXiv 2019.
   URL: `https://arxiv.org/abs/1909.02092`
   Why: X-SSD cites remote-PM persistence ambiguity as a motivation; useful for
   defining exact durability acknowledgements when WAL, replicas, NICs, GPUs,
@@ -3328,6 +3328,25 @@ Append new candidates here as each paper is processed.
   Why: X-SSD's fast-side API can host PM-oriented logging schemes; useful for
   comparing delayed durability placement with GPU DB's WAL-before-visibility
   invariant and batch publication boundary.
+- `queued` — **Octopus: an RDMA-enabled Distributed Persistent Memory File
+  System**, Lu et al., USENIX ATC 2017.
+  URL: `https://www.usenix.org/conference/atc17/technical-sessions/presentation/lu`
+  Why: Correct, Fast Remote Persistence cites Octopus as early RDMA plus PM
+  work; useful for comparing remote persistent-memory file semantics with GPU
+  DB WAL, cold-tier namespace, and replica durability counters.
+- `queued` — **Mojim: A Reliable and Highly-Available Non-Volatile Memory
+  System**, Zhang et al., ASPLOS 2015.
+  URL: `https://doi.org/10.1145/2694344.2694370`
+  Why: Correct, Fast Remote Persistence cites Mojim as an early HA NVM system;
+  useful for comparing primary/backup memory replication and failure handling
+  with explicit WAL-before-visibility and retained snapshot clocks.
+- `queued` — **Failure-Atomic Persistent Memory Updates via JUSTDO Logging**,
+  Izraelevitz, Kelly, and Kolli, ASPLOS 2016.
+  URL: `https://doi.org/10.1145/2872362.2872410`
+  Why: Correct, Fast Remote Persistence uses local persistence-domain and
+  flush-ordering assumptions that build on PM logging work; useful for
+  comparing local PM commit records with remote durability acknowledgement
+  recipes.
 - `reviewed` — **Robust Query Driven Cardinality Estimation under Changing
   Workloads**, Negi et al., PVLDB 2023.
   URL: `https://doi.org/10.14778/3583140.3583164`

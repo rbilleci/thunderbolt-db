@@ -42116,3 +42116,150 @@ serve as expected performance on the future GPU machine.
   canonical state, GPU resident snapshot generation, and cold destage. The
   planner and runtime should report which tier boundary caused write or read
   admission failure.
+
+### 2026-06-04 - Correct remote durability depends on the whole path
+
+**Citation:** Sanidhya Kashyap, Dai Qin, Steve Byan, Virendra J. Marathe,
+and Sanketh Nalli. "Correct, Fast Remote Persistence." arXiv:1909.02092,
+2019. Retrieved 2026-06-04 from `https://arxiv.org/abs/1909.02092`.
+
+**Category:** transaction processing / write path; remote persistence and
+durability semantics.
+
+**Relevance tags:** RDMA; persistent memory; WAL replication; remote
+durability; persistence domains; DDIO; RDMA flush; ordered compound writes;
+log replication; session/write admission; failure recovery.
+
+**Core idea:** The paper's key warning is that "remote write completed" is
+not the same as "remote write is durable." For RDMA updates to remote
+byte-addressable persistent memory, correctness depends on where the incoming
+bytes currently sit: RNIC buffers, I/O controller buffers, processor cache,
+memory-controller buffers, or persistent memory DIMMs. The answer changes with
+the remote persistence domain, DDIO/cache-stashing behavior, RDMA transport
+semantics, and whether receive-queue buffers live in DRAM or PM.
+
+The authors build a taxonomy of correct persistence recipes for singleton
+updates and compound ordered updates. Their evaluation uses a remote log append
+workload and shows that the fastest recipe is configuration-dependent:
+one-sided RDMA-style paths can be much faster, but only if the hardware
+configuration really makes the needed bytes persistent in the assumed order.
+The transferable design point for GPU DB is that a durability certificate must
+name the whole path, not just the API call used to ship bytes.
+
+**Concrete mechanisms:**
+
+- The taxonomy uses three responder persistence domains. DMP includes PM DIMMs
+  plus integrated memory-controller buffers protected by ADR-like mechanisms.
+  MHP includes the whole memory hierarchy, such as processor caches and store
+  buffers. WSP includes the whole system, including RNIC buffers.
+- DDIO/cache stashing changes the persistence recipe. With DMP, inbound RDMA
+  data may land in processor cache outside the persistence domain, so a remote
+  CPU-side cache-line flush or equivalent handshake may be required. Turning
+  DDIO off can route inbound data through memory-controller buffers that are in
+  DMP, enabling simpler one-sided persistence recipes.
+- RDMA receive-queue work request buffers matter. If an RDMA `SEND` lands in a
+  receive buffer allocated in PM, the message itself may be recoverable and can
+  sometimes be treated like a one-sided persisted command. If the receive
+  buffer is in DRAM, the responder must usually process/copy/ack it.
+- Existing RDMA operation ordering separates posted operations (`SEND`,
+  `WRITE`, `WRITE_IMM`) from non-posted operations (`READ`, atomics, proposed
+  `FLUSH`). Posted and non-posted operations do not give a single simple
+  persistence order by default.
+- The proposed RDMA `FLUSH` makes prior updates visible at the responder before
+  the requester receives completion, but because it is non-posted, later posted
+  writes can still reorder around it unless fenced or replaced by an atomic
+  write-style operation where available.
+- For singleton remote PM updates, some configurations can use one-sided
+  `WRITE` plus `FLUSH`; others require `WRITE`/`WRITE_IMM` plus a responder
+  message that locally flushes affected cache lines and sends an ack.
+- For compound updates such as log-record append followed by tail-pointer
+  advance, the recipe must preserve persistence order. In DMP with DDIO on,
+  this can require responder-side message exchanges and local flushes. With
+  MHP or WSP, or DMP with DDIO off in some cases, one-sided ordered recipes
+  become possible.
+- `WRITE_IMM` can avoid a data copy but exposes only small immediate metadata,
+  so the target location or command context must be representable through that
+  payload or through prearranged state.
+- WSP lets InfiniBand/RoCE completion imply persistence when RNIC buffers are
+  in the persistence domain. The paper notes that iWARP's weaker completion
+  semantics still require a flush-like operation.
+- Torn writes remain an application-level concern; checksums, ordered writes,
+  or comparable recovery metadata are still needed.
+- The evaluation emulates PM with DRAM on two machines using 100Gb/s
+  InfiniBand and a remote-log benchmark with 10 million 64-byte appends. It
+  emulates `FLUSH` with RDMA `READ` because the proposed flush was not
+  available.
+- Reported evaluation highlights: one-sided persistence can outperform
+  two-sided message-passing persistence by up to about `50%` for singleton
+  remote-log appends; WSP can remove flush overhead and drop one-sided
+  singleton latency by about `25%`; for compound appends, one-sided MHP and WSP
+  paths can beat message passing by about `20%` and `30%` respectively, while
+  DMP with DDIO on can make message packing cheaper than multiple write/flush
+  round trips.
+
+**GPU DB mapping:** This sharpens the WAL and replica durability track from
+X-SSD. GPU DB should expose durability as a named route certificate: local WAL
+buffered, local durable, remote RNIC-visible, remote PM-durable, remote
+replayable, CPU MVCC visible, GPU resident invalidated, and GPU resident
+refreshed. A commit path must publish visibility only after the selected
+durability certificate is satisfied, not merely after an RDMA, NVMe, CXL, or
+storage API reports completion.
+
+For future replication or disaggregated tiers, the mutation owner should know
+the persistence recipe selected for each remote target. A remote WAL lane using
+RDMA writes to PM has different correctness requirements under DMP+DDIO,
+DMP without DDIO, MHP, WSP, InfiniBand/RoCE, or iWARP. Treating all of those
+as "remote write durable" would be a data-loss bug.
+
+The receive-buffer result maps to command-ring design. A PM-backed, replayable
+ingress ring can turn some received commands into durable facts before CPU
+processing, but only if recovery can interpret the ring without volatile
+context and if queue-buffer recycling is bounded. This is a possible future
+shape for WAL admission or remote partition-owner commands, not a shortcut for
+SQL visibility.
+
+For P8 tiering, the paper also argues for precise path telemetry. GPU memory,
+CPU cache, host DRAM, CXL memory, persistent memory, RNIC buffers, and NVMe
+controllers all have different failure semantics. Resident GPU snapshots should
+remain acceleration state, but the same certification idea applies: a route
+must say which tier owns correctness and which tiers merely contain fast copies.
+
+**Risks and mismatches:** The paper is a taxonomy and microbenchmark, not a
+complete database recovery protocol. Its evaluation uses emulated persistent
+memory, one client/server pair, 100Gb/s InfiniBand, and an RDMA `READ`
+approximation for the proposed `FLUSH`; it does not prove behavior on future
+CXL, GPUDirect Storage, commodity NVMe, or a modern GPU server. It also does
+not cover MVCC validation, SQL transaction semantics, consensus, failover, or
+GPU residency invalidation.
+
+Some fast recipes rely on hardware support or configuration that may be rare,
+such as WSP, MHP, DDIO controls, PM-backed receive queues, or future RDMA
+extensions. Persistent receive buffers also create recovery complexity: if a
+durable message is missing volatile context, the system may still need the
+slower responder-ack protocol. Finally, optimizing remote durability does not
+remove the need for local WAL ordering, checksums, torn-write protection, and
+clear replay boundaries.
+
+**Benchmark candidates:**
+
+- Add a durability-certificate model for write routes. Fields should include
+  transport, target tier, persistence domain assumption, flush/ack recipe,
+  contiguous durable boundary, and replay interpretation. Proof gate: a route
+  cannot publish MVCC visibility unless its certificate says the selected
+  durability policy is complete.
+- Build a remote-WAL simulator with configurable DMP/MHP/WSP, DDIO on/off,
+  PM/DRAM receive buffers, and posted/non-posted ordering. Failure condition:
+  a simulated crash loses a log record whose commit was acknowledged.
+- Extend WAL tests with compound ordered updates: record bytes followed by tail
+  pointer or generation advancement. Inject crashes between every operation and
+  require replay to stop at the last ordered durable boundary.
+- Prototype PM-backed command-ring recovery in a no-GPU harness. Required
+  measurement: queue recycle pressure, replay cost, command context needed for
+  recovery, and whether durable-but-unprocessed messages can be made
+  idempotent.
+- Add telemetry to distinguish API completion from durable boundary completion.
+  For local file/NVMe today this may be `write`, `fdatasync`, checkpoint, and
+  replay-visible; future RDMA/CXL paths can add richer counters later.
+- In 1M logical-session write tests, tie active write credits to the durability
+  boundary, not to socket write completion. The expected result is bounded WAL
+  memory and explicit backpressure when remote durability lags.
