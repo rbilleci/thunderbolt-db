@@ -758,6 +758,28 @@ Append new candidates here as each paper is processed.
   Why: follow-up to PARQO that focuses on parametric robust query
   optimization and plan-penalty profile caching; relevant to repeated retained
   GPU route templates and admission-time route reuse.
+- `reviewed` — **Concurrency Control as a Service**, Zhou et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p2761-zhou.pdf`
+  DOI: `https://doi.org/10.14778/3746405.3746406`
+  Why: modern execution-CC-storage disaggregation with sharded multi-write OCC,
+  asynchronous log push-down, and independently scalable conflict-resolution
+  resources; directly relevant to mutation-owner decomposition and write-path
+  admission.
+- `queued` — **A Hybrid Approach to Integrating Deterministic and
+  Non-deterministic Concurrency Control in Database Systems**, Hong et al.,
+  PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p1376-lu.pdf`
+  DOI: `https://doi.org/10.14778/3718057.3718066`
+  Why: modern hybrid deterministic/OCC design with global validation and
+  logging integration; useful for deciding whether GPU DB write batches should
+  route through deterministic or optimistic lanes by workload.
+- `queued` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
+  PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
+  DOI: `https://doi.org/10.14778/3681954.3681956`
+  Why: schedule-first concurrency-control approach with fine-grained operation
+  ordering; useful for comparing engine-owned transaction scheduling against
+  route-level micro-batching and conflict-aware admission.
 - `queued` — **Fluid Co-processing: GPU Bloom-filters for CPU Joins**,
   Gubner et al., DaMoN 2019.
   URL: `https://doi.org/10.1145/3329785.3329934`

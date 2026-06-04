@@ -33554,3 +33554,157 @@ state.
 - Simulate skewed hot/cold key movement and verify that boundary-group refresh
   can split/coalesce groups without breaking snapshot visibility or producing
   unbounded tiny groups.
+
+### 2026-06-04 - CCaaS separates conflict resolution from execution and storage
+
+**Citation:** Weixing Zhou, Yanfeng Zhang, Xinji Zhou, Zhiyou Wang, Zeshun
+Peng, Yang Ren, Sihao Li, Huanchen Zhang, Guoliang Li, and Ge Yu.
+"Concurrency Control as a Service." PVLDB 18(9): 2761-2774, 2025. Retrieved
+2026-06-04 from the VLDB PDF,
+`https://www.vldb.org/pvldb/vol18/p2761-zhou.pdf`; DOI
+`https://doi.org/10.14778/3746405.3746406`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale.
+
+**Relevance tags:** concurrency-control service; sharded OCC; write admission;
+conflict resolution; asynchronous logging; execution/storage disaggregation;
+multi-writer architecture; deterministic conflict resolution; elasticity;
+transaction metadata sharding.
+
+**Core idea:** CCaaS argues that concurrency control has its own resource
+profile and should not always be coupled to either SQL execution or storage.
+Execution may scale out for CPU demand, storage may scale for capacity and IO,
+while conflict resolution often scales best with a different node count because
+extra participants increase coordination overhead. The proposed architecture
+therefore inserts a separate concurrency-control layer between execution and
+storage.
+
+The paper's default algorithm, Sharded Multi-Write OCC, tries to offset the new
+network hop by making transaction execution optimistic, sharding committed
+transaction metadata by data item, resolving conflicts with deterministic
+ordering inside shards, and acknowledging commit after the CC layer persists the
+log locally instead of after storage has applied the update. In evaluation, the
+authors report 1.02-3.11x higher throughput and 1.11-2.75x lower latency than
+their state-of-the-art disaggregated database baselines. The exact numbers are
+cloud/disaggregation-specific; the transferable idea is that conflict ownership
+can be scaled and budgeted independently from execution and storage ownership.
+
+**Concrete mechanisms:**
+
+- CCaaS exposes abstract transaction interfaces to execution engines:
+  transaction start, read/write-set submission, commit/abort result delivery,
+  and log push to storage. The CC layer sees data-item operation metadata rather
+  than storage-engine-specific tuple formats.
+- Each CC node manages shards of committed transaction metadata. Shards may be
+  replicated on multiple nodes for availability and load distribution.
+- Transactions execute optimistically in the execution layer, then send read
+  and write sets to CCaaS for validation and conflict resolution. This avoids
+  per-read or per-write lock round trips during transaction execution.
+- SM-OCC works in epochs. After transactions of one epoch finish execution,
+  CCaaS generates a snapshot and resolves conflicts for the next epoch.
+- Conflict handling is split into read-set validation and write-set resolution.
+  Read-set validation checks whether versions observed by a transaction remain
+  valid against committed metadata. Write-set resolution orders conflicting
+  writers deterministically.
+- Commit sequence numbers include local time and node identity, giving
+  distributed CC nodes a deterministic tie-breaker for write conflicts.
+- The multi-write architecture allows multiple CC nodes to receive transaction
+  requests and resolve local shard work, reducing single-master bottlenecks.
+- The paper uses asynchronous log push-down: CCaaS writes commit/abort logs to
+  local durable storage, returns the resolution result to execution, and pushes
+  the update log to the storage layer asynchronously.
+- CCaaS discusses Raft replication for CC-layer fault tolerance. If an execution
+  node fails after submitting a transaction, the user can reconnect and observe
+  whether the transaction committed through storage state.
+- Re-sharding is supported by switching conflict resolution to the new sharding
+  policy at a predetermined epoch and then migrating committed transaction
+  metadata.
+- The evaluation varies execution nodes, CC nodes, storage engines, workload
+  contention, read/write mix, transaction operation count, log mode, elasticity,
+  and recovery behavior. Higher write intensity and larger read/write sets hurt
+  more because CCaaS sends more metadata across the network.
+
+**GPU DB mapping:** The current architecture already names mutation,
+residency, catalog, and GPU execution owners. CCaaS sharpens the next split:
+the mutation owner should not be treated as one indivisible bottleneck forever.
+It contains at least WAL admission, visibility publication, conflict metadata,
+CPU tuple/index mutation, resident invalidation, and refresh notification. Those
+subdomains may have different scaling laws.
+
+The most useful transfer is not to build a remote CC service immediately. It is
+to make conflict resolution an explicit owner with typed inputs and outputs.
+For GPU DB, a write batch could submit a compact read/write-set descriptor,
+source snapshot generation, intended table/partition boundaries, and WAL
+payload handle to a conflict/visibility owner. That owner decides commit,
+abort, repair, reorder, or retry without owning GPU execution resources or
+cold-tier maintenance.
+
+The asynchronous log push-down idea has to be adapted carefully. GPU DB already
+requires WAL-before-visibility. A safe local version would be: once the durable
+WAL/commit record is fsynced by the authority for the partition, visibility may
+be published and resident generations invalidated, while slower derived work
+such as CPU index maintenance, GPU refresh, cold-tier propagation, and cache
+warmup runs behind that boundary. The paper is a reminder to distinguish
+durable commit acknowledgment from downstream storage/cache application, but
+not a reason to weaken WAL ordering.
+
+SM-OCC's sharded metadata suggests a possible route for 1M logical sessions:
+session workers and read workers should not all contend on one global
+transaction table. A retained read or short transaction can carry the shard IDs
+it touches, and admission can meter per-shard conflict queues, metadata cache
+pressure, and validation backlog. Hot shards then become observable overload
+points rather than hidden p99 latency.
+
+For P8, the execution-CC-storage layering maps onto durable truth, visibility
+truth, and resident/cache truth. Storage owns recoverable bytes; CC/visibility
+owns whether a version may be observed; residency owns whether an already
+visible boundary is accelerated on GPU. Keeping those contracts separate should
+make it easier to reason about refresh, invalidation, and fallback under
+high-concurrency writes.
+
+**Risks and mismatches:** CCaaS targets disaggregated cloud databases and
+multi-model engines, not a single-node GPU-accelerated transactional engine.
+The extra network layer may be inappropriate inside one process where owner
+rings and cache-local metadata are cheaper. Its default SM-OCC protocol is
+epoch-based and optimistic, so high-contention write-heavy workloads can abort
+more often, and epoch boundaries may hurt low-latency interactive
+transactions.
+
+The paper abstracts data items, but SQL predicate conflicts, range reads,
+secondary indexes, MVCC version chains, DDL invalidation, and serializable
+predicate protection need more detail than a generic read/write set. The
+asynchronous log push-down mechanism must not be copied naively: if GPU DB
+acknowledges commit before the durable WAL authority has persisted the commit
+record, recovery correctness is broken. Finally, the evaluation uses YCSB-style
+workloads, NoSQL/graph case studies, and openGauss-style integration; it does
+not evaluate GPU residency, retained snapshots, pgwire session pressure, or
+NVMe/GDS tiering.
+
+**Benchmark candidates:**
+
+- Split write-path telemetry into WAL admission, conflict validation,
+  visibility publication, CPU mutation/index maintenance, resident
+  invalidation, and refresh notification. Gate: a write-heavy benchmark can
+  identify which subdomain saturates instead of reporting one owner queue.
+- Prototype a CPU-only conflict/visibility owner fed by bounded rings from
+  mutation workers. Inputs: read set, write set, snapshot generation, WAL handle,
+  and partition IDs. Proof gate: identical commit/abort and replay behavior to
+  the current serialized path.
+- Add a sharded transaction-metadata simulator with hot-key Zipfian workloads.
+  Compare one global validation owner, hash-sharded validation, and partition
+  owner validation. Failure condition: p99 validation latency remains hidden
+  behind aggregate throughput.
+- Test epoch-batched OCC admission for COPY/INSERT micro-batches against
+  immediate per-transaction validation. Measure throughput, aborts, p50/p99
+  commit latency, and WAL fsync grouping. Failure condition: latency ceilings
+  are exceeded or abort storms erase throughput gains.
+- Add a WAL-before-derived-work benchmark: acknowledge only after durable WAL
+  and visibility publication, then perform CPU index update, resident
+  invalidation, GPU refresh, and cold-tier propagation asynchronously where
+  correctness permits. Gate: crash/replay proves no acknowledged transaction is
+  lost and no stale resident read is served.
+- Expose per-shard validation backlog and read/write-set byte telemetry in the
+  session admission model. Expected improvement: hot conflict shards produce
+  explicit overload or retry reasons while unrelated read-only retained routes
+  continue to execute.
