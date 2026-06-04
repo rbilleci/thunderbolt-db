@@ -1817,12 +1817,24 @@ Append new candidates here as each paper is processed.
   reviewing Centiman's read-only bypass path; relevant to route-level choices
   that keep serializability while letting safe read-heavy templates avoid the
   strongest validation path.
-- `queued` — **Detecting Robustness against MVRC for Transaction Programs
+- `reviewed` — **Detecting Robustness against MVRC for Transaction Programs
   with Predicate Reads**, Vandevoort et al., EDBT 2023.
-  URL: `https://doi.org/10.48786/edbt.2023.47`
+  URL: `https://doi.org/10.48786/edbt.2023.48`
   Why: read-promotion paper cites this as a direction for transaction programs
   with predicate reads; relevant to GPU DB route templates that include ranges,
   prefix predicates, and phantom-sensitive retained scans.
+- `queued` — **Serializable use of Read Committed isolation level**, Alomari
+  and Fekete, AICCSA 2015.
+  URL: `https://doi.org/10.1109/AICCSA.2015.7507195`
+  Why: EDBT 2023 refines this type-I counterflow-cycle robustness test; useful
+  as the simpler baseline for deciding whether route-template certification
+  needs predicate-aware type-II graph checks.
+- `queued` — **Checking Robustness Against Snapshot Isolation**, Beillahi,
+  Bouajjani, and Enea, CAV 2019.
+  URL: `https://doi.org/10.1007/978-3-030-25540-4_16`
+  Why: EDBT 2023 cites it as static robustness work for snapshot isolation;
+  useful for comparing MVRC route templates with future snapshot-isolation
+  certificates for retained GPU reads.
 - `reviewed` — **Allocating Isolation Levels to Transactions in a Multiversion
   Setting**, Vandevoort, Ketsman, and Neven, PODS 2023.
   URL: `https://doi.org/10.1145/3584372.3588672`

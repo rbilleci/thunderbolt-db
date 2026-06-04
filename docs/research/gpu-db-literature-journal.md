@@ -44225,3 +44225,134 @@ can wait unless they directly test route certificates or multi-tier placement.
   merge is correct.
 - Add crash/restart assertions that any published resident generation either
   belongs to a clean durable prefix or is rejected before serving new reads.
+
+### 2026-06-04 - MVRC robustness turns route isolation into a static template property
+
+**Citation:** Brecht Vandevoort, Bas Ketsman, Christoph Koch, and Frank
+Neven. "Detecting Robustness against MVRC for Transaction Programs with
+Predicate Reads." EDBT 2023, pages 565-577. doi:10.48786/edbt.2023.48.
+Retrieved 2026-06-04 from
+`https://openproceedings.org/2023/conf/edbt/3-paper-54.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing /
+concurrency control; query route certification.
+
+**Relevance tags:** multiversion read committed; serializability by workload
+robustness; predicate reads; phantoms; summary graph; counterflow dependency;
+static transaction-template analysis; route isolation; safe lower-isolation
+execution.
+
+**Core idea:** The paper asks when a transactional workload can run under
+multi-version Read Committed while every allowed execution remains
+serializable. This is an offline workload property, not a new online
+concurrency-control algorithm. Developers model the transaction programs once,
+then use the robustness result to decide whether the cheaper isolation route is
+semantically safe.
+
+The important advance over earlier robustness tests is that the model includes
+control flow, inserts, deletes, and predicate reads, so it can reason about
+phantom-sensitive programs rather than only key lookups and simple read/write
+sequences. The detection algorithm is sound but incomplete: a positive result
+certifies robustness, while a negative result may be a conservative false
+negative.
+
+**Concrete mechanisms:**
+
+- SQL transaction programs are abstracted into basic transaction programs
+  (BTPs). Each statement records operation type, relation, read attributes,
+  written attributes, predicate-read attributes, and relevant foreign-key
+  constraints. Concrete predicate expressions are abstracted away.
+- Branches and loops are unfolded into linear transaction programs. For the
+  robustness test, loops need only be unfolded up to two iterations because a
+  serialization-graph cycle needs at most one incoming and one outgoing
+  operation from a transaction instance.
+- The analysis builds a summary graph whose nodes are transaction programs and
+  whose labeled edges summarize possible dependencies between statements:
+  counterflow or non-counterflow, plus the source and target statements.
+- Under MVRC, only read/write and predicate-read/write antidependencies can be
+  counterflow, meaning the dependency direction is opposite to commit order.
+- The paper refines the older "any counterflow cycle is dangerous" condition.
+  Every non-serializable MVRC schedule must contain a type-II cycle: at least
+  one non-counterflow dependency and either adjacent counterflow dependencies
+  or an ordered counterflow pattern.
+- Algorithm 1 constructs the summary graph from statement metadata, attribute
+  intersections, and foreign-key checks. Algorithm 2 searches the graph for
+  type-II cycles. Absence of such cycles implies robustness against MVRC.
+- The implementation is a Python proof of concept evaluated on SmallBank,
+  TPC-C, Auction, and a scaled Auction(n) benchmark. It detects larger robust
+  subsets than the older type-I-cycle test. The scaled synthetic benchmark runs
+  in seconds, which is acceptable because the analysis is offline.
+- In the reported TPC-C result, the algorithm detects robust subsets including
+  `{OS, Pay, SL}` and `{NO, Pay}` when attribute dependencies and foreign keys
+  are used, but it does not certify the complete workload.
+
+**GPU DB mapping:** The direct GPU DB lesson is that route isolation should be
+a property of declared command templates, not just a per-query runtime guess.
+For simple retained lookup, range, prefix, and mutation templates, the engine
+can maintain a route-certificate class: serializable owner route required,
+MVRC-style route statically safe, snapshot route statically safe, or unknown
+and therefore forced through the conservative owner path.
+
+Predicate reads are the key fit for P8. A retained GPU prefix scan or range
+scan can be phantom-sensitive when concurrent inserts/deletes modify the
+predicate domain. This paper gives a way to ask whether a specific template
+mix remains serializable under a weaker route, provided the template metadata
+knows which attributes are read, written, and used in predicates.
+
+For the high-throughput runtime, the summary graph maps naturally to route
+admission. Before a request enters a GPU read-snapshot ring, the planner can
+attach a static isolation certificate for the transaction template and the
+active route family. If the template set gains a DDL or application command
+that introduces a type-II cycle, the route certificate should be invalidated
+and new requests should fall back to serializable owner execution until the
+template is recertified.
+
+The analysis also complements the route-clock synthesis. Freshness boundaries
+say which versions a route may see; robustness certification says whether the
+set of allowed interleavings at that route is serializable despite using a
+cheaper visibility mode. Both belong in the same route metadata, but they
+answer different questions.
+
+**Risks and mismatches:** This is a static analysis paper, not a measured
+runtime design. It does not provide throughput gains by itself, and it does not
+remove the need to implement MVRC, SI, or serializable routes correctly.
+
+The algorithm is sound but incomplete. A negative result cannot be treated as
+proof that a GPU route is unsafe; it only means the static checker could not
+certify it. The production fallback should therefore be conservative execution,
+not ad hoc weakening.
+
+The BTP abstraction deliberately ignores concrete predicate values. That keeps
+the analysis broadly applicable, but it can miss robustness that depends on
+specific predicates or mutually exclusive value domains. The paper gives
+Delivery in TPC-C as an example of a false negative caused by concrete
+predicate behavior.
+
+The model is MVRC-specific. Applying it directly to retained GPU snapshots,
+stable resident generations, or mixed CPU/GPU delta merge would require a
+separate proof that the route's visibility semantics match the assumed
+isolation model.
+
+**Benchmark candidates:**
+
+- Build a static route-template registry for supported GPU DB commands. For
+  each template, record relation, read attributes, written attributes,
+  predicate attributes, key/foreign-key constraints, and route family.
+  Proof gate: every admitted weak-route template has an explicit certificate.
+- Implement a small summary-graph checker for the first P8 workload slice:
+  point lookup, prefix scan, bounded aggregate, insert, update, and delete.
+  Compare three admission modes: owner-serializable only, MVRC-certified
+  templates, and uncertified optimistic routing with forced fallback.
+- Add a phantom-sensitive retained-scan test. Concurrent inserts into the
+  prefix/range domain must either be excluded by the certified read boundary,
+  merged through a declared delta route, or force owner execution.
+- Add a route-invalidation test for schema or template changes. When a new
+  command template introduces a type-II cycle, existing certificates must be
+  retired before new weak-route executions are admitted.
+- Measure the benefit and risk of static certification separately from runtime
+  execution: certification time, number of certified template subsets, fallback
+  rate, abort/retry rate, and p99 latency under mixed reads and writes.
+- Use TPC-C-like templates as a benchmark target, but do not assume the full
+  workload certifies. The minimum useful result is identifying which command
+  subsets can safely bypass the strongest route and which must remain owner
+  serialized.
