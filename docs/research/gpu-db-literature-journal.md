@@ -30109,3 +30109,187 @@ numbers are PostgreSQL-based, not GPU-resident.
   host-memory Present with timestamp indexes, and GPU-resident Value
   projection. Metrics: merge backlog, HBM bytes, read p50/p99,
   promotion/demotion events, and correctness after crash replay.
+
+### 2026-06-04 - SMaRTT turns congestion signals into staged sender admission
+
+**Citation:** Tommaso Bonato, Abdul Kabbani, Ahmad Ghalayini, Anup
+Agarwal, Daniele De Sensi, Rong Pan, Costin Raiciu, Mark Handley,
+Mihai Brodschi, Timo Schneider, Nils Blach, Daniel Santos Ferreira
+Alves, and Torsten Hoefler. "SMaRTT: Sender-based Marked
+Rapidly-adapting Trimmed & Timed Transport." arXiv:2404.01630v4,
+2024/2026. Retrieved 2026-06-04 from
+`https://arxiv.org/abs/2404.01630` and
+`https://arxiv.org/pdf/2404.01630`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** congestion control; sender-side admission; ECN;
+RTT delay; packet trimming; multipath load balancing; fair increase;
+QuickAdapt; FastIncrease; bounded per-flow state; response-ring
+backpressure; high-concurrency networking.
+
+**Core idea:** SMaRTT is a sender-side congestion-control design for
+lossy high-performance datacenter Ethernet. Its useful lesson for GPU
+DB is not that the database should implement UEC transport. It is that
+admission should treat congestion evidence as a staged state machine,
+not as one queue-depth threshold. SMaRTT combines ECN, RTT delay, and
+optional packet trimming to distinguish "try another path", "decrease
+now", "probe carefully", and "increase normally".
+
+That maps well to pgwire and internal GPU DB routing: a request can see
+different forms of pressure at the IO worker, route cache, mutation
+owner, GPU execution queue, response ring, or cold tier. Acting on a
+single signal risks either overreacting to transient queueing or
+continuing to admit work after a real resource collapse has started.
+
+**Concrete mechanisms:**
+
+- SMaRTT keeps a sender congestion window and targets RTT around 1.5x
+  the base RTT. The paper assumes widely available ECMP and ECN, uses
+  packet trimming when available, and falls back to timeout-based loss
+  handling when trimming is not available.
+- The core loop has four signal cases. ECN plus high RTT triggers
+  multiplicative decrease. ECN plus low RTT asks the load balancer to
+  change path without reducing the window. No ECN plus high RTT invokes
+  Fair Increase, a cautious probe that avoids punishing a path whose
+  recent packet was not marked. No ECN plus low RTT uses Proportional
+  Increase.
+- QuickAdapt reacts to severe congestion by estimating recent delivered
+  bytes over a target-RTT window and dropping the congestion window
+  toward that observed capacity. It runs at most once per target RTT
+  and ignores congestion feedback from already in-flight bytes after
+  the drop to avoid repeated overcorrection.
+- Packet trimming carries loss/congestion information back quickly by
+  forwarding headers while dropping payload when switch queues overflow.
+  Without trimming, the same broad logic can use timeouts, but the paper
+  reports roughly one retransmission-timeout worth of added delay in
+  loss-heavy cases.
+- FastIncrease reclaims bandwidth after congestion clears or competing
+  flows finish. Once roughly a window of contiguous bytes returns with
+  base-RTT delay and no ECN, the sender increases more aggressively.
+- SMaRTT is designed for multipath spraying. It keeps one aggregate
+  congestion window across paths and lets ECN-marked, low-delay packets
+  first drive path change instead of immediately shrinking capacity.
+- The implementation target is lightweight: the paper reports 19 bytes
+  of per-flow state, 28 global bytes, and a per-packet instruction count
+  in the tens for the core logic on its compiled CPU test.
+- Evaluation uses packet-level simulation over fat-tree topologies with
+  incast, permutation, and all-to-all workloads, plus a DPDK/libfabric
+  hardware testbed. The authors report up to 50% better performance
+  than Swift, RoCEv2, and MPRDMA in their scenarios, and show SMaRTT can
+  complement receiver-driven EQDS under fabric congestion.
+
+**GPU DB mapping:** For 1M logical sessions, GPU DB needs admission that
+can route around transient congestion before it rejects or globally
+throttles. SMaRTT's four-case loop suggests a database-local equivalent:
+
+- route-cache hit but response-ring pressure low: try a different IO or
+  response lane before reducing admitted retained reads
+- route-cache hit plus response-ring delay high: shrink credits for that
+  route class or reject before doing more work
+- no explicit queue overflow but high observed latency: probe carefully,
+  maybe admit one smaller micro-batch rather than opening the floodgate
+- low latency and no saturation: increase credits for the route class
+
+For GPU execution, QuickAdapt maps to fast credit collapse after a
+severe signal such as pinned-buffer exhaustion, CUDA queue backlog,
+memory-tier fault storm, or response-ring overflow. The important
+detail is the ignore window: after cutting credits, the scheduler should
+not keep reacting to stale completions from requests that were already
+in flight before the cut.
+
+FastIncrease maps to recovery after a long scan, refresh job, or cold
+tier burst drains. A GPU DB scheduler should restore retained lookup
+credits quickly only after completions show low queue wait, enough
+response-ring space, and no invalidation pressure for a full window of
+work. That avoids the common failure mode where p99 improves only until
+the next burst refills every bounded queue.
+
+The single aggregate window across multipath routes maps to split
+execution choices. A retained lookup route may have multiple eligible
+snapshot workers, GPU streams, or CPU fallback workers. The scheduler
+should account for total outstanding work by route class while still
+allowing per-lane steering when one lane reports local pressure.
+
+**Risks and mismatches:** SMaRTT is a network-transport paper aimed at
+AI/HPC datacenter traffic, not a SQL database or transaction scheduler.
+It does not address WAL-before-visibility, MVCC, pgwire ordering,
+portal state, SQL retries, or GPU kernel correctness. ECN, packet
+trimming, UEC, DPDK, packet spraying, and NIC-level support may not be
+available or desirable in the first GPU DB deployment. Its evaluation
+traffic is incast, permutation, and all-to-all, not mixed SQL templates
+with conflicting visibility and response ordering. The paper's fairness
+goal may also differ from database priorities, where a write-frontier or
+DDL route sometimes must beat fair read throughput.
+
+**Benchmark candidates:**
+
+- Add a route-credit controller to the no-GPU runtime simulator with
+  four signals per route class: explicit saturation, observed queue
+  delay, stale-route/invalid generation repairs, and response-ring
+  pressure. Compare single-threshold admission, AIMD, and SMaRTT-style
+  staged cases.
+- Prototype QuickAdapt-style credit collapse for retained lookup
+  workers. Gate: after a severe backlog or pinned-buffer exhaustion,
+  credits drop within one measurement window and stale completions do
+  not cause repeated overcorrection.
+- Add FastIncrease recovery after long scans or refresh jobs drain.
+  Metrics: time to recover throughput, p99 overshoot, response-ring
+  occupancy, and retained lookup SLO violations during recovery.
+- Simulate multipath route steering across several snapshot workers or
+  GPU execution owners using one aggregate route-class window plus
+  per-lane pressure signals. Failure condition: local lane steering
+  preserves throughput but violates response ordering or snapshot
+  compatibility.
+- Add a negative pgwire test for transaction ordering under aggressive
+  credit changes. A route may reduce, reject, or defer work, but it must
+  not reorder extended-query responses within a session.
+- Track `route_credit_window`, `route_credit_cut_reason`,
+  `route_signal_delay_us`, `route_explicit_saturation_count`,
+  `route_fast_increase_events`, `route_quick_adapt_events`,
+  `stale_completion_ignored_count`, and `response_lane_reroutes`.
+
+### 2026-06-04 - Cross-paper synthesis: admission needs typed feedback, not just queue depth
+
+**Papers synthesized:** FileScale keeps metadata transactions
+authoritative while caching the common route; CRDV makes replicated
+conflict resolution a queryable view stack; SMaRTT turns congestion
+signals into staged sender admission.
+
+**Converging design tracks:** These papers all separate a fast visible
+path from an authoritative slow path, then make the separating frontier
+explicit. FileScale says cached metadata routes can be fast if they are
+WAL-backed and repair stale ownership. CRDV says derived state can avoid
+coordination if History, Present, and Value are queryable and the merge
+rule is declared. SMaRTT says sender admission should distinguish
+transient steering opportunities from true congestion collapse.
+
+For GPU DB, the next design track is typed route feedback. A hot route
+descriptor should not carry only "queue full" or "cache hit". It should
+carry separate feedback for authority, visibility, derived-state
+freshness, route-owner pressure, response-lane pressure, and recovery
+lag. The scheduler can then choose among steer, admit, micro-batch,
+refresh, fallback, reject, or shrink credits without confusing stale
+route repair with GPU overload or async merge backlog with network
+congestion.
+
+**Category gaps:** The recent batch improved metadata/tiering,
+coordination-avoiding derived views, and runtime admission. The queue
+should next keep alternating between transaction/write-path recovery,
+MVCC predicate/range safety, and optimizer route choice. GPU analytics
+entries remain useful, but they should be selected only when they feed
+the same route-contract and feedback model.
+
+**Benchmark priorities:**
+
+- Extend the typed route-contract simulator so each route class has
+  structured feedback: authority generation, visibility generation,
+  derived-view freshness, owner credits, response credits, and tier
+  pressure.
+- Test admission decisions over a mixed workload of retained lookups,
+  hotspot writes, route moves, async derived-view refresh, long scans,
+  and cold-tier reads. The pass gate is correct SQL behavior plus lower
+  p99 than a single FIFO owner queue.
+- Add explicit "steered", "fallback", "refreshing", "rejected", and
+  "credit cut" outcomes to route telemetry, so throughput improvements
+  cannot hide correctness or overload costs.

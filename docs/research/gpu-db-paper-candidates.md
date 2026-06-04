@@ -2302,12 +2302,25 @@ Append new candidates here as each paper is processed.
   Why: modern Swift follow-up that studies robustness under per-packet load
   balancing; useful if GPU DB later maps delay-based admission across
   multi-path gateways, distributed IO workers, or multiple response lanes.
-- `queued` — **FASTFLOW: Flexible Adaptive Congestion Control for
-  High-Performance Datacenters**, arXiv 2024.
+- `reviewed` — **SMaRTT: Sender-based Marked Rapidly-adapting Trimmed &
+  Timed Transport**, Bonato et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2404.01630`
   Why: recent congestion-control comparison against Swift, PowerTCP, and other
   datacenter schemes; useful for deciding whether GPU DB admission should
-  combine delay, queue-depth, and optional explicit notification signals.
+  combine delay, queue-depth, and optional explicit notification signals. The
+  queued FASTFLOW title now resolves to the SMaRTT arXiv paper.
+- `queued` — **Ultra Ethernet's Design Principles and Architectural
+  Innovations**, Hoefler et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2508.08906`
+  Why: SMaRTT positions itself as the basis for UEC NSCC; the broader UEC
+  design may inform future GPU DB transport assumptions, multipath routing,
+  out-of-order placement, and packet-trimming availability.
+- `queued` — **Bolt: Sub-RTT Congestion Control for Ultra-Low Latency**,
+  Arslan et al., NSDI 2023.
+  URL: `https://www.usenix.org/conference/nsdi23/presentation/arslan`
+  Why: SMaRTT cites Bolt as a recent sub-RTT congestion-control baseline;
+  useful for comparing fast congestion notification with GPU DB response-ring
+  and gateway admission telemetry.
 - `queued` — **Transaction Healing: Scaling Optimistic Concurrency Control on
   Multicores**, Wu, Chan, and Tan, SIGMOD 2016.
   URL: `https://dl.acm.org/doi/10.1145/2882903.2915202`
