@@ -35378,3 +35378,115 @@ and whether the reported latency includes CPU grouping and transfer costs.
 - Add a latency-ceiling micro-batch gate for write batches. The GPU write lane
   may wait for compatible transactions only up to a configured microsecond
   budget, then route or fall back explicitly.
+
+### 2026-06-04 - LTPG removes predefined read/write sets from GPU batch transactions
+
+**Citation:** Jianpeng Wei, Yu Gu, Tianyi Li, Jianzhong Qi, Chuanwen Li,
+Yanfeng Zhang, Christian S. Jensen, and Ge Yu. "LTPG: Large-Batch Transaction
+Processing on GPUs with Deterministic Concurrency Control." ICDE 2024,
+pp. 3865-3877. doi:10.1109/ICDE60146.2024.00296. Retrieved 2026-06-04
+from the Aalborg University research-portal metadata page
+`https://vbn.aau.dk/en/publications/ltpg-large-batch-transaction-processing-on-gpus-with-deterministi`
+and DOI page `https://doi.org/10.1109/ICDE60146.2024.00296`. The AAU page
+lists an accepted author manuscript PDF, but direct retrieval of that PDF was
+blocked by a Cloudflare challenge in this run.
+
+**Category:** Transaction processing / write path; GPU execution; concurrency
+control.
+
+**Relevance tags:** GPU OLTP; deterministic OCC; large transaction batches;
+conflict detection; write-back stage; read/write-set avoidance; batch
+admission.
+
+**Core idea:** LTPG is a newer GPU OLTP design that targets the pain point left
+by GaccO-style and dependency-graph-oriented GPU transaction systems: the cost
+and rigidity of predeclaring or maintaining read/write dependency information
+before execution. According to the primary metadata abstract, LTPG uses
+deterministic optimistic concurrency control and avoids dependency-graph
+maintenance, while still splitting GPU transaction processing into explicit
+execution, conflict-detection, and write-back stages.
+
+The transferable idea is not "send all writes to the GPU." It is that a GPU
+write lane can first execute a large batch speculatively, then run a separate
+parallel conflict-detection stage, and only then apply write-back for the
+accepted deterministic outcome. That shape fits a database runtime where GPU
+execution is fast but visibility publication must remain carefully fenced.
+
+The accessible metadata says experiments used real-world workloads from two
+benchmarks and found throughput and latency improvements over leading
+baselines. This run could not verify the exact benchmark names, hardware,
+sensitivity curves, or speedup numbers from the full manuscript, so those
+details remain unknown here rather than inferred.
+
+**Concrete mechanisms:**
+
+- Avoid predefined read/write sets and avoid dependency-graph maintenance as a
+  required pre-execution phase. This lowers CPU/GPU preprocessing pressure and
+  may admit more dynamic transaction templates.
+- Use deterministic optimistic concurrency control as the correctness model
+  for concurrent GPU transaction execution.
+- Divide the GPU workflow into three stages: execution, conflict detection, and
+  write-back. The separation makes conflict work and write publication
+  independently measurable.
+- Use GPU parallelism across the three stages rather than treating conflict
+  analysis as a serial CPU-side coordinator.
+- Add additional optimizations to improve performance; the primary metadata
+  does not expose their concrete algorithms, so they are unknown in this read.
+
+**GPU DB mapping:** LTPG strengthens the case for a staged GPU write-batch
+route behind the mutation owner. A compatible batch of stored-procedure-like
+writes could execute on the GPU against an immutable input generation, produce
+candidate read/write observations and write intents, then run a deterministic
+conflict-detection stage. Only after that should the mutation owner append WAL,
+publish the accepted visibility boundary, and invalidate or refresh resident
+snapshots.
+
+For write throughput, the design suggests measuring the three stages
+separately: GPU execution time, GPU/CPU conflict-detection time, and owner/WAL
+write-back time. If write-back dominates, more GPU execution parallelism will
+not help; if conflict detection dominates, the engine needs better per-key or
+per-partition conflict summaries; if grouping delay dominates, the route should
+fall back to CPU or owner-local execution under sparse arrival rates.
+
+For session concurrency, LTPG's large-batch premise should become an admission
+contract. A million logical sessions cannot imply unbounded GPU write queues.
+The runtime needs a latency ceiling, a compatible-template key, a maximum
+in-flight batch budget, and explicit rejection or fallback when enough similar
+transactions do not arrive quickly.
+
+For MVCC and snapshot design, LTPG's staged shape maps cleanly to immutable
+input snapshots plus deterministic publication boundaries. It should not
+replace WAL-before-visibility. GPU conflict detection can decide which writes
+are accepted, but the durable CPU/WAL truth still owns commit order, snapshot
+generation, and resident-cache invalidation.
+
+**Risks and mismatches:** The full paper was not accessible in this run, so
+the exact algorithms, memory layouts, benchmark workloads, hardware, and
+reported speedups are unknown. Deterministic OCC may still abort or delay
+heavily contended hot keys, and large batches may improve throughput while
+violating p50 latency targets. The paper appears to focus on GPU OLTP batches,
+not a complete SQL engine with arbitrary ad hoc statements, MVCC garbage
+collection, DDL, WAL replay, SQL type semantics, or multi-tier resident data.
+Any GPU DB adoption must keep GPU batch output as staged intent until durable
+write-back and visibility publication are complete.
+
+**Benchmark candidates:**
+
+- Implement a three-counter write-batch harness: execution stage,
+  conflict-detection stage, and WAL/write-back stage. The proof gate is that
+  each stage is separately visible in telemetry and no accepted GPU write is
+  visible before WAL publication.
+- Compare predefined read/write-set batching against LTPG-style
+  post-execution conflict detection for stored-procedure templates with
+  predictable, partially predictable, and dynamic key access.
+- Sweep batch size and latency ceiling for GPU write admission: 1, 32, 256,
+  4K, and large batches, with hard p50 and p99 latency failure conditions.
+- Add a hot-key contention sweep where conflict detection can reject,
+  deterministically order, or route hot keys back to an owner lane. Failure
+  condition: GPU occupancy is consumed mostly by doomed transactions.
+- Measure resident snapshot invalidation cost after accepted write-back. The
+  route is only useful if accepted GPU batches do not force full-table resident
+  rebuilds for small write sets.
+- Add a no-predeclared-access benchmark for dynamic transactions and compare
+  against GaccO-style same-type queues. The expected win is lower preprocessing
+  overhead; the expected risk is worse conflict precision.

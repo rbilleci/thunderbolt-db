@@ -2855,7 +2855,7 @@ Append new candidates here as each paper is processed.
   provisioning work; useful for session-admission and cold/warm route
   provisioning policies when dormant tenants or idle logical sessions become
   active quickly.
-- `queued` — **LTPG: Large-Batch Transaction Processing on GPUs with
+- `reviewed` — **LTPG: Large-Batch Transaction Processing on GPUs with
   Deterministic Concurrency Control**, Wei, Gu, Li, and Yu, ICDE 2024.
   URL: `https://doi.org/10.1109/ICDE60146.2024.00296`
   Metadata: `https://vbn.aau.dk/en/publications/ltpg-large-batch-transaction-processing-on-gpus-with-deterministi`
