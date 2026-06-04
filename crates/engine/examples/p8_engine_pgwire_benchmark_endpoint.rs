@@ -827,7 +827,7 @@ fn handle_client_io(
             }
             FrontendMessage::Terminate => break,
             other => {
-                return Err(format!("unsupported benchmark frontend message: {other:?}").into())
+                return Err(format!("unsupported benchmark frontend message: {other:?}"))
             }
         }
     }
