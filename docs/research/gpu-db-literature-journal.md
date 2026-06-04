@@ -35680,3 +35680,136 @@ chunk movement. Second, build a staged write-batch harness with separate
 execution, conflict, WAL/write-back, and invalidation timers. Third, make
 active-resource budgets explicit so logical-session scale is measured
 separately from scarce active buffers, GPU slots, and owner queue entries.
+
+### 2026-06-04 - MOCC selectively locks only hot read-conflict records
+
+**Citation:** Tianzheng Wang and Hideaki Kimura. "Mostly-Optimistic
+Concurrency Control for Highly Contended Dynamic Workloads on a Thousand
+Cores." PVLDB 10(2), 2016, pp. 49-60. doi:10.14778/3015274.3015276.
+Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol10/p49-wang.pdf`.
+
+**Category:** Transaction processing / write path and concurrency control.
+
+**Relevance tags:** OCC; hot-key contention; selective pessimism; native
+reader-writer locks; deadlock avoidance; many-core OLTP; long transactions;
+validation; route promotion.
+
+**Core idea:** MOCC starts from decentralized OCC because OCC keeps reads
+cheap when contention is low, but it adds pessimistic read locks only where
+recent verification failures show that a reader is likely to be clobbered by a
+writer. The point is not to replace OCC with 2PL. The paper shows that
+monolithic read locking can collapse on a 288-core, 16-socket machine because
+logically compatible read locks still create physical cache-coherence traffic.
+
+MOCC therefore treats contention as a local, learned property. Cold records use
+ordinary OCC. Hot records receive read locks during forward execution, then the
+transaction still verifies all reads at commit. The protocol can acquire,
+release, and re-acquire locks before commit because OCC validation, not 2PL
+lock retention, is what establishes serializability. In high-conflict YCSB on
+the 288-core machine, the authors report MOCC running 8x faster than OCC and
+23x faster than pessimistic locking; for low-conflict TPC-C, MOCC matches the
+base OCC system because the hot-read locking path rarely triggers.
+
+**Concrete mechanisms:**
+
+- MOCC inherits a latch-free-read OCC architecture from FOEDUS: reads avoid
+  page latches, writes are built in private redo/log buffers, and write locks
+  are acquired in commit after the write set is known.
+- Each transaction tracks a read set, write set, current lock list, and
+  retrospective lock list. It verifies reads at commit even if some reads were
+  protected by read locks.
+- Page-level temperature statistics approximate recent verification failures.
+  A clobbered read probabilistically increments the page temperature, avoiding
+  a heavily contended exact counter. A threshold near 5-10 is recommended in
+  the evaluated setup.
+- A read takes a pessimistic read lock only if the page is hot enough or the
+  record appears in the transaction's retrospective lock list from a previous
+  abort.
+- If a transaction aborts and retries, MOCC builds a sorted retrospective lock
+  list from its known read/write sets: writes in write mode and failed or hot
+  reads in read mode. The next run can then lock likely conflict points in a
+  globally consistent order.
+- Canonical lock order is the deadlock-free state. When a new lock would
+  violate that order, MOCC may release later locks and restore canonical mode
+  because serializability is still checked at commit.
+- When releasing too many locks would be costly, MOCC uses non-canonical
+  try/asynchronous acquisition and conservatively aborts if the request cannot
+  complete safely.
+- The MOCC Queuing Lock is a native cancellable reader-writer queue lock. It
+  supports read/write modes plus unconditional, try, and asynchronous lock
+  acquisition so MOCC can use fast unconditional acquisition in canonical mode
+  and cancellation-aware acquisition elsewhere.
+- Dynamic two-table experiments alternate a tiny hot table between read-only
+  and read-modify-write phases. Reasonable temperature thresholds quickly
+  switch to read locking during conflict phases and return to OCC-like behavior
+  when the table is only hot for reads.
+- A long-scan workload with one hot update shows the intended hybrid behavior:
+  MOCC protects the conflicting small-table record without pessimistically
+  locking the whole scan.
+
+**GPU DB mapping:** MOCC is a strong argument for route-local promotion rather
+than a single global write-path protocol. GPU DB should keep the cheap
+optimistic route for cold partitions and ordinary stored-procedure templates,
+but hot keys, hot pages, or hot resident route families should be promoted to a
+stronger owner-serialized, locked, or deterministic lane only after telemetry
+shows repeated conflict loss.
+
+The temperature idea maps directly to route descriptors. A mutation or retained
+read route can carry conflict temperature for table, partition, key range, or
+resident segment generation. Cold routes use optimistic validation and normal
+snapshot checks. Hot routes request a contended-key lane, shorter batch, or
+owner-local serial execution before burning GPU work on transactions likely to
+fail validation.
+
+For MVCC and snapshots, MOCC reinforces that all read protection is advisory
+until commit/visibility publication. A GPU write-batch may protect hot input
+keys or hot resident indexes during execution, but it still must validate and
+publish through the mutation owner after WAL safety. Selective read locks are
+not a substitute for WAL-before-visibility or snapshot compatibility.
+
+For session concurrency, MOCC's main warning is physical contention. A million
+logical sessions that all read a hot catalog row, route record, or session
+admission counter can melt a shared cache line even when the reads are
+logically compatible. Hot shared metadata should be replicated, snapshotted, or
+read without writes; promotion counters must be approximate, sharded, or
+probabilistic.
+
+For GPU execution, the transferable route is "mostly optimistic GPU admission":
+execute dynamic batches optimistically while conflict temperature is low; once
+hot-key aborts dominate, divert that template or key cluster to a conflict-aware
+lane before launch. That lane may still use GPU parallelism for conflict
+detection, but it should not queue arbitrary cold transactions behind the hot
+path.
+
+**Risks and mismatches:** MOCC targets CPU main-memory OLTP, not GPU kernels,
+SQL planning, disk/NVMe tiering, or PostgreSQL protocol serving. Its reported
+throughputs are embedded-API measurements without SQL/network overhead. The
+temperature statistics are page-level in the implementation, which may be too
+coarse for columnar resident segments or GPU hash indexes. Selective locking
+also adds complexity to retry semantics; if GPU DB transactions are ad hoc
+rather than stored-procedure-like, retrospective lock lists may be hard to
+reuse. Finally, read locks can protect hot records but do not solve full-range
+phantoms, DDL invalidation, resident cache coherence, or long snapshot garbage
+collection on their own.
+
+**Benchmark candidates:**
+
+- Add conflict-temperature telemetry to the mutation benchmark harness:
+  validation failures by table, partition, key range, and route shape. Use
+  approximate counters first, not exact hot shared counters.
+- Compare three hot-key policies under mixed YCSB/TPC-C-like templates:
+  pure optimistic validation, owner-serialized hot-key lane, and MOCC-style
+  selective read protection. Failure condition: hot-key retries consume most
+  active slots while successful commits stagnate.
+- Add a dynamic route-promotion test where a key range alternates between
+  read-only hot and read-write hot phases. Proof gate: the route promotes only
+  during conflict phases and returns to the cheaper path without manual reset.
+- For GPU write batches, measure wasted GPU work from transactions that later
+  fail validation. Trigger a conflict-aware route when wasted GPU time exceeds
+  a threshold.
+- Stress shared route metadata with many logical sessions reading the same
+  catalog/residency/admission entry. Compare exact counters, sharded counters,
+  approximate counters, immutable snapshots, and per-worker cached decisions.
+- Add a long-retained-scan plus hot-update benchmark. Expected behavior:
+  protect the small hot update/read conflict without pessimistically locking
+  every row touched by the long scan.

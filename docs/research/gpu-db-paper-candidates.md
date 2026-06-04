@@ -1588,7 +1588,7 @@ Append new candidates here as each paper is processed.
   Why: queue-oriented transaction execution cited by the batching paper;
   relevant to deterministic owner queues, queue-local ordering, and whether
   control-free execution can coexist with WAL-before-visibility.
-- `queued` — **Mostly-Optimistic Concurrency Control for Highly Contended
+- `reviewed` — **Mostly-Optimistic Concurrency Control for Highly Contended
   Dynamic Workloads on a Thousand Cores**, Wang and Kimura, PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol10/p49-wang.pdf`
   Why: hybrid OCC/pessimistic contention handling cited by the batching paper;
@@ -2750,7 +2750,7 @@ Append new candidates here as each paper is processed.
   useful for deciding when GPU DB should prefer deterministic rerun,
   lock-based fallback, or owner-serialized execution for mispredicted
   read/write sets.
-- `queued` — **Caracal: Contention Management with Deterministic
+- `reviewed` — **Caracal: Contention Management with Deterministic
   Concurrency Control**, Qin, Demke Brown, and Goel, SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483591`
   PDF: `https://www.eecg.utoronto.ca/~ashvin/publications/caracal.pdf`
@@ -2870,13 +2870,26 @@ Append new candidates here as each paper is processed.
   Why: precursor to GaccO with a deterministic GPU concurrency scheme;
   useful for isolating which design choices came from the smaller prototype
   versus the later CPU/GPU co-execution storage design.
-- `queued` — **Mostly-Optimistic Concurrency Control for Highly Contended
+- `reviewed` — **Mostly-Optimistic Concurrency Control for Highly Contended
   Dynamic Workloads on a Thousand Cores**, Wang and Kimura, PVLDB 2016.
-  URL: `https://doi.org/10.14778/3021924.3021933`
+  URL: `https://www.vldb.org/pvldb/vol10/p49-wang.pdf`
+  DOI: `https://doi.org/10.14778/3015274.3015276`
   Why: No False Negatives contrasts graph-based scheduling with hybrid
   pessimistic/optimistic hot-tuple handling; useful for deciding when GPU DB
   should switch hot keys or route families from optimistic batch admission to
   owner-serialized or lock-like handling.
+- `queued` — **Opportunities for Optimism in Contended Main-Memory Multicore
+  Transactions**, Huang et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p629-huang.pdf`
+  Why: MOCC cites hybrid optimistic/pessimistic contention handling as a
+  related direction; useful for comparing transaction-level and record-level
+  promotion when hot keys appear dynamically.
+- `queued` — **The Impact of Timestamp Granularity in Optimistic Concurrency
+  Control**, Yu et al., arXiv 2018.
+  URL: `https://arxiv.org/abs/1811.04967`
+  Why: MOCC and TicToc both depend on decentralized OCC commit metadata;
+  useful for measuring whether tuple, page, partition, or route-level
+  timestamps best fit GPU DB validation and visibility summaries.
 - `reviewed` — **Zero-sided RDMA: Network-driven Data Shuffling for
   Disaggregated Heterogeneous Cloud DBMSs**, Jasny, Thostrup, Tamimi,
   Koch, Istvan, and Binnig, PACMMOD 2024.
