@@ -38036,3 +38036,200 @@ queries, or validate SLO-aware rejection and scheduling policies.
 - Measure p95/p99 queue wait separately from execution time so allocator
   stalls, memory eviction, conflict scheduling, and GPU kernel time are
   not collapsed into one latency number.
+
+### 2026-06-04 - Stage makes route prediction a latency-budgeted hierarchy, not one model
+
+**Citation:** Ziniu Wu, Ryan Marcus, Zhengchun Liu, Parimarjan Negi,
+Vikram Nathan, Pascal Pfeil, Gaurav Saxena, Mohammad Rahman,
+Balakrishnan (Murali) Narayanaswamy, and Tim Kraska. "Stage:
+Query Execution Time Prediction in Amazon Redshift." SIGMOD 2024.
+DOI `10.1145/3626246.3653391`. Retrieved 2026-06-04 from the
+Amazon Science PDF,
+`https://assets.amazon.science/e6/a8/0f59e3b14ffdbe68f419b3682edb/stage-query-execution-time-prediction-in-amazon-redshift.pdf`.
+The ACM landing page returned HTTP 403 during this run, so the
+journal entry uses the author/vendor-hosted ACM paper PDF.
+
+**Category:** Query optimization / planning; runtime / HFT / session
+scale.
+
+**Relevance tags:** execution-time prediction; route admission;
+uncertainty; workload management; short-query protection; cache-aware
+prediction; local model; global model; cold start; scheduling; resource
+control.
+
+**Core idea:** Stage is a production query execution-time predictor
+for Amazon Redshift that treats prediction itself as a critical-path
+latency problem. Instead of replacing the workload manager with one
+heavy learned model, it uses a hierarchy: exact-query execution-time
+cache first, lightweight per-instance model with uncertainty second,
+and a more expensive global graph model only when the local model is
+uncertain and the query is expected to be long enough to justify the
+extra inference cost.
+
+The transferable idea for GPU DB is that route prediction should have
+its own route plan. Repeated short retained lookups, medium same-shape
+aggregates, new queries, overloaded queries, and cold-start tenants do
+not need the same estimator. A cached recent route decision may be
+better and cheaper than a model. A cheap local model may be enough for
+known route families. A heavier global or cross-workload model belongs
+behind an uncertainty and latency gate, not on every request.
+
+**Concrete mechanisms:**
+
+- Redshift uses execution-time prediction for workload-manager choices:
+  admission, short-versus-long queue placement, priority, cluster or
+  concurrency-scaling decisions, and execution resource control.
+- Stage first flattens a physical plan tree into a 33-dimensional vector
+  that summarizes operators of the same type, optimizer cost,
+  cardinality, query type, and related plan features.
+- The execution-time cache hashes the plan vector and returns a
+  prediction for exact repeats. For repeated queries it stores observed
+  execution times and predicts with a weighted mix of historical mean
+  and most recent observation; the paper reports alpha `0.8` worked
+  well for the Redshift fleet.
+- Cache entries are bounded and evicted by least-recently-updated date.
+  The implementation can store hash keys instead of full vectors and
+  running mean/variance instead of full histories to reduce lookup time
+  and memory.
+- On cache miss, Stage uses an instance-local Bayesian ensemble of 10
+  XGBoost-style gradient-boosted tree models. Each model predicts a
+  mean and variance; total uncertainty combines disagreement across
+  model means with data uncertainty.
+- The local model is described as a fuzzy cache: it specializes to the
+  customer's cluster and handles queries similar to prior local work.
+  If the local model predicts a short query or is confident, Stage uses
+  that result directly.
+- The local training pool is bounded, deduplicates repeat queries using
+  the cache, and buckets examples by execution-time range so common
+  short queries do not crowd out rarer long-running examples.
+- When the local model is uncertain and the query is likely long-running,
+  Stage invokes a global graph convolutional model. It consumes the
+  physical plan tree plus database and system features such as instance
+  type, Redshift node count, memory size, and concurrent-query count.
+- The global model is trained across a diverse set of Redshift instances
+  and uses node embedding, graph-convolution message passing, and a final
+  MLP prediction head.
+- The paper reports that many fleet queries are short enough that heavy
+  predictors with 50ms to 500ms inference costs are unacceptable on the
+  critical path. The global model can take up to about 100ms, so Stage
+  rarely uses it and amortizes that cost.
+- The evaluation replays roughly 30 million queries from the 100 most
+  billed Redshift instances in each of three regions over July/August
+  2023 through a Redshift workload-manager simulator.
+- The reported end-to-end query-latency improvement over AutoWLM is
+  20.3% average, 16.4% median, and 14.9% tail. The improvement comes
+  from better wait/scheduling decisions, not faster query execution.
+- Stage achieves median absolute prediction error of 0.67 seconds over
+  27,441,359 evaluated queries, versus 2.03 seconds for AutoWLM.
+- The execution-time cache handles 61.8% of evaluated queries, reflecting
+  high exact-repeat rates in the Redshift workload.
+- The paper reports sub-millisecond practical inference for Stage overall,
+  cache inference in microseconds, and a few hundred KiB memory usage for
+  the local pieces; the global model is considered separately because it
+  is intended to be invoked remotely/serverlessly.
+- The global model underperforms the local model on all cache misses, but
+  improves over the local model on the subset where the local model is
+  uncertain. The authors explicitly conclude that better local data can
+  beat more global data.
+- The paper uses prediction-rejection ratio to evaluate uncertainty
+  quality; median PRR is reported as 0.9, but some instances have poor
+  uncertainty because they lack enough training queries.
+- A practical limitation is environment state: the same query can vary
+  dramatically under different memory pressure, CPU utilization, cache
+  state, buffer-pool state, and concurrent-query mixes. The authors say
+  simply adding point-in-time memory/CPU utilization may not solve this
+  because those factors change during execution.
+- Part of Stage, the cache and local model, was already deployed in
+  production at publication time. The global model was not fully deployed
+  because of observed accuracy regressions.
+
+**GPU DB mapping:** The current runtime already names route envelopes,
+bounded queues, admission, memory budgets, and GPU/CPU fallback. Stage
+suggests making the route estimator itself hierarchical and budgeted:
+
+- Stage 1 should be a retained-route cache keyed by query shape, snapshot
+  generation class, partition/residency identity, predicate family,
+  output shape, and recent resource state. It should predict not only
+  execution time but queue wait, HBM/pinned-buffer wait, fallback rate,
+  and invalidation risk.
+- Stage 2 should be a cheap local model or rules-plus-residual estimator
+  per table/partition/query family. It can learn from recent route
+  telemetry: rows scanned, result rows, transfer bytes, kernel time,
+  queue depth, pool wait, memory pressure, conflict depth, and cache age.
+- Stage 3 should be a heavier cross-workload model or offline advisor used
+  only for cold-start tenants, new route families, or long queries where
+  extra inference does not dominate latency.
+
+For 1M logical sessions, the strongest lesson is short-query protection.
+A few badly classified long GPU scans or refresh-heavy fallbacks can
+block thousands of tiny retained lookups if they share a queue. The GPU
+DB admission layer should use predicted latency and uncertainty to route
+work into short retained-read lanes, long analytical lanes, mutation
+lanes, refresh lanes, or explicit overload/fallback paths. A query with
+high uncertainty should not silently enter the most latency-sensitive
+lane.
+
+For MVCC and snapshots, Stage's cache key needs an extra database
+correctness dimension. Redshift can cache recent execution time for an
+exact plan even if data changed, but GPU DB route decisions must include
+visibility generation and resident validity. A cached "fast retained
+lookup" prediction is valid only if the snapshot generation, residency
+state, and invalidation boundary still match the route contract.
+
+For P8 tiering, Stage highlights that environment factors are first-class
+features, not afterthoughts. GPU DB should feed route prediction with
+observable state: resident bytes, HBM pressure, pinned-pool pressure,
+host cache state, CPU NUMA locality, NVMe queue depth, refresh backlog,
+and expected victim cost. The paper's warning that point-in-time CPU or
+memory utilization is insufficient maps directly to tiering: the route
+estimator needs queue and reservation telemetry that predicts the state
+over the route's execution window, not only at admission instant.
+
+**Risks and mismatches:** Stage is built for Redshift's analytical cloud
+warehouse workload, not a PostgreSQL-compatible GPU OLTP/HTAP engine with
+WAL-before-visibility, MVCC tuple visibility, GPU-resident snapshots, and
+write invalidation. Redshift's exact query repetition rate may not hold
+for parameterized OLTP workloads unless the GPU DB cache key normalizes by
+prepared statement and route shape instead of literal SQL. The reported
+end-to-end gains are simulator-based because production users cannot run
+the same workload twice with different predictors. The global model's
+deployment caveat matters: heavier learned components can regress even
+when they look strong offline.
+
+The paper also does not solve environment-state prediction. It names cache,
+buffer-pool, CPU, memory, and concurrency state as hard factors, which are
+exactly the factors GPU DB must model for HBM/DRAM/NVMe placement. For GPU
+DB, a naive Stage clone that ignores pool waits and invalidation would
+likely make confident but wrong GPU route decisions.
+
+**Benchmark candidates:**
+
+- Build a three-stage route estimator simulator: exact route telemetry
+  cache, cheap local residual model or rules, and expensive offline/global
+  predictor. Compare against static CPU/GPU thresholds. Proof gate:
+  lower p95/p99 queue wait for retained lookups without increasing wrong
+  GPU admissions.
+- Add route-cache keys with correctness fields: prepared statement id,
+  plan shape, table/partition id, snapshot generation class, resident
+  validity generation, predicate family, output shape, and resource-state
+  bucket. Failure condition: cached decisions cross invalidation or
+  snapshot boundaries.
+- Measure short-query protection under mixed workloads: tiny retained
+  lookups plus long scans, refreshes, and CPU fallbacks. Required metrics:
+  lane placement accuracy, head-of-line blocking time, queue wait, kernel
+  time, fallback count, and explicit overload count.
+- Add uncertainty to route admission. A high-uncertainty query should use
+  a conservative lane, require a reservation, sample execution, or fallback
+  rather than entering a short retained-read lane. Minimum gate: bad
+  predictions become bounded slowdowns rather than lane-wide stalls.
+- Feed tier telemetry into route prediction: HBM free bytes, pinned-pool
+  availability, CPU arena wait, NVMe queue depth, refresh backlog, resident
+  age, and expected eviction victim cost. Compare admission-time-only
+  signals with windowed/lagged telemetry.
+- Run a cold-start benchmark for a new table, tenant, or route family.
+  Compare deterministic fallback, global model/advisor route, and
+  exploration with bounded sampling. Failure condition: cold-start learning
+  harms existing retained routes.
+- Track predictor overhead as a first-class metric: cache lookup latency,
+  local inference latency, model memory, background training cost, and
+  whether prediction work steals CPU from network IO or owner lanes.

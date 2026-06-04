@@ -2065,7 +2065,7 @@ Append new candidates here as each paper is processed.
   operator selection largely because it preserves PostgreSQL cost estimates as
   inputs; useful for a hybrid GPU route-cost model that learns residuals while
   keeping deterministic planner expertise visible.
-- `queued` — **Stage: Query Execution Time Prediction in Amazon Redshift**,
+- `reviewed` — **Stage: Query Execution Time Prediction in Amazon Redshift**,
   Wu et al., SIGMOD 2024.
   URL: `https://doi.org/10.1145/3626246.3653391`
   PDF: `https://assets.amazon.science/e6/a8/0f59e3b14ffdbe68f419b3682edb/stage-query-execution-time-prediction-in-amazon-redshift.pdf`
@@ -3129,3 +3129,22 @@ Append new candidates here as each paper is processed.
   Why: Database Kernels points to coherent virtually materialized views and
   persistence-layer coherence mechanisms; useful for future row/column view
   invalidation across CPU, CXL, and GPU-resident representations.
+- `queued` — **Robust Query Driven Cardinality Estimation under Changing
+  Workloads**, Negi et al., PVLDB 2023.
+  URL: `https://doi.org/10.14778/3583140.3583150`
+  Why: Stage calls out workload and data drift as a predictor weakness; this
+  paper is a modern follow-up for robust route-cardinality signals when GPU DB
+  query mixes or resident-cache contents shift.
+- `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
+  Learning**, Zhang et al., AIDB@VLDB 2020.
+  URL:
+  `https://drive.google.com/file/d/1trNYAcQ3S71SHu5dbtkBR2hjcK-dIHt21c-/view`
+  Why: Stage identifies buffer-pool and cache state as hard-to-featurize
+  environment factors; useful for comparing learned scheduling with explicit
+  GPU/host/NVMe residency telemetry and cache-aware admission.
+- `queued` — **Auto-WLM: Machine Learning Enhanced Workload Management in
+  Amazon Redshift**, Saxena et al., SIGMOD Companion 2023.
+  URL: `https://doi.org/10.1145/3555041.3589677`
+  Why: Stage compares against Redshift's prior workload-manager predictor;
+  useful for understanding the production queue, priority, concurrency-scaling,
+  and resource-control hooks that a GPU DB route predictor would influence.
