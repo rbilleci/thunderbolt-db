@@ -38584,3 +38584,172 @@ checkpoint/archive churn, and concurrent WAL appends. The proof gate is
 stable retained-read p99 and commit-publication latency while the system
 names the bottlenecking resource instead of merely reporting that a GPU
 or disk route is slow.
+
+### 2026-06-04 - Compound GPU pipelines trade materialization for explicit reduction pressure
+
+**Citation:** Henning Funke, Sebastian Bress, Stefan Noll, Volker Markl,
+and Jens Teubner. "Pipelined Query Processing in Coprocessor
+Environments." SIGMOD 2018, pages 1603-1618. doi:10.1145/3183713.3183734.
+Retrieved 2026-06-04 from the TU Dortmund publication page and PDF,
+`https://dbis.cs.tu-dortmund.de/storages/dbis-cs/r/papers/2018/pipelined-query-processing/pipelined-query-processing.pdf`.
+
+**Category:** GPU execution / analytics; query optimization / planning.
+
+**Relevance tags:** GPU query compilation; operator fusion; compound kernels;
+pipeline materialization; prefix sums; grouped aggregation; atomics;
+scratchpad memory; PCIe transfer; GPU global-memory bandwidth; route costing.
+
+**Core idea:** The paper argues that scalable GPU query execution has two
+different bandwidth problems. Kernel-at-a-time execution repeatedly transfers
+operator inputs and intermediates across PCIe, while batch processing removes
+much of that PCIe traffic but then exposes GPU global memory traffic from
+intermediate materialization. HorseQC's answer is a GPU query compiler that
+turns compatible relational pipelines into compound kernels so selections,
+probes, projections, write-position assignment, and some reductions pass
+intermediate state through registers, scratchpad memory, and local thread
+cooperation instead of through materialized GPU global-memory arrays.
+
+The main transferable result is the measurement shape. In their SSB 3.1 data
+movement analysis, batch processing reduces PCIe transfers by 8.8x versus
+kernel-at-a-time but leaves the same GPU global-memory traffic. Their
+multi-pass compiled pipeline reduces GPU global-memory traffic by 1.9x versus
+batch processing, and their one-pass compound-kernel model reduces it by 4.7x
+versus operator-at-a-time. Across the abstract and evaluation, they report up
+to 7.5x lower memory-access volume and up to 9.5x shorter kernel time versus
+operator-at-a-time for the studied workloads. The paper also shows the cost:
+once materialization is removed, prefix sums, grouped aggregation, atomics,
+and local/global reduction design become the new bottleneck knobs.
+
+**Concrete mechanisms:**
+
+- HorseQC is integrated into CoGaDB as a compiler-based execution engine over
+  the existing columnar storage/front-end path. A translation layer identifies
+  fusion operators either from SQL plans via a produce/consume model or from
+  JSON-described plans when SQL support is incomplete.
+- The paper distinguishes macro execution models from micro execution models.
+  Run-to-finish keeps intermediates on the GPU but is limited by GPU memory
+  capacity. Kernel-at-a-time scales by chunks but repeatedly moves each
+  kernel's input/output over PCIe. Batch processing transfers a block once and
+  runs multiple kernels on it, reducing PCIe traffic but still materializing
+  between GPU kernels.
+- Operator-at-a-time GPU primitives commonly use three passes per relational
+  operator: count or flag outputs, compute a prefix sum to assign dense write
+  positions, and perform an aligned write. That makes a four-operator pipeline
+  become many global-memory passes.
+- Multi-pass query compilation groups relational primitives into a count
+  kernel, a prefix-sum phase, and a write kernel. Relational logic and aligned
+  writes are fused, but the prefix sum remains a materialization boundary.
+- The one-pass compound kernel integrates the write-position computation into
+  the generated kernel. Selection flags and write offsets stay in registers,
+  and join probe payloads can remain available for projection rather than
+  being recomputed or materialized.
+- A simple atomic prefix sum assigns unique output positions with an atomic
+  add. The output order is undefined, but relational semantics only require
+  unique positions unless a later operator requires stable ordering.
+- To reduce pressure on atomic units, HorseQC uses "local resolution, global
+  propagation": a collaborative thread array computes local prefix sums or
+  pre-aggregates in scratchpad/SIMD-local execution, then one or a few threads
+  propagate pre-aggregated totals through global atomics.
+- The same local/global pattern is used for grouped aggregation: local
+  segmented reductions or pre-aggregation reduce contention before inserting
+  pre-aggregates into a global hash table with atomics.
+- In their grouped-aggregation experiment, pre-aggregation reduces execution
+  time by up to 126x versus the naive pipelined atomic approach for heavily
+  contended group counts, but the benefit shrinks as group cardinality grows.
+- In SSB, fully pipelined HorseQC keeps kernel times below PCIe transfer times
+  for all supported SSB queries in their GTX970 setup; in TPC-H it does so for
+  8 of 11 selected queries, with heavy unfiltered grouped aggregation still
+  unable to saturate PCIe.
+- Their scalability experiment streams fact-table blocks from pinned host
+  memory, keeps dimension hash tables in GPU global memory, and uses
+  asynchronous PCIe transfers into an inner star-join kernel. Blocks of at
+  least 2 MB saturate PCIe in that experiment, and runtime scales linearly
+  over the tested scale factors.
+- End-to-end comparison shows HorseQC outperforming CoGaDB on supported TPC-H
+  queries and sometimes MonetDB, but Q19 is faster on MonetDB; the paper
+  interprets this as a case where low-complexity queries may be better served
+  directly on CPU than moved over PCIe.
+
+**GPU DB mapping:** This directly sharpens P8's route design. A retained GPU
+route should not be described only as "resident scan", "GPU join", or "GPU
+aggregate". It needs a pipeline contract: which intermediates are materialized,
+which are kept in registers/shared memory, which reductions force global
+coordination, which atomics are expected, and which output ordering properties
+are required by SQL or response encoding.
+
+For same-shape retained lookups and micro-batched aggregates, compound kernels
+suggest a first benchmark shape: fuse predicate evaluation, visibility-vector
+check, row-id/key lookup, projection, and compact result scattering into one
+kernel when the snapshot generation and output schema match. The runtime
+already plans to micro-batch by snapshot generation and query shape; this paper
+adds the kernel-level reason to do so: compatible batches can avoid writing
+intermediate selection vectors or projection buffers to global memory.
+
+For MVCC/snapshots, the write-position lesson matters. If retained reads use
+visibility masks, deleted-row masks, or generation filters, a naive GPU path
+may materialize flags, prefix sums, row-id lists, and projected columns between
+separate kernels. A compound retained-read kernel could check visibility and
+predicate state once, compute a local/global output allocation, and scatter
+only final response rows or compact row IDs. However, output permutation must
+be accepted only for SQL results without ordering requirements; `ORDER BY`,
+stable cursors, merge joins, or deterministic tests need a stronger route.
+
+For session concurrency, the paper warns that GPU queue admission cannot price
+only bytes and kernel launches. A route with many small filtered outputs may
+stress atomic units and result-scatter buffers differently from a full scan.
+Grouped aggregation with few hot groups can be dominated by atomic contention,
+so admission telemetry should include reduction style, estimated group
+cardinality, hot-key skew, and whether local pre-aggregation is available.
+
+For multi-tier placement, HorseQC reinforces the prior synthesis: PCIe or NVMe
+transfer is only one boundary. Once block transfer is hidden or saturated, GPU
+global memory and scratchpad/register traffic decide whether a route can use
+the device effectively. P8's cost model should track global-memory passes and
+intermediate byte volume as first-class route costs, not only source tier and
+final result size.
+
+**Risks and mismatches:** The paper targets analytical query processing in
+CoGaDB/HorseQC, not transactional writes, MVCC correctness, WAL ordering, DDL
+invalidation, prepared pgwire portals, or mixed short/long session workloads.
+Its experiments use older GPUs, older drivers, OpenCL/CUDA-era hardware, and
+scale-factor-10 style analytical benchmarks; absolute times should not be
+treated as modern GPU DB predictions.
+
+Compound kernels also create operational risks. More fusion can increase
+compile time, register pressure, occupancy loss, code-cache pressure, and
+debugging complexity. Atomic prefix sums deliberately produce unordered dense
+outputs; that is invalid for SQL routes requiring stable order unless a later
+operator restores order. The paper's compiler support is partial: sorting and
+dictionary decompression remain in CoGaDB's original execution engine, and
+some TPC-H queries are handled through JSON plan descriptions rather than full
+SQL planning. Finally, local pre-aggregation helps contention but is workload
+dependent; high group cardinality, skew shifts, or complex expressions can
+change the best route.
+
+**Benchmark candidates:**
+
+- Add a retained-read fusion benchmark with three variants: separate kernels
+  for visibility/predicate/compact/project, a multi-pass fused count+prefix+write
+  shape, and a compound one-pass shape with local/global output allocation.
+  Required metrics: global-memory bytes, atomic count, kernel launches,
+  register pressure/occupancy, p50/p99 latency, and result correctness.
+- Extend route costing with `global_memory_passes`, intermediate bytes,
+  expected atomic operations, local pre-aggregation availability, and required
+  output ordering. Failure condition: planner chooses a GPU route that is
+  PCIe-cheap but global-memory or atomic-bound.
+- For grouped aggregate micro-batches, vary group cardinality and skew under
+  retained snapshots. Compare naive global atomics, CTA-local pre-aggregation,
+  sorted/segmented local reduction, and CPU fallback. Proof gate: route
+  telemetry correctly names atomic contention versus transfer bottleneck.
+- Benchmark unordered versus ordered result scattering for same-shape lookup
+  batches. Use unordered dense output only when SQL semantics permit it; require
+  an ordered route for `ORDER BY`, cursor-stable plans, or deterministic
+  protocol tests.
+- Test block-size admission for over-resident scans: stream 0.5 MB, 2 MB,
+  4 MB, and 8 MB chunks from pinned host/NVMe staging into fused kernels while
+  short retained reads run. Failure condition: the chunk size that saturates
+  transfer also harms retained-read p99 beyond the budget.
+- Add a query-shape compiler cache experiment. Measure compile latency,
+  generated kernel count, code-cache memory, and fallback behavior for many
+  similar prepared statements. The route should amortize compilation across
+  repeated same-shape sessions without blocking IO workers.

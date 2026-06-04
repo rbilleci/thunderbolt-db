@@ -657,9 +657,11 @@ Append new candidates here as each paper is processed.
   Why: SiliconDB contrasts adaptive runtime scheduling with static
   co-processor decisions; useful for route robustness when GPU queue,
   transfer, or selectivity estimates are wrong.
-- `queued` — **Pipelined Query Processing in Coprocessor Environments**,
+- `reviewed` — **Pipelined Query Processing in Coprocessor Environments**,
   Funke et al., SIGMOD 2018.
-  URL: `https://doi.org/10.1145/3183713.3183736`
+  URL: `https://doi.org/10.1145/3183713.3183734`
+  PDF:
+  `https://dbis.cs.tu-dortmund.de/storages/dbis-cs/r/papers/2018/pipelined-query-processing/pipelined-query-processing.pdf`
   Why: SiliconDB cites it as coprocessor query processing background; relevant
   to deciding how much CPU/GPU pipeline state should be fused versus
   materialized across transfer and queue boundaries.
@@ -2686,9 +2688,11 @@ Append new candidates here as each paper is processed.
   Why: Data Blocks notes padded encoding as a possible secondary-index-like
   structure; useful for testing whether skew-aware compressed scan layouts
   belong in GPU DB as route-specific acceleration rather than canonical storage.
-- `queued` — **Pipelined Query Processing in Coprocessor Environments**,
+- `reviewed` — **Pipelined Query Processing in Coprocessor Environments**,
   Funke, Bress, Noll, Markl, and Teubner, SIGMOD 2018.
   URL: `https://doi.org/10.1145/3183713.3183734`
+  PDF:
+  `https://dbis.cs.tu-dortmund.de/storages/dbis-cs/r/papers/2018/pipelined-query-processing/pipelined-query-processing.pdf`
   Why: Revisiting GPU DB performance identifies kernel fusion and avoiding
   intermediate materialization as central GPU DB efficiency levers; this
   follow-up should expose pipeline/fusion design choices for coprocessor
@@ -2699,6 +2703,24 @@ Append new candidates here as each paper is processed.
   Why: Revisiting GPU DB performance highlights memory stalls, skew, and cache
   behavior; this follow-up is relevant to GPU DB route choices under skewed
   retained lookup, join, and aggregation workloads.
+- `queued` — **GPU-Accelerated Database Systems: Survey and Open Challenges**,
+  Bress et al., VLDB Journal 2021.
+  URL: `https://doi.org/10.1007/s00778-020-00624-x`
+  Why: broader GPU DB survey from the HorseQC/CoGaDB ecosystem; useful for
+  checking whether retained routes, transfer-aware planning, and GPU memory
+  hierarchy benchmarks cover known open challenges.
+- `queued` — **HippogriffDB: Balancing I/O and GPU Bandwidth in Big Data
+  Analytics**, Li et al., PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p1647-li.pdf`
+  Why: directly related fused data-path work cited by HorseQC; useful for
+  comparing pre-fabricated fused kernels with query-generated compound kernels
+  and P8 resident/cold transfer balance.
+- `queued` — **GPL: A GPU-Based Pipelined Query Processing Engine**, Paul,
+  He, and He, SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915214`
+  Why: related GPU pipeline engine using GPU pipes/local execution contexts;
+  useful for comparing explicit compound kernels with hardware/runtime
+  pipeline handoff costs.
 - `reviewed` — **GPU-Accelerated OLTP: An In-Depth Analysis of
   Concurrency Control Schemes**, Sun et al., arXiv 2024; v2 2026.
   URL: `https://arxiv.org/abs/2406.10158`
