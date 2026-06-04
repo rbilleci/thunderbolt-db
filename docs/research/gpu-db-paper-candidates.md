@@ -3264,7 +3264,7 @@ Append new candidates here as each paper is processed.
   coherent DRAM/NVMe page protocol; useful for deciding when GPU DB should
   move hot objects to owner lanes versus run distributed commit or remote
   accelerator access.
-- `queued` — **X-SSD: A Storage System with Native Support for Database Logging
+- `reviewed` — **X-SSD: A Storage System with Native Support for Database Logging
   and Replication**, Lee et al., SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526188`
   Why: Database Kernels cites X-SSD as a dedicated storage-device path for
@@ -3309,6 +3309,25 @@ Append new candidates here as each paper is processed.
   Why: Database Kernels points to coherent virtually materialized views and
   persistence-layer coherence mechanisms; useful for future row/column view
   invalidation across CPU, CXL, and GPU-resident representations.
+- `queued` — **Correct, Fast Remote Persistence**, Kashyap et al., arXiv 2019.
+  URL: `https://arxiv.org/abs/1909.02092`
+  Why: X-SSD cites remote-PM persistence ambiguity as a motivation; useful for
+  defining exact durability acknowledgements when WAL, replicas, NICs, GPUs,
+  and future persistent tiers overlap.
+- `queued` — **Rethinking Database High Availability with RDMA Networks**,
+  Zamanian, Yu, Stonebraker, and Kraska, PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p1637-zamanian.pdf`
+  DOI: `https://doi.org/10.14778/3342263.3342639`
+  Why: X-SSD contrasts device-managed log propagation with Active Memory's
+  RDMA-based fresh replica path; useful for comparing storage-owned durability
+  with replica-owned visibility and freshness.
+- `queued` — **Write-behind Logging**, Arulraj, Perron, and Pavlo,
+  PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol10/p337-arulraj.pdf`
+  DOI: `https://doi.org/10.14778/3025111.3025116`
+  Why: X-SSD's fast-side API can host PM-oriented logging schemes; useful for
+  comparing delayed durability placement with GPU DB's WAL-before-visibility
+  invariant and batch publication boundary.
 - `reviewed` — **Robust Query Driven Cardinality Estimation under Changing
   Workloads**, Negi et al., PVLDB 2023.
   URL: `https://doi.org/10.14778/3583140.3583164`

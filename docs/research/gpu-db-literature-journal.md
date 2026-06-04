@@ -41965,3 +41965,154 @@ Benchmark priorities:
   count, and resident base size.
 - Buffer-fragmentation benchmarks for pinned host slabs, scratch buffers, and
   result arenas under mixed retained lookup/scan/refresh workloads.
+
+### 2026-06-04 - X-SSD moves WAL propagation into the storage device
+
+**Citation:** Sangjin Lee, Alberto Lerner, Andre Ryser, Kibin Park, Chanyoung
+Jeon, Jinsub Park, Yong Ho Song, and Philippe Cudre-Mauroux. "X-SSD: A Storage
+System with Native Support for Database Logging and Replication." SIGMOD 2022,
+pages 988-1002. DOI `10.1145/3514221.3526188`. Retrieved 2026-06-04 from the
+author-hosted PDF, `https://exascale.info/assets/pdf/lee2022sigmod.pdf`.
+
+**Category:** transaction processing / write path; durable storage and
+replication tiering.
+
+**Relevance tags:** WAL; transaction logging; log shipping; persistent memory;
+NVMe CMB; device-managed replication; credit counters; crash consistency;
+destaging; storage scheduling; write admission; durability acknowledgement.
+
+**Core idea:** X-SSD argues that transaction logging and log shipping should
+not force the database to manually stitch together host persistent memory,
+RDMA, remote persistence ordering, and SSD destaging. Instead, the storage
+device exposes two integrated paths: a conventional block SSD side and a
+PM-backed byte-addressable fast side for append-only log writes. The device
+acknowledges fast-side writes when they reach its persistent backing memory,
+then propagates them to remote peer devices and eventually destages them to
+NAND without further application copies.
+
+The strongest transferable idea for GPU DB is a split between the database's
+logical durability contract and the physical propagation machinery. The engine
+should still own WAL-before-visibility, but the hot commit path can be modeled
+as an append-only fast tier with explicit credits, durability counters, and
+background propagation to slower or remote tiers. That is directly relevant to
+future CXL/NVMe/persistent-tier designs and to deciding which boundaries a
+mutation owner must wait for before publishing visibility.
+
+**Concrete mechanisms:**
+
+- The X-SSD architecture combines a PM-backed fast side and a conventional
+  NAND-backed SSD side inside one NVMe-compatible device. The fast side is
+  exposed through an NVMe Controller Memory Buffer or PMR-like memory-mapped
+  region.
+- Villars, the reference device, implements three fast-side modules: CMB for
+  byte-addressable writes, Transport for optional primary-secondary log
+  propagation, and Destage for moving fast-side log data into the conventional
+  NAND ring.
+- Fast-side writes are treated as persistent once they reach the device's
+  backing memory ring. A credit counter advances only after contiguous bytes
+  have reached that persistent ring.
+- The application writes mostly sequentially to the ring tail. It may write up
+  to the queue/credit budget, then polls the credit counter to avoid overrunning
+  data that has not yet become persistent.
+- The drop-in `x_pwrite()` copies data into the CMB in chunks and backs off
+  when credits are exhausted. `x_fsync()` waits until the credit counter covers
+  all bytes written by the shared internal write counter.
+- In replicated mode, the primary device mirrors CMB writes to secondary
+  X-SSD devices. Each secondary advances its local credit counter after data
+  reaches its backing memory and periodically reports a shadow counter to the
+  primary.
+- Villars' eager replication semantics return the most delayed secondary
+  counter to the database, so the database considers a log entry durable only
+  when all configured secondaries have persisted it. The paper notes lazy,
+  chain, quorum, 2PC, replicated-state-machine, and deterministic protocols as
+  possible extensions, but Villars does not implement them.
+- The Destage module batches fast-side ring data into flash pages and writes it
+  into a predefined LBA ring on the conventional side. It can use destage
+  priority, conventional priority, or neutral scheduling to control interference
+  with ordinary SSD writes.
+- Crash behavior is explicit: with battery or capacitor support, a sudden power
+  loss causes the device to destage the full CMB ring after power failure. It
+  stops at gaps, matching the contiguous-credit semantics.
+- The design saves host bandwidth versus host-managed PM destaging because the
+  database writes once into the device, and the storage controller reads that
+  area directly for flash destage.
+- Villars was implemented on the Cosmos+ OpenSSD FPGA platform. Experiments
+  used ERMIA with TPC-C log generation, SRAM/DRAM-backed CMB variants, and NTB
+  links between three servers.
+- Reported evaluation highlights include SRAM-backed CMB giving latency close
+  to NVDIMM logging, conventional SSD logging topping out around `200k`
+  transactions per second at 8 workers in the tested queue-depth-1 setup,
+  best CMB write throughput around `64` byte write-combined chunks for SRAM,
+  `32KB` queue size working best across tested group-commit sizes, priority
+  scheduling preserving the chosen side under interference, and shadow-counter
+  update intervals trading PCIe bandwidth for replication-latency variance.
+
+**GPU DB mapping:** X-SSD maps to the mutation owner's commit pipeline rather
+than to GPU execution directly. GPU DB should keep WAL-before-visibility as an
+engine invariant, but it can represent durable propagation as named counters:
+local append accepted, local durable, remote durable, destaged to slow tier,
+checkpointed, and replay-visible. Visibility publication should wait for the
+counter required by the selected durability policy, not for an implicit
+`fsync()` path whose physical meaning is unclear.
+
+The credit-counter model is also a write-admission primitive. COPY, batched
+INSERT, and future partition-owner commits can expose "durability credits" in
+the same spirit as network/session credits. If the WAL fast tier, replica
+propagation, or destage queue is behind, the mutation owner should slow or
+reject new writes at that boundary before GPU refresh, MVCC publication, or
+response rings accumulate hidden debt.
+
+For P8, the fast-side/conventional-side split is a useful template for
+multi-tier placement. A future GPU DB storage path may have WAL in a fast
+persistent tier, CPU canonical state in DRAM, resident read snapshots in GPU
+memory, warm compressed segments in host memory, and cold pages on NVMe. The
+paper's key lesson is to make propagation state observable per tier instead of
+treating "written" as a single boolean.
+
+For replication and recovery, X-SSD reinforces that freshness and durability
+are separate clocks. A remote device may have durable log bytes while a remote
+database has not replayed them into queryable state. GPU DB should preserve
+that distinction for local resident GPU snapshots too: WAL may be durable,
+CPU MVCC may be visible, and GPU resident generations may still be stale until
+refresh and publication complete.
+
+**Risks and mismatches:** X-SSD requires specialized storage hardware and its
+Villars prototype assumes device PM, capacitor-backed crash behavior, CMB
+support, NTB transport, and firmware changes. Commodity NVMe devices available
+to GPU DB today may not expose these semantics. The paper also focuses on log
+bytes, not SQL execution, MVCC visibility, GPU residency, snapshot retirement,
+or query planning.
+
+The replication protocol in Villars is eager primary-secondary log shipping,
+not consensus and not a complete failover protocol. Promotion/demotion and
+some recovery decisions remain the database's responsibility. The multi-writer
+case is only sketched as several counters, potentially one per core, so a GPU DB
+with partition owners would need a precise mapping from owner lanes to WAL
+sequence ranges. Finally, the throughput and latency numbers come from an FPGA
+prototype and ERMIA workload, so they should guide benchmark shape rather than
+serve as expected performance on the future GPU machine.
+
+**Benchmark candidates:**
+
+- Add WAL propagation counters to the mutation-owner design model: accepted,
+  local durable, remote durable, CPU visible, resident invalidated, resident
+  refreshed, and checkpoint/destage complete. Proof gate: visibility can be
+  published only after the configured durability counter advances.
+- Build a WAL credit-admission microbenchmark for COPY/INSERT batches. Vary
+  fast-tier capacity, remote-durable delay, and destage bandwidth. Expected
+  result: bounded memory and explicit backpressure instead of unbounded queued
+  WAL bytes.
+- Add a fault-injection test where a partial WAL batch reaches the fast tier
+  but contains a gap before contiguous durability. Recovery must replay only
+  through the contiguous durable boundary.
+- Benchmark group-commit chunk size and queue credit size using the existing
+  WAL path before any device-specific work. Required metrics: p50/p95 commit
+  latency, bytes per commit, flush count, queue wait, and throughput.
+- Model local durability versus remote durability policies for retained reads:
+  local-only, all-replica durable, and lazy remote propagation. Failure
+  condition: a read snapshot is advertised as durable/fresh under the wrong
+  policy clock.
+- For future tiering, prototype separate telemetry for WAL fast tier, CPU
+  canonical state, GPU resident snapshot generation, and cold destage. The
+  planner and runtime should report which tier boundary caused write or read
+  admission failure.
