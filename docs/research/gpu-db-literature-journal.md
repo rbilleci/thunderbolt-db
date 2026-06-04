@@ -36648,3 +36648,135 @@ shared memory, different cache behavior, and higher interconnect bandwidth.
   compressed generation while a new CPU/MVCC generation is published. Failure
   condition: refresh or recompression blocks WAL-before-visibility publication
   or lets new readers select an invalidated compressed generation.
+
+### 2026-06-04 - Delilah exposes the real cost of programmable storage offload
+
+**Citation:** Niclas Hedam, Morten Tychsen Clausen, Philippe Bonnet, Sangin Lee,
+and Ken Friis Larsen. "Delilah: eBPF-offload on Computational Storage." DaMoN
+2023, pp. 70-76. doi:10.1145/3592980.3595319. Retrieved 2026-06-04 from the
+author PDF, `https://hed.am/papers/2023-DaMoN.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** computational storage; eBPF offload; NVMe computational
+programs; PCIe DMA; BAR writes; cache coherence; storage-side filtering; cold
+tier pushdown; offload admission.
+
+**Core idea:** Delilah is a small but useful reality check for programmable
+computational storage. It implements eBPF code offload on an OpenSSD Daisy
+platform and evaluates the host/device protocol overhead rather than claiming
+an end-to-end database speedup. The strongest result is that the eBPF program
+and registered function execution are not the main latency problem in the
+prototype; broad cache invalidation and flushing around DMA buffers dominate.
+
+The paper therefore reframes storage-side pushdown as a data-movement and
+coherence contract problem. Downloadable functions can orchestrate
+device-specific functions and perform data massaging, but the route only helps
+if the host, device controller, DMA buffers, cache maintenance, and result
+return path are all scoped to the bytes the function actually touches.
+
+**Concrete mechanisms:**
+
+- Delilah uses OpenSSD Daisy in an on-path/PCIe architecture with a Zynq
+  Ultrascale+ MPSoC, FPGA logic, ARM cores running embedded Linux, PCIe Gen3
+  x16 to the host, and M.2 SSDs behind the device.
+- The controller runs uBPF virtual machines and registered functions in the
+  ARM processing-system image; hardware-accelerated functions can live in the
+  FPGA programmable-logic image.
+- The host/device protocol transfers eBPF programs and data to device memory,
+  triggers execution, and reads results. The driver is a char device using
+  asynchronous `io_uring` commands instead of synchronous ioctl-style calls.
+- The driver exposes four command classes: write eBPF program, write program
+  arguments, execute the program, and read result data.
+- Program and data movement use XDMA over PCIe into reserved contiguous device
+  memory that is user-space mappable for the Delilah controller.
+- Execution is signaled through the PCIe BAR aperture; the authors note that
+  BAR writes are fastest for very small transfers, while DMA wins for larger
+  payloads.
+- In the initial implementation, the device flushes or invalidates the whole
+  cache around DMA/program execution because the ARM cores cannot directly DMA
+  host data into their caches.
+- The evaluated execution path has an approximately 15 ms latency floor before
+  selective cache flushing, independent of the file size read by the registered
+  function.
+- A latency breakdown for a 1 KB read shows host driver overhead, interrupt
+  handling, and eBPF/registered-function execution are small; cache
+  maintenance dominates and is proportional to cache size rather than touched
+  data size.
+- Selective cache flushing lets the host declare the number of bytes that must
+  be invalidated for reads and writes when issuing the execution command. With
+  that change, execution time becomes proportional to data processed.
+- BAR writes are faster for small payloads up to roughly 1 KB, while DMA is
+  better above roughly 10 KB in their setup, suggesting separate control,
+  small-program, and bulk-data paths.
+- Verification is unresolved. The authors identify the need to verify both
+  offloaded eBPF programs and registered functions, and note that Linux eBPF's
+  verifier restrictions, especially around loops, do not directly fit storage
+  data-massaging workloads.
+- The evaluation is intentionally limited to latency sanity checks. Throughput,
+  hardware-accelerated functions, uBPF JIT behavior, and real data-system
+  pushdown workloads are left for future work.
+
+**GPU DB mapping:** Delilah is a useful cold-tier warning for P8. It supports
+the idea of storage-side filtering or data massaging, but only if GPU DB treats
+offload as an explicit route with a byte-range, cache-maintenance, and result
+contract. A vague "push it to storage" plan could easily lose to DMA/cache
+coherence overhead before SQL work begins.
+
+The BAR-versus-DMA split maps cleanly to route descriptors. Tiny control
+payloads, storage-function ids, predicate constants, and generation tokens
+should be separated from bulk column pages or compressed segments. The planner
+should cost control-plane writes, bulk DMA, device cache maintenance, result
+bytes, and host/GPU staging separately rather than folding them into one
+"storage offload" cost.
+
+Selective cache flushing is the main transferable mechanism. For GPU DB,
+storage-side or future CXL/offload functions should declare touched byte
+ranges, column chunks, compressed tiles, and result buffers up front. That same
+metadata can feed invalidation, WAL/read-boundary compatibility, and
+backpressure. A storage function that cannot declare its footprint should be a
+slow path, not a retained hot route.
+
+Delilah also argues for DBMS-owned operator contracts over arbitrary UDF
+freedom in the first implementation. Fixed or generated functions for
+predicate filtering, projection, compression-aware tile selection, checksum,
+or feature extraction are easier to verify, meter, and recover than arbitrary
+downloadable programs. The eBPF path is interesting, but it needs termination,
+memory-safety, and storage-integrity proof before it can participate in
+WAL-before-visibility or snapshot-valid route selection.
+
+**Risks and mismatches:** The paper is a seven-page workshop systems baseline,
+not a database execution engine. It does not measure SQL operators,
+concurrency, throughput, MVCC semantics, recovery, GPU handoff, or multi-tenant
+admission. The hardware is a specific OpenSSD Daisy/Zynq prototype with ARM
+Cortex A-53 cache behavior and PCIe Gen3; newer CXL, SmartSSD, DPU, or NVMe-oF
+devices may move the thresholds. The initial 15 ms floor is an implementation
+and coherence-path result, not an inherent lower bound for all computational
+storage. The security and verifier story is explicitly future work, so
+downloadable functions should not be treated as production-safe database
+extensions yet.
+
+**Benchmark candidates:**
+
+- Add a storage-offload cost model microbenchmark with separate fixed control
+  cost, payload-transfer bytes, cache-maintenance bytes, device execution time,
+  and result bytes. Failure condition: the planner selects offload when a CPU
+  or GPU resident route is faster after coherence costs.
+- Prototype a cold compressed-segment filter route with declared touched
+  column tiles and result ranges. Minimum gate: identical SQL-visible results
+  to CPU execution under retained snapshot boundaries and WAL replay.
+- Measure BAR-like small-control submission versus DMA-like bulk transfer in
+  the local runtime analog: command descriptor bytes, pinned buffer setup,
+  H2D/D2H transfer, and response-ring publication. Use the result to define a
+  payload-size cutoff for offload route admission.
+- Require every future storage-side function descriptor to declare table
+  generation, snapshot boundary, byte ranges, output buffer bounds, maximum
+  execution budget, and fallback reason. Proof gate: invalidation or snapshot
+  mismatch rejects the route before execution starts.
+- Compare fixed DBMS-owned storage kernels, generated eBPF-like functions, and
+  CPU fallback for simple predicate/project/compressed-tile selection. Measure
+  setup latency, steady-state throughput, verification surface, and recovery
+  behavior.
+- Add telemetry for cold-tier offload attempts: submitted bytes, touched bytes,
+  cache/coherence bytes, result bytes, queue wait, function time, rejected
+  route reason, and whether the offload saved GPU HBM or PCIe traffic.

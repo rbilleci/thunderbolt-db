@@ -3007,12 +3007,26 @@ Append new candidates here as each paper is processed.
   Why: Database Kernels cites X-SSD as a dedicated storage-device path for
   database logging; useful for comparing append-only CXL logging kernels with
   WAL-before-visibility and recovery accelerator designs.
-- `queued` — **Delilah: eBPF-Offload on Computational Storage**, Hedam et al.,
+- `reviewed` — **Delilah: eBPF-Offload on Computational Storage**, Hedam et al.,
   DaMoN 2023.
   URL: `https://doi.org/10.1145/3592980.3595319`
+  PDF: `https://hed.am/papers/2023-DaMoN.pdf`
   Why: Database Kernels cites Delilah as a programmable computational-storage
   example; useful for deciding whether storage-side database functions should
   be fixed kernels, eBPF-like user functions, or DBMS-owned operators.
+- `queued` — **BPF-oF: Storage Function Pushdown Over the Network**,
+  Delamare et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2312.06808`
+  Why: modern remote-storage pushdown protocol over NVMe-oF using eBPF-like
+  storage functions; useful follow-up for comparing local computational
+  storage offload with disaggregated cold-tier predicate/data-massaging
+  routes.
+- `queued` — **An Evaluation of WebAssembly and eBPF as Offloading Mechanisms
+  in the Context of Computational Storage**, Delamare et al., arXiv 2021.
+  URL: `https://arxiv.org/abs/2111.01947`
+  Why: compares programmable offload mechanisms for computational storage;
+  useful for deciding whether GPU DB cold-tier functions should use eBPF,
+  WebAssembly, fixed kernels, or DBMS-owned generated operators.
 - `queued` — **Hello Bytes, Bye Blocks: PCIe Storage Meets Compute Express Link
   for Memory Expansion (CXL-SSD)**, Jung, HotStorage 2022.
   URL: `https://doi.org/10.1145/3538643.3539745`
