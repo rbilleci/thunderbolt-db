@@ -41001,3 +41001,162 @@ templates and route contracts.
 - Cross-check static certification with a trace-based anomaly detector such as
   IsoDiff. Failure condition: a route certified as weakly isolated produces an
   anomaly trace under the supported workload model.
+
+### 2026-06-04 - GPU learned indexes need batch-shaped residency contracts
+
+**Citation:** Jiesong Liu, Feng Zhang, Lv Lu, Chang Qi, Xiaoguang Guo,
+Dong Deng, Guoliang Li, Huanchen Zhang, Jidong Zhai, Hechen Zhang,
+Yuxing Chen, Anqun Pan, and Xiaoyong Du. "G-Learned Index: Enabling
+Efficient Learned Index on GPU." IEEE Transactions on Parallel and
+Distributed Systems 35(6), June 2024, pp. 795-812. DOI
+`10.1109/TPDS.2024.3381214`. Retrieved 2026-06-04 from the author PDF,
+`https://fred1031.github.io/files/2024_tpds.pdf`.
+
+**Category:** GPU execution / analytics; query optimization / planning;
+resident indexing.
+
+**Relevance tags:** GPU learned index; PGM-index; resident point lookup;
+batched lookup; branch divergence; shared memory; CPU/GPU split; range
+query; update batches; route admission.
+
+**Core idea:** G-Learned Index adapts learned indexes to GPU hardware by
+choosing a PGM-style structure, storing compact model segments on the GPU,
+keeping the full key array on the CPU, and executing many lookup queries as
+one-query-per-thread GPU batches. The design goal is not to make a single
+lookup magical. It makes the index useful when the runtime can admit enough
+same-shape lookups to fill the GPU while keeping per-thread control flow
+regular.
+
+For GPU DB, the strongest transferable idea is that a resident index route
+should be a batch contract. A learned index can help retained point lookups
+only when the route records the resident generation, lookup shape, key vector,
+batch ceiling, memory placement of index metadata, CPU/GPU last-mile work,
+and fallback path. Without that envelope, the index can easily become another
+GPU fast path that wins benchmark throughput but loses under mixed session
+latency, update invalidation, or memory pressure.
+
+**Concrete mechanisms:**
+
+- The paper rejects RMI as the main GPU target because different queries can
+  walk different model nodes and execute different models, increasing branch
+  divergence. It uses PGM-index segments because each model has only a few
+  parameters and the same operations repeat across threads.
+- The structure is split: PGM segment levels are loaded to GPU memory, while
+  the original sorted array `A` remains on the CPU. The GPU predicts bounded
+  positions; the CPU performs the final bounded search in `A`.
+- The design uses two precision/error parameters. A larger `epsilon1` reduces
+  bottom-level segment count and GPU metadata footprint; a small `epsilon2`
+  keeps upper-level search ranges narrow and reduces divergent work.
+- Query execution is batched. Each GPU thread handles one query, traverses the
+  segment levels, and returns an estimated position. The CPU then resolves the
+  final location over the bounded range.
+- A lookahead strategy chooses between walking all segment levels and directly
+  checking the bottom level for some shapes, using a sampled query batch to
+  select the faster path.
+- Segment metadata is arranged across GPU memory hierarchy. The implementation
+  loads segment levels to global memory and uses shared memory per block when
+  the structure fits; the paper reports shared memory is faster than global or
+  constant memory for the tested configurations.
+- Within the bounded segment range, the design uses binary search instead of
+  traversal because fixed operation counts reduce warp-level tail waiting and
+  branch divergence.
+- For updates, it follows the logarithmic-method idea: maintain multiple
+  containers of exponentially increasing size, build a G-Learned Index per
+  container, merge on overflow, and use tombstones for deletes. A query can
+  use groups of threads to search the containers in parallel.
+- For two-dimensional range queries, it maps points to Z-order addresses,
+  learns the one-dimensional distribution, uses the GPU index to find the
+  range endpoints, then checks candidate points against the original rectangle.
+- Evaluation uses SOSD-style real and synthetic datasets plus a string
+  dictionary, 4M lookup queries, and an Intel i9-9900K with an RTX 2080 Ti.
+  The paper reports average lookup throughput around `1.2e9` queries/s,
+  roughly `174x` over sequential PGM, `107x` over parallel PGM, and `1.9x`
+  over a GPU B-Tree on comparable successful datasets. It also reports
+  average latency under `0.04 ms` for the tested batched lookup setting.
+- Batch-size experiments show throughput rises until GPU resources saturate,
+  while latency stays low only up to a threshold. The paper's reported knee is
+  around a 512 KB batch for its platform and workload.
+- The work includes PCIe transfer time in the main comparison, and separately
+  reports much larger speedups when CPU/GPU transfer is excluded. That is a
+  useful warning: resident-route benchmarks must separate transfer-free,
+  already-resident, and cold-transfer cases.
+
+**GPU DB mapping:** A GPU DB learned index should first be a resident
+snapshot index for same-shape point lookups, not a general replacement for
+CPU B-trees. The resident route can store compact segment metadata in GPU
+memory, keep CPU canonical keys and MVCC state as truth, and use GPU batches
+to predict candidate row ordinals. The final visibility check should still be
+bound to the retained snapshot's visible generation and should have a CPU
+fallback for stale, underfilled, or unsupported routes.
+
+The route descriptor needs more than "index present." It should name the
+table generation, key column, sorted/key-order vector generation, segment
+metadata residency, `epsilon` bounds, batch minimum/maximum, expected
+last-mile search cost, and whether the route can scatter results directly or
+must return candidate ordinals to CPU. That keeps planner cost hooks honest
+about the difference between a hot resident lookup batch and a lone lookup
+that would only pay launch and transfer overhead.
+
+This also maps cleanly to the runtime's micro-batching model. Network IO
+workers can collect compatible `WHERE key = ?` reads by snapshot generation
+and query shape; a GPU execution owner can drain a bounded vector of keys;
+results can scatter by request id through response rings. For 1M logical
+sessions, the important invariant is that logical sessions wait cheaply while
+only admitted batches consume GPU streams, pinned buffers, shared-memory
+copies, and response buffers.
+
+For MVCC, the update mechanism should not be copied directly into the durable
+write path. The logarithmic containers are useful as a refresh-delta
+experiment, but GPU DB still needs WAL-before-visibility, invalidation before
+new visibility, and generation publication. A safer first variant is immutable
+index segments per retained snapshot, rebuilt or delta-merged after WAL
+publication rather than modified in place by arbitrary concurrent writes.
+
+**Risks and mismatches:** The paper is primarily a batched lookup and indexing
+paper, not an OLTP transaction protocol. It does not solve WAL ordering,
+snapshot isolation, serializable reads, resident cache invalidation, or DDL
+generation changes. Its update approach is index-local; GPU DB must wrap any
+update/delta behavior in the mutation-owner and residency-owner protocols.
+
+The benchmark shape is favorable to high-throughput batches. A production GPU
+DB will often see short single-session reads, mixed writes, refresh work, and
+long scans competing for the same GPU. The paper's batch-size knee is
+platform-specific, so route admission must learn or measure its own knee
+under pinned-buffer and response-ring pressure.
+
+Keeping `A` on the CPU is attractive for capacity, but it means the final
+search and visibility check can become a CPU-side tail if the GPU route emits
+too many candidates or if many batches complete at once. A retained GPU
+index route should test both CPU-last-mile and all-resident variants rather
+than assuming the paper's split is always optimal.
+
+Learned indexes also need data-distribution guardrails. The paper tunes
+`epsilon`, uses sampled strategy selection, and reports strong results across
+datasets, but it does not provide a production planner contract for skew,
+range selectivity, phantoms, or adversarial key distributions. GPU DB should
+expose misprediction and last-mile metrics before admitting the route widely.
+
+**Benchmark candidates:**
+
+- Build a retained learned-index prototype over one `int4` key-order vector.
+  Proof gate: every lookup route records snapshot generation, key column,
+  segment metadata bytes, `epsilon` bounds, batch size, and fallback reason.
+- Compare three point-lookup paths: CPU key-order binary search, GPU learned
+  index with CPU last-mile search, and all-resident GPU candidate resolution.
+  Measure throughput, p50/p95/p99 latency, kernel launches, CPU last-mile
+  time, D2H result bytes, and queue wait.
+- Sweep micro-batch sizes for same-shape retained lookups. Required result:
+  identify the local throughput/latency knee and enforce a route-specific
+  batch cap before response-ring or pinned-buffer pressure rises.
+- Add a negative control with sparse or adversarial key distributions. Failure
+  condition: learned-index misprediction expands last-mile work enough that
+  CPU fallback would have been faster but admission still chooses GPU.
+- Test refresh behavior after COPY/INSERT batches. Compare full rebuild,
+  immutable delta segment, and conservative invalidation. No variant may
+  expose a resident index generation before WAL-visible CPU truth exists.
+- Combine with 1M logical sessions issuing a small set of prepared point
+  lookup templates. Measure active GPU batches, waiting sessions, response
+  memory, owner queue wait, and fairness between hot-key and cold-key batches.
+- Add a range/prefix experiment only after point lookup is stable. Route range
+  scans through a stricter certificate because learned endpoint prediction
+  does not by itself prove predicate visibility or phantom safety.

@@ -626,9 +626,9 @@ Append new candidates here as each paper is processed.
   Tech report: `https://www.labs.hpe.com/techreports/2015/HPL-2015-37.pdf`
   Why: many-core OLTP and NVRAM-oriented storage architecture cited by TicToc;
   relevant to partition ownership, logging, NUMA locality, and future tiers.
-- `queued` — **G-Learned Index: Enabling Efficient Learned Index on GPU**,
+- `reviewed` — **G-Learned Index: Enabling Efficient Learned Index on GPU**,
   Liu et al., IEEE TPDS 2024.
-  URL: `https://doi.org/10.1109/TPDS.2024.3384966`
+  URL: `https://doi.org/10.1109/TPDS.2024.3381214`
   Why: modern follow-up to early GPU learned-index work; useful for comparing
   PGM-on-GPU with a more engineered GPU learned-index design before choosing a
   resident point-lookup index family.
@@ -977,6 +977,19 @@ Append new candidates here as each paper is processed.
   Why: Umbra's adaptive bytecode/JIT execution foundation; relevant to deciding
   when GPU DB should interpret, compile, batch, or route short SQL plans
   without paying excessive setup latency.
+- `queued` — **Updatable Learned Index with Precise Positions**, Wu et al.,
+  PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p1276-wu.pdf`
+  Why: G-Learned Index compares against dynamic learned-index behavior; LIPP's
+  precise-position and dynamic-adjustment design is useful for deciding whether
+  resident learned indexes can support refresh and update deltas without wide
+  last-mile searches.
+- `queued` — **ALEX: An Updatable Adaptive Learned Index**, Ding et al.,
+  SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3389711`
+  Why: G-Learned Index uses ALEX as a dynamic learned-index baseline; useful for
+  comparing model-node expansion, update handling, and CPU fallback against GPU
+  resident learned-index routes.
 - `reviewed` — **An Empirical Evaluation of Columnar Storage Formats**,
   Zeng et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol17/p148-zeng.pdf`
