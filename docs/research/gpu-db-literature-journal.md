@@ -43454,3 +43454,234 @@ before a lower layer may over-fetch.
 - Add a safety gate for any over-fetch optimization: the fetched region must be
   inside one validated relation/column buffer and one snapshot generation, and
   gap bytes must be non-observable by the receiver.
+
+### 2026-06-04 - Mako decouples fast speculative certification from slow durable replication
+
+**Citation:** Weihai Shen, Yang Cui, Siddhartha Sen, Sebastian Angel, and
+Shuai Mu. "Mako: Speculative Distributed Transactions with Geo-Replication."
+OSDI 2025. Retrieved 2026-06-04 from
+`https://www.usenix.org/system/files/osdi25-shen-weihai.pdf`.
+
+**Category:** transaction processing / write path; runtime / concurrency;
+MVCC / snapshot publication.
+
+**Relevance tags:** speculative transaction execution; distributed OCC; 2PC;
+geo-replication; vector clocks; vector watermarks; bounded rollback; per-core
+replication streams; batched logs; snapshot boundaries; failure recovery;
+client-visible commit; high-concurrency admission.
+
+**Core idea:** Mako targets strongly consistent, sharded, geo-replicated
+transaction processing where WAN replication latency would normally sit on the
+critical path of every distributed transaction. Its central move is to separate
+transaction execution/certification from replication: shard leaders execute and
+certify transactions quickly, install writes speculatively, and replicate the
+resulting transaction logs in the background. Clients are answered only after
+replication progress proves the transaction and its dependencies are durable.
+
+The GPU DB transfer is not "return before WAL" or "let speculative writes leak
+to clients." The useful idea is to split publication into internal and external
+boundaries. An internally certified generation can feed later owner-local work
+or controlled refresh pipelines, while a stricter durable visibility boundary
+decides what clients and retained read snapshots may observe. Mako shows that
+this split can preserve strong semantics if dependency metadata and rollback
+scope are explicit.
+
+**Concrete mechanisms:**
+
+- Mako extends Silo-style optimistic concurrency control across shards. A
+  coordinator executes a one-shot transaction, records read and write sets, and
+  performs a four-step certification protocol: lock write keys, collect shard
+  clocks, validate read versions, then install writes.
+- The installed state after certification is speculative. Later transactions
+  may read certified writes before those writes have been geo-replicated, but
+  the client response waits until durability/dependency checks pass.
+- Each version carries a vector clock with one logical clock per shard. The
+  transaction commit version is formed by taking maxima across involved shard
+  clocks and read-set version clocks, so read dependencies are represented
+  coarsely by pairwise vector-clock ordering.
+- Replication uses one MultiPaxos stream per worker/core rather than one global
+  shard log. Stream entries batch transactions, with 400 transactions per entry
+  in the implementation, avoiding a single serialization bottleneck.
+- Followers cannot replay a durable stream entry solely because its local log
+  arrived. Mako uses vector watermarks that summarize replication progress
+  across shards; replay and client acknowledgement require the relevant
+  watermark entries to cover the transaction vector clock.
+- On shard-leader failure, Mako advances an epoch through a replicated
+  configuration manager. Recovered shards close the old epoch by retrieving
+  replicated entries and no-oping unrecoverable slots; healthy shards try to
+  finish old-epoch certification, replicate special INF entries, and compute
+  finalized shard watermarks.
+- The finalized vector watermark is a deterministic global cut for the old
+  epoch. Old-epoch transactions not below that cut are rolled back, bounding
+  cascading aborts and preventing rollback from leaking unboundedly into newer
+  epochs.
+- New-epoch transactions may proceed on healthy shards, but before the finalized
+  vector watermark is known they cannot read uncertain old-epoch speculative
+  versions. This prevents cross-epoch dependency ambiguity.
+- For very large shard counts, Mako compresses per-object vector clocks by
+  merging shard clock entries. This is lossy but preserves the invariant that a
+  dependent transaction has a greater vector clock; the tradeoff is more waiting
+  or broader rollback when shards slow or fail.
+- Evaluation on Azure reports 3.66M TPC-C transactions per second at 10 shards
+  with 24 worker threads per shard, 8.6x higher throughput than the strongest
+  geo-replicated baseline in that setup. A microbenchmark reaches 16.7M TPS at
+  10 shards. The reported median light-load latency is about 60 ms, mostly one
+  simulated WAN RTT plus batching and watermark wait.
+- The paper also shows that simply increasing client concurrency does not solve
+  transactional replication bottlenecks: in one 2PC experiment, throughput
+  plateaus while aborts rise to 98% as conflict windows stretch.
+- Limitations acknowledged by the paper include no follower read-only
+  execution in the current implementation, static sharding in the prototype,
+  high aborts under high contention, and weaker performance than tightly
+  coupled RDMA-oriented systems when geo-replication is not the target.
+
+**GPU DB mapping:** The P8 and runtime designs already insist that WAL remains
+the correctness authority and GPU-resident state is a performance cache. Mako
+sharpens that into two generation concepts. A write batch can have an
+owner-local certified generation after validation and state installation, but a
+retained read snapshot should become externally routeable only after the durable
+visibility boundary covers the batch and all dependencies it read.
+
+For the current single-node GPU DB, the "WAN replication" analog is any slow
+durability or refresh path: WAL fsync, checkpointing, NVMe cold-tier placement,
+GPU residency rebuild, or future remote replica/cold-tier copy. Mako suggests
+that the mutation owner should not necessarily block all later internal work on
+the slowest path. It can pipeline validated work, but it must carry dependency
+metadata so route publication, snapshot retention, and rollback/replay remain
+deterministic.
+
+Per-core replication streams map to partition-owned or worker-owned WAL/log
+lanes. Instead of forcing one global mutation queue to serialize all work, GPU
+DB can benchmark partition-local append lanes plus a visibility watermark that
+names which lanes and epochs a retained snapshot covers. This aligns with the
+runtime goal of owner domains and bounded rings, but the publication certificate
+must remain explicit enough for recovery and stale-route rejection.
+
+Vector clocks are probably too heavy as a first implementation primitive for a
+single-node table engine, but the shape is valuable. A compact route certificate
+could include `{epoch, partition_id, lane_generation, visibility_boundary,
+read_dependency_boundary}`. GPU read workers and resident indexes would only
+serve a request when their snapshot certificate dominates the request's read
+boundary.
+
+Mako's failure recovery also maps to cache invalidation. When a refresh,
+checkpoint, or future replica stream fails, GPU DB should not globally throw
+away all retained snapshots if the affected partition/lane is known. A finalized
+watermark-style cut could identify which resident generations are still safe,
+which need rollback/retirement, and which new reads must wait or fall back to
+CPU.
+
+For 1M logical sessions, the concurrency experiment is a warning. More
+connected clients do not create throughput when conflict windows and durable
+publication windows grow. Admission should expose conflict-window time,
+visibility-watermark lag, WAL/refresh queue depth, and abort/fallback causes,
+then reject, delay, or redirect sessions before contention collapses into
+retries.
+
+**Risks and mismatches:** Mako is a geo-replicated in-memory key-value store,
+not a SQL engine, not a GPU database, and not a local WAL/checkpoint storage
+engine. Its one-shot transaction model avoids interactive SQL transaction
+state, cursors, prepared statements, and protocol-level backpressure questions.
+
+Speculative internal visibility is dangerous if copied without its full
+dependency and rollback machinery. GPU DB must not let speculative rows reach
+client-visible SQL results, retained read snapshots, resident indexes, or
+planner route caches unless the durable visibility boundary proves safety.
+
+The vector-clock mechanism may be excessive for a single-node engine and grows
+with shard count unless compressed. Compression preserves safety but can widen
+stall or rollback scope, which matters for long GPU refreshes and skewed
+partitions. The first benchmark should test scalar or partition-vector
+watermarks before adopting full vector clocks.
+
+Mako's high throughput relies on one-shot transactions, in-memory data, DPDK,
+batched Paxos streams, and shard leaders often being co-located. The absolute
+throughput numbers should not be treated as directly predictive for pgwire SQL,
+GPU kernel launch, text encoding, or NVMe-backed cold paths.
+
+Finally, Mako acknowledges high abort rates under high contention. GPU DB still
+needs contention-aware admission or deterministic owner execution for hot keys;
+speculation alone can reduce a slow durability window but cannot make conflicting
+updates independent.
+
+**Benchmark candidates:**
+
+- Add a two-boundary write-path model in the benchmark harness: `certified`
+  after owner validation/install and `durable_visible` after WAL fsync or
+  checkpoint coverage. Proof gate: no client-visible retained read can observe a
+  row whose durable boundary is not covered.
+- Prototype partition/lane visibility watermarks for append batches. Measure
+  single global generation versus per-partition lane generations under mixed
+  inserts, point reads, retained snapshots, and GPU refresh. Failure condition:
+  per-lane publication improves throughput only by making stale-route detection
+  ambiguous.
+- Add conflict-window telemetry: time from first read to validation, validation
+  to certified install, certified install to durable visibility, and durable
+  visibility to GPU-resident publication. Correlate each window with aborts,
+  fallback, and p99 latency.
+- Build a failure-injection test for retained snapshots. Interrupt a refresh,
+  checkpoint, or synthetic replica stream after internal certification but
+  before durable publication, then verify that affected resident generations are
+  retired or withheld while unaffected partitions continue serving.
+- Compare full route certificates with compressed certificates: full
+  `{partition, lane}` vectors versus one scalar epoch versus grouped partitions.
+  Required metrics: certificate bytes, route-check cost, false waiting,
+  rollback/retirement scope, and retained-read throughput.
+- Run a concurrency sweep similar to Mako's 2PC experiment: increase logical
+  sessions while holding active workers bounded, then measure throughput, aborts
+  or retries, admission delay, WAL lag, visibility lag, and GPU queue lag.
+  Pass condition: admission catches the collapse before p99 latency and retry
+  rate explode.
+- Test whether read-only retained snapshots should use the latest durable
+  boundary or a lagged all-agreed boundary. Measure freshness, snapshot-retire
+  pressure, GPU resident bytes, and write-path interference.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates now need durability, shape, and tier state
+
+LeanStore 2024, D-RDMA, and Mako converge on the same architectural pressure
+from different layers. LeanStore says cold/warm storage cannot remain an opaque
+OS side effect; it needs DB-owned handles, write-aware replacement, explicit IO
+queues, and recovery/warmup accounting. D-RDMA says result and movement paths
+should preserve shape so the transport layer can choose copy-out,
+scatter-gather, padding, or future offload without losing database semantics.
+Mako says transaction publication needs more than one boundary: internal
+certification can advance work, but durable client visibility and failure-safe
+replay need watermarks.
+
+The shared design track is a route certificate that travels with work and
+resident snapshots. It should name at least relation/partition identity,
+snapshot or epoch generation, durable visibility boundary, physical layout,
+tier source, output shape, and dependency or lane coverage. That certificate is
+the contract between mutation owners, storage/tiering workers, GPU execution
+owners, and network IO workers.
+
+This synthesis also argues against one global "is resident" bit. A route may be
+GPU-resident but not durable-visible, host-resident but fragmented, NVMe-backed
+but shape-preserving, or current for one partition and stale for another. The
+planner and runtime should expose these distinctions instead of collapsing them
+into generic CPU fallback.
+
+**Category gaps:** Recent coverage is now strong on storage tier ownership,
+structured movement, and speculative/durable publication boundaries. The next
+few papers should keep pressure on transaction/write-path concurrency and
+optimizer/admission decisions, especially papers that decide when to switch
+from optimistic execution to deterministic, partitioned, or contention-aware
+routes. GPU analytics candidates remain plentiful and should not dominate the
+next batch.
+
+**Benchmark priorities:**
+
+- Define a first route-certificate struct for benchmarks, even if it is not a
+  production API: relation id, partition id, physical layout id, tier source,
+  snapshot generation, durable visibility boundary, selected columns, row-id
+  vector or bitmap, and fallback reason.
+- Add one cross-layer trace for each request: admission decision, owner queue,
+  visibility wait, tier route, bytes moved, result materialization shape, and
+  response-ring pressure.
+- Build a three-state publication benchmark: internally certified write batch,
+  durable-visible CPU state, and GPU-resident retained snapshot. Reads must
+  prove which state they used.
+- Compare global generation, per-partition generation, and per-lane watermark
+  certificates under mixed inserts, retained point reads, and GPU refresh.
+- Measure whether structured result descriptors reduce protocol CPU before
+  adding any specialized NIC/RDMA path.

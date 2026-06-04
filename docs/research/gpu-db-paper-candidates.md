@@ -1979,7 +1979,7 @@ Append new candidates here as each paper is processed.
   Why: CXL DB position paper cites disaggregated-memory index design; useful
   for comparing B-tree node placement with LSM-style far-memory indexes for
   cold partitions and write-heavy tables.
-- `queued` — **Mako: Speculative Distributed Transactions with
+- `reviewed` — **Mako: Speculative Distributed Transactions with
   Geo-Replication**, Shen et al., OSDI 2025.
   URL: `https://www.usenix.org/conference/osdi25/presentation/shen-weihai`
   PDF: `https://www.usenix.org/system/files/osdi25-shen-weihai.pdf`
@@ -1987,6 +1987,25 @@ Append new candidates here as each paper is processed.
   transaction path; useful for comparing execution/replication decoupling,
   deterministic replay, and geo-replication costs against owner-local GPU DB
   WAL and snapshot publication.
+- `queued` — **Fast Commitment for Geo-Distributed Transactions via
+  Decentralized Co-coordinators**, Zhang et al., PVLDB 2024.
+  URL: `https://doi.org/10.14778/3641204.3641229`
+  Why: Mako compares against D2PC as a modern geo-distributed transaction
+  baseline; useful for evaluating whether decentralized commit coordination
+  can reduce owner or shard-leader bottlenecks without speculative rollback
+  machinery.
+- `queued` — **DINT: Fast In-Kernel Distributed Transactions with eBPF**,
+  Zhou et al., NSDI 2024.
+  URL: `https://www.usenix.org/conference/nsdi24/presentation/zhou-yang`
+  Why: Mako cites DINT among recent fast distributed transaction systems;
+  relevant to comparing kernel/eBPF-assisted transaction routing with GPU DB's
+  user-space rings, admission queues, and protocol-edge ownership.
+- `queued` — **Ocean Vista: Gossip-based Visibility Control for Speedy
+  Geo-Distributed Transactions**, Fan and Golab, PVLDB 2019.
+  URL: `https://doi.org/10.14778/3342263.3342644`
+  Why: Mako contrasts against integrated replication and concurrency-control
+  protocols; useful for comparing visibility-control metadata against GPU DB
+  snapshot publication and route certificates.
 - `queued` — **A Hybrid Approach to Integrating Deterministic and
   Non-Deterministic Concurrency Control in Database Systems**, Hong et al.,
   PVLDB 2025.
