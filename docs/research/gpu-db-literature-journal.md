@@ -41513,3 +41513,145 @@ Benchmark priorities:
   demotes cyclic or incomplete work to deterministic fallback;
 - 1M logical-session admission test where idle sessions do not allocate route
   state and active batches are bounded by certificate budgets.
+
+### 2026-06-04 - GPU query concurrency as a resource-fitting problem
+
+**Citation:** Hao Li, Yi-Cheng Tu, and Bo Zeng. "Concurrent query processing
+in a GPU-based database system." PLOS ONE 14(4), 2019, e0214720. DOI
+`10.1371/journal.pone.0214720`. Retrieved 2026-06-04 from the PMC full text,
+`https://pmc.ncbi.nlm.nih.gov/articles/PMC6467383/`.
+
+**Category:** GPU execution / analytics; runtime scheduling; query
+admission.
+
+**Relevance tags:** CUDA streams; concurrent kernels; GPU resource
+allocation; multi-kernel scheduling; batch-level optimization; dynamic
+programming; bin packing; hash join; query co-scheduling; launch parameters.
+
+**Core idea:** The paper treats concurrent GPU query execution as a resource
+fitting problem rather than as a simple queue of independent kernels. GPU
+queries are decomposed into kernels, each kernel consumes registers, shared
+memory, blocks, and warps, and CUDA streams can run kernels concurrently when
+their resource footprints fit. Instead of relying only on CPU-side overlap,
+the paper controls kernel launch parameters and batches kernels so
+complementary resource profiles can share the GPU at the same time.
+
+The strongest transferable idea for GPU DB is that a GPU execution route
+should publish a compact resource-shape certificate before admission. A route
+should not merely say "GPU eligible"; it should declare the kernel sequence,
+dependency barriers, approximate registers/shared-memory/block/warp footprint,
+stream compatibility, pinned-memory requirements, and batch limits. The
+runtime can then co-schedule compatible retained reads and joins explicitly,
+rather than hoping that concurrent CUDA streams produce useful overlap.
+
+**Concrete mechanisms:**
+
+- The paper assumes query operators are implemented as CUDA kernels. A simple
+  scan query may have scan and output kernels; a hash join has kernels for
+  copying/reading inputs, building hash tables, scanning/probing, and
+  outputting results.
+- CUDA streams provide the hardware-facing concurrency mechanism. Kernels
+  within a stream preserve order, while kernels from different streams may run
+  concurrently if resources permit and dependencies allow it.
+- The model treats a block as the useful scheduling unit because CUDA schedules
+  all threads in a block on the same multiprocessor resource pool.
+- Kernel launch parameters are the control surface: total blocks and block
+  size determine the number of threads/warps and affect per-block register and
+  shared-memory use. Shared memory can also be specified at launch, though the
+  paper mostly treats per-block shared memory as fixed by the kernel/input.
+- The original kernel-level formulation is a multi-dimensional knapsack-like
+  integer program over registers, warps, shared memory, and blocks. The goal is
+  to maximize simultaneously scheduled threads as a proxy for throughput.
+- The paper simplifies the model by using warp count and block count, removing
+  constraints that can be checked after feasibility, and minimizing total
+  shared-memory use under block and warp constraints. It then solves the
+  reduced quadratic knapsack-like formulation with dynamic programming.
+- A key theorem states that, for a fixed block count for a kernel, the optimal
+  warp count is the ceiling needed to cover that kernel's required threads.
+  This collapses part of the search space.
+- For cases where all kernels cannot fit in one scheduling batch, the paper
+  adds a batch-level model shaped like a three-dimensional bin-packing problem
+  over warps, registers, and shared memory. It uses a column-generation style
+  approach inspired by cutting-stock formulations.
+- The evaluation compares sequential execution, MultiQx-GPU, and the paper's
+  two-stage model on a server with eight GTX Titan X Pascal GPUs, though the
+  described workloads focus on one-GPU scheduling behavior. The benchmark uses
+  two-table hash join, three-table hash join, MD5 verification, matrix
+  multiplication, and atom-distance calculation kernels.
+- Reported results include `1.47x` average GPU-side speedup for two-table hash
+  join operations versus sequential execution, at least `2.01x` speedup for
+  two-query workloads, `3.38x` speedup at five queries, and `7.33x` speedup at
+  sixteen queries while MultiQx-GPU falls back near `1.03x`. Model-solving
+  overhead is reported between `0.082 ms` and `1.487 ms`, averaging `0.571 ms`.
+
+**GPU DB mapping:** This paper gives the GPU execution owner a concrete
+admission language. Each resident route can describe its kernel DAG, resource
+footprint, stream class, input/output transfer requirements, and last-mile
+result-scatter work. The scheduler can then pack compatible commands into a
+GPU batch using measured route certificates, bounded latency ceilings, and
+fallback rules.
+
+For retained point reads, the certificate may be tiny: one lookup/predicate
+kernel plus optional visibility and scatter kernels. For joins or aggregates,
+the certificate should expose dependency barriers: build-side materialization,
+probe-side scan, reduction, and output. Work can overlap only across kernels
+that are independent and whose footprints are complementary; the route
+descriptor should make this visible to the scheduler.
+
+The batch-level model maps naturally to the high-throughput runtime's
+micro-batching rules. The network/read snapshot rings can collect same-shape
+requests, but the GPU execution owner should decide whether the batch is
+accepted based on GPU resource fit, not only request count. This also gives a
+clean overload reason: no compatible stream pack fits under the current
+resource and latency budget.
+
+For 1M logical sessions, the paper reinforces that GPU state must be attached
+to active batches, not idle sessions. Idle sessions should carry no GPU
+resource reservation. Active commands should be classified into route shapes,
+batched under a short deadline, and admitted only if their aggregate resource
+certificate fits.
+
+**Risks and mismatches:** The paper optimizes analytical/scientific GPU
+workloads and explicitly targets throughput more than single-request latency.
+GPU DB must preserve p50/p95 latency targets, SQL result correctness, MVCC
+visibility, and WAL-before-visibility even when a more aggressive GPU packing
+would improve total throughput.
+
+The resource model is built around older CUDA behavior and GTX Titan X Pascal
+hardware. Modern GPUs, CUDA runtime behavior, cooperative groups, MIG/MPS,
+copy engines, and memory hierarchy details may change the best packing policy.
+The paper also uses thread concurrency as a proxy for running time; GPU DB must
+measure actual query latency, queue wait, transfer cost, and result materialize
+time.
+
+The model does not cover transactional writes, snapshot invalidation,
+long-reader retirement, cache eviction, query optimization semantics, or
+multi-tier placement. It also assumes kernels and their resource use are known
+up front. For generated SQL plans, GPU DB needs conservative estimation,
+telemetry calibration, and deterministic CPU/owner fallback when a route
+certificate is missing or stale.
+
+**Benchmark candidates:**
+
+- Add a GPU route resource certificate schema for retained execution:
+  route id, snapshot generation, kernel sequence, dependency barriers,
+  stream class, block/warp/shared-memory/register estimates, pinned bytes,
+  H2D/D2H bytes, result-scatter budget, and fallback reason.
+- Build a no-SQL scheduler harness that packs synthetic route certificates
+  under block/warp/shared-memory constraints. Compare FIFO, same-shape batching,
+  and resource-complementary packing. Proof gate: packing never exceeds a
+  declared route budget.
+- Measure retained point lookups plus retained aggregate scans under one GPU
+  owner. Expected benefit: complementary kernels improve throughput without
+  increasing p95 latency beyond a configured micro-batch ceiling.
+- Add an overload test where many active sessions submit incompatible GPU
+  shapes. Required result: the runtime rejects, delays, or falls back with a
+  named reason instead of silently over-queuing the GPU owner.
+- For join routes, benchmark dependency-aware overlap: build/probe/output
+  kernels with and without explicit stream packing. Failure condition: stream
+  packing improves throughput by hiding queue time while violating per-request
+  ordering, visibility, or result-scatter ownership.
+- Re-measure all certificate fields on the future GPU rather than importing the
+  paper's hardware assumptions. Required telemetry: queue wait, batch size,
+  model/packing overhead, kernel elapsed time, H2D/D2H bytes, pinned allocation
+  time, and fallback count.

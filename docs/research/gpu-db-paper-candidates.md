@@ -176,7 +176,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   Why: directly relevant to concurrent GPU query scheduling and resource
   sharing. Reviewed before the 2015-present policy was added; keep as
   historical context.
-- `queued` — **Concurrent query processing in a GPU-based database system**,
+- `reviewed` — **Concurrent query processing in a GPU-based database system**,
   PLOS ONE 2019.
   URL: `https://pmc.ncbi.nlm.nih.gov/articles/PMC6467383/`
   Why: batch-level optimization model for concurrent GPU database workloads.
@@ -318,7 +318,24 @@ Append new candidates here as each paper is processed.
   heterogeneous CPU-GPU DBMS**, Yogatama et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
   Why: cost-based CPU/GPU placement and execution orchestration for
-  heterogeneous DBMS designs.
+  heterogeneous CPU-GPU database systems.
+- `queued` — **Dynamic Resource Management for Efficient Utilization of
+  Multitasking GPUs**, Park, Park, and Mahlke, HPCA 2017.
+  URL: `https://doi.org/10.1109/HPCA.2017.19`
+  Why: GPU Maestro-style dynamic resource partitioning for multitasking GPUs;
+  useful follow-up to kernel/batch concurrency scheduling for GPU DB streams.
+- `queued` — **Classification-Driven Search for Effective SM Partitioning in
+  Multitasking GPUs**, Zhao, Wang, and Eeckhout, ICS 2018.
+  URL: `https://doi.org/10.1145/3205289.3205311`
+  Why: low-overhead SM partitioning search for multitasking GPUs; relevant to
+  GPU execution-owner admission, resident query co-scheduling, and fairness.
+- `queued` — **Fast Equi-Join Algorithms on GPUs: Design and Implementation**,
+  Rui and Tu, SSDBM 2017.
+  URL: `https://doi.org/10.1145/3085504.3085521`
+  PMC: `https://pmc.ncbi.nlm.nih.gov/articles/PMC10829000/`
+  Why: modern-enough GPU join implementation paper cited by the concurrency
+  study; useful for comparing route-specific kernels before concurrent
+  co-scheduling.
 - `reviewed` — **Distributed GPU Joins on Fast RDMA-capable Networks**,
   Thostrup et al., PACMMOD 2023.
   URL: `https://doi.org/10.1145/3588709`
