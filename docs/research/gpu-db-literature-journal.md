@@ -33872,3 +33872,141 @@ proof gates for predicate/range conflicts, secondary-index maintenance,
 MVCC-version retirement, DDL invalidation, and crash replay. Benchmark priority
 should therefore favor CPU-first correctness simulators with GPU hooks, not a
 premature device-only OLTP route.
+
+### 2026-06-04 - RTScan maps conjunctive filters onto ray-tracing cores
+
+**Citation:** Yangming Lv, Kai Zhang, Ziming Wang, Xiaodong Zhang, Rubao Lee,
+Zhenying He, Yinan Jing, and X. Sean Wang. "RTScan: Efficient Scan with Ray
+Tracing Cores." PVLDB 17(6): 1460-1472, 2024. Retrieved 2026-06-04 from the
+PVLDB PDF, `https://www.vldb.org/pvldb/vol17/p1460-lv.pdf`; DOI
+`https://doi.org/10.14778/3648160.3648183`; artifact
+`https://github.com/AntaresAlice/RTScan`.
+
+**Category:** GPU execution / analytics; query optimization / planning.
+
+**Relevance tags:** ray-tracing cores; predicate scan; conjunctive filters;
+resident indexes; BVH; uniform encoding; sieving bit vectors; matrix ray
+refinement; skew handling; GPU hardware specialization.
+
+**Core idea:** RTScan treats a group of up to three conjunctive predicates as a
+3D spatial query over GPU ray-tracing hardware. Each record is represented as a
+cube whose coordinates come from encoded column values, each predicate group
+defines a cuboid query region, and rays are launched through the remaining
+candidate space to identify matching records. The important design signal is
+that RT cores are only useful when the mapping creates many short, balanced rays
+with few intersections; a literal "one value becomes one primitive, one range
+becomes one ray" translation is orders of magnitude too slow.
+
+RTScan combines approximate bitmap filtering with RT-core refinement. It reports
+up to five orders of magnitude improvement over earlier RTIndex-style range
+scans and up to 4.6x over the BinDex CPU baseline in the evaluated cases. On an
+RTX 3090 setup, the paper also reports average advantages over BinDex-CUDA, but
+the benefit depends on having resident index structures and avoiding host result
+transfer. The result is most relevant to GPU DB as an optional resident
+predicate-index route, not as a replacement for the default MVCC lookup or scan
+path.
+
+**Concrete mechanisms:**
+
+- Build RTScan indexes per three-attribute group. The CPU performs uniform
+  encoding for each attribute, encoded columns are moved to GPU memory, a BVH is
+  built over cube primitives for each attribute group, and sieving bit vectors
+  are built and kept on the GPU.
+- Uniform Encoding maps each column into an order-preserving, broadly uniform
+  encoded range. Repeated skewed values map to encoded intervals, with a mapping
+  table used to translate predicates back into encoded lower or upper bounds.
+- Data Sieving precomputes bit vectors for approximate predicate results. For a
+  predicate whose boundary falls between two vector boundaries, RTScan selects
+  the positive or negative approximate vector that leaves fewer records for
+  refinement.
+- RT refinement scans only the residual cuboids left after sieving, then merges
+  results from predicate groups with CUDA bitwise operations.
+- Matrix RT Refine uses cube primitives, ray intervals, and ray spacing to
+  reduce repeated primitive intersections and total BVH traversal length. Cube
+  projection is chosen because it minimizes the area that can be hit by
+  neighboring rays compared with triangles or spheres.
+- The OptiX intersection shader fetches the primitive's encoded column values,
+  checks them against the original predicate group, and atomically sets the
+  result bit for matching record ids.
+- One- and two-predicate groups are handled as degenerate versions of the same
+  approach; four predicates can be split as 3+1 or 2+2 groups and then merged.
+- The evaluation uses 100M-record synthetic uniform/skewed integer datasets,
+  TPC-H predicates from Q3/Q6/Q17, CUDA 12.1, OptiX 7.5, and an RTX 3090 with 82
+  RT cores. The reported RTScan index for 100M rows and three attributes used
+  7.6 GB, with most device memory split between sieving vectors and the BVH.
+
+**GPU DB mapping:** For P8, RTScan is a candidate for a narrow, opt-in resident
+predicate index over immutable GPU snapshots. The current resident layout
+already has table identity, source WAL boundary, column buffers, route-ready
+facts, and invalidation states. An RTScan-like route would add a resident
+`rt_predicate_group` structure tied to the same snapshot generation: encoded
+column group ids, mapping tables, sieving vector count, BVH handle, supported
+operators, and memory budget. Reads could use it only when the planner can prove
+snapshot compatibility and when the predicate group is conjunctive, range-like,
+and covered by resident columns.
+
+The strongest transfer is the two-stage filter/refine contract. GPU DB does not
+need to start with ray tracing to use the idea: planner routes can first build a
+cheap approximate mask from resident min/max, bitmap, or encoded-vector
+metadata, then refine only the uncertain residual on CUDA or RT cores. RTScan
+gives a concrete benchmark shape for deciding whether a resident predicate index
+should spend memory on approximate vectors, BVH, sort-order arrays, or plain
+column scans.
+
+RTScan also fits the runtime's route-descriptor direction. A query should carry
+predicate group identity, selectivity estimate, resident snapshot generation,
+required result location, and transfer policy. If the result must cross back to
+the CPU for pgwire encoding, the route must charge D2H mask/result bytes. If a
+same-shape batch can stay inside the GPU for aggregate or join continuation,
+the planner can price the RT route more favorably.
+
+For write-heavy or mixed workloads, the paper is mainly a caution. RTScan says
+updates require rebuilding or updating the BVH, mapping table, and sieving
+vectors, and calls the current design suitable for infrequent updates. In GPU
+DB terms, an RT resident index should attach to immutable retained generations,
+be invalidated before mutated rows become visible, and rebuild through the
+residency maintenance path rather than trying to absorb every OLTP write
+in-place.
+
+**Risks and mismatches:** RTScan targets analytical scans over denormalized
+tables, not MVCC transaction processing. It assumes integer attributes in the
+main evaluation, groups predicates by fixed attribute triples, and focuses on
+conjunctive predicates; disjunctions are future work. The memory footprint is
+large enough that it competes directly with resident column groups, hash/key
+indexes, compressed vectors, and query scratch. Build cost is non-trivial, so
+rapidly changing tables could spend more time rebuilding than querying.
+
+The paper uses OptiX and ray-tracing hardware. That adds implementation and
+portability risk, especially across server GPUs, driver versions, CUDA/OptiX
+availability, and non-NVIDIA devices. Predicate-to-3D grouping is also a planner
+problem: a bad grouping may waste memory or produce poor selectivity even when
+each individual predicate is supported. Unknown from this read: how well the
+approach behaves with SQL null semantics, text prefixes, MVCC visibility
+columns, compressed resident segments, concurrent query scheduling, or
+incremental refresh under bounded latency.
+
+**Benchmark candidates:**
+
+- Add a CPU/CUDA resident predicate-mask baseline before RT work: encoded
+  vectors plus approximate bitmaps over an immutable resident snapshot. Gate:
+  planner-visible memory, build time, D2H bytes, and refinement rows beat a
+  plain resident scan on selective conjunctive filters.
+- Prototype an RTScan-style route only for three `int4` columns on one immutable
+  generated resident chunk. Proof gate: results match the CPU MVCC comparator at
+  one fixed visibility boundary, with resident route invalidated on mutation.
+- Compare resident scan, CUDA BinDex-like bitmap refine, and RTScan-like BVH
+  refine on uniform and Zipfian data at 1%, 10%, 50%, and 90% predicate
+  selectivity. Failure condition: memory or build cost hides the scan win.
+- Measure result-location sensitivity: GPU-local mask consumed by a following
+  aggregate versus mask copied back for pgwire rows. Expected result: RT routes
+  are only attractive when downstream work stays on device or result sets are
+  small.
+- Add route telemetry for `predicate_group`, `sieving_vector_count`,
+  `rt_bvh_bytes`, `rt_vector_bytes`, `rt_build_ms`, `rt_refine_ms`,
+  `active_rays`, `intersection_tests`, `d2h_result_bytes`, and
+  `invalidation_generation`.
+- Test rebuild policy through P8 maintenance ticks: rebuild RT metadata only
+  after a table crosses a read-frequency threshold and no longer has a pending
+  invalidation. Gate: OLTP-visible commits never wait for RT index rebuild.
+- Keep RTScan behind an explicit feature flag until a portability check proves
+  CUDA/OptiX availability and a non-RT fallback is always planned.

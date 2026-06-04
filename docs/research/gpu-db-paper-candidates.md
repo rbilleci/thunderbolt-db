@@ -473,10 +473,10 @@ Append new candidates here as each paper is processed.
   Why: AIFO depends on fast-converging end-host congestion control; useful for
   mapping delay-based feedback to GPU DB ingress, response-ring, and tier
   admission signals.
-- `queued` — **RTScan: Efficient Scan with Ray Tracing Cores**, Lv et al.,
+- `reviewed` — **RTScan: Efficient Scan with Ray Tracing Cores**, Lv et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p1460-lv.pdf`
-  DOI: `https://doi.org/10.14778/3641204.3641216`
+  DOI: `https://doi.org/10.14778/3648160.3648183`
   Why: RTCUDB cites RTScan as the main RT-core scan baseline; useful for
   isolating predicate-only ray tracing from RTCUDB's fused scan/group/aggregate
   mapping.
@@ -518,6 +518,13 @@ Append new candidates here as each paper is processed.
   caching/routing layers to avoid synchronous database round trips while
   preserving distributed transaction support; useful for GPU DB catalog,
   route-cache, and cold-tier namespace scaling.
+- `queued` — **BinDex: A Two-Layered Index for Fast and Robust Scans**,
+  Li et al., SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3380563`
+  PDF: `https://kay21s.github.io/Bindex2020.pdf`
+  Why: RTScan's main CPU/CUDA baseline; useful for comparing two-layer bitmap
+  filtering, refinement cost, memory footprint, and update limitations against
+  GPU-resident predicate-index experiments.
 - `reviewed` — **Facebook's Tectonic Filesystem: Efficiency from Exascale**,
   Pan et al., FAST 2021.
   URL: `https://www.usenix.org/conference/fast21/presentation/pan`
