@@ -325,9 +325,10 @@ Append new candidates here as each paper is processed.
   PDF: `https://cccp.eecs.umich.edu/papers/jasonjk-asplos17.pdf`
   Why: GPU Maestro-style dynamic resource partitioning for multitasking GPUs;
   useful follow-up to kernel/batch concurrency scheduling for GPU DB streams.
-- `queued` — **Classification-Driven Search for Effective SM Partitioning in
+- `reviewed` — **Classification-Driven Search for Effective SM Partitioning in
   Multitasking GPUs**, Zhao, Wang, and Eeckhout, ICS 2018.
   URL: `https://doi.org/10.1145/3205289.3205311`
+  PDF: `https://users.elis.ugent.be/~leeckhou/papers/ics18.pdf`
   Why: low-overhead SM partitioning search for multitasking GPUs; relevant to
   GPU execution-owner admission, resident query co-scheduling, and fairness.
 - `queued` — **Fast Equi-Join Algorithms on GPUs: Design and Implementation**,
@@ -733,6 +734,17 @@ Append new candidates here as each paper is processed.
   layered filesystem designs; useful for evaluating whether GPU DB cold-tier
   placement should centralize data placement, caching, and failure recovery or
   keep them as explicit route-owned tiers.
+- `queued` — **HSM: A Hybrid Slowdown Model for Multitasking GPUs**,
+  Choi, Kim, and Eeckhout, ASPLOS 2020.
+  URL: `https://users.elis.ugent.be/~leeckhou/papers/asplos2020.pdf`
+  Why: modern follow-up from the same GPU multitasking line that models
+  cross-kernel slowdown; relevant to route resource-class calibration and
+  conservative GPU co-scheduling.
+- `queued` — **NUBA: Non-Uniform Bandwidth GPUs**, Zhao et al., ASPLOS 2023.
+  URL: `https://doi.org/10.1145/3575693.3575745`
+  Why: newer off-chip/on-chip bandwidth-aware GPU architecture work from the
+  CD-search authors; relevant to treating GPU bandwidth locality and
+  partitioning as route-certificate inputs for future hardware.
 - `reviewed` — **Oze: Decentralized Graph-Based Concurrency Control for
   Long-Running Update Transactions**, Nemoto et al., PVLDB 2025.
   URL: `https://vldb.org/pvldb/vol18/p2321-nemoto.pdf`

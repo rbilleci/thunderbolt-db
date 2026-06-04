@@ -42896,3 +42896,201 @@ interference, and fallback policy.
   publication delay, dirty-frontier growth, GPU refresh queue wait, memory
   bandwidth where available, and rejection/fallback reason. A scheduling rule
   is not accepted unless it preserves these counters within declared bounds.
+
+### 2026-06-04 - CD-search makes GPU co-scheduling a classified resource-partition problem
+
+**Citation:** Xia Zhao, Zhiying Wang, and Lieven Eeckhout.
+"Classification-Driven Search for Effective SM Partitioning in Multitasking
+GPUs." ICS 2018, pp. 65-75. doi:10.1145/3205289.3205311. Retrieved
+2026-06-04 from `https://users.elis.ugent.be/~leeckhou/papers/ics18.pdf`,
+with metadata cross-checked at
+`https://biblio.ugent.be/publication/8589946`.
+
+**Category:** GPU execution / runtime scheduling / admission.
+
+**Relevance tags:** GPU multitasking; SM partitioning; co-scheduling;
+bandwidth-aware admission; GPU execution owners; micro-batching; queue
+fairness; power-aware scheduling; route certificates.
+
+**Core idea:** CD-search argues that equal GPU sharing is often the wrong
+default. In spatial GPU multitasking, a memory-sensitive kernel may stop
+benefiting from more SMs once the off-SM system is saturated, while a
+compute-sensitive kernel may still scale almost linearly with additional SMs.
+The system first classifies co-running applications by their sensitivity to SM
+count, then uses a small workload-specific search rather than exhaustively
+trying SM partitions.
+
+For GPU DB, the transferable idea is not literal SM control. It is the shape of
+the admission decision: classify route work by its limiting resource before
+co-scheduling it. A retained lookup batch, decompression scan, grouped
+aggregate, refresh kernel, or split delta-reduction route should carry enough
+telemetry to decide whether it wants more GPU compute slots, more memory or
+L2/off-chip bandwidth, more copy-engine capacity, or fewer concurrent kernels.
+
+**Concrete mechanisms:**
+
+- CD-search uses spatial multitasking: independent applications execute on
+  disjoint sets of SMs rather than sharing each SM at fine granularity.
+- The algorithm starts with workload classification, then chooses performance
+  mode for heterogeneous mixes of compute-sensitive and memory-sensitive
+  applications, power mode for homogeneous memory-sensitive mixes, or even
+  partitioning for homogeneous compute-sensitive mixes.
+- Classification relies on an off-SM bandwidth model rather than DRAM
+  bandwidth utilization alone. The model includes NoC, LLC, and DRAM capacity
+  and compares total SM bandwidth demand against off-SM bandwidth supply.
+- The total SM demand estimate uses per-SM bandwidth demand multiplied by SM
+  count. Per-SM demand depends on maximum IPC, LLC accesses per thousand
+  instructions, cache-line size, and SM frequency.
+- The off-SM supply estimate takes the minimum of NoC bisection bandwidth and
+  an LLC/DRAM bandwidth term derived from LLC bandwidth, memory bandwidth,
+  cache hit/miss rates, and effective memory utilization.
+- Hardware performance counters provide the online workload-specific inputs:
+  LLC accesses per instruction, hit rate, and miss rate. Most other terms are
+  hardware constants known ahead of time.
+- Classification uses a warmup phase and profiling phase, each `20K` cycles in
+  the paper. During classification, two co-running applications each receive
+  half the SMs.
+- In performance mode, CD-search gradually stalls SMs assigned to the
+  memory-sensitive application in steps of two and measures IPC. It stops when
+  the memory-sensitive application's performance stays within a configured
+  threshold, then gives the freed SMs to the compute-sensitive application.
+- In power mode, CD-search aggressively finds the smallest SM count that
+  preserves each memory-sensitive application's performance and power-gates
+  the unused SMs.
+- The paper validates the compute-sensitive versus memory-sensitive behavior
+  on an NVIDIA P100 by using a shadow kernel to occupy selected SMs while the
+  main kernel runs on a separate stream.
+- Main evaluation uses modified GPGPU-Sim with a 24-SM GPU, GPUWattch power
+  modeling, 91 two-application CUDA workload mixes, and STP/ANTT metrics.
+- The off-SM model classifies all 91 workload mixes correctly in the paper's
+  setup; using memory-bandwidth utilization alone would misclassify 36 of
+  them under the paper's best threshold.
+- In heterogeneous performance-mode workloads, CD-search improves system
+  throughput by `10.4%` on average and up to `62.9%` over even partitioning.
+  ANTT improves by `22%` on average in that mode.
+- In memory-sensitive power-mode workloads, it reduces power by `25%` on
+  average and up to `41.2%`, while roughly preserving performance on average.
+- Profiling overhead is reported as `0.92%` for performance mode and `2.5%`
+  for power mode relative to offline-optimal partition choice.
+- The benefit grows when memory bandwidth is constrained and when the GPU has
+  more SMs, because extra SMs are more likely to be wasted on saturated
+  memory-sensitive kernels.
+- Against SMK-style intra-SM sharing, CD-search avoids severe interference for
+  some mixes; the paper also notes that CD-search is orthogonal to Maestro-like
+  designs that combine SMK with spatial multitasking.
+
+**GPU DB mapping:** The immediate mapping is to GPU execution-owner admission.
+Today the runtime target already calls for compatible micro-batches by
+snapshot generation, relation or partition identity, query shape, predicate
+family, and output shape. CD-search adds a second compatibility dimension:
+resource class. A batch should be labeled as compute-limited, memory-bandwidth
+limited, transfer-limited, launch-limited, or refresh/visibility-limited before
+the scheduler decides whether to co-run it, serialize it, or assign it to a
+separate stream.
+
+For retained GPU reads, equality lookups may be launch- or index-access
+limited at small batch sizes but become memory- or scatter-limited as batches
+grow. Scans over compressed resident columns may be bandwidth-limited after
+decompression saturates HBM or L2. Grouped aggregates may be compute-, shared
+memory-, or global-memory-limited depending on cardinality. A route certificate
+should therefore include measured bytes, cache behavior where available,
+kernel time, queue wait, occupancy hints, transfer bytes, and observed scaling
+with batch size.
+
+The off-SM model is a useful design pattern even if the exact counters differ
+on modern NVIDIA hardware. GPU DB can start with a software analog: each route
+family publishes a small profile from calibration runs and live telemetry:
+device bytes per row, host/device transfer bytes, expected instructions or
+kernel family, result scatter bytes, and whether throughput saturates when
+batch size or concurrent streams increase. That profile can drive conservative
+co-scheduling without a learned scheduler.
+
+The performance mode maps to pairing complementary work: run a memory-saturated
+scan or refresh with a compute-heavy kernel only if measurements show the pair
+does not worsen p95 latency or write-path freshness. The power mode maps less
+directly to current goals, but its lesson still matters: sometimes fewer active
+GPU lanes or streams can preserve throughput while reducing contention. For a
+database, that means "use all streams" should not be the default if it harms
+tail latency, HBM pressure, or copy-engine availability.
+
+For 1M logical sessions, CD-search reinforces that GPU resources should be
+allocated to route batches, not sessions. Logical sessions submit work into
+bounded rings; the GPU owner classifies and co-schedules batches by resource
+class. A session does not get an implicit share of SMs, streams, pinned
+buffers, or resident memory merely because it is connected.
+
+**Risks and mismatches:** The paper targets architectural GPU multitasking, not
+SQL execution. It assumes the ability to preempt, stall, reassign, and
+power-gate SMs in ways ordinary CUDA applications may not control directly.
+The main evaluation is simulation on a 24-SM model with older CUDA benchmark
+kernels; only the performance-sensitivity phenomenon is validated on real P100
+hardware.
+
+The off-SM bandwidth model is not a complete GPU DB cost model. It does not
+include PCIe/NVLink transfers, copy-engine overlap, CUDA graph launch overhead,
+resident snapshot invalidation, MVCC visibility checks, output encoding,
+network response pressure, or WAL/write-path interference. It also assumes
+long-running kernels where profiling overhead is small; many database kernels
+may be short micro-batches where an extra profiling phase would cost more than
+the saved work.
+
+Finally, the objective functions differ. CD-search optimizes STP, ANTT, and
+power across independent GPU applications. GPU DB must optimize SQL latency,
+freshness, fairness, and correctness under bounded queues. Any co-scheduling
+rule must be subordinate to visibility generation, memory budget, response
+ordering, and overload policy.
+
+**Benchmark candidates:**
+
+- Add a route resource-class microbenchmark for retained lookup, scan,
+  decompression, grouped aggregate, refresh, and split delta-reduction kernels.
+  Vary batch size and concurrent streams; classify each route as launch-,
+  compute-, memory-, transfer-, or scatter-limited. Proof gate: every GPU route
+  has a stable measured class before co-scheduling policy uses it.
+- Compare naive stream co-running against resource-class-aware co-scheduling:
+  pair compute-heavy and memory-heavy routes where possible, serialize two
+  memory-saturated routes, and cap active streams under HBM pressure. Measure
+  p50/p95 latency, GPU occupancy, H2D/D2H bytes, and throughput.
+- Build a "fewer active lanes can win" test for resident scans and refresh
+  kernels. Expected result: under memory saturation, reducing concurrent
+  batches or streams can preserve throughput while lowering p95 latency or
+  write-path interference. Failure condition: the cap only reduces throughput
+  without improving any latency, queue, or freshness counter.
+- Add route certificates with measured resource class, resident generation,
+  touched bytes, transfer bytes, expected output bytes, queue wait, and
+  fallback reason. A scheduler decision should be explainable from these fields
+  without hidden per-session state.
+- Test co-scheduling under freshness pressure: run retained reads, refresh
+  work, and mutation-driven invalidations together. Pass condition: GPU
+  co-running never delays WAL visibility publication or stale-route rejection
+  beyond declared bounds.
+- For future hardware with MPS/MIG or similar partitioning, compare whole-GPU
+  streams, software stream caps, and hardware partitions for database route
+  classes. Mark absolute performance unknown until the newer GPU is available.
+
+### 2026-06-04 - Cross-paper synthesis: route certificates should combine freshness, estimates, and measured resource class
+
+The last three reviewed papers converge on a planner/runtime contract for
+choosing GPU work safely. PRICE says a route needs portable cardinality and
+fanout features plus local calibration. Adaptive HTAP says the route must name
+its freshness demand and dirty frontier. CD-search says the scheduler should
+also know the measured resource class before co-running GPU work.
+
+**Converging design tracks:** A GPU DB route certificate should include
+cardinality/fanout estimates, snapshot generation, dirty frontier coverage,
+resident bytes, transfer bytes, output bytes, queue pressure, freshness
+requirement, and measured resource class. Deterministic planner rules can use
+that certificate first; learned or adaptive layers should only refine choices
+inside those correctness and budget gates.
+
+**Category gaps:** The queue has enough GPU analytics follow-ups. The next
+high-value pick should come from multi-tier storage placement, indexing, or
+metadata/cold-tier routing unless a newer transaction-processing paper is
+added.
+
+**Benchmark priorities:** The next benchmark design should log route
+certificates for a small family of retained reads and refreshes. The pass
+condition is that route choice, fallback, and stale-snapshot rejection are
+explainable from recorded certificate fields. The failure condition is any
+planner or scheduler decision that depends on implicit session state,
+unbounded profiling, or stale statistics.
