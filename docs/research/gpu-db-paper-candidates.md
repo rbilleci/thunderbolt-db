@@ -3739,3 +3739,28 @@ Append new candidates here as each paper is processed.
   Why: follow-up to Two-Tree/Three-Tree on access-method tiering under skew;
   relevant to GPU DB hot/cold resident index placement and selective
   promotion of upper, lower, or leaf-heavy structures.
+- `reviewed` — **An Examination of CXL Memory Use Cases for In-Memory Database
+  Management Systems using SAP HANA**, Ahn et al., PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p3827-ahn.pdf`
+  DOI: `https://doi.org/10.14778/3685800.3685809`
+  Why: modern empirical CXL-memory placement study for a commercial in-memory
+  DBMS; selected because the recent synthesis called for more tier and
+  placement work after several transaction-publication reviews.
+- `queued` — **CXL Memory Performance for In-Memory Data Processing**,
+  Weisgut, Benson, Rabl, and Boissier, PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p3119-weisgut.pdf`
+  Why: newer CXL memory benchmark paper for in-memory data processing; useful
+  follow-up for separating raw CXL latency/bandwidth effects from
+  DBMS-object-placement effects.
+- `queued` — **Database Kernels: Seamless Integration of Database Systems and
+  Fast Storage via CXL**, Lee, Lerner, Bonnet, and Cudre-Mauroux, CIDR 2024.
+  URL:
+  `https://www.vldb.org/cidrdb/2024/database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl.html`
+  Why: CXL storage/database co-design paper cited by the SAP HANA CXL work;
+  useful for comparing simple CXL memory expansion with DBMS-owned storage
+  functions, logging, and cold-tier pushdown.
+- `queued` — **NeoMem: Hardware/Software Co-Design for CXL-Native Memory
+  Tiering**, Zhong et al., arXiv 2024.
+  URL: `https://arxiv.org/abs/2403.18702`
+  Why: CXL-native tiering design; useful for contrasting OS/hardware-managed
+  placement with GPU DB's explicit object-family placement and route telemetry.

@@ -45616,3 +45616,139 @@ publication. Benchmark priority should combine the active-window
 admission simulator with generation certificates: measure when bounded
 batching helps, when it hurts tail latency, and when older retained
 snapshots safely bypass owners.
+
+### 2026-06-04 - CXL memory should be placed by object behavior, not by capacity alone
+
+**Citation:** Minseon Ahn, Thomas Willhalm, Norman May, Donghun Lee,
+Suprasad Mutalik Desai, Daniel Booss, Jungmin Kim, Navneet Singh,
+Daniel Ritter, and Oliver Rebholz. "An Examination of CXL Memory Use
+Cases for In-Memory Database Management Systems using SAP HANA." PVLDB
+17(12), 2024, pp. 3827-3840. doi:10.14778/3685800.3685809. Retrieved
+2026-06-04 from `https://www.vldb.org/pvldb/vol17/p3827-ahn.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** CXL memory; disaggregated memory; tier placement;
+OLTP/OLAP interference; operational heap; temporary tables; fast
+restart; failover; object-level placement; future tiers.
+
+**Core idea:** The paper evaluates real commercial CXL memory devices
+inside SAP HANA and separates two uses: dynamic memory expansion for an
+in-memory DBMS and CXL shared memory for faster failover restart. The
+main result is not "put cold data in CXL." Different database objects
+react very differently to CXL latency and bandwidth, so placement has to
+be based on access pattern, workload class, and restart/failover value.
+
+The reported SAP HANA results are a useful tiering warning for GPU DB:
+OLTP throughput can remain effectively unchanged because it creates
+little CXL traffic and is dominated by transactional interference, while
+OLAP degradation varies widely. Sequential main-table access tolerates
+CXL better because prefetching can hide latency and bandwidth becomes
+the limit; random operational data access is much more latency
+sensitive. For shared-memory failover, keeping table data in CXL memory
+reduces restart work by avoiding reload from storage; the paper reports
+a 40% restart-time reduction for TPC-H SF10 and estimates 84% for SF100.
+
+**Concrete mechanisms:**
+
+- SAP HANA can place different memory categories on CXL: main columnar
+  table data, operational heap memory, and temporary-table memory. The
+  evaluation varies which category is backed by CXL rather than treating
+  CXL as a uniform spill tier.
+- The commercial CXL memory is integrated through OS/NUMA-visible memory
+  placement. The paper compares placement effects under OLTP and OLAP
+  workloads and uses hardware counters to reason about CXL traffic.
+- Main storage is a better first candidate for CXL expansion than
+  operational memory because table scans are often sequential and can
+  benefit from prefetching. Operational structures have more random
+  access and are more exposed to CXL latency.
+- Temporary tables need separate treatment because their allocation and
+  access patterns vary by query shape. Moving all temporary data to a
+  slower tier can punish operators that are latency or bandwidth
+  sensitive during query execution.
+- CXL shared memory is evaluated as a fast-restart/failover substrate.
+  A new host can attach to table data that remains in a CXL device with
+  an independent power domain, perform consistency checks, and avoid
+  reloading that data from storage.
+- The failover prototype uses software-managed coherency for the shared
+  memory scenario. The paper treats fuller CXL coherency support as
+  future work, so the restart mechanism is not a free consistency
+  protocol.
+- The evaluation emphasizes that larger databases should benefit more
+  from avoiding preload during restart, while small scale factors show
+  a smaller absolute gain because less data must be read from storage.
+- The authors call out future requirements around cloud sharing,
+  resource management, and data-structure placement. The work is an
+  empirical placement study rather than a full automatic tiering system.
+
+**GPU DB mapping:** This sharpens the P8 tier model. Future tiers should
+not be a linear stack named GPU, DRAM, CXL, NVMe, and disk with one
+generic "hotness" score. GPU DB should classify object families:
+MVCC/version metadata, resident column buffers, resident key vectors,
+route/cache metadata, operational heaps, temporary join/aggregate
+state, WAL buffers, checkpoint data, and cold compressed segments. Each
+family needs its own placement contract and fallback risk.
+
+For retained snapshots, the CXL lesson is attractive but dangerous.
+Older certified generations, immutable column groups, and compressed
+warm segments may be good CXL candidates because they are read-mostly
+and can be scanned or prefetched. Mutation-owner state, visibility
+summaries, active version chains, route-cache counters, response rings,
+and pinned GPU staging buffers are poor candidates unless benchmarks
+prove the added latency is hidden.
+
+The fast-restart idea maps to GPU DB recovery and warmup. If future CXL
+or persistent shared memory is available, recovered CPU truth and
+resident generation metadata could potentially skip some cold-tier or
+host-memory reload. That cannot replace WAL/checkpoint validation: a
+reattached tier must be treated like rebuildable acceleration state
+until the control metadata, WAL boundary, checksums, catalog generation,
+and invalidation generation prove it matches durable truth.
+
+The paper also suggests a planner/admission feature: tier latency and
+bandwidth should be route inputs by object type. A GPU route that scans
+CXL-backed compressed segments may be fine; a route that performs
+random lookups through CXL-backed operational metadata may need CPU
+DRAM promotion, a smaller GPU-resident index, or rejection with a clear
+tier-pressure reason.
+
+**Risks and mismatches:** SAP HANA is a mature in-memory CPU column
+store, not a GPU-resident engine. Its table, heap, temporary, and
+restart mechanisms do not map directly to CUDA streams, GPU HBM,
+pinned host staging, WAL/MVCC publication, or PostgreSQL protocol
+responses. The paper evaluates CXL memory, not GPU-attached memory or
+GPUDirect storage. It also does not provide a general automatic tiering
+algorithm, and the failover design relies on software-managed coherency
+in the prototype.
+
+The OLTP result should not be overgeneralized. "No negative impact" in
+their setup comes from low CXL traffic and workload behavior; GPU DB
+could easily put the wrong control structure on a slower tier and create
+tail-latency spikes. The restart savings are promising but must not
+weaken WAL-before-visibility or recovery replay checks.
+
+**Benchmark candidates:**
+
+- Add an object-family tier-placement matrix to the P8 benchmark plan:
+  resident column buffers, resident key vectors, MVCC metadata, route
+  metadata, temp operator state, WAL buffers, and cold compressed
+  segments. Proof gate: each family has an allowed tier set and a
+  measured fallback/rejection policy.
+- Build a CXL-emulated latency/bandwidth tier in benchmarks using NUMA,
+  artificial delay, or capped memory bandwidth. Compare sequential
+  resident scans, batched lookups, random visibility checks, temp hash
+  tables, and response-buffer reuse.
+- Test "warm certified generation" placement: keep older immutable
+  snapshots in a slower host tier while newest generations stay in DRAM
+  or GPU memory. Measure owner bypass, p95/p999 read latency, promotion
+  frequency, and invalidation correctness.
+- Add a recovery/warmup experiment that reuses previously materialized
+  host-tier resident metadata only after WAL boundary, catalog
+  generation, invalidation generation, and checksum validation. Failure
+  condition: any stale resident generation is served before validation.
+- Extend route telemetry with tier object class, access pattern
+  estimate, transfer bytes, random versus sequential flag, promotion
+  cost, and restart reuse eligibility.
+- Benchmark temporary operator placement separately from table data.
+  Failure condition: moving temp state to a slower tier improves capacity
+  while worsening p99 latency or causing GPU route fallback spikes.
