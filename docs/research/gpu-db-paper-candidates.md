@@ -1237,7 +1237,7 @@ Append new candidates here as each paper is processed.
   Why: related cooperative-memory baseline for sharing memory between table
   caching and temporary query data; useful for comparing DuckDB's unified
   paged temporary allocations with explicit GPU DB tier budgets.
-- `queued` — **On the Impact of Memory Allocation on High-Performance Query
+- `reviewed` — **On the Impact of Memory Allocation on High-Performance Query
   Processing**, Durner, Leis, and Neumann, DaMoN 2019.
   URL: `https://doi.org/10.1145/3329785.3329918`
   Why: cited by cooperative memory management for allocation overhead in
@@ -1450,6 +1450,20 @@ Append new candidates here as each paper is processed.
   Why: Natto's base protocol; useful for evaluating fixed-set interactive
   transactions that overlap read/prepare, commit, and replication phases,
   which maps to GPU DB route descriptors with predeclared read/write sets.
+
+- `queued` — **Data Partitioning for In-Memory Systems: Myths, Challenges,
+  and Opportunities**, Zhang, Deshmukh, and Patel, CIDR 2019.
+  URL: `https://www.cidrdb.org/cidr2019/papers/p128-zhang-cidr19.pdf`
+  Why: cited by the DaMoN 2019 allocator study around allocation-heavy
+  partitioned hash joins; relevant to partition sizing, NUMA locality, and
+  whether GPU DB should materialize, partition, or stream intermediate state.
+- `queued` — **Analyzing the Impact of System Architecture on the Scalability
+  of OLTP Engines for High-Contention Workloads**, Appuswamy et al.,
+  PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol11/p121-appuswamy.pdf`
+  Why: cited by the allocator study as an OLTP scalability baseline; useful
+  for separating allocator, NUMA, latch, and architecture bottlenecks under
+  high-contention transactional workloads.
 - `reviewed` — **Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit
   Rate**, Cheng et al., OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/cheng`

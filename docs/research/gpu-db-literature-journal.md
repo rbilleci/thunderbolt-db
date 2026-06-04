@@ -37867,3 +37867,172 @@ rejection, or application-level aggregation.
 - Run a low-contention control workload to prove the scheduler's overhead is
   bounded. Minimum gate: when conflict telemetry stays low, the route
   bypasses scheduling or pays only a small fixed admission cost.
+
+### 2026-06-04 - Allocator behavior is part of the query route contract
+
+**Citation:** Dominik Durner, Viktor Leis, and Thomas Neumann. "On the
+Impact of Memory Allocation on High-Performance Query Processing."
+DaMoN 2019. DOI `10.1145/3329785.3329918`. Retrieved 2026-06-04 from
+the author PDF,
+`https://db.in.tum.de/~durner/papers/memory-allocation-impact-damon2019.pdf`,
+and the extended arXiv version, `https://arxiv.org/abs/1905.01135`.
+
+**Category:** Runtime / HFT / session scale; multi-tier cache / data
+placement.
+
+**Relevance tags:** temporary memory; allocator latency; query admission;
+NUMA locality; memory fairness; fragmentation; hash joins; group by;
+tail latency; reusable buffers; scratch pools.
+
+**Core idea:** The paper shows that dynamic memory allocation is not a
+minor implementation detail once query execution is fast and parallel
+enough. Analytical operators such as hash joins, pre-aggregation hash
+tables, and tuple materialization create many short-lived medium-size
+allocations plus occasional large allocations. The allocator then affects
+query throughput, wait time, memory footprint, memory returned to the
+OS, and NUMA placement.
+
+The result that matters for GPU DB is not "use one allocator forever."
+It is that allocation behavior has to be measured as part of route
+admission. A route that allocates HBM scratch, pinned host buffers,
+CPU hash tables, decompression buffers, response arenas, or temporary
+join/aggregate state after it enters the hot queue can quietly turn into
+the latency bottleneck.
+
+**Concrete mechanisms:**
+
+- The study compares glibc `malloc` 2.23, glibc `malloc` 2.28,
+  TBBmalloc, TCMalloc, and jemalloc in a multi-threaded in-memory DBMS.
+- The DBMS already uses transaction-local chunks for small allocations
+  below 32 KiB and grows tuple-materialization chunks, so the remaining
+  allocator pressure comes from medium and large query-processing
+  allocations rather than naive per-object allocation.
+- In TPC-DS SF100, the most frequent allocations are 32 KiB to 512 KiB;
+  larger allocations are used for chaining hash-table bucket arrays.
+- In the reported allocation breakdown, group-by operators account for
+  61.2% of allocated bytes and 77.9% of allocation count; joins account
+  for 25.7% of bytes and 11.7% of count.
+- The workload generator uses exponentially distributed query arrival
+  times and caps active transactions at 10, making allocator-induced
+  slowdowns visible as scheduler wait time and query congestion.
+- On a 4-socket 60-core Xeon server with TPC-DS SF100, the right
+  allocator improves query-set performance by up to 2.7x versus glibc
+  `malloc` 2.23.
+- jemalloc and TBBmalloc show the lowest latency and variance in the
+  4-socket experiments; glibc variants and TCMalloc incur much larger
+  wait times in the tested workload.
+- TCMalloc uses `MADV_FREE` aggressively and can return memory fairly,
+  but the paper reports poor scalability on the 4-socket system and
+  more than 10x worse latency than other allocators in one SF10
+  high-rate experiment.
+- On a single-socket Skylake X, allocator differences largely shrink;
+  the bigger differences appear as core count and NUMA complexity grow.
+- NUMA measurements show the fastest allocators have more local DRAM
+  accesses and fewer remote accesses; the paper treats remote accesses
+  as a major performance indicator.
+- jemalloc uses multiple independent arenas, size classes, low address
+  reuse for large allocations, `MADV_FREE`, and decay-based dirty-page
+  purging, which trades reuse and performance against memory-return
+  behavior.
+- TBBmalloc uses thread-local heaps and global free/abandoned block
+  heaps; huge objects are allocated and freed directly through the OS.
+- The paper scores allocators across scalability, speed, memory fairness,
+  and memory efficiency, and the authors adopt jemalloc as the default
+  allocator for their DBMS.
+
+**GPU DB mapping:** This strengthens the current bounded-ring and
+cooperative-memory direction. Query routes should reserve or acquire
+their scarce memory before entering a latency-sensitive execution lane.
+That includes CUDA scratch buffers, pinned staging buffers, host-side
+temporary hash/aggregate state, decoded/compressed segment buffers,
+response arenas, and refresh workspaces. A queue admission decision
+should know whether the route can run with already-owned buffers,
+must wait for a pool, can spill, should fall back to CPU, or should be
+rejected.
+
+For P8, allocator effects become tier-placement effects. A resident GPU
+route may look cheap in kernel time but lose if every batch allocates
+host temporary state or forces NUMA-remote CPU work before launch.
+Similarly, a CPU fallback route may beat GPU execution if it can reuse
+thread-local/partition-local arenas while the GPU route needs fresh
+pinned allocation or HBM eviction. The planner route envelope should
+therefore include temporary bytes, allocation source, pool hit/miss,
+NUMA home, pinned/HBM reservation wait, and memory-return or eviction
+cost.
+
+For the 1M logical-session target, the paper reinforces that memory
+state must be per active route, owner, worker, partition, or query
+shape, not per logical session. Idle sessions should not own allocator
+arenas or scratch buffers. Active sessions should borrow from bounded
+pools with explicit backpressure, and hot query shapes should reuse
+buffers across batches.
+
+**Risks and mismatches:** The paper studies CPU analytical queries,
+not GPU kernels, SQL protocol responses, WAL, MVCC writes, or retained
+GPU snapshots. It is strongest as a measurement warning, not a complete
+GPU memory-manager design. The benchmark uses a specific in-memory
+engine, mostly TPC-DS, and a maximum of 10 active transactions; its
+absolute allocator ranking may change with Rust allocators, CUDA memory
+pools, pinned memory APIs, NUMA policy, query mix, or modern kernels.
+Also, jemalloc's favorable behavior in this study does not remove the
+need for DB-owned arenas and reusable buffers on hot paths.
+
+**Benchmark candidates:**
+
+- Add allocation telemetry to retained and CPU fallback query routes:
+  allocation count, bytes by size class, allocator or pool source,
+  pool hit/miss, wait time, NUMA node, pinned/HBM requests, and bytes
+  returned or retained after completion.
+- Build a microbenchmark for same-shape retained lookups and aggregates
+  with three modes: allocate per request, reuse per worker, and reserve
+  per micro-batch before enqueue. Proof gate: the hot queue path performs
+  zero dynamic scarce-memory allocations after admission.
+- Measure CPU fallback under NUMA placement: partition-local arena,
+  network-worker-local arena, global allocator, and wrong-node memory.
+  Failure condition: route p95 is dominated by allocator or remote-memory
+  effects rather than query work.
+- Compare pinned host buffer strategies for GPU routes: allocate/free per
+  batch, per-GPU worker pool, per-query-shape pool, and cooperative pool
+  with eviction. Required metrics: p50/p95/p99 latency, allocation wait,
+  H2D/D2H throughput, and retained-route starvation.
+- Add temporary-memory stress to hash join/grouped aggregate benchmarks:
+  controlled 32 KiB to 512 KiB allocation bursts plus large hash-table
+  bucket allocations. Compare allocator choice with DB-owned arenas.
+- Include memory-fairness telemetry in tier tests: resident bytes, dirty
+  or retained host pages, memory released to OS, memory kept for reuse,
+  and impact on unrelated query classes.
+
+### 2026-06-04 - Cross-paper synthesis: admission must price contention, memory, and allocation before work enters hot queues
+
+The last three papers converge on a practical runtime rule. Cooperative
+Memory Management says table cache and temporary query memory should
+share capacity under one policy instead of living behind static
+partitions. Towards Optimal Transaction Scheduling says conflicting
+hot-key writes should be ordered before they create aborts, retries, or
+owner-queue stalls. The DaMoN allocator study says temporary-memory
+allocation itself can become the bottleneck and is amplified by NUMA and
+parallelism.
+
+The design track is pre-admission resource pricing. Before a request
+enters a mutation, retained-read, GPU execution, refresh, or response
+queue, the runtime should classify its route shape and reserve the scarce
+things it needs: conflict lane, visibility generation, resident route,
+HBM scratch, pinned host buffers, CPU temporary arena, response arena,
+and expected tier victims. Admission can then choose immediate execution,
+bounded wait, batch ordering, spill, CPU fallback, or explicit overload.
+
+Category gaps remain around making this policy adaptive without making
+it opaque. The next useful optimizer/runtime papers should help rank
+routes under concurrent cache pressure, estimate interference among
+queries, or validate SLO-aware rejection and scheduling policies.
+
+**Benchmark priorities:**
+
+- Add a route-admission simulator that combines hot-key conflict queues,
+  cooperative tier budgets, and allocator/pool waits.
+- Require every accelerated route envelope to declare temporary memory,
+  conflict class, reusable-buffer class, fallback route, and overload
+  behavior.
+- Measure p95/p99 queue wait separately from execution time so allocator
+  stalls, memory eviction, conflict scheduling, and GPU kernel time are
+  not collapsed into one latency number.
