@@ -43094,3 +43094,222 @@ condition is that route choice, fallback, and stale-snapshot rejection are
 explainable from recorded certificate fields. The failure condition is any
 planner or scheduler decision that depends on implicit session state,
 unbounded profiling, or stale statistics.
+
+### 2026-06-04 - LeanStore 2024 treats NVMe as a first-class transactional tier
+
+**Citation:** Viktor Leis. "LeanStore: A High-Performance Storage Engine for
+NVMe SSDs." PVLDB 17(12):4536-4545, 2024.
+doi:10.14778/3685800.3685915. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol17/p4536-leis.pdf`.
+
+**Category:** Multi-tier cache / data placement / transactional storage.
+
+**Relevance tags:** NVMe tiering; explicit buffer management; vmcache;
+write-aware replacement; page-size selection; async IO; OLTP storage; MVCC;
+graveyard index; decentralized logging; continuous checkpointing; recovery
+bounds; cold-tier ownership.
+
+**Core idea:** LeanStore argues that modern NVMe SSDs are neither slow disks
+nor a poor substitute for DRAM. A storage engine can keep traditional
+transactional strengths - buffer management, B-trees, physiological logging,
+fuzzy checkpoints, large transactions, and MVCC - while approaching
+in-memory-system performance if every component is engineered for multicore
+CPUs and highly parallel flash.
+
+For GPU DB, the transferable idea is that the CPU/NVMe side cannot be a
+passive overflow path. If resident GPU snapshots cover only the hot route
+families, the backing CPU/NVMe storage tier still needs explicit ownership,
+bounded IO queues, replacement policy, recovery limits, and visibility-aware
+version handling. Otherwise GPU fallback and refresh work will inherit hidden
+OS and storage bottlenecks.
+
+**Concrete mechanisms:**
+
+- LeanStore's newer direction replaces invasive pointer swizzling with
+  virtual-memory-assisted buffer management (`vmcache`). Cached pages are
+  mapped at virtual addresses corresponding to storage offsets, while the DBMS
+  keeps control of misses and evictions using anonymous virtual memory,
+  explicit `pread`, and explicit `madvise(..., MADV_DONTNEED)`.
+- The paper emphasizes that this differs from ordinary file-backed `mmap`:
+  the DBMS, not the OS, chooses eviction and replacement. The tradeoff is that
+  current OS virtual-memory operations can become too slow for modern SSDs, so
+  faster VM primitives, kernel modules, or DB/OS co-design may be needed.
+- Page replacement uses WATT, a write-aware timestamp-tracking policy. It
+  keeps a small bounded history of read and write timestamps per page, computes
+  page value from recent access subfrequencies, samples candidate pages, and
+  evicts low-value candidates.
+- WATT tracks reads and writes separately and combines their values with a
+  weighted sum so the policy can reflect asymmetric flash read/write costs.
+  The paper reports practical optimizations such as infrequent global timestamp
+  increments, prefetching during sampling, and SIMD page-value calculation.
+- LeanStore's IO path is designed around the tight CPU budget created by fast
+  NVMe. The paper gives an example budget of roughly `15,000` CPU cycles per
+  IO on a 100-core server with 8 SSDs at 2.5M IOPS each, covering index lookup,
+  concurrency control, task management, replacement, and the IO operation.
+- The IO stack avoids unnecessary global locks, dynamic allocation on hot IO
+  paths, OS page cache, file-system overhead, software RAID, and sometimes the
+  Linux block layer by using user-space NVMe stacks such as SPDK.
+- Rather than configure separate background thread pools for eviction, dirty
+  writeback, IO polling, and transaction work, the newer design uses one worker
+  per hardware thread and lightweight task switching at natural wait points
+  such as page misses.
+- LeanStore moved from 16 KB to 4 KB pages because 4 KB IO has lower latency
+  and less random-workload IO amplification, despite the extra pressure it
+  creates on the storage engine.
+- For flash, the paper argues that sequential IO and segment-maintenance
+  benefits are much smaller than on disks because placement is mostly inside
+  the SSD, so flash-optimized engines can avoid some disk-era locality
+  complexity.
+- LeanStore keeps B-trees for buffer-managed transactional data, adds
+  contention split to spread hot keys across separate nodes/locks, and uses
+  XMerge during page pressure to merge neighboring underfull nodes and free
+  pages.
+- Low-level synchronization uses optimistic lock coupling over versioned locks
+  rather than lock-free B-tree structures. The paper argues this keeps scalable
+  reads while avoiding mapping-table and delta-record complexity.
+- Memory reclamation is simplified in the buffer-managed setting: if memory is
+  never returned to the OS and version counters monotonically increase, the
+  system can avoid a separate epoch-reclamation mechanism for some internal
+  data structures.
+- MVCC uses OSIC, Ordered Snapshot Instant Commit. Each worker maintains a
+  fixed-size commit log, visibility checks use worker identifiers plus cached
+  commit-log entries, and a transitive commit invariant makes snapshot
+  creation and visibility checks scalable without revisiting a large write set
+  at commit.
+- LeanStore uses first-writer-wins snapshot isolation, newest-to-oldest version
+  chains, and delta entries for updates rather than full tuple copies.
+- To protect OLTP under long read snapshots, LeanStore moves logically deleted
+  versions out of the main index into a separate graveyard index, allowing old
+  snapshots to find them without making hot OLTP index probes traverse garbage.
+- Version storage is adaptive: a default off-row Delta Index supports cheap
+  bulk GC with high watermarks and range deletes, while frequently updated
+  tuples can use in-row FatTuple storage to reduce random IO risk. GC also runs
+  during eviction for FatTuple pages.
+- Logging is physiological but decentralized. Per-thread logs use distributed
+  clocks/global sequence numbers so transactions touching disjoint page sets
+  can remain unordered and avoid needless synchronization.
+- Commit acknowledgment cannot merely flush one local log if the transaction
+  depends on lower-GSN records in other logs. LeanStore discusses group commit,
+  page-level remote flush avoidance, and its current transaction-level tracking
+  integrated with MVCC and early lock release.
+- Continuous checkpointing bounds recovery volume by checkpointing a fraction
+  of the buffer pool as log volume accumulates. Recovery keeps ARIES-like
+  analysis, redo, and undo phases, but parallelizes them.
+- The paper reports that useful work dominates LeanStore's in-memory TPC-C
+  Neworder instruction breakdown compared with Shore's internal overhead, and
+  that LeanStore scales better across CPU cores and can reach similar gains in
+  out-of-memory workloads. The exact cross-workload performance numbers depend
+  on cited component papers and are not fully repeated in this overview.
+- Future work explicitly includes lower-latency commit processing, request
+  frontend scheduling, SSD write optimization, ZNS/FDP interfaces, and DB/OS
+  co-design.
+
+**GPU DB mapping:** P8 currently treats GPU resident state as a performance
+cache over CPU/WAL truth. LeanStore 2024 says the CPU/NVMe truth path still
+needs first-class performance design. GPU DB should keep the WAL and CPU state
+as correctness authority, but the cold and warm tiers should be explicit
+storage-engine objects with observable page/segment residency, dirty state,
+queue depth, and recovery cost, not incidental files behind the OS page cache.
+
+`vmcache` maps well to the host-memory tier question. For GPU DB, the equivalent
+would be a DB-owned address/handle space for CPU pages, compressed host
+segments, GPU resident buffers, and NVMe offsets. GPU-resident snapshots should
+not require pointer-swizzling-like invasive knowledge of every reference before
+eviction. A handle table or virtual-address-like indirection that the DBMS
+controls may keep route metadata simple while still making hot-page access
+cheap.
+
+WATT maps to tier admission and demotion. GPU DB should track read and write
+temperature separately for tables, resident column groups, indexes, and host
+pages. A page or segment with frequent reads but expensive dirty writeback
+should not be scored the same as a clean scan-only page. The write-aware score
+also suggests a direct benchmark knob: demotion cost should include WAL state,
+refresh cost, and whether eviction creates later GPU rebuild pressure.
+
+LeanStore's IO lesson is directly relevant to over-resident execution. If an
+NVMe miss has a CPU budget in the tens of thousands of cycles, GPU DB cannot
+route a retained read through a slow fallback stack that allocates request
+state, blocks a mutation owner, or hides IO behind a generic file abstraction.
+Cold-tier fetches and refreshes need bounded rings, preallocated IO descriptors,
+queue-depth telemetry, and a measured page or segment size.
+
+The MVCC/graveyard-index lesson is important for retained snapshots. GPU DB
+must not let old read snapshots poison hot lookup structures. Deleted or old
+versions needed only by long readers should move to a separate visibility path
+or retained-snapshot side structure, while hot current-version CPU/GPU indexes
+remain compact. This is especially relevant if GPU resident equality indexes
+mirror current visible keys but older versions still need CPU fallback or
+snapshot repair.
+
+Decentralized logging and continuous checkpointing map to the write path and
+recovery target. GPU DB should preserve WAL-before-visibility, but it can
+measure whether partition-owned or page/segment-owned log order can avoid a
+single hot global publication point. Recovery should have a declared bound not
+only for CPU table reconstruction but also for resident-cache invalidation,
+warmup, and route readiness after restart.
+
+For 1M logical sessions, LeanStore's future-work note on frontend scheduling
+reinforces the runtime target: storage and network queues cannot be tuned
+separately. Session admission should know whether a request will hit GPU HBM,
+host DRAM, an NVMe page miss, a checkpoint writeback, or a recovery/warmup
+barrier.
+
+**Risks and mismatches:** LeanStore is an embeddable C++ key/value and
+transactional storage engine, not a SQL engine and not a GPU database. Its
+opaque byte-array API, B-tree focus, and page-based layout do not directly
+answer columnar GPU layout, text encoding, GPU kernel launch, copy-engine
+overlap, or vectorized SQL planning questions.
+
+`vmcache` depends on virtual-memory primitives whose current OS cost can be too
+high for the fastest SSDs. GPU DB should treat the idea as an indirection and
+ownership pattern, not assume ordinary `mmap`, page faults, or `madvise` will
+be fast enough for GPU refresh or cold-tier execution.
+
+LeanStore's 4 KB-page choice is optimized for random transactional NVMe IO. GPU
+resident columns and compressed segments may prefer larger transfer and kernel
+granularities. The first GPU DB tiering design should measure both page-sized
+point misses and larger segment refreshes rather than copy LeanStore's page size
+blindly.
+
+The MVCC design is complex: graveyard index, Delta Index, FatTuple, multiple GC
+paths, and OSIC visibility logic. GPU DB should not import this whole stack
+until a benchmark proves long-snapshot or garbage-index pressure is a real
+bottleneck. The simpler starting point is to measure whether old/deleted
+versions are polluting hot resident indexes or CPU fallback paths.
+
+Finally, the overview summarizes many component papers but does not reproduce
+all implementation details or performance curves. Some claims, especially
+exact out-of-memory throughput and component-specific overheads, require the
+cited papers for deeper validation.
+
+**Benchmark candidates:**
+
+- Add a cold-tier route benchmark with explicit NVMe queue depth, request
+  allocation count, page or segment size, IO API, p50/p95 latency, and CPU
+  cycles per miss. Proof gate: fallback and refresh routes expose their IO
+  budget instead of appearing as opaque CPU time.
+- Compare 4 KB page fetches, medium compressed host segments, and larger GPU
+  refresh segments for point lookup, prefix filter, and aggregate routes.
+  Expected result: point misses prefer small units, while GPU refresh prefers
+  larger coalesced units. Failure condition: one fixed unit is chosen without
+  explaining latency versus bandwidth tradeoffs.
+- Implement a write-aware residency score for host/GPU segments: separate read
+  temperature, dirty writeback cost, refresh cost, and rebuild cost. Compare it
+  with LRU-like eviction under mixed retained reads and inserts/updates.
+- Build a long-snapshot pollution test. Hold an old read snapshot while hot
+  keys are updated/deleted, then measure current-version lookup latency,
+  resident index size, stale-version fallback count, and GC work. Test a
+  separate "graveyard" side structure against keeping old versions in the hot
+  index.
+- Add continuous-checkpoint and warmup telemetry: configured recovery bound,
+  bytes checkpointed per interval, replay bytes, resident-cache invalidation
+  time, and route-ready time after restart. Pass condition: recovery and GPU
+  warmup have explicit bounds and fallback states.
+- Test storage-task ownership with one worker per hardware thread versus
+  dedicated eviction/writeback/polling workers for CPU/NVMe fallback. Measure
+  queue wait, IO completion latency, mutation-owner interference, and retained
+  read p95.
+- Add a route-certificate field for tier source: GPU resident, host resident,
+  host compressed, NVMe page, NVMe segment, or CPU tuple/index fallback. A route
+  decision should record why the chosen tier satisfies freshness, latency, and
+  memory budget.

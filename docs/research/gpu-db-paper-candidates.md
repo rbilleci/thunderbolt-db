@@ -114,6 +114,14 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   Why: low-overhead storage manager that keeps in-memory performance for hot
   data while transparently handling SSD-resident data; directly relevant to
   GPU/DRAM/NVMe tiering and transactional working sets.
+- `reviewed` — **LeanStore: A High-Performance Storage Engine for NVMe SSDs**,
+  Leis, PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p4536-leis.pdf`
+  DOI: `https://doi.org/10.14778/3685800.3685915`
+  Why: modern synthesis of LeanStore's NVMe-optimized OLTP storage engine,
+  including virtual-memory-assisted caching, write-aware replacement, IO
+  scheduling, MVCC, logging, checkpointing, and recovery; directly relevant to
+  GPU DB's CPU/NVMe cold-tier and recovery design.
 - `reviewed` — **Umbra: A Disk-Based System with In-Memory Performance**,
   Neumann and Freitag, CIDR 2020.
   URL: `https://www.vldb.org/cidrdb/papers/2020/p29-neumann-cidr20.pdf`
@@ -623,6 +631,20 @@ Append new candidates here as each paper is processed.
   Why: command-log recovery with static and dynamic dependency analysis;
   useful for GPU DB WAL replay, checkpoint rebuild, and post-crash CPU/GPU
   cache warmup design.
+- `queued` — **What Modern NVMe Storage Can Do, And How To Exploit It:
+  High-Performance I/O for High-Performance Storage Engines**, Haas and Leis,
+  PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`
+  Why: LeanStore 2024 cites it as the direct NVMe IO-path study; useful for
+  quantifying cold-tier queue depth, page size, SPDK/io_uring tradeoffs, and
+  CPU-cycle budgets before GPU DB adopts explicit NVMe placement.
+- `queued` — **Towards Buffer Management with Tiered Main Memory**, Hao et al.,
+  PACMMOD 2024.
+  URL: `https://doi.org/10.1145/3639307`
+  DBLP: `https://dblp.org/rec/journals/pacmmod/HaoZYS24`
+  Why: modern tiered-memory buffer management follow-up from LeanStore's
+  related work; useful for extending GPU DB placement beyond DRAM/NVMe toward
+  CXL, remote memory, or future intermediate tiers.
 - `reviewed` — **RUMA has it: Rewired User-space Memory Access is Possible!**,
   Schuhknecht et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p768-schuhknecht.pdf`
