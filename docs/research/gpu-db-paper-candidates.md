@@ -1224,12 +1224,30 @@ Append new candidates here as each paper is processed.
   Isolation model that orders a prefix of history; useful for comparing
   low-wait distributed snapshot freshness against GPU DB's snapshot generation
   and route-validity rules.
-- `queued` — **On Reading Fresher Snapshots in Parallel Snapshot Isolation**,
+- `reviewed` — **On Reading Fresher Snapshots in Parallel Snapshot Isolation**,
   Javidi Kishi and Palmieri, ICDCS 2020.
   URL: `https://doi.org/10.1109/ICDCS47774.2020.00127`
+  PDF: `https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-ICDCS-2020.pdf`
   Why: cited by TOPSI as a PSI freshness direction; useful for comparing
   snapshot freshness and abort-rate tradeoffs against scalar-prefix visibility
   certificates.
+- `queued` — **FW-KV: Improving Read Guarantees in PSI**, Javidi Kishi and
+  Palmieri, Middleware 2021.
+  URL: `https://doi.org/10.1145/3464298.3493400`
+  PDF: `https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-MIDDLEWARE-2021.pdf`
+  Why: full FPSI successor that evaluates fresher PSI snapshots on YCSB and
+  TPC-C; useful for checking whether version-access metadata remains practical
+  under OLTP contention and read-mostly workloads.
+- `queued` — **SSS: Scalable Key-Value Store with External Consistent and
+  Abort-free Read-only Transactions**, Javidi Kishi, Peluso, Korth, and
+  Palmieri, ICDCS 2019.
+  URL: `https://doi.org/10.1109/ICDCS.2019.00065`
+  PDF: `https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-icdcs2019.pdf`
+  arXiv: `https://arxiv.org/abs/1901.03772`
+  Why: related vector-clock and snapshot-queuing design for abort-free,
+  externally consistent read-only transactions without centralized
+  synchronization; useful for comparing PSI freshness against stronger
+  client-visible ordering.
 - `reviewed` — **Amazon Aurora: Design Considerations for High Throughput
   Cloud-Native Relational Databases**, Verbitski et al., SIGMOD 2017.
   URL: `https://doi.org/10.1145/3035918.3056101`

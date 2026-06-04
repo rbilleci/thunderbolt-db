@@ -47428,3 +47428,168 @@ pressure rather than another pure GPU-OLAP scan paper.
 - Admission-control bench: combine mutation-owner queue depth,
   refresh debt, decode-lane saturation, and GPU-stream saturation into
   explicit reject/fallback decisions.
+
+### 2026-06-04 - FPSI makes freshness a first-contact snapshot policy
+
+**Citation:** Masoomeh Javidi Kishi and Roberto Palmieri. "On Reading
+Fresher Snapshots in Parallel Snapshot Isolation." ICDCS 2020,
+pp. 1205-1206. doi:10.1109/ICDCS47774.2020.00127. Retrieved
+2026-06-04 from the Lehigh author PDF,
+`https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-ICDCS-2020.pdf`.
+
+**Category:** MVCC / snapshot / visibility; distributed transaction
+freshness.
+
+**Relevance tags:** Parallel Snapshot Isolation; MVCC freshness;
+vector clocks; read-only transactions; visible reads; anti-dependency
+tracking; snapshot routing; abort-rate reduction; route certificates.
+
+**Core idea:** This short ICDCS poster paper introduces Fresher
+Parallel Snapshot Isolation (FPSI), a PSI concurrency-control variant
+that tries to prevent distributed transactions from reading arbitrarily
+old object versions when nodes do not share a synchronized clock.
+Walter-style PSI assigns objects to preferred nodes and can guarantee
+fresh reads at those preferred nodes, but reads through non-preferred
+nodes may lag until asynchronous clock-update messages arrive. That
+staleness can hurt both read-only transactions, which may observe old
+values, and update transactions, which may repeatedly abort because
+their read snapshot is too stale.
+
+FPSI changes the snapshot rule from "fix an old-enough snapshot at
+transaction start" to "advance the snapshot at first contact when doing
+so is still PSI-safe." For read-only transactions, the system attempts
+to include the latest version of an object at the first node contacted.
+For update transactions, the first read can also see the latest
+version, but later reads may need a safer snapshot derived from the
+first read's node clock to avoid inconsistency. The paper's
+transferable idea is not a complete GPU DB protocol; it is the
+separation between freshness policy and safety metadata. A snapshot can
+be advanced only when the route has enough dependency facts to certify
+that the read remains legal.
+
+**Concrete mechanisms:**
+
+- FPSI builds on Walter's vector-clock PSI design rather than assuming
+  synchronized physical clocks across nodes.
+- Walter's stale-read problem comes from allowing node clocks to be
+  updated without propagating causal dependencies with concurrent
+  transactions, because ordinary Walter transactions do not read from
+  concurrent transactions.
+- FPSI enriches each committed version with a version-access-set that
+  records identifiers of read-only transactions that read that version.
+- During commit of an update transaction, FPSI collects concurrent
+  conflicting read-only transaction identifiers and propagates them to
+  the version-access-sets of the newly created versions.
+- A read-only transaction does not fully define its reading snapshot at
+  start. On each first contact with a node, it attempts to advance its
+  snapshot to include newer versions that still preserve PSI.
+- When choosing a version for a read-only transaction, FPSI excludes
+  versions whose version-access-set contains that transaction's
+  identifier, because that indicates an already established
+  anti-dependency with the transaction that created the version.
+- Among the remaining eligible versions, the read-only transaction
+  returns the newest version.
+- Update transactions also try to read a fresh version on first access,
+  but FPSI avoids version-access-set tracking for them because aborted
+  update transactions would require extra cleanup.
+- After an update transaction's first read, FPSI uses the logical clock
+  associated with that first-read node to decide whether later reads can
+  safely access latest versions or must use an older consistent
+  snapshot.
+- The paper states that improving update-transaction read snapshots can
+  reduce repeated validation failures caused by stale snapshots.
+- The source is a two-page poster paper. It describes mechanisms but
+  does not provide a full algorithm listing, proof details, or
+  performance evaluation; the later FW-KV paper is the natural
+  follow-up for evaluation.
+
+**GPU DB mapping:** FPSI is most useful as a warning against treating a
+retained snapshot generation as a single global scalar when the engine
+eventually has multiple owner domains, resident partitions, GPU
+workers, and perhaps remote durability or tier owners. A read route
+that first touches a partition or resident segment may be able to
+advance to the freshest certified generation for that owner, but only
+if the route certificate includes enough dependency information to
+avoid mixing incompatible versions from different owners.
+
+For the current P8/runtime design, the version-access-set maps to a
+bounded "reader dependency stamp" rather than a literal per-transaction
+set in the hot path. A resident segment, deleted-key side structure,
+or old-version bundle could carry compact facts about which retained
+read classes or snapshot handles have already observed it. The runtime
+would use those facts when deciding whether a same-shape retained read
+can jump to a newer segment generation on first contact or must remain
+on its original snapshot boundary.
+
+The read-only/update split also maps to route classes. Read-only
+retained queries can tolerate freshness advancement if the returned
+snapshot remains internally consistent and route-valid. Update
+transactions need stricter handling because they may abort, validate,
+and publish writes. GPU DB should avoid recording cleanup-heavy
+per-update dependency sets unless a benchmark proves the abort
+reduction is worth it. For writes, a first-read owner clock or
+partition generation may be a cheaper certificate than tracking every
+visible-read dependency.
+
+This paper strengthens the recent route-certificate track. A route
+certificate should say not only "this generation is visible," but also
+whether freshness was fixed at transaction start, advanced at first
+contact, or restricted by prior anti-dependencies. That distinction
+matters for 1M logical sessions: most idle or read-only sessions should
+not force old snapshots to remain globally pinned if they have not yet
+contacted the relevant owner or segment.
+
+**Risks and mismatches:** FPSI targets distributed in-memory
+key-value PSI, not SQL serializability, PostgreSQL-visible MVCC, GPU
+execution, WAL recovery, or multi-tier storage. It intentionally
+improves PSI freshness, which remains weaker than serializable
+isolation. The paper is a poster summary, so important details such as
+version-access-set representation, garbage collection, memory overhead,
+and full validation rules are not visible here.
+
+Literal version-access-sets could be too expensive for GPU DB if they
+grow with retained sessions or high read fanout. A 1M-session design
+cannot attach unbounded reader identifiers to hot versions. The
+transferable mechanism is therefore the dependency gate, not the
+specific set representation. GPU DB would need compressed epochs,
+reader classes, owner-local generation intervals, or Bloom-like
+summaries with correctness-preserving fallback.
+
+There is also a freshness-versus-reuse tension. Advancing retained
+reads at first contact may reduce staleness, but it can fragment
+micro-batches by giving otherwise compatible sessions different
+snapshot generations. The runtime should benchmark whether fresher
+first-contact snapshots improve user-visible latency and aborts enough
+to justify smaller GPU batches or extra route-certification work.
+
+**Benchmark candidates:**
+
+- Add a snapshot freshness simulator with multiple partition owners:
+  compare fixed-at-start snapshots, scalar global generation,
+  owner-local first-contact advancement, and strict newest-only reads.
+  Measure stale-read distance, abort/fallback count, batch
+  compatibility, and p50/p99 route latency.
+- Prototype a route-certificate field for snapshot policy:
+  `start_fixed`, `first_contact_advanced`, `owner_safe_clock`, or
+  `dependency_restricted`. Proof gate: mixed-owner reads never combine
+  versions that violate the selected visibility model.
+- Stress 1M logical-session behavior with many sessions that begin a
+  read transaction but contact only a subset of partitions. Expected
+  result: untouched owners are not pinned by those sessions until a
+  route actually contacts them.
+- Test a compact dependency summary for retained read advancement:
+  owner generation interval, reader class, or epoch bitmap versus
+  per-session identifiers. Failure condition: metadata grows with
+  logical session count or forces hot-version allocation on every read.
+- Add a write transaction benchmark where stale first reads cause
+  validation failures under partition-local visibility lag. Compare
+  old snapshot, first-contact owner clock, and optimistic latest-read
+  variants. Reject any variant that weakens WAL-before-visibility or
+  replays to a different visible outcome.
+- Measure GPU micro-batch fragmentation from fresher first-contact
+  snapshots. Compatible lookup requests should still group by
+  relation, partition, shape, and certified generation; if freshness
+  advancement splits batches too far, use bounded freshness windows.
+- Extend retained snapshot telemetry with "snapshot age at first
+  owner contact" and "age at result publication" so stale reads can be
+  measured instead of inferred from transaction start time alone.
