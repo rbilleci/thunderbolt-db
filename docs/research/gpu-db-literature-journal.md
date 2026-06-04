@@ -42600,3 +42600,136 @@ pending arrays plus WAL durability credits. The pass condition is bounded
 memory and correct visibility ordering under hot-key skew; the failure
 condition is any path where API completion, local staging, durable replay, or
 GPU freshness is reported as the wrong frontier.
+
+### 2026-06-04 - PRICE separates portable cardinality priors from database-specific tuning
+
+**Citation:** Tianjing Zeng, Junwei Lan, Jiahong Ma, Wenqing Wei, Rong Zhu,
+Pengfei Li, Bolin Ding, Defu Lian, Zhewei Wei, and Jingren Zhou. "PRICE: A
+Pretrained Model for Cross-Database Cardinality Estimation." arXiv 2024.
+Retrieved 2026-06-04 from `https://arxiv.org/abs/2406.01027` and
+`https://arxiv.org/pdf/2406.01027`.
+
+**Category:** query optimization / planning; route-cost estimation.
+
+**Relevance tags:** cardinality estimation; pretrained optimizer component;
+cross-database transfer; histograms; join scaling factors; self-attention;
+fine-tuning; route certificates; CPU/GPU route choice.
+
+**Core idea:** PRICE tries to make learned cardinality estimation deployable
+like traditional statistics. Instead of training a separate model from scratch
+for every database, it uses transferable low-level features: per-attribute
+value distributions, join scaling-factor distributions, predicate features,
+table-level auxiliary estimates, and coarse query-level estimates. A
+self-attention model learns how to combine those features into a multi-table
+cardinality estimate across databases.
+
+The strongest transferable idea for GPU DB is the separation between a portable
+prior and local calibration. GPU route choice should not start with a bespoke
+learned model for each table or GPU. It can begin with cheap, typed statistics
+that every route already needs, then add a small learned or calibrated residual
+only where live measurements prove value.
+
+**Concrete mechanisms:**
+
+- PRICE represents continuous attributes with normalized histogram vectors and
+  categorical attributes with SpaceSaving summaries.
+- It represents each join condition with a histogram of scaling factors:
+  how many tuples on one side match each tuple or value on the other side.
+- Predicate features include bounds or categorical-bin ids plus single-attribute
+  selectivity.
+- Auxiliary table/query features include table sizes, simple single-table
+  selectivity estimates, number of joins/tables, and PostgreSQL's traditional
+  cardinality estimate.
+- The model has an embedding stage, a joining stage, and a filtering stage.
+  The joining stage uses multi-head self-attention over join-attribute tokens
+  to summarize inter-table scaling and correlation. The filtering stage uses
+  another attention block over join, predicate, table, and special summary
+  tokens, then an MLP predicts log cardinality.
+- The authors pretrain on 26 of 30 collected datasets, holding out IMDB, STATS,
+  ErgastF1, and VisualGenome for testing. They generate `5e4` training queries
+  per dataset and use true cardinalities from execution.
+- Reported pretraining uses `1.3e6` SQL queries, about five hours on an
+  eight-A100 server, and produces an approximately `40MB` model. The deployed
+  model is shared across databases.
+- In PostgreSQL 13.1 experiments via PilotScope, pretrained PRICE generally
+  improves end-to-end plan quality over PostgreSQL histograms and several
+  learned baselines on unseen datasets. On STATS, the paper reports PRICE's
+  end-to-end time as `1.67x` faster than PostgreSQL's histogram estimator.
+- Fine-tuning with database-specific queries can push plan performance close
+  to the "optimal cardinality" baseline in their setup; the paper reports less
+  than `0.4%` relative deviation from optimal end-to-end time after fine-tuning
+  with `5e4` queries.
+- The paper also evaluates data updates, data scaling, and query workload
+  drift, arguing that the pretrained model is more stable than methods that
+  bind tightly to one database and one workload.
+
+**GPU DB mapping:** PRICE reinforces that GPU DB should keep cardinality,
+residual runtime, and route ranking as separate planner signals. A GPU route
+certificate can carry histogram or sketch ids, join scaling summaries, expected
+rows, queue-depth class, resident bytes, transfer bytes, and fallback risk.
+Those are useful even without ML, and they are exactly the features a
+calibration layer can consume later.
+
+For retained GPU snapshots, the cheap transferable feature layer should be
+segment-scoped. Each resident or warm segment can publish value histograms,
+dirty-generation state, join-key scaling summaries where available, and route
+support flags. A CPU/GPU planner can first produce a deterministic route
+estimate, then optionally apply a PRICE-like residual model trained on observed
+GPU scan, lookup, join, and transfer timings.
+
+The join scaling-factor idea is especially relevant to GPU joins and predicate
+transfer. A selectivity estimate that knows only per-column histograms can
+choose a resident GPU route that explodes after a join. A route-aware planner
+should track per-generation join fanout summaries for admitted hot relations,
+then price GPU build/probe memory, output cardinality, and result scattering
+before assigning work to a GPU execution owner.
+
+For 1M logical sessions, PRICE is a warning against per-session learned state.
+The learned component should sit at the route-template or table-generation
+level, with bounded feature extraction and cacheable predictions. Session
+admission should read a small route certificate rather than asking a large
+model to optimize every request independently.
+
+**Risks and mismatches:** PRICE estimates cardinality, not GPU latency. The
+paper evaluates PostgreSQL plan choices, not CPU/GPU split execution, GPU queue
+pressure, resident snapshot validity, refresh cost, or transfer overlap. Its
+query model focuses on select-project-join queries with equality joins and
+comparison predicates; non-equi joins, outer joins, `LIKE`, strings beyond
+simple categorical summaries, UDFs, and MVCC visibility predicates are listed
+as future work or outside the main focus.
+
+The reported pretraining environment uses eight A100 GPUs. That is acceptable
+for an offline research model, but not a requirement GPU DB should add to its
+planner path. Feature collection also depends on true-cardinality workloads
+for pretraining and fine-tuning; GPU DB must define a bounded measurement
+budget so calibration cannot become a hidden production workload.
+
+Finally, high cardinality accuracy is not the same as correct route choice.
+For GPU DB, a slightly worse row estimate may still be safe if the route
+certificate includes memory pressure, visibility generation, transfer bytes,
+and fallback gates. Conversely, a good cardinality estimate can still pick a
+bad GPU route if it ignores queue delay or refresh invalidation.
+
+**Benchmark candidates:**
+
+- Add a planner-metadata benchmark that records, for each retained route,
+  per-column histogram id, optional join-scaling summary id, estimated rows,
+  actual rows, resident bytes, transfer bytes, queue wait, and chosen CPU/GPU
+  route. Proof gate: every route decision is explainable without ML.
+- Build a PRICE-inspired residual estimator for a tiny query family only:
+  equality lookup, range scan, and one join over resident segments. Compare
+  deterministic cost rules, cardinality-only residuals, latency residuals, and
+  route-ranking residuals. Failure condition: learned routing violates any
+  explicit memory, visibility, or queue backpressure gate.
+- Measure whether join fanout summaries change GPU route choices. Use TPC-H or
+  JOB-style joins with skewed foreign-key distributions and compare column
+  histograms alone against histogram plus scaling-factor summaries.
+- Add a drift test where data is appended and hot segments are refreshed while
+  old snapshots remain retained. Proof gate: estimates are tied to the correct
+  snapshot generation, and stale statistics cannot certify a resident route.
+- Test feature-extraction overhead at high session counts. Expected result:
+  route-template caching should amortize model inputs; failure condition:
+  per-request feature building adds measurable p95 latency or unbounded memory.
+- Keep calibration optional and bounded. A pass condition for any learned
+  estimator is that disabling it falls back to deterministic rules with the
+  same correctness envelope and only a performance change.

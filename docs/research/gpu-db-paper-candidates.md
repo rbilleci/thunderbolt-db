@@ -2231,12 +2231,20 @@ Append new candidates here as each paper is processed.
   Why: hierarchical production query-time prediction with cache, local model,
   global model, and uncertainty; useful for routing GPU/CPU work, admission,
   and resource control without relying on one monolithic learned estimator.
-- `queued` — **PRICE: A Pretrained Model for Cross-Database Cardinality
+- `reviewed` — **PRICE: A Pretrained Model for Cross-Database Cardinality
   Estimation**, Zeng et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2406.01027`
   Why: cross-database cardinality estimation is the counterpart to DACE's
   residual-cost path; useful for deciding whether GPU route choice should keep
   cardinality and residual-latency learning as separate planner signals.
+- `queued` — **Learned Cardinality Estimation: A Design Space Exploration
+  and A Comparative Evaluation**, Sun et al., PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol15/p752-sun.pdf`
+  DOI: `https://doi.org/10.14778/3503585.3503586`
+  Why: PRICE compares against the learned-cardinality-estimation design space;
+  useful for stress-testing whether a GPU DB planner should learn
+  cardinality, residual latency, or route ranking, and for choosing benchmark
+  metrics beyond raw q-error.
 - `reviewed` — **Your Read is Our Priority in Flash Storage**, An et al.,
   PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1911-lee.pdf`
