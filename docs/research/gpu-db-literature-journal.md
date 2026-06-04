@@ -31209,3 +31209,154 @@ visibility even if coalescing would reduce churn; split aggregates must
 fall back when merge or transfer budgets exceed the latency target. The
 first proof gate is stable correctness under adversarial route hints, not
 peak aggregate throughput.
+
+### 2026-06-04 - CacheLib makes cache policy a typed storage contract
+
+**Citation:** Benjamin Berg, Daniel S. Berger, Sara McAllister, Isaac
+Grosof, Sathya Gunasekar, Jimmy Lu, Michael Uhlar, Jim Carrig, Nathan
+Beckmann, Mor Harchol-Balter, and Gregory R. Ganger. "The CacheLib
+Caching Engine: Design and Experiences at Scale." OSDI 2020. Retrieved
+2026-06-04 from the USENIX publication page and PDF,
+`https://www.usenix.org/conference/osdi20/presentation/berg`.
+
+**Category:** multi-tier cache / data placement, with runtime and storage
+policy mechanics.
+
+**Relevance tags:** hybrid DRAM/flash caching; resident-cache policy;
+slab allocation; cache pools; zero-copy handles; reference-counted
+objects; warm restart; admission control; write amplification; flash
+indexing; dynamic memory pressure; workload-class isolation.
+
+**Core idea:** CacheLib is Facebook's production caching engine for many
+formerly separate cache systems. Its strongest transferable idea is that a
+cache is not just an eviction policy; it is a typed object lifecycle with
+handles, pools, allocation classes, admission rules, tier transitions,
+restart behavior, and resource budgets. The paper argues that a shared
+cache substrate can still serve specialized workloads if the substrate
+exposes the right contracts and lets each workload tune policy without
+rewriting the storage machinery.
+
+For GPU DB, this is a useful counterweight to treating P8 residency as a
+single hot/cold bit. CacheLib's experience suggests that resident GPU
+snapshots, host-memory segments, flash/NVMe pages, and future tiers should
+share a small common lifecycle vocabulary even when the physical layouts
+differ. Objects should have a route-visible type, owner, byte budget,
+reference/reader lifetime, admission reason, and eviction or demotion
+state. Without that, cache policy becomes implicit in scattered planner,
+refresh, and runtime code.
+
+**Concrete mechanisms:**
+
+- CacheLib exposes cached objects as `Item`s and access capabilities as
+  `ItemHandle`s. A referenced item cannot be evicted while a handle is
+  alive; expired or removed items stop issuing new handles but existing
+  handles remain valid until released.
+- Insert/update uses allocate-then-publish: `allocate` returns a handle,
+  the client fills or mutates memory, and `insertOrReplace` makes the item
+  visible. This mirrors a useful resident snapshot pattern: build or
+  refresh off to the side, then publish through a single visible generation
+  boundary.
+- Cache memory is partitioned into pools selected by `PoolId`; each pool
+  can isolate a traffic class and use a different eviction policy. The
+  DRAM cache uses slab classes with per-class eviction state, workload-tuned
+  sizes, and slab rebalancing to approximate global eviction while limiting
+  fragmentation.
+- The hybrid cache has a DRAM cache plus flash Large Object Cache and Small
+  Object Cache. Finds check DRAM first, then flash. Flash hits return a
+  handle that becomes ready after asynchronous fetch into DRAM.
+- Flash admission is explicit. Unchanged objects already present on flash
+  are not rewritten; otherwise admission can be probabilistic to control
+  flash write rate. The paper reports sequential FIFO region writes in the
+  LOC reducing device-level write amplification compared with less orderly
+  writes.
+- The LOC keeps a DRAM B+tree index for large flash objects and stores full
+  keys on flash to validate hash collisions. The SOC avoids an exact
+  per-object DRAM index for tiny objects by hashing keys to 4 KB flash-page
+  sets and keeping a small Bloom filter per set in DRAM to skip most
+  unnecessary flash reads.
+- CacheLib monitors total system memory and dynamically shrinks or grows the
+  DRAM cache around configured thresholds to avoid process crashes. It also
+  supports warm restarts by keeping DRAM state in POSIX shared memory and
+  serializing flash indexes/filters on shutdown.
+- Evaluation reports CacheLib reaching similar hit ratios to Memcached but
+  up to 60% higher request throughput in the look-aside cache experiment,
+  and better small-object flash-cache throughput than NGINX/ATS in the HTTP
+  cache comparison. These are production-cache results, not database query
+  throughput claims.
+
+**GPU DB mapping:** CacheLib's `ItemHandle` maps cleanly to retained read
+snapshot handles. A P8 resident table segment, GPU key vector, encoded
+response-shape buffer, or host compressed page should not be evictable
+while a query, micro-batch, or response encoder holds a handle. Existing
+snapshots can stay valid after invalidation for new readers, exactly as
+CacheLib lets existing handles outlive remove/expiry, but new route
+selection must stop issuing handles for invalidated generations.
+
+The allocate-then-publish path is also the right shape for GPU refresh:
+build a new resident segment, fill metadata and device buffers, validate
+source WAL/visibility/catalog generations, then publish it atomically for
+new readers. Failed refreshes should drop the uninserted handle without
+poisoning the current visible generation.
+
+Pools are directly useful for route isolation. Keep separate budgets for
+hot OLTP lookup snapshots, retained analytical scans, GPU scratch, response
+buffers, host compressed warm segments, and cold NVMe staging. Each pool
+can have a different eviction or admission policy and a different overload
+response. A write-heavy workload should not evict every retained lookup
+key vector merely because an analytical route generated temporary pages.
+
+The flash-cache split is relevant to future NVMe and host-memory tiers. P8
+should distinguish large resident column chunks from tiny metadata or
+index entries; they need different DRAM-index overhead, admission, and
+write-amplification accounting. CacheLib's LOC/SOC split is a concrete
+model for deciding when an exact index is acceptable and when approximate
+page-set metadata is a better trade.
+
+Finally, warm restart is a useful architectural prompt. GPU memory itself
+will not survive process restart, but CPU host-tier indexes, statistics,
+compressed chunks, and NVMe placement manifests can. P8 should separate
+which acceleration state can be warmed, validated, and reused from which
+must be discarded and rebuilt from WAL/checkpoint truth.
+
+**Risks and mismatches:** CacheLib is a cache engine, not a transactional
+DBMS. It does not solve SQL visibility, WAL-before-visibility, serializable
+reads, DDL invalidation, planner correctness, or GPU kernel scheduling.
+The paper's API trusts clients for some raw-memory mutation reporting, which
+is too loose for database correctness unless wrapped by owner-controlled
+publication protocols.
+
+The flash mechanisms target caching web/service objects, not MVCC tuple
+versions or GPU columnar snapshots. Probabilistic admission and FIFO region
+eviction are attractive for wear control but can produce unacceptable
+latency variance if used blindly for query-critical route metadata. Also,
+workload-specific slab tuning was manual in their production experience;
+GPU DB should avoid requiring hand-tuned size classes before benchmarks can
+be trusted.
+
+**Benchmark candidates:**
+
+- Prototype a resident-resource handle model for P8 metadata: a retained
+  read obtains a typed handle to a segment generation, and invalidation
+  prevents new handles while allowing existing readers to finish. Proof
+  gate: no stale route can be acquired after invalidation, and active
+  readers keep seeing a consistent generation.
+- Add cache-pool telemetry for GPU DB: resident table bytes, resident index
+  bytes, host compressed bytes, scratch bytes, response-buffer bytes,
+  pinned-buffer bytes, handle counts, invalid-but-held bytes, and eviction
+  or rejection reason by pool.
+- Benchmark allocate-then-publish refresh against in-place refresh for a hot
+  retained table. Measure p50/p99 read latency during refresh, failed
+  refresh behavior, and visibility correctness under concurrent mutation.
+- Build a tiered-object simulation with large column chunks and tiny
+  metadata/index entries. Compare exact DRAM indexes, page-set approximate
+  indexes, Bloom-filter-assisted negative checks, and route failure rates.
+  Failure condition: index metadata consumes enough DRAM to evict useful hot
+  data or false positives add unacceptable cold-tier reads.
+- Measure admission policies for host/NVMe warm segments: always admit,
+  probability-based admit, frequency-based admit, and route-value-based
+  admit. Gate: write amplification and promotion churn are bounded while
+  hit ratio and p99 latency stay within target.
+- Add warm-restart classification to P8 design tests: which state can be
+  reused after process restart, which must be validated against WAL/catalog
+  generations, and which must be rebuilt. Failure condition: a warmed cache
+  can serve a route before its source generation is proven current.

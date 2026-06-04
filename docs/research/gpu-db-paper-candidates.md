@@ -2397,13 +2397,20 @@ Append new candidates here as each paper is processed.
   application-visible replicated/derived data structures for reducing
   coordination, relevant to write-hot derived views and contention-safe
   denormalized state.
-- `queued` — **The CacheLib Caching Engine: Design and Experiences at Scale**,
+- `reviewed` — **The CacheLib Caching Engine: Design and Experiences at Scale**,
   Berg et al., OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/berg`
   Why: 2-Tree cites CacheLib as evidence that working sets shift over time;
   its production cache admission, eviction, slab, and workload-class mechanics
   are useful follow-up material for GPU DB host-memory and resident-cache
   policy.
+- `queued` — **Kangaroo: Caching Billions of Tiny Objects on Flash**,
+  McAllister et al., SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483568`
+  Why: CacheLib's SOC design highlights flash-cache DRAM-index pressure for
+  tiny objects; Kangaroo is a direct follow-up for billions-of-objects flash
+  indexing, admission, and write-amplification control in future cold or warm
+  metadata tiers.
 - `queued` — **BzTree: A High-Performance Latch-Free Range Index for
   Non-Volatile Memory**, Arulraj et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p553-arulraj.pdf`
