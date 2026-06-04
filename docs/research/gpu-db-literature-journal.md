@@ -44356,3 +44356,161 @@ isolation model.
   workload certifies. The minimum useful result is identifying which command
   subsets can safely bypass the strongest route and which must remain owner
   serialized.
+
+### 2026-06-04 - Three-Tree makes intermediate memory a first-class buffer tier
+
+**Citation:** Xiangpeng Hao, Xinjing Zhou, Xiangyao Yu, and Michael
+Stonebraker. "Towards Buffer Management with Tiered Main Memory." Proceedings
+of the ACM on Management of Data 2(1), Article 31, 2024.
+doi:10.1145/3639286. Retrieved 2026-06-04 from the ACM DOI metadata, DBLP
+record, author publication page, and artifact repository
+`https://github.com/Two-tier-memory-project/tiered-buffer-pool`. The ACM PDF
+endpoint was blocked by a Cloudflare challenge from this worker, so exact
+figure values and some paper-internal terminology remain unknown here.
+
+**Category:** multi-tier cache / buffer management / data placement; OLTP
+storage and access-method design.
+
+**Relevance tags:** tiered main memory; CXL/RDMA-like remote memory; B-tree
+buffer pool; local DRAM; remote memory; disk fallback; promotion; page
+translation; cost/performance provisioning; hot/cold index placement; future
+memory tiers.
+
+**Core idea:** The paper studies how a DBMS should use an intermediate main
+memory tier between local DRAM and SSD/disk. The abstract frames remote or
+tiered memory as much lower latency than SSD but cheaper or more poolable than
+local DRAM, and explicitly says the study compares five indexing designs across
+performance, tier-latency sensitivity, and cost-effectiveness. Its headline
+result is not a single universal winner: different designs dominate different
+dimensions, so the DBMS needs a workload-aware and cost-aware placement policy.
+
+The artifact names the evaluated designs as `OneTree`, `TwoTreeLower`,
+`TwoTreeUpper`, `TwoTreeUpperBlind`, and `ThreeTree`. The code makes the design
+space concrete: remote memory can be treated as the only backing memory, as a
+selective part of an index, as a blind allocator after local DRAM fills, or as
+an explicit third buffer tier with DRAM, remote memory, and disk all tracked in
+the page table.
+
+**Concrete mechanisms:**
+
+- The implementation uses a B-tree with a `BufferPool` trait exposing
+  `reserve_page`, `free_page`, and `resolve_pid`. Logical page ids map through
+  a concurrent page table to `PhysicalPage` states: local DRAM pointer, tiered
+  memory pointer, disk offset, or inflight migration.
+- Physical-page state is encoded compactly in pointer/id high bits in the
+  artifact. This keeps route lookup as a low-overhead page-table operation
+  while preserving the ability to distinguish local, remote, disk, and
+  in-flight pages.
+- `TwoTierBufferPool` models one memory pool plus disk. It can emulate remote
+  memory latency by delaying accesses when the memory type is NUMA. Misses to
+  disk transition a page through `Inflight`, read it into memory, and update
+  the page table back to local memory.
+- `TwoTierMemory` reserves local DRAM first and then allocates remote pages
+  directly once local capacity is exhausted. It can probabilistically promote
+  a remote page into local DRAM; the promotion path locks the remote page,
+  marks the page table inflight, copies the page into a local buffer frame, and
+  evicts another local page to remote memory if needed.
+- `TwoTierMemoryBlind` is the simpler blind allocator: it tries local DRAM,
+  then remote memory, and treats the page id as the pointer. It avoids a
+  logical page table but gives up DBMS-controlled remapping and fine-grained
+  promotion metadata.
+- `ThreeTierBufferPool` uses separate local and remote shard caches plus a
+  file tier. New pages fill local DRAM until full, then remote memory with
+  replacement. Remote hits optionally promote to local DRAM; disk misses load
+  into remote memory rather than directly into local DRAM. Dirty remote pages
+  are written to the file tier on remote eviction.
+- The benchmark configuration varies local DRAM and remote memory budgets,
+  thread count, Zipf skew, read/update mix, artificial remote delay, and
+  promotion rate. The larger configurations use 120 million records, 10
+  threads, 3 GB local DRAM, 18 GB remote memory, 1 us remote delay, Zipf
+  distributions, and read/write mixes from read-heavy to write-heavy.
+- The paper also proposes a memory provisioning strategy for choosing amounts
+  of local and remote memory for a workload. The abstract states this as an
+  optimal allocation problem, but the exact optimizer formulation and objective
+  weights are unknown from the accessible sources.
+
+**GPU DB mapping:** Three-Tree's main transfer is that GPU DB should not think
+of future CXL/remote memory as just "slower DRAM" or just "faster disk." It is
+a separate placement class with its own page-table state, promotion policy,
+and cost contract. For P8, that suggests extending the current durable CPU
+truth, CPU derived state, and GPU resident state model with an explicit
+intermediate host tier for warm segments, warm indexes, compressed vectors, or
+delta buffers.
+
+The `PhysicalPage` state machine maps neatly to route certificates. A route
+should know whether a segment/index page is in GPU HBM, local DRAM, remote/CXL
+memory, NVMe, or in flight, and it should use that state to decide whether to
+run a GPU-resident kernel, stage from host memory, fall back to CPU, wait for
+promotion, or reject under queue pressure. "Inflight" is particularly useful:
+GPU DB needs an explicit state for refresh, promotion, demotion, eviction, and
+rebuild so a request cannot accidentally treat a moving page as stable.
+
+The promotion mechanism also fits retained read snapshots. A remote/warm
+segment promoted into a faster tier must either preserve the same visibility
+boundary or publish a new route generation after the copy completes. The
+paper's page-table compare/exchange pattern is a useful low-level analog:
+mark the object inflight, copy under an ownership protocol, then atomically
+publish the new physical location. For GPU DB this publication should include
+WAL boundary, schema generation, resident layout id, and freshness clocks.
+
+The no-universal-winner result argues against a fixed rule such as "keep all
+upper index levels in DRAM" or "put all cold resident vectors in remote
+memory." The planner should treat placement as part of route choice: hot
+point-lookups may want key/index structures in fast memory, scan-heavy
+workloads may prefer dense compressed vectors, and write-heavy workloads may
+avoid promoting pages that will be invalidated immediately.
+
+For the high-throughput runtime, the artifact's low-level mechanics suggest
+that tier placement has to be observable in the same telemetry surface as
+queues. Admission should include tier-hit counts, promotion attempts,
+promotion failures, remote-delay cost, inflight wait, dirty demotion, and disk
+load count. Otherwise the engine will not know whether a p99 spike came from
+GPU saturation, remote-memory promotion, or cold-tier reload.
+
+**Risks and mismatches:** The accessible sources describe B-tree and OLTP-style
+buffer/index behavior, not GPU kernels or MVCC visibility. GPU DB cannot copy
+the artifact's page movement protocol directly unless each movement is tied to
+immutable snapshot publication and WAL-before-visibility ordering.
+
+The artifact uses NUMA or artificial delay to model remote memory. That is
+useful for sensitivity analysis, but it may not capture real CXL pooling,
+RDMA memory semantics, bandwidth contention, failure modes, or GPU DMA
+behavior. Any GPU DB benchmark must vary bandwidth and concurrency, not only
+latency.
+
+The paper's own abstract says no design wins all measured dimensions. That is
+a warning against prematurely choosing a Three-Tree-like tiering policy as the
+architecture. The immediate action should be benchmarkable route policies and
+provisioning experiments.
+
+Exact throughput numbers, cost-model equations, and some design definitions
+were not available because the official PDF could not be fetched in this run.
+The entry therefore relies on primary metadata, author/project pages, and the
+public artifact for mechanisms.
+
+**Benchmark candidates:**
+
+- Add a tier-state simulator for route certificates: `GpuHbm`, `LocalDram`,
+  `RemoteMemory`, `Nvme`, and `Inflight`. Proof gate: no read route can execute
+  from a page or segment whose physical tier is `Inflight` or whose visibility
+  boundary is missing.
+- Build a warm-host-tier benchmark with synthetic remote-memory latency and
+  bandwidth controls. Compare GPU-resident, local-DRAM staged, remote-memory
+  staged, and NVMe-staged execution for point lookup, prefix scan, and bounded
+  aggregate routes.
+- Add promotion/demotion telemetry to the P8 cache manager design: promotion
+  attempts, successful promotions, failed promotions, dirty demotions,
+  inflight wait time, and tier-hit counts. Failure condition: p99 latency
+  increases without enough telemetry to attribute it to a tier movement.
+- Test visibility-preserving promotion. Hold an old retained snapshot, promote
+  a warm segment into a faster tier, then verify both old and new routes see
+  exactly the visibility boundary they declare.
+- Create a placement provisioning sweep. Given a fixed memory budget, vary HBM,
+  local DRAM, and remote-memory allocations for skewed read-heavy, balanced,
+  and write-heavy mixes. The pass condition is not one winning policy; it is a
+  planner rule that predicts when each placement family wins or should fall
+  back.
+- Compare blind allocation against DBMS-controlled remapping. The blind policy
+  should be faster to allocate but should lose observability and promotion
+  precision; the benchmark should quantify whether that simplicity is ever
+  acceptable for GPU DB route certificates.

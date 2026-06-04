@@ -638,9 +638,9 @@ Append new candidates here as each paper is processed.
   Why: LeanStore 2024 cites it as the direct NVMe IO-path study; useful for
   quantifying cold-tier queue depth, page size, SPDK/io_uring tradeoffs, and
   CPU-cycle budgets before GPU DB adopts explicit NVMe placement.
-- `queued` — **Towards Buffer Management with Tiered Main Memory**, Hao et al.,
+- `reviewed` — **Towards Buffer Management with Tiered Main Memory**, Hao et al.,
   PACMMOD 2024.
-  URL: `https://doi.org/10.1145/3639307`
+  URL: `https://doi.org/10.1145/3639286`
   DBLP: `https://dblp.org/rec/journals/pacmmod/HaoZYS24`
   Why: modern tiered-memory buffer management follow-up from LeanStore's
   related work; useful for extending GPU DB placement beyond DRAM/NVMe toward
@@ -3642,3 +3642,17 @@ Append new candidates here as each paper is processed.
   Why: WBL's Peloton implementation stores indexes as persistent B+trees;
   useful for deciding whether future host/persistent indexes should be durable
   performance state or rebuilt from WAL and route metadata.
+- `queued` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
+  Larger-Than-Memory Range Index**, Hao and Chandramouli, PVLDB 2024.
+  URL: `https://vldb.org/pvldb/vol17/p3442-hao.pdf`
+  DOI: `https://doi.org/10.14778/3685800.3685831`
+  Why: follow-up by the Three-Tree first author on larger-than-memory range
+  indexing; useful for comparing page-granular tiering with an index design
+  that explicitly balances reads, writes, concurrency, and cold storage.
+- `queued` — **Tiered-Indexing: Optimizing Access Methods for Skew**, Zhou,
+  Hao, Yu, and Stonebraker, VLDB Journal 2025.
+  URL: `https://doi.org/10.1007/s00778-025-00909-3`
+  Code: `https://github.com/zxjcarrot/2-Tree`
+  Why: follow-up to Two-Tree/Three-Tree on access-method tiering under skew;
+  relevant to GPU DB hot/cold resident index placement and selective
+  promotion of upper, lower, or leaf-heavy structures.
