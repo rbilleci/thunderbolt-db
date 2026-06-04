@@ -532,8 +532,8 @@ Append new candidates here as each paper is processed.
   Why: QueCC contrasts LADS dependency-graph execution with priority queues;
   useful for deciding whether GPU DB should use dependency graphs, owner
   queues, or lighter runtime conflict classes for prepared multi-step writes.
-- `queued` — **Improving High Contention OLTP Performance via Transaction
-  Scheduling**, Ding et al., arXiv 2018.
+- `reviewed` — **Improving High Contention OLTP Performance via Transaction
+  Scheduling**, Prasaad, Cheung, and Suciu, arXiv 2018.
   URL: `https://arxiv.org/abs/1810.01997`
   Why: ORTHRUS sharpens the case for planned access and specialized
   concurrency-control work; this follow-up clusters conflict-free transactions

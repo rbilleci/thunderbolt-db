@@ -46609,3 +46609,208 @@ needs explicit admission rules and fallback reasons.
 - Use ORTHRUS as a warning for per-session state: active session credits,
   response handles, and route descriptors should be owned or sharded, not
   mutated by every worker serving a logical session.
+
+### 2026-06-04 - Strife turns contention into batch-time conflict-free lanes
+
+**Citation:** Guna Prasaad, Alvin Cheung, and Dan Suciu. "Improving
+High Contention OLTP Performance via Transaction Scheduling." arXiv
+1810.01997, 2018. Retrieved 2026-06-04 from
+`https://arxiv.org/pdf/1810.01997`.
+
+**Category:** transaction processing / write path; runtime / HFT /
+session scale.
+
+**Relevance tags:** high-contention OLTP; transaction scheduling;
+micro-batching; conflict-free clusters; residual conflict lane; access
+graph; hot-key writes; owner lanes; route certificates; admission
+fallback; latency-throughput tradeoff.
+
+**Core idea:** Strife starts from a useful observation for high-contention
+OLTP: even workloads that look globally contended often contain large
+groups of transactions that conflict only within a group, plus a smaller
+set of residual transactions that cross groups. Strife collects
+transactions into batches, builds a data-access graph over transactions
+and accessed data items, partitions the batch into conflict-free clusters
+and residuals, runs the clusters in parallel without concurrency control,
+then executes the residuals with a conventional concurrency-control
+protocol.
+
+This is not static data partitioning. Strife repartitions each batch by
+the batch's actual read/write sets, so the scheduling boundary can move
+with the workload. The key tradeoff is that the analysis phase must be
+cheap enough that it does not consume the throughput gained by removing
+locks, aborts, and deadlock handling from the conflict-free phase.
+
+**Concrete mechanisms:**
+
+- Strife assumes the read/write set of each transaction is available
+  before execution. The authors point to static analysis or stored
+  procedures for settings where it is not naturally known.
+- A batch is represented as an undirected bipartite access graph with
+  transaction nodes, data-item nodes, and edges from transactions to the
+  items they access.
+- A clustering partitions transactions into clusters `C1..Ck` plus a
+  residual set `R`. Transactions in different clusters must not conflict;
+  the residual set has no such guarantee.
+- Batch execution has three phases: analysis, conflict-free execution,
+  and residual execution. Conflict-free clusters are placed on a shared
+  worklist, each worker drains whole clusters, and workers synchronize
+  before residuals run because residuals may conflict with any cluster.
+- The partitioning heuristic has three stages. The spot stage randomly
+  samples transactions to seed clusters around mutually non-conflicting
+  hot items. The allocate stage scans transactions and assigns them to a
+  unique compatible cluster, leaves initially distant transactions
+  unallocated, or marks cross-cluster transactions as residual. A second
+  allocation round randomly seeds otherwise isolated work. The merge
+  stage merges clusters when doing so pulls enough transactions out of
+  the residual set.
+- The merge decision uses a tunable residual bound `alpha`; the paper
+  uses `alpha = 0.2` in experiments. Larger residual tolerance preserves
+  more parallel clusters but leaves more work in the conflict-controlled
+  phase; lower tolerance can over-merge and reduce parallelism.
+- Preprocessing ignores data items accessed by every transaction in the
+  batch for partitioning, such as a dimension table in the TPC-C variant,
+  because those items do not help form useful conflict-free clusters.
+- The prototype uses a C++ in-memory transaction manager with pages,
+  primary-key hash indexes, record-local metadata, atomic `clusterId`
+  updates during analysis, and 2PL NoWait for the residual phase.
+- Experiments use a 50:50 TPC-C NewOrder/Payment mix and a YCSB-style
+  workload with 10M keys, 20 accesses per transaction, 50% reads and 50%
+  writes, and Zipf-controlled contention.
+- Reported results include up to 2x throughput over 2PL variants on
+  TPC-C and YCSB under high contention, and up to 5x over competing
+  protocols in the high-contention YCSB contention sweep. The paper also
+  notes that low-contention YCSB can favor NoWait/WaitDie/LockOrdered by
+  roughly 20%-50%, because Strife still pays batch-analysis overhead.
+- The paper's main latency caveat is explicit: their experiments use
+  100K-transaction batches, with response latency up to about 200ms,
+  which they argue is below the TPC-C recommended 500ms client response
+  target but is much higher than an interactive low-latency target.
+
+**GPU DB mapping:** Strife is a strong candidate mechanism for GPU DB's
+known-shape write lanes, but only as a certified batch path. The planner
+or admission layer can build a route certificate containing read/write
+keys or ranges, owner ids, conflict family, batch id, residual/fallback
+classification, and snapshot/visibility boundary. Transactions whose
+access sets fall into one conflict-free lane can execute on a partition
+or mutation owner without per-record lock/OCC overhead inside that lane.
+Cross-lane transactions stay on a residual path with ordinary validation,
+ordered owner messaging, or CPU fallback.
+
+For write throughput, the most direct target is hot-key and hot-range
+prepared workloads: COPY chunks, prepared updates, single-table upserts,
+and known-shape multi-row writes. A Strife-like analysis pass can cluster
+requests by conflict family and then drain each cluster through its owning
+mutation lane while preserving WAL-before-visibility. The residual lane
+is especially important: it is the place where GPU DB can keep general
+SQL correct without letting one cross-partition transaction poison the
+fast lane for the whole batch.
+
+For 1M logical sessions, Strife supports the runtime model where sessions
+enqueue compact requests and owners drain scheduled work, rather than
+sessions owning execution threads. It also suggests that admission should
+measure active-window conflict shape, not only queue depth. A queue with
+many requests may be excellent if it partitions into independent
+conflict-free lanes; a smaller queue may be dangerous if it collapses
+into one residual hot object.
+
+For GPU read and refresh work, the mechanism maps to micro-batching by
+snapshot generation and route shape. Same-snapshot retained lookups or
+refresh tasks can be clustered as conflict-free lanes; work that crosses
+generations, touches invalidated partitions, or needs mutable residency
+metadata enters a residual/fallback lane. The same certificate should
+record whether the fast lane is lock-free because it is conflict-free or
+because it is read-only over an immutable snapshot.
+
+**Risks and mismatches:** Strife requires known read/write sets before
+execution. That fits prepared SQL and stored procedures better than ad hoc
+queries, volatile functions, dynamic index probes, triggers, or
+data-dependent predicates. GPU DB should reject or route those requests
+to generic validation until a reconnaissance pass or planner proof exists.
+
+The batch size used in the experiments is throughput-oriented and not a
+natural fit for low-latency pgwire service. GPU DB should use
+microsecond/count dual triggers and measure p50/p99/p999, not only
+commits per second. If the analysis phase or batch wait dominates
+latency, Strife should become an overload/high-contention lane rather
+than the default write path.
+
+The prototype is CPU-only and in-memory. It does not include WAL flush,
+resident GPU invalidation, MVCC version-chain publication, NVMe or CXL
+tiers, network IO, response encoding, or recovery replay. Any GPU DB
+adaptation must put WAL append, invalidation, and visibility publication
+outside the lock-free cluster shortcut.
+
+The residual phase is also a correctness pressure point. If residuals are
+large or frequent, Strife can devolve into analysis overhead plus ordinary
+2PL/OCC. The route certificate therefore needs explicit residual ratio,
+merge decisions, cluster-count, and fallback telemetry before the engine
+trusts this path.
+
+**Benchmark candidates:**
+
+- Build a Strife-style batch scheduler simulator for prepared writes:
+  generic mutation-owner FIFO, ORTHRUS-style owner-ordered locking,
+  QueCC-style priority queues, and Strife-style conflict-free clusters
+  plus residuals. Measure throughput, aborts, residual ratio, cluster
+  count, analysis cost, p50/p99/p999 latency, and WAL visibility delay.
+- Add route-certificate fields for write/read set provenance,
+  conflict-free cluster id, residual reason, merge decision, batch id,
+  analysis micros, owner lane, and fallback class.
+- Test dual-trigger micro-batches: 100us, 500us, 1ms, and count-based
+  thresholds. Failure condition: lock-free cluster throughput improves
+  while p99/p999 or visibility publication gets worse than the generic
+  owner path.
+- Prototype a conservative COPY/upsert lane where batches are clustered
+  by key/range and residuals use the generic mutation owner. Proof gate:
+  WAL-before-visibility and resident invalidation happen once per
+  committed sub-batch and are traceable in telemetry.
+- Use the active-window conflict-shape metric for admission: classify
+  windows as one-hot-object, N independent hot objects, low-contention,
+  or high-residual. Route only N-independent-hot-object windows to the
+  Strife lane.
+- Compare cluster scheduling against GPU retained lookup micro-batching:
+  immutable read clusters should skip mutation conflict work entirely,
+  while mixed read/write windows should force residual or snapshot
+  boundary separation.
+- Stress cases where Strife should lose: low contention, unknown access
+  sets, many cross-cluster transactions, and skewed cluster sizes. The
+  failure policy should be "fall back early," not "wait for a giant batch
+  to prove it was bad."
+
+### 2026-06-04 - Cross-paper synthesis: active-window certificates should choose the write lane
+
+**Converging design tracks:** QueCC, ORTHRUS, CXL placement, and Strife
+all point at the same runtime discipline: do not send every request to
+one generic hot path. Instead, classify the active window before it hits
+shared state. QueCC makes operation queues and priority lanes explicit;
+ORTHRUS separates concurrency-control ownership from transaction
+execution; CXL placement says object families need measured tier
+classes; Strife says the current batch's conflict graph should decide
+which writes can run without per-record control.
+
+For GPU DB, this converges into an active-window route certificate. A
+request batch should carry scheduling intent, conflict-shape proof,
+owner fan-out, residual/fallback class, tier/object class, and visibility
+boundary. The system can then choose among at least four lanes:
+immutable retained read, single-owner write, conflict-free scheduled
+write cluster, and residual/generic validation. This is better than a
+single "GPU route eligible" bit because a route can be GPU-resident but
+write-conflicted, conflict-free but tier-unfriendly, or low-latency but
+not batchable.
+
+**Category gaps:** The recent set is intentionally write/runtime heavy
+after many GPU/analytics reviews. The next useful non-analytics papers
+are still T-Part or LADS for deterministic/dependency scheduling, a
+snapshot-freshness/PSI paper for visibility certificates, or Aurora for
+durable log/storage publication. A GPU execution paper is acceptable
+next only if the queue needs balance after another OLTP/MVCC source.
+
+**Benchmark priorities:** First, build an active-window classifier that
+labels a window as immutable-read, one-hot-object, N independent hot
+objects, high-residual, low-contention, or unknown-access. Second, wire
+the classifier to a simulator that compares owner FIFO, priority queues,
+ORTHRUS-style owners, and Strife-style clusters under the same generated
+workloads. Third, require every fast lane to emit certificate telemetry:
+snapshot generation, owner fan-out, residual ratio, queue wait, batch
+flush reason, WAL/invalidation boundary, and fallback reason.
