@@ -39382,3 +39382,162 @@ Benchmark priorities:
   fragments;
 - attach every learned or robust route decision to live deterministic
   descriptors and a fallback policy.
+
+### 2026-06-04 - Semantic conflict removal beats protocol switching alone
+
+**Citation:** Yihe Huang, William Qian, Eddie Kohler, Barbara
+Liskov, and Liuba Shrira. "Opportunities for Optimism in Contended
+Main-Memory Multicore Transactions." PVLDB 13(5), 2020, pp.
+629-642. DOI `10.14778/3377369.3377373`. Retrieved 2026-06-04
+from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol13/p629-huang.pdf`.
+
+**Category:** Transaction processing / write path; MVCC / snapshot /
+visibility; runtime / HFT / session scale.
+
+**Relevance tags:** optimistic concurrency control; MVCC; TicToc;
+high contention; commit-time updates; timestamp splitting; false
+conflicts; abort path; allocator behavior; RCU; hot-row layout.
+
+**Core idea:** The paper re-evaluates OCC, TicToc, and MVCC in one
+implementation, STOv2, so concurrency-control algorithms are not
+confounded by unrelated engineering choices. With "basis factors" held
+constant, the authors find that OCC does not inherently collapse on
+their high-contention TPC-C, YCSB, Wikipedia, and RUBiS workloads.
+Many prior collapses were caused or amplified by implementation
+choices such as poor contention regulation, slow allocation, expensive
+abort paths, inappropriate index types, and costly deadlock avoidance.
+
+The stronger design lesson is that removing semantically unnecessary
+conflicts can matter more than switching the whole engine to another
+protocol. The paper adds commit-time updates, which turn eligible
+read-modify-write operations into blind update functions applied at
+commit, and timestamp splitting, which assigns separate timestamps to
+column groups with different update patterns. Together these reduce
+false conflicts for OCC, TicToc, and MVCC. The reported high-contention
+TPC-C gain reaches about 3.6x over base concurrency control, and the
+authors argue this class of optimization is more general than relying
+on MVCC or TicToc reordering to avoid a few benchmark-specific
+conflicts.
+
+**Concrete mechanisms:**
+
+- STOv2 implements three protocols over shared infrastructure: Silo-like
+  OCC, a TicToc variant, and a Cicada-like MVCC variant. This isolates
+  protocol effects from allocator, index, abort, and backoff choices.
+- The OCC commit path locks the write set, chooses a serialization
+  timestamp, validates the read set, installs writes, updates timestamps,
+  and releases locks.
+- The MVCC variant stores a version chain per record, assigns read-only
+  transactions a recent-past timestamp, inserts pending versions at
+  commit, validates the read set against the chosen commit timestamp,
+  then marks pending versions committed or aborted.
+- STOv2 uses RCU-style reclamation with thread-local and global
+  timestamps, so logically deleted records and index nodes can be read
+  safely until all possibly concurrent transactions finish.
+- Basis-factor recommendations include randomized exponential backoff
+  after conflicts, a scalable allocator, explicitly checked abort return
+  values instead of C++ exceptions, hash indexes when range scans are not
+  needed, contention-aware range indexes for queue-like indexes, and
+  bounded spinning instead of expensive write-set sorting for OCC
+  deadlock avoidance.
+- Commit-time updates encode a read-modify-write as an updater object in
+  the write set when the transaction does not otherwise observe that
+  record value. In OCC and TicToc, the updater runs while the record is
+  locked during install. In MVCC, updaters are stored as delta versions
+  in the version chain and are flattened into full versions when read.
+- Timestamp splitting divides a record into column subsets with separate
+  timestamps. A transaction reading rarely changed columns can avoid
+  conflicting with a transaction updating unrelated hot columns.
+- The paper's simple evaluated split uses two timestamps. It notes that
+  more timestamps increase read/write set size and record-layout cost,
+  and three timestamps performed worse than two in their benchmarks.
+- Commit-time updates and timestamp splitting can reinforce each other:
+  splitting may make a field update eligible for commit-time application
+  because the transaction's observed field now belongs to a different
+  timestamp subset.
+- The authors observe MVCC-specific overheads from delta-version
+  allocation, flattening, and garbage collection, especially when
+  contention is low.
+
+**GPU DB mapping:** This paper is directly relevant to the write path
+and P8 physical layout. GPU DB should not treat "MVCC versus OCC versus
+deterministic batches" as the only knob. Many hot conflicts may be
+false conflicts caused by row-level visibility metadata, generic
+read-modify-write encoding, or one resident generation for unrelated
+column families. The route descriptor should therefore carry semantic
+write intent: blind increment, max/min, append, counter update,
+balance-like update, metadata-only update, and which columns or
+visibility groups the transaction actually observes.
+
+Commit-time updates map to a mutation-owner contract where eligible
+operations are staged as deterministic updater records. The owner can
+apply them at a WAL-safe publication boundary without adding the old
+value to the transaction's conflict-sensitive read set. For GPU DB, this
+could reduce hot counter and queue-head conflicts while preserving
+WAL-before-visibility: the updater itself is logged, replayable, and
+applied by the owner before publishing the next visibility generation.
+
+Timestamp splitting maps to P8 column groups and MVCC metadata. If a row
+has immutable identity columns, frequently updated counters, and
+read-mostly payload columns, one tuple-level timestamp can create false
+conflicts and unnecessary resident invalidations. A safer first step is
+not arbitrary attribute-level locking, but a small number of visibility
+or invalidation groups per table route. Retained GPU reads that touch
+only stable columns should not be invalidated by unrelated hot counters
+unless SQL semantics require the whole row version to move together.
+
+The basis-factor section reinforces recent runtime synthesis. High
+session counts make abort path, allocator path, backoff, index choice,
+and deadlock avoidance part of the correctness-adjacent performance
+surface. GPU DB benchmarks should not compare a GPU batch protocol
+against a weak CPU/OCC baseline with hidden allocator or abort overheads;
+otherwise the system may choose a complex GPU path to solve a basis
+factor problem.
+
+**Risks and mismatches:** STOv2 is a main-memory transactional library,
+not a durable SQL engine. It does not implement networking, WAL,
+PostgreSQL protocol behavior, DDL, GPU residency, or crash recovery.
+The authors explicitly say transactions are one-shot C++ programs with
+all parameters available at start, which is friendlier than interactive
+SQL transactions. Commit-time update eligibility depends on knowing that
+the record value is not otherwise observed by the transaction; deriving
+that automatically for arbitrary SQL and user functions is hard.
+
+Timestamp splitting can also become a semantic trap. SQL users expect a
+row version and isolation behavior that are explainable. Splitting
+visibility or invalidation groups must preserve tuple reconstruction,
+index correctness, foreign-key checks, triggers, and recovery replay.
+For MVCC, delta-version flattening and GC can become a new hot path.
+Finally, the absolute throughput claims are CPU-only results on EC2
+hardware from 2020; the transferable claim is conflict removal and
+basis-factor control, not the specific speedup on GPU hardware.
+
+**Benchmark candidates:**
+
+- Add a hot-update workload with counters and stable payload columns.
+  Compare tuple-level MVCC timestamps, two-group timestamp splitting,
+  and a commit-time updater path. Proof gate: identical SQL-visible
+  results and WAL replay under insert/update/delete.
+- Prototype replayable commit-time updater records for simple
+  operations: increment, add bounded delta, max/min, and blind set where
+  the old value is not read. Measure abort rate, owner queue wait, WAL
+  bytes, and visibility generations per second.
+- Add a false-conflict detector to transaction telemetry: record when an
+  abort or invalidation was caused by a field/group the query did not
+  actually read. Use it to rank timestamp-splitting candidates.
+- Benchmark retained GPU reads over stable columns while hot writes
+  update unrelated counters. Failure condition: stable-column retained
+  routes are invalidated or forced to CPU solely by unrelated hot-column
+  mutations.
+- Compare abort and retry implementation costs under conflict: explicit
+  error returns, structured errors, allocation-heavy errors, and panic-like
+  unwinding. Minimum gate: conflict handling does not add a hidden shared
+  bottleneck.
+- Test MVCC delta updater flattening and GC under one long retained
+  snapshot. Required metrics: chain length, flatten latency, GC backlog,
+  owner stall time, and retained-read correctness.
+- Include basis-factor controls in any GPU OLTP protocol benchmark:
+  allocator/pool choice, index type, backoff, write-lock acquisition,
+  abort path, read-only snapshot route, and contention-aware queue/index
+  handling must be reported alongside GPU kernel time.

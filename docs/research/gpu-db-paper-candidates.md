@@ -3036,7 +3036,7 @@ Append new candidates here as each paper is processed.
   pessimistic/optimistic hot-tuple handling; useful for deciding when GPU DB
   should switch hot keys or route families from optimistic batch admission to
   owner-serialized or lock-like handling.
-- `queued` — **Opportunities for Optimism in Contended Main-Memory Multicore
+- `reviewed` — **Opportunities for Optimism in Contended Main-Memory Multicore
   Transactions**, Huang et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p629-huang.pdf`
   Why: MOCC cites hybrid optimistic/pessimistic contention handling as a
@@ -3234,3 +3234,10 @@ Append new candidates here as each paper is processed.
   Why: Stage compares against Redshift's prior workload-manager predictor;
   useful for understanding the production queue, priority, concurrency-scaling,
   and resource-control hooks that a GPU DB route predictor would influence.
+- `queued` — **Deferred Runtime Pipelining for Contentious Multicore Software
+  Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
+  URL: `https://doi.org/10.1145/3302424.3303966`
+  PDF: `https://www.cis.upenn.edu/~sga001/papers/drp-eurosys19.pdf`
+  Why: Opportunities for Optimism contrasts manual commit-time updates with
+  DRP's lazy/deferred execution; useful for comparing automatic transaction
+  chopping against explicit GPU DB route-shape annotations for hot writes.
