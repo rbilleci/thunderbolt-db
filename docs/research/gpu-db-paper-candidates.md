@@ -2155,13 +2155,22 @@ Append new candidates here as each paper is processed.
   Why: BOHM-adjacent deterministic two-phase planning/execution design for
   many-core transaction processing; useful for comparing queue-oriented
   planning against owner-local placeholder-first MVCC batches.
-- `queued` — **Serval: A Wait-free Multi-version Deterministic Concurrency
+- `reviewed` — **Serval: A Wait-free Multi-version Deterministic Concurrency
   Control Scheme**, Li, Onishi, and Kawashima, CANDAR 2024.
   URL: `https://doi.org/10.1109/CANDAR64496.2024.00028`
+  Metadata: `https://keio.elsevierpure.com/ja/publications/serval-a-wait-free-multi-version-deterministic-concurrency-contro/`
+  Poster: `https://apsys2024.github.io/posters/apsys24posters-paper58.pdf`
   Why: Caracal follow-up that replaces global version-array latch pressure for
   contended rows with bitmaps and dynamic local version arrays; useful for
   deciding whether GPU DB write batches should keep per-owner local version
   arrays before publishing a merged visibility front.
+- `queued` — **Dodo: A scalable optimistic deterministic concurrency control
+  protocol**, Li et al., Future Generation Computer Systems 2024.
+  URL: `https://doi.org/10.1016/j.future.2024.05.004`
+  Why: modern deterministic concurrency control design that removes some
+  state-of-the-art scalability bottlenecks; useful as a follow-up after
+  Serval/Caracal for comparing deterministic batch ordering when full
+  read/write sets are not always known.
 - `queued` — **Cheetah: An Efficient Deterministic Concurrency Control Scheme
   with Non-Visible Write Elimination and Re-Designed Garbage Collection**, Li,
   Onishi, and Kawashima, IEEE CLUSTER Workshops 2024.

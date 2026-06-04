@@ -42439,3 +42439,164 @@ over another pure GPU scan paper unless the queue becomes stale.
 - Keep WAL visibility and resident read certificates separate: a commit can be
   durable and CPU-visible while GPU predicate indexes are still invalidated or
   refreshing.
+### 2026-06-04 - Serval keeps contended deterministic writes local until publication
+
+**Citation:** Haowen Li, Rina Onishi, and Hideyuki Kawashima. "Serval: A
+Wait-free Multi-version Deterministic Concurrency Control Scheme." CANDAR
+2024, pages 169-175. Retrieved 2026-06-04 from
+`https://doi.org/10.1109/CANDAR64496.2024.00028`, metadata page
+`https://keio.elsevierpure.com/ja/publications/serval-a-wait-free-multi-version-deterministic-concurrency-contro/`,
+and APsys 2024 poster
+`https://apsys2024.github.io/posters/apsys24posters-paper58.pdf`. The IEEE PDF
+endpoint listed by CiNii returned HTTP 418 during this run, so concrete details
+below are limited to the public metadata abstract and poster.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility.
+
+**Relevance tags:** deterministic concurrency control; MVCC; wait-free
+initialization; contended writes; bitmaps; local version arrays; NUMA-aware
+writes; owner-local publication; write batching; hot-key admission.
+
+**Core idea:** Serval is a Caracal follow-up for deterministic,
+multi-version transaction processing under skew. Caracal preorders batches and
+can append multiple pending versions for the same row, but its contended path
+still writes into a global version array with latch acquisition. Serval moves
+the contended pending-version append into per-core local version arrays and
+uses compact row/core and transaction bitmaps to describe which local arrays
+contain writes for a row.
+
+The transferable point is not the exact data structure alone. It is the
+publication shape: a deterministic write batch can gather row-local update
+intent without forcing every core through one remote, latched version-array
+slot. The global visibility structure can be derived from bounded local
+metadata after the hot initialization phase instead of being the place where
+all contention is paid.
+
+**Concrete mechanisms:**
+
+- Serval targets Caracal's initialization phase, where pending versions for
+  transactions are prepared before deterministic execution.
+- Caracal's contended path uses per-core, per-row buffers but still requires a
+  latch when remote writes append into the global version array for that row.
+- Serval introduces a core bitmap inside each row. Its length is the total
+  number of cores, and a set bit means the corresponding core has a write
+  operation for that row.
+- Serval introduces a transaction bitmap inside each local version array. Its
+  length is the number of transactions assigned to the corresponding core, and
+  a set bit means that transaction writes the corresponding row.
+- Pending versions are appended to local version arrays instead of directly to
+  the global version array. The corresponding bitmaps summarize which local
+  lanes must be consulted.
+- The poster frames the technique as NUMA-aware local writes: remote writes to
+  the global version array are avoided during the contended append path.
+- The authors compare the approach to a chunked parallel radix-partitioning
+  style optimization, where local writes and later sequential remote reads
+  amortize the cost of remote memory access.
+- The public poster reports up to `4x` better total latency than Caracal at
+  skew `0.99` for a write-only workload of `4,096,000` transactions. The exact
+  machine, thread/core count, transaction shape, and full parameter table were
+  not available from the public poster/metadata.
+- Public metadata states that the design provides wait-free conditions during
+  the initialization phase and improves execution-phase efficiency under
+  contention. The available sources do not expose the full proof or execution
+  algorithm.
+
+**GPU DB mapping:** Serval maps directly to the planned owner-domain write
+pipeline. For hot rows or partitions, GPU DB should avoid a single global
+version-chain append latch during mutation preparation. Partition owners can
+collect pending row versions in owner-local chunk arrays, publish a compact
+row-to-owner bitmap or write-summary vector, and merge into the visible MVCC
+front only at deterministic generation boundaries.
+
+This is especially attractive for GPU snapshot refresh. A mutation batch can
+invalidate resident GPU snapshots using compact dirty-row, dirty-segment, or
+dirty-owner bitmaps before CPU visibility is exposed, while the heavy pending
+version payload remains local until the merge/publication step. Retained GPU
+reads then see either the old generation or the new published generation, not a
+half-populated global version array.
+
+Serval also reinforces a queue/admission rule: hot-key contention should be
+identified before all writers enter the same cache line or latch. A session
+admission controller can route hot update batches into owner-local lanes,
+bound the local array capacity, and apply backpressure when a row's core bitmap
+or pending-version payload grows beyond the merge budget.
+
+For 1M logical sessions, the bitmap idea should stay in the engine layer, not
+the session layer. Many logical sessions can enqueue writes, but the hot path
+should collapse them into a small number of partition-owner update lanes with
+preallocated local buffers. Response rings can be notified after publication
+without letting each session contend on the global MVCC structure.
+
+**Risks and mismatches:** The available public source during this run was a
+one-page poster plus metadata abstract, not the full IEEE paper. Unknowns
+include the full transaction model, read/write-set assumptions, merge order,
+memory reclamation, exact wait-free proof, NUMA topology, durability handling,
+and whether the execution phase introduces other bottlenecks once global
+version-array writes are removed.
+
+Deterministic concurrency control often assumes batches and sometimes known
+write sets before execution. GPU DB's SQL path may include interactive
+transactions and statements whose write footprint is not known until execution.
+Serval is therefore a candidate for COPY, stored procedures, generated
+benchmarks, partition-owned batched updates, and hot-key admission first, not a
+complete replacement for MVCC validation.
+
+The bitmap overhead may also become large if the number of cores, owner lanes,
+or transactions per core is high and sparsity is poor. A GPU DB design would
+need compressed or chunked dirty summaries, deterministic overflow behavior,
+and benchmarks for skew changes over time. Finally, the reported `4x` result is
+against Caracal under one public poster workload; it should shape our
+microbenchmark, not a performance forecast.
+
+**Benchmark candidates:**
+
+- Build an owner-local pending-version microbenchmark for hot-row updates:
+  compare a single global version-chain append latch against per-owner local
+  arrays plus row/owner dirty bitmaps and deterministic merge. Proof gate:
+  identical final visibility order and no WAL-before-visibility violation.
+- Add a dirty-bitmap invalidation prototype for retained GPU snapshots. A
+  mutation batch should publish dirty row/segment summaries before exposing CPU
+  visibility, then refresh or reject resident reads by generation. Failure
+  condition: a resident route serves a row whose owner-local pending version
+  was not reflected in the published generation.
+- Measure bitmap density and overflow behavior under Zipf skew from `0.0` to
+  `0.99`, varying owner lanes, transactions per batch, and rows per segment.
+  Required metrics: bitmap bytes, local-array bytes, merge time, p50/p95
+  mutation latency, and aborted/rejected overflow batches.
+- Compare deterministic batch sizes for write-heavy hot keys: small batches
+  reduce publication latency but increase merge overhead; large batches improve
+  locality but may delay read freshness and GPU snapshot refresh.
+- Add an admission experiment where hot update sessions are multiplexed into
+  bounded owner lanes. Expected result: bounded queue memory and lower global
+  version-append contention; failure condition: owner-local queues create
+  worse tail latency than the global-latch baseline at moderate skew.
+- For future GPU execution, test whether dirty bitmaps can feed a GPU refresh
+  kernel that updates only affected resident segments, while still keeping the
+  CPU MVCC chain as the source of truth.
+
+### 2026-06-04 - Cross-paper synthesis: publication certificates need local staging and explicit durability clocks
+
+The last three reviews form a coherent write-path track. X-SSD says storage
+devices can expose fast-tier durability as counters and credits; Correct Remote
+Persistence says those counters are only correct if they name the actual
+persistence domain and ordering recipe; Serval says hot deterministic writes
+should be staged locally and summarized compactly before they touch the global
+visibility structure.
+
+**Converging design tracks:** GPU DB's mutation path should separate four
+frontiers: local pending-version staging, durable WAL/replica certification,
+CPU MVCC visibility publication, and GPU resident-snapshot refresh. Each
+frontier needs a named certificate or generation counter. A response should not
+implicitly mean all four are complete.
+
+**Category gaps:** This synthesis is still write-path heavy. The next useful
+paper should probably come from runtime/session scheduling, query
+optimization, or multi-tier cache placement unless a very strong MVCC/GC paper
+is queued.
+
+**Benchmark priorities:** The next write benchmark should model owner-local
+pending arrays plus WAL durability credits. The pass condition is bounded
+memory and correct visibility ordering under hot-key skew; the failure
+condition is any path where API completion, local staging, durable replay, or
+GPU freshness is reported as the wrong frontier.
