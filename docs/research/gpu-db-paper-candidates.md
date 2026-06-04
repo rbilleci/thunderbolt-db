@@ -200,9 +200,10 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://arxiv.org/abs/2302.00734`
   Why: cross-stack GPU DBMS performance, resource utilization, and concurrent
   query recommendations.
-- `queued` — **Efficiently Processing Joins and Grouped Aggregations on GPUs**,
-  arXiv 2023.
+- `reviewed` — **Efficiently Processing Joins and Grouped Aggregations on GPUs**,
+  Wu, Koutsoukos, and Alonso, SIGMOD/PACMMOD 2025.
   URL: `https://arxiv.org/abs/2312.00720`
+  DOI: `https://doi.org/10.1145/3709689`
   Why: modern evaluation of GPU joins, grouped aggregation, and workload-aware
   implementation selection.
 - `skipped` — **Red Fox: An Execution Environment for Relational Query
@@ -318,6 +319,18 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
   Why: cost-based CPU/GPU placement and execution orchestration for
   heterogeneous DBMS designs.
+- `queued` — **Distributed GPU Joins on Fast RDMA-capable Networks**,
+  Thostrup et al., PACMMOD 2023.
+  URL: `https://doi.org/10.1145/3588709`
+  Why: follow-up GPU join work on scaling join state and data movement across
+  RDMA-connected GPUs; relevant to future multi-device and network-aware
+  route planning.
+- `queued` — **Heterogeneous Intra-Pipeline Device-Parallel Aggregations**,
+  Kroviakov et al., DaMoN 2024.
+  URL: `https://doi.org/10.1145/3662010.3663441`
+  Why: recent aggregation work across CPU/GPU devices; useful follow-up for
+  deciding when grouped aggregation stays on GPU, splits by fragment, or falls
+  back to CPU under mixed route pressure.
 - `reviewed` — **Everything is a Transaction: Unifying Logical
   Concurrency Control and Physical Data Structure Maintenance in
   Database Management Systems**, Zhang et al., CIDR 2021.

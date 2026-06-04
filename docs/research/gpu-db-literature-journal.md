@@ -28726,3 +28726,160 @@ superior modern MVCC/cache-coherence candidate.
 - Treat deliberate delay as a first-class knob. Compare micro-batching for
   writes and compressed reads with explicit p50/p99 latency budgets instead
   of optimizing throughput alone.
+
+### 2026-06-04 - GPU joins and group-by need materialization-aware route choice
+
+**Citation:** Bowen Wu, Dimitrios Koutsoukos, and Gustavo Alonso.
+"Efficiently Processing Joins and Grouped Aggregations on GPUs."
+Proceedings of the ACM on Management of Data 3(1), SIGMOD/PACMMOD
+2025, Article 39. doi:10.1145/3709689. Retrieved 2026-06-04 from
+`https://arxiv.org/abs/2312.00720`.
+
+**Category:** GPU execution / analytics; query optimization / planning.
+
+**Relevance tags:** GPU joins; grouped aggregation; materialization
+cost; random access; coalesced memory; radix partitioning; shared
+memory aggregation; route heuristics; GPU resident snapshots; output
+scattering; wide joins; group cardinality.
+
+**Core idea:** The paper's strongest lesson is that GPU join and
+group-by performance is often dominated by the supposedly boring final
+step: fetching payload columns and materializing output. Existing
+sort-/partition-based GPU joins can find matches efficiently, but then
+use randomly permuted tuple ids to gather payloads from the original
+relations. On an A100, the paper reports that this unclustered
+materialization can account for most of the operator runtime on wide
+joins.
+
+The authors propose "gather-from-transformed-relations" (GFTR): transform
+payload columns together with join or group keys, so later materialization
+reads clustered, transformed payloads instead of doing random gathers
+from the original layout. GFTR intentionally spends extra sequential
+sort/partition bandwidth to avoid random global-memory traffic. The
+important optimizer lesson is that this is not always better; it depends
+on match ratio, payload width, key width, group cardinality, data skew,
+and whether a downstream sort/order can reuse the transformed order.
+
+**Concrete mechanisms:**
+
+- The paper contrasts GFUR, where transformed keys carry tuple ids and
+  payloads are gathered from untransformed input, with GFTR, where
+  payload columns are transformed with the keys and then read
+  sequentially.
+- A microbenchmark over 2^27 4-byte elements on an A100 reports that
+  clustered gather is 8.52x faster than unclustered gather; the authors
+  model random global-memory bandwidth as roughly one twenty-fourth of
+  peak sequential bandwidth.
+- For partitioned hash joins, bucket-chain partitioning is unsuitable
+  for GFTR because atomic allocation makes per-column partition output
+  non-deterministic, and bucket fragmentation prevents constant-time
+  indexed payload lookup.
+- Their partitioned hash join replaces bucket chains with stable
+  radix-partition output stored in contiguous arrays. Histogram and
+  prefix-sum metadata recover partition offsets and sizes, while large
+  partitions are further split for load balance.
+- For wide primary/foreign-key joins, radix-partition GFTR reduces
+  random materialization. The paper reports up to 2.3x over the prior
+  partitioned hash join and 1.6x for GFTR sort-merge over GFUR
+  sort-merge in the evaluated wide-join cases.
+- A match-ratio cost model predicts when GFTR beats GFUR. In their
+  partitioned hash join model, the empirical turning point is near a
+  25% match ratio for the tested wide joins; below that, paying to
+  transform all payloads can lose to gathering a small result.
+- The radix-partition approach is more robust to foreign-key skew than
+  bucket-chain partitioning because the radix primitive balances work
+  independent of key distribution, while bucket allocation/bookkeeping
+  synchronization grows with skew.
+- For group-by, the paper redesigns hash aggregation so stage one assigns
+  compact group ids, and stage two aggregates into dense arrays. When
+  group state fits, per-block shared-memory aggregation reduces global
+  atomic contention.
+- The partition-based group-by partitions keys and payloads, then assigns
+  partitions to thread blocks with local shared-memory hash tables. It
+  handles one-group, small-group, and too-many-group partitions with
+  different aggregation paths.
+- Dictionary encoding reduces sort-based group-by cost when many payload
+  columns share the same group keys: after discovering group ids, later
+  payload columns sort on compact encoded keys instead of full-width
+  keys.
+- The authors end with optimizer heuristics: choose partitioned GFTR joins
+  for moderate/high match ratios, skewed foreign keys, or 8-byte keys;
+  prefer GFUR partitioned joins for low match ratios. For group-by, choose
+  hash aggregation when shared memory can hold group state, partitioned
+  group-by for high-cardinality uniform groups, and sort/dictionary routes
+  when sort semantics or downstream order make sorting valuable.
+
+**GPU DB mapping:** This paper is a direct argument for making
+materialization shape part of the route descriptor. A retained GPU join
+route should not only know input relations, predicates, and resident
+device handles. It should know projected payload count, expected match
+ratio, group cardinality estimate, key width, payload widths, skew
+estimate, output row order requirements, and whether transforming payload
+columns can be reused by a later aggregation or order-sensitive step.
+
+For the P8 storage design, the result says resident column groups should
+carry enough layout metadata to support both "gather from source columns"
+and "operate on transformed column groups" routes. A hot table with wide
+join projections may deserve a transformed or partitioned resident
+layout even when a narrow point lookup only needs a dense key vector.
+That layout decision should be versioned with the retained snapshot so
+MVCC visibility and row identity remain explicit.
+
+The GFTR/GFUR distinction also maps to response scattering. For repeated
+same-shape lookup micro-batches, transforming the key vector and payloads
+together may reduce device-side random access, but each logical session
+still needs its own response order. The runtime should separate internal
+GPU-friendly order from pgwire-visible request/result order using a
+stable row-id or request-id scatter map.
+
+For grouped aggregation, the shared-memory and partitioned paths suggest
+three route classes instead of a single GPU aggregate operator: tiny/low
+cardinality groups use shared-memory-local aggregation, high-cardinality
+uniform groups use partitioned aggregation, and skewed groups use
+sort-based or special large-partition handling. That is useful for
+session concurrency because a bad aggregate route can monopolize GPU
+time; admission should route by group cardinality and skew risk before
+launch.
+
+**Risks and mismatches:** The paper assumes operator inputs and outputs
+fit in GPU memory and focuses on in-memory analytical joins and grouped
+aggregations. It does not cover MVCC visibility checks, WAL ordering,
+transactional updates, text-heavy SQL values, nullable payloads, outer
+joins, pgwire portals, or larger-than-device execution. The evaluated
+joins are mostly primary/foreign-key plus selected many-to-many cases,
+so the exact thresholds should not be copied into GPU DB without
+measurement. Transforming payloads can also duplicate resident data and
+increase invalidation/refresh cost under updates. For GPU DB, GFTR is a
+route option, not a storage default.
+
+**Benchmark candidates:**
+
+- Add a no-GPU planner model that predicts GFUR versus GFTR from
+  projected payload bytes, estimated match ratio, key width, payload
+  width, group cardinality, skew, and downstream order/group reuse. Gate:
+  every decision records the predicted reason and fallback path.
+- Once GPU hardware is available, implement a narrow resident join
+  microbenchmark with two paths: gather payloads from dense source
+  columns versus transform payloads with keys before materialization.
+  Metrics: kernel time, HBM bytes, random/clustered access counters where
+  available, output rows, and p50/p99 under concurrent retained reads.
+- Build a CPU simulation of transformed resident layout invalidation:
+  partitioned key/payload chunks tied to a snapshot generation and row-id
+  map. Gate: updates publish a new visibility boundary without corrupting
+  old snapshot row identity or pgwire result order.
+- Extend retained aggregate tests with route classes for low-cardinality,
+  high-cardinality uniform, and skewed group distributions. Failure
+  condition: one fixed aggregate route is chosen despite worse p99 or GPU
+  occupancy under another distribution.
+- Add "materialization dominates" telemetry to GPU operators: match search
+  time, transformation time, payload materialization time, scatter time,
+  output bytes, and transformed-layout bytes. Gate: optimizer thresholds
+  are derived from measured phases, not only total operator runtime.
+- Test route reuse across join followed by group-by. Compare materializing
+  join output fully, keeping transformed payload order for grouped
+  aggregation, and CPU fallback for low match ratio. Gate: the fastest
+  route preserves SQL-visible result correctness and explicit snapshot
+  generation.
+- Add admission protection for large transformed outputs. A GFTR route
+  must reserve scratch/output memory before launch and reject or fall back
+  when transforming all payload columns would exceed the GPU memory budget.
