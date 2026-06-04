@@ -1044,7 +1044,7 @@ Append new candidates here as each paper is processed.
   2PL, timestamp ordering, MVCC, OCC, GPUTx, and GaccO-style conflict-graph or
   deterministic locking schemes; useful follow-up for deciding which GPU write
   batch protocol is benchmark-worthy.
-- `queued` — **Accelerating in-memory transaction processing using general
+- `reviewed` — **Accelerating in-memory transaction processing using general
   purpose graphics processing units**, Gao et al., Future Generation Computer
   Systems 2019.
   URL: `https://doi.org/10.1016/j.future.2019.03.034`
@@ -1052,6 +1052,18 @@ Append new candidates here as each paper is processed.
   gCCTB study; useful for comparing GPU transaction execution models, GPU hash
   table/B+ tree indexing, and SmallBank/TPC-C write-path claims against
   conflict-control-only testbeds.
+- `queued` — **Thread-Level Locking for SIMT Architectures**, Gao et al.,
+  IEEE TPDS 2020.
+  URL: `https://doi.org/10.1109/TPDS.2019.2955705`
+  Why: GPU-TPS builds on GPU-side fine-grained locking constraints; useful for
+  isolating whether thread-level locks can safely support GPU DB write-batch
+  admission, conflict handling, and hot-row synchronization.
+- `queued` — **Towards a General and Efficient Linked-List Hash Table on
+  GPUs**, Gao et al., HPCC/SmartCity/DSS 2019.
+  URL: `https://doi.org/10.1109/HPCC/SmartCity/DSS.2019.00064`
+  Why: GPU-TPS depends on GPU-friendly unordered indexes; useful for comparing
+  resident hash-table update costs against sorted vectors, B-trees, and
+  rebuild-at-generation-boundary index routes.
 - `reviewed` — **LibPreemptible: Enabling Fast, Adaptive, and
   Hardware-Assisted User-Space Scheduling**, Li et al., HPCA 2024.
   URL: `https://doi.org/10.1109/HPCA57654.2024.00075`

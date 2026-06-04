@@ -35258,3 +35258,123 @@ cross-owner fenced writes before choosing a permanent owner split. Third,
 benchmark resident point-index families under the same MVCC generation and HBM
 budget harness so RT-core, hash, B-tree, and sorted-vector routes compete on
 the same truth boundary.
+
+### 2026-06-04 - GPU-TPS maps OLTP writes onto SIMT with grouping, locks, and GPU indexes
+
+**Citation:** Lan Gao, Yunlong Xu, Rui Wang, Hailong Yang, Zhongzhi
+Luan, and Depei Qian. "Accelerating in-memory transaction processing
+using general purpose graphics processing units." Future Generation Computer
+Systems 97, 2019, pp. 836-848. doi:10.1016/j.future.2019.03.034.
+Retrieved 2026-06-04 from the ScienceDirect DOI page
+`https://doi.org/10.1016/j.future.2019.03.034`.
+
+**Category:** Transaction processing / write path; GPU execution / analytics;
+MVCC / snapshot / visibility.
+
+**Relevance tags:** GPU OLTP; transaction batching; SIMT divergence; two-phase
+locking; GPU hash table; GPU B+ tree; SmallBank; TPC-C; resident write path.
+
+**Core idea:** GPU-TPS is a 2015-present GPU OLTP baseline that treats
+transaction processing as a GPU-resident batch execution problem instead of
+only a scan or join problem. The paper's useful contribution for GPU DB is not
+that every transaction should run on the GPU. It is the decomposition of GPU
+OLTP bottlenecks: branch divergence from mixed transaction control flow,
+correctness-preserving synchronization inside GPU kernels, and the lack of
+GPU-friendly dynamic indexes for store-heavy transactions.
+
+GPU-TPS attacks those bottlenecks with transaction grouping and mapping before
+kernel launch, a GPU transaction execution model that can synchronize
+transactions, and GPU-oriented unordered and ordered index structures. The DOI
+page reports that GPU-TPS evaluates SmallBank and TPC-C, outperforming a
+hardware-transactional-memory CPU OLTP baseline by 3.8x on SmallBank and 1.9x
+on TPC-C, and outperforming the older GPUTx GPU OLTP baseline by 1.6x and
+1.8x respectively. This run could read the ScienceDirect abstract, highlights,
+and introduction; full algorithmic details beyond that page remain unknown in
+this run.
+
+**Concrete mechanisms:**
+
+- Group and map transactions before launching GPU transaction kernels to
+  reduce SIMT branch divergence. This is a different batching axis from simply
+  collecting any pending write: compatible transaction type and control-flow
+  shape matter.
+- Pipeline transaction grouping/mapping with transaction processing so the CPU
+  preprocessing path does not become the sole limiter while the GPU drains the
+  previous batch.
+- Implement two-phase locking on GPUs using a thread-level locking approach
+  for transaction consistency. The paper frames this as a way to provide
+  synchronization among transactions despite the GPU's weak fit for
+  fine-grained lock management.
+- Add a device memory management mechanism to avoid expensive dynamic
+  allocation/deallocation inside GPU kernels.
+- Optimize both common OLTP index families: hash tables for unordered stores
+  and B+ trees for ordered stores.
+- For B+ trees, use readers-writer-lock synchronization plus a tree-division
+  approach to expose more parallelism and reduce synchronization bottlenecks.
+- Evaluate on SmallBank and TPC-C, comparing against DrTM and GPUTx. Reported
+  improvements are throughput/latency claims from the DOI page; this run did
+  not retrieve the full plots, hardware configuration, or sensitivity tables.
+
+**GPU DB mapping:** GPU-TPS reinforces that a GPU DB write path needs a
+transaction-shape admission contract. The current runtime already describes
+COPY admission batches and same-shape lookup batches; GPU-TPS suggests adding
+same-shape write batches where the admission key includes transaction family,
+expected index operations, write-set pattern when known, and conflict risk.
+Sending unrelated OLTP statements into one GPU batch may waste warp lanes even
+if it increases batch size.
+
+For write throughput, the strongest transferable idea is a typed GPU write
+lane with explicit correctness mode. Some stored-procedure-like writes could
+route to a `gpu_2pl_batch` or `gpu_deterministic_batch` when enough compatible
+work is queued, while singleton writes, high-conflict hot keys, DDL, and
+latency-sensitive transactions stay on CPU or a partition owner. The route
+should expose grouping delay, GPU lock wait, abort/retry count, and index
+maintenance time separately.
+
+For MVCC and snapshots, GPU-TPS's lock-based consistency is not directly the
+same as GPU DB's current WAL/MVCC baseline. The safe mapping is to treat GPU
+write execution as speculative or staged until the mutation owner can preserve
+WAL-before-visibility. A GPU batch may compute write effects and conflict
+decisions, but CPU/WAL truth must still publish the visibility boundary before
+new read snapshots trust the result.
+
+For resident indexes, GPU-TPS is a reminder that write-heavy resident index
+routes are a separate design from RTIndeX-style read-mostly acceleration.
+Hash-table and B+ tree update paths need their own HBM budget, lock telemetry,
+allocation strategy, and rebuild/replay story. If updates are frequent, a
+mutable GPU index may be justified; if not, generation-boundary rebuilds may
+remain simpler and safer.
+
+**Risks and mismatches:** GPU-TPS appears to focus on in-memory GPU execution
+for benchmark transaction types, not a full SQL engine with arbitrary
+statements, durability, DDL, multi-version read snapshots, text/collation
+semantics, or larger-than-device-memory tiering. Locking inside GPU kernels may
+behave poorly under skew and could serialize hot rows while consuming scarce
+GPU execution capacity. Grouping delays can improve throughput while harming
+p50 latency, especially with many logical sessions and low per-shape arrival
+rates. Unknown from this read: exact transaction mapping data structures, lock
+deadlock/ordering rules, index update algorithms, memory reclamation behavior,
+and whether the reported latency includes CPU grouping and transfer costs.
+
+**Benchmark candidates:**
+
+- Add a GPU write-batch admission benchmark with transaction-shape grouping:
+  same procedure only, same index family only, and mixed arbitrary writes.
+  Measure grouping delay, kernel time, lock wait, WAL publication wait, and
+  p50/p99 latency.
+- Prototype a staged GPU write lane where the GPU computes candidate write
+  effects and conflict outcomes, but the mutation owner appends WAL and
+  publishes visibility. Failure condition: any GPU result becomes visible
+  before WAL-before-visibility is proven.
+- Compare mutable GPU hash/B+ tree updates against immutable
+  generation-rebuilt resident indexes for equality and range predicates.
+  Include HBM allocation, temporary memory, rebuild time, and update skew.
+- Add a SIMT divergence sweep over transaction mixes: 100/0, 90/10, 75/25,
+  50/50, and fully mixed procedure families. The route should reject GPU
+  batching when mixed control flow erases throughput gains.
+- Add a hot-row contention sweep for GPU locks. Measure whether lock wait
+  consumes GPU occupancy and whether CPU/partition-owner execution wins under
+  high skew.
+- Add a latency-ceiling micro-batch gate for write batches. The GPU write lane
+  may wait for compatible transactions only up to a configured microsecond
+  budget, then route or fall back explicitly.
