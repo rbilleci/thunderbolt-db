@@ -36227,3 +36227,136 @@ WAL replay, DDL invalidation, or retained snapshot retirement.
   expansion only, CXL append/log service, CXL near-storage filter, and direct
   GPU transfer. The first proof metric is correctness of fences and
   invalidation, not peak bandwidth.
+
+### 2026-06-04 - GPU B-Trees need warp-shaped nodes and restart-on-contention updates
+
+**Citation:** Muhammad A. Awad, Saman Ashkiani, Rob Johnson, Martin
+Farach-Colton, and John D. Owens. "Engineering a High-Performance GPU B-Tree."
+PPoPP 2019. Retrieved 2026-06-04 from
+`https://par.nsf.gov/servlets/purl/10101116`.
+
+**Category:** GPU execution / analytics.
+
+**Relevance tags:** GPU indexes; B-tree; B-link tree; warp cooperative work
+sharing; range lookup; successor lookup; mutable resident index; contention;
+coalesced memory access; GPU cache behavior.
+
+**Core idea:** The paper shows that a mutable GPU B-tree can support point
+lookups, range queries, successor queries, insertions, and deletions at high
+throughput if the tree is engineered around warp-wide memory behavior rather
+than copied from CPU latch-coupled designs. The central claim is that
+contention, not just raw memory bandwidth, is the limiting factor for a
+dynamic GPU tree.
+
+The transferable idea for GPU DB is narrower than "put all indexes on the
+GPU." A resident index should be shaped so a warp can read one node with
+coalesced accesses, should avoid long spin waits on hot nodes, and should make
+its update semantics explicit enough that the database can place it either
+inside one MVCC generation or behind a controlled refresh/update lane.
+
+**Concrete mechanisms:**
+
+- Each B-tree node is one 128-byte GPU cache-line-sized object. With 32-bit
+  keys, values, pivots, and offsets, the node stores 15 key-value or
+  pivot-offset pairs plus a side-link pair.
+- The tree uses B-link-style level-wise right links. A side link stores the
+  right sibling pointer and the right sibling's minimum key, letting readers
+  recover when a concurrent split has updated the lower level before the
+  parent pointer is visible.
+- Reads are latch-free. A warp traverses in read mode for queries and for the
+  read phase of updates.
+- Writes use a single exclusive write latch embedded in a node entry. After
+  acquiring a latch, the warp rereads the node because another warp may have
+  changed it between traversal and latch acquisition.
+- Insertions use proactive splitting: a full node is split during traversal
+  instead of waiting for leaf overflow and then holding a locked path from a
+  safe ancestor.
+- Splits are limited to two adjacent tree levels, and the side links preserve
+  correct search behavior while parent updates catch up.
+- The implementation generally restarts from the last known parent or root
+  rather than spinning on contended latches. On a small tree in their
+  experiment, restarts improved insertion throughput by 6.39x over spinlocks,
+  while backoff alone improved it by 1.47x.
+- Warp cooperative work sharing assigns operations per thread but executes
+  each warp's active tasks cooperatively. This serializes a warp's task queue
+  so all lanes cooperate on one tree access at a time, reducing divergence and
+  making node reads/writes coalesced.
+- The implementation uses CUDA warp primitives such as ballot, find-first-set,
+  and shuffle to choose lanes and broadcast keys or task metadata within a
+  warp.
+- Bulk build sorts key-value pairs and builds the tree bottom-up. Incremental
+  insertion wins for smaller and medium update batches, while sorted-array or
+  LSM-style rebuilds win only at larger batch sizes.
+- For correctness in mixed concurrent operations, the paper bypasses or
+  carefully controls stale L1 behavior and uses memory fences around latch
+  acquire/release. It explicitly says strict serial semantics are not provided
+  by the raw concurrent mixed-operation benchmark; applications may phase
+  reads and updates.
+- Reported evaluation on a TITAN V includes average point lookup throughput
+  around 1020 MQuery/s, roughly 6.44x faster than the compared GPU LSM and
+  3x faster than the compared GPU sorted array. Range queries with expected
+  length 8 average about 502 MQuery/s, roughly 3x the GPU LSM comparison.
+  Average incremental insertion throughput is reported around 182.9 MKey/s
+  versus 0.166 MKey/s for their baseline GPU B-tree.
+
+**GPU DB mapping:** This is a strong resident-index design candidate for P8's
+hot equality and range routes, but only if scoped behind database visibility
+rules. The first useful mapping is an immutable or generation-local GPU B-tree:
+build from a CPU/MVCC snapshot boundary, publish it as part of a retained read
+snapshot, and let many read workers use it latch-free until invalidation.
+
+The update mechanisms are still valuable, but they should initially be treated
+as a benchmark lane rather than the default correctness path. If GPU DB later
+admits GPU-side resident index updates inside a write batch, proactive splits,
+side links, and restart-on-contention give a concrete alternative to spin-heavy
+GPU latching. Publication still has to happen at WAL/MVCC generation
+boundaries; the GPU tree cannot decide SQL visibility by hardware scheduling.
+
+Warp cooperative work sharing maps directly to retained lookup
+micro-batching. Same-shape key lookups can be grouped so a warp cooperates on
+node traversal and result scatter instead of assigning one independent lookup
+per lane and suffering divergent memory access. The 128-byte node design is
+also a useful warning: resident index nodes should be sized to the target
+GPU's cache/coalescing behavior, not to CPU B-tree page conventions.
+
+The side-link design is useful for refresh and maintenance too. A GPU
+resident index rebuild or incremental refresh could publish new sibling links
+before the parent directory is fully stable, but only within an unpublished
+or generation-local structure. For published SQL routes, the safer first
+version is still copy/build/validate/publish, then retire the old generation
+after readers release it.
+
+**Risks and mismatches:** The paper's raw concurrent semantics are not SQL
+transaction semantics. Operations in a mixed batch complete in hardware-
+dependent order, and the authors call out that strict serial semantics are
+incompatible with that implementation. The design assumes 32-bit keys and
+values and reserves a key bit for latching/metadata, which does not directly
+fit SQL keys, composite indexes, text prefixes, NULL handling, or MVCC
+visibility metadata. It does not handle data larger than GPU memory, durability,
+WAL replay, catalog invalidation, crash recovery, or host/GPU tier placement.
+It also evaluates dictionary operations rather than planner-selected SQL
+workloads with pgwire sessions and mixed transactional visibility.
+
+**Benchmark candidates:**
+
+- Build a synthetic resident GPU B-tree route for `int4` key lookups over one
+  published MVCC generation. Compare against sorted key-vector binary search
+  and hash index lookup. Minimum gate: identical SQL-visible results for a
+  fixed snapshot boundary.
+- Test warp cooperative lookup batching with batch sizes 1, 4, 16, 32, 128,
+  and 1024. Measure p50/p95 latency, kernel launches, HBM reads, and result
+  scatter cost. Failure condition: batching improves throughput only by
+  violating the retained-read latency target.
+- Compare immutable rebuild-at-generation-boundary with incremental GPU-side
+  inserts under low, medium, and high update rates. Proof gate: WAL-applied
+  invalidation happens before any new reader selects a stale index generation.
+- Add a hot-key contention test for GPU-side updates with spin, backoff, and
+  restart-on-contention policies. The first metric is forward progress and
+  tail latency, not only peak insertion throughput.
+- Benchmark node sizes aligned to 128-byte GPU cache lines versus wider
+  fanout nodes. Track cache hit rate, memory transactions per lookup, branch
+  divergence, and tree height.
+- Add a mixed route test where CPU truth updates continue while retained GPU
+  B-tree readers finish on an old generation. Failure condition: old readers
+  are forced to block behind refresh, or new readers can observe an invalidated
+  generation.

@@ -2654,7 +2654,7 @@ Append new candidates here as each paper is processed.
   Why: the GPU OLTP concurrency-control study contrasts against CPU CC
   benchmarking gaps; CCBench is useful for separating CPU-owner concurrency
   limits from GPU-specific SIMT and launch-parameter effects.
-- `queued` — **Engineering a High-Performance GPU B-Tree**, Awad et al.,
+- `reviewed` — **Engineering a High-Performance GPU B-Tree**, Awad et al.,
   PPoPP 2019.
   URL: `https://doi.org/10.1145/3293883.3295706`
   PDF: `https://par.nsf.gov/servlets/purl/10101116`
@@ -3011,6 +3011,13 @@ Append new candidates here as each paper is processed.
   Why: Database Kernels contrasts naive CXL-Flash memory expansion with richer
   DBK semantics; useful for benchmarking simple load/store CXL storage against
   explicit database-owned placement and offload contracts.
+
+- `queued` — **A Dynamic Hash Table for the GPU**, Ashkiani, Farach-Colton,
+  and Owens, IPDPS 2018.
+  URL: `https://doi.org/10.1109/IPDPS.2018.00052`
+  Why: the GPU B-Tree paper uses its warp cooperative work-sharing strategy;
+  useful for comparing resident GPU hash indexes against B-tree and LSM-style
+  mutable dictionary routes for point lookups and batched updates.
 - `queued` — **PLayer: Expanding Coherence Protocol Stack with a Persistence
   Layer**, Braun, Ramdas, Friedman, and Alonso, DIMES 2023.
   URL: `https://doi.org/10.1145/3609308.3625270`
