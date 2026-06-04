@@ -49678,3 +49678,153 @@ admission harness that exercises 1M idle logical sessions, a bounded active
 request subset, route-lane queues, power-of-k selection, stale telemetry,
 cancellation, and disconnect cleanup. Passing that gate would make GPU
 execution-worker scheduling much less speculative.
+
+### 2026-06-05 - RPCValet makes single-queue behavior possible without software lock contention
+
+**Citation:** Alexandros Daglis, Mark Sutherland, and Babak Falsafi.
+"RPCValet: NI-Driven Tail-Aware Balancing of Microsecond-Scale RPCs."
+ASPLOS 2019, pp. 35-48. doi:10.1145/3297858.3304070. Retrieved
+2026-06-05 from the ACM DOI and author PDF,
+`https://doi.org/10.1145/3297858.3304070` and
+`https://faculty.cc.gatech.edu/~adaglis/files/papers/RPCValet_asplos19.pdf`.
+
+**Category:** runtime / HFT / session scale; high-concurrency
+admission; network/runtime co-design.
+
+**Relevance tags:** microsecond RPCs; tail latency; request dispatch;
+single-queue emulation; bounded outstanding work; NIC/CPU co-design;
+hardware-terminated protocols; response completion; flow control; queue
+affinity; low-synchronization scheduling.
+
+**Core idea:** RPCValet argues that once network latency drops toward
+microsecond or sub-microsecond service times, endpoint dispatch becomes a
+tail-latency bottleneck. Static per-core receive queues avoid software
+synchronization but create load imbalance; a shared software queue balances
+better but adds lock contention that is too expensive for tiny RPCs.
+RPCValet tries to get the best of both: the network interface observes
+message completion, maintains a shared dispatch frontier, and pushes each
+request notification to an available core's private queue.
+
+The key design distinction is between where the request bytes live and which
+core is assigned to process them. Incoming messages are placed in shared
+receive-buffer slots, but the NI separately chooses a handler core and writes
+only a receive-slot pointer into that core's completion queue. This decouples
+network arrival from per-core assignment and lets the system behave like a
+single FIFO feeding many workers without making workers contend on a shared
+software queue.
+
+The evaluation uses a simulated 16-core soNUMA-style chip plus synthetic
+RPCs, HERD, and Masstree get/scan distributions. RPCValet reports up to
+1.4x higher throughput under tight tail-latency goals than less flexible
+hardware queuing, up to 4x lower pre-saturation tail latency, 2.3-2.7x
+higher throughput than a software single-queue implementation under the
+same SLO, and within 3-15% of the theoretical single-queue model.
+
+**Concrete mechanisms:**
+
+- Each participating thread keeps a private queue pair, preserving
+  synchronization-free polling on the CPU side.
+- The system adds native messaging semantics to a one-sided/RDMA-like
+  baseline so the receiving NI can distinguish message arrivals from ordinary
+  remote writes and create CPU notification events.
+- Incoming messages are written into a shared PGAS-resident receive buffer.
+  The NI enqueues a pointer to the completed receive slot in a shared
+  hardware completion queue.
+- A centralized NI dispatch stage tracks outstanding requests per core and
+  writes the receive-slot pointer into a selected core's private completion
+  queue.
+- A replenish operation follows request processing. It notifies the source
+  that the send-buffer slot can be reused and informs the dispatcher that the
+  handler core has completed a previously assigned request.
+- The ideal single-queue behavior allows one outstanding request per core.
+  The implementation often uses two outstanding requests per core to remove
+  small execution bubbles for extremely short RPCs.
+- Packet and data handling remain parallel across NI backends; only the final
+  dispatch decision is centralized.
+- The simple proof-of-concept policy dispatches FIFO work to cores whose
+  outstanding count is below threshold, but the paper notes that policies
+  could incorporate request type, affinity, data locality, or richer load
+  estimates.
+- The hardware state is intentionally small: most send/receive buffers live
+  in host memory, with only buffer metadata and dispatch counters kept in
+  fast NI state.
+- The Masstree experiment mixes latency-critical gets with longer scans,
+  showing that occupancy feedback can steer gets away from cores currently
+  occupied by long work.
+
+**GPU DB mapping:** RPCValet strengthens the runtime target in
+`11-high-throughput-query-runtime.md`: pgwire IO workers should decouple
+request bytes and response buffers from final execution ownership. A frontend
+message, decoded COPY chunk, or retained-read request can live in an ingress
+buffer while a compact route token names the selected owner, worker, route
+lane, and buffer id. The handler should receive a pointer or handle, not
+force all workers to contend on one shared software queue.
+
+The one-or-two outstanding request rule maps well to admission credits. Each
+network worker, mutation owner, read snapshot worker, GPU execution lane, and
+response writer should expose a small active-window limit. More logical
+sessions may exist, but only a bounded number of requests should be assigned
+to a lane before completion signals return capacity. For 1M logical sessions,
+this distinction between idle session state and assigned work is crucial.
+
+The replenish mechanism is a useful model for buffer ownership. GPU DB needs
+completion signals that release pgwire input buffers, decoded COPY chunks,
+pinned staging buffers, retained-read result slots, and response buffers only
+after the owning domain has finished with them. A request's SQL execution
+completion is not enough if network writeback, GPU DMA, WAL publication, or
+cleanup ownership is still outstanding.
+
+RPCValet also suggests a practical benchmark shape for mixed route lanes.
+Short retained reads should not wait behind long scans, refresh jobs, or
+mutation batches merely because they landed on the wrong worker queue. The
+engine can emulate the paper's Masstree get/scan setup with point lookups
+mixed against long retained scans and refresh work, then compare static
+queue assignment, software shared queues, sampled admission, and active-window
+dispatch.
+
+**Risks and mismatches:** RPCValet assumes hardware-terminated protocols and
+an integrated NI with nanosecond-scale access to CPU load state. Near-term
+GPU DB uses ordinary TCP/pgwire, OS sockets, and CPU-owned IO workers, so the
+hardware mechanism is not directly available. The transferable idea is the
+dispatch structure: separate byte storage from route assignment, keep worker
+queues private, bound outstanding work, and make completion release capacity.
+
+The paper's requests are microsecond RPCs, not SQL transactions. SQL routes
+carry transaction state, prepared statements, portals, catalog generation,
+MVCC visibility, WAL ordering, resident GPU snapshots, and error handling.
+A GPU DB dispatch token must prove those frontiers before steering work to
+the least-loaded lane. RPCValet's request completion also has weaker failure
+semantics than database work; disconnect, cancellation, abort, and crash
+recovery must release or rebuild every buffer and ownership record
+deterministically.
+
+The evaluation is simulation-based on a 16-core chip and uses synthetic,
+HERD, and Masstree service-time distributions. It is strong evidence about
+queueing shape and synchronization costs, not an absolute throughput
+prediction for PostgreSQL wire protocol, GPU kernels, WAL flushes, or
+multi-tier storage.
+
+**Benchmark candidates:**
+
+- Add a CPU-only route-dispatch harness with three modes: static per-worker
+  queues, software shared queue, and handle-based dispatch to private worker
+  queues with bounded outstanding credits. Measure p50/p99 queue wait and
+  throughput under short retained reads mixed with long scans.
+- Add per-lane active-window limits of one and two outstanding requests and
+  compare queue bubbles, head-of-line blocking, and tail latency for retained
+  point lookups, retained aggregates, COPY chunks, and refresh work.
+- Prototype replenish-style completion records for request buffers:
+  `request_id`, ingress buffer id, selected route lane, selected owner,
+  response buffer id, completion generation, and release reason. Gate: no
+  buffer remains pinned after normal completion, cancellation, overload, or
+  disconnect.
+- Compare static queue assignment against route-token steering where request
+  bytes stay in a shared ingress slab and workers receive compact handles.
+  Failure condition: shared queue locking or cross-worker stealing dominates
+  p99 latency for microsecond-scale retained reads.
+- Build a Masstree-like mixed-service benchmark for GPU DB: many point reads,
+  a small fraction of long scans or refreshes, and a fixed p99 SLO. Expected
+  improvement: short-read p99 remains bounded until true capacity saturation.
+- Add telemetry for assigned-but-not-started work per lane. Admission should
+  reject, defer, or fallback based on active-window pressure before route
+  queues hide tail buildup.

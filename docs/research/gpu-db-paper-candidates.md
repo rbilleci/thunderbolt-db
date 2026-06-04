@@ -2380,12 +2380,32 @@ Append new candidates here as each paper is processed.
   useful for deciding whether GPU DB should use explicit cooperative yield
   probes, request-budget probes, or cheaper route-local cancellation checks
   around long scans, refresh jobs, and mutation batches.
-- `queued` — **RPCValet: NI-Driven Tail-Aware Balancing of microsecond-scale
-  RPCs**, Sutherland et al., ASPLOS 2019.
-  URL: `https://doi.org/10.1145/3297858.3304050`
+- `reviewed` — **RPCValet: NI-Driven Tail-Aware Balancing of microsecond-scale
+  RPCs**, Daglis, Sutherland, and Falsafi, ASPLOS 2019.
+  URL: `https://doi.org/10.1145/3297858.3304070`
+  PDF: `https://faculty.cc.gatech.edu/~adaglis/files/papers/RPCValet_asplos19.pdf`
   Why: Concord cites RPCValet as a JBSQ-style dispatcher placement point;
   useful for comparing CPU-owned IO-worker scheduling with NIC-assisted
   request steering, bounded per-worker queues, and response-path priorities.
+- `queued` — **NetClone: Fast, Scalable, and Dynamic Request Cloning for
+  Microsecond-Scale RPCs**, Sutherland et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2307.13285`
+  Why: RPCValet and related microsecond RPC schedulers focus on dispatch;
+  NetClone is a modern follow-up on request cloning, useful for testing
+  whether GPU DB should ever duplicate short retained reads across CPU/GPU
+  lanes under tail pressure, and what cancellation/cleanup costs that creates.
+- `queued` — **Dagger: Accelerating RPCs in Cloud Microservices Through
+  Tightly-Coupled Reconfigurable NICs**, Kumar et al., ISCA 2021.
+  URL: `https://arxiv.org/abs/2106.01482`
+  Why: RPCValet points toward tighter CPU/NI co-design; Dagger is a later
+  tightly-coupled NIC/RPC-stack design that may inform future pgwire offload,
+  request parsing, and response steering boundaries.
+- `queued` — **Rain: RDMA-assisted In-Network Scheduling for
+  Microsecond-scale Workloads**, arXiv 2026.
+  URL: `https://arxiv.org/abs/2606.03352`
+  Why: modern in-network/RDMA scheduling follow-up; useful for comparing
+  switch-assisted scheduling against GPU DB's in-process route admission and
+  for testing whether slice-aware scheduling maps to route lanes.
 - `queued` — **Releasing Locks As Early As You Can: Reducing Contention of
   Hotspots by Violating Two-Phase Locking**, Guo, Wu, Yan, and Yu,
   SIGMOD 2021.
