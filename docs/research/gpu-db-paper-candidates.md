@@ -1262,9 +1262,9 @@ Append new candidates here as each paper is processed.
   Why: cited by TOPSI as a PSI freshness direction; useful for comparing
   snapshot freshness and abort-rate tradeoffs against scalar-prefix visibility
   certificates.
-- `queued` — **FW-KV: Improving Read Guarantees in PSI**, Javidi Kishi and
+- `reviewed` — **FW-KV: Improving Read Guarantees in PSI**, Javidi Kishi and
   Palmieri, Middleware 2021.
-  URL: `https://doi.org/10.1145/3464298.3493400`
+  URL: `https://doi.org/10.1145/3464298.3476131`
   PDF: `https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-MIDDLEWARE-2021.pdf`
   Why: full FPSI successor that evaluates fresher PSI snapshots on YCSB and
   TPC-C; useful for checking whether version-access metadata remains practical
@@ -1279,6 +1279,13 @@ Append new candidates here as each paper is processed.
   externally consistent read-only transactions without centralized
   synchronization; useful for comparing PSI freshness against stronger
   client-visible ordering.
+- `queued` — **GMU: Genuine Multiversion Update-Serializable Partial Data
+  Replication**, Peluso et al., IEEE TPDS 2016.
+  URL: `https://doi.org/10.1109/TPDS.2015.2465906`
+  Why: FW-KV names GMU as a related multiversion partial-replication design
+  that advances snapshots while preserving update-serializable guarantees;
+  useful for comparing version-access metadata with stronger replicated MVCC
+  visibility rules.
 - `reviewed` — **Amazon Aurora: Design Considerations for High Throughput
   Cloud-Native Relational Databases**, Verbitski et al., SIGMOD 2017.
   URL: `https://doi.org/10.1145/3035918.3056101`

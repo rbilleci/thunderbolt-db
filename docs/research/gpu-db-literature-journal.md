@@ -50194,3 +50194,147 @@ state, bounded active-window credits, freshness-frontier checks, cancellation,
 refresh lag, and buffer replenishment. Passing that gate gives the GPU path a
 stable contract before CUDA concurrency or DeltaTree-style resident deltas are
 optimized.
+
+### 2026-06-05 - FW-KV improves PSI freshness with version-access metadata
+
+**Citation:** Masoomeh Javidi Kishi and Roberto Palmieri. "FW-KV:
+Improving Read Guarantees in PSI." Middleware 2021, pp. 1-12.
+doi:10.1145/3464298.3476131. Retrieved 2026-06-05 from
+`https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-MIDDLEWARE-2021.pdf`.
+
+**Category:** MVCC / snapshot / visibility; distributed transaction
+processing.
+
+**Relevance tags:** Parallel Snapshot Isolation; fresher read-only
+transactions; vector clocks; version-access sets; anti-dependency tracking;
+long fork; abort-free reads; TPC-C; YCSB; snapshot freshness.
+
+**Core idea:** FW-KV starts from Walter's Parallel Snapshot Isolation design,
+where asynchronous propagation lets non-local transactions use old vector-clock
+snapshots. The paper keeps PSI's scalable, abort-free read-only behavior but
+lets read-only transactions observe fresher versions when they first contact a
+node, without assuming synchronized clocks or a clock service. It does this by
+tracking which read-only transactions have read each version and propagating
+those identifiers onto new versions that overwrite them.
+
+The useful design point is a middle ground between stale snapshot routing and
+globally fresh reads. FW-KV does not eliminate PSI's long-fork anomaly in the
+general case, and it does not provide serializability. Instead, it improves the
+freshness of common read-only transactions by making first access to each new
+node fresh, then pinning that node's visible timestamp for later accesses by
+the same transaction. In the evaluation, FW-KV's throughput stays close to
+Walter in low-contention YCSB and TPC-C runs, while delayed propagation causes
+Walter to abort far more update transactions than FW-KV.
+
+**Concrete mechanisms:**
+
+- Each object version stores the value and the vector-clock timestamp of the
+  update transaction that produced it.
+- A transaction carries a vector clock `T.VC` and a `T.hasRead` vector that
+  records which nodes have already contributed to the transaction's snapshot.
+- On the first read from a node, a read-only transaction can advance its
+  snapshot by reading the freshest version available at that node, then sets
+  `hasRead[node]` so later reads from that node stay consistent with the
+  chosen timestamp.
+- Every version has a version-access set containing identifiers of read-only
+  transactions that read that version.
+- When an update transaction prepares, participants collect version-access-set
+  identifiers from the versions being overwritten. On commit, those identifiers
+  are attached to the newly created versions, preserving transitive
+  anti-dependency information for later read-only transactions.
+- Read-only version selection first filters versions by the vector-clock
+  entries for nodes already read, then excludes versions whose access set
+  contains the transaction's identifier. The freshest remaining version is
+  returned, and the transaction id is added to that version's access set.
+- Update transactions use a more conservative safe-snapshot rule. They advance
+  on their first read but then exclude versions that may have been produced by
+  concurrent conflicting transactions, accepting false positives to preserve
+  PSI.
+- Read-only commit is cleanup: it sends remove messages to delete the
+  transaction id from the version-access sets it touched, including propagated
+  occurrences.
+- Update commit still uses two-phase commit over written keys. Participants
+  lock and validate written objects, return collected anti-dependency sets to
+  the coordinator, then install versions after commit decision ordering is
+  respected.
+- Asynchronous propagate messages still advance node vector clocks in
+  per-origin sequence order. FW-KV can overlap update execution with delayed
+  propagation instead of forcing the repeated aborts Walter sees when a node's
+  vector clock is stale.
+- Evaluation uses an in-memory distributed key-value store derived from Walter,
+  with YCSB and TPC-C on up to 20 CloudLab nodes. The paper reports less than
+  5% gap from Walter in low contention, up to 20% on high-contention YCSB and
+  28% on high-contention TPC-C, and much lower abort rate than Walter when
+  propagation is intentionally delayed.
+
+**GPU DB mapping:** FW-KV is directly relevant to retained snapshot routing.
+The current GPU DB design already treats resident GPU state as generationed and
+immutable, but freshness-sensitive reads still need a precise rule for when a
+route can advance to a newer resident or CPU-visible boundary. FW-KV suggests
+that a read token can carry a compact "which owner domains have contributed to
+my snapshot" certificate instead of either freezing the whole system at begin
+time or forcing every read through a single global timestamp service.
+
+Version-access sets map to dependency sidecars for retained read snapshots.
+When a long retained read observes a version or resident segment, a mutation or
+refresh that overwrites that data can propagate a small reader/dependency marker
+onto the new generation. Later fragments of the same read can avoid mixing in a
+generation that would create an unsafe read-after-write cycle. The GPU DB
+version should probably not store unbounded per-reader identifiers in hot GPU
+segments, but the mechanism is useful as a correctness oracle for CPU-side
+experiments.
+
+The first-contact rule is a useful route policy for partitioned owners. If a
+request touches partition A, then later partition B, the route could advance at
+B only if it has not previously established B's visibility. Once a partition
+has contributed, future reads from that partition must stay at the same or a
+provably compatible generation. That is a concrete alternative to forcing all
+multi-partition retained reads to choose a full vector snapshot before the
+first row is read.
+
+FW-KV also warns that freshness metadata has a contention shape. Under low
+contention, version-access sets are often empty or tiny. Under hot update
+workloads, the sets grow and are transitively propagated, adding synchronization
+and cleanup overhead. GPU DB should make any retained-read dependency metadata
+bounded, aggregated by snapshot generation where possible, and measurable in
+hot-key benchmarks before adopting it on the serving path.
+
+**Risks and mismatches:** FW-KV is a distributed key-value store, not a SQL
+engine and not a GPU system. It preserves PSI rather than PostgreSQL-style
+serializable isolation, and it explicitly allows the long-fork anomaly in some
+concurrent cases. Its read-only transactions must be identified up front, which
+maps imperfectly to SQL statements inside multi-statement transactions.
+
+The version-access-set mechanism can create hot metadata, requires cleanup
+messages, and can propagate transitive identifiers onto newer versions. That
+may be too expensive for GPU-resident segments, especially if millions of
+logical sessions can hold retained reads. The paper evaluates uniform access
+and a relatively small 20-node cluster; it does not prove behavior under 1M
+idle sessions, GPU refresh queues, or extreme skew. Its 2PC and vector-clock
+model also assumes distributed nodes; a single-node GPU DB may be able to use
+owner generations or partition vectors with lower overhead.
+
+**Benchmark candidates:**
+
+- Build a CPU-only retained-read freshness harness with two or more partition
+  owners. Compare begin-time scalar snapshot, full vector snapshot, and
+  first-contact partition advancement. Gate: no read skew under update/read
+  interleavings modeled after FW-KV's examples.
+- Prototype version-access metadata as a debug-only sidecar for MVCC versions:
+  read-only snapshot ids are recorded on read versions, overwritten versions
+  propagate dependency ids, and later reads reject unsafe generations. Failure
+  condition: metadata grows without a bounded aggregation or cleanup path.
+- Add a hot-key test with long retained reads and repeated updates to the same
+  rows. Measure version-access-set size, cleanup delay, write latency, and
+  retained-read p99 before considering a production variant.
+- Test route-token partition vectors: a retained query starts with no
+  partition entries, fixes each partition on first access, and rejects or
+  falls back when a later fragment would require mixing an incompatible
+  generation.
+- Use FW-KV's delayed-propagation setup as an analog for GPU refresh lag:
+  deliberately delay resident generation propagation and compare stale-route
+  rejection, CPU fallback, and abort/retry rates for fresh retained reads.
+- For SQL semantics, add a proof fixture that distinguishes single read-only
+  statements from multi-statement transactions, prepared statements, and
+  portals; do not allow a statement-level freshness advance to leak across a
+  broader transaction snapshot.
