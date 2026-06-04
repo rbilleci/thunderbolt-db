@@ -30427,3 +30427,154 @@ the better choice.
 - Add telemetry fields `route_hint_family`, `route_hint_completed`,
   `route_hint_rejected_reason`, `route_prediction_uncertainty`,
   `route_regret_us`, and `route_model_bypass_count`.
+
+### 2026-06-04 - Saving Private Hash Join makes temporary memory a shared route budget
+
+**Citation:** Laurens Kuiper, Paul Gross, Peter Boncz, and Hannes
+Muhleisen. "Saving Private Hash Join." PVLDB 18(8):2748-2760,
+2025. DOI: `10.14778/3742728.3742762`. Retrieved 2026-06-04
+from `https://www.vldb.org/pvldb/vol18/p2748-kuiper.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** larger-than-memory joins; temporary-data buffer
+pool; external hash join; dynamic operator memory; spillable pages;
+runtime compression; concurrent blocking operators; NVMe-backed
+intermediates; GPU route budgets; over-resident execution.
+
+**Core idea:** The paper attacks a common modern OLAP failure mode:
+hash joins are fast while the build sides fit in memory, then systems
+fall off a cliff when an intermediate exceeds RAM or when several joins
+in one pipeline compete for memory. DuckDB's answer is not to switch
+wholesale to a separate disk algorithm. It keeps the in-memory hash join
+shape for the fraction that fits, spills only the overflow through a
+unified buffer manager, compresses materialized columns when cheap
+statistics make that safe, and dynamically divides memory among active
+blocking operators using observed sizes rather than optimizer guesses.
+
+For GPU DB, the transferable idea is that temporary state needs the same
+explicit, shared budgeting discipline as resident table snapshots. GPU
+routes will not only consume HBM for cached base data; large joins,
+groups, refresh builds, decompression buffers, and response staging can
+all become active together. A robust route contract should account for
+resident data, temporary intermediates, pinned host buffers, and cold
+spill pages as one measured execution budget rather than pretending each
+operator owns a private unlimited scratch space.
+
+**Concrete mechanisms:**
+
+- DuckDB stores both persistent and temporary pages under one buffer
+  manager. Temporary intermediates can use fixed 256 KiB spillable pages,
+  variable-size spillable pages, or non-spillable allocations, so the
+  system can evict persistent pages first and spill temporary pages only
+  when needed.
+- Temporary hash-join data uses a page layout designed to be efficient
+  in memory and spillable without serialization. Fixed-size row-major
+  rows keep hash-table access local; variable-size data such as strings
+  lives on separate pages, with lazy pointer recomputation after a page
+  is reloaded at a different address.
+- The external hash join is hybrid and execution-time adaptive. Build
+  tuples are radix-partitioned into spillable pages, then as many
+  partitions as fit are inserted into the hash table. Probe tuples for
+  resident build partitions stream immediately; probe tuples for
+  non-resident partitions are partitioned and materialized for later
+  partitioned probes.
+- Parallelism is morsel-driven through build, probe, and hash-table scan
+  phases, avoiding per-partition worker ownership that collapses under
+  skew. The paper still notes an unresolved skew limit: if one inner
+  partition exceeds the memory limit because many tuples share a key,
+  repartitioning does not fix it.
+- The join table uses 64-bit entries with a pointer plus a 16-bit salt
+  from the upper hash bits to reduce random pointer chasing during
+  probing. Equal-key build tuples are chained separately from ordinary
+  hash collisions, so many-to-many joins can reuse the first key
+  comparison across all tuples in the chain.
+- Compressed materialization is implemented as optimizer-inserted
+  projection/decompression expressions rather than per-operator custom
+  code. Integer columns can use frame-of-reference narrowing from
+  min/max statistics; short strings can be packed into integer types
+  while preserving comparison order on little-endian machines.
+- The Temporary Memory Manager assigns memory to concurrently active
+  joins at fixed synchronization points, especially after build-side
+  materialization and before hash-table creation. That delay lets the
+  system observe actual build sizes before assigning memory.
+- The TMM cost model balances two pressures: minimize the weighted
+  fraction of probe-side data that must be materialized, and keep
+  pipeline throughput from dropping to zero. It approximates assignments
+  with a few bounded gradient-descent iterations only when total active
+  operator size exceeds the memory limit.
+- Evaluation integrates the techniques into DuckDB 1.2.0. On larger-
+  than-memory synthetic joins, DuckDB avoids the abrupt abort or
+  sort-merge cliff seen in the compared systems. In pipelined join
+  scenarios, the weighted cost policy beats equality/equity-style memory
+  splits, especially when small joins should be kept fully in memory
+  without starving larger joins. On TPC-H SF1000, DuckDB keeps Q9/Q13/Q18
+  within the same broad runtime range as in-memory queries while HyPer
+  times out or is much slower on several external-processing queries.
+
+**GPU DB mapping:** The P8 design already separates resident base-table
+data from durable CPU/WAL truth. This paper says the next execution
+layer also needs a first-class temporary-state tier. A retained GPU join
+route should declare not only resident input bytes and transfer bytes,
+but also build hash bytes, probe overflow bytes, output buffer bytes,
+string/decode metadata, pinned host spill buffers, and expected spill
+page pressure.
+
+For HBM, the analog of DuckDB's TMM is a route-level scratch-budget
+manager. Before launching concurrent retained joins, grouped aggregates,
+refresh builds, or cold-tier scans, the runtime should assign HBM/pinned
+host/NVMe scratch budgets from observed batch sizes and route facts. A
+small retained lookup route must not lose its latency budget because one
+large blocking operator privately grabbed every scratch buffer.
+
+For over-resident GPU execution, the hybrid hash-join shape maps well:
+build or keep the fraction that fits in HBM, stream matching probe
+fragments immediately, and partition overflow into host/NVMe pages with
+explicit generation and route metadata. That is safer than a binary
+"resident or CPU fallback" decision for joins and large groups.
+
+The compressed materialization mechanism also fits P8. Instead of making
+compression a global storage-format choice, the planner can insert route
+local encode/decode steps when statistics prove that narrowed ints or
+packed short strings reduce temporary bytes enough to pay for decoding.
+This connects to the FastLanes/FSST track: compression should be a
+route-level budget knob with telemetry, not an invisible file-format
+assumption.
+
+**Risks and mismatches:** This is a CPU DuckDB OLAP paper, not an OLTP
+or GPU execution paper. It does not cover MVCC visibility, WAL-before-
+visibility, session ordering, write transactions, GPU kernels, CUDA
+streams, HBM allocation, or pgwire response rules. Its TMM works at
+operator synchronization points; GPU kernels may need finer-grained
+preemption or admission because a bad HBM assignment can stall an entire
+stream. The current skew limitation is important for database workloads:
+hot keys, counters, and tenant-local joins can create partitions that do
+not shrink under radix repartitioning. Finally, the paper's evaluation
+uses analytical queries and large intermediates; short OLTP lookups
+should bypass this machinery.
+
+**Benchmark candidates:**
+
+- Add a no-GPU route-budget simulator with active operators for retained
+  lookup, hash join, grouped aggregate, residency refresh, response
+  staging, and cold-tier scan. Compare fixed per-operator scratch budgets,
+  per-query budgets, and a TMM-style weighted dynamic assignment.
+- Prototype an over-resident join route with HBM-resident build
+  partitions plus host/NVMe overflow pages. Gate: when the build side
+  exceeds HBM by 10-50%, p99 degrades gradually rather than switching
+  immediately to full CPU fallback.
+- Track temporary-state bytes separately from resident table bytes:
+  `route_temp_hbm_bytes`, `route_temp_host_bytes`,
+  `route_temp_spill_bytes`, `route_temp_spill_pages`,
+  `route_scratch_budget_bytes`, and `route_scratch_budget_denied_reason`.
+- Add a compressed-temporary benchmark for int and short text join keys.
+  Compare uncompressed temporary pages, frame-of-reference narrowed ints,
+  and packed short strings. Required metrics: spill bytes, decode time,
+  kernel time, H2D/D2H bytes, p50/p99, and wrong-route regret.
+- Add a skew failure benchmark with one hot build key whose partition
+  exceeds the scratch budget. The pass condition is an explicit fallback,
+  side-swap, or hot-key special route rather than repeated repartitioning
+  with no progress.
+- Test mixed workload admission where a large join competes with many
+  retained point reads. Failure condition: average join throughput
+  improves while retained lookup p99 or response-ring ordering regresses.

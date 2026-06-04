@@ -1091,7 +1091,7 @@ Append new candidates here as each paper is processed.
   Why: DuckDB external aggregation work cited by Resource-Adaptive Query
   Execution; useful for paged intermediate state, spill-resistant aggregates,
   and over-resident query execution under bounded memory.
-- `queued` — **Saving Private Hash Join**, Kuiper, Gross, Boncz, and
+- `reviewed` — **Saving Private Hash Join**, Kuiper, Gross, Boncz, and
   Muhleisen, PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p2748-kuiper.pdf`
   DOI: `https://doi.org/10.14778/3742728.3742762`
@@ -1238,10 +1238,24 @@ Append new candidates here as each paper is processed.
 - `queued` — **Tile-based Lightweight Integer Compression in GPU**,
   Shanbhag, Yogatama, Yu, and Madden, SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526132`
-  Why: compressed GPU execution related work for tile-level decompression;
-  useful as a contrast against operating directly on RLE/index encodings and
-  for deciding whether GPU DB should decode into scratch tiles or preserve
-  compressed resident columns through predicates and aggregates.
+  Why: GPU compression baseline relevant to temporary and resident integer
+  compression when route-local encoding must trade HBM footprint against
+  kernel occupancy and memory traffic.
+- `queued` — **Design Trade-Offs for a Robust Dynamic Hybrid Hash Join**,
+  Jahangiri, Carey, and Freytag, PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p2257-jahangiri.pdf`
+  DOI: `https://doi.org/10.14778/3547305.3547327`
+  Why: Saving Private Hash Join cites this recent dynamic partitioning work;
+  useful for comparing spill granularity, adaptive partition policy, skew
+  behavior, and robust hybrid hash join choices before mapping them to HBM,
+  host-memory, and NVMe overflow routes.
+- `queued` — **To Partition, or Not to Partition, That is the Join Question in
+  a Real System**, Bandle, Giceva, and Neumann, SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3452831`
+  Why: Saving Private Hash Join cites this hardware-conscious join evaluation;
+  useful for deciding when GPU DB should avoid materializing/partitioning
+  because memory traffic dominates, especially for selective joins and
+  retained resident inputs.
 - `queued` — **BtrBlocks: Efficient Columnar Compression for Data Lakes**,
   Kuschewski, Sauerwein, Alhomssi, and Leis, SIGMOD 2023.
   URL: `https://doi.org/10.1145/3589263`
