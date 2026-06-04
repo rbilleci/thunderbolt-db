@@ -28249,3 +28249,139 @@ route-choice papers rather than returning immediately to GPU OLAP.
 - Treat stale or unavailable acceleration state as a route outcome, not a
   hidden fallback. The proof gate is correct SQL results plus explicit
   telemetry for fallback, reject, rebuild, and direct response paths.
+
+### 2026-06-04 - Epic deterministic MVCC removes version search from GPU OLTP batches
+
+**Citation:** Shujian Qian and Ashvin Goel. "Massively Parallel
+Multi-Versioned Transaction Processing." OSDI 2024, pp. 765-782.
+Retrieved 2026-06-04 from
+`https://www.usenix.org/conference/osdi24/presentation/qian` and
+`https://www.usenix.org/system/files/osdi24-qian.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; GPU execution.
+
+**Relevance tags:** deterministic OLTP; MVCC; GPU transaction
+processing; epoch batching; known read/write sets; version placement;
+scratchpad versions; write-back; CPU/GPU co-execution; contention;
+batch latency.
+
+**Core idea:** Epic combines deterministic transaction batching with
+MVCC so the system can precompute where every read and write should
+find or create its version before transactions execute. Because the
+serial order inside an epoch is fixed and read/write sets are known,
+Epic can avoid linked-list version traversal during execution, allocate
+versions outside the hot execution phase, and reclaim most temporary
+versions at epoch boundaries.
+
+This is more transferable than the headline "GPU OLTP" result. For GPU
+DB, the useful design is to make a batch's visibility and write targets
+explicit before GPU execution starts. A retained write or mixed
+read/write batch should enter the GPU with a compact execution plan:
+record ids, source visibility boundary, direct read-version locations,
+direct write locations, and dependency waits. That plan is close to the
+runtime's `RouteDescriptor`, but it additionally names MVCC version
+slots and write-back obligations.
+
+**Concrete mechanisms:**
+
+- Epic batches transactions into epochs and establishes a deterministic
+  serial order within each epoch before transaction execution.
+- Each epoch is split into indexing, initialization, and execution.
+  Indexing maps read/write keys to record ids. Initialization performs
+  MVCC setup and emits a per-transaction execution plan with direct
+  version locations. Execution then uses those locations without
+  searching version chains.
+- When read/write sets are not fully known, Epic can run an optional
+  GPU read/write-set identification phase, analogous to reconnaissance
+  queries, before indexing.
+- Storage separates within-epoch temporary versions from durable
+  across-epoch table versions. Temporary versions live in scratchpad
+  memory and are reclaimed wholesale after the epoch.
+- For each record, Epic keeps two table versions, `prevVer` and
+  `currVer`, distinguished by epoch ids. `prevVer` serves reads that
+  need the prior epoch value while the final write in the current epoch
+  updates `currVer`.
+- Intermediate writes to a record within an epoch fill scratchpad
+  versions; the final write for that record writes into the dense table
+  area so later epochs only need the last committed value.
+- Reads synchronize with writes when they depend on a version produced
+  earlier in the epoch, preserving deterministic ordering while still
+  running independent work in parallel.
+- Indexing and MVCC initialization always run on the GPU. Execution may
+  run on the GPU when the dataset fits device memory, or on the CPU
+  while the GPU still accelerates indexing and initialization for larger
+  datasets.
+- The paper evaluates with TPC-C and YCSB against CPU and deterministic
+  baselines. The reported shape is that Epic is comparable at small
+  epoch sizes, gains more throughput as epochs grow, and after roughly a
+  few milliseconds of average latency outperforms the compared systems.
+  Abort cost grows roughly linearly when read/write-set prediction is
+  wrong and aborted transactions rerun in the next epoch.
+
+**GPU DB mapping:** Epic is a strong argument for a two-level mutation
+path. The CPU mutation owner should remain the correctness authority for
+WAL-before-visibility, but compatible write-heavy or mixed batches can
+be prepared as deterministic epochs whose MVCC version slots are planned
+before execution. For the first GPU DB slice, that could be simulated
+without running GPU kernels: build an epoch planner that groups
+same-procedure or same-shape writes, maps keys to stable tuple/version
+ids, assigns direct output slots, and publishes visibility only after
+WAL and write-back complete.
+
+The scratchpad/table split maps cleanly to P8's retained snapshot
+design. GPU DB can keep final, published resident snapshots immutable
+for readers while staging within-batch deltas in per-epoch scratch
+buffers. At the epoch boundary, the mutation owner either publishes a
+new visibility generation or invalidates the affected resident objects.
+The important invariant is that scratchpad state is never a hidden
+visible cache; it becomes visible only through the WAL/visibility
+publication protocol.
+
+The CPU/GPU co-execution option is also useful. GPU DB does not need to
+move the whole OLTP engine to device memory to benefit. A near-term
+benchmark can use GPU-style parallel planning or a CPU simulator to
+precompute read/write version slots, then execute write-back on the CPU
+owner. Later, when device memory is available, the same execution-plan
+shape can drive GPU resident batches for admitted partitions.
+
+**Risks and mismatches:** Epic assumes one-shot stored procedures and
+known read/write sets, while GPU DB must support interactive SQL,
+pgwire extended-query semantics, errors, portals, and transactions whose
+future statements are not known at admission time. Its epoch batching
+trades latency for throughput, so it fits COPY, stored-procedure-like
+routes, and batched mutations better than arbitrary low-latency
+single-row updates. The paper's durable logging and SQL compatibility
+details are not the focus; GPU DB must preserve WAL-before-visibility,
+recovery replay, DDL invalidation, and CPU truth even if GPU planning is
+wrong or unavailable. The read/write-set identification phase is useful
+but risky: wrong prediction causes aborts and reruns, and GPU DB should
+not hide that cost behind throughput averages.
+
+**Benchmark candidates:**
+
+- Build an epoch-planning simulator for same-shape INSERT/UPDATE stored
+  procedures: known read/write keys in, `(record_id, read_slot,
+  write_slot, dependency_wait, response_id)` out. Gate: plan generation
+  is bounded and deterministic, and CPU execution produces the same
+  visible rows as the existing MVCC path.
+- Compare ordinary owner-serialized writes with deterministic epoch
+  write admission for YCSB-style read/update mixes and a small TPC-C-like
+  stock/payment subset. Metrics: throughput, p50/p99 latency, aborts,
+  queue wait, epoch size, write-back time, and visibility publication
+  lag.
+- Prototype scratchpad resident deltas for one admitted table, then
+  publish or invalidate a new resident generation only after WAL flush
+  and CPU-visible write-back. Failure condition: any retained read can
+  observe scratchpad data before publication.
+- Measure epoch-size knees explicitly: 500, 1K, 5K, 10K, 30K, 50K, and
+  100K operations per epoch under low and high contention. Gate:
+  throughput gains must be reported together with average and p99
+  latency, not as throughput alone.
+- Add read/write-set prediction telemetry for any future
+  stored-procedure route: `rw_set_unknown_count`, `rw_set_prediction_miss`,
+  `epoch_abort_count`, `epoch_rerun_count`, and `epoch_publish_lag_us`.
+- Test CPU/GPU split readiness without hardware by treating GPU
+  initialization as a separable worker: initialization/planning time,
+  transfer bytes for plans, CPU write-back time, and the benefit of
+  pipelining adjacent epochs.

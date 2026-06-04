@@ -2417,3 +2417,26 @@ Append new candidates here as each paper is processed.
   Why: the CIDR 2023 paper names Falcon as a modern alternative to directory
   invalidation; useful for comparing timestamped coherence with explicit
   invalidation for GPU/host resident-object directories.
+- `reviewed` — **Massively Parallel Multi-Versioned Transaction Processing**,
+  Qian and Goel, OSDI 2024.
+  URL: `https://www.usenix.org/conference/osdi24/presentation/qian`
+  PDF: `https://www.usenix.org/system/files/osdi24-qian.pdf`
+  Why: selected after the remaining ready queue skewed toward GPU analytics;
+  Epic is a modern deterministic MVCC OLTP design that uses GPU-parallel
+  indexing/initialization to precompute direct version locations, avoid
+  version-chain search, and reclaim epoch scratchpad versions wholesale.
+- `queued` — **Aria: A Fast and Practical Deterministic OLTP Database**,
+  Lu et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p2047-lu.pdf`
+  DOI: `https://doi.org/10.14778/3407790.3407808`
+  Why: Epic compares against Aria's deterministic abort/fallback strategy;
+  useful for deciding when GPU DB should prefer deterministic rerun,
+  lock-based fallback, or owner-serialized execution for mispredicted
+  read/write sets.
+- `queued` — **Caracal: Contention Management with Deterministic
+  Concurrency Control**, Qin, Demke Brown, and Goel, SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483591`
+  PDF: `https://www.eecg.utoronto.ca/~ashvin/publications/caracal.pdf`
+  Why: Epic contrasts its shared-memory initialization and direct version
+  lookup with Caracal's sorted-array version allocation; relevant to
+  high-contention MVCC batch planning and direct version slot assignment.
