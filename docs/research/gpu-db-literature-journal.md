@@ -46113,3 +46113,169 @@ prove that a route decision can explain its tier inputs, scheduling
 inputs, and estimate inputs, then compare accepted, rejected, and
 fallback executions under skew, stale resident generations, and
 missing query-template coverage.
+
+### 2026-06-04 - QueCC turns hot transactions into planned priority queues
+
+**Citation:** Thamir M. Qadah and Mohammad Sadoghi. "QueCC: A
+Queue-oriented, Control-free Concurrency Architecture." Middleware
+2018:13-25. doi:10.1145/3274808.3274810. Retrieved 2026-06-04 from
+`https://expolab.org/papers/quecc.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT /
+session scale; deterministic concurrency control.
+
+**Relevance tags:** queue-oriented execution; deterministic planning;
+high-contention OLTP; owner queues; fragment scheduling; serializable
+execution; batch admission; hot-key writes; queue-depth telemetry;
+WAL visibility boundaries.
+
+**Core idea:** QueCC removes concurrency-control work from the
+transaction execution critical path by splitting each batch into a
+deterministic planning phase and a control-free execution phase.
+Planner threads have fixed priorities, decompose transactions into
+record-range execution queues, and preserve a serial order through
+execution-priority invariance: for any record, higher-priority queues
+must run before lower-priority queues. Execution threads can then run
+assigned queues directly against the in-memory store without locks,
+validation, or per-operation coordination except when they need to
+respect priority overlap or intra-transaction dependencies.
+
+The strongest transferable idea for GPU DB is not to make every SQL
+route deterministic. It is to identify prepared, retained, COPY, and
+hot-key mutation routes whose read/write sets or conflict classes are
+known early enough to compile them into bounded owner queues. For those
+routes, contention should be resolved once at admission/planning time,
+then the mutation, residency, and GPU execution owners should drain
+ordered queues with explicit latency ceilings.
+
+**Concrete mechanisms:**
+
+- QueCC models transactions as DAGs of fragments. A fragment contains a
+  sequence of reads or writes over records in the same contiguous RID
+  range plus any integrity constraints that can trigger logic-induced
+  aborts.
+- Batches are planned by multiple planner threads. Each planner owns a
+  client transaction queue and a predetermined priority, so planners can
+  work independently while still producing a deterministic cross-planner
+  order.
+- Planners create priority groups of execution queues. Queues cover
+  disjoint RID ranges inside a planner's group and inherit that
+  planner's priority.
+- Range-based planning starts with one range per execution thread and
+  progressively splits ranges when a queue reaches a configurable
+  capacity. Ranges can be reused across batches to amortize planning.
+- Execution threads receive partitions of priority groups and can
+  choose outstanding queues arbitrarily as long as execution-priority
+  invariance is maintained for overlapping record ranges.
+- Intra-transaction data dependencies are handled by queue switching:
+  if a fragment needs an intermediate value not yet produced by another
+  fragment, the execution thread moves to other runnable queue work
+  instead of blocking on a global coordinator.
+- Commit dependencies are tracked when a transaction reads an
+  uncommitted write from another transaction in the same batch. QueCC
+  stores last-writer transaction ids in per-record metadata, increments
+  dependency counters, and checks those counters during the commit
+  stage.
+- The implementation uses a latch-free BatchQueue circular buffer for
+  plan delivery. Planner threads publish priority-group partitions with
+  atomic CAS operations while execution threads spin on their slots.
+- Planning and execution can be pipelined: planners can build batch
+  `i+1` while executors drain batch `i`.
+- QueCC supports speculative write visibility with undo buffers and
+  discusses early write visibility as a way to reduce cascading abort
+  and undo-copy overhead when writes are known to commit.
+- Evaluation uses in-memory YCSB and TPC-C workloads generated at the
+  server, excluding network effects. Reported results include almost
+  40M YCSB operations per second, over 5M TPC-C transactions per second,
+  up to 4.5x YCSB throughput improvement, and up to 6.3x TPC-C
+  improvement over compared concurrency-control protocols under high
+  contention. QueCC also reports low average latency under 3ms for
+  batches below 20K transactions in its high-skew YCSB experiment.
+
+**GPU DB mapping:** GPU DB already leans toward owner domains and
+bounded rings. QueCC suggests a stronger benchmark track for known-shape
+write paths: separate conflict planning from execution and make the
+planned queue itself a correctness artifact. COPY chunks, prepared
+multi-row updates, retained lookup refreshes, and hot partition-local
+mutations could be admitted as operation fragments tagged with owner id,
+resident generation, conflict key or range, priority lane, and WAL
+visibility boundary.
+
+For the mutation owner, a QueCC-like path maps to deterministic
+micro-batches where WAL append, resident invalidation, CPU MVCC apply,
+and visibility publication remain ordered but per-fragment lock or OCC
+validation is avoided for routes whose conflict sets were proven at
+admission. The route certificate should record the planner priority,
+queue id, conflict range, and commit-dependency count so the system can
+explain why a write was allowed to bypass the generic conflict path.
+
+For residency and GPU execution owners, the useful analogy is
+thread-to-queue rather than thread-to-transaction. Instead of sending a
+whole transaction through one owner, the runtime can place independent
+fragments into mutation, residency-refresh, and GPU route queues, then
+join their responses at the session/request layer. That fits the target
+runtime's command and response rings, but only if each fragment carries
+snapshot compatibility, invalidation generation, and response-scatter
+metadata.
+
+For 1M logical sessions, QueCC reinforces that session count must not
+imply one active execution context per session. Client-facing workers
+should enqueue planned fragments into bounded lanes, while the hot
+owners drain queues by conflict class, priority, and latency deadline.
+Queue wait, range splits, dependency stalls, and batch flush causes
+should become first-class telemetry.
+
+**Risks and mismatches:** QueCC assumes stored procedures or transactions
+whose read and write sets are known before execution. GPU DB must also
+serve ad hoc SQL, cursor-like interactions, arbitrary expressions, and
+planner fallback. Those routes should not enter deterministic fragment
+queues unless the planner can prove the necessary conflict keys,
+snapshot generations, and write effects.
+
+The paper's evaluation intentionally removes network effects and focuses
+on in-memory execution. That is useful for isolating concurrency-control
+cost, but GPU DB has pgwire parsing, response encoding, GPU transfer,
+NVMe tiers, and WAL durability in the same latency budget. QueCC's large
+batches may improve throughput while violating interactive p50/p99
+targets unless the runtime enforces microsecond flush ceilings.
+
+Speculative write visibility and same-batch uncommitted reads are a
+poor default fit for the current WAL-before-visibility invariant. A GPU
+DB adaptation should start with conservative deterministic queues whose
+published visibility occurs only after durable WAL and resident
+invalidation are complete. Early write visibility is a follow-up research
+track, not an immediate implementation shortcut.
+
+QueCC's record-range queues assume useful RID locality and key-value-like
+access. GPU DB will need conflict classes for SQL predicates, indexes,
+resident column groups, and partitioned GPU buffers. Range splitting also
+has to account for skew, text-prefix predicates, and multi-column joins,
+not only contiguous record identifiers.
+
+**Benchmark candidates:**
+
+- Build a deterministic-fragment simulator for prepared hot-key writes:
+  generic owner FIFO, OCC-style retry, QueCC-style priority queues, and
+  dependency-graph scheduling. Measure throughput, p50/p99/p999 latency,
+  abort/retry rate, queue switching, and visibility-boundary delay.
+- Prototype COPY chunk admission as planned fragments: WAL append,
+  index update, resident invalidation, and optional refresh queues.
+  Proof gate: WAL-before-visibility and invalidation ordering remain
+  observable for every chunk.
+- Add queue-certification telemetry to the route certificate:
+  planner priority, queue id, conflict range/key, owner lane, batch id,
+  dependency count, flush reason, queue wait, and fallback reason.
+- Compare count-triggered versus time-triggered micro-batches for hot
+  retained lookups and writes. Failure condition: improved throughput
+  with worse p99/p999 latency or stale-generation publication.
+- Test thread-to-queue execution for multi-owner transactions where
+  mutation, residency, and GPU execution fragments can run independently
+  after a plan barrier. Measure idle time, cross-owner messages, and
+  response join latency.
+- Evaluate conservative write visibility first. Only after that passes,
+  test early-write-visibility variants with explicit undo/dependency
+  tracking and reject them if they complicate recovery replay or resident
+  invalidation proofs.
+- Add skew-aware queue splitting benchmarks for hot integer keys and
+  text-prefix ranges. Track whether queue splits reduce contention
+  without increasing cache misses or planning overhead.

@@ -350,9 +350,10 @@ Append new candidates here as each paper is processed.
   distributed transaction processing; useful for evaluating whether GPU DB
   owner rings should become explicit operation queues for multi-partition
   transactions without forcing every route through a single global schedule.
-- `queued` — **QueCC: A Queue-oriented, Control-free Concurrency
+- `reviewed` — **QueCC: A Queue-oriented, Control-free Concurrency
   Architecture**, Qadah and Sadoghi, Middleware 2018.
   URL: `https://doi.org/10.1145/3274808.3274810`
+  PDF: `https://expolab.org/papers/quecc.pdf`
   Why: Q-Store's direct predecessor for queue-oriented concurrency inside a
   node; useful for comparing owner-domain operation queues, contention
   avoidance, and control-free execution before distributed queue routing.
@@ -512,6 +513,25 @@ Append new candidates here as each paper is processed.
   Why: Crystal's tile-based execution model is the execution substrate used by
   the SIGMOD 2022 GPU compression paper; useful for separating compression
   effects from baseline GPU query operator and memory-traffic behavior.
+- `queued` — **High Performance Transactions via Early Write Visibility**,
+  Faleiro, Abadi, and Hellerstein, PVLDB 2017.
+  URL: `https://doi.org/10.14778/3055540.3055553`
+  Why: QueCC discusses early write visibility as a way to reduce cascading
+  abort and undo-buffer overhead; useful for evaluating when GPU DB can publish
+  intra-batch writes before full transaction completion without weakening
+  serializability or WAL-before-visibility.
+- `queued` — **Design Principles for Scaling Multi-core OLTP Under High
+  Contention**, Ren, Faleiro, and Abadi, SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882958`
+  Why: ORTHRUS separates concurrency-control work from transaction execution;
+  useful contrast to QueCC's no-control execution and GPU DB's owner-domain
+  command rings under hot-key contention.
+- `queued` — **Exploiting Single-Threaded Model in Multi-Core In-Memory
+  Systems**, Yao et al., IEEE TKDE 2016.
+  URL: `https://doi.org/10.1109/TKDE.2016.2578319`
+  Why: QueCC contrasts LADS dependency-graph execution with priority queues;
+  useful for deciding whether GPU DB should use dependency graphs, owner
+  queues, or lighter runtime conflict classes for prepared multi-step writes.
 - `reviewed` — **Chiller: Contention-centric Transaction Execution and Data
   Partitioning for Modern Networks**, Zamanian et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389724`
