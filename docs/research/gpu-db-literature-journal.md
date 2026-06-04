@@ -31360,3 +31360,139 @@ be trusted.
   reused after process restart, which must be validated against WAL/catalog
   generations, and which must be rebuilt. Failure condition: a warmed cache
   can serve a route before its source generation is proven current.
+
+### 2026-06-04 - PIFOs make scheduling policy explicit at enqueue time
+
+**Citation:** Anirudh Sivaraman, Suvinay Subramanian, Mohammad Alizadeh,
+Sharad Chole, Shang-Tse Chuang, Anurag Agrawal, Hari Balakrishnan,
+Tom Edsall, Sachin Katti, and Nick McKeown. "Programmable Packet
+Scheduling at Line Rate." SIGCOMM 2016. Retrieved 2026-06-04 from
+the author PDF, `https://people.csail.mit.edu/alizadeh/papers/pifo-sigcomm16.pdf`;
+DOI: `https://doi.org/10.1145/2934872.2934899`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** programmable scheduling; admission control; response
+shaping; bounded queues; hierarchical fairness; deadline scheduling;
+ranked request queues; line-rate hardware; congestion and overload policy.
+
+**Core idea:** The paper turns packet scheduling into a programmable
+ranked-queue abstraction. A push-in first-out queue, or PIFO, accepts
+elements with a computed rank, places each element by rank at enqueue time,
+and always dequeues from the head. By attaching small scheduling
+transactions to PIFOs and composing PIFOs into trees, the design can express
+weighted fair queueing, strict priority, shortest-job-like ranking,
+deadline/slack policies, hierarchical scheduling, token-bucket shaping, and
+rate-controlled service disciplines.
+
+For GPU DB, the transferable idea is not the switch hardware itself. It is
+that overload policy should be an explicit enqueue-time contract rather than
+an emergent side effect of whichever worker queue fills first. A request
+entering a network, mutation, read-snapshot, GPU, residency, or response
+ring should carry a route class and a computed rank derived from bounded
+state: deadline, estimated service, tenant/session class, snapshot age,
+queue budget, and fairness counters.
+
+**Concrete mechanisms:**
+
+- A PIFO is a priority queue with stable FIFO tie-breaking for equal ranks.
+  Lower-ranked elements are dequeued first, so rank can represent either
+  scheduling order or scheduling time.
+- A scheduling transaction is an atomically executed block of code that runs
+  once before enqueue and computes the element rank. Stateful examples
+  include start-time fair queueing, where per-flow virtual finish times
+  determine the next packet's virtual start rank.
+- Scheduling trees compose PIFOs hierarchically. A packet follows a path from
+  a leaf to the root, executing one transaction per matching node; internal
+  PIFOs hold references to child PIFOs rather than only packets.
+- Shaping transactions add non-work-conserving behavior. A child shaping
+  PIFO can delay when a reference to that child's scheduling PIFO becomes
+  visible to its parent, implementing token-bucket or frame-based release.
+- The model can express algorithms such as WFQ, HPFQ, token-bucket filters,
+  stop-and-go queueing, least-slack-time-first, minimum rate guarantees, and
+  fine-grained priority scheduling.
+- The model has useful limits. It cannot arbitrarily change the scheduling
+  order of all already-buffered elements in a flow after one new arrival, and
+  input-side shaping does not provide the same short-term guarantees as
+  output-side rate limiting after higher-priority traffic stops starving a
+  lower-priority class.
+- The hardware design decomposes each PIFO block into a flow scheduler over
+  head elements and a rank store for later per-flow elements. The baseline
+  target is 64K packets, 1024 flows, 256 logical PIFOs, 16-bit ranks, and a
+  five-block mesh for five hierarchy levels.
+- The synthesized 16 nm design reports 1 GHz operation for a 64-port 10 Gbit/s
+  shared-memory switch, about 3.7% chip-area overhead for the five-block mesh,
+  and timing success up to 2048 flows but not 4096 in the flow scheduler.
+
+**GPU DB mapping:** The immediate mapping is ranked admission for bounded
+runtime rings. The current runtime target already separates network ingress,
+mutation, read snapshot, residency, GPU execution, and response rings. A
+PIFO-like policy layer would let each ring compute a small rank at enqueue
+instead of relying only on FIFO arrival order. Example rank terms include
+route class, deadline, estimated service time, session credit state, tenant
+weight, snapshot generation age, result size, and queue wait carried from
+the previous owner.
+
+Scheduling trees map to owner-domain hierarchy. A request can first compete
+within its session or tenant class, then within route family, then within the
+shared GPU or response budget. That is a better fit for 1M logical sessions
+than one queue per session: idle sessions stay cheap, while active requests
+enter a bounded number of logical classes.
+
+Shaping transactions map to response and GPU-work release. COPY chunks,
+refresh work, long scans, and large result encoders can be delayed by
+token-bucket-style budgets without blocking short retained lookups or
+mutation acknowledgments. The paper's warning about input-side shaping is
+important: if low-priority results accumulate behind high-priority traffic,
+they may burst later unless the GPU DB also applies output-side response
+budgeting or per-socket write limits.
+
+The flow-scheduler/rank-store split suggests a practical request-queue
+layout. Keep only class or route heads in the hot scheduling structure, with
+per-class FIFO/ring storage for later requests. For GPU DB this could mean
+heads for `short_retained_read`, `mutation_ack`, `copy_chunk`,
+`refresh`, `over_resident_scan`, and `large_response`, not millions of
+session heads. This is directly aligned with compact logical sessions and
+bounded active credits.
+
+**Risks and mismatches:** PIFO is a switch scheduling paper, not a database
+runtime paper. It does not cover SQL transactions, MVCC visibility, WAL,
+query planning, GPU kernels, response encoding, or socket backpressure. Its
+best hardware numbers depend on a custom switch pipeline and small rank
+programs, while GPU DB will initially run in software with ordinary CPU
+queues.
+
+The expressiveness limits matter. Some adaptive scheduling policies require
+reranking already-buffered requests when new information arrives, such as a
+GPU worker suddenly becoming available, a snapshot invalidation arriving, or
+a transaction's actual read/write set expanding. A strict rank-at-enqueue
+queue should therefore be paired with cancellation, requeue, fallback, and
+route-invalidation paths. The flow-count result is also a warning: do not
+model every logical session as a schedulable flow in the hot path.
+
+**Benchmark candidates:**
+
+- Prototype a no-GPU ranked admission ring with a hot scheduler over route
+  class heads and per-class FIFO storage. Compare FIFO, strict priority,
+  weighted fair, shortest-estimated-service, and deadline/slack ranks under
+  mixed retained reads, COPY chunks, refresh, and large responses.
+- Add route-rank telemetry:
+  `route_class`, `rank_policy`, `computed_rank`, `tenant_weight`,
+  `estimated_service_us`, `deadline_us`, `queue_wait_us`,
+  `shape_release_us`, and `rank_requeue_reason`.
+- Build a response-shaping benchmark with short query replies and large
+  result sets. Failure condition: a shaped large-response class bursts after
+  starvation and raises short-response p99 latency beyond the target.
+- Test class-head scheduling versus per-session scheduling at simulated
+  100K and 1M logical sessions. Required metrics: scheduler memory,
+  enqueue/dequeue cost, active credit memory, fairness error, and p99 queue
+  wait for short retained reads.
+- Add a route-invalidation stress test where queued GPU work becomes illegal
+  after a mutation or residency invalidation. Proof gate: ranked scheduling
+  never executes an invalid snapshot route, and requeue/fallback telemetry
+  explains every discarded rank.
+- Compare micro-batch drain order under FIFO and rank-aware policies. The
+  expected win is lower tail latency for short compatible reads without
+  starving lower-priority refresh or COPY work. Failure condition: rank-aware
+  batching improves p50 while causing unbounded refresh delay or WAL-visible
+  mutation backlog.

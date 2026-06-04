@@ -447,7 +447,7 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/2785956.2787510`
   Why: eRPC's congestion-control path builds on Timely; useful for deciding
   whether GPU DB network admission should use RTT/queue-delay telemetry.
-- `queued` — **Programmable Packet Scheduling at Line Rate**, Sivaraman et al.,
+- `reviewed` — **Programmable Packet Scheduling at Line Rate**, Sivaraman et al.,
   SIGCOMM 2016.
   URL: `https://doi.org/10.1145/2934872.2934899`
   PDF: `https://people.csail.mit.edu/alizadeh/papers/pifo-sigcomm16.pdf`
@@ -859,6 +859,13 @@ Append new candidates here as each paper is processed.
   Why: Eiffel cites universal packet scheduling as a flexible scheduling
   objective; useful for comparing request-ranking policies that emulate
   shortest-job, deadline, and slack-aware queueing in GPU DB admission.
+- `queued` — **NUMFabric: Fast and Flexible Bandwidth Allocation in
+  Datacenters**, Nagaraj et al., SIGCOMM 2016.
+  URL: `https://doi.org/10.1145/2934872.2934890`
+  PDF: `https://web.stanford.edu/~skatti/pubs/sigcomm16-num.pdf`
+  Why: PIFO cites NUMFabric as a flexible bandwidth-allocation use case; useful
+  for comparing utility-driven admission and weighted fair queueing when GPU DB
+  request classes compete for network, owner-ring, and accelerator capacity.
 - `queued` — **Andromeda: Performance, Isolation, and Velocity at Scale in
   Cloud Network Virtualization**, Dalton et al., NSDI 2018.
   URL: `https://www.usenix.org/conference/nsdi18/presentation/dalton`
