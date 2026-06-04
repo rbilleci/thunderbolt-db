@@ -513,14 +513,14 @@ Append new candidates here as each paper is processed.
   Why: Crystal's tile-based execution model is the execution substrate used by
   the SIGMOD 2022 GPU compression paper; useful for separating compression
   effects from baseline GPU query operator and memory-traffic behavior.
-- `queued` — **High Performance Transactions via Early Write Visibility**,
+- `reviewed` — **High Performance Transactions via Early Write Visibility**,
   Faleiro, Abadi, and Hellerstein, PVLDB 2017.
   URL: `https://doi.org/10.14778/3055540.3055553`
   Why: QueCC discusses early write visibility as a way to reduce cascading
   abort and undo-buffer overhead; useful for evaluating when GPU DB can publish
   intra-batch writes before full transaction completion without weakening
   serializability or WAL-before-visibility.
-- `queued` — **Design Principles for Scaling Multi-core OLTP Under High
+- `reviewed` — **Design Principles for Scaling Multi-core OLTP Under High
   Contention**, Ren, Faleiro, and Abadi, SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2882958`
   Why: ORTHRUS separates concurrency-control work from transaction execution;
@@ -532,6 +532,13 @@ Append new candidates here as each paper is processed.
   Why: QueCC contrasts LADS dependency-graph execution with priority queues;
   useful for deciding whether GPU DB should use dependency graphs, owner
   queues, or lighter runtime conflict classes for prepared multi-step writes.
+- `queued` — **Improving High Contention OLTP Performance via Transaction
+  Scheduling**, Ding et al., arXiv 2018.
+  URL: `https://arxiv.org/abs/1810.01997`
+  Why: ORTHRUS sharpens the case for planned access and specialized
+  concurrency-control work; this follow-up clusters conflict-free transactions
+  before executing residual contended work and may inform GPU DB admission
+  lanes for hot-key batches.
 - `reviewed` — **Chiller: Contention-centric Transaction Execution and Data
   Partitioning for Modern Networks**, Zamanian et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389724`

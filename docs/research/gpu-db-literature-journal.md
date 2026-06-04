@@ -46447,3 +46447,165 @@ uncertainty also matter.
 - Test interleaving-style striping for warm sequential host columns
   and reject it for random metadata unless measured top-down counters
   show the workload is bandwidth-bound rather than latency-bound.
+
+### 2026-06-04 - ORTHRUS separates contention control from transaction execution
+
+**Citation:** Kun Ren, Jose M. Faleiro, and Daniel J. Abadi.
+"Design Principles for Scaling Multi-core OLTP Under High Contention."
+SIGMOD 2016, pp. 1583-1598. doi:10.1145/2882903.2882958.
+Retrieved 2026-06-04 from
+`https://www.cs.umd.edu/~abadi/papers/orthrus-sigmod16.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT /
+session scale.
+
+**Relevance tags:** high-contention OLTP; partitioned functionality;
+planned data access; deadlock avoidance; message passing; single-writer
+metadata; owner domains; lock manager queues; cache locality; admission
+planning; hot-key writes.
+
+**Core idea:** ORTHRUS argues that high-contention OLTP systems lose
+throughput for two reasons beyond the unavoidable serialization of
+conflicting logical operations: one execution thread usually performs
+both transaction logic and concurrency-control work, and transactions
+often discover their data accesses dynamically. The first problem makes
+logical hot spots become physical contention on shared metadata and
+pollutes instruction/data caches. The second forces deadlock handling,
+which extends lock hold time or wastes work through aborts.
+
+The paper's prototype separates function roles across pinned cores.
+Concurrency-control threads own lock metadata for disjoint object
+partitions, while execution threads run transaction logic and communicate
+through explicit queues. It also plans each transaction's lock footprint
+before execution, then acquires locks in concurrency-control-thread order
+to avoid deadlocks.
+
+**Concrete mechanisms:**
+
+- Each concurrency-control thread owns a disjoint subset of database
+  objects and the lock table metadata for those objects. Lock metadata is
+  read and written by exactly one concurrency-control thread, eliminating
+  contended latch/CAS traffic for that metadata.
+- Execution threads do not manipulate lock tables directly. They send
+  lock acquire/release messages to concurrency-control threads and run
+  other transactions while waiting for responses.
+- The queue implementation avoids many-writer contention by giving each
+  execution/concurrency-control thread pair a physical queue, implemented
+  as a latch-free circular buffer in the common case.
+- ORTHRUS requires the complete lock request set before a transaction
+  starts execution. Locks are acquired in a fixed order over
+  concurrency-control thread ids so deadlocks cannot occur.
+- For data-dependent access sets, ORTHRUS uses the OLLP reconnaissance
+  idea from Calvin: run a no-lock, no-write pass to estimate the access
+  footprint, annotate the transaction, then restart if execution needs a
+  lock outside the estimate.
+- To reduce asynchronous message delay, concurrency-control threads
+  forward a transaction's lock-request message to the next needed
+  concurrency-control thread. This changes lock-acquisition messages
+  from roughly `2 * Ncc` to `Ncc + 1`, where `Ncc` is the number of
+  concurrency-control threads touched by the transaction.
+- The paper evaluates on an 80-core, 128GB in-memory server with pinned
+  threads. The prototype is intentionally only a transaction-management
+  component, not a full DBMS with SQL parsing, networking, or durable
+  storage.
+- In deadlock experiments, deadlock-free planned locking beats wait-die,
+  dreadlocks, and wait-for-graph handling at high contention; at the most
+  contended reported point it reaches 2.2x over wait-die and 5.5x over
+  dreadlocks/wait-for graph.
+- On TPC-C NewOrder/Payment with 16 warehouses, ORTHRUS scales with core
+  count and at 80 cores reports about 2x the throughput of deadlock-free
+  locking and nearly an order of magnitude over 2PL with dreadlocks.
+- Execution-thread breakdown shows ORTHRUS spending more useful time on
+  transaction logic under high contention: 18% versus 7.2% for
+  deadlock-free locking and 3.7% for 2PL with dreadlocks, despite using
+  64 execution threads plus 16 concurrency-control threads while the
+  baselines use all 80 threads for execution.
+
+**GPU DB mapping:** ORTHRUS strongly supports the current owner-domain
+direction. GPU DB should not let every network/session/query worker
+directly touch mutation metadata, visibility state, residency metadata,
+GPU stream state, or route counters. Hot state should have a single
+owning worker or owner domain, and other workers should interact through
+bounded messages and immutable snapshots.
+
+For write throughput, the direct mapping is a mutation-concurrency owner
+or a small set of partition owners that own conflict metadata, WAL
+admission state, and per-key/range hotness. Execution workers can prepare
+statement fragments, but they should request admission through the owner
+instead of competing on shared lock/version/index metadata. The route
+certificate should record the planned access footprint, owner ids,
+message hops, admitted conflict class, and whether the route used exact
+keys, ranges, or a conservative whole-partition/table claim.
+
+For 1M logical sessions, ORTHRUS reinforces that logical sessions should
+not become threads and should not share hot metadata directly. Network
+IO workers can own sockets and protocol state, while mutation, snapshot,
+residency, and GPU workers own their local state. A session's request is
+a compact message with preallocated response handles, not a stack frame
+waiting on locks.
+
+For GPU read throughput, the same separation applies to resident route
+state. GPU execution workers should own CUDA streams, reusable pinned
+buffers, and device-side scratch. Residency workers should own
+refresh/eviction/invalidation state. Query workers should not update
+shared resident metadata directly; they should consume immutable
+generation handles and return route telemetry through response rings.
+
+The planned-access idea maps to fast lanes for prepared writes, COPY
+chunks, retained lookups, and known-shape multi-row updates. The planner
+or admission layer can perform a cheap reconnaissance pass to discover
+keys/ranges/partitions, then enter an owner-ordered path only if the
+footprint is stable. If execution discovers an unplanned access, the
+correct response is fallback/restart on a generic path, not ad hoc
+acquisition that breaks the ordering discipline.
+
+**Risks and mismatches:** ORTHRUS is a CPU in-memory transaction
+management prototype, not a full SQL engine. It does not evaluate
+pgwire parsing, client admission, WAL durability, MVCC version chains,
+GPU transfer, resident invalidation, or NVMe/far-memory tiers. Its
+pessimistic-locking focus is useful for hot writes, but GPU DB's
+read-mostly retained routes should prefer immutable snapshots over lock
+mediated reads.
+
+The design also introduces message-delay costs. ORTHRUS is attractive
+when each transaction touches one or a few concurrency-control owners;
+when a random YCSB transaction touches many owners, message hops can
+outweigh shared-memory lock overhead. GPU DB must measure owner fan-out
+before turning every operation into cross-owner messages.
+
+Planned access is easier for stored procedures and prepared routes than
+for arbitrary SQL. OLLP-style reconnaissance may be too expensive or
+semantically risky for volatile functions, DDL, triggers, complex
+predicates, or parameter-dependent index probes. Conservative footprints
+avoid deadlocks but can over-serialize hot work. The fast lane therefore
+needs explicit admission rules and fallback reasons.
+
+**Benchmark candidates:**
+
+- Build an owner-domain contention simulator with generic shared metadata
+  versus ORTHRUS-style single-owner metadata. Workloads: hot-key writes,
+  read-only hot-key metadata probes, prepared multi-row updates, and COPY
+  chunks. Measure throughput, p50/p99/p999 latency, cache misses if
+  available, owner queue wait, and message hops.
+- Prototype a planned-access admission certificate for prepared writes:
+  exact keys, ranges, owner ids, lock/conflict class, route shape,
+  fallback reason, and owner fan-out. Proof gate: unplanned access always
+  restarts or falls back before visibility changes.
+- Compare queue layouts for owner messages: shared MPSC channel,
+  per-worker SPSC ring, and batched ring drain. Failure condition:
+  queue synchronization replaces metadata synchronization as the hot
+  bottleneck.
+- Measure owner fan-out explicitly. Compare one-owner, two-owner, and
+  random-owner write batches. Reject ORTHRUS-style routing for routes
+  where `Ncc + 1` message hops dominate transaction work.
+- Test hot retained lookup routing where the read path consumes immutable
+  snapshots and only telemetry/admission updates go through an owner.
+  Expected outcome: read throughput should not wait on mutation lock
+  metadata except at snapshot publication boundaries.
+- Add a reconnaissance benchmark for prepared SQL/COPY routes. Measure
+  footprint-discovery cost, incorrect-estimate rate, fallback latency,
+  and visibility safety. Failure condition: recon passes improve
+  throughput by hiding stale reads or weakening WAL-before-visibility.
+- Use ORTHRUS as a warning for per-session state: active session credits,
+  response handles, and route descriptors should be owned or sharded, not
+  mutated by every worker serving a logical session.
