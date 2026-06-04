@@ -32175,3 +32175,152 @@ lookups, and cold-tier refreshes into bounded class queues, then report commit
 latency, read p99, retained-resource lifetime, epoch lag, and rejected work.
 The proof gate is not maximum throughput alone; it is stable p99 latency and
 correct visibility while background work is deliberately overloaded.
+
+### 2026-06-04 - HetCache makes cache placement execution-centric across CPU, GPU, and NVMe
+
+**Citation:** Hamish Nicholson, Aunn Raza, Periklis Chrysogelos, and
+Anastasia Ailamaki. "HetCache: Synergising NVMe Storage and GPU
+acceleration for Memory-Efficient Analytics." CIDR 2023. Retrieved
+2026-06-04 from the CIDR proceedings PDF:
+`https://www.cidrdb.org/cidr2023/papers/p84-nicholson.pdf`.
+
+**Category:** Multi-tier cache / data placement and GPU execution / analytics.
+
+**Relevance tags:** CPU/GPU/NVMe placement; access-path-aware caching;
+execution-centric cache policy; staged transfers; SemiLazy transfers;
+GPUDirect Storage; io_uring; PCIe bottlenecks; per-query selectivity;
+proportional caching; route descriptors; over-resident reads.
+
+**Core idea:** HetCache argues that GPU/NVMe servers break the old buffer-pool
+assumption that the main question is whether a page is cached. In a
+heterogeneous server, the useful question is where a column page is cached,
+which device will consume it, how much of it the query will touch, and whether
+the query is actually storage-bound, PCIe-bound, memory-bandwidth-bound, or
+compute-bound.
+
+The paper's strongest transferable idea is to move cache policy from
+frequency-only page replacement toward execution-centric placement. HetCache
+uses workload and hardware feedback to decide how much of each column to keep
+in GPU memory, CPU memory, or NVMe, and it lets the execution layer choose the
+actual transfer path while the cache manager supplies hints. That is a better
+fit for GPU DB than a single "hot means GPU resident" rule, because some
+queries benefit more from CPU-staged sparse GPU access than from pushing full
+pages into HBM.
+
+**Concrete mechanisms:**
+
+- HetCache models modern GPU/NVMe servers as a non-linear hierarchy. Data can
+  move NVMe-to-CPU, NVMe-to-GPU through GPUDirect Storage, CPU-to-GPU, or be
+  accessed by a GPU from CPU memory at finer granularity through unified
+  virtual memory.
+- The policy distinguishes query benefit from cache hit rate. A page used by a
+  compute-bound query may not deserve scarce memory even if it is frequently
+  touched, while a bandwidth-bound query may need only a proportion of a
+  column cached before extra memory gives diminishing returns.
+- For hybrid CPU/GPU execution, the desired local placement is proportional to
+  the devices' observed query processing throughput, but GPU HBM capacity is
+  smaller than CPU DRAM and can saturate first.
+- Staged SemiLazy Transfers handle GPU requests for NVMe-resident data by
+  either eagerly moving full pages to GPU memory or staging pages into CPU
+  memory so the GPU can lazily fetch selected values at finer granularity.
+- The selectivity cutoff is query and hardware dependent. In the paper's
+  scan-filter-aggregate microbenchmark, directly accessing CPU-resident values
+  was better than pushing full 2 MiB pages below about 10% selectivity; above
+  that, eager page transfer won.
+- HetCache uses per-column query selectivity hints, per-device query
+  throughput, interconnect bandwidth, storage bandwidth, and memory bandwidth
+  to decide how much and where to cache.
+- Dense pages are preferentially cached in GPU memory when HBM is constrained;
+  sparsely accessed pages for storage-bound GPU work can be cached in CPU
+  memory to avoid NVMe block-level IO amplification.
+- The Proteus integration keeps page placement late-bound. A logical scan
+  emits page handles, a routing policy consults HetCache for page locations,
+  and a `mem-move` operator chooses source, target, and transfer mechanism.
+- HetCache's cache answers are hints rather than absolute orders. The
+  execution layer can ignore them when the current query route has better
+  information or different constraints.
+- Multiple immutable copies of a page may exist in NVMe, CPU memory, and GPU
+  memory. HetCache keeps cached pages alive by holding an extra reference, and
+  eviction releases that reference without freeing memory still held by active
+  query pipelines.
+- The implementation uses `io_uring` for NVMe-to-CPU transfers, GPUDirect
+  Storage for direct NVMe-to-GPU transfers, CUDA memcpy for CPU/GPU memory
+  transfers, and 2 MiB page transfers aligned with Proteus huge pages.
+- Evaluation uses SSB scale factor 1000 on a server with 2x24-core AMD EPYC
+  7413 CPUs, two Nvidia A40 GPUs with 48 GB each, 256 GB DRAM, and 12 PCIe 4.0
+  NVMe drives. Reported results include up to 1.78x speedup for GPU-only
+  execution over naive NVMe-to-GPU transfers and near CPU-memory-resident
+  performance for selected hybrid CPU/GPU queries with much less memory.
+
+**GPU DB mapping:** HetCache sharpens the P8 tier model. The current design
+already separates WAL/CPU truth, CPU derived state, GPU resident snapshots,
+and cold tiers. HetCache says the cache manager should not assign a single
+temperature to a relation or segment. It should assign an access-path contract:
+which columns are dense enough for HBM, which columns are sparse enough for
+CPU-staged GPU access, which routes are fine from NVMe, and when additional
+cache bytes have stopped moving the latency bottleneck.
+
+This maps directly to retained route descriptors. A read route should carry
+`expected_selectivity`, `column_access_density`, `bytes_if_eager`,
+`bytes_if_lazy`, `resident_hbm_bytes`, `cpu_stage_bytes`, `nvme_read_bytes`,
+`pcie_budget`, and `tier_time_budget`. The planner and runtime can then choose
+between GPU-resident scan, GPU with CPU-staged sparse access, GPUDirect
+streaming, CPU execution, or rejection under pressure.
+
+For mixed OLTP/analytics, HetCache is also a warning. CPU memory used as a GPU
+staging cache is not free: it consumes DRAM capacity and memory bandwidth that
+mutation owners, WAL replay, MVCC indexes, and network response buffers may
+need. The admission layer should therefore price CPU-staged GPU work as both
+GPU interconnect work and CPU-memory-bandwidth work, not merely as "not in
+HBM."
+
+The execution-layer hint model fits the runtime owner design. The residency
+owner can publish placement hints and cache references, while GPU execution
+owners make final transfer choices for the actual batch and report what they
+used. That preserves a clean boundary: cache policy guides execution, but the
+worker that owns CUDA streams, pinned buffers, and transfer timing decides the
+current path.
+
+**Risks and mismatches:** HetCache targets analytical scans in Proteus, not a
+transactional SQL engine with WAL-before-visibility, MVCC snapshots, DDL
+invalidation, prepared statements, and session admission. Its cached pages are
+immutable analytical pages; GPU DB must tie every resident or staged copy to a
+WAL/visibility boundary and catalog generation.
+
+The reported selectivity threshold and speedups are hardware-specific. They
+come from A40, PCIe 4.0, AMD EPYC memory behavior, 2 MiB page transfers, SSB
+queries, binary columnar data, and Proteus execution. The transferable design
+is the access-path-aware policy, not the exact 10% cutoff or 1.78x speedup.
+
+The paper does not discuss long-running snapshots, version-chain cleanup, CPU
+write-path interference, or high logical session counts. A CPU staging cache
+that looks good for one analytical query could hurt OLTP p99 if it consumes
+memory bandwidth, pinned buffers, or eviction attention at the wrong time.
+
+**Benchmark candidates:**
+
+- Add a no-GPU tier-placement simulator that compares frequency-only caching,
+  HBM-first caching, and HetCache-style proportional placement across HBM,
+  CPU DRAM, and NVMe. Inputs: query shape, selectivity, column density,
+  expected rows, tier bandwidths, and memory budgets. Gate: choose the same
+  route deterministically for the same descriptor and expose the bottleneck
+  reason.
+- Extend retained route descriptors with access-path estimates:
+  `dense_columns`, `sparse_columns`, `eager_transfer_bytes`,
+  `lazy_transfer_bytes`, `cpu_stage_bytes`, `nvme_bytes`, `pcie_budget_us`,
+  `dram_bandwidth_budget_us`, and `expected_selectivity`.
+- Build a CPU-only microbenchmark that emulates eager full-page transfer
+  versus sparse staged access over `int4` column groups. Sweep selectivity and
+  page size before GPU hardware returns; later repeat with CUDA/GPUDirect.
+- Add admission accounting for CPU-staged GPU work. Proof gate: a sparse GPU
+  route cannot consume unbounded CPU DRAM bandwidth or staging memory while
+  mutation/COPY/read-response routes are latency-sensitive.
+- Benchmark over-resident scans with three paths once GPU hardware is
+  available: full HBM resident, GPUDirect-style full-page streaming, and
+  CPU-staged sparse late materialization. Failure condition: planner chooses a
+  path whose measured bottleneck disagrees with the descriptor's predicted
+  bottleneck without recording a correction sample.
+- Add resident-cache telemetry per route shape: cache bytes by tier, hit bytes
+  by tier, transfer bytes by path, queue wait by path, p50/p99 latency,
+  HBM-retained bytes, CPU-stage bytes, and "cached but no latency benefit"
+  bytes.

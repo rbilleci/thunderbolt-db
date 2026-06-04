@@ -2488,7 +2488,7 @@ Append new candidates here as each paper is processed.
   Why: OLTPim cites HybriDS for keeping frequently used upper tree levels in
   CPU cache while lower pointer-chasing work runs near memory; relevant to
   GPU DB's split CPU/GPU/future-tier index residency decisions.
-- `queued` — **HetCache: Synergising NVMe Storage and GPU Acceleration for
+- `reviewed` — **HetCache: Synergising NVMe Storage and GPU Acceleration for
   Memory-Efficient Analytics**, Nicholson, Raza, Chrysogelos, and Ailamaki,
   CIDR 2023.
   URL: `https://www.cidrdb.org/cidr2023/papers/p84-nicholson.pdf`
@@ -2496,6 +2496,14 @@ Append new candidates here as each paper is processed.
   disk-backed analytics; useful for comparing cache-placement decisions against
   GOLAP-style compressed SSD-to-GPU streaming and GPU DB's explicit residency
   manager.
+- `queued` — **Workload Placement on Heterogeneous CPU-GPU Systems**,
+  Carvalho, Simitsis, Queralt, and Romero, PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p4241-carvalho.pdf`
+  DOI: `https://doi.org/10.14778/3685800.3685845`
+  Why: modern tutorial and taxonomy for CPU/GPU placement strategies, cost
+  prediction, placement granularity, and code-management choices; useful for
+  turning HetCache-style access-path hints into a broader route-placement
+  contract.
 - `queued` — **Adaptive Compression for Databases**, Windheuser et al.,
   EDBT 2024.
   URL: `https://doi.org/10.48786/EDBT.2024.13`
