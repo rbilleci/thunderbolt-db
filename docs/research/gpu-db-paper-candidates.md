@@ -3172,12 +3172,31 @@ Append new candidates here as each paper is processed.
   Why: Database Kernels points to coherent virtually materialized views and
   persistence-layer coherence mechanisms; useful for future row/column view
   invalidation across CPU, CXL, and GPU-resident representations.
-- `queued` — **Robust Query Driven Cardinality Estimation under Changing
+- `reviewed` — **Robust Query Driven Cardinality Estimation under Changing
   Workloads**, Negi et al., PVLDB 2023.
-  URL: `https://doi.org/10.14778/3583140.3583150`
+  URL: `https://doi.org/10.14778/3583140.3583164`
+  PDF: `https://www.vldb.org/pvldb/vol16/p1520-negi.pdf`
   Why: Stage calls out workload and data drift as a predictor weakness; this
   paper is a modern follow-up for robust route-cardinality signals when GPU DB
   query mixes or resident-cache contents shift.
+- `queued` — **Warper: Efficiently Adapting Learned Cardinality Estimators to
+  Data and Workload Drifts**, Li, Lu, and Kandula, SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517871`
+  Why: Robust query-driven cardinality estimation contrasts against retraining
+  and drift-adaptation systems; useful for deciding when GPU DB route models
+  should retrain, adapt online, or fall back to anchored DBMS statistics.
+- `queued` — **ALECE: An Attention-based Learned Cardinality Estimator for SPJ
+  Queries on Dynamic Workloads**, Li et al., PVLDB 2023.
+  URL: `https://arxiv.org/abs/2310.05349`
+  Why: modern learned cardinality estimator for dynamic workloads; useful for
+  comparing data-update-aware route estimates against simpler DBMS-statistics
+  correction and explicit route telemetry.
+- `queued` — **CardOOD: Robust Query-driven Cardinality Estimation under
+  Out-of-Distribution Workloads**, 2024.
+  URL: `https://arxiv.org/abs/2412.05864`
+  Why: direct follow-up on out-of-distribution robustness for query-driven
+  cardinality estimation; useful for GPU DB when tenant workloads, resident
+  cache contents, or mixed CPU/GPU route families drift from training logs.
 - `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
   Learning**, Zhang et al., AIDB@VLDB 2020.
   URL:

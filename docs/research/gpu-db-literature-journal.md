@@ -38925,3 +38925,147 @@ before it becomes a production policy.
 - Compare synchronous participant logging, Lotus-like coordinator-grounded
   batch logging, and current conservative WAL publication. Keep the production
   invariant fixed: no visibility publication before durable recovery truth.
+
+### 2026-06-04 - Robust cardinality estimation should be anchored to live DBMS statistics
+
+**Citation:** Parimarjan Negi, Ziniu Wu, Andreas Kipf, Nesime Tatbul,
+Ryan Marcus, Sam Madden, Tim Kraska, and Mohammad Alizadeh.
+"Robust Query Driven Cardinality Estimation under Changing Workloads."
+PVLDB 16(6):1520-1533, 2023. doi:10.14778/3583140.3583164.
+Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol16/p1520-negi.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** learned cardinality estimation; workload drift; data
+drift; DBMS-statistics anchoring; query masking; join bitmaps; sampling
+features; route-risk calibration; CPU/GPU route choice; retraining budget.
+
+**Core idea:** Query-driven cardinality models are attractive because they are
+small, fast to train and infer, and can handle broad SQL query shapes, but
+standard models overfit to query features seen in the training workload. When
+tables, columns, filters, joins, or data distributions drift, those models can
+produce plans worse than PostgreSQL's native estimates. Negi et al. make the
+learned model behave more like a correction layer over live DBMS estimates:
+randomly mask query-specific features during training so the model must use
+up-to-date DBMS statistics, then add join-aware sampling features that preserve
+correlation signals across primary/foreign-key joins.
+
+The most transferable lesson is not "replace the cost model with a neural
+model." It is "make learned route advice prove it remains anchored to live,
+cheap, conservative statistics." In the paper's evaluation, Robust-MSCN trained
+on simple JOBLight queries generalizes to the much more complex JOB workload
+and improves query runtime by about 2x over PostgreSQL, while standard MSCN can
+regress badly under workload drift. Under stale-data training, Robust-MSCN
+does not always beat PostgreSQL, but it avoids the 4-5x collapses reported for
+the standard model. The paper explicitly notes harder cases where the
+correlation structure itself changes; then the learned correction can point in
+the wrong direction.
+
+**Concrete mechanisms:**
+
+- Query features encode tables, joins, and filter columns with one-hot or set
+  representations. Data features include the DBMS's own cardinality estimate,
+  which is cheap and refreshed through ordinary statistics maintenance.
+- Query masking randomly zeroes query-specific features during training. At
+  inference, unseen tables/columns naturally appear as missing query features,
+  so the model has practiced using DBMS estimates and sampling features rather
+  than memorized workload-specific query tokens.
+- The model is best viewed as a cardinality corrector: it learns when native
+  DBMS estimates tend to under- or over-estimate because of stable correlation
+  patterns. This is expected to transfer only while those error patterns remain
+  similar.
+- Join bitmaps replace independent table samples with correlated samples over
+  primary/foreign-key values. Filters on different tables that affect the same
+  join key are intersected into one bitmap, borrowing the sideways-information
+  passing idea to expose join correlations.
+- Join bitmaps support equi-joins and known join keys. They are less suitable
+  for ad-hoc new join columns, arbitrary join predicates, or correlations that
+  require multiple primary keys in one compact bitmap.
+- For data updates, DBMS estimates can be refreshed through native statistics,
+  while sampling features need periodic replacement or on-the-fly sampling.
+  The paper shuffles bitmap indices during training so the model learns broad
+  selectivity/correlation signals rather than overfitting to fixed sample
+  positions.
+- The experiments compare true cardinalities, PostgreSQL estimates, SQL Server
+  estimates, MSCN, and Robust-MSCN across JOB, CEB, JOBLight, ErgastF1, and
+  stale IMDb snapshots. The authors emphasize end-to-end query runtime, not
+  only Q-error, because better aggregate cardinality error can still pick worse
+  plans.
+
+**GPU DB mapping:** GPU DB's route choice problem is more volatile than a
+classic CPU optimizer. Cardinality alone is insufficient; a route model must
+also predict resident validity, HBM capacity, pinned-buffer pressure, kernel
+queue delay, transfer bytes, reduction skew, and whether CPU fallback is
+available. This paper argues that any learned route predictor should be an
+anchored correction layer over explicit engine telemetry, not the authority.
+
+For P8, "DBMS estimate" maps to live route descriptors: table/segment row
+counts, visibility-generation boundaries, resident bytes, invalidation age,
+sampled key/selectivity summaries, host/NVMe tier state, queue depth, and
+recent kernel/transfer timings. A learned model may adjust those estimates for
+stable correlations, such as tenant query templates, key skew, or join-filter
+relationships, but the planner should retain hard guardrails when the descriptor
+is missing, stale, or outside the trained route family.
+
+For GPU execution, query masking suggests a training discipline for CPU/GPU
+route models: deliberately hide route-specific features such as exact query
+template, cache residency, or queue state during training so the model learns
+which live telemetry is sufficient for conservative fallback. If a model can
+only perform when it sees exact prepared-statement tokens, it is too brittle
+for session concurrency and changing resident snapshots.
+
+Join bitmaps map naturally to resident summary structures. GPU DB can maintain
+route-level bitmaps or compact sketches for primary/foreign-key relationships,
+hot key ranges, and visibility-compatible row groups. These should feed both
+planning and admission: a selective join route with a compatible bitmap may
+avoid over-resident transfer, while a missing or stale bitmap should push the
+route back to CPU or a safer scan.
+
+For 1M logical sessions, the retraining point matters. Collecting ground-truth
+latencies by executing bad GPU routes is expensive and can hurt tenants.
+Anchored correction should reduce retraining frequency, and drift monitors
+should trigger model quarantine or retraining before the model sends many
+sessions into a bad GPU queue.
+
+**Risks and mismatches:** The paper focuses on cardinality estimation for CPU
+PostgreSQL planning, not GPU execution, MVCC visibility, WAL publication,
+resident cache invalidation, or admission under accelerator contention. Its
+sampling mechanisms are most concrete for equi-joins with known primary and
+foreign keys. It does not solve arbitrary SQL, changing correlation direction,
+or route choices whose dominant cost is temporary memory, kernel occupancy, or
+queue delay rather than row cardinality.
+
+The learned correction can become harmful if the native estimate's error shape
+changes. GPU DB should therefore attach an uncertainty and drift state to every
+learned route hint. A high-confidence learned route may be allowed only when
+live descriptors match the route family, the snapshot generation is current,
+the cache state is known, and recent observed latency stays inside the model's
+calibration band.
+
+**Benchmark candidates:**
+
+- Build a route-estimation harness with three planners: native deterministic
+  P8 cost rules, a naive query-template learned model, and a masked/anchored
+  correction model over live route descriptors. Vary workload templates,
+  resident cache state, and data skew. Failure condition: learned routes
+  regress below deterministic fallback under drift.
+- Add "route masking" training experiments that hide exact query shape,
+  residency flags, queue depth, or tier state independently. Measure which
+  live telemetry is required to preserve safe CPU/GPU/fallback decisions.
+- Maintain join/key summary bitmaps for admitted resident partitions and test
+  whether they reduce GPU transfer for selective joins or batched lookups.
+  Required metrics: bitmap refresh cost, route-estimate error, avoided bytes,
+  plan latency, and stale-summary fallback rate.
+- Track end-to-end route regret, not only row-count or cardinality error:
+  compare chosen CPU/GPU/tiered route latency against a hindsight oracle for
+  the same snapshot. Proof gate: learned correction improves p95 route regret
+  without increasing p99 overloads.
+- Add drift quarantine logic for learned route hints. When observed latency,
+  selectivity, or queue delay exceeds the calibrated band for a route family,
+  disable learned corrections for that family until enough fresh observations
+  or retraining data exists.
+- Test stale-data training by building route models on an older resident
+  generation, then applying mutations and refreshes. The safe behavior is
+  graceful fallback or bounded correction, not repeated admission into a stale
+  GPU path.
