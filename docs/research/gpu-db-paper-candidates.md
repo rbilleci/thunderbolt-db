@@ -3881,7 +3881,7 @@ Append new candidates here as each paper is processed.
   Why: CXL Memory Performance points to software prefetching for random
   high-latency memory accesses; useful for deciding whether cold host indexes,
   far-memory B+trees, and route metadata can hide CXL/future-tier latency.
-- `queued` — **Databases in the Era of Memory-Centric Computing**, Chronis
+- `reviewed` — **Databases in the Era of Memory-Centric Computing**, Chronis
   et al., CIDR 2025.
   URL:
   `https://www.vldb.org/cidrdb/2025/databases-in-the-era-of-memory-centric-computing.html`
@@ -3889,6 +3889,20 @@ Append new candidates here as each paper is processed.
   Why: CXL Memory Performance cites memory-centric database designs as a
   broader architectural direction; useful for comparing GPU DB's explicit
   owner/tier model with memory-centric pooled designs and database operators.
+- `queued` — **A Case Against CXL Memory Pooling**, Levis, Lin, and Tai,
+  HotNets 2023.
+  URL: `https://doi.org/10.1145/3626111.3628195`
+  Why: memory-centric database designs cite it as the main cautionary source
+  on CXL pooling; useful for stress-testing GPU DB's future memory-pool
+  assumptions against networking, failure, and deployment costs.
+- `queued` — **Dremel: A Decade of Interactive SQL Analysis at Web Scale**,
+  Melnik et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf`
+  DOI: `https://doi.org/10.14778/3415478.3415568`
+  Why: the memory-centric CIDR paper uses BigQuery's shuffle service as an
+  existence proof for disaggregated intermediate memory; useful for comparing
+  GPU DB response rings, intermediate result placement, and checkpointed
+  distributed query stages.
 - `queued` — **Don't Look Back, Look into the Future: Prescient Data
   Partitioning and Migration for Deterministic Database Systems**, Lin et al.,
   SIGMOD 2021.

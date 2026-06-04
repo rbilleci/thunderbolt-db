@@ -47740,3 +47740,167 @@ write dependencies before execution when a batch has enough known structure.
 - Add telemetry for active-window scheduling: batch size, graph vertices,
   graph edges, cross-owner edges, longest dependency chain, owner imbalance,
   build time, execution time, WAL wait, and visibility publish wait.
+
+### 2026-06-04 - Memory-centric databases make pooled memory a query-route resource
+
+**Citation:** Yannis Chronis, Anastasia Ailamaki, Lawrence Benson,
+Helena Caminal, Jana Giceva, Dave Patterson, Eric Sedlar, and Lisa
+Wu Wills. "Databases in the Era of Memory-Centric Computing."
+CIDR 2025. Retrieved 2026-06-04 from the author-hosted PDF,
+`https://users.cs.duke.edu/~lkw34/papers/chronis-memcentric-cidr2025.pdf`,
+after the CIDR/VLDB PDF URL returned HTTP 403 to `curl`.
+
+**Category:** multi-tier cache / data placement; distributed query
+execution; memory-centric database architecture.
+
+**Relevance tags:** CXL; disaggregated memory; memory pooling;
+intermediate result placement; distributed joins; data skew; query
+checkpointing; accelerator-equidistant data; cost/performance routing.
+
+**Core idea:** The paper argues that database infrastructure should
+stop treating CPU-attached memory as a fixed companion to compute.
+The authors identify a newer memory wall: CPU core counts and compute
+performance keep growing, while memory bandwidth per core, DRAM cost
+per byte, and cloud memory stranding make processor-centric scaling
+increasingly inefficient. Their proposed response is memory-centric
+computing: modest local DRAM on compute nodes plus a shared memory pool
+reachable by CPUs, accelerators, and lower-power processors.
+
+The database-specific claim is not that every access should become
+remote-memory access. It is that DBMSs already manage data movement,
+out-of-core algorithms, spilling, repartitioning, and intermediate
+state, so they are better positioned than ordinary applications to make
+explicit cost/performance choices over a memory pool. The memory pool
+becomes another tier between local DRAM and storage, and also a shared
+exchange space for distributed query stages.
+
+The paper's concrete example is a distributed equi-join model. With
+10 compute servers, 200 Gbit RDMA, 100 GB/s local DRAM bandwidth, and
+a CXL-backed memory pool, the memory-centric variant uses less total
+memory for a skewed join because the overloaded node borrows pool
+memory for part of its hash table. The modeled tradeoff is explicit:
+32.5 GB total memory versus 55 GB in the processor-centric setup, with
+2.5295 seconds versus 1.967 seconds for the modeled join. The paper
+frames that as a cost/performance knob, not as a universal latency win.
+
+**Concrete mechanisms:**
+
+- Treat the memory pool as a separate tier with larger aggregate
+  capacity and lower performance than local DRAM, not as a transparent
+  replacement for local memory.
+- Keep compute nodes with modest local DRAM and put most DRAM in a
+  shared pool reachable over high-bandwidth fabrics such as CXL, RDMA,
+  optical links, or similar future interconnects.
+- Let producers of distributed query intermediates write to a
+  disaggregated memory/shuffle service, and let consumers read from
+  that service, as in the BigQuery shuffle example cited by the paper.
+- Use pooled memory to absorb intermediate-result misestimation and
+  data skew that would otherwise force disk spill, query abort,
+  over-provisioning, or expensive adaptive redistribution.
+- Exploit CXL-like shared-memory semantics where available to reduce
+  software-visible copying, serialization, allocation, and format
+  transformation at tier boundaries.
+- View CPUs and accelerators as more nearly equidistant from shared
+  data, reducing pipeline cliffs when database output feeds GPU, TPU,
+  ML, or other downstream consumers.
+- Preserve local cache-conscious design inside compute nodes; the paper
+  explicitly does not claim that memory-centric design eliminates
+  ordinary locality work.
+- Quantify memory-pool choices as cost/performance points: less local
+  memory and more pooled memory can reduce cost while accepting slower
+  access on the fraction of data that spills into the pool.
+- The paper is primarily a position and analytical-model paper; it does
+  not present a production DBMS implementation or experimental CXL
+  benchmark suite.
+
+**GPU DB mapping:** GPU DB's P8 design already treats GPU memory as an
+explicit acceleration tier rather than durable truth. This paper argues
+that future CPU-side memory expansion should be modeled the same way:
+not as an invisible OS paging substrate, but as a route-visible pool
+with explicit admission, placement, fallback, and telemetry. A route
+certificate should be able to say whether a buffer lives in GPU HBM,
+local host DRAM, remote pooled memory, NVMe-backed cold storage, or a
+shuffle/intermediate service.
+
+The most transferable idea is that pooled memory is a query-route
+resource, not merely a capacity bucket. For retained GPU reads, the
+runtime could keep hot resident vectors in HBM, warm compressed or
+intermediate vectors in host DRAM, and skew-absorbing or overflow
+intermediates in a future CXL/RDMA pool. The planner would choose
+between local execution, GPU execution, CPU fallback, pooled-memory
+spill, or reject/delay based on route shape, expected bytes, memory
+pressure, and p99 latency budget.
+
+The BigQuery shuffle example maps directly to response rings and future
+intermediate-result placement. If a GPU route produces data that another
+CPU/GPU stage will consume, the engine should avoid unnecessary round
+trips through protocol-owned buffers or disk-format materialization.
+A memory-pool-like intermediate tier could hold checkpointable,
+reusable, route-certified fragments while preserving WAL/MVCC truth in
+canonical storage.
+
+For 1M logical sessions, the lesson is to avoid coupling session count
+to local memory reservation. Logical sessions should own little more
+than protocol/session metadata until they issue active work. Active
+queries can then reserve local, GPU, pooled, or NVMe-backed resources
+through bounded admission. Memory-centric thinking reinforces the idea
+that memory reservations belong to admitted work and retained snapshots,
+not idle connection identity.
+
+**Risks and mismatches:** The paper is mostly analytical and visionary.
+It does not prove a deployed memory-centric DBMS, and its join example
+uses simplified assumptions about CXL bandwidth, local memory bandwidth,
+network behavior, and operator costs. The exact 32.5 GB versus 55 GB and
+2.5295 second versus 1.967 second figures should be treated as a design
+illustration, not a benchmark target for GPU DB.
+
+CXL or remote memory can be a latency trap for OLTP point lookups,
+version-chain traversal, lock metadata, visibility checks, and
+per-session control structures. GPU DB should not place mutation-owner
+hot state, WAL publication metadata, route certificates, or queue heads
+in a high-latency pool unless a benchmark shows the access pattern is
+streaming or prefetchable enough.
+
+The paper's examples are dominated by distributed analytical
+intermediates. GPU DB's product target includes transactional writes,
+MVCC, low-latency reads, and PostgreSQL-compatible behavior, so pooled
+memory must remain below correctness layers. It can hold copies,
+intermediates, retired snapshots, compressed segments, and warm data,
+but it must not become the only place where durable visibility or replay
+truth exists.
+
+There is also an operational mismatch. Memory pools introduce failure,
+congestion, isolation, and noisy-neighbor questions. A route certificate
+that names a pooled tier must include overload and fallback behavior,
+not just a pointer. The queued "A Case Against CXL Memory Pooling" paper
+should be used as a counterweight before turning this into an
+architecture commitment.
+
+**Benchmark candidates:**
+
+- Add a tier-placement simulator with HBM, local DRAM, pooled/CXL-like
+  memory, and NVMe. Vary latency, bandwidth, capacity, and failure
+  rates. Measure route latency, fallback rate, memory cost, and
+  snapshot-retirement pressure.
+- Prototype a route-certificate field for data tier: `gpu_hbm`,
+  `host_dram`, `pooled_memory`, `nvme_cold`, or `intermediate_service`.
+  Proof gate: every noncanonical tier has a canonical WAL/MVCC recovery
+  source and deterministic invalidation path.
+- Benchmark skewed distributed join or grouped aggregation intermediates
+  with three policies: local-only over-provisioning, NVMe spill, and
+  pooled-memory spill. Expected result: pooled memory wins only when it
+  avoids disk-format materialization without violating p99 limits.
+- Stress 1M logical sessions with memory reserved only for active work.
+  Compare per-session local buffers versus pooled/shared scratch leases.
+  Failure condition: idle sessions pin tier capacity or old snapshots.
+- Add a GPU pipeline experiment where one stage produces a reusable
+  intermediate fragment and a later stage consumes it. Compare protocol
+  buffer materialization, host DRAM fragment, pooled-memory fragment, and
+  direct GPU-resident handoff.
+- Measure whether route metadata, visibility stamps, and queue control
+  structures degrade when placed in high-latency memory. Expected result:
+  only large cold payloads and streaming intermediates belong in pooled
+  memory; hot control state stays local.
+- Add telemetry for tier-route decisions: requested bytes, admitted
+  bytes by tier, local/pooled hit ratio, spill reason, remote access
+  latency, retry/fallback reason, and cost/performance class.
