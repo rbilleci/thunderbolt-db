@@ -31833,3 +31833,144 @@ for mixed OLTP plus long maintenance work.
   refresh batch benefits from deterministic RID-range queues versus a
   single owner queue. The proof gate is lower queue wait and stable p99
   mutation latency without stale resident reads.
+
+### 2026-06-04 - GPU multiversion indexes need scoped snapshots and device-side reclamation
+
+**Citation:** Muhammad A. Awad, Serban D. Porumbescu, and John D.
+Owens. "A GPU Multiversion B-Tree." PACT 2022, pp. 481-493.
+Retrieved 2026-06-04 from the OpenReview/DOI page, author publication
+page, author-hosted PACT slides, and artifact repository:
+`https://openreview.net/forum?id=RJ95nyPhcp`,
+`https://doi.org/10.1145/3559009.3569681`,
+`https://maawad.github.io/`, and
+`https://github.com/owensgroup/MVGpuBTree`. The eScholarship landing
+page was reachable through the author page, but direct PDF retrieval was
+blocked/empty in this worker; the entry therefore uses the OpenReview
+abstract plus primary author slides and artifact documentation for
+mechanism details.
+
+**Category:** MVCC / snapshot / visibility and GPU execution / resident
+indexes.
+
+**Relevance tags:** GPU B-tree; multiversion index; scoped snapshots;
+linearizable range query; point lookup; insertion; deletion; cooperative
+groups; tile-level APIs; cache-line-sized nodes; version lists; epoch-based
+reclamation; device allocator; resident index lifetime.
+
+**Core idea:** The paper turns a GPU B-tree into a multiversion,
+snapshot-capable data structure that can serve point queries, updates, and
+linearizable multipoint or range queries while operations run concurrently on
+the GPU. The key design move is to make versioning local to B-tree nodes,
+give readers a snapshot timestamp/scope, and reclaim old node versions with a
+GPU-adapted epoch scheme rather than assuming a CPU-style thread runtime.
+
+For GPU DB, this is the index-level counterpart to Epic's warning about
+version-chain search. A resident GPU snapshot should not force every lookup
+or range predicate to scan tuple-version chains. A compact visibility-aware
+resident index can expose a timestamped lookup surface, but only if snapshot
+scope, node version lifetime, allocator behavior, and reclamation are explicit
+route resources.
+
+**Concrete mechanisms:**
+
+- The B-tree stores cache-line-sized nodes and uses cooperative processing so
+  a tile of GPU threads handles node traversal/update work at the granularity
+  the hardware can execute efficiently.
+- A multiversion node carries a timestamp and a pointer to an older version.
+  Versions are linked into a version list so a reader with a snapshot can
+  choose the node version visible to that snapshot.
+- The project exposes both host-side batch APIs and device-side cooperative
+  APIs. Device code can take a snapshot, then issue cooperative finds,
+  inserts, erases, and range queries against that snapshot.
+- Insert/delete operations can use in-place or out-of-place update modes.
+  Out-of-place update copies a node, modifies the copy, links the old copy
+  into the version list, and retires the old node when safe.
+- The slides describe a timestamp-initialization protocol where a thread that
+  observes a node with an invalid timestamp helps set it to the most recent
+  timestamp before readers depend on it.
+- Safe memory reclamation is implemented with a GPU epoch-based reclamation
+  scheme: execution is divided into epochs, retired pointers are placed in
+  per-epoch limbo bags, and old pointers are freed only after all relevant GPU
+  processes/blocks have advanced far enough. The summary calls this
+  block-wide EBR and emphasizes that an epoch is not wall-clock time.
+- Snapshot scopes are GPU-aware. The paper reports support for
+  phase-concurrent, stream-concurrent, and fully on-device concurrent usage,
+  which maps to increasingly aggressive overlap between updates and reads.
+- Reported evaluation results include snapshot support with low overhead for
+  point queries and inserts, about 1.04x and 1.11x slower than a non-versioned
+  baseline, respectively. For linearizable multipoint queries under concurrent
+  range queries and insertions, the paper reports similar read-heavy
+  performance and about 2.39x slowdown for write-heavy workloads. The slides
+  use a Tesla V100 PCIe GPU with 32 GB DRAM and a 40M-key initial tree for
+  linearizable multipoint experiments; the EBR experiment includes 45M
+  insertion/range-query operations with 50% updates and average range length
+  16.
+
+**GPU DB mapping:** The transferable design is a retained resident index with
+its own snapshot and reclamation contract. A future P8 resident index route
+could publish `(relation_id, index_id, resident_generation,
+snapshot_timestamp, allocator_epoch, supported_predicates)` and let GPU
+workers execute point/range lookups directly without re-entering the mutation
+owner for each key.
+
+The scoped-snapshot idea maps cleanly onto runtime route classes. A
+phase-concurrent scope fits refresh-style batches: freeze a resident index
+generation, run many read batches, then publish a new generation. A
+stream-concurrent scope fits overlapping refresh and read streams when CUDA
+event ordering proves the reader sees a complete snapshot. Fully concurrent
+on-device scope is the most powerful but should require the strongest proof:
+device-side snapshot handles, versioned nodes, allocator/reclaimer telemetry,
+and route tests under mixed insert/delete/range pressure.
+
+The node-local version-list design also suggests a narrower alternative to
+full-table retained snapshot pinning. For selective equality/range routes, old
+resident index nodes may be held only while snapshot handles need them, while
+CPU truth and WAL still own durability. That could reduce GPU HBM refresh
+costs for hot indexed predicates, but it must be integrated with relation
+generation invalidation so a stale resident index never outruns WAL-applied
+mutation visibility.
+
+**Risks and mismatches:** The artifact limits keys and values to unsigned
+32-bit types, and the README notes snapshots are bounded by 32-bit ids unless
+extended. GPU DB needs composite SQL keys, nullable values, text prefixes,
+tuple ids, MVCC transaction boundaries, and possibly 64-bit snapshot
+generations.
+
+The paper's data structure is an index, not a full SQL MVCC storage engine.
+It does not by itself solve WAL-before-visibility, crash replay,
+transactional abort semantics, DDL invalidation, or host/GPU cache coherence.
+Out-of-place updates protect readers but add copying cost and device memory
+pressure; in-place updates are cheaper but only safe under narrower snapshot
+scope. The evaluation is on V100-era hardware and standalone data-structure
+benchmarks, so throughput and overhead must be remeasured inside SQL route
+execution with protocol, planner, WAL, and resident-segment constraints.
+
+Device-side epoch reclamation is also a production risk. A stuck or very long
+GPU batch could delay reclamation and grow invalid-but-held node bytes. The
+runtime needs explicit epoch-holder telemetry and admission caps before a
+resident multiversion index can run under 1M logical sessions.
+
+**Benchmark candidates:**
+
+- Build a no-GPU resident-index contract simulator with node-version handles,
+  snapshot ids, invalidation generations, and epoch reclamation. Compare full
+  resident-generation pinning versus node-local version retention under mixed
+  point lookup, range lookup, insert, update, and delete streams.
+- When GPU hardware returns, prototype a narrow unsigned-int resident index
+  route over one table: equality lookup and bounded range lookup against
+  immutable resident segments, with optional node-version snapshots. Gate:
+  identical visible results to CPU MVCC at chosen read boundaries.
+- Measure in-place versus out-of-place resident index updates under read-only,
+  read-heavy, and write-heavy mixes. Track GPU HBM bytes, retired-node bytes,
+  epoch lag, range-query p99, update p99, and refresh/invalidation lag.
+- Add route descriptors:
+  `resident_index_id`, `snapshot_scope`, `snapshot_timestamp`,
+  `allocator_epoch`, `versioned_node_bytes`, `retired_node_bytes`,
+  `epoch_lag`, `key_type_family`, and `supports_range_linearizability`.
+- Add negative tests for composite keys, nullable keys, text prefixes,
+  non-deterministic predicates, DDL during lookup, snapshot-id wraparound, and
+  crash/replay. Failure condition: any resident index answer is accepted after
+  the CPU/WAL visibility boundary or catalog generation has invalidated it.
+- Compare resident B-tree, resident hash table, and resident scan routes for
+  selective point predicates. The proof gate is a planner threshold where the
+  index wins on p50 and p99 without hidden reclamation debt or stale reads.

@@ -2548,9 +2548,12 @@ Append new candidates here as each paper is processed.
   Why: the GPU OLTP study finds index lookup can dominate low-contention
   runs; a GPU B-tree gives a concrete follow-up for retained equality/range
   indexes and batched lookup/update paths.
-- `queued` — **A GPU Multiversion B-Tree**, Awad, Porumbescu, and Owens,
+- `reviewed` — **A GPU Multiversion B-Tree**, Awad, Porumbescu, and Owens,
   PACT 2022.
   URL: `https://openreview.net/forum?id=RJ95nyPhcp`
+  DOI: `https://doi.org/10.1145/3559009.3569681`
+  Author page/slides: `https://maawad.github.io/`
+  Code: `https://github.com/owensgroup/MVGpuBTree`
   Why: the reviewed GPU OLTP paper warns that naive MVCC version-chain
   traversal can erase read benefits; a GPU multiversion tree is a direct
   follow-up for compact visibility-aware index structures.
@@ -2690,3 +2693,18 @@ Append new candidates here as each paper is processed.
   Why: QueCC cites transaction chopping and constrained parallel execution as
   related fragment models; useful for deciding when GPU DB should expose
   template-level dependency constraints instead of only route-local queues.
+- `queued` — **Analyzing and Implementing GPU Hash Tables**, Awad et al.,
+  APOCS 2023.
+  URL: `https://doi.org/10.1137/1.9781611977561.ch4`
+  Author/code page: `https://github.com/owensgroup/BGHT`
+  Why: the GPU multiversion B-tree project identifies BGHT as a companion
+  GPU data-structure design with device-side APIs; useful for comparing
+  retained B-tree versus hash-index lookup routes, probe bounds, and
+  snapshot-friendly index rebuild options.
+- `queued` — **More Bang For Your Buck(et): Fast and Space-efficient
+  Hardware-accelerated Coarse-granular Indexing on GPUs**, Henneberg et al.,
+  arXiv 2024.
+  URL: `https://arxiv.org/abs/2406.03965`
+  Why: discovered while following GPU index literature around MVGpuBTree; uses
+  hardware-accelerated coarse-granular indexing ideas that may compete with or
+  complement resident GPU B-tree/hash indexes for selective predicates.
