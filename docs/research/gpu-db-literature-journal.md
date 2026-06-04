@@ -36780,3 +36780,183 @@ extensions yet.
 - Add telemetry for cold-tier offload attempts: submitted bytes, touched bytes,
   cache/coherence bytes, result bytes, queue wait, function time, rejected
   route reason, and whether the offload saved GPU HBM or PCIe traffic.
+
+### 2026-06-04 - Primo removes 2PC by making commit conflict-free before it starts
+
+**Citation:** Ziliang Lai, Hua Fan, Wenchao Zhou, Zhanfeng Ma, Xiang Peng,
+Feifei Li, and Eric Lo. "Knock Out 2PC with Practicality Intact: A
+High-performance and General Distributed Transaction Protocol." ICDE 2023;
+arXiv technical report 2302.12517v2. Retrieved 2026-06-04 from
+`https://arxiv.org/abs/2302.12517`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** distributed transactions; 2PC avoidance; serializable
+concurrency control; write-conflict-free commit; TicToc timestamps; async
+group commit; watermarks; WAL durability; partition owners; write admission.
+
+**Core idea:** Primo argues that eliminating 2PC does not require deterministic
+database assumptions for the whole transaction lifetime. It is enough to ensure
+that, once a distributed transaction reaches commit, no partition can still
+abort because of a write conflict. Primo does this with write-conflict-free
+concurrency control: distributed transactions acquire exclusive locks for the
+records they read during execution, buffer writes at the coordinator, and then
+install the write set without a prepare phase because the required locks are
+already held.
+
+The second part of the design moves crash handling out of the per-transaction
+critical path. Partition leaders persist transaction logs asynchronously and
+periodically publish durable timestamp watermarks. A transaction's result is
+returned after the global watermark passes its logical timestamp. During
+recovery, partitions agree on a common watermark and roll back transactions at
+or beyond that frontier. The reported result is 1.42x to 8.25x higher
+throughput than evaluated general distributed protocols, including Sundial and
+COCO, on YCSB and TPC-C, with latency tuned around the group-commit interval.
+
+**Concrete mechanisms:**
+
+- The protocol targets main-memory shared-nothing partitions with replicated
+  partition leaders. One partition coordinates a distributed transaction, while
+  other touched partitions are participants.
+- A transaction starts in local TicToc/OCC mode and switches to distributed WCF
+  mode on the first remote access. Before switching, previously read local
+  records are locked and checked for change.
+- In WCF mode, every read takes an exclusive lock. Writes are buffered at the
+  coordinator until all commands have executed.
+- Primo assumes or enforces `write_set subset read_set`. Blind writes are
+  handled by adding dummy reads that acquire the needed exclusive locks without
+  actually reading the value; remote dummy reads can be batched with normal
+  remote reads when possible.
+- At commit, the coordinator computes a TicToc-style logical timestamp from
+  accessed records. Because the transaction holds exclusive locks on its read
+  records, it can extend read timestamps as needed instead of running a separate
+  validation phase.
+- Local writes install values and set `wts` and `rts` to the transaction's
+  logical timestamp. Remote writes are sent to participants with that timestamp
+  and are installed without 2PC prepare/commit voting.
+- Deadlocks are prevented with WAIT_DIE. A transaction that cannot acquire a
+  read lock during execution aborts before making effects; no deadlock can
+  appear in the commit phase.
+- Read-only stored procedures can be optimized with snapshots and no locks.
+  Predicate reads use exclusive predicate locks, but large scans may fall back
+  to shared predicate locks plus 2PC to avoid blocking too much work.
+- Local transactions keep using TicToc OCC so they are not blocked during
+  execution by WCF read locks. The paper reports less than 2% extra local aborts
+  from those locks in a read-heavy experiment.
+- Each partition leader asynchronously persists logs and periodically publishes
+  a partition watermark `Wp`; the global watermark `Wg` is the minimum known
+  partition watermark.
+- A partition watermark is chosen below the minimum timestamp or lower-bound
+  timestamp of active transactions. Coordinators force new transaction
+  timestamps above the current partition watermark, and participants may bump
+  accessed record timestamps above their watermark before returning remote read
+  results.
+- Idle or lagging partitions can force-advance their watermarks toward the
+  average of other partitions so one quiet partition does not indefinitely hold
+  back global result return.
+- Failure recovery elects new leaders, reads durable partition watermarks from
+  Raft logs, agrees through a membership service on a recovery global watermark,
+  and rolls back transactions whose timestamps are at or beyond that frontier.
+- Limitations stated by the paper include straggler/long-transaction effects on
+  watermark latency, no unilateral abort after commit-phase entry, and poor fit
+  for read-heavy mostly distributed workloads where extra exclusive read locks
+  dominate the avoided 2PC cost.
+
+**GPU DB mapping:** Primo is directly relevant to a future multi-owner write
+path. The transferable idea is not "take exclusive locks for every read"
+globally; it is to make the publish/install phase deterministic enough that no
+participant can discover a new conflict after the transaction has crossed the
+commit frontier. For GPU DB, that suggests a route class for multi-partition or
+multi-owner write batches where all conflict-prone ownership is acquired or
+validated before WAL visibility publication begins.
+
+The watermark design maps to generation publication. A mutation owner or
+partition owner can keep executing and logging batches while a durable
+watermark trails behind. Client-visible success, retained snapshot selection,
+and GPU residency refresh should key off the durable/publication frontier, not
+off an in-flight local timestamp that may still be rolled back after failure.
+This reinforces the current architecture's WAL-before-visibility rule while
+showing how to keep WAL/group-commit delay out of some lock contention windows.
+
+The WCF/TicToc split also suggests an adaptive write admission policy. Local or
+single-owner transactions can use the cheapest optimistic or owner-serialized
+route. Distributed write batches that repeatedly pay 2PC-like coordination can
+switch to an early-conflict-acquisition route only when the workload is
+write-heavy enough and the read/write set is compact enough. Read-heavy
+cross-partition scans should keep a snapshot route and avoid WCF-style
+exclusive reads.
+
+For P8, the key benchmarkable hook is a "publish frontier" separate from the
+"execution frontier." GPU resident generations, old snapshot retention, and
+cache invalidation should observe durable frontiers. A new resident generation
+can be built speculatively from executed mutations, but it cannot become the
+default read route until its source boundary is durable and cannot be rolled
+back by recovery watermark choice.
+
+**Risks and mismatches:** Primo is a distributed CPU OLTP protocol, not a GPU
+database or MVCC storage design. Its WCF mechanism can harm read-heavy or
+mostly distributed read workloads because exclusive read locks block otherwise
+compatible work. It depends on read/write sets being known by execution time
+and on dummy reads for blind writes; arbitrary SQL statements, broad predicate
+updates, secondary-index side effects, DDL, and long scans need special
+handling or fallback. The evaluation uses DBx1000 on a small Alibaba Cloud
+cluster with four partitions by default and scales to twenty partitions, not
+1M logical sessions or GPU execution workers. The reported latency is tied to
+the group-commit interval around milliseconds, so the design is more useful for
+throughput-oriented writes than p50-sensitive retained reads.
+
+**Benchmark candidates:**
+
+- Add a multi-owner write-path simulator with three routes: ordinary 2PC-like
+  prepare/commit, owner-serialized single-lane execution, and WCF-like early
+  conflict acquisition. Measure throughput, aborts, lock/queue wait, and p95
+  latency across read/write ratios and distributed transaction ratios.
+- Implement a publish-frontier telemetry experiment: execution timestamp,
+  WAL-durable watermark, visibility-published watermark, resident-generation
+  source boundary, and oldest retained snapshot. Proof gate: no read route can
+  observe a generation whose source boundary could be rolled back.
+- Benchmark blind-write and predicate-update handling separately. Failure
+  condition: dummy reads or predicate locks erase the benefit of avoiding 2PC
+  for common SQL update shapes.
+- Add a workload switch rule: WCF-like admission is eligible only when
+  conflict degree, write ratio, and distributed-write ratio exceed thresholds;
+  read-heavy distributed work must keep snapshot/2PC/fallback routes.
+- Test asynchronous group commit against WAL-before-visibility: release
+  execution locks before durable result return, crash at controlled points, and
+  verify recovery rolls back all transactions beyond the agreed watermark while
+  preserving committed prefixes.
+- For GPU residency, prototype speculative refresh from executed but
+  not-yet-durable batches and prove that it never becomes route-valid until the
+  durable watermark passes its source timestamp.
+
+### 2026-06-04 - Cross-paper synthesis: hot routes need separate execution and publication frontiers
+
+The last three reviews point at the same implementation shape from different
+tiers. Tile-based GPU compression says the query route should own its physical
+decode contract. Delilah says cold-tier/offload routes must declare touched
+bytes, coherence cost, and result bounds before execution. Primo says write
+routes should separate execution progress from the durable/publication
+frontier that clients and snapshots can trust.
+
+The converging design track is a two-frontier route descriptor. Each hot route
+should name an execution frontier, which can advance speculatively for batching
+and throughput, and a publication frontier, which is the boundary safe for SQL
+visibility, retained snapshot selection, resident-generation validity, and
+recovery. GPU kernels, storage offload functions, and write batches can all do
+work ahead of publication, but the planner and runtime must reject routes whose
+publication frontier is stale, rolled back, invalidated, or over budget.
+
+Category gaps remain around query optimization for these route descriptors and
+around admission under many logical sessions. The next useful non-analytics
+papers should cover deterministic/optimistic hybrid transaction execution,
+autoscaling or resource-control loops, or optimizer models that can price
+queue interference and publication risk.
+
+**Benchmark priorities:**
+
+- Track execution frontier versus publication frontier for writes, compressed
+  resident generations, and cold-tier offload routes in one telemetry schema.
+- Add crash/recovery tests that leave speculative GPU or offload work complete
+  but unpublished, then verify no stale route becomes selectable after replay.
+- Measure when speculative refresh or compressed/offloaded execution pays back
+  before invalidation by counting queries served per publication generation.

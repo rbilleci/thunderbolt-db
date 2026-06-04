@@ -2957,12 +2957,20 @@ Append new candidates here as each paper is processed.
   useful for comparing coarse batch validation with finer per-transaction
   dependency tracking when GPU DB mixes deterministic batches and optimistic
   owner lanes.
-- `queued` — **Knock Out 2PC with Practicality Intact: A High-performance and
+- `reviewed` — **Knock Out 2PC with Practicality Intact: A High-performance and
   General Distributed Transaction Protocol**, Lai et al., ICDE 2023.
   URL: `https://doi.org/10.1109/ICDE55515.2023.00179`
+  arXiv: `https://arxiv.org/abs/2302.12517`
   Why: HDCC contrasts deterministic execution against 2PC-like deterministic
   optimistic protocols; useful for measuring whether GPU DB multi-owner write
   batches should avoid 2PC entirely or make the commit path cheaper.
+- `queued` — **Lotus: Scalable Multi-Partition Transactions on Single-Threaded
+  Partitioned Databases**, Zhou, Yu, Graefe, and Stonebraker, PVLDB 2022.
+  URL: `https://doi.org/10.14778/3551793.3551851`
+  Why: Primo contrasts Lotus' epoch/lock-holding tradeoff with asynchronous
+  watermarks; useful for comparing single-threaded partition owners,
+  multi-partition write routing, and whether GPU DB should hold or release
+  owner-lane locks across publication boundaries.
 - `queued` — **Plan-Structured Deep Neural Network Models for Query
   Performance Prediction**, Marcus and Papaemmanouil, PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p1733-marcus.pdf`
