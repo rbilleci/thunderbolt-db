@@ -1714,12 +1714,32 @@ Append new candidates here as each paper is processed.
   Why: read-promotion paper cites this as a direction for transaction programs
   with predicate reads; relevant to GPU DB route templates that include ranges,
   prefix predicates, and phantom-sensitive retained scans.
-- `queued` — **When View- and Conflict-Robustness Coincide for Multiversion
+- `queued` — **Allocating Isolation Levels to Transactions in a Multiversion
+  Setting**, Vandevoort, Ketsman, and Neven, PODS 2023.
+  URL: `https://doi.org/10.1145/3584372.3588672`
+  Why: direct predecessor to the view/conflict robustness result; useful for
+  automated RC/SI/SSI route-template allocation before deciding whether a
+  retained read or write template can bypass the strongest isolation path.
+- `reviewed` — **When View- and Conflict-Robustness Coincide for Multiversion
   Concurrency Control**, Vandevoort et al., PACMMOD 2024.
-  URL: `https://doi.org/10.1145/3651593`
+  URL: `https://doi.org/10.1145/3651592`
+  arXiv: `https://arxiv.org/abs/2403.17665`
   Why: modern mixed-isolation robustness follow-up; useful for deciding whether
   GPU DB can rely on conflict-robustness checks for route templates or needs a
   broader view-robustness model for MVCC-visible retained reads.
+- `queued` — **Robustness against Read Committed for Transaction Templates**,
+  Vandevoort et al., PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p2141-vandevoort.pdf`
+  DOI: `https://doi.org/10.14778/3476249.3476268`
+  Why: transaction-template robustness and selective read-promotion baseline;
+  useful for benchmarking whether known OLTP command shapes can safely use a
+  cheaper RC-style route while preserving serializable outcomes.
+- `queued` — **Robustness Against Read Committed for Transaction Templates with
+  Functional Constraints**, Vandevoort et al., ICDT 2022.
+  URL: `https://arxiv.org/abs/2201.05021`
+  Why: extends robustness analysis with functional constraints; useful for GPU
+  DB templates where primary keys, unique constraints, and derived keys may
+  prove that cheaper route-level isolation is still safe.
 - `queued` — **Detock: High Performance Multi-region Transactions at Scale**,
   Li et al., SIGMOD 2023.
   URL:

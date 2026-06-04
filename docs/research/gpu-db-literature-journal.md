@@ -40025,3 +40025,162 @@ indexes, constraints, and generated columns.
 - Evaluate validation order policies for prepared write batches: address order,
   schema/tree order, partition-owner order, and hot-record-last order. Minimum
   gate: deadlock-prevention aborts and p99 validation time are visible.
+
+### 2026-06-04 - View-serializability does not buy extra safe MVCC route templates for RC/SI/SSI
+
+**Citation:** Brecht Vandevoort, Bas Ketsman, and Frank Neven.
+"When View- and Conflict-Robustness Coincide for Multiversion Concurrency
+Control." Proceedings of the ACM on Management of Data 2(2), Article 91,
+PACMMOD/SIGMOD 2024. DOI `10.1145/3651592`. Retrieved 2026-06-04 from
+arXiv, `https://arxiv.org/abs/2403.17665`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing / write
+path; query optimization / planning.
+
+**Relevance tags:** MVCC robustness; view-serializability;
+conflict-serializability; read committed; snapshot isolation; serializable
+snapshot isolation; mixed isolation; transaction templates; route safety;
+static workload analysis.
+
+**Core idea:** The paper asks whether view-robustness can safely admit more
+transaction workloads under weaker MVCC isolation levels than the usual
+conflict-robustness test. View-serializability is more permissive than
+conflict-serializability for individual schedules, so in principle it could
+allow more transaction templates to run at cheaper isolation levels while still
+being equivalent to serial execution.
+
+The surprising result is negative for the practical MVCC isolation family used
+by PostgreSQL and Oracle: read committed, snapshot isolation, and serializable
+snapshot isolation. For allocations over RC, SI, and SSI, a set of transactions
+is view-robust exactly when it is conflict-robust. In other words, widening the
+definition of "safe" from conflict-equivalent serial schedules to
+view-equivalent serial schedules does not create extra robust workloads for
+these isolation levels.
+
+For GPU DB, this turns a tempting design branch into a guardrail. If a retained
+read route, stored-procedure route, or cheaper write-admission route is intended
+to be safe for all interleavings of a transaction template under RC/SI/SSI-like
+MVCC semantics, conflict-robustness is not merely a conservative approximation
+that leaves obvious view-robust performance on the table. It is the right
+static safety target for this family.
+
+**Concrete mechanisms:**
+
+- The paper models multiversion schedules with an operation order, a per-object
+  version order, and a version function mapping each read to the version it
+  observes. This makes snapshot-visible reads explicit instead of relying only
+  on single-version conflict order.
+- Conflict dependencies include write-write dependencies, write-read
+  dependencies, and read-write anti-dependencies over multiversion version
+  order. A schedule is conflict-serializable exactly when its serialization
+  graph is acyclic.
+- View-equivalence requires corresponding reads to observe the same written
+  versions and requires the same final installed version per object. This is
+  stricter than older multiversion definitions that ignore final installed
+  versions, because practical MVCC systems must know which versions future
+  transactions can read and which old versions can be reclaimed.
+- RC is defined with reads observing the last committed version relative to
+  each read operation, writes respecting commit order, and no dirty writes.
+- SI is defined with reads observing the last committed version relative to the
+  first operation of the transaction, writes respecting commit order, and no
+  concurrent writes on the same object.
+- SSI is modeled as SI plus a global prohibition on dangerous structures among
+  SSI transactions, matching the PostgreSQL-style dependency pattern where two
+  read-write anti-dependencies can witness a non-serializable anomaly.
+- The paper distinguishes robustness from exact robustness. Robustness requires
+  every allowed schedule over every subset of a transaction set to be safe,
+  which matches template/API analysis better than checking only the full set.
+- The main technical device is a generalized split schedule: a minimal cyclic
+  chain of dependencies with version installation respecting commit order. Such
+  a schedule witnesses both non-conflict-serializability and
+  non-view-serializability.
+- The authors define Condition C1: if non-conflict-robustness can always be
+  witnessed by an allowed generalized split schedule, then view-robustness and
+  conflict-robustness coincide for that allocation class.
+- They prove that allocations over RC, SI, and SSI satisfy this condition by
+  reducing non-conflict-robust schedules to minimal cycles and transforming the
+  existing multiversion split-schedule characterization into generalized split
+  schedules.
+- A corollary is that deciding view-robustness for RC/SI/SSI allocations is in
+  polynomial time, through the conflict-robustness characterization from the
+  predecessor mixed-isolation work.
+- The paper separately shows that deciding view-serializability for a concrete
+  schedule remains NP-hard even when schedules consist only of transactions
+  allowed under RC or SI. The cheap result applies to robustness of transaction
+  sets/templates, not arbitrary online schedule classification.
+
+**GPU DB mapping:** The clean mapping is a route-template certification pass.
+Prepared statements, stored procedures, retained read shapes, batched lookup
+routes, and owner-local write envelopes can be analyzed as transaction
+templates with declared reads, writes, predicates, and isolation choices. If a
+template set is conflict-robust under an RC/SI/SSI allocation, GPU DB can route
+that set through a cheaper isolation path while preserving serializable
+outcomes for all allowed interleavings in the model.
+
+The result says not to spend engineering time searching for a separate
+view-robustness-only fast path for PostgreSQL-like RC/SI/SSI. For route
+planning, the useful contract is: prove conflict-robustness offline, attach the
+proof or template class to the route descriptor, then let admission choose a
+cheaper runtime path only when the actual command envelope matches that proven
+template.
+
+For retained GPU snapshots, the version-function framing is especially useful.
+Each retained read route already needs to know the snapshot generation and the
+visible tuple versions it may observe. A route descriptor can record whether a
+read observes per-statement committed state, transaction-start state, or an SSI
+read boundary. That makes the static isolation allocation explicit instead of
+leaking it into ad hoc planner rules.
+
+For write throughput, mixed isolation allocation could separate command shapes:
+some read-heavy templates may run with RC-like per-statement visibility, some
+multi-read templates may need SI-like start snapshots, and unsafe templates
+remain on SSI/serializable or owner-serialized paths. The benchmark question is
+whether this route split reduces validation and owner contention enough to
+matter under 1M logical sessions.
+
+**Risks and mismatches:** This is a theory paper, not a DBMS implementation or
+GPU execution paper. It does not provide a production static analyzer for SQL,
+does not benchmark transaction throughput, and does not cover arbitrary
+interactive PostgreSQL transactions. The practical route from theorem to
+engine requires a conservative template extractor that understands predicates,
+indexes, constraints, DDL, triggers, generated columns, and partition routing.
+
+The result is scoped to RC, SI, and SSI as modeled in the paper. It should not
+be generalized to weaker, distributed, stale-read, or non-atomic-visibility
+isolation models without a separate proof. It also does not say that
+conflict-serializability and view-serializability coincide for individual
+schedules; they do not. The equivalence is for robustness of transaction sets
+under the specified isolation allocations.
+
+The paper's SSI model abstracts PostgreSQL's dangerous-structure semantics, but
+GPU DB will add resident snapshot invalidation, cross-device queues,
+micro-batching, and route fallback. Those mechanisms must preserve the same
+read/write/version facts that the proof assumes. If GPU routes blur the visible
+snapshot boundary or allow stale resident data to masquerade as committed
+state, the robustness result no longer applies.
+
+**Benchmark candidates:**
+
+- Add an offline route-template checker prototype for a tiny transaction DSL:
+  key reads, key writes, predicate reads, commit order, and RC/SI/SSI allocation.
+  Proof gate: accepted templates have acyclic dependency graphs for all bounded
+  instantiations used in the test harness.
+- Build a mixed-isolation routing benchmark with three paths: all-SSI owner
+  route, conflict-robust RC/SI route, and unsafe-template fallback. Measure
+  owner queue time, validation work, abort/retry count, and p99 latency under
+  hot read-heavy templates.
+- Attach isolation allocation to retained route descriptors: per-statement RC,
+  transaction-start SI, and SSI-required. Failure condition: a route executes
+  without proving that its snapshot generation matches the allocated isolation
+  boundary.
+- Test template drift: start with a proven route template, then add a predicate
+  read, constraint check, or generated-column dependency. The route must either
+  re-prove robustness or fall back to the stronger path.
+- Compare conflict-robust template analysis with semantic repair telemetry from
+  Transaction Healing. Measure whether cheaper isolation routing reduces the
+  conflicts that repair would otherwise handle, or merely moves tail latency to
+  route fallback.
+- Add a "no view-only shortcut" regression: construct schedules that are
+  view-serializable but not conflict-serializable, then confirm they are not
+  accepted as robust RC/SI/SSI route templates unless the robustness proof for
+  every relevant subset succeeds.
