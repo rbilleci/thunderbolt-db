@@ -2158,9 +2158,10 @@ Append new candidates here as each paper is processed.
   transaction path; useful for comparing execution/replication decoupling,
   deterministic replay, and geo-replication costs against owner-local GPU DB
   WAL and snapshot publication.
-- `queued` — **Fast Commitment for Geo-Distributed Transactions via
+- `reviewed` — **Fast Commitment for Geo-Distributed Transactions via
   Decentralized Co-coordinators**, Zhang et al., PVLDB 2024.
-  URL: `https://doi.org/10.14778/3641204.3641229`
+  URL: `https://www.vldb.org/pvldb/vol17/p2555-hu.pdf`
+  DOI: `https://doi.org/10.14778/3675034.3675046`
   Why: Mako compares against D2PC as a modern geo-distributed transaction
   baseline; useful for evaluating whether decentralized commit coordination
   can reduce owner or shard-leader bottlenecks without speculative rollback

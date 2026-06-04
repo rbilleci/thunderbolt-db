@@ -48951,3 +48951,201 @@ GPU implementation should preserve.
   partial aggregate, point lookup, and range scan. Proof gate: the logical plan
   and authorization path stay CPU-owned; GPU is only a physical route selected
   after snapshot/freshness validation.
+
+### 2026-06-04 - D2PC decentralizes commit coordination to shorten conflict windows
+
+**Citation:** Zihao Zhang, Huiqi Hu, Xuan Zhou, Yaofeng Tu, Weining Qian,
+and Aoying Zhou. "Fast Commitment for Geo-Distributed Transactions via
+Decentralized Co-coordinators." PVLDB 17(10), 2024, pp. 2555-2567.
+doi:10.14778/3675034.3675046. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol17/p2555-hu.pdf`.
+
+**Category:** transaction processing / commit path; concurrency control
+windows; distributed runtime coordination.
+
+**Relevance tags:** decentralized commit coordination; early PreCommit;
+short conflict windows; raw dependency tracking; bypass-leader replication
+reply; co-coordinator sharding; geo-distributed OLTP; OCC and 2PL integration.
+
+**Core idea:** D2PC targets the commit phase of layered geo-distributed
+databases, where 2PC sits above leader-based replication. Its main observation
+is that a single 2PC coordinator stretches both commit latency and the
+concurrency-control period because participant leaders wait across multiple
+cross-region message delays before releasing locks or validation state.
+
+The paper replaces the single coordinator with co-coordinators in every
+datacenter. Each co-coordinator collects votes from local replicas and can make
+a local PreCommit decision before full replication completion. Participant
+leaders can then end the concurrency-control period early, while the
+correspondent coordinator waits for enough replication replies to make the
+final Commit or Abort decision. This separates "the serial order is known" from
+"the durable final decision is fully replicated."
+
+The strongest transferable idea for GPU DB is not geo-replication itself; it is
+the split between early conflict-window closure and later final publication.
+For multi-owner write batches, refresh batches, and route-generation
+publication, GPU DB can use a similar two-stage boundary: a PreCommit-like
+stage that proves ordering/dependencies and releases scarce owner resources,
+followed by a final visibility/publication stage that preserves WAL and
+recovery invariants.
+
+**Concrete mechanisms:**
+
+- D2PC deploys one co-coordinator per datacenter, plus a correspondent
+  coordinator for each transaction. A transaction's participant leaders still
+  run the underlying data-store concurrency control, such as OCC or 2PL.
+- Participant leaders receive Prepare, validate the shard-local read/write
+  sets, generate a vote and transaction log, then replicate the log, vote, and
+  involved-shard list to replicas.
+- Followers send votes and replication replies to their co-located
+  co-coordinator. Once a co-coordinator has votes for all participant shards,
+  it makes a PreCommit decision and notifies local participant leaders.
+- On PreCommit, participant leaders end the concurrency-control period. For
+  2PL this means releasing locks; for OCC this means removing the transaction
+  from the validation list. The paper's analysis reduces this period to about
+  0.5 inter-datacenter RTT.
+- Final commit waits for the correspondent coordinator to receive votes from
+  all shards and replication replies from a majority of replicas for each
+  participant. With bypass-leader replication replies this takes 1 to 1.5
+  inter-datacenter RTTs depending on replica placement.
+- Bypass-leader replication reply lets followers relay replication replies
+  through co-coordinators directly to the correspondent coordinator, avoiding a
+  return through the shard leader on the fast path. A slow path via leaders is
+  retained for failure cases.
+- Because writes may become visible after PreCommit but before final Commit,
+  D2PC tracks raw dependencies. Each tuple has a PreCommit list of transactions
+  that wrote it but are not finally committed. Readers register dependencies
+  through `in` counters and `out` lists.
+- A dependent transaction can reach PreCommit, but it cannot finally commit
+  while its `in` counter is greater than zero. If a dependency aborts, dependent
+  transactions are marked through the counter and prevented from committing.
+- PreCommit updates are stored in memory write sets rather than applied
+  in-place, so aborting a PreCommit transaction does not require undoing durable
+  state.
+- Co-coordinator failures degrade the protocol rather than breaking it. If fast
+  replies are unavailable, the correspondent coordinator can learn replication
+  results through the slow leader path. With only one live co-coordinator, D2PC
+  behaves more like ordinary 2PC.
+- Co-coordinators can be sharded by transaction id modulo the number of
+  coordinator groups to avoid making the coordinator layer a bottleneck.
+- The evaluation combines D2PC with OCC and 2PL on Retwis, TPC-C, and
+  microbenchmarks in multi-cloud deployments. Reported headline results are up
+  to 43% commit-latency reduction and up to 2.43x throughput over 2PC-based
+  geo-distributed transaction processing.
+
+**GPU DB mapping:** D2PC suggests making owner-resource hold time a first-class
+metric. GPU DB's mutation owner, partition owners, residency owner, and GPU
+execution owners should distinguish time spent proving order/dependencies from
+time spent waiting for durable flush, refresh completion, response draining, or
+replica acknowledgement. Long owner hold time should be visible as a separate
+counter from end-to-end command latency.
+
+For write throughput, a PreCommit-like stage could fit WAL-backed multi-owner
+batches: validate all participating owner domains, reserve the publication
+generation, record raw dependencies or fallback blockers, then release hot
+per-key/partition conflict state before slower publication or refresh work
+finishes. Final visibility must still wait for WAL-before-visibility and
+snapshot publication, but conflict admission does not need to keep every scarce
+owner latch or validation entry live until the whole route is done.
+
+For retained GPU snapshots, the same idea maps to refresh. A refresh worker
+could first establish that a target generation has a complete source boundary
+and dependency set, then let mutation admission proceed while GPU transfer,
+checksum, and route-publication steps finish. The route must remain
+unavailable until final publication, but mutation owners should not be blocked
+by device-side staging after ordering has been proven.
+
+For 1M logical sessions, co-coordinator sharding maps to route-admission shards.
+A single global coordinator for all retained reads, writes, and refreshes will
+become a bottleneck. Admission should shard by transaction id, relation, route
+family, or partition, while still producing a small route certificate that
+records the ordering boundary and final visibility state.
+
+The raw-dependency list is the cautionary part. If GPU DB ever allows reads
+from PreCommit-like writes or in-flight refreshed generations, it must track
+dependency counters and abort/fallback propagation explicitly. A simpler first
+implementation should avoid speculative visibility and use the D2PC split only
+to release internal resources early, not to expose uncommitted data to SQL
+readers.
+
+**Risks and mismatches:** D2PC is designed for geo-distributed databases, not a
+single-node GPU-accelerated storage engine. Its benefits come from removing
+cross-region RTTs; GPU DB's initial bottlenecks are likely owner queues,
+WAL/flush cost, CPU/GPU transfer, CUDA launch overhead, and response rings.
+The protocol also assumes the data store already has OCC or 2PL and that
+transaction logs and votes are replicated across datacenters.
+
+The PreCommit mechanism deliberately permits reads from PreCommit writes with
+raw-dependency tracking. That is dangerous for a PostgreSQL-compatible primary
+engine unless the isolation contract is very explicit. Early resource release
+is transferable; early SQL-visible dirty reads are not. Finally, the paper's
+evaluation is multi-cloud Retwis/TPC-C/microbenchmark work. It does not measure
+GPU memory, device queues, MVCC version retention, or snapshot refresh cost.
+
+**Benchmark candidates:**
+
+- Add owner hold-time telemetry to the write path: queue wait, validation
+  time, WAL reservation/flush time, visibility publication time, refresh
+  invalidation time, and response time. Failure condition: end-to-end latency
+  improves while owner hold time remains the hidden bottleneck.
+- Prototype a two-stage multi-partition write admission path in a benchmark
+  harness: `prepared_ordered` after dependency validation and WAL reservation,
+  `visible` only after WAL-before-visibility. Measure write throughput and
+  p99 under hot-key contention.
+- Compare single global commit/admission coordination against sharded
+  coordinators by partition or relation. Measure coordinator queue depth,
+  rejected work, commit p50/p99, and correctness under injected aborts.
+- Add a refresh PreCommit benchmark: establish a complete source generation,
+  release mutation-owner refresh pressure, then complete GPU transfer and
+  publish the route. Proof gate: no query can use the generation before final
+  publication.
+- Test speculative dependency tracking only as an internal experiment: allow a
+  dependent internal task to wait on an in-flight publication, with explicit
+  abort/fallback propagation. Do not expose this as SQL-visible reads until the
+  isolation contract is proven.
+- Compare D2PC-style early resource release with simpler batching: fixed WAL
+  batch boundaries, epoch publication, and queue-oriented owner execution.
+  The winner should minimize p99 write latency and owner occupancy without
+  increasing stale GPU route acceptance.
+
+### 2026-06-04 - Cross-paper synthesis: freshness, safe routes, and short commit windows
+
+The last three reviewed papers, HyBench, F1 Lightning, and D2PC, converge on a
+single design pressure: fast routes are useful only when they carry explicit
+semantic boundaries. HyBench makes freshness a benchmark dimension, F1
+Lightning turns freshness into a safe timestamp window for analytical routing,
+and D2PC splits transaction ordering from final durable completion to shorten
+the time scarce concurrency-control resources are held.
+
+**Converging design tracks:**
+
+- Route certificates should include both read-side and write-side boundaries:
+  source WAL/transaction generation, min/max safe resident generation,
+  freshness lag, route family, fallback reason, and whether a request is before
+  or after the final visibility/publication point.
+- GPU resident data should be treated as a timestamped physical access path,
+  not a cache hit. A retained route is valid only if its generation satisfies
+  the query's isolation and freshness requirement.
+- Write and refresh pipelines should separate ordering proof from final
+  publication. Owners should release conflict/admission resources after order
+  and dependencies are known, but SQL visibility and GPU route availability
+  must wait for WAL and snapshot publication.
+- Benchmark results should report tuples, not a single throughput number:
+  write throughput, retained-read latency, refresh lag, stale-route rejection,
+  owner hold time, and fallback rate.
+
+**Category gaps:** The queue still has useful work in transaction commit,
+MVCC/read-safe visibility, runtime scheduling, and future memory tiers. After
+this transaction-focused D2PC pass, the next review should probably target
+either a modern MVCC/snapshot paper or a runtime/admission paper unless the
+queue has a clearly stronger 2025+ tier-placement candidate.
+
+**Benchmark priorities:**
+
+- Build a route-certificate fixture that can reject stale resident generations
+  under injected writes and refresh delays.
+- Add owner hold-time telemetry before optimizing commit or refresh batching.
+- Run a reduced HTAP freshness workload with shared tables, not separate OLTP
+  and OLAP data streams.
+- Compare coarse table-generation safe windows against per-partition safe
+  windows before adding per-key freshness state.
