@@ -44934,3 +44934,175 @@ benchmark questions.
 - Test a lowest-priority fast path explicitly. When all active work is
   priority zero, the route should match the current optimistic path within
   measurement noise.
+
+### 2026-06-04 - Runtime conflicts make transaction order a measurable resource
+
+**Citation:** Yang Cao, Wenfei Fan, Weijie Ou, Rui Xie, and Wenyue
+Zhao. "Transaction Scheduling: From Conflicts to Runtime Conflicts."
+PACMMOD/SIGMOD 2023, article 26. Retrieved 2026-06-04 from the
+DOI page and Edinburgh author PDF, `https://doi.org/10.1145/3603164`.
+
+**Category:** transaction processing / write path / concurrency
+control.
+
+**Relevance tags:** transaction scheduling; runtime conflicts;
+proactive deferment; hot-key admission; contention management;
+bounded probing; TPC-C; YCSB; DBx1000; partition refinement.
+
+**Core idea:** This paper argues that the usual conflict graph is too
+coarse for scheduling OLTP work. Two transactions may touch the same
+item and still avoid an actual conflict if their execution intervals
+do not overlap. The authors define a runtime conflict using both the
+read/write conflict relation and the scheduled start/finish window,
+then use that finer notion to reorder transactions within thread-local
+queues.
+
+The transferable idea is that hot-key admission should reason about
+when work will overlap, not only whether two requests name the same
+key, partition, or resident segment. For GPU DB this is a useful
+counterweight to purely pessimistic hot-key throttling: a route owner
+can delay, reorder, or batch compatible work to avoid conflict windows
+while still letting the underlying MVCC/OCC/WAL checks enforce
+correctness.
+
+**Concrete mechanisms:**
+
+- TSkd has two modules. TsPar refines an existing transaction
+  partitioning into per-thread ordered queues with fewer runtime
+  conflicts. TsDefer works on unbundled or residual transactions by
+  deferring likely-conflicting transactions before handing them to the
+  normal concurrency-control engine.
+- A transaction schedule maps work to `k` queues and orders each
+  queue. A pair is runtime-conflicting only if the transactions
+  conflict under the target isolation level and their estimated
+  execution intervals overlap.
+- The formal scheduling problem is NP-complete, including simple
+  cases. The paper therefore uses TSgen, a greedy algorithm that
+  preserves existing partition assignments, picks the least-loaded
+  queue for residual transactions, uses the partitioner's conflict
+  graph, and checks whether appending a transaction keeps the queues
+  runtime-conflict free.
+- TSgen can also run without an input partition by treating all work
+  as residual. Its stated implementation complexity is linear in the
+  workload size when the number of threads is fixed, assuming it
+  reuses conflict-graph data from a partitioner.
+- TsDefer keeps thread-local transaction queues in shared arrays with
+  owner-writable, remotely readable head/tail pointers. It exposes
+  `regPos`, `lookup`, and `defer` operations implemented with C++
+  atomics rather than locks.
+- Before executing a transaction, TsDefer performs a bounded number
+  of random lookups into other threads' active transaction write sets.
+  If the probes repeatedly find items that conflict, it defers the
+  transaction with a tunable probability. The paper emphasizes that
+  this is a lightweight filter, not a replacement for concurrency
+  control.
+- Cost estimates come from execution histories, partial dry runs, or
+  access-set size fallbacks. The system still runs with the underlying
+  CC protocol to preserve isolation when estimates or access sets are
+  wrong.
+- Evaluation integrates the prototype with DBx1000 on full TPC-C and
+  YCSB, including runtime-skew and artificial I/O-latency extensions.
+  The paper reports that scheduling improves partitioners by 131% on
+  average and up to 294%, while proactive deferment improves a
+  CC-based baseline by 109% on average and reduces retries by 45.7%.
+  These numbers are useful as direction, not as directly portable GPU
+  DB expectations.
+
+**GPU DB mapping:** GPU DB should treat runtime-conflict avoidance as
+an owner-local admission tool. A mutation owner or hot-partition owner
+can maintain active-window metadata: route class, key or segment hash,
+estimated service time, snapshot/visibility boundary, priority class,
+and queue position. When a new write, refresh, or retained read arrives,
+the owner can choose among immediate execution, short deferment, CPU
+fallback, or batch coalescing based on predicted overlap rather than a
+single global "hot key" bit.
+
+TsPar maps to bundled work: stored procedures, prepared same-shape
+mutations, COPY chunks, refresh batches, and retained lookup batches
+whose access sets are known or cheaply estimated. The runtime can
+generate schedule certificates that say why a batch is safe to drain in
+a particular order. Those certificates must remain hints to admission;
+the actual correctness authority stays with WAL-before-visibility,
+MVCC validation, and snapshot compatibility checks.
+
+TsDefer maps to the live queue path. IO workers or owner rings can use
+a bounded number of probes into active owner-local descriptors to avoid
+starting a transaction that is likely to abort, invalidate a retained
+route, or collide with a higher-priority request. This is especially
+relevant to the 1M logical-session target because the state scales with
+active queued work, not idle sessions. A few probes against active
+descriptors are much cheaper than per-session conflict state.
+
+The paper also suggests a useful distinction for GPU execution:
+conflicts can be about physical resources as well as logical rows. A
+long resident refresh, GPU kernel, or NVMe read can create an expensive
+overlap window even when logical isolation is valid. The same
+active-window metadata can therefore feed both transaction ordering and
+GPU/CPU/tier admission.
+
+**Risks and mismatches:** TSkd assumes many transactions have
+predeclared or inferable access sets, as in stored procedures or
+templates. Ad hoc SQL, range predicates, joins, dynamic plans, and
+variable result sizes are weaker fits and should fall back to ordinary
+planning and CC. The paper targets in-memory multicore OLTP, not SQL
+over GPU-resident snapshots, NVMe tiers, or long GPU kernels.
+
+Incorrect estimates can still create conflicts, so the design is not a
+correctness mechanism. GPU DB must never let a runtime-conflict
+certificate bypass MVCC, WAL ordering, catalog generation checks,
+resident invalidation, or durable publication. There is also a policy
+risk: too much deferment can inflate queue wait and p50 latency even
+while reducing aborts. Deferment needs a latency budget, starvation
+release, and fallback reason telemetry.
+
+**Benchmark candidates:**
+
+- Build a hot-key active-window simulator that compares FIFO,
+  priority reservation, SMF-style ordering, runtime-conflict scheduling,
+  and bounded probe deferment on YCSB and TPC-C-like mixes. Measure
+  throughput, aborts, queue wait, p99/p999 latency, and starvation.
+- Add route-certificate fields for `estimated_service_us`,
+  `active_window_start`, `active_window_end`, `conflict_scope`,
+  `defer_count`, and `schedule_reason`. Proof gate: certificates only
+  influence admission order, never visibility.
+- Prototype owner-local bounded probes over active descriptors before
+  admitting a retained read or mutation. Failure condition: probe cost
+  exceeds saved abort/fallback/refresh cost under low contention.
+- Test runtime-conflict scheduling for COPY chunk publication and
+  resident refresh batches. Compare append-order drain, key-hash
+  grouping, and estimated-window ordering while preserving
+  WAL-before-visibility.
+- Add queue telemetry that separates productive deferment from harmful
+  delay: avoided retry count, false defer count, max defer age,
+  starvation release count, and latency budget violations.
+- For GPU route work, benchmark whether predicted kernel/transfer
+  overlap should defer a retained request, split it to CPU, or batch it
+  behind compatible keys. The first proof should use synthetic service
+  times before touching real GPU benchmarks.
+
+### 2026-06-04 - Cross-paper synthesis: admission needs active-window state
+
+Recent runtime papers now converge on a more concrete admission model.
+DINT says the edge should classify only bounded common cases and route
+the rest to owner logic. Polaris says priority should be sparse and
+attached to active conflicts, not every record or session. Transaction
+scheduling adds the missing time dimension: two requests that name the
+same object do not necessarily need pessimism if their active windows
+can be separated cheaply.
+
+The main design track is an owner-local active-window table for hot
+work. Each entry should carry route class, key or segment hash,
+snapshot or visibility boundary, priority class, estimated service
+time, queue position, and fallback/defer counters. Protocol-edge
+classification may create compact descriptors, but only owners should
+interpret them into scheduling, priority reservation, or deferment
+decisions. That keeps correctness centralized while still shrinking the
+amount of work that reaches heavy paths.
+
+Category gaps remain in multi-tier placement and query optimization.
+The next few papers should include at least one modern tier/cache or
+optimizer paper unless the queue presents a clearly stronger MVCC or
+transaction-control candidate. The benchmark priority is now a single
+admission simulator that can compare edge classification, priority,
+runtime-conflict scheduling, and bounded deferment under the same
+workload and latency gates.

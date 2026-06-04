@@ -253,7 +253,7 @@ Append new candidates here as each paper is processed.
   strong 2023-present full paper in transaction scheduling; directly relevant
   to hot-key admission, abort/fallback reduction, and route ordering under
   contention.
-- `queued` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
+- `reviewed` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
   Cao et al., PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3603164`
   PDF:
@@ -1813,6 +1813,14 @@ Append new candidates here as each paper is processed.
   Why: lightweight learned transaction-to-thread assignment cited by TSkd;
   relevant to admission-time prediction before choosing an owner, CPU route,
   or deferred execution path.
+- `queued` — **Design Principles for Scaling Multi-core OLTP Under High
+  Contention**, Ren, Faleiro, and Abadi, SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882955`
+  PDF: `http://www.cs.umd.edu/~abadi/papers/orthrus-sigmod16.pdf`
+  Why: TSkd contrasts with Orthrus-style separation of transaction logic and
+  concurrency-control cores; useful for deciding whether GPU DB mutation
+  owners, read-snapshot workers, and conflict/admission workers should be
+  separated under hot-key contention.
 - `reviewed` — **Polyjuice: High-Performance Transactions via Learned
   Concurrency Control**, Wang et al., OSDI 2021.
   URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`
