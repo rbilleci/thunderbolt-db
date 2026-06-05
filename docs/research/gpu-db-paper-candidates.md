@@ -5646,15 +5646,23 @@ Append new candidates here as each paper is processed.
   Why: SAP HANA NVM flags persistent-memory testing as a separate challenge;
   useful for designing crash/restart fault-injection gates before any future
   GPU DB CXL/NVM tier stores durable or semi-durable route metadata.
-- `queued` — **Deadlocks in Datacenter Networks: Why Do They Form, and How to
+- `reviewed` — **Deadlocks in Datacenter Networks: Why Do They Form, and How to
   Avoid Them**, Hu et al., HotNets 2016.
-  URL: `https://doi.org/10.1145/3005745.3005778`
+  URL: `https://doi.org/10.1145/3005745.3005760`
   Why: Backpressure Flow Control relies on avoiding cyclic buffer dependencies;
   useful for translating network backpressure deadlock rules into GPU DB
-  owner-ring, response-ring, and gateway admission graphs.
+  owner-ring, response-ring, and gateway admission graphs. Reviewed on
+  2026-06-05.
 - `queued` — **Tagger: Practical PFC Deadlock Prevention in Data Center
   Networks**, Hu et al., CoNEXT 2017.
   URL: `https://doi.org/10.1145/3143361.3143368`
   Why: BFC cites Tagger-style deadlock prevention for pause/resume paths;
   useful follow-up for ensuring selective backpressure and bounded queues
   cannot create distributed wait cycles across GPU DB runtime domains.
+- `queued` — **Congestion Control for Large-Scale RDMA Deployments**,
+  Zhu et al., SIGCOMM 2015.
+  URL: `https://doi.org/10.1145/2785956.2787484`
+  Why: the HotNets deadlock paper identifies DCQCN-style end-to-end congestion
+  control as useful for reducing PFC generation but too delayed to eliminate it;
+  useful for comparing end-to-end delay/rate feedback with GPU DB's local
+  ring-pressure and credit signals.

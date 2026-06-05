@@ -71929,3 +71929,142 @@ or NVMe-backed resident snapshots without new measurements.
 - Extend the generator with deletion and range-delete bursts before using it as
   a write-path proof. Gate: old-version and tombstone growth under retained
   snapshots is visible in latency and cleanup telemetry.
+
+### 2026-06-05 - Deadlock safety needs packet-level pressure, not just cycle detection
+
+**Citation:** Shuihai Hu, Yibo Zhu, Peng Cheng, Chuanxiong Guo, Kun Tan,
+Jitendra Padhye, and Kai Chen. "Deadlocks in Datacenter Networks: Why Do They
+Form, and How to Avoid Them." HotNets-XV, 2016, pp. 92-98.
+doi:10.1145/3005745.3005760. Retrieved 2026-06-05 from the Microsoft Research
+PDF:
+`https://www.microsoft.com/en-us/research/wp-content/uploads/2016/10/hotnets16-final67.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** backpressure; deadlock; bounded queues; wait-for graphs;
+RDMA; PFC; local pressure; rate limiting; admission control; response rings.
+
+**Core idea:** The paper studies Priority-based Flow Control deadlocks in
+lossless RDMA-over-Ethernet datacenter networks. Its main result is negative
+but useful: cyclic buffer dependency is necessary for PFC deadlock, but it is
+not sufficient. Some traffic matrices contain a buffer-dependency cycle and
+active flows without deadlocking, while small changes to the matrix can make
+the same dependency cycle deadlock. Even simultaneous pause events around a
+cycle are not always enough to prove permanent deadlock.
+
+The transferable idea for GPU DB is that "there is a cycle" and "the system is
+deadlocked" are different claims. BFC-style selective backpressure and bounded
+owner rings need both static dependency checks and runtime pressure signals.
+Cycle detection is still valuable, but a production runtime also needs local
+thresholds, rate shaping, bounded pause domains, and explicit escape paths
+when pressure propagates through a loop.
+
+**Concrete mechanisms:**
+
+- PFC pauses an immediate upstream link when an ingress queue exceeds a
+  threshold. Deadlock occurs when paused links form a directed cycle and every
+  switch in that cycle holds buffer needed by its upstream neighbor while
+  waiting for downstream buffer to drain.
+- Existing proactive approaches try to eliminate cyclic buffer dependency
+  through routing restrictions or structured buffer pools. The paper argues
+  those approaches can waste path diversity, require too many priority/buffer
+  classes, or fail under bugs, misconfiguration, routing updates, and transient
+  loops.
+- In a simple routing-loop case, the authors derive a boundary condition:
+  deadlock forms only when injection rate exceeds `nB / TTL`, where `n` is
+  loop length, `B` is link bandwidth, and `TTL` is packet time-to-live. In
+  their 40 Gbps, two-hop, TTL-16 test, the threshold is 5 Gbps.
+- Packet TTL matters because expired packets drain the loop. Shorter effective
+  TTL or longer loops raise the injection rate needed to sustain deadlock.
+- In multi-flow examples without routing loops, the same cyclic dependency can
+  produce different outcomes depending on traffic matrix and packet-level
+  buffer occupancy. Flow-level stable-state analysis can predict similar
+  average throughput while missing whether PFC pauses line up permanently.
+- The authors implement packet-level NS-3 simulations with PFC behavior:
+  switches track ingress-queue bytes and pause the incoming link once the
+  queue crosses a threshold.
+- Adding one additional flow outside the cyclic dependency changes pause
+  timing enough to create deadlock in a four-switch example, even though the
+  average-flow analysis does not predict the change.
+- Rate limiting can prevent deadlock even when the buffer-dependency graph is
+  unchanged. In the example, limiting the added flow to 2 Gbps avoids
+  deadlock, while 3 Gbps deadlocks.
+- Proposed mitigations are heuristic, not complete proofs: reduce effective
+  TTL within priority classes, rate-limit flows involved in cyclic dependency,
+  limit PFC pause propagation by topology-aware thresholds, and reduce PFC
+  generation through earlier congestion signals such as DCQCN/TIMELY-style
+  feedback or phantom queues.
+- The paper explicitly says it does not fully characterize necessary and
+  sufficient deadlock conditions for general multi-flow cases.
+
+**GPU DB mapping:** This extends the BFC journal entry. GPU DB's owner-domain
+runtime should treat queues, rings, buffer credits, and response lanes like a
+lossless backpressured network: a mutation owner can pause ingress, a GPU
+worker can pause read lanes, a socket writer can stall response buffers, and a
+residency owner can block refresh publication. If these pause edges can form a
+cycle, a full system can stop making progress even though each individual
+queue is locally bounded and "correct."
+
+The paper argues for two layers of safety. First, build a static wait-for graph
+for runtime domains: network IO, parse/admission, mutation owner, catalog
+owner, residency owner, GPU workers, response encoders, socket writers, and
+memory-budget managers. Certain cycles should be forbidden by design or given
+an always-draining owner. Second, add packet-level equivalents: queue-depth
+time series, service-rate estimates, pause/resume events, and credit ownership
+per lane. Average throughput is not enough to diagnose deadlock risk.
+
+TTL-based mitigation maps to finite leases and deadlines. Requests, snapshot
+handles, pinned buffers, response chunks, and refresh artifacts should not be
+able to hold scarce credits indefinitely without an owner-visible deadline,
+abort path, demotion, or spill path. A long client response or stuck refresh
+should release or downgrade resources rather than permanently blocking an
+upstream owner.
+
+Rate limiting maps to route-class shaping. If COPY admission, long
+over-resident scans, or refresh work feed a pressure cycle, the runtime can
+shape that class locally without throttling unrelated retained lookups. The
+threshold should come from measured service rate and queue occupancy at the
+specific boundary, not only from global p99 latency.
+
+Limiting pause propagation maps to narrow backpressure domains. A saturated
+socket writer should pause only the response lane or session credit that feeds
+it, not the entire IO worker. A saturated GPU stream should reduce credits for
+the compatible route class, not mutation admission. This keeps BFC's
+selectivity while adding the HotNets warning that pause propagation can become
+self-sustaining.
+
+**Risks and mismatches:** The paper is a short HotNets networking study, not a
+database runtime, and its mitigations are intentionally incomplete. It studies
+PFC, RoCE, switch buffers, TTL, and packet-level simulation, not SQL
+transactions, WAL ordering, MVCC snapshots, GPU streams, or TCP pgwire
+semantics. GPU DB should borrow the deadlock reasoning, not assume the same
+rate thresholds or packet behavior.
+
+The strongest caution is that runtime deadlock may depend on instantaneous
+queue and credit timing. Static architecture diagrams can miss the failure, but
+simulation-only evidence can also overfit. The GPU DB implementation needs
+small deterministic tests that can force every pause edge and failure path.
+
+**Benchmark candidates:**
+
+- Add a runtime wait-for graph model for IO workers, mutation owner, catalog
+  owner, residency owner, GPU workers, response encoders, socket writers, and
+  memory-budget owners. Gate: known production queue/backpressure edges cannot
+  form an unbreakable cycle.
+- Build a bounded-ring deadlock simulator with deterministic service rates,
+  queue capacities, pause thresholds, and route classes. Reproduce cases where
+  a static cycle drains safely and cases where slight traffic changes deadlock.
+- Add per-request and per-buffer leases for scarce credits: pinned host
+  buffers, response lanes, retained snapshot handles, refresh artifacts, and
+  GPU scratch buffers. Failure condition: a stuck downstream consumer can hold
+  upstream progress forever.
+- Stress socket backpressure with one slow client holding a large result while
+  many retained lookups complete. Gate: unrelated short responses do not wait
+  behind the slow client's lane or exhaust global response buffers.
+- Add route-class rate shaping for COPY, refresh, long scan, and retained
+  lookup lanes. Compare global overload throttling with local shaping at the
+  saturated boundary; measure p50/p99 latency, throughput, and pause events.
+- Extend admission telemetry with pause/resume counters, queue depth over
+  time, service-rate estimates, and owner-lane credit ownership. Gate: a
+  deadlock or near-deadlock is diagnosable from telemetry without guessing from
+  average throughput alone.
