@@ -5513,7 +5513,7 @@ Append new candidates here as each paper is processed.
   Why: OrpheusDB builds on the recreation/storage tradeoff for versioned
   datasets; useful for turning GPU DB snapshot-retention, checkpoint, and
   cold-version reconstruction policy into an explicit cost frontier.
-- `queued` — **Type-Aware Transactions for Faster Concurrent Code**,
+- `reviewed` — **Type-Aware Transactions for Faster Concurrent Code**,
   Herman, Inala, Huang, Tsai, Kohler, Liskov, and Shrira, EuroSys 2016.
   URL: `https://doi.org/10.1145/2901318.2901348`
   Author PDF: `https://read.seas.harvard.edu/~kohler/pubs/herman16type-aware.pdf`
@@ -5521,6 +5521,14 @@ Append new candidates here as each paper is processed.
   object work; useful for comparing route-specific conflict predicates,
   datatype-owned commit hooks, and reduced read/write-set bookkeeping
   against generic tuple-level validation.
+- `queued` — **Automatic Scalable Atomicity via Semantic Locking**,
+  Golan-Gueta, Ramalingam, Sagiv, and Yahav, PPoPP 2015.
+  URL:
+  `https://www.microsoft.com/en-us/research/publication/automatic-scalable-atomicity-via-semantic-locking/`
+  DOI: `https://doi.org/10.1145/2688500.2688511`
+  Why: Type-Aware Transactions contrasts STO with automatic semantic locking;
+  useful for comparing rollback-free pessimistic semantic locks against
+  datatype-owned optimistic predicates and route-specific conflict contracts.
 - `queued` — **SAP HANA Adoption of Non-Volatile Memory**, Andrei et al.,
   PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p1754-andrei.pdf`

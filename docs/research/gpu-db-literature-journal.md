@@ -70098,3 +70098,188 @@ workloads unless bounded by deterministic correctness and overload rules.
   throughput, abort rate, p99 latency, WAL wait, GPU refresh starvation, and
   memory pressure rather than optimizing committed transactions per second
   alone.
+
+### 2026-06-05 - Type-aware transactions make conflict semantics a data-structure contract
+
+**Citation:** Nathaniel Herman, Jeevana Priya Inala, Yihe Huang,
+Lillian Tsai, Eddie Kohler, Barbara Liskov, and Liuba Shrira.
+"Type-Aware Transactions for Faster Concurrent Code." EuroSys 2016.
+Retrieved 2026-06-05 from the author-hosted prepublication PDF,
+`https://read.seas.harvard.edu/~kohler/pubs/herman16type-aware.pdf`;
+DOI: `https://doi.org/10.1145/2901318.2901348`.
+
+**Category:** transaction processing / write path and concurrency
+control.
+
+**Relevance tags:** semantic concurrency control; transactional data
+structures; commutativity; optimistic predicates; false-conflict
+reduction; route-specific validation; owner-domain indexes; hot-key
+admission.
+
+**Core idea:** STO replaces word-level software transactional memory
+bookkeeping with abstract operations on transactional datatypes. The
+transaction core still supplies a commit protocol, version numbers, and
+tracking items, but datatype callbacks own the concrete locking,
+validation, installation, rollback, and cleanup rules. This lets a
+counter, vector, hash table, queue, priority queue, or Masstree expose
+the conflict shape of its operations rather than making every touched
+memory word part of the transaction contract.
+
+The useful database lesson is that concurrency control can be modular
+without becoming arbitrary. Each datatype must prove which version
+numbers cover which logical state, which predicates remain valid at
+commit, and which operations commute. In the evaluation, STO beats TL2
+by 1.4x to 118x across STAMP benchmarks, a STO-backed Silo variant
+outperforms Silo by 1.17x on TPC-C at 24 cores, and replacing some
+Masstree tables with STO hash tables raises the reported TPC-C gain to
+1.23x. Those numbers are CPU/STM results, but the mechanism is directly
+relevant to GPU DB's route certificates and owner-local indexes.
+
+**Concrete mechanisms:**
+
+- The core stores each transaction's abstract accesses in a thread-local
+  tracking set of compact `TItem`s keyed by transactional object and
+  datatype-defined key. The paper states that `TItem` efficiency was the
+  major performance concern; each item is a fixed 32-byte object.
+- Transactional datatypes define version numbers over logical segments
+  of state. A version number includes an ID plus helper bits such as a
+  lock bit; many datatypes use multiple version numbers per object to
+  separate logically independent conflicts.
+- Commit has four phases: lock modified items through datatype callbacks,
+  verify read items and predicates, advance a global version clock and
+  install writes, then unlock and run cleanup callbacks for committed or
+  aborted modifications.
+- Datatype callbacks implement `lock`, `check`, `install`, `unlock`, and
+  `cleanup`. This delegates concrete latch choice, version checking,
+  direct update rollback, and post-commit rebalancing to the datatype
+  while preserving one serializable transaction protocol.
+- Optimistic transactional predicates record semantic commit conditions
+  rather than only concrete versions. At commit, the datatype checks the
+  predicate, upgrades it to covering version numbers, then conventional
+  validation ensures atomicity.
+- Predicates reduce false conflicts for conditions such as "counter value
+  remains positive" or "vector size remains greater than five"; the paper
+  reports 1.5x higher throughput for a predicated vector microbenchmark
+  at 16 cores.
+- Some datatypes use eager direct updates during transaction execution.
+  Inserted items can be marked poisoned so other transactions that
+  observe them abort; this avoids repeating expensive tree or hash-table
+  searches at commit.
+- Absent keys are protected with datatype-specific version numbers, such
+  as per-bucket versions in hash tables or parent-node versions in trees,
+  and the paper notes the same versions can help validate range queries.
+- Transactional data structures use RCU so state reachable from a
+  tracking item remains safe until the observing transaction commits or
+  aborts, even if another transaction deletes that node.
+- Correctness depends on datatype rules: all shared-state observations
+  are covered by version numbers, locks are not concurrently held on the
+  same logical segment, predicate checks fail on semantically meaningful
+  modification, direct updates remain invisible before install, and lock
+  acquisition avoids deadlock.
+- STO provides opacity with a TL2-style global version clock and
+  revalidation. The Silo experiment disables opacity for the main
+  comparison, and enabling it in that workload reportedly adds about 5%
+  overhead.
+
+**GPU DB mapping:** This paper strengthens the route-certificate line
+that has been emerging across the recent reviews. GPU DB should not make
+every concurrency decision a tuple-level read/write-set validation if a
+route already knows it is operating on a key, queue, counter, range, or
+resident index structure with a narrower semantic conflict. The right
+unit is a data-structure or route-owned conflict contract.
+
+For the mutation owner, a route certificate can name a logical object
+class and conflict predicate: account balance update, append-only COPY
+chunk, queue push, queue pop, range delete, metadata generation update,
+resident-key-vector refresh, or old-snapshot cleanup. Each class should
+declare its version cells, lock scope, predicate validation, cleanup
+rules, and WAL-before-visibility fence. Generic tuple validation remains
+the fallback when no narrower proof exists.
+
+For resident GPU indexes, STO's split between abstract operation and
+datatype callback maps to CPU/GPU ownership. A GPU key-vector lookup,
+delete bitmap update, delta-bundle merge, or resident range certificate
+can expose a semantic predicate to the CPU owner: "key absence in this
+bucket is still valid," "range frontier did not cross this boundary," or
+"append-only segment size stayed within this interval." The GPU should
+not become the authority for transaction commit, but it can consume
+compact semantic certificates created by owner-managed version cells.
+
+The direct-update and poisoned-item mechanisms suggest a way to admit hot
+write intentions without repeated search. A mutation owner could reserve
+an insert slot, queue item, or delta-bundle cell before final visibility,
+mark it as tentative, and force conflicting readers or writers onto wait,
+retry, or fallback lanes. This is only safe if the tentative state is not
+SQL-visible before WAL and commit publication.
+
+Finally, the TPC-C STO-Silo result argues for modularity as a performance
+tool, not just a software-engineering cleanup. A route-aware engine can
+choose hash-table semantics for tables that never need ranges, range
+certificates for prefix scans, and queue semantics for ordered work
+tables, instead of forcing all hot paths through one index or OCC shape.
+
+**Risks and mismatches:** STO is a C++ STM system, not a DBMS storage
+engine, and the Silo evaluation disables logging/persistence and mostly
+disables opacity. It does not address WAL flushing, crash recovery,
+MVCC snapshot retention, SQL isolation levels, GPU kernels, pgwire
+ordering, or multi-session admission. The approach relies on datatype
+authors writing correct callbacks; a wrong conflict predicate is a
+correctness bug, not just a bad optimization. Global version-clock
+opacity and bounded spinning can become bottlenecks or false-abort
+sources. Direct updates and poisoning are especially dangerous for SQL
+unless tentative state is fully hidden from committed readers and replay
+knows how to discard it after abort.
+
+**Benchmark candidates:**
+
+- Add a semantic-conflict contract prototype for three write routes:
+  counter increment, queue push/pop, and unique-key insert. Compare
+  generic read/write-set validation with route-specific version cells and
+  predicates under hot-key contention.
+- Build a negative correctness suite for semantic predicates: concurrent
+  absent-key insert, range scan plus insert, queue pop races, direct
+  update abort, and WAL replay after tentative-state discard. Gate:
+  identical committed histories to the generic MVCC path.
+- Add route-certificate fields for logical object class, version cells,
+  predicate expression, tentative-state policy, cleanup policy, and
+  fallback isolation mode. Failure condition: a route can select a
+  semantic fast path without declaring every correctness surface.
+- Benchmark a resident key-vector or CPU hash-index route where absent
+  keys validate against bucket/range version cells instead of whole-index
+  generations. Required metrics: aborts, false conflicts, p99 lookup
+  latency, update latency, and version-cell memory.
+- Test tentative insert-slot reservation inside the mutation owner:
+  reserve before final visibility, poison conflicting same-key work,
+  publish only after WAL, and roll back on abort. Failure condition: any
+  retained snapshot or CPU fallback reads tentative state as committed.
+- Compare per-route structures for a TPC-C-like subset: hash table for
+  exact-key tables, ordered index for range-visible tables, and queue
+  semantics for work queues. Measure whether semantic structure choice
+  improves throughput without introducing route-specific anomalies.
+
+### 2026-06-05 - Cross-paper synthesis: route policies need execution-shape proof
+
+Flowcut, access-method RUM budgeting, NeurCC, and Type-Aware
+Transactions all point at the same design track: a route is not just a
+plan node or a queue entry. It is a proof-carrying object with a resource
+shape, conflict shape, execution shape, and ordering shape. Flowcut says
+ordered response movement needs a drain frontier; RUM says resident
+access methods must declare read/update/memory costs; NeurCC says hot
+conflict policy can be selected from cheap route state; STO says the
+correct conflict predicate often belongs to the datatype or route rather
+than a universal tuple validator.
+
+For GPU DB, the convergence is a route certificate with typed fields:
+ordered-stream frontier, resident bytes, update amplification,
+false-positive/refinement cost, conflict predicate, semantic version
+cells, policy-table version, and fallback lane. The certificate should be
+inspectable and conservative. If a route cannot explain one of those
+surfaces, it should fall back to the generic MVCC/CPU path.
+
+The main category gap is now empirical proof for semantic fast paths.
+There are many candidate policies, but fewer tests that prove a
+route-specific predicate preserves SQL-visible histories under WAL,
+snapshot retention, cancellation, and replay. The next benchmark
+priority should be a small semantic-conflict harness that can run both
+the generic path and one route-specific path over the same generated
+history, then compare results with an isolation checker and WAL replay.
