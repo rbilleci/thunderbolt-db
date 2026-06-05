@@ -4630,13 +4630,21 @@ Append new candidates here as each paper is processed.
   Why: Skeena cites SAP HANA's heterogeneous-engine direction; useful for
   contrasting cross-engine OLTP correctness with HTAP table placement,
   analytical freshness, and transaction-aware engine routing.
-- `queued` — **Low-Overhead Asynchronous Checkpointing in Main-Memory Database
+- `reviewed` — **Low-Overhead Asynchronous Checkpointing in Main-Memory Database
   Systems**, Ren, Diamond, Abadi, and Thomson, SIGMOD 2016.
   URL: `https://www.cs.yale.edu/homes/dna/papers/fast-checkpoint-sigmod16.pdf`
   DOI: `https://doi.org/10.1145/2882903.2915966`
   Why: MOT reuses this checkpointing line; useful for designing asynchronous
   CPU truth checkpoints that do not stop GPU resident snapshot refresh,
   invalidation, or WAL replay.
+- `queued` — **Index Checkpoints for Instant Recovery in In-Memory Database
+  Systems**, Lee, Xie, Ma, and Chen, PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p1671-lee.pdf`
+  DOI: `https://doi.org/10.14778/3529337.3529350`
+  Why: follow-up recovery paper that makes rebuildable in-memory indexes part
+  of the checkpoint/recovery frontier; useful for deciding when GPU DB CPU
+  indexes, route metadata, or resident-index acceleration state should be
+  checkpointed instead of rebuilt after WAL replay.
 - `queued` — **A Scalable Linearizable Multi-Index Table**, Sheffi,
   Golan-Gueta, and Petrank, ICDCS 2018.
   URL: `https://doi.org/10.1109/ICDCS.2018.00029`

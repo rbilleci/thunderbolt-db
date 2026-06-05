@@ -57827,3 +57827,172 @@ operator unless the queue needs a specific kernel baseline.
   refreshes, and speculative warmups compete for GPU memory and streams.
   The pass condition is bounded urgent latency plus explicit discarded or
   delayed background work, not just higher average throughput.
+
+### 2026-06-05 - CALC checkpoints at virtual consistency points without quiescing OLTP
+
+**Citation:** Kun Ren, Thaddeus Diamond, Daniel J. Abadi, and
+Alexander Thomson. "Low-Overhead Asynchronous Checkpointing in
+Main-Memory Database Systems." SIGMOD 2016. Retrieved 2026-06-05
+from the author PDF,
+`https://www.cs.yale.edu/homes/dna/papers/fast-checkpoint-sigmod16.pdf`.
+DOI: `https://doi.org/10.1145/2882903.2915966`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** checkpointing; recovery; write throughput;
+virtual consistency point; stable version; command logging;
+partial checkpoints; CPU truth; WAL/replay frontier; latency spikes.
+
+**Core idea:** CALC targets main-memory transactional systems where
+synchronous redo logging or quiesced full snapshots erase much of the
+latency benefit of keeping the database in memory. The paper's central
+move is to take a transaction-consistent checkpoint at a virtual point
+of consistency rather than waiting for a physical instant where no
+transactions are active. Transactions continue to execute while the
+checkpoint is captured; only record writes around the checkpoint
+frontier create stable copies that preserve the pre-frontier value for
+the background writer.
+
+This matters to GPU DB because CPU/WAL truth, resident GPU snapshots,
+and future cold-tier checkpoints will all need publication frontiers.
+A checkpoint or resident refresh that requires stopping writes will show
+up as a latency cliff under high session concurrency. CALC's lesson is
+that the durable/rebuildable frontier can be expressed as phase and
+record metadata, so the background copier follows a consistent view
+while the hot write path keeps moving.
+
+The paper also introduces pCALC, a partial-checkpoint variant that logs
+only records that may have changed since the last checkpoint and merges
+partial checkpoints in the background. That turns checkpointing into a
+runtime-versus-recovery tradeoff: fewer bytes on the steady-state path,
+but more merging work unless the background compactor keeps the partial
+chain short.
+
+**Concrete mechanisms:**
+
+- CALC keeps one live version for each record and creates an explicit
+  stable version only when a write might otherwise overwrite the value
+  needed by the checkpoint.
+- A stable-status bit vector records whether the checkpoint writer
+  should read the explicit stable version or the live version for a
+  record. Inserts and deletes use analogous status vectors, though the
+  paper's explanation focuses mostly on updates.
+- The system cycles through rest, prepare, resolve, capture, and
+  complete phases. Phase transitions are appended as tokens to a simple
+  commit-order log, allowing transactions and recovery logic to identify
+  which side of the checkpoint frontier a commit belongs to.
+- In the prepare phase, a transaction copies the live value to the
+  stable slot before overwriting it because its eventual commit side is
+  not known yet. If it commits before the resolve frontier, the stable
+  copy is erased; if it commits after the frontier, the stable copy
+  becomes the checkpoint-visible value.
+- The transition into resolve marks the virtual point of consistency:
+  transactions committed before it are included in the checkpoint, and
+  transactions committed after it are excluded.
+- Transactions that start in resolve or capture are definitely after the
+  frontier, so before their first update to a record they preserve the
+  old value as the stable checkpoint value unless a stable value already
+  exists.
+- In capture, a background thread scans records and writes stable values
+  when present, otherwise live values. As it records a stable value, it
+  erases the explicit stable copy.
+- The complete phase restores ordinary write behavior after capture and
+  waits for transactions that began during capture to finish before
+  returning to rest.
+- CALC avoids a full bit-vector reset by swapping the meaning of the
+  available and not-available bit values between checkpoint rounds.
+- pCALC tracks updated keys after the virtual point of consistency, using
+  a bit vector in the implementation because the authors found it cheaper
+  than hash-table or Bloom-filter alternatives for their in-memory
+  setting.
+- Partial checkpoints can be merged with a full checkpoint by keeping the
+  newest record version across partials. Old partials are discarded only
+  after a successful merge, so merge failure does not weaken durability.
+- Recovery from a full CALC checkpoint loads the latest completed
+  checkpoint. In deterministic systems, post-checkpoint committed inputs
+  from the commit log are replayed to reconstruct the exact post-frontier
+  state.
+- The evaluation uses a C++ stored-procedure key-value engine with strict
+  two-phase locking, microbenchmarks over 20 million 100-byte records,
+  and a 50-warehouse TPC-C subset. CALC is reported to avoid the latency
+  spikes caused by quiescing schemes and to have 2-10x lower overhead than
+  the compared alternatives. Peak CALC record-memory overhead in the
+  shown experiment is about 1.2x database size, versus roughly 2x for
+  Zigzag and up to 4x for IPP.
+
+**GPU DB mapping:** The strongest mapping is to CPU-truth checkpoint
+and resident-refresh publication. P8 already treats GPU memory as
+rebuildable acceleration state and requires WAL-before-visibility. CALC
+suggests a concrete frontier protocol: a checkpoint, refresh, or cold-tier
+snapshot can name a virtual generation boundary while mutation owners
+continue accepting writes, preserving only the overwritten values or
+metadata needed by the background copier.
+
+For resident GPU snapshots, the stable version does not need to be a full
+row copy in GPU memory. It could be a CPU-side before-image pointer,
+version-chain marker, segment delta, or old resident-generation reference
+that lets refresh workers build a consistent resident generation without
+blocking later writes. The key invariant is that the background refresh
+sees all commits before its frontier and none after it.
+
+The phase-token idea maps to the engine's existing owner domains and
+route certificates. A mutation owner can publish a checkpoint/refresh
+phase token in the commit-generation stream, while residency and recovery
+workers consume it as a durable or rebuildable frontier. Reads and GPU
+routes should record which frontier they consume, and writes that cross a
+frontier should expose how much stable-copy or before-image pressure they
+created.
+
+pCALC is particularly relevant to large resident/cold tiers. Full
+checkpoints of CPU truth or full resident rebuilds may be simple but too
+expensive when only a small hot set changed. Partial checkpoint chains
+map to resident delta segments, invalidated-row ranges, or cold-tier
+change files that are merged during low pressure. The benchmarkable
+question is how long a partial chain can grow before recovery, startup,
+or refresh latency violates the service target.
+
+**Risks and mismatches:** CALC assumes a main-memory engine with stored
+procedures, pessimistic locking, and record-level stable copies. The
+current GPU DB must preserve SQL statement behavior, WAL durability,
+MVCC visibility, DDL invalidation, prepared statements, and resident-route
+fallbacks, so the protocol cannot simply replace WAL with deterministic
+input logging. It should be treated as a checkpoint/refresh-frontier
+shape, not as permission to weaken WAL-before-visibility.
+
+The paper's implementation is a key-value store, not a relational engine
+with secondary indexes, column groups, text buffers, GPU resident handles,
+or cold NVMe tiers. Stable copies of variable-length rows and resident
+columnar segments may have very different memory overhead. The evaluation
+hardware used magnetic disk and a 16-vCPU EC2 instance, so absolute
+checkpoint durations do not transfer to NVMe or future storage. Finally,
+pCALC's partial-chain merge introduces a background IO/CPU consumer that
+must be admitted like any other route; otherwise it can compete with WAL,
+resident refresh, or response encoding.
+
+**Benchmark candidates:**
+
+- Add a checkpoint-frontier simulation around the CPU tuple store: start a
+  virtual checkpoint while concurrent updates run, preserve overwritten
+  pre-frontier values, and verify the captured state includes exactly the
+  commits before the frontier. Gate: replay and visibility tests produce
+  identical tuple sets to a quiesced checkpoint.
+- Measure mutation latency during full refresh, CALC-style virtual
+  checkpoint, and naive quiesced checkpoint. Required metrics: p50/p95/p99
+  mutation latency, stable-copy bytes, checkpoint bytes, queue wait, and
+  active snapshot count.
+- Prototype partial resident-refresh deltas: after a resident generation
+  frontier, track changed row ids or segment ranges and merge them into a
+  new resident generation in the background. Failure condition: partial
+  delta chains grow until refresh or recovery time exceeds the full rebuild
+  path.
+- Add stable-copy pressure telemetry to mutation owners: records copied,
+  bytes copied, skipped copies because a stable value already existed,
+  phase duration, and background capture lag. Use this as an admission
+  signal for COPY and hot update batches.
+- Stress a variable-length text workload where stable copies preserve text
+  offsets and byte buffers. Proof gate: no stable copy points to mutated or
+  freed text bytes after checkpoint capture.
+- Compare full CPU-truth checkpoint plus WAL replay against pCALC-style
+  partial checkpoints plus merge. Metrics: steady-state write throughput,
+  checkpoint IO bytes, recovery time, and background merge interference
+  with resident GPU reads.
