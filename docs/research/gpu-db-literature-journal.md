@@ -70640,3 +70640,136 @@ priority should be a mixed retained-read workload where correlated point/range
 requests compete with refresh, cold-tier scans, and write invalidation, while
 the runtime reports per-route queue wait, bytes by tier, GPU kernel class,
 fallback reason, and p99 latency.
+
+### 2026-06-05 - ConWeave masks RDMA rerouting disorder inside the network
+
+**Citation:** Cha Hwan Song, Xin Zhe Khooi, Raj Joshi, Inho Choi,
+Jialin Li, and Mun Choon Chan. "Network Load Balancing with In-network
+Reordering Support for RDMA." SIGCOMM 2023. doi:10.1145/3603269.3604849.
+Retrieved 2026-06-05 from the author-hosted PDF,
+`https://www.comp.nus.edu.sg/~lijl/papers/conweave-sigcomm23.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** RDMA; high-concurrency networking; load balancing;
+in-order delivery; programmable switches; response routing; admission
+control; flow-completion tail latency; future gateway design.
+
+**Core idea:** ConWeave starts from a practical RDMA mismatch: datacenter
+load balancers that work for TCP often hurt RDMA because RDMA traffic has
+few flowlet gaps and RNICs react badly to out-of-order packet arrivals.
+The paper proposes fine-grained path switching with a destination ToR
+switch that reorders packets before the RNIC sees them. The host and RNIC
+remain unchanged, while the network takes responsibility for masking the
+temporary disorder introduced by rerouting.
+
+The transferable idea for GPU DB is not "use RDMA now." It is that a
+high-throughput transport can change routes frequently only if it also
+has a bounded mechanism that restores the ordering contract required by
+the receiver. For SQL gateways, response rings, GPU completion streams,
+and future multi-gateway routing, dynamic load balancing must preserve
+per-session message order unless the upper layer has explicitly declared
+the stream reorderable.
+
+**Concrete mechanisms:**
+
+- ConWeave runs one component on the source ToR and one on the destination
+  ToR. The source ToR monitors active-flow RTTs, picks an alternate path
+  when the current path appears congested, and marks the transition. The
+  destination ToR reorders packets before delivering them to the endpoint.
+- Rerouting is deliberately cautious. It happens only when the existing
+  path is congested, an alternate path is available, and the previous
+  reroute's out-of-order packets have cleared. This bounds each flow to at
+  most two in-flight paths.
+- The source marks one final packet on the old path as `TAIL` and marks
+  subsequent packets on the new path as `REROUTED`. This produces a
+  predictable old/new stream pattern instead of arbitrary packet spraying.
+- The destination ToR pauses one FIFO reorder queue for early `REROUTED`
+  packets, forwards the `TAIL` when it arrives, then resumes the reorder
+  queue with higher priority so the held packets drain before newer
+  default-queue packets.
+- ConWeave does not rely on packet sequence numbers for the reorder logic.
+  It uses path-transition markers plus switch queue pause/resume behavior.
+- If `TAIL` is lost, a resume timer estimates when the old-path tail should
+  have arrived and flushes the paused queue, avoiding an indefinite stall.
+- The source also handles lost `CLEAR` packets by advancing after a long
+  inactive period that should exceed the maximum propagation time for the
+  old transition.
+- Congested paths are learned through in-band notifications from the
+  destination ToR when packets carry congestion indications. The source
+  samples candidate paths and avoids paths marked busy rather than actively
+  probing every possible route.
+- The implementation is about 2400 lines of P4_16 on Intel Tofino2. It
+  repurposes RDMA BTH reserved bits for ConWeave metadata and adds a small
+  header in the forward direction.
+- In NS3 simulations, ConWeave improves average and 99-percentile FCT
+  slowdowns by at least 23.3% and 45.8% at 50% load in lossless RDMA, and
+  by at least 42.3% and 66.8% at 80% load in IRN RDMA, compared with the
+  evaluated baselines. The paper also evaluates a hardware testbed with
+  Tofino and Mellanox RNICs.
+
+**GPU DB mapping:** The runtime target already uses network IO workers,
+bounded command rings, response rings, and owner domains. ConWeave adds a
+specific warning: when work can move between lanes, paths, workers, GPU
+streams, or gateways, ordering restoration must be part of the route
+contract rather than an afterthought. A pgwire session cannot receive
+responses out of order just because a faster gateway or GPU worker became
+available.
+
+The closest near-term mapping is response-ring scheduling. A session may
+have several internal operations in flight, but the network writer should
+release frontend responses only when that session's protocol sequence is
+complete. If the runtime ever lets later retained reads bypass earlier
+slow work, it needs ConWeave-like transition metadata: which requests are
+allowed to bypass, which response boundary restores order, and what timer
+or cancellation rule prevents a permanently missing predecessor from
+blocking all later responses.
+
+For future multi-gateway or RDMA-connected deployments, ConWeave suggests
+route classes. Ordered SQL responses, COPY streams, WAL shipping, and
+snapshot-publication notifications are not the same as unordered telemetry
+or background warmup hints. Only reorderable classes should be packet-sprayed
+or path-switched freely; ordered classes need either a single lane or a
+bounded reorder buffer with explicit memory admission.
+
+The paper's resource-exhaustion discussion maps directly to 1M logical
+sessions. A reorder queue is cheap only while few active flows need it. GPU
+DB should treat per-session out-of-order buffers, response queues, pinned
+send buffers, and gateway reroute state as scarce active-session resources,
+not as allocations every idle logical session receives.
+
+**Risks and mismatches:** ConWeave is a network load balancer, not a
+database runtime. It assumes programmable switches, source routing, RDMA
+packet formats, and ToR queue pause/resume support. Those assumptions may
+not hold for ordinary TCP/pgwire, managed cloud networks, or a single-node
+GPU DB prototype. It does not solve SQL transaction ordering, WAL durability,
+MVCC visibility, cancellation, prepared statement state, or GPU execution
+fairness.
+
+The mechanism is also intentionally cautious: it allows at most two in-flight
+paths per flow, and destination resources can be exhausted when many flows
+need reordering. If GPU DB copies the idea inside the process, the reorder
+buffer must be bounded and observable; otherwise dynamic route switching
+could improve mean latency while harming tail latency and memory pressure.
+
+**Benchmark candidates:**
+
+- Add a response-ordering stress test with one session issuing pipelined
+  reads where later retained-cache hits finish before earlier CPU/GPU slow
+  paths. Proof gate: pgwire-visible responses preserve session order unless
+  the protocol state explicitly permits independent completion.
+- Build a multi-lane response-ring benchmark with ordered and unordered
+  route classes. Compare single-lane FIFO, bypass-with-reorder-buffer, and
+  reject-on-predecessor-stall policies under p50/p99 latency, buffer bytes,
+  and cancellation behavior.
+- Add active-session admission counters for reorder buffers, response bytes,
+  pinned send buffers, and in-flight request slots. Failure condition: idle
+  sessions reserve reorder capacity needed by active sessions.
+- For future gateway experiments, model path switching between two IO
+  workers or gateways with a `TAIL`-like handoff marker. Measure whether
+  handoff improves tail latency without breaking per-session order or
+  increasing memory beyond the active-session budget.
+- Add a route-contract field that names response ordering requirements:
+  strict session order, transaction-local order, unordered background
+  notification, or idempotent telemetry. The scheduler should refuse to
+  reroute strict-order work unless a bounded reorder path is available.

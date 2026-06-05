@@ -5506,12 +5506,24 @@ Append new candidates here as each paper is processed.
   Why: Ultra Ethernet cites Flowcut as a newer routing direction; useful for
   deciding whether future GPU DB transport paths need packet spraying,
   flowlet switching, or in-order route classes for SQL responses.
-- `queued` — **Network Load Balancing with In-network Reordering Support
+- `reviewed` — **Network Load Balancing with In-network Reordering Support
   for RDMA**, Song et al., SIGCOMM 2023.
   URL: `https://www.comp.nus.edu.sg/~lijl/papers/conweave-sigcomm23.pdf`
   Why: Flowcut contrasts with ConWeave's switch-side in-network reordering;
   useful for comparing endpoint/NIC pause-and-reroute against fabric-buffered
   reordering when future GPU DB gateways need in-order high-throughput flows.
+- `queued` — **When Cloud Storage Meets RDMA**, Gao et al., NSDI 2021.
+  URL: `https://www.usenix.org/conference/nsdi21/presentation/gao`
+  Why: ConWeave cites it as production-scale cloud-storage RDMA context;
+  useful for understanding real RDMA service mixes, CPU offload, and
+  storage/network tail-latency interactions before GPU DB considers
+  RDMA-connected storage or gateway paths.
+- `queued` — **Backpressure Flow Control**, Goyal et al., NSDI 2022.
+  URL: `https://www.usenix.org/conference/nsdi22/presentation/goyal`
+  Why: ConWeave discusses switch resource exhaustion and cites backpressure
+  as related switch-flow-control work; useful for comparing explicit
+  transport backpressure with GPU DB response-ring, reorder-buffer, and
+  active-session admission limits.
 - `queued` — **Data Center Ethernet and Remote Direct Memory Access:
   Issues at Hyperscale**, Hoefler et al., IEEE Computer 2023.
   URL: `https://doi.org/10.1109/MC.2023.3261184`
