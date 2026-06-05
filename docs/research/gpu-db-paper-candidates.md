@@ -1144,18 +1144,27 @@ Append new candidates here as each paper is processed.
   for comparing B-tree-indexed segments with fully learned recursive routing
   and for understanding update/retraining costs. Journal entry added
   2026-06-05.
-- `queued` — **Design Tradeoffs of Data Access Methods**, Athanassoulis and
+- `reviewed` — **Design Tradeoffs of Data Access Methods**, Athanassoulis and
   Idreos, SIGMOD 2016.
-  URL: `https://doi.org/10.1145/2882903.2912577`
+  URL: `https://doi.org/10.1145/2882903.2912569`
   Why: FITing-Tree frames its error knob around the broader access-method
   tuning problem; useful for turning GPU DB resident index choices into
-  explicit memory/latency/update tradeoff policies.
+  explicit memory/latency/update tradeoff policies. Journal entry added
+  2026-06-05.
 - `queued` — **UpBit: Scalable In-Memory Updatable Bitmap Indexing**,
   Athanassoulis et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2903734`
   Why: FITing-Tree discusses bitmap-index compression as related work; useful
   for comparing delete/update-friendly bitmap summaries against learned
   key-position models for GPU resident predicate filters.
+- `queued` — **Designing Access Methods: The RUM Conjecture**,
+  Athanassoulis et al., EDBT 2016.
+  URL: `https://doi.org/10.5441/002/edbt.2016.42`
+  Author page:
+  `https://stratos.seas.harvard.edu/publications/designing-access-methods-rum-conjecture`
+  Why: direct formal source for the read-update-memory design-space model used
+  by the SIGMOD access-method tutorial; useful if route certificates need a
+  more precise RUM cost vocabulary.
 - `queued` — **Pangea: Monolithic Distributed Storage for Data Analytics**,
   Ghosh et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p681-ghosh.pdf`

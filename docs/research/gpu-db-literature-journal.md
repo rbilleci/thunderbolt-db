@@ -69804,3 +69804,133 @@ used only for ordered streams whose remaining work justifies switching paths.
 - Add an "ordered stream budget" to route certificates. Any route that requires
   order should declare max in-flight chunks, max drain time, and whether bounded
   out-of-order repair is allowed.
+
+### 2026-06-05 - Access methods should be RUM-budgeted route components
+
+**Citation:** Manos Athanassoulis and Stratos Idreos. "Design Tradeoffs of
+Data Access Methods." SIGMOD 2016 tutorial. Retrieved 2026-06-05 from the
+author-hosted PDF,
+`https://cs-people.bu.edu/mathan/publications/sigmod16-athanassoulis-tutorial.pdf`;
+DOI: `https://doi.org/10.1145/2882903.2912569`.
+
+**Category:** multi-tier cache / data placement; query optimization / planning;
+resident access-method design.
+
+**Relevance tags:** access methods; RUM tradeoffs; read/update/memory budget;
+resident indexes; data skipping; adaptive indexing; log-structured updates;
+bitmap indexes; approximate indexes; tier-aware route selection.
+
+**Core idea:** The tutorial surveys access-method design through the
+read-update-memory (RUM) lens: access methods repeatedly trade read overhead,
+update overhead, and memory/storage overhead, and optimizing two tends to make
+the third worse. It groups mechanisms by recurring design elements rather than
+by product family: logarithmic designs, continuous reorganization, and
+space-efficient designs.
+
+For GPU DB, the useful point is that an index or resident segment is not simply
+"fast" or "slow." Each route component should declare the RUM budget it spends:
+extra GPU memory, CPU memory, update amplification, refresh cost, false
+positives, scan bytes, or point-lookup latency. P8 can then choose access
+methods by workload and tier rather than treating B-trees, bitmaps, key vectors,
+learned indexes, and data-skipping metadata as interchangeable accelerators.
+
+**Concrete mechanisms:**
+
+- Logarithmic read-optimized structures such as B-trees, tries, and adaptive
+  radix trees reduce lookup cost by storing extra routing metadata. The paper
+  presents this as a read win paid for with memory and update work.
+- Log-structured update-optimized structures such as LSM-style trees buffer,
+  sort, and merge writes through levels. They exploit sequential writes and
+  reduce physical write cost, but reads may check multiple levels and often
+  need filters or fractional-cascading-style shortcuts.
+- Memory-aware logarithmic variants tune node layout and hierarchy behavior for
+  cache, main memory, flash, or disk. The tutorial cites techniques such as
+  cache-sensitive B-trees, sibling clustering, offset-based nodes, and stores
+  that combine logging, immutable hashing, and sorted components.
+- Continuous reorganization lets the access method move through the design
+  space online. Database cracking and adaptive indexing refine only the ranges
+  touched by queries; adaptive merging balances read speed against index-build
+  overhead.
+- Differential update approaches keep updates separate and consolidate them in
+  bulk. They improve update admission and avoid random IO, but reads must merge
+  base data with deltas until consolidation catches up.
+- Space-efficient structures trade query generality or exactness for memory.
+  Hash indexes are compact for point lookup but weak for range predicates.
+  Bitmap indexes support fast bitwise predicate evaluation, while UpBit adds
+  update support with extra metadata and a small read penalty.
+- Data skipping is framed as scan enhancement. Zone maps and column imprints
+  store lightweight per-zone metadata so scans can skip non-qualifying ranges,
+  especially when data is clustered or sorted.
+- Approximate indexing uses compact probabilistic or bounded-error structures,
+  such as Bloom-filter-inspired BF-Trees, quotient filters, or cuckoo filters,
+  to trade memory for false positives and extra refinement work.
+- The tutorial's open-problem direction is an access-method optimizer: choose
+  or adapt the physical design from hardware and workload properties instead
+  of hard-coding one static access-method point.
+
+**GPU DB mapping:** P8 should treat every resident access method as a route
+component with an explicit RUM certificate. A GPU-resident dense key vector
+optimizes read latency and coalesced lookups but spends HBM and refresh work. A
+GPU bitmap or predicate summary spends HBM and update maintenance to reduce scan
+bytes. A CPU warm-tier learned or piecewise-linear index may save memory while
+paying false-positive/refinement cost. A log-structured mutation buffer may keep
+write admission fast while forcing retained reads to merge a base resident
+snapshot with deltas.
+
+The current resident snapshot design can use the same taxonomy. Dense column
+groups are a scan access method. Optional key-order vectors are a logarithmic or
+position-based read accelerator. Per-segment min/max and prefix metadata are
+data skipping. Old-snapshot side structures and delta bundles are differential
+updates. Rather than adding all of them, the planner should require each
+candidate route to declare which overhead it increases and which workload shape
+it improves.
+
+The tutorial also argues for adaptive movement through the design space. For
+GPU DB, that means resident structures can be admitted at shallow levels first:
+zone maps and cheap validity metadata before full GPU key vectors; CPU bitmap
+summaries before GPU bitmaps; append-only deltas before expensive merged
+resident rebuilds. Telemetry should decide whether to deepen the structure,
+merge deltas, or evict it.
+
+RUM is also a useful guardrail for MVCC and tiering. Long snapshots, delete
+bitmaps, visibility maps, and update deltas are not free correctness metadata;
+they are memory and update overheads. A retained route should not claim a read
+win unless it includes the cost of maintaining those structures under writes and
+retiring them after snapshot release.
+
+**Risks and mismatches:** This is a six-page SIGMOD tutorial, not a full
+experimental paper, so it offers a taxonomy and examples rather than a new
+measured mechanism. Many cited structures predate the 2015-present selection
+rule; they are useful here only as mechanisms summarized by the 2016 tutorial,
+not as separate review targets. The paper is not GPU-specific and does not
+address CUDA memory coalescing, HBM capacity, pinned buffers, WAL durability,
+MVCC correctness, or pgwire/runtime admission. Its RUM framing is qualitative;
+GPU DB still needs measured route-specific overheads before acting on it.
+
+**Benchmark candidates:**
+
+- Add a resident-access-method matrix for one `int4` table: dense scan only,
+  segment min/max, CPU key vector, GPU key vector, CPU bitmap, GPU bitmap, and
+  learned/piecewise index if available. Measure read latency, update/refresh
+  cost, resident bytes, host bytes, and fallback/refinement work.
+- Add RUM fields to route certificates: read bytes, update amplification,
+  resident HBM bytes, host-memory bytes, false-positive rate, refresh cost, and
+  delta-merge debt. Gate: planner explanations include the overhead paid for
+  each selected access method.
+- Benchmark shallow-to-deep admission: start with zone maps, promote to CPU
+  summaries, then GPU-resident key vectors or bitmaps only when telemetry proves
+  repeated compatible predicates. Failure condition: promotion spends more HBM
+  or refresh time than the saved read latency.
+- Build a base-plus-delta retained-read benchmark. Compare full resident rebuild
+  after every mutation, base snapshot plus CPU delta merge, and base snapshot
+  plus GPU-friendly delta bundle. Required metrics: write admission latency,
+  retained read p50/p99, stale-generation count, and snapshot retirement delay.
+- Add data-skipping benchmarks for clustered versus unclustered predicates so
+  min/max or imprint-style metadata cannot look good only on sorted toy data.
+- For bitmap or approximate filters, report false positives and refinement
+  bytes separately from kernel time. Failure condition: the filter accelerates a
+  primitive but slows the full route after refinement and refresh are included.
+- Add an access-method optimizer smoke test that chooses among scan, skipping,
+  key-vector lookup, bitmap, and CPU fallback from workload stats plus tier
+  budgets. Minimum proof gate: the selected route is explainable and never
+  violates WAL-before-visibility or snapshot validity.
