@@ -60881,3 +60881,162 @@ portable constants for this engine.
   may begin before GPU residency warmup, but any route that relies on a
   checkpointed manifest must expose whether it is loaded, validated, warmed,
   stale, or rebuilding.
+
+### 2026-06-05 - Adaptive execution makes compilation a runtime route, not a startup tax
+
+**Citation:** Andre Kohn, Viktor Leis, and Thomas Neumann. "Adaptive Execution
+of Compiled Queries." ICDE 2018, pp. 197-208. doi:10.1109/ICDE.2018.00027.
+Retrieved 2026-06-05 from the Zenodo archival PDF,
+`https://zenodo.org/records/2157816/files/adaptiveexecution.pdf`, with
+metadata cross-checked through the TUM publication page and DBLP.
+
+**Category:** query optimization / planning, with runtime scheduling relevance.
+
+**Relevance tags:** adaptive execution; query compilation latency; bytecode
+interpretation; morsel scheduling; pipeline-level route choice; prepared and
+ad-hoc SQL latency; CPU/GPU fallback; route certificates.
+
+**Core idea:** Compilation-based query engines can lose badly on short,
+interactive, metadata-heavy, or machine-generated SQL because compilation time
+can dominate actual execution. The paper's example pgAdmin metadata query
+executes in under 1 ms in HyPer but takes 54 ms to compile with optimized LLVM,
+and the largest TPC-DS query in their setup takes close to 1 second to compile.
+At the other end, long-running scans and joins still benefit from optimized
+machine code.
+
+The paper's answer is not a second independent Volcano engine. HyPer always
+generates LLVM IR, translates it quickly to an efficient bytecode form, starts
+execution immediately in the interpreter across all worker threads, then
+compiles only the query pipelines that runtime progress shows are worth
+compiling. Execution can switch at morsel boundaries because every pipeline
+worker takes shared query state plus a morsel range, and the interpreted and
+compiled variants execute the same IR semantics over the same state.
+
+On TPC-H scale factors from 0.01 to 30, adaptive execution tracks or beats the
+best static mode: pure bytecode for tiny data, unoptimized compilation for
+mid-sized work, and optimized compilation for long-running pipelines. For very
+large generated functions, the authors show bytecode translation scaling
+linearly where optimized LLVM compilation becomes impractical.
+
+**Concrete mechanisms:**
+
+- The system supports three execution modes for each worker function:
+  bytecode interpretation, unoptimized machine code, and optimized machine
+  code.
+- Every query starts in bytecode interpretation, so all worker threads can
+  begin useful work while compilation decisions are still unresolved.
+- Query code is split into a one-shot `queryStart` function and data-dependent
+  worker functions. Worker functions process independent morsels over shared
+  query state such as hash tables.
+- Morsels are the progress and switching unit. After each morsel, workers
+  already consult the scheduler, so the system records processed morsels,
+  tuple rates, and remaining work with little extra coordination.
+- A handle object stores the bytecode and any compiled variants for a worker
+  function. Each morsel dispatch picks the fastest currently available variant;
+  switching modes is a function-pointer update for future morsels.
+- Compilation runs in the background. While one worker compiles, other workers
+  continue interpreting or running the best available compiled variant.
+- The decision model compares predicted remaining time for staying in the
+  current mode, compiling unoptimized code, or compiling optimized code. It
+  uses measured per-thread processing rate, remaining tuple count, estimated
+  compilation time, estimated speedup, and the fact that other workers can keep
+  processing during compilation.
+- Compilation time is estimated from the number of LLVM instructions. The
+  authors found near-linear behavior for TPC-H/TPC-DS query plans, while very
+  large generated queries motivate the bytecode fallback.
+- The bytecode VM is a register machine with fixed-length, statically typed
+  opcodes and around 500 instruction/type combinations. It avoids LLVM's
+  pointer-heavy IR interpreter overhead.
+- LLVM IR is translated to bytecode using liveness and register allocation
+  designed to keep the VM register file small enough for cache residency.
+- The liveness algorithm approximates optimal register allocation in linear
+  time by labeling blocks, using dominator/loop structure, and extending live
+  ranges over containing loops instead of running expensive per-block liveness
+  analysis.
+- The VM fuses common instruction sequences, such as overflow checks and
+  address-compute-plus-load/store patterns, into macro opcodes.
+- The VM must behave identically to generated machine code because interpreted
+  and compiled execution share data structures and switch without redoing
+  completed morsels.
+- The paper treats plan caching as orthogonal. Caching cannot hide first-run
+  compilation latency, but repeated pipeline execution could later be used to
+  compile hot pipelines more aggressively.
+
+**GPU DB mapping:** This is a clean template for GPU DB route selection. A
+route should not be "compile GPU kernel" or "CPU fallback" as a one-time
+planner decision. It should be an adaptive runtime choice with explicit
+startup cost, remaining work, queue pressure, resident-state status, and
+expected speedup. For short retained reads, catalog queries, tiny point
+lookups, or first-run prepared statements, the fastest route may be an
+interpreted/fused CPU path or an existing generic kernel, even if a compiled
+or specialized GPU route would win on a larger batch.
+
+The morsel boundary maps to GPU DB's runtime rings. Same-shape retained reads,
+resident scans, refresh builds, and CPU fallback scans should expose a small
+work unit that can be executed by a generic route first and upgraded for later
+work. That work unit might be a row range, key-vector chunk, segment fragment,
+or micro-batch. Switching must be allowed only at a boundary where visibility,
+snapshot generation, response ownership, and partial aggregation state remain
+well-defined.
+
+Pipeline-level decisions also fit the current route-certificate direction.
+Within one SQL query, a cheap metadata lookup or small hash build may stay on
+CPU while a large resident probe or aggregate compiles, batches, or moves to a
+GPU execution owner. This argues against treating "the query" as the sole route
+unit. The certificate should name the pipeline/fragment, execution mode,
+snapshot boundary, resident segment set, setup cost, expected remaining work,
+and fallback/switch condition.
+
+For 1M logical sessions, the first-run latency lesson is important. A system
+serving many distinct ad-hoc statements cannot afford to burn worker cores or
+GPU-owner time compiling every route up front. GPU DB should begin with a
+low-setup route, admit compilation/specialization only when runtime evidence
+shows enough remaining or repeated work, and prevent background compilation
+from starving network IO, mutation owners, or GPU execution queues.
+
+The bytecode VM is not directly a GPU mechanism, but its design principle is
+transferable: one semantic IR, multiple execution backends. GPU DB could keep
+one route fragment representation that can execute through a simple CPU
+interpreter/fused loop, a compiled CPU fragment, a generic GPU kernel, or a
+specialized GPU kernel. Correctness lives in the shared representation and
+visibility certificate, not in duplicated hand-maintained semantics.
+
+**Risks and mismatches:** The paper is CPU query-execution work in HyPer, not a
+GPU database, MVCC storage engine, or network/session runtime. It does not
+address WAL-before-visibility, snapshot retirement, DDL invalidation, GPU
+kernel launch overhead, CUDA compilation, device memory residency, pgwire
+response encoding, or multi-tenant GPU scheduling.
+
+The decision model relies on knowing remaining tuple count for a pipeline and
+on morsels being semantically independent. GPU DB joins, variable-length text
+operators, early-exit point lookups, and over-resident tiered scans may have
+less predictable remaining work. Background compilation or specialization also
+competes for CPU cores, memory, and possibly GPU driver resources; it must be
+admitted like any other route. Finally, bytecode interpretation is useful only
+if its semantics remain identical to compiled execution. Duplicating SQL,
+visibility, null, collation, or error behavior across backends would undermine
+the main benefit.
+
+**Benchmark candidates:**
+
+- Add a four-mode route benchmark for one retained query shape: generic CPU
+  fused loop, compiled/specialized CPU fragment, generic GPU kernel, and
+  specialized/resident GPU route. Gate: the adaptive policy chooses the
+  measured best mode across tiny, medium, and large batches.
+- Track setup latency separately from execution latency for compiled CPU
+  fragments, CUDA graph setup, kernel specialization, resident refresh, and
+  response encoding. Failure condition: a route wins kernel time but loses
+  end-to-end p50/p99 for short queries.
+- Prototype fragment-level route handles with swappable execution variants and
+  immutable visibility metadata. Minimum proof: switching variants at chunk or
+  morsel boundaries returns the same SQL rows as a single-mode execution.
+- Add background-specialization admission. Required metrics: compiler CPU time,
+  queue wait added to IO/mutation/read/GPU owners, number of fragments
+  upgraded, and number abandoned because work finished first.
+- Extend route certificates with setup cost, remaining-work estimate, measured
+  current throughput, expected speedup, and switch boundary. Gate: certificate
+  logs explain every compile/specialize/no-op decision.
+- Test first-run and repeated-run prepared statement behavior separately.
+  Expected result: first execution starts on a low-setup route; repeated hot
+  fragments become eligible for optimized CPU/GPU variants without changing
+  SQL-visible semantics.

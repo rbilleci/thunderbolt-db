@@ -1335,9 +1335,10 @@ Append new candidates here as each paper is processed.
   Why: related SAP HANA scheduling work from the same research line; useful
   for mixed OLTP/OLAP freshness, scheduler, and admission tradeoffs before
   GPU DB combines retained snapshots with writes.
-- `queued` — **Adaptive Execution of Compiled Queries**, Kohn, Leis, and
+- `reviewed` — **Adaptive Execution of Compiled Queries**, Kohn, Leis, and
   Neumann, ICDE 2018.
   URL: `https://doi.org/10.1109/ICDE.2018.00027`
+  PDF: `https://zenodo.org/records/2157816/files/adaptiveexecution.pdf`
   Why: Umbra's adaptive bytecode/JIT execution foundation; relevant to deciding
   when GPU DB should interpret, compile, batch, or route short SQL plans
   without paying excessive setup latency.
@@ -1418,6 +1419,18 @@ Append new candidates here as each paper is processed.
   Why: Eiffel cites universal packet scheduling as a flexible scheduling
   objective; useful for comparing request-ranking policies that emulate
   shortest-job, deadline, and slack-aware queueing in GPU DB admission.
+- `queued` — **Fast Compilation and Execution of SQL Queries with WebAssembly**,
+  Grulich, Dorok, Bress, and Schallehn, arXiv 2021.
+  URL: `https://arxiv.org/abs/2104.15098`
+  Why: modern follow-up to adaptive query execution that uses WebAssembly/V8
+  tiered execution; useful for comparing bytecode/JIT route startup cost with
+  portable fragment execution before GPU DB commits to a custom IR.
+- `queued` — **How to Architect a Query Compiler**, Shaikhha et al.,
+  SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915244`
+  Why: adaptive execution cites it as a query-compiler architecture direction;
+  useful for deciding how much of GPU DB's route compiler should be reusable
+  staged code, hand-written kernels, or a compact fragment IR.
 - `queued` — **NUMFabric: Fast and Flexible Bandwidth Allocation in
   Datacenters**, Nagaraj et al., SIGCOMM 2016.
   URL: `https://doi.org/10.1145/2934872.2934890`
