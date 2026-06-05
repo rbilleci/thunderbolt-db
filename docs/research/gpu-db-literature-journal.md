@@ -53330,3 +53330,171 @@ snapshot and route handle is done.
 - Extend snapshot retirement tests so route-map nodes, resident
   descriptors, pinned buffers, and HBM handles are reclaimed together
   after the last retained route handle releases.
+
+### 2026-06-05 - Descriptor reuse turns helping metadata into a bounded per-worker resource
+
+**Citation:** Maya Arbel-Raviv and Trevor Brown. "Reuse, Don't
+Recycle: Transforming Lock-Free Algorithms That Throw Away
+Descriptors." DISC 2017, LIPIcs 91, Article 4, pp. 4:1-4:16.
+doi:10.4230/LIPIcs.DISC.2017.4. Retrieved 2026-06-05 from Dagstuhl,
+`https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.DISC.2017.4`.
+
+**Category:** runtime / HFT / session scale; lock-free publication and
+allocation-bounded helper metadata.
+
+**Relevance tags:** descriptor reuse; lock-free helping; weak
+descriptors; k-CAS; DCSS; per-worker preallocation; ABA avoidance;
+sequence tags; memory reclamation; NUMA/cache effects.
+
+**Core idea:** Many lock-free algorithms publish descriptors so other
+threads can help complete an operation. The simple design allocates a
+fresh descriptor for every operation, then relies on memory reclamation
+after no helper can still reach it. This paper turns that pattern into
+an explicit descriptor ADT and shows when algorithms can be transformed
+to reuse descriptors immediately after the owning operation completes.
+
+The transferable idea for GPU DB is that helper metadata should be a
+bounded per-worker resource, not an unbounded allocation stream. If
+route publication, resident-generation updates, or multi-location
+metadata changes use lock-free helping, each worker should own a small
+fixed descriptor pool with sequence tags. Helpers that discover an old
+descriptor can stop helping or use an algorithm-specific safe default,
+instead of requiring general descriptor reclamation on the hot path.
+
+**Concrete mechanisms:**
+
+- The paper models common helping algorithms with immutable and mutable
+  descriptor ADTs. Descriptors contain operation arguments and sometimes
+  mutable status fields such as undecided, succeeded, or failed.
+- Wasteful algorithms allocate a new descriptor per high-level
+  operation or attempt. The descriptor must remain reachable and
+  consistent until no helper can access it, which pushes cost into
+  allocation and memory reclamation.
+- A weak descriptor ADT lets each process reuse a descriptor. When a
+  process creates a new descriptor of the same type, its prior
+  descriptors become invalid.
+- `ReadField`, `WriteField`, and `CASField` on invalid descriptors do
+  not modify shared state. Reads return a special invalid value, so a
+  helper can conclude that the operation being helped has already
+  terminated and return.
+- The weak-compatible algorithm class requires that each attempt create
+  at most one descriptor, helper accesses occur inside the matching
+  `Help` routine, post-completion helper steps are trivial, and helping
+  another process does not leak local state outside the helper call.
+- The extended weak descriptor ADT supports algorithms that read a
+  descriptor outside the matching helper routine by supplying an
+  algorithm-specific default value. For k-CAS, a read of an invalid
+  state field can return `Succeeded` because the important fact is
+  simply "not Undecided."
+- For algorithms that create multiple descriptor types per operation,
+  reuse invalidates only previous descriptors of the same type.
+- The implementation stores one descriptor object per process and type,
+  plus a sequence number. Logical descriptor pointers encode the owning
+  process and sequence number. Mutable fields carry sequence numbers so
+  stale operations cannot modify the current descriptor incarnation.
+- The transformed k-CAS implementation allocates two descriptors per
+  process rather than at least `k + 1` descriptors per k-CAS attempt.
+- The evaluation compares reusable descriptors with DEBRA, hazard
+  pointers, and RCU reclamation for k-CAS on 48-thread Intel and
+  64-thread AMD NUMA systems. The reusable implementation is reported
+  as fastest in the tested workloads, with up to 2.3x, 3.3x, and 5.0x
+  speedups over DEBRA, hazard pointers, and RCU in a k-CAS
+  microbenchmark. The paper also reports up to three orders of
+  magnitude lower peak memory usage than reclamation-based variants.
+- The authors observe cache and NUMA effects: on the Intel system,
+  crossing sockets increased cache misses for the fastest reusable
+  variant, while high contention and larger arrays changed whether
+  cache misses or helping dominated throughput.
+
+**GPU DB mapping:** This paper sharpens the PathCAS conclusion. A
+bounded multi-location route-publication primitive is only attractive
+if its descriptors, helper work, and reclamation are bounded too. For
+GPU DB, every hot helper protocol should declare its descriptor types:
+route publication, resident-generation swap, invalidation frontier
+publish, response-credit state, or partition-owner handoff. Each
+network worker, GPU execution worker, and owner thread can then own a
+small reusable descriptor set rather than allocate per request.
+
+The sequence-tag idea maps naturally to route certificates. A pointer
+to a publication descriptor should be interpreted as `(owner,
+descriptor type, sequence)`, not just an address. That makes stale
+helpers fail closed when a worker has already completed one publication
+and reused the descriptor for another. It also gives telemetry-friendly
+budgets: descriptors per worker, active descriptor sequences, failed
+stale reads, helper retries, and hot descriptor cache-line movement.
+
+Weak invalidation is a good fit for metadata operations whose
+post-completion helper steps are trivial. A helper trying to finish a
+resident-root swap can stop if the descriptor has been invalidated,
+because the owner or another helper already completed or failed the
+publication. This is less appropriate for row MVCC, WAL flush, or
+transaction state where "already completed" must still be reconciled
+with durability, commit ordering, and client-visible results.
+
+For the 1M logical-session target, descriptor reuse is mainly about
+active work, not idle sessions. Idle sessions should not hold
+descriptors. Active requests that enter CPU-side route metadata,
+response scheduling, or residency publication should draw from
+per-worker pools. A surge of sessions then raises queue pressure or
+returns overload instead of triggering descriptor allocation and
+deferred reclamation pressure.
+
+The paper also suggests a test discipline for any lock-free route
+metadata structure: prove or assert that post-completion helper steps
+are trivial, that reads outside helper routines have safe defaults, and
+that sequence wraparound or reuse cannot create ABA-style stale
+publication.
+
+**Risks and mismatches:** The paper is about lock-free synchronization
+primitives and data structures, not database transactions. Its
+transformations do not provide SQL isolation, WAL-before-visibility,
+crash recovery, or snapshot serializability. GPU DB can borrow the
+descriptor discipline only for CPU-side helper metadata around
+published immutable structures.
+
+The transformation applies only to algorithms with specific helping
+shapes. If a route update can leave meaningful work after completion,
+or if helper state escapes and drives later SQL behavior, weak
+descriptor invalidation is unsafe. Default values for extended weak
+descriptors are algorithm-specific proof obligations, not a generic
+escape hatch.
+
+Sequence numbers introduce their own lifecycle risks. A long-running
+system needs wraparound policy, type separation, and tests that stale
+descriptor pointers cannot collide with a later descriptor sequence.
+Per-worker descriptors also create hot cache lines; the paper's NUMA
+results are a reminder that eliminating allocation can expose
+cross-socket invalidation as the next bottleneck.
+
+Finally, reusable descriptors help CPU metadata, not GPU kernels
+directly. Device-side work still needs separate lifetime management for
+HBM buffers, CUDA events, pinned host memory, and snapshot retirement.
+A CPU descriptor may publish a resident generation, but it must not be
+the sole mechanism that governs device-resource reclamation.
+
+**Benchmark candidates:**
+
+- Build a microbenchmark for route-publication descriptors with one
+  reusable descriptor per worker and descriptor type. Compare against
+  heap-allocated descriptors plus epoch reclamation under 1K, 100K, and
+  1M simulated logical sessions. Gate: no hot-path allocation after
+  worker initialization.
+- Add stale-helper tests for a resident-generation root swap. Helpers
+  racing an invalidated descriptor must either stop or observe a safe
+  default, never publish mixed visibility/schema/resident generations.
+- Track descriptor telemetry: active descriptors, sequence numbers,
+  stale reads, helper retries, cache-line bounce counters where
+  available, and p99 helper time. Failure condition: descriptor helper
+  work becomes unbounded or leaks into network progress.
+- Compare owner-serialized publication, PathCAS-style publication with
+  allocated descriptors, and PathCAS-style publication with reusable
+  descriptors. Required measurements: route-decision latency,
+  publication throughput, allocation rate, reclamation lag, and LLC
+  misses.
+- Stress sequence wraparound with a deliberately small sequence field
+  in tests. Proof gate: stale descriptor pointers cannot modify or
+  validate against a reused descriptor incarnation.
+- Tie descriptor retirement to resource retirement for GPU-visible
+  publications. A descriptor can be reused immediately after the CPU
+  publication completes, but HBM buffers and pinned memory must remain
+  live until retained snapshot handles release them.

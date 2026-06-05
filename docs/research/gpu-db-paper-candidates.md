@@ -663,7 +663,7 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up that combines multi-word CAS and transactional-memory
   ideas for concurrent search structures; useful for route metadata updates
   that need atomic multi-location publication without full STM overhead.
-- `queued` — **Reuse, Don't Recycle: Transforming Lock-Free Algorithms That
+- `reviewed` — **Reuse, Don't Recycle: Transforming Lock-Free Algorithms That
   Throw Away Descriptors**, Arbel-Raviv and Brown, DISC 2017.
   URL: `https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.DISC.2017.4`
   PDF:
@@ -672,6 +672,14 @@ Append new candidates here as each paper is processed.
   reclamation overhead; useful for bounded per-worker command descriptors,
   route-publication descriptors, and lock-free helper metadata under high
   session counts.
+- `queued` — **A Template for Implementing Fast Lock-free Trees Using HTM**,
+  Brown, PODC 2017.
+  URL: `https://arxiv.org/abs/1708.04838`
+  PDF: `https://mc.uwaterloo.ca/pubs/3path/paper.podc17.pdf`
+  Why: Reuse Don't Recycle notes that HTM can reduce descriptor allocation on
+  fast paths but still needs an efficient lock-free fallback; useful for
+  evaluating whether route metadata updates should use HTM as an optional fast
+  path while keeping descriptor-reuse fallback progress.
 - `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`
