@@ -67130,3 +67130,137 @@ restores to claim correctness.
 - Treat GPU resident snapshots as invalid after crash, then measure whether a
   restored CPU key range can serve CPU fallback immediately while GPU warmup
   happens in the background.
+
+### 2026-06-05 - HorseQC makes GPU transfer routes prove pipeline density
+
+**Citation:** Henning Funke, Sebastian Bress, Stefan Noll, Volker Markl, and
+Jens Teubner. "Pipelined Query Processing in Coprocessor Environments."
+SIGMOD 2018, pp. 1603-1618. doi:10.1145/3183713.3183734. Retrieved
+2026-06-05 from the TU Dortmund author PDF,
+`https://dbis.cs.tu-dortmund.de/storages/dbis-cs/r/papers/2018/pipelined-query-processing/pipelined-query-processing.pdf`.
+
+**Category:** GPU execution / analytics and query route planning.
+
+**Relevance tags:** GPU query compilation; coprocessor data movement; kernel
+fusion; compound kernels; prefix sums; local resolution; global propagation;
+PCIe/NVLink route economics; CPU/GPU fallback calibration.
+
+**Core idea:** The paper argues that GPU query processing is primarily limited
+by data movement across PCIe, GPU global memory, and on-chip memory, not just
+by arithmetic throughput. HorseQC maps multiple relational primitives into
+fused GPU kernels so intermediate state stays in registers, scratchpad memory,
+or other on-chip structures rather than being repeatedly materialized in GPU
+global memory.
+
+For GPU DB, the transferable idea is a route eligibility test for non-resident
+or partially resident GPU execution: a pipeline should go to GPU only when the
+compiled shape can keep enough work on-chip to amortize transfer and launch
+costs. Residency is still the best case, but HorseQC shows a useful fallback
+middle ground between "CPU only" and "fully resident GPU cache."
+
+**Concrete mechanisms:**
+
+- The paper separates macro execution models from micro execution models.
+  Run-to-finish keeps intermediates on the GPU but is limited by GPU memory
+  capacity; kernel-at-a-time scales to larger data but moves data through PCIe
+  for each kernel; batch processing reduces PCIe pressure but can become
+  limited by GPU global-memory traffic.
+- HorseQC integrates with CoGaDB by replacing sequences of physical operators
+  with fusion operators. A translation layer either derives fusion operators
+  from a SQL plan using produce/consume style traversal or reads them from a
+  JSON plan for query shapes the SQL integration cannot express.
+- The multi-pass compiler first splits a pipeline into a count kernel, a
+  prefix-sum phase, and a write kernel. This already reduces GPU global-memory
+  traffic compared with operator-at-a-time processing, but prefix sums and
+  reductions still force materialized intermediate passes.
+- The fully pipelined design emits a compound kernel. Predicate evaluation,
+  join probing, prefix-sum or reduction logic, projection, and output writes
+  are placed into one generated kernel where flags, payloads, and write
+  positions remain in registers or scratchpad memory.
+- Dense output positions are computed with local resolution and global
+  propagation. A thread group computes a local prefix or pre-aggregation; one
+  representative performs an atomic global update for the group; threads add
+  local and global offsets to produce write positions. Output order is only
+  semi-ordered, but the relational semantics require uniqueness, not stable
+  tuple order, for these operators.
+- The same pattern extends to grouped aggregation by doing local segmented
+  reductions in scratchpad memory, then atomically propagating pre-aggregates
+  into a global hash table.
+- Evaluation uses SSB, TPC-H subsets, and several GPUs/APUs. The paper reports
+  GPU global-memory access reductions up to 7.5x and kernel-time reductions up
+  to 9.5x versus operator-at-a-time. In end-to-end TPC-H tests, HorseQC is up
+  to 5.8x faster than CoGaDB and up to 26.9x faster than MonetDB for supported
+  queries, while simple or unsupported shapes can still favor CPU execution.
+- Limitations are explicit: the prototype does not support every SQL feature,
+  changes several TPC-H queries, lacks a fully scalable CoGaDB-integrated
+  storage path, and leaves decompression of dictionary-compressed columns and
+  sorting to the original CoGaDB engine.
+
+**GPU DB mapping:** P8 currently treats GPU memory as a versioned acceleration
+tier, while the runtime document expects read snapshot workers and GPU
+execution workers to group compatible work by shape, snapshot generation, and
+partition. HorseQC sharpens the planner contract for the cases where a route
+is not already resident: the planner should know whether the query can be
+lowered to a compound pipeline whose input, output, hash state, reductions, and
+result scattering have a bounded transfer budget.
+
+The route selector should maintain a "pipeline density" estimate beside the
+route-frontier certificate. Useful inputs include selected columns, projected
+bytes, expected selectivity, number of pipeline-breaking reductions, hash-table
+residency, output ordering requirements, and whether prefix sums can be relaxed
+to semi-ordered dense writes. A route that cannot prove pipeline density should
+fall back to CPU or warm-tier vectorized execution before occupying GPU queues.
+
+The local-resolution/global-propagation pattern also maps to retained lookup
+and aggregate micro-batches. Instead of launching one kernel per read request,
+compatible requests can allocate output ranges per CTA or request group, then
+scatter results back by request id. That is attractive for repeated retained
+lookups and simple aggregates as long as response ordering is handled at the
+protocol layer rather than by imposing stable row order inside the GPU kernel.
+
+For mutation-adjacent work, the paper is a warning rather than an invitation to
+run arbitrary transactions on GPU. It assumes analytical pipelines and relaxed
+output order. GPU DB should first use this for read-only retained routes,
+refresh pipelines, and derived cold/warm segment scans. Write visibility,
+WAL-before-visibility, and MVCC validation still belong to the mutation owner
+unless a later transaction paper proves a safe GPU batch protocol.
+
+**Risks and mismatches:** HorseQC is an analytical query-processing paper, not
+an OLTP or MVCC design. It does not address transactions, snapshot visibility,
+WAL, DDL, long readers, or session admission. Its supported SQL surface is
+limited, and some TPC-H queries were modified because the prototype lacked
+features such as `LIKE` expressions and anti joins.
+
+The strongest results rely on query shapes where GPU-local work can outrun the
+host/GPU transfer path. Simple predicates, low-complexity queries, unsupported
+operators, or output-order-sensitive plans can make CPU execution better. The
+paper also uses older GPUs and PCIe-era measurements, so current NVLink, large
+HBM, and future CXL tiers need recalibration rather than direct adoption of
+the reported speedups.
+
+**Benchmark candidates:**
+
+- Add a route-density estimator for one retained scan/aggregate family:
+  selected bytes, projected bytes, expected output bytes, pipeline-breaking
+  reductions, hash-state location, and output-order requirement. Gate: routes
+  predicted GPU-favorable must beat CPU fallback on p50 and p95 latency after
+  transfer and launch costs are included.
+- Implement a compound-kernel microbenchmark for `WHERE int4 BETWEEN ? AND ?`
+  plus projection and `COUNT`/`SUM`, comparing operator-at-a-time, multi-pass,
+  and single-pass local-resolution variants. Failure condition: the single-pass
+  route cannot beat CPU vectorized fallback for any selectivity band.
+- Test semi-ordered dense GPU output with protocol-level result scattering:
+  each request gets correct rows or aggregate values, while row order is marked
+  unordered unless SQL requires `ORDER BY`. Gate: correctness under mixed
+  micro-batches with different request ids.
+- Compare resident versus streamed GPU execution for the same query shape:
+  fully resident column group, pinned-host streamed batch, and CPU warm-tier
+  vectorized scan. Measure launch count, transfer bytes, GPU global-memory
+  bytes, queue wait, and response p95.
+- Add a grouped-aggregation stress test with skewed group counts. Compare local
+  pre-aggregation in scratchpad against direct atomic global aggregation and
+  CPU fallback. Failure condition: hot groups serialize enough to starve short
+  retained lookups sharing the GPU worker.
+- Teach route telemetry to report why a GPU plan was rejected: stale
+  visibility frontier, missing residency, low pipeline density, unsupported
+  operator, output ordering, saturated GPU queue, or transfer budget exceeded.

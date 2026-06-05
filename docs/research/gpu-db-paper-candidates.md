@@ -602,12 +602,16 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/2882903.2903729`
   Why: direct predecessor to HANA NSE's pageable column design; useful if the
   GPU DB needs more detail on piecewise dictionary/vector access and prefetch.
-- `queued` — **HorseQC: A GPU-accelerated Query Compiler for Query Processing**,
-  Rui et al., VLDB Journal 2021.
-  URL: `https://doi.org/10.1007/s00778-020-00646-9`
+- `reviewed` — **Pipelined Query Processing in Coprocessor Environments**,
+  Funke et al., SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3183734`
+  PDF:
+  `https://dbis.cs.tu-dortmund.de/storages/dbis-cs/r/papers/2018/pipelined-query-processing/pipelined-query-processing.pdf`
   Why: Crystal evaluates GPU-as-coprocessor query compilation against efficient
   CPU baselines; useful follow-up for deciding whether GPU DB should ever use
-  pipelined transfer routes when data is not resident.
+  pipelined transfer routes when data is not resident. Previously queued under
+  the informal HorseQC name with an incorrect VLDB Journal DOI; corrected and
+  reviewed on 2026-06-05.
 - `reviewed` — **Relaxed Operator Fusion for In-Memory Databases: Making
   Compilation, Vectorization, and Prefetching Work Together at Last**,
   Menon et al., PVLDB 2017.
@@ -5308,3 +5312,16 @@ Append new candidates here as each paper is processed.
   PDF: `https://pages.cs.wisc.edu/~yxy/pubs/bamboo.pdf`
   Why: duplicate queue entry; Bamboo was already reviewed under the earlier
   Rebirth-Retire follow-up block.
+- `queued` — **Adaptive Work Placement for Query Processing on Heterogeneous
+  Computing Resources**, Karnagel, Habich, and Lehner, PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p733-karnagel.pdf`
+  DOI: `https://doi.org/10.14778/3067421.3067427`
+  Why: HorseQC cites adaptive heterogeneous work placement; useful for deciding
+  when GPU DB should route a pipeline to CPU, GPU, or split execution based on
+  transfer cost and operator support.
+- `queued` — **Generating Custom Code for Efficient Query Execution on
+  Heterogeneous Processors**, Bress et al., arXiv 2017.
+  URL: `https://arxiv.org/abs/1709.00700`
+  Why: HorseQC's CoGaDB integration reuses Hawk-style code generation; useful
+  for route-specific CPU/GPU codegen without tying planner correctness to one
+  hardware backend.
