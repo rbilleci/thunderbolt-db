@@ -4210,7 +4210,7 @@ Append new candidates here as each paper is processed.
   placement into future-window routing and migration; useful for comparing
   active-window route certificates with data movement and owner-boundary
   changes under shifting hot spots.
-- `queued` — **MgCrab: Transaction Crabbing for Live Migration in
+- `reviewed` — **MgCrab: Transaction Crabbing for Live Migration in
   Deterministic Database Systems**, Lin et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p597-lin.pdf`
   Why: direct follow-up from the T-Part/ElaSQL line on live migration during
@@ -4282,3 +4282,11 @@ Append new candidates here as each paper is processed.
   strict serializability and may inform owner-placement and route-freshness
   policy when GPU DB partitions or replicas become geographically or
   tier-wise distributed.
+- `queued` — **Rocksteady: Fast Migration for Low-latency In-memory
+  Storage**, Kulkarni et al., SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132784`
+  PDF: `https://chinkulkarni.github.io/public/rocksteady.pdf`
+  Why: MgCrab contrasts transactional deterministic migration with
+  low-latency in-memory key-value migration; useful for comparing early
+  ownership transfer, workload-skew-aware movement, and adaptive background
+  migration against GPU DB resident segment and owner-domain movement.

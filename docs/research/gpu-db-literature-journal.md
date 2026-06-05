@@ -52586,3 +52586,194 @@ one long retained read, one write batch, one moving hot/cold segment,
 and one stale cardinality estimate. Measure how often each frontier
 causes fallback or delay, and require the simulator to explain every
 route decision in terms of visibility, placement, or estimate freshness.
+
+### 2026-06-05 - MgCrab: Transaction Crabbing for Live Migration in Deterministic Database Systems
+
+**Citation:** Yu-Shan Lin, Shao-Kan Pi, Meng-Kai Liao, Ching Tsai,
+Aaron Elmore, and Shan-Hung Wu. "MgCrab: Transaction Crabbing for
+Live Migration in Deterministic Database Systems." PVLDB 12(5),
+2019, pp. 597-610. doi:10.14778/3303753.3303764. Retrieved
+2026-06-05 from `https://www.vldb.org/pvldb/vol12/p597-lin.pdf`.
+
+**Category:** transaction processing / write path; runtime / live
+partition movement; hybrid HTAP placement.
+
+**Relevance tags:** live migration; deterministic execution; hot
+partition movement; source/destination handoff; migration admission;
+range ownership; background copy; owner-domain routing; zero-downtime
+reconfiguration.
+
+**Core idea:** MgCrab targets deterministic distributed OLTP systems
+whose workload and hot partitions change over time. Traditional live
+migration either keeps serving from the source and repeatedly ships
+updates, serves from the destination and pays early pull latency, or
+routes each transaction to one side based on partial ownership
+metadata. MgCrab instead runs each incoming transaction on both the
+source and destination during migration and lets the faster side reply
+to the client. Deterministic ordering makes both executions produce
+the same logical effects without a per-transaction agreement protocol.
+
+The useful abstraction is a migration window where data ownership is
+being moved but route admission remains continuous. In MgCrab, the
+source starts as the likely winner because it has warm local data; as
+the destination receives chunks and computes updates itself, the
+winner can shift per transaction. The design trades extra compute for
+less communication, no downtime, no migration-induced aborts, and less
+performance sensitivity to chunk size than source-only or
+destination-only approaches.
+
+**Concrete mechanisms:**
+
+- The target system is deterministic: sequencers establish a global
+  transaction order, schedulers forward ordered stored-procedure
+  requests, and executors produce state that is deterministic with
+  respect to that order.
+- A migration plan is derived from old and new partition plans and
+  identifies records or ranges moving from a source node to a
+  destination node.
+- An initialization transaction marks migration metadata in the same
+  ordered stream as user transactions so both sides switch behavior at
+  the same logical point.
+- During the crabbing phase, both source and destination execute every
+  transaction that touches migrating data. The client may continue
+  after receiving the first correct result, called the winner node.
+- The destination does not wait for shipped update logs from the
+  source. It executes the same ordered transactions and computes the
+  migrated records' new values itself.
+- Foreground pushes send only data that the destination needs to
+  execute a transaction and has not yet received. The source can keep
+  serving from warm state while the destination catches up.
+- Background migration uses a two-phase push. The first ordered
+  transaction reads a chunk on the source without blocking foreground
+  work there; the second ordered transaction persists that chunk at
+  the destination.
+- Two-phase background pushes can be pipelined by merging phase two of
+  one chunk with phase one of the next chunk, keeping the number of
+  ordered migration transactions close to a one-phase design.
+- For distributed transactions, non-migrating partitions can treat
+  the source and destination as a single logical participant and use
+  data pushed by the winner side, preserving deterministic results
+  without a new commit protocol.
+- For large range reads, MgCrab can deterministically switch a
+  transaction to master-slave mode. The source executes and pushes
+  results instead of forcing the destination to actively compute a
+  transaction whose read set would require a large foreground copy.
+- Active chunks touched by range-mode transactions can be tagged so
+  the background process prioritizes those chunks under a deterministic
+  reordering rule.
+- If the destination is slow, an optional catching-up phase uses
+  master-slave execution so the destination can fill missing data
+  before full crabbing. If the destination becomes fast, a caught-up
+  phase lets the source stop updating migrated records and skip later
+  transactions that no longer need source-only data.
+- Transitions between phases are issued as special ordered
+  transaction requests so both source and destination enter the new
+  mode at the same logical time.
+- Concurrent migration plans are possible, but the paper recommends
+  grouping them so a node is involved in only a few migrations at once;
+  otherwise crabbing can turn a node into a hotspot.
+- For disk-backed storage, source-side prefetch and asynchronous
+  destination writes can reduce migration cost because chunks can be
+  recreated by replaying deterministic request logs during recovery.
+- The evaluation implements MgCrab over a Calvin-like deterministic
+  system and compares it with stop-and-copy and Squall on YCSB and
+  TPC-C. The paper reports more stable throughput and latency during
+  scaling-out and consolidation migrations, including larger
+  concurrent-migration experiments where MgCrab still outperforms the
+  baselines.
+
+**GPU DB mapping:** MgCrab is a useful mental model for moving GPU DB
+owner domains, resident segments, and hot partitions without freezing
+the route surface. A future GPU DB should be able to move a hot table
+segment from CPU-only execution to GPU-resident execution, from one GPU
+worker to another, or from one partition owner to another while
+existing sessions continue to receive correct answers. The transferable
+idea is to treat movement as a typed, ordered window with source and
+destination routes both valid under the same logical generation.
+
+For the current runtime design, the winner-node idea maps to
+source/destination route racing only when correctness is already
+certified: CPU truth versus a warming resident snapshot, old GPU worker
+versus new GPU worker, or source partition owner versus destination
+partition owner. A query can take the first completed result only if
+both candidates are tied to the same SQL visibility boundary,
+schema generation, resident data generation, and estimator generation.
+Otherwise, crabbing becomes a stale-read bug rather than an optimization.
+
+The two-phase background push maps well to P8 refresh and future
+tiering. Phase one is a source-owned read or encoding of a chunk that
+does not block foreground writes; phase two is a destination-owned
+install into HBM, host DRAM, CXL memory, or NVMe metadata. The
+pipeline rule suggests a refresh scheduler that overlaps encoding the
+next resident chunk with installing the previous chunk, while keeping
+publication behind an ordered generation barrier.
+
+MgCrab also gives a concrete admission policy for live movement:
+large range reads or long retained scans should not blindly force
+foreground movement of huge chunks. The route descriptor should carry
+the read-set size, expected foreground-copy bytes, and migration phase.
+If the read set is too large, switch to a deterministic master-slave
+style path: serve from the current owner, push only the result or a
+bounded delta to the destination, and let background movement catch up.
+
+Finally, concurrent migration grouping maps to the 1M logical-session
+goal. Many sessions may observe a movement window, but only a bounded
+number of active movement tasks should consume source-owner CPU,
+destination install bandwidth, pinned buffers, GPU streams, or response
+rings. Movement needs its own credit class rather than borrowing from
+ordinary read or write admission.
+
+**Risks and mismatches:** MgCrab assumes deterministic stored
+procedures with known read/write sets and a total transaction order.
+The GPU DB currently supports SQL protocol execution, WAL/MVCC state,
+and retained snapshots, but not a Calvin-style deterministic global
+sequencer. Arbitrary ad hoc SQL, unknown predicate selectivity, DDL,
+and MVCC visibility rules make it harder to know when two executions
+are guaranteed equivalent.
+
+Running work on both source and destination spends extra compute. That
+trade is plausible during scale-out or consolidation only when one side
+has spare capacity; it is dangerous if GPU streams, pinned buffers, or
+mutation-owner queues are already saturated. The paper's cluster used
+commodity CPUs and 1Gbps networking, so its absolute throughput and
+latency numbers are not transferable to GPU/HBM/NVMe routes. The
+destination computing updates from deterministic replay also does not
+replace GPU DB's WAL-before-visibility, checkpoint, or crash-recovery
+requirements.
+
+The design handles range queries with deterministic mode switches, but
+it does not solve SQL optimizer route choice, cardinality estimation,
+long MVCC snapshot retention, or query-result equivalence for
+non-deterministic functions. GPU DB should copy the movement-window
+structure and benchmarks, not assume dual execution is generally safe.
+
+**Benchmark candidates:**
+
+- Build a source/destination route simulator for one admitted table:
+  CPU owner is the source, a warming GPU resident generation is the
+  destination, and same-shape reads may race both only when their route
+  certificates match. Gate: first-result wins never returns a stale or
+  mismatched generation.
+- Prototype a two-phase resident refresh pipeline: source encode/read
+  chunk, destination install chunk, publish only after an ordered
+  generation barrier. Measure foreground write latency, read fallback
+  rate, refresh time, pinned-buffer occupancy, and HBM install bytes.
+- Add movement credits to the runtime model: maximum active movement
+  chunks, source-owner work, destination install work, and response
+  buffers. Failure condition: a movement task can starve ordinary
+  retained reads, COPY admission, or mutation publication.
+- Test master-slave fallback for large retained scans during movement:
+  serve from the current owner and send bounded result/delta metadata
+  rather than forcing a large foreground resident copy. Required
+  metrics: p50/p99 scan latency, movement completion time, foreground
+  bytes, and destination catch-up lag.
+- Simulate concurrent movement plans across partition owners or GPU
+  workers. Compare unrestricted crabbing with grouped plans that cap
+  the number of migrations involving any one owner. Proof gate: grouped
+  movement keeps route latency stable while still completing movement
+  within a configured window.
+- Add a route-certificate invariant test: visibility boundary, schema
+  generation, source data generation, destination data generation, and
+  estimator generation must agree before duplicate execution can race.
+  If any frontier differs, the route must choose one authoritative path
+  or report an explicit fallback reason.
