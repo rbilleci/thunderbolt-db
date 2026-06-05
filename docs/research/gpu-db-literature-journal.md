@@ -65546,3 +65546,169 @@ Benchmark priorities:
   refinement work plus queue wait exceeds CPU fallback.
 - Keep HTAP freshness benchmarks paired with write-path contention tests so
   compaction, resegmentation, and resident refresh do not hide commit latency.
+
+### 2026-06-05 - CCaaS separates conflict metadata from execution and storage
+
+**Citation:** Weixing Zhou, Yanfeng Zhang, Xinji Zhou, Zhiyou Wang,
+Zeshun Peng, Yang Ren, Sihao Li, Huanchen Zhang, Guoliang Li, and Ge Yu.
+"Concurrency Control as a Service." PVLDB 18(9), 2025, pp. 2761-2774.
+doi:10.14778/3746405.3746406. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol18/p2761-zhou.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; runtime / HFT / session scale.
+
+**Relevance tags:** decoupled concurrency control; OCC; snapshot isolation;
+epoch validation; write-set sharding; deterministic conflict resolution;
+asynchronous log pushdown; owner domains; commit metadata; hot-key contention;
+distributed transaction admission.
+
+**Core idea:** CCaaS argues that concurrency control has a resource profile
+different from SQL execution and storage, so disaggregated databases should
+not blindly attach conflict resolution to either layer. It proposes a separate
+CC service that receives transaction read/write sets from execution nodes,
+resolves conflicts against compact metadata, persists logs, and asynchronously
+pushes committed updates to storage engines.
+
+The paper's concrete default protocol is Sharded Multi-Write OCC (SM-OCC).
+It keeps optimistic execution at the SQL/storage edge, but batches validation
+by epochs inside the CC layer. Each CC node can act as a master for conflict
+resolution, shards split the metadata responsibility, and deterministic
+write-conflict rules let nodes prune losing writes locally before exchanging
+the surviving write sets. The strongest transferable lesson is not "make GPU
+DB a distributed three-layer system"; it is that conflict metadata can be a
+small, independently scalable owner domain with an explicit commit boundary
+and its own admission limits.
+
+**Concrete mechanisms:**
+
+- Execution engines optimistically read data and buffer writes, then submit a
+  unified read set and write set to CCaaS through a transaction commit
+  interface. The CC layer does not need to understand row, column, graph, or
+  vector payload formats beyond operation identity and data item keys.
+- CCaaS stores committed-transaction metadata rather than the full database
+  state. Scaling or re-sharding mostly moves metadata, not user data.
+- SM-OCC divides time into epochs, tags each transaction with a commit epoch
+  number and commit sequence number, and validates epoch `i + 1` against the
+  snapshot produced after epoch `i`.
+- Read-set validation defaults to snapshot isolation. For storage engines that
+  expose only row-level updates, the paper adds detection for partial reads of
+  multi-row transactions by validating execution results against the snapshot.
+- Write-set resolution checks committed state in a `GlobalWriteVersionMap`,
+  then detects same-epoch write/write conflicts in an `EpochWriteVersionMap`.
+- Conflicting writes are ordered by a deterministic CSN rule based on local
+  timestamp plus node id, avoiding a central sequencer. The paper notes this
+  rule can be replaced because clock skew can bias winners.
+- Nodes first resolve locally received write sets and send only locally winning
+  write sets to peers. Because the comparison rule is deterministic, a local
+  loser cannot become a global winner later.
+- In the sharded setup, transactions are split into subtransactions by key
+  shard. Each shard produces an abort set; an extra abort-set exchange builds
+  a globally consistent abort set before committed write sets are logged.
+- The storage adaptor translates committed logs into each storage engine's
+  update interface. For engines without direct data update APIs, the paper
+  modifies the engine so the adaptor can apply updates internally.
+- CCaaS persists logs at the CC layer before returning commit results, then
+  may push logs to storage asynchronously. This lowers commit latency but can
+  increase aborts in write-heavy workloads because readers may observe stale
+  storage before all pushes complete.
+- Fault handling uses Raft for shard master membership and for backing up
+  locally received transactions. If a node fails before write-set exchange for
+  an epoch completes, surviving nodes re-run conflict resolution for that
+  epoch to avoid pushing inconsistent logs.
+- Isolation support is limited. The paper says CCaaS supports RC and RR when
+  the storage engine supports transaction-level updates and defaults to SI, but
+  full serializable isolation would need global read-write dependency tracking
+  across nodes and epochs.
+- The evaluation implements about 10K lines of C++ CCaaS code and modifies
+  openGauss and NebulaGraph integrations. On YCSB-B and TPC-C-style workloads,
+  the paper reports 1.02-3.11x higher throughput and 1.11-2.75x lower latency
+  versus selected disaggregated database baselines; benefits shrink under
+  write-heavy Zipfian contention and large write sets.
+
+**GPU DB mapping:** GPU DB should not split concurrency control into a remote
+service now, but CCaaS is a useful pressure test for owner-domain boundaries.
+The mutation owner can be decomposed conceptually into three smaller pieces:
+execution/data movement, conflict metadata, and durable update application.
+Even if those pieces remain in one process, their queues, budgets, and
+telemetry should be separate enough that high-volume retained reads, COPY
+admission, and GPU refresh work do not hide conflict-resolution saturation.
+
+SM-OCC maps to a possible commit-batch path for partition owners. A batch of
+prepared writes can carry read-set keys, write-set keys, proposed commit
+generation, and route identity into a conflict owner. That owner validates
+against compact per-key/version metadata, emits a deterministic abort set, and
+only then lets the WAL/visibility owner publish committed versions. This gives
+GPU DB a benchmarkable alternative to a single global mutation queue without
+letting execution workers mutate MVCC state directly.
+
+The epoch model also fits the retained snapshot plan, but only with strict
+boundaries. A resident read snapshot can be tied to an epoch/generation, while
+new writes accumulate in a not-yet-visible write-set map. At publication, WAL
+durability must happen before visible generation advancement; storage or GPU
+refresh may lag, but route certificates must distinguish committed CPU truth
+from asynchronously refreshed resident state.
+
+The deterministic local-prune idea is valuable for hot-key write admission.
+For a micro-batch of writes to the same key or shard, GPU DB can reject or
+defer known losers before doing expensive resident invalidation, GPU refresh,
+or response-buffer allocation. The policy must be explicit: timestamp order,
+session priority, retry budget, or stored-procedure priority, not accidental
+network arrival order.
+
+Asynchronous log pushdown maps only partially. GPU DB already treats WAL as the
+durable authority and GPU resident state as rebuildable acceleration state, so
+it can safely acknowledge after WAL and CPU visibility publication while
+refreshing GPU state later. It must not, however, let a stale resident route
+serve a strong read unless the route certificate proves the requested boundary
+or falls back.
+
+**Risks and mismatches:** CCaaS targets distributed cloud-native and
+cross-engine systems, not a single-node GPU database. Its extra network layer
+would be the wrong default for the current engine, and its reported gains come
+from comparisons in a 5 Gbps Aliyun cluster with modified systems.
+
+The protocol defaults to snapshot isolation and explicitly does not implement
+serializable isolation because dependency tracking across epochs is expensive.
+That matters because GPU DB still needs a clear serializable-read and future
+serializable-transaction story. CCaaS also assumes transaction read/write sets
+are known at commit time; interactive SQL, secondary-index discovery, trigger
+behavior, and partial GPU execution can make that harder.
+
+Asynchronous storage pushdown is dangerous if copied casually. The paper notes
+that stale storage reads can raise abort rates in write-heavy workloads. For
+GPU DB, a stale GPU resident snapshot must be treated as a route-selection
+state, not as the visibility authority. Finally, deterministic CSN ordering
+based on local time plus node id is not fair under skew; GPU DB should make any
+winner rule observable and workload-driven.
+
+**Benchmark candidates:**
+
+- Split mutation-path telemetry into conflict metadata time, WAL append/flush
+  time, CPU MVCC publication time, invalidation time, and resident refresh
+  lag. Gate: p95 write latency can identify the saturated owner instead of
+  reporting one opaque mutation queue delay.
+- Prototype an in-process conflict-metadata owner for batched writes. Inputs:
+  read set, write set, proposed generation, session priority, and partition.
+  Outputs: commit/abort set plus deterministic loser reason. Compare against
+  the current single-owner mutation path under YCSB-A-like Zipfian writes.
+- Add an epoch/generation write-set benchmark: collect writes for `100 us`,
+  `500 us`, `1 ms`, and `5 ms`, validate as a batch, then publish after WAL.
+  Measure throughput, p50/p99 latency, abort rate, and generation staleness.
+- Test local-prune hot-key admission before expensive work. Failure condition:
+  known-loser writes still allocate GPU refresh buffers, invalidate resident
+  snapshots, or occupy response slots before conflict outcome is decided.
+- Add a stale-resident strong-read test modeled on async log pushdown: commit
+  CPU/WAL truth, delay GPU refresh, then issue strong retained reads. Gate:
+  every stale resident route either waits, falls back to CPU, or rejects with a
+  boundary reason; it never returns the old GPU snapshot silently.
+- Compare deterministic winner policies for same-epoch conflicts: arrival
+  order, transaction id, session priority, shortest-write-set-first, and retry
+  count. Measure fairness, abort storms, and tail latency under hot keys.
+- For future partition owners, measure the cost of exchanging only winning
+  write sets versus all write sets across partitions. Required metrics: bytes
+  exchanged, abort-set merge time, and atomicity bugs under multi-partition
+  failures.
+- Add serializable-read guardrail tests showing that SI-style epoch validation
+  is insufficient for dependency cycles. Use the result to keep SERIALIZABLE
+  route work separate from the faster SI/OCC batch path.

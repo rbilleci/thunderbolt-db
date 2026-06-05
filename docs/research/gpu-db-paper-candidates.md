@@ -718,6 +718,29 @@ Append new candidates here as each paper is processed.
   interrupts and optimistic concurrency to preempt long low-priority
   transactions for short high-priority work; selected because recent synthesis
   called for more transaction/runtime papers after HTAP/GPU scheduling work.
+- `reviewed` — **Concurrency Control as a Service**, Zhou et al.,
+  PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p2761-zhou.pdf`
+  DOI: `https://doi.org/10.14778/3746405.3746406`
+  Code: `https://github.com/iDC-NEU/CCaaS`
+  Why: modern disaggregated concurrency-control service with sharded
+  multi-write OCC, epoch validation, deterministic conflict resolution, and
+  asynchronous log pushdown; selected after the last synthesis called for more
+  transaction/MVCC write-publication work.
+- `queued` — **RCBench: an RDMA-enabled transaction framework for analyzing
+  concurrency control algorithms**, Zhao et al., VLDB Journal 2023.
+  URL: `https://doi.org/10.1007/s00778-023-00821-0`
+  PDF: `https://link.springer.com/content/pdf/10.1007/s00778-023-00821-0.pdf`
+  Why: CCaaS motivates independently scaled conflict-resolution resources;
+  RCBench may provide a modern distributed/RDMA concurrency-control benchmark
+  framework for comparing protocol scalability under data-node fan-out.
+- `queued` — **Epoxy: ACID Transactions Across Diverse Data Stores**,
+  Kraft et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p2742-kraft.pdf`
+  DOI: `https://doi.org/10.14778/3611479.3611484`
+  Why: CCaaS contrasts Epoxy's MVCC control-panel approach; useful for
+  comparing cross-store MVCC metadata, global snapshots, and atomic commit
+  without forcing all stores to implement a 2PC participant protocol.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for Microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
