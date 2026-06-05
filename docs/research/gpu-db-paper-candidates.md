@@ -4546,10 +4546,24 @@ Append new candidates here as each paper is processed.
   Why: GenericVC cites MindPalace's auto-mergeability as related
   reconciliation work; useful for comparing semantic merge rules against
   strict SQL validation and retained-snapshot correctness.
-- `queued` — **Skeena: Efficient and Consistent Cross-Engine Transactions**,
+- `reviewed` — **Skeena: Efficient and Consistent Cross-Engine Transactions**,
   Zhang et al., arXiv 2021.
   URL: `https://arxiv.org/abs/2108.00632`
   Why: MindPalace's branch reconciliation raises the broader question of how
   version and snapshot metadata crosses engines; Skeena is a modern
   cross-engine transaction source for comparing lightweight snapshot tracking
   and atomic commit across CPU, GPU, and cold-tier execution engines.
+- `queued` — **Industrial-Strength OLTP Using Main Memory and Many Cores**,
+  Avni et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p3099-avni.pdf`
+  DOI: `https://doi.org/10.14778/3415478.3415538`
+  Why: Skeena cites this main-memory engine line as a production fast-engine
+  target; useful for comparing cross-engine snapshot coordination with
+  many-core OLTP ownership, logging, and memory-resident transaction paths.
+- `queued` — **Harmony: A Heterogeneous Database System Built for Hybrid
+  Transactional and Analytical Processing**, Psaroudakis et al., PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p1161-psaroudakis.pdf`
+  DOI: `https://doi.org/10.14778/2994509.2994530`
+  Why: Skeena cites SAP HANA's heterogeneous-engine direction; useful for
+  contrasting cross-engine OLTP correctness with HTAP table placement,
+  analytical freshness, and transaction-aware engine routing.

@@ -56611,3 +56611,180 @@ momentum threshold or scan classification resists transient access bursts.
   catalog/route metadata, and compressed host segments. Required metrics:
   p50/p99 lookup latency, cache misses in placement metadata, migration bytes,
   and wrong-tier accesses.
+
+### 2026-06-05 - Skeena coordinates snapshots and commits across autonomous engines
+
+**Citation:** Jianqiu Zhang, Kaisong Huang, Tianzheng Wang, and
+King Lv. "Skeena: Efficient and Consistent Cross-Engine Transactions."
+SIGMOD 2022 / arXiv:2108.00632v5, 2022. Retrieved 2026-06-05 from
+arXiv, `https://arxiv.org/abs/2108.00632`.
+
+**Category:** transaction processing / MVCC / snapshot visibility.
+
+**Relevance tags:** cross-engine transactions; snapshot selection; atomic
+commit; fast-slow engines; commit ordering; MVCC visibility; table placement;
+CPU/GPU/cold-tier route coordination; WAL-before-visibility.
+
+**Core idea:** Skeena targets a practical multi-engine DBMS where a fast
+main-memory engine coexists with a slower storage-centric engine behind one
+SQL layer. Simply starting sub-transactions in each engine is not enough:
+two engines can each provide snapshot isolation or serializability locally
+while the combined transaction observes skewed snapshots, commits in
+different cross-engine orders, or exposes only one sub-transaction after a
+partial commit.
+
+Skeena's answer is deliberately small. A cross-engine snapshot registry
+tracks which snapshots in one engine correspond to safe snapshots in another,
+and a pipelined commit protocol makes all sub-transactions durable and
+application-visible as one unit without forcing traditional distributed 2PC
+onto the fast path. Single-engine work avoids the registry where possible;
+cross-engine work pays coordination only when it crosses an engine boundary.
+
+**Concrete mechanisms:**
+
+- A transaction starts normally through the unified SQL layer. When it first
+  accesses another engine, Skeena selects a compatible snapshot for that
+  second engine rather than letting the engine choose independently.
+- The cross-engine snapshot registry (CSR) stores mappings between commit
+  timestamps, treating committed cross-engine transactions as future snapshot
+  boundaries.
+- Snapshot selection performs a forward range scan from the current engine's
+  snapshot and chooses the newest mapped snapshot in the other engine that
+  preserves the same cross-engine begin order. If no mapping constrains it,
+  the latest snapshot in the other engine may be used.
+- Commit check performs reverse and forward scans around the anchor
+  sub-transaction's commit timestamp to find legal lower and upper bounds for
+  the other engine's commit timestamp. If the timestamp would create a skewed
+  mapping, the cross-engine transaction aborts.
+- Skeena designates an anchor engine, usually the cheap main-memory engine,
+  and follows its snapshot order. This turns many-to-many snapshot mappings
+  into a simpler one-to-many range index.
+- The CSR is partitioned into multiple snapshot-range indexes. One index is
+  open for new mappings; older indexes are read-only and can be recycled as a
+  unit when no active transaction needs their snapshot range.
+- Concurrency is intentionally simple: the index list uses a reader-writer
+  latch and individual CSR indexes use mutexes. The paper argues this is
+  acceptable because cross-engine transactions also touch the slower engine.
+- Cross-engine commit splits each engine's commit into pre-commit and
+  post-commit. Pre-commit obtains each sub-transaction's commit timestamp and
+  decision; post-commit publishes it after the CSR check passes.
+- Atomic visibility is provided by extending pipelined commit. Worker threads
+  detach transactions into a commit queue, and a committer releases client
+  results only after both engines' log records are durable.
+- Recovery can record commit-begin and commit-end records, or truncate/roll
+  back at the first cross-engine hole where only one sub-transaction finished.
+  Dependent transactions wait behind the commit queue and are not reported to
+  applications before durability.
+- For serializability, Skeena relies on each engine using a protocol with
+  commit ordering, such as 2PL or OCC without anti-dependencies. It does not
+  inspect arbitrary engine dependency graphs.
+- The MySQL prototype integrates ERMIA and InnoDB, using ERMIA as the anchor.
+  InnoDB read views are adjusted by CSR high-watermark changes, and InnoDB's
+  commit path is split to expose a pre-commit serialization number.
+- The paper reports that the MySQL/InnoDB changes were small, CSR was around
+  600 LoC, and cross-engine table placement in TPC-C can improve throughput
+  substantially when hot tables move to the memory engine.
+
+**GPU DB mapping:** Skeena is a useful blueprint for treating CPU canonical
+state, GPU resident snapshots, and cold/NVMe structures as separate engines
+without letting each tier invent its own visibility boundary. The GPU DB
+should not let a GPU snapshot route, CPU fallback route, and cold-tier route
+pick independent freshness. A route certificate needs a cross-tier snapshot
+mapping: source WAL generation, MVCC visibility boundary, resident generation,
+catalog generation, and cold-tier/checkpoint boundary must be comparable
+before one SQL transaction mixes them.
+
+The anchor-engine idea maps to the mutation owner or WAL/MVCC owner. That
+owner should be the timestamp authority even when a query executes mostly
+from GPU memory. GPU execution workers can own CUDA streams and resident
+buffers, but they should receive an already selected snapshot boundary rather
+than allocate visibility independently. Cold-tier readers similarly need an
+adjusted read boundary tied to the mutation owner's generation.
+
+The CSR range-index shape suggests a small "route snapshot registry" for
+published retained snapshots. It should record safe mappings between mutation
+generations, resident segment generations, catalog/DDL generations, and
+durable cold-tier frontiers. Older mapping ranges can become read-only and
+retire when retained readers release them, matching the existing immutable
+snapshot-retirement direction.
+
+The commit protocol reinforces WAL-before-visibility. A cross-tier mutation
+that updates CPU MVCC state, resident invalidation metadata, and cold-tier
+checkpoint or index metadata should have a pre-publication phase where every
+owner has assigned its durable or visibility frontier, then a publication
+phase where no client sees success until all required frontiers are safe.
+The benchmark target should be pipelined and queue-based, not synchronous
+queue-depth-one coordination.
+
+The table-placement results matter for P8: moving every table into the fast
+tier is not the only useful goal. The first GPU DB placement policy should
+identify which tables, segments, indexes, or route families dominate a
+transaction class, then move only those into GPU or fast host memory while
+keeping colder history in cheaper tiers.
+
+**Risks and mismatches:** Skeena studies two CPU engines inside MySQL, not
+GPU kernels, CUDA streams, pinned buffers, GPUDirect, or asynchronous resident
+refresh. Its CSR assumes comparable commit timestamps inside engines and a
+vendor-controlled integration that can expose pre/post-commit hooks. A GPU DB
+can choose those interfaces more freely, but it must still define the exact
+authority for each timestamp.
+
+The design relies on commit-ordering engines for serializability and avoids
+engine-specific dependency inspection. That is conservative and simple, but
+it may reject schedules that a more semantic route-validation system could
+repair or prove safe. The extra abort rate is small in the paper's TPC-C
+experiments but rises in some microbenchmarks. CSR latch and range-index
+overheads are acceptable in fast-slow CPU settings; they still need stress
+tests under millions of logical sessions and high retained-read concurrency.
+
+**Benchmark candidates:**
+
+- Prototype a route snapshot registry that maps mutation-owner generation to
+  resident GPU generation, catalog generation, and cold-tier frontier. Gate:
+  a mixed CPU/GPU/cold read transaction cannot observe skewed snapshots.
+- Add a cross-tier commit harness with pre-publication and post-publication
+  phases for CPU MVCC mutation, resident invalidation, and cold-tier metadata.
+  Failure condition: client success can be returned before every required
+  frontier is durable or recoverable.
+- Compare synchronous cross-tier publication against pipelined publication
+  with completion queues. Metrics: commit throughput, p95/p99 latency, queue
+  wait, WAL flush grouping, and replay correctness.
+- Stress long retained GPU snapshots while CSR-like mapping ranges retire.
+  Required result: old ranges remain available to active readers but are
+  recycled once no snapshot can use them.
+- Build table/segment placement experiments modeled on Skeena's TPC-C
+  results: move only one hot table or route family to GPU memory and measure
+  the affected transaction class, total mix throughput, refresh churn, and
+  cold-tier cost.
+- Test a mixed route where a transaction reads a GPU-resident hot table and a
+  CPU/cold historical table. Proof gate: identical rows to a serial CPU-only
+  execution under `READ COMMITTED`, `REPEATABLE READ`, and eventual
+  serializable route settings.
+
+### 2026-06-05 - Cross-paper synthesis: route certificates now need tier, merge, and snapshot contracts
+
+MindPalace, HybridTier, and Skeena converge on a stronger route-certificate
+shape. MindPalace says a route may be semantically mergeable only after a
+predicate/value proof. HybridTier says placement decisions need separate
+long-term heat and short-term momentum, but those counters are advisory only.
+Skeena says independent engines or tiers need an explicit snapshot mapping
+and atomic publication protocol before one SQL transaction can safely cross
+them.
+
+The design track is becoming: make semantic validity, placement policy, and
+cross-tier freshness separate fields instead of hiding them behind "GPU route
+eligible." A retained read or write route should carry its conflict proof or
+fallback reason, its placement/promotion reason, and its mapped generation
+across mutation, catalog, residency, and cold-tier owners.
+
+The biggest category gap is now evaluated end-to-end commit and recovery
+behavior for GPU/CPU/cold mixed routes. There is enough optimizer, runtime,
+MVCC, and tiering literature to start building a small active-window harness
+that combines all three contracts.
+
+Benchmark priority: implement a route-certificate simulator with three
+independent switches: semantic conflict proof on/off, frequency+momentum
+placement on/off, and cross-tier snapshot registry on/off. The proof gate is
+identical SQL-visible results and replay under all switch settings; the win
+condition is lower aborts, lower wrong-tier accesses, and stable p99 latency
+when the switches are enabled.
