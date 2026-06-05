@@ -3609,7 +3609,7 @@ Append new candidates here as each paper is processed.
   search; useful for deciding whether GPU DB should limit itself to offline
   policy tables or consider broader learned functions for owner admission,
   wait placement, and retry/backoff decisions.
-- `queued` — **Native Store Extension for SAP HANA**, Sherkat et al.,
+- `reviewed` — **Native Store Extension for SAP HANA**, Sherkat et al.,
   PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p2047-sherkat.pdf`
   Why: BTrim-related SAP tiering work for keeping warm/cold data outside the
@@ -5217,7 +5217,7 @@ Append new candidates here as each paper is processed.
   this multi-index table work; useful for deciding which index-update
   atomicity guarantees must be database-transactional versus data-structure
   local.
-- `queued` — **Native Store Extension for SAP HANA**, Sherkat et al.,
+- `reviewed` — **Native Store Extension for SAP HANA**, Sherkat et al.,
   PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p2047-sherkat.pdf`
   Why: MOT names memory capacity and tiering as future work; HANA NSE is a
@@ -5484,3 +5484,11 @@ Append new candidates here as each paper is processed.
   object work; useful for comparing route-specific conflict predicates,
   datatype-owned commit hooks, and reduced read/write-set bookkeeping
   against generic tuple-level validation.
+- `queued` — **SAP HANA Adoption of Non-Volatile Memory**, Andrei et al.,
+  PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p1754-andrei.pdf`
+  DOI: `https://doi.org/10.14778/3137765.3137780`
+  Why: HANA NSE cites NVM as the nearer-memory tier between DRAM and disk;
+  useful for comparing byte-compatible hot/warm structures against persistent
+  memory placement, restart, and tier-specific durability behavior before GPU
+  DB adds future CXL/NVM tiers.

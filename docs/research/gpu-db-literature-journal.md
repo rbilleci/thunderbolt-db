@@ -69125,3 +69125,181 @@ Benchmark priorities:
   buffers.
 - Add retire/debt telemetry for every lazy shortcut, compressed segment,
   membership map, and resident generation held by active snapshots.
+
+### 2026-06-05 - HANA NSE makes warm placement byte-compatible, not separate-engine
+
+**Citation:** Reza Sherkat, Colin Florendo, Mihnea Andrei, Rolando Blanco,
+Adrian Dragusanu, Amit Pathak, Pushkar Khadilkar, Neeraj Kulkarni, Christian
+Lemke, Sebastian Seifert, Sarika Iyer, Sasikanth Gottapu, Robert Schulze,
+Chaitanya Gottipati, Nirvik Basak, Yanhong Wang, Vivek Kandiyanallur, Santosh
+Pendap, Dheren Gala, Rajesh Almeida, and Prasanta Ghosh. "Native Store
+Extension for SAP HANA." PVLDB 12(12), 2019, pp. 2047-2058.
+doi:10.14778/3352063.3352123. Retrieved 2026-06-05 from VLDB,
+`https://www.vldb.org/pvldb/vol12/p2047-sherkat.pdf`.
+
+**Category:** multi-tier cache / data placement; hybrid HTAP; query execution
+and storage layout.
+
+**Relevance tags:** warm/cold placement; byte-compatible persistence;
+pageable column primitives; hybrid column store; buffer cache; prefetch; load
+unit advisor; online conversion; partition-level placement; HTAP cost control.
+
+**Core idea:** SAP HANA's Native Store Extension increases capacity by making
+the existing in-memory column store page-loadable instead of adding a separate
+disk engine. The central trick is unified persistence: the on-disk page format
+is byte-compatible with contiguous pieces of HANA's in-memory column
+structures. A column, partition, or subcomponent can therefore switch between
+fully loaded and paged access without converting to a different logical store.
+
+For GPU DB, the transferable design is that a warm tier should preserve the
+hot-tier operator vocabulary. If a warm column group, dictionary, index, or
+compressed vector has a different physical source but the same route-level API,
+the planner and kernels can treat placement as a cost and proof field rather
+than as a separate execution universe.
+
+**Concrete mechanisms:**
+
+- HANA columns are split into a read-optimized main fragment and a
+  write-optimized delta fragment. Inserts and updates append to the delta; the
+  main fragment is periodically rebuilt by delta merge. NSE targets the large,
+  read-optimized main fragment, so OLTP writes mostly continue through the
+  delta path.
+- Unified persistence stores page-loadable structures in a representation that
+  is byte-compatible with the corresponding in-memory pieces. Switching load
+  unit can allocate contiguous memory and copy from buffer-cache pages instead
+  of rewriting every data vector, dictionary, and index into another format.
+- Pageable primitives wrap the physical placement behind the same access API:
+  multi-page vectors for large fixed-size arrays, paged mapped vectors for
+  small vectors that can point directly into loaded pages, and arbitrary-size
+  items for variable-size values such as spatial data.
+- Compression schemes get pageable counterparts. RLE stores value-id and start
+  position vectors; sparse encoding pages both the reduced vector and the bit
+  vector; indirect encoding stores per-block dictionaries and block metadata
+  through paged vectors and arbitrary-size items.
+- Search helper structures stay memory resident when they are small. For
+  pageable RLE and dictionaries, helpers store per-page boundary values so a
+  lookup narrows to one or two page loads instead of binary-searching across
+  many unloaded pages.
+- The RowID column is compressed in 1,024-value blocks aligned on page
+  boundaries. A memory-resident block address vector lets RowID lookup identify
+  one page and offset without copying the block into aligned temporary memory.
+- Hash-based indexes avoid a large dictionary by replacing it with a hash
+  function and paging the row-position mapping through a hybrid hash column.
+  The paper notes these hash values are internal and almost never projected by
+  user queries.
+- The NSE buffer cache is separate from HANA's broader memory resource manager.
+  It supports multiple page-size pools, domain-specific page pools for data,
+  dictionaries, and indexes, dynamic capacity changes, background growth, and
+  proportional shrinkage.
+- Hot buffer retention uses an adaptive LRU-like policy with a working-set
+  queue and a housekeeper that rebalances buffers into LRU/free lists. The
+  cache can steal buffers from less active page-size pools to avoid starving a
+  heavily used pool.
+- HEX integrates prefetch with query execution. Scan jobs issue best-effort,
+  bounded prefetch requests for page ranges before the scan runs, and fairness
+  advances per-subrange watermarks so one scan worker does not get all prefetched
+  pages while others wait.
+- Prefetch is capped as a fraction of cache capacity so asynchronous prefetch
+  cannot starve synchronous page loads or allocations.
+- Critical operations such as transaction undo, crash recovery, and log replay
+  can use an emergency overflow buffer provider rather than failing when the
+  normal buffer cache runs out.
+- Load unit hints are persistent at column, partition, and table granularity:
+  column-loadable, page-loadable, or default-loadable. Column hints override
+  partition hints, which override table hints.
+- Online load-unit conversion versions existing columns while preserving column
+  identifiers. Old readers continue using the old column version; the new
+  version becomes active when the DDL commits.
+- Unbalanced partitioning lets hot and cold partition subtrees use different
+  partitioning and load-unit choices, rather than forcing one hot partition and
+  a uniform set of aged partitions.
+- The Load Unit Advisor collects physical main-fragment access counts in a
+  statistics cache and recommends page-loadable or column-loadable placement
+  using scan density and object-size thresholds.
+- Evaluation uses SAP's ML4 S/4HANA-style workload with OLTP steps and
+  occasional OLAP reporting over at least 100,000 tables. Reported results
+  include roughly 60-75% memory savings for an OLTP workload, roughly 44-66%
+  memory savings for a mixed workload, and less than 3.7% OLTP impact under the
+  tested NSE configuration. Smaller buffer caches hurt OLAP more because scans
+  touch more pages.
+
+**GPU DB mapping:** P8 currently treats GPU resident state as acceleration
+state rebuilt from CPU truth. NSE suggests tightening that into a
+byte-compatible placement rule where possible: dense GPU segments, compressed
+host segments, and NVMe-backed cold pages should share a route-level logical
+format, with placement and encoding recorded in the route certificate.
+
+The pageable primitive idea maps to resident segment subcomponents. A table
+does not need one placement decision. Key vectors, dictionaries, value buffers,
+text offset buffers, visibility maps, hash buckets, and row-id maps can be
+loaded, paged, compressed, or kept as compact helper structures independently.
+That fits the recent semantic-proof synthesis: route proof should name which
+subcomponents are resident, paged, helper-backed, or materialized.
+
+The main/delta split is a useful warning for write throughput. GPU DB can keep
+hot mutation in append-only WAL/MVCC deltas while larger read-optimized resident
+or warm segments are refreshed asynchronously. A warm-tier design should not
+make every insert rewrite compressed GPU or NVMe-resident main fragments.
+
+NSE's buffer cache has direct analogs for HBM, pinned host memory, DRAM, and
+NVMe page caches. Separate pools by page size and domain suggest separate
+budgets for value pages, dictionaries, visibility maps, text payloads, index
+helpers, and GPU staging buffers. Prefetch caps should also apply to GPU
+over-resident scans so speculative cold loads cannot starve point lookups,
+WAL/undo, or response buffers.
+
+The online load-unit conversion design maps to P8 generation publication. A
+conversion from dense GPU to compressed host, or host to NVMe-backed warm pages,
+should create a new versioned placement object. Active readers keep the old
+generation; new readers use the new placement only after commit/publication.
+
+The Load Unit Advisor is a minimal first advisor model for GPU DB: collect
+access density per segment and route shape, divide by byte footprint, then
+recommend resident, host-warm, compressed, or cold placement. The model is
+simple, but its value is that placement becomes an observable policy with
+thresholds instead of an implicit cache accident.
+
+**Risks and mismatches:** NSE is a CPU enterprise HTAP system, not a GPU
+database. Byte-compatible HANA column pieces do not imply CUDA kernels can
+consume the same bytes efficiently; GPU DB may need a logical compatibility
+contract rather than literal byte identity. The paper focuses on the
+read-optimized main fragment and does not expose a full MVCC visibility design
+for NSE pages. The reported performance comes from an internal SAP workload,
+with selected experiments and normalized charts rather than public benchmark
+numbers. HANA's buffer cache and HEX are mature production subsystems; GPU DB
+must prove similar behavior with much smaller machinery. Finally, keeping many
+small helper structures resident can become its own memory-pressure problem
+under 1M logical sessions and many admitted tables.
+
+**Benchmark candidates:**
+
+- Add placement metadata per resident segment subcomponent: value vector,
+  dictionary, text payload, visibility map, key vector, and helper index. Gate:
+  each retained route reports subcomponent placement and encoding.
+- Prototype byte-compatible or API-compatible warm pages for one `int4` value
+  vector: dense GPU, dense host, paged host, and cold NVMe-backed forms.
+  Measure route proof time, materialization bytes, GPU kernel compatibility,
+  and p99 latency.
+- Add compact helper structures for paged dictionaries or key vectors:
+  per-page min/max or last-value summaries. Failure condition: point/range
+  lookup loads unrelated cold pages before proving route eligibility.
+- Build a prefetch fairness benchmark for over-resident scans: multiple
+  concurrent scans across cold/warm segments with a capped prefetch budget.
+  Required metrics: per-scan progress skew, synchronous load starvation, GPU
+  queue wait, and point-lookup tail latency.
+- Compare whole-table placement with subcomponent placement. Example: keep
+  key vector and visibility map GPU-resident, value dictionary host-resident,
+  and text payload cold. Expected win: lower HBM footprint with retained
+  point-lookup latency close to dense residency.
+- Add online placement-conversion tests under active retained readers. Convert
+  a segment from dense resident to compressed warm and back; prove old readers
+  keep their generation, new readers see the committed generation, and WAL/MVCC
+  visibility is unchanged.
+- Implement a first Load Unit Advisor simulation over route telemetry:
+  scan density divided by bytes, object-size threshold, and route-class
+  overrides. Compare static residency with advisor-driven HBM/DRAM/NVMe
+  placement under mixed OLTP plus occasional OLAP scans.
+- Add emergency-buffer accounting for correctness-critical paths. WAL replay,
+  undo, invalidation, and snapshot retirement should either reserve buffers or
+  use a separately measured overflow path rather than failing behind cold scan
+  prefetch.
