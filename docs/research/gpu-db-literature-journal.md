@@ -74297,3 +74297,161 @@ Benchmark priorities:
   separately budgeted maintenance paths. Failure condition: either path
   improves mean latency by creating unbounded p99 merge, mask, or
   response work.
+
+### 2026-06-06 - Crystal turns cache entries into semantic regions, not blocks
+
+**Citation:** Dominik Durner, Badrish Chandramouli, and Yinan Li.
+"Crystal: A Unified Cache Storage System for Analytical Databases."
+PVLDB 14(11):2432-2444, 2021. doi:10.14778/3476249.3476292.
+Retrieved 2026-06-06 from the PVLDB PDF,
+`https://vldb.org/pvldb/vol14/p2432-durner.pdf`.
+
+**Category:** multi-tier cache / data placement, with query
+optimization and analytical-route relevance.
+
+**Relevance tags:** semantic caching; region cache; disaggregated
+storage; local SSD cache; predicate pushdown; cache admission; overlap
+aware replacement; workload history; route matching; warm/cold tiering.
+
+**Core idea:** Crystal argues that analytical caches should not be
+blind file or block caches when the DBMS already knows predicates and
+projected columns. It runs as a cache management system beside the
+compute node, receives pushed-down predicate metadata through a small
+DBMS-specific connector, and caches semantic single-table regions in a
+portable columnar format. The cached object is a query-covering region,
+not the original cloud-storage file.
+
+The transferable idea for GPU DB is that a tier cache can be a small
+query processor with its own metadata, matcher, admission policy, and
+background optimizer. The cache boundary should preserve enough route
+semantics to decide whether a resident or warm object actually covers a
+request, how much remote or cold-tier traffic it saves, and whether two
+overlapping cached objects should both remain.
+
+Crystal evaluates this idea with Spark and Greenplum over Azure Blob
+Storage, local SSD, Arrow, Gandiva, and Parquet. It reports up to 20x
+latency improvement for individual queries, up to 8x average
+improvement, and up to 41% average bandwidth savings from remote
+storage in the tested workloads. Those are analytical, cloud-storage
+results rather than GPU or OLTP results, but the mechanisms map well to
+P8's explicit GPU/DRAM/NVMe placement problem.
+
+**Concrete mechanisms:**
+
+- A Crystal connector plugs into a DBMS data-source API. It sends the
+  remote file path, pushed-down predicate tree, and required schema to a
+  separate Crystal CMS process, then scans the local or remote files
+  Crystal returns.
+- Crystal rewrites predicates into disjunctive normal form and models
+  regions as unions of conjunctions, effectively single-table
+  hyper-rectangles over pushed-down predicates.
+- The matcher first searches the larger oracle-region cache, then the
+  requested-region cache, then falls back to downloading remote files.
+  Full supersets are preferred over fragmented partial covers to avoid
+  excessive returned files and duplicate tuples.
+- If partial overlapping regions must be combined, Crystal builds
+  reduced temporary files so tuples are not returned twice.
+- Cache metadata is partitioned by remote file names and projected
+  schema before semantic matching, keeping online matching cheap in the
+  evaluated system.
+- New regions are materialized as Snappy-compressed Parquet files.
+  Crystal uses Arrow tables and Gandiva LLVM filters to transform and
+  filter source data.
+- The cache is split into a short-term requested-region cache and a
+  long-term oracle-region cache. The requested-region cache reacts
+  online with simple LRU/LRU-k style admission; the oracle-region cache
+  periodically recomputes better long-term contents in the background.
+- The oracle formulates region choice as a knapsack problem using saved
+  remote bytes as benefit and materialized region size as cost.
+- Because regions overlap, Crystal uses an overlap-aware greedy
+  knapsack. It recomputes benefit ratios after each pick, discounts
+  benefits for subsets or intersections already covered, and replaces
+  smaller picked regions when a better containing region is chosen.
+- An approximative region-merging step generalizes from history by
+  merging intersecting or near-intersecting regions, then samples to
+  estimate size before admitting generalized candidates.
+- Region-request history is stored in a ring buffer with file, schema,
+  tuple-count, size, selectivity, and result-statistics metadata.
+- Background cache creation runs at low priority, so expensive
+  long-term optimization should not add latency to foreground queries.
+
+**GPU DB mapping:** P8 should treat GPU-resident column groups, host
+compressed segments, and NVMe-backed cold partitions as semantic route
+regions rather than anonymous byte pages. A retained route certificate
+can say: this snapshot covers table generation X, columns Y, predicate
+region Z, visibility frontier F, and output shape S. That is stronger
+than "segment is resident" because the planner can prove coverage
+before choosing GPU, CPU warm-tier, or cold transfer.
+
+The RR/OR split maps naturally to GPU DB's hot path. A small requested
+region tier can catch bursts of repeated point/range/filter shapes
+without waiting for offline optimization. A larger oracle tier can use
+recent route history to decide which column groups, text-prefix slices,
+tenant ranges, and aggregate-ready summaries deserve GPU memory or
+warm host memory. The oracle should optimize saved transfer bytes,
+saved kernel launches, saved decompression, result size, and snapshot
+pin cost rather than only remote-storage bandwidth.
+
+Crystal's overlap handling is directly relevant to resident snapshots.
+If two resident regions overlap, the engine needs an exact composition
+rule: prefer one covering superset, subtract already-returned rows, or
+split the route. Returning two overlapping region files is wrong for
+Crystal; returning two overlapping resident fragments would be just as
+wrong for SQL result correctness.
+
+The region-merging idea also gives a concrete cache-admission
+benchmark. Instead of warming exact SQL queries only, GPU DB can merge
+nearby tenant/time/key-prefix requests into a slightly larger retained
+region when the extra bytes are cheaper than repeated cold transfers or
+refreshes. That decision should be bounded by GPU memory pressure,
+visibility generation, update invalidation rate, and expected reuse.
+
+**Risks and mismatches:** Crystal targets read-only analytical
+workloads over disaggregated cloud storage. Updates are left to
+invalidation or future refresh work, so the paper does not solve
+WAL-before-visibility, MVCC garbage collection, write amplification, or
+transactional refresh. GPU DB cannot copy Crystal's background cache
+builder unless every generated region is tied to a durable snapshot and
+invalidated before stale reads are admitted.
+
+The region model is single-table predicate pushdown. Joins,
+cross-table constraints, aggregates pushed into storage, MVCC
+visibility predicates, and variable-length text/index routes need extra
+metadata. The reported gains come from Spark/Greenplum, Parquet,
+Azure Blob Storage, and local SSD; they do not predict GPU kernel
+speedups directly.
+
+Crystal can duplicate data across overlapping regions. That may be
+reasonable on local SSD but dangerous in GPU memory unless the benefit
+model includes HBM scarcity, refresh cost, and snapshot pins. Its
+background optimizer also uses historical regions, so sudden workload
+changes still need a small reactive tier and overload-safe fallback.
+
+**Benchmark candidates:**
+
+- Add a semantic-region cache model to P8 planning: route candidates
+  carry table generation, snapshot frontier, columns, predicate bounds,
+  resident bytes, warm bytes, and overlap metadata. Gate: route matching
+  proves coverage before execution and never returns duplicate rows.
+- Prototype RR/OR-style resident admission. RR admits exact recent
+  query regions with a small byte cap; OR periodically merges route
+  history into generalized retained regions. Measure hit rate, refresh
+  bytes, GPU memory pressure, and point-query p99.
+- Compare file/segment LRU, exact-query cache, and overlap-aware
+  semantic-region admission for tenant/time/key-prefix workloads.
+  Failure condition: semantic regions improve average latency only by
+  increasing p99 invalidation or refresh stalls.
+- Build an overlap correctness test where two retained regions partly
+  cover the same keys and visibility frontier. The route must choose a
+  superset, subtract overlap, or reject composition; duplicate rows are
+  a hard failure.
+- Extend route telemetry with saved cold bytes, saved H2D bytes, saved
+  decompression bytes, result bytes, region overlap, and invalidation
+  age. Use it to decide whether generalized regions are worth keeping.
+- Benchmark approximate region merging for hot dashboard-like filters:
+  exact retained regions versus merged tenant/time ranges. Measure
+  cache utilization, cold-tier traffic, refresh cost after writes, and
+  route misprediction.
+- Test background region building under foreground OLTP/read pressure.
+  Gate: low-priority refresh never consumes pinned buffers, GPU memory,
+  or response-ring credits needed by latency-sensitive retained reads.

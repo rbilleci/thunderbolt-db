@@ -5755,13 +5755,14 @@ Append new candidates here as each paper is processed.
   whether CPU warm-tier compressed scans can beat GPU transfer or resident
   refresh on selective predicates. Author spelling, DOI, and PDF were
   corrected during review on 2026-06-05.
-- `queued` — **Crystal: A Unified Cache Storage System for Analytical
+- `reviewed` — **Crystal: A Unified Cache Storage System for Analytical
   Databases**, Durner, Chandramouli, and Li, PVLDB 2021.
   URL: `https://vldb.org/pvldb/vol14/p2432-durner.pdf`
   DOI: `https://doi.org/10.14778/3476249.3476292`
   Why: Selection Pushdown and Microsoft data-lake work point to a
   query-aware cache layer with push-down predicates and region caching; useful
   for GPU DB's warm/cold tier placement and cache-admission contract.
+  Reviewed on 2026-06-06.
 - `queued` — **ReCache: Reactive Caching for Fast Analytics over
   Heterogeneous Data**, Azim, Karpathiotakis, and Ailamaki, PVLDB 2017.
   URL: `https://infoscience.epfl.ch/record/232607/files/p375-azim.pdf`
@@ -5770,6 +5771,13 @@ Append new candidates here as each paper is processed.
   workloads; ReCache is a primary follow-up on workload-aware cache
   replacement and layout adaptation that may inform GPU DB resident and
   warm-tier admission policy.
+- `queued` — **SOC: A Succinct Adaptive Semantic OLAP Caching**, You et al.,
+  Data Science and Engineering 2025.
+  URL: `https://link.springer.com/article/10.1007/s41019-025-00290-1`
+  DOI: `https://doi.org/10.1007/s41019-025-00290-1`
+  Why: discovered while reviewing Crystal's semantic-region caching; useful as
+  a modern follow-up on compact semantic cache summaries, aggregate-result
+  inference, and adaptive cache bounds for repeated OLAP-style routes.
 - `queued` — **SyPer: Connecting the Pieces for Hybrid Transactional and
   Analytical Processing**, Wang et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p673-wang.pdf`
