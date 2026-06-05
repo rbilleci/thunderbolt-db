@@ -621,7 +621,7 @@ Append new candidates here as each paper is processed.
   Why: PreemptDB contrasts cooperative coroutine scheduling with preemptive
   scheduling; useful for evaluating whether GPU DB should use cooperative
   latency hiding for memory/NVMe stalls, preemption for urgent routes, or both.
-- `queued` — **Asynchronous Memory Access Chaining**, Kocberber, Falsafi, and
+- `reviewed` — **Asynchronous Memory Access Chaining**, Kocberber, Falsafi, and
   Grot, PVLDB 2015.
   URL: `https://www.vldb.org/pvldb/vol9/p252-kocberber.pdf`
   DOI: `https://doi.org/10.14778/2850578.2850581`
@@ -629,6 +629,19 @@ Append new candidates here as each paper is processed.
   comparison for pointer-stall hiding; useful for deciding whether selected
   GPU DB metadata paths deserve explicit state-machine optimization instead
   of general coroutine machinery.
+- `queued` — **Asynchronized Concurrency: The Secret to Scaling Concurrent
+  Search Data Structures**, David, Guerraoui, and Trigonakis, ASPLOS 2015.
+  URL: `https://doi.org/10.1145/2694344.2694359`
+  Project: `https://dcl.epfl.ch/site/ascylib`
+  Why: AMAC uses ASCYLIB's concurrent skip list workload; useful for comparing
+  latch avoidance, search/update path simplification, and portable scalability
+  in CPU-side indexes and route metadata structures.
+- `queued` — **Improving Main Memory Hash Joins on Intel Xeon Phi Processors:
+  An Experimental Approach**, Jha et al., PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol8/p642-Jha.pdf`
+  Why: AMAC cites many-core hash-join tuning as related hardware-conscious
+  database work; useful for separating CPU many-core memory-level parallelism
+  from GPU/accelerator route choices when joins or grouped lookups spill to CPU.
 - `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`

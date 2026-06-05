@@ -51337,3 +51337,156 @@ exceeds the planned envelope.
   should use the point estimate for ranking but the upper bound for admission
   into scarce resources. Gate: fewer catastrophic memory/queue overruns with
   acceptable loss in throughput.
+
+### 2026-06-05 - AMAC makes pointer-stall hiding a bounded state-machine lane
+
+**Citation:** Onur Kocberber, Babak Falsafi, and Boris Grot. "Asynchronous
+Memory Access Chaining." PVLDB 9(4), 2015, pp. 252-263.
+doi:10.14778/2850578.2850581. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol9/p252-kocberber.pdf`.
+
+**Category:** runtime / HFT / session scale; multi-tier cache / data placement;
+CPU-side query execution mechanics.
+
+**Relevance tags:** memory-level parallelism; pointer chasing; hash joins;
+group-by; tree search; skip lists; software prefetching; state machines;
+coroutine upper bound; fill-buffer pressure; CPU fallback; route metadata.
+
+**Core idea:** AMAC targets a common database CPU bottleneck: one lookup through
+a hash table, tree, or skip list often cannot expose enough independent memory
+accesses for an out-of-order core to hide DRAM latency. Group prefetching and
+software-pipelined prefetching can help when all lookups advance through the
+same number of pointer dereferences, but they lose memory-level parallelism
+when lookups diverge through skew, early exit, variable chain length, or latch
+contention.
+
+The paper's answer is to keep each in-flight lookup as an independent software
+state entry. When any lookup's prefetched memory arrives, the thread advances
+that lookup's next stage; if the lookup completes, the same slot immediately
+starts a new input lookup. This preserves a roughly constant number of
+outstanding memory accesses without forcing unrelated lookups to move in
+lockstep. In the evaluation, AMAC matches or beats group/pipeline prefetching
+on regular cases and is more robust on irregular cases, including up to 2.3x
+higher performance than existing prefetching techniques for irregular
+data-structure lookups. The authors also show a hardware ceiling: on their
+Xeon system, prefetch-heavy execution stops scaling once shared LLC miss
+resources become the bottleneck.
+
+**Concrete mechanisms:**
+
+- Each in-flight lookup lives in a software-managed circular buffer. A hash
+  probe entry carries the original row id, key, payload, current pointer, and
+  stage id; other operators add the state needed for their traversal.
+- A stage is a small code block around a dependent memory access. For hash join
+  probe, one stage hashes the input key and prefetches the bucket, while the
+  next stage compares the bucket/node and either outputs, prefetches the next
+  node, or starts a new lookup.
+- The circular buffer size is tuned to the hardware's useful outstanding miss
+  count. The paper observes little benefit beyond roughly eight to ten
+  in-flight lookups on the tested Xeon core, while very large counts can hurt
+  through TLB pressure.
+- Completed lookups are merged with new-lookup initialization where possible,
+  so the slot does not sit idle between one lookup's terminal stage and the
+  next lookup's first prefetch.
+- Output order is preserved by carrying the original input row id in the state
+  entry and materializing results into the corresponding output position.
+- For read/write dependencies, such as group-by or hash-build latches, AMAC
+  uses try-acquire behavior. If a latch is unavailable, the stage stores state
+  and moves to another lookup instead of spinning on the blocked one.
+- The paper hand-writes stage tables for hash join probe, hash join build,
+  group-by, binary search tree search, and skip-list insert/search. It notes
+  that coroutine-like programming could automate this style, but a full
+  user-level thread state would carry more redundant state than the compact
+  AMAC entries.
+- Evaluation uses 16-byte key/payload tuples, cache-line-aligned nodes, large
+  pages, hardware counters, and both Intel Xeon x5670 and SPARC T4 systems.
+- For large 2 GB by 2 GB hash joins on Xeon, AMAC reports 4.3x speedup over a
+  no-prefetch baseline on uniform data and about 3x average speedup on skewed
+  cases where group and pipeline prefetching degrade.
+- For group-by, AMAC reports 1.6x average speedup on small skewed inputs and
+  2.6x on larger inputs. For binary-search-tree search, it reports up to 4.45x
+  speedup over baseline. For skip-list search, it reports 1.9x average and
+  2.6x maximum speedup.
+- Scalability is limited by shared memory-system resources. On the tested Xeon,
+  prefetch-based probes level off after about four physical cores; performance
+  counters suggest contention in shared LLC miss-handling resources rather
+  than more off-chip accesses alone.
+
+**GPU DB mapping:** AMAC is a useful lower-level companion to CoroBase and
+Fetch Me If You Can. Coroutines are the maintainable default for hiding CPU
+metadata and cold-index latency, but AMAC shows what a hand-shaped upper-bound
+path looks like when the route is hot enough to justify it: compact per-lookup
+state, bounded in-flight count, explicit stage transitions, and no blocking on
+one slow pointer chain.
+
+For GPU DB, the strongest transferable idea is a bounded CPU metadata
+state-machine lane. Some paths will remain CPU-side even when table payloads
+are GPU-resident: route descriptor lookup, segment-map search, MVCC chain
+header walk, resident-generation validation, host equality indexes, and
+fallback hash joins or grouped lookups. Those paths should not always allocate
+coroutine frames or queue full tasks. A hot route can instead use AMAC-style
+compact state entries that hold only the fields needed to resume after a
+prefetched cache line or far-memory access arrives.
+
+The latch handling maps to owner-domain backpressure. A route that cannot
+acquire a metadata latch, owner token, or per-segment refresh guard should not
+spin in the network or mutation path. It should save its compact state, try
+another compatible request, and later retry under an explicit admission budget.
+This fits the runtime's bounded rings better than blocking one worker on a
+single cold key or contended metadata record.
+
+AMAC also sharpens the recent movement-window synthesis. The in-flight lookup
+count is a resource contract, not a magic constant. GPU DB should tie AMAC or
+coroutine lanes to calibrated fill-buffer/TLB/LLC behavior, route queue depth,
+and memory-tier placement. On a future CXL or remote-memory tier, more in-flight
+metadata walks may help; on a saturated mutation owner or shared LLC, they may
+steal exactly the miss resources needed for visibility publication.
+
+The output-order mechanism is relevant to micro-batched retained reads.
+Same-shape lookup batches can advance out of order through CPU metadata, host
+indexes, or GPU result paths, but the response ring still needs per-request
+ids and stable result scattering. AMAC's row-id field is the small-scale version
+of the request id and response-slot discipline the production runtime needs.
+
+**Risks and mismatches:** AMAC is a CPU software-prefetching paper, not a GPU
+execution paper, an MVCC design, or a SQL runtime. It does not solve
+WAL-before-visibility, snapshot publication, route invalidation, CUDA stream
+scheduling, or PostgreSQL protocol behavior.
+
+The paper's hardware is old. Exact in-flight counts, cache hierarchy behavior,
+prefetch reliability, TLB cost, and shared miss-resource ceilings will differ
+on current AMD, Intel, ARM, and Grace/Hopper systems. The implementation is
+manual and brittle if applied everywhere. GPU DB should reserve AMAC-style
+state machines for a few proven hot paths, with coroutine or direct lookup as
+the default.
+
+Prefetch-heavy execution can also harm other work. The Xeon scaling result is
+a warning that one optimized route can consume shared memory-system resources
+and raise tail latency for mutation publication, response encoding, or other
+CPU fallback work. AMAC admission therefore needs per-worker and per-socket
+budgets, not only per-route speedups.
+
+**Benchmark candidates:**
+
+- Add an AMAC-versus-coroutine metadata probe benchmark for segment-map lookup,
+  MVCC chain header walk, and host equality-index probe. Compare direct lookup,
+  coroutine interleaving, and hand-coded compact state entries. Gate:
+  improvement in p95/p99 under random remote accesses without isolated-request
+  p50 regression.
+- Build a bounded in-flight-count sweep for CPU fallback hash/group lookup:
+  1, 2, 4, 8, 16, and 32 state entries. Measure throughput, p99, TLB misses,
+  LLC miss-resource stalls where available, and interference with mutation
+  owner latency.
+- Prototype try-acquire metadata stages for a contended route-cache or segment
+  refresh guard. Failure condition: a blocked metadata record can still spin a
+  runtime worker or IO worker instead of yielding its state slot.
+- Add result-scattering validation for out-of-order lookup completion in a
+  same-shape retained read batch. Minimum proof: stable per-request results,
+  error propagation, and response ordering under skewed lookup depths.
+- Calibrate AMAC only where queue depth exists. Run isolated urgent reads,
+  shallow queues, and deep queues; enable the state-machine lane only when the
+  observed memory stall and queue depth justify batching.
+- Measure interference with write visibility. Run a read-heavy AMAC metadata
+  lane beside COPY/INSERT publication and retained-snapshot refresh. Failure
+  condition: read throughput gains raise write p99 or snapshot publication
+  latency past the configured admission budget.
