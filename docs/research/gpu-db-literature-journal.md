@@ -52777,3 +52777,174 @@ structure and benchmarks, not assume dual execution is generally safe.
   estimator generation must agree before duplicate execution can race.
   If any frontier differs, the route must choose one authoritative path
   or report an explicit fallback reason.
+
+### 2026-06-05 - NDP: Re-architecting Datacenter Networks and Stacks for Low Latency
+
+**Citation:** Mark Handley, Costin Raiciu, Alexandru Agache,
+Andrei Voinescu, Andrew W. Moore, Gianni Antichi, and Marcin
+Wojcik. "Re-architecting Datacenter Networks and Stacks for Low
+Latency and High Performance." SIGCOMM 2017, pp. 29-42.
+doi:10.1145/3098822.3098825. Retrieved 2026-06-05 from the UCL
+accepted-version PDF,
+`https://discovery.ucl.ac.uk/id/eprint/10068163/1/ndp.pdf`.
+
+**Category:** runtime / HFT / session scale; high-concurrency
+networking and admission.
+
+**Relevance tags:** receiver-driven transport; bounded queues;
+incast control; response scheduling; pull-based admission;
+packet trimming; multipath load balancing; priority traffic;
+tail latency; request/response rings.
+
+**Core idea:** NDP argues that low latency and high throughput in a
+datacenter require the transport, switch service model, and endpoint
+stack to be designed together. Instead of building deep queues,
+waiting for conservative congestion windows, or relying on lossless
+Ethernet pause behavior, NDP uses very shallow switch queues. When a
+data queue overflows, the switch trims packet payloads but forwards
+headers with priority, giving the receiver prompt knowledge of which
+senders have demand. The receiver then paces future data with pull
+packets and can prioritize senders on RTT timescales.
+
+The transferable lesson is not that GPU DB should implement NDP.
+It is that high fan-in request/response systems should make the
+receiver or bottleneck owner the pacing authority. Senders can be
+optimistic for the first small burst, but sustained work must be
+pulled by the component that owns the scarce resource: a response
+ring, mutation owner, GPU execution worker, pinned-buffer pool, HBM
+install path, or network writer.
+
+**Concrete mechanisms:**
+
+- NDP uses per-packet multipath forwarding in Clos networks so short
+  flows are not trapped on one unlucky ECMP path.
+- Switches maintain a low-priority data queue and a high-priority
+  queue for trimmed headers, ACKs, NACKs, and pull packets.
+- When the data queue is full, the switch trims either the arriving
+  packet or the tail data packet with 50% probability, keeping header
+  feedback while breaking phase effects.
+- Weighted round robin between high-priority metadata and data avoids
+  congestion collapse where only headers consume the bottleneck.
+- Senders start optimistically with a full first window because
+  datacenter RTTs and link speeds are bounded and known.
+- Trimmed headers let receivers know exactly which packets were sent
+  even under reordering and incast, avoiding long timeout-based loss
+  ambiguity.
+- Receivers enqueue pull packets for arriving data or headers and
+  pace them from a shared per-interface pull queue at the receiver's
+  link rate.
+- A pull sequence number lets senders transmit the delta in pulled
+  packets and prioritizes retransmissions before new data.
+- The receiver can fair-queue or prioritize pull entries from
+  different senders, which lets it favor stragglers or high-priority
+  work during incast.
+- Path penalties reduce traffic on asymmetric or failing paths when
+  one path observes more NACKs than ACKs.
+- The Linux implementation uses DPDK, a core process mediating NIC
+  access, socket TX/RTX/RX rings, and a dedicated pull-queue thread;
+  switch implementations are shown in software, NetFPGA, and P4.
+- In large simulations, eight-packet queues with 9KB MTU reach more
+  than 95% utilization for the tested permutation traffic matrix.
+- In a 432-node FatTree permutation, NDP reports about 92% utilization
+  and much better fairness than DCTCP/DCQCN single-path schemes in
+  the tested configuration.
+- For 90KB short flows under random background load, the paper reports
+  NDP median and p99 completion times several times lower than DCTCP
+  and MPTCP because NDP keeps standing queues shallow.
+- For 100-to-432-way incasts, receiver pulling keeps last-flow
+  completion close to optimal in the paper's simulations, while
+  priority pulls can accelerate selected straggler traffic.
+- The authors note a real limitation: their host implementation costs
+  CPU for accurate pull pacing and low-latency retransmission, and
+  they expect smart NIC support would be needed for a large deployment.
+
+**GPU DB mapping:** NDP strengthens the case that GPU DB admission
+should be receiver-owned at every scarce boundary. A pgwire session,
+network IO worker, or application client should not be allowed to push
+unbounded work into mutation, read-snapshot, GPU, refresh, response,
+or movement queues. The owner of each queue should grant credits or
+pull work when it has buffer and latency budget, much like NDP's
+receiver pulls packets after seeing demand.
+
+The first-window idea maps to fast SQL admission. A logical session
+can optimistically submit a small bounded request or COPY chunk, but
+larger responses, same-shape read batches, resident refresh chunks,
+and movement tasks should become pull/credit-driven. This gives a
+path toward 1M logical sessions: idle sessions retain cheap protocol
+state, while active sessions compete for explicit request, response,
+pinned-buffer, and GPU-worker credits.
+
+NDP's high-priority header queue is a useful analogy for GPU DB
+control-plane metadata. Invalidations, cancellation, overload
+responses, snapshot release, route-certificate failures, and queue
+credit returns should not sit behind large result payloads or long GPU
+work. They need their own narrow, bounded, higher-priority path so the
+runtime can shed, retry, or retire work quickly.
+
+The incast results map directly to batched responses. Many sessions
+can complete a micro-batched lookup or aggregate at nearly the same
+time, creating a response-ring incast into a small set of network
+writers. The response side should pace by writer/socket readiness and
+per-session credits, not simply dump encoded bytes into unbounded
+queues. When exact response sizes are unknown, response admission
+should reserve a small optimistic budget and require additional pulls
+before large row sets can monopolize buffers.
+
+Finally, NDP's path penalty mechanism resembles route feedback. GPU
+DB can penalize overloaded or failing routes by queue family:
+GPU stream, CPU fallback lane, HBM install path, NVMe cold-tier lane,
+or response writer. The planner can still try multiple route families,
+but admission should quickly stop selecting routes whose recent
+queue-delay or fallback telemetry says they cannot meet the latency
+budget.
+
+**Risks and mismatches:** NDP is a datacenter transport architecture,
+not a database runtime. It assumes switch and endpoint changes such
+as packet trimming, per-packet multipath, DPDK, P4/NetFPGA support,
+and accurate pacing. Ordinary TCP pgwire cannot reproduce those
+mechanisms directly. The strongest GPU DB takeaway is the admission
+shape, not the network protocol.
+
+The design spends CPU in the host stack, especially for pull pacing
+and fast retransmission. GPU DB already has CPU pressure from SQL
+parsing, MVCC, WAL, planning, and response encoding, so a literal
+transport rewrite could hurt before it helps. Also, NDP optimizes
+packet and flow completion, while database requests have transaction
+ordering, visibility, cancellation, SQL errors, row-description
+metadata, cursor state, and WAL-before-visibility requirements that
+cannot be treated as interchangeable packets.
+
+NDP's receiver-driven fairness is only as good as the receiver's
+policy. A GPU DB pull scheduler could starve long scans, refresh, or
+low-priority tenants if it only optimizes short responses. The policy
+must expose fairness, priority, and age limits rather than hiding them
+inside a transport-style queue.
+
+**Benchmark candidates:**
+
+- Add a response-ring incast benchmark: complete one retained
+  micro-batch for 1K, 10K, and 100K logical sessions and compare
+  unbounded response enqueueing with writer-owned response credits.
+  Gate: p99 response latency and memory use remain bounded as
+  simultaneous completions grow.
+- Prototype owner-pulled work admission for one queue family, such as
+  GPU lookup batches or resident refresh chunks. Producers publish
+  demand metadata; the owner pulls only as many items as its buffers
+  and latency budget allow.
+- Split runtime control metadata from payload queues. Cancellation,
+  invalidation, snapshot release, credit return, and overload notices
+  should bypass large row payloads. Failure condition: a full response
+  payload queue delays snapshot retirement or overload reporting.
+- Add a per-session optimistic window: allow a small number of
+  frontend messages or COPY chunks to enter without round-trip credit,
+  then require explicit credits for larger active work. Measure active
+  memory per logical session and admission latency at 100K simulated
+  sessions.
+- Implement route penalties based on queue delay and fallback rate for
+  CPU, GPU, refresh, movement, and response lanes. Proof gate: the
+  planner stops selecting a route family whose recent wait time makes
+  the latency SLO impossible.
+- Stress response fairness with mixed short lookups and large result
+  scans completing together. The scheduler should prioritize short
+  completions without starving large responses beyond an explicit age
+  or byte budget.

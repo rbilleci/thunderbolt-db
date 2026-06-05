@@ -4236,12 +4236,19 @@ Append new candidates here as each paper is processed.
   Why: Homa contrasts sender-side multilevel feedback priority assignment
   against receiver-driven SRPT approximation; useful for GPU DB request and
   response scheduling when exact route size is unknown at admission time.
-- `queued` — **NDP: Re-architecting Datacenter Networks and Stacks for Low
+- `reviewed` — **NDP: Re-architecting Datacenter Networks and Stacks for Low
   Latency**, Handley et al., SIGCOMM 2017.
   URL: `https://doi.org/10.1145/3098822.3098825`
   Why: Homa compares against NDP's receiver-side pulling and bounded queues;
   useful for evaluating how much GPU DB should trade bandwidth utilization for
   low queueing delay at network, response-ring, and owner-ingress boundaries.
+- `queued` — **Presto: Edge-based Load Balancing for Fast Datacenter
+  Networks**, He et al., SIGCOMM 2015.
+  URL: `https://doi.org/10.1145/2785956.2787507`
+  Why: NDP contrasts packet spraying and load-balancing schemes such as Presto;
+  useful for deciding whether GPU DB response/request traffic should rely on
+  route-level spreading, endpoint pacing, or DB-owned admission when short
+  requests collide on shared queues.
 - `reviewed` — **HyBench: A New Benchmark for HTAP Databases**, Zhang et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p939-zhang.pdf`
