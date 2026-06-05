@@ -1185,12 +1185,23 @@ Append new candidates here as each paper is processed.
   tuning problem; useful for turning GPU DB resident index choices into
   explicit memory/latency/update tradeoff policies. Journal entry added
   2026-06-05.
-- `queued` — **UpBit: Scalable In-Memory Updatable Bitmap Indexing**,
+- `reviewed` — **UpBit: Scalable In-Memory Updatable Bitmap Indexing**,
   Athanassoulis et al., SIGMOD 2016.
-  URL: `https://doi.org/10.1145/2882903.2903734`
+  URL: `https://doi.org/10.1145/2882903.2915964`
   Why: FITing-Tree discusses bitmap-index compression as related work; useful
   for comparing delete/update-friendly bitmap summaries against learned
-  key-position models for GPU resident predicate filters.
+  key-position models for GPU resident predicate filters. Journal entry added
+  2026-06-06 using the accessible author PDF:
+  `https://cs-people.bu.edu/mathan/publications/sigmod16-athanassoulis.pdf`.
+- `queued` — **CUBIT: Concurrent Updatable Bitmap Indexing**, Wang and
+  Athanassoulis, PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p399-athanassoulis.pdf`
+  arXiv: `https://arxiv.org/abs/2410.16929`
+  Artifact: `https://github.com/junchangwang/CUBIT`
+  Why: modern concurrent successor to UpBit that adds real-time updates,
+  lightweight snapshotting, wait-free queries, and latch-free consolidation;
+  useful follow-up for GPU DB resident predicate indexes under concurrent
+  mutation and retained snapshot reads.
 - `queued` — **Designing Access Methods: The RUM Conjecture**,
   Athanassoulis et al., EDBT 2016.
   URL: `https://doi.org/10.5441/002/edbt.2016.42`

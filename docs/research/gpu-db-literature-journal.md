@@ -73546,3 +73546,207 @@ metadata rather than a user-facing DDL surface.
   Gate: the fast path must check relation identity, schema generation,
   visibility boundary, and residency invalidation generation before bypassing
   the owner.
+
+### 2026-06-06 - UpBit keeps bitmap filters mutable by separating sparse update state
+
+**Citation:** Manos Athanassoulis, Zheng Yan, and Stratos Idreos.
+"UpBit: Scalable In-Memory Updatable Bitmap Indexing." SIGMOD
+2016, pp. 243-255. doi:10.1145/2882903.2915964. Retrieved
+2026-06-06 from the author PDF at
+`https://cs-people.bu.edu/mathan/publications/sigmod16-athanassoulis.pdf`.
+
+**Category:** multi-tier cache / data placement and query access methods,
+with HTAP indexing relevance.
+
+**Relevance tags:** updatable bitmap index; compressed bitvectors; sparse
+delta state; predicate filters; HTAP freshness; secondary indexes; fence
+pointers; query-driven merge; RUM tradeoff; resident predicate summaries.
+
+**Core idea:** UpBit targets the awkward middle ground where bitmap indexes are
+useful for selective reads, but ordinary compressed bitvectors are expensive to
+update. Read-optimized bitmap indexes pay decode/re-encode cost when bits are
+changed. Update Conscious Bitmaps avoid direct value-bitvector rewrites with
+one existence bitvector, but reads degrade as updates accumulate because the
+global auxiliary bitvector becomes less compressible and must be consulted.
+
+UpBit's transferable idea is to split stable predicate evidence from sparse
+update evidence. For each domain value, the index keeps a compressed value
+bitvector and a separate update bitvector. Reads combine the pair with XOR only
+when the update bitvector is non-empty. Updates touch the update bitvectors for
+the old and new values rather than rewriting the compressed value bitvectors.
+The update bitvectors remain sparse and are merged back into value bitvectors
+when a threshold is crossed, using subsequent reads to absorb the merge work.
+
+The paper reports that, on its synthetic and real-data experiments, UpBit is
+15-29x faster than the update-optimized bitmap baseline for updates, 2.7x
+faster for reads than that same baseline, and 51-115x lower update latency than
+read-optimized in-place bitmap updates, while adding at most about 8% read
+overhead versus the read-optimized bitmap index in the tested mixed workloads.
+The absolute numbers come from a standalone CPU prototype, so the useful claim
+for GPU DB is the shape of the access method rather than a direct throughput
+prediction.
+
+**Concrete mechanisms:**
+
+- For an indexed attribute with `d` domain values, UpBit stores `d` value
+  bitvectors and `d` update bitvectors. The current bit for a row/value is
+  `VB XOR UB`.
+- A per-value update bitvector starts as all zeros, compresses cheaply, and
+  receives only the changes for that value instead of forcing all updates
+  through one global existence bitvector.
+- Exact-match search first finds the domain value's bitvector id. If its
+  update bitvector has no set bits, the value bitvector can be returned
+  directly; otherwise the result is the XOR of the value and update bitvectors.
+- Delete finds the row's current value, then flips the corresponding bit in
+  that value's update bitvector so future reads no longer return the row.
+- Update finds the old value for the row, finds the new value, and flips one
+  bit in each corresponding update bitvector. Insert appends into the update
+  bitvector for the inserted value, using active-word-style padding.
+- Because update and delete need the old value for a row, UpBit adds fence
+  pointers over compressed bitvectors. A fence pointer maps an approximate
+  uncompressed word position to the encoded word containing it, allowing
+  partial decode near the requested row instead of decoding from the beginning.
+- Old-value retrieval scans the value/update bitvector pairs for a row and can
+  be parallelized across bitvectors. The paper's implementation uses C++11
+  threads and a modified FastBit bitvector implementation.
+- Each update bitvector tracks accumulated changes. When a threshold is
+  exceeded, the value/update pair is marked for merge.
+- Merge is query-driven: a later read already computes `VB XOR UB`, so the
+  result is written back as the new value bitvector, fence pointers are rebuilt,
+  and the update bitvector is reset to zeros.
+- Merge decisions happen per domain value. Unlike one global existence
+  bitvector, one hot value can be absorbed without rewriting all value
+  bitvectors.
+- The evaluation studies equality and range predicates, update/delete/insert
+  mixes, data size, cardinality, uniform and Zipfian distributions, Berkeley
+  Earth data, and a TPC-H Q6 variant. It also compares against an optimized
+  multicore/SIMD scan to show that bitmap filtering wins mainly for selective
+  predicates.
+- For range predicates, UpBit still needs bitwise OR across multiple value
+  bitvectors, so the break-even point against scans is lower than for equality
+  predicates with the same selectivity.
+- The paper focuses on serial execution, but notes that one update bitvector
+  per value enables finer-grained locking than a single existence bitvector.
+
+**GPU DB mapping:** UpBit is a useful design pattern for GPU DB resident and
+warm-tier predicate summaries. P8's current first slice builds immutable GPU
+column-group snapshots from CPU MVCC truth. A selective predicate index over
+resident or warm segments should not be forced into either "fully immutable
+until rebuild" or "rewrite compressed bitmap on every update." UpBit suggests a
+middle layer: stable compressed predicate bitmaps plus sparse per-value delta
+bitmaps tied to a visibility or resident generation.
+
+For GPU resident scans, the equivalent would be a segment-local predicate
+summary with `base_bits`, `delta_bits`, and a merge generation. Reads that can
+prove the delta is empty use the base bitmap directly. Reads against a fresh
+retained snapshot combine base and delta masks, possibly on GPU if the mask is
+already resident or small enough to transfer. Mutation owners append or flip
+small delta masks after WAL safety and before publishing a new visibility
+boundary, while background refresh can fold deltas into a new immutable segment
+generation.
+
+The per-value delta structure maps well to low-cardinality columns, status
+flags, partition keys, tenant ids, and selective categorical filters. It is less
+obviously right for high-cardinality learned-index-like point lookups, where
+the number of value bitvectors can dominate. Route metadata should therefore
+carry the access-method shape: equality bitmap, range bitmap, learned key
+model, B-tree/hash fallback, or scan.
+
+Fence pointers are relevant to CPU/warm-tier compressed summaries and maybe
+GPU-host transfer boundaries. A retained route often needs only a row-id range,
+a small segment, or a visibility-ambiguous slice. Fence-pointer-like metadata
+can let the CPU decode or transfer only the words surrounding those rows,
+instead of materializing an entire compressed predicate vector. For GPU
+execution, a similar concept could become per-tile offsets into compressed
+mask blocks so kernels can jump directly to admitted tiles.
+
+Query-driven merge is the most important caution. It is attractive because it
+uses work a read was already doing, but GPU DB cannot let a user read become an
+unbounded maintenance operation on the latency-critical path. The safe mapping
+is bounded opportunistic merge: a read can publish a merge request or perform a
+small capped fold if it already owns the relevant warm/resident buffer budget;
+larger folds should become refresh-owner work with queue telemetry.
+
+**Risks and mismatches:** UpBit is a CPU in-memory access method for bitmap
+indexes, not an MVCC storage engine or GPU execution system. It does not define
+WAL ordering, retained snapshots, concurrent readers/writers, crash recovery,
+GPU residency, DDL invalidation, or compressed device kernels. The paper's
+implementation is standalone and serial for core update semantics, so the
+concurrency note is design intuition rather than evaluated correctness.
+
+The design is most natural for low-cardinality attributes. High-cardinality
+columns create many bitvectors, and old-value retrieval across many values can
+be expensive even with parallelism and fence pointers. Range predicates also
+pay OR cost across multiple value bitvectors, and the paper shows scans win as
+selectivity rises. For GPU DB, bitmap routes should be admitted only when
+selectivity and cardinality are favorable and when the delta merge budget is
+bounded.
+
+There is also an MVCC mismatch. Flipping update bits mutates the index's
+current logical state, while GPU DB must support multiple retained snapshots.
+A production mapping needs generationed delta masks or per-snapshot visibility
+rules; otherwise a flip for a new write could corrupt an older retained read.
+
+**Benchmark candidates:**
+
+- Prototype a segment-local low-cardinality predicate summary with
+  `base_bitmap`, `delta_bitmap`, and generation metadata. Gate: retained reads
+  before and after insert/update/delete return identical results to CPU MVCC
+  visibility checks.
+- Compare three refresh strategies for resident predicate masks: full rebuild
+  on every mutation, sparse delta mask plus periodic fold, and no bitmap
+  route/CPU fallback. Measure write latency, read p50/p99, resident bytes, and
+  refresh queue pressure.
+- Add a selectivity/cardinality route gate for bitmap filters. Failure
+  condition: bitmap route is chosen when a vectorized CPU scan or resident GPU
+  scan is faster for high-selectivity predicates.
+- Test per-tile fence metadata for compressed predicate masks. Measure partial
+  decode latency, transferred bytes, and GPU kernel setup overhead versus
+  decoding the whole bitvector.
+- Add a bounded query-driven merge experiment: reads may fold at most `N`
+  dirty words or enqueue a refresh-owner merge request. Gate: p99 read latency
+  does not spike when one hot value crosses the merge threshold.
+- Benchmark low-cardinality categorical filters such as tenant/status/region
+  against learned or sorted key-vector routes. The goal is to decide where
+  update-friendly bitmaps beat model-guided resident lookup.
+- Add a retained-snapshot delta test with two live snapshots and interleaved
+  updates. Failure condition: folding a delta for the newest generation changes
+  the result of an older retained snapshot.
+
+### 2026-06-06 - Cross-paper synthesis: fast routes need private formats plus publication proof
+
+LiquidCache, ShardingSphere, and UpBit converge on one design track: a fast
+route should carry its own physical evidence, not just a logical SQL plan.
+LiquidCache adds a cache-private format for pushdown; ShardingSphere turns SQL
+routing, rewrite, execution units, and merge mode into explicit metadata; UpBit
+keeps mutable predicate evidence in sparse per-value update structures instead
+of rewriting the base compressed representation on every change.
+
+For GPU DB, that points toward three route artifacts that should be measured
+together. First, a route certificate should declare the relation generation,
+snapshot boundary, resident or warm-tier format, predicate family, expected
+selectivity, required buffers, merge mode, and fallback path. Second, each tier
+should be allowed to use a private physical format as long as durable CPU/WAL
+truth remains authoritative and invalidation is explicit. Third, mutable
+accelerators should publish with generationed proof: sparse deltas, cache
+transcodes, resident snapshots, and route metadata cannot bypass
+WAL-before-visibility or retained-snapshot compatibility.
+
+The biggest category gap remains concurrent update behavior for accelerated
+indexes. UpBit gives a serial sparse-delta shape, but the next high-value paper
+should be a modern concurrent bitmap/index or MVCC access-method paper, such as
+CUBIT, unless balance needs pull the queue back toward runtime admission.
+
+Benchmark priorities:
+
+- Route-certificate validation for retained reads, including snapshot,
+  residency generation, predicate support, output encoding, resource budget,
+  and explicit fallback reason.
+- Warm/resident private-format benchmarks: raw CPU tuple scan, encoded warm
+  pushdown, sparse bitmap delta route, GPU resident scan, and CPU fallback under
+  the same visibility workload.
+- Generationed sparse-delta predicate indexes for low-cardinality columns, with
+  retained-snapshot correctness under interleaved writes.
+- Merge-mode benchmarks that separate stream merge, memory merge, aggregate
+  merge, and response encoding so route plans cannot hide fanout or buffering
+  costs.
