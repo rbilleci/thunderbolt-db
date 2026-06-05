@@ -4982,13 +4982,25 @@ Append new candidates here as each paper is processed.
   Why: storage-device mismatch work points to crash-consistent NVMe paths;
   useful for separating durable ordering constraints from unnecessary
   synchronous queue-depth-1 IO in future WAL/checkpoint routes.
-- `queued` — **Barrier-Enabled IO Stack for Flash Storage**, Won et al.,
+- `reviewed` — **Barrier-Enabled IO Stack for Flash Storage**, Won et al.,
   FAST 2018.
   URL: `https://www.usenix.org/conference/fast18/presentation/won`
   PDF: `https://www.usenix.org/system/files/conference/fast18/fast18-won.pdf`
   Why: Horae contrasts its multi-queue/multi-device control/data split with
   BarrierFS; useful for comparing fbarrier-style ordering without durability
   against GPU DB WAL, checkpoint, and cold-tier publication boundaries.
+- `queued` — **Application Crash Consistency and Performance with CCFS**,
+  Pillai et al., FAST 2017.
+  URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/pillai`
+  Why: BarrierFS contrasts its block/device-level ordering with CCFS-style
+  application crash-consistency mechanisms; useful for deciding whether GPU DB
+  should expose route-level ordering groups above WAL/checkpoint IO.
+- `queued` — **SpanFS: A Scalable File System on Fast Storage Devices**,
+  Kang et al., USENIX ATC 2015.
+  URL: `https://www.usenix.org/conference/atc15/technical-session/presentation/kang`
+  Why: BarrierFS names SpanFS as a multi-transaction journaling approach on
+  fast storage; useful for comparing partitioned commit lanes with GPU DB
+  owner-domain WAL and checkpoint queues.
 - `reviewed` — **Generic Version Control: Configurable Versioning for
   Application-Specific Requirements**, Yilmaz and Dittrich, CIDR 2025.
   URL:

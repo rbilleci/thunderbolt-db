@@ -65871,3 +65871,199 @@ metadata, not durable truth.
   no rebuild, notice active, base generation, delta generation, and fallback
   reason. Failure condition: a strong read waits indefinitely or silently uses
   a stale derived base when the CPU truth has advanced.
+
+### 2026-06-05 - BarrierFS separates storage order from durability waits
+
+**Citation:** Youjip Won, Jaemin Jung, Gyeongyeol Choi, Joontaek Oh,
+Seongbae Son, Jooyoung Hwang, and Sangyeun Cho. "Barrier-Enabled IO Stack for
+Flash Storage." FAST 2018, pp. 211-226. Retrieved 2026-06-05 from the USENIX
+publication page and PDF,
+`https://www.usenix.org/conference/fast18/presentation/won` and
+`https://www.usenix.org/system/files/conference/fast18/fast18-won.pdf`.
+
+**Category:** multi-tier cache / data placement; transaction processing /
+write path; runtime / HFT / session scale.
+
+**Relevance tags:** storage ordering; WAL; checkpointing; NVMe/flash;
+barrier writes; queue depth; fsync latency; durable publication; commit
+pipelines; ordered async IO; cold-tier IO owners.
+
+**Core idea:** BarrierFS argues that modern flash storage loses most of its
+parallelism when software enforces write ordering by issuing a write, waiting
+for DMA transfer, flushing, and only then issuing the next dependent write.
+The paper separates two properties that are often bundled together:
+persist-order control and durability completion. If the storage stack can
+preserve order through cache-barrier-aware commands, ordered priority
+dispatch, and epoch-aware scheduling, applications can express "A must become
+durable before B" without forcing every boundary to become a synchronous
+flush boundary.
+
+The reported performance lesson is sharp for database write paths. In the
+paper's 4 KB random-write experiment, transfer-and-flush drops ordered-write
+throughput to a tiny fraction of orderless flash throughput, while barrier
+writes retain most of the available queue depth. At the application layer,
+BarrierFS improves SQLite and MySQL-style workloads by replacing unnecessary
+ordering fsyncs with lighter barrier calls when durability can be relaxed.
+The transferable claim is not the absolute throughput of their kernel and
+firmware prototype; it is that ordering, durability, and queue-drain policy
+should be separate contracts.
+
+**Concrete mechanisms:**
+
+- The paper names four IO orders: filesystem issue order, block-layer dispatch
+  order, storage transfer-completion order, and persist order. Traditional
+  transfer-and-flush makes them line up by serializing the path.
+- BarrierFS introduces order-preserving writes and barrier writes. A barrier
+  write delimits an epoch: writes inside an epoch may be reordered, but the
+  relative order across barrier boundaries must be preserved.
+- The block layer uses an epoch-based IO scheduler. It stops accepting new
+  order-preserving requests when a barrier enters the queue, allows ordinary
+  scheduling and merging inside the epoch, then reassigns the barrier flag to
+  the last order-preserving request dispatched from that epoch.
+- Order-preserving dispatch uses SCSI ordered command priority so a barrier
+  write is transferred after earlier queued commands and before later simple
+  commands, avoiding a wait for the previous DMA transfer to complete before
+  issuing the next request.
+- The storage device side uses a cache barrier command or equivalent barrier
+  write flag so data transferred before the barrier is persisted before data
+  transferred after it.
+- The paper discusses several device-side implementations: power-loss
+  protected writeback cache, in-order writeback, transactional writeback, or
+  log-structured in-order recovery. Their UFS prototype uses firmware that
+  treats the device as log structured for recovery ordering.
+- BarrierFS adds `fbarrier()` and `fdatabarrier()`. They mirror `fsync()` and
+  `fdatasync()` in the blocks they synchronize, but return after ordering is
+  established rather than after the data is durable.
+- Dual-mode journaling splits journal commit into a commit thread that
+  dispatches ordered journal writes and a flush thread that performs durability
+  waits only when the caller asked for durability.
+- Journal data/descriptor and commit blocks are written as ordered epochs, so
+  multiple journal transactions can be in flight while still preserving commit
+  order.
+- Multi-transaction page conflicts are tracked through a conflict-page list,
+  avoiding a full scan of all committing transactions before a running
+  transaction can safely commit.
+- CrashMonkey tests in the paper report that BarrierFS passed the tested
+  crash-consistency workloads for both durability and ordering-only modes,
+  while EXT4 with `nobarrier` failed some ordering-only cases.
+- The evaluation is kernel/filesystem/storage-stack work, not DBMS WAL code;
+  the barrier storage device support is a modified UFS firmware plus modeled
+  assumptions for SSDs without that firmware.
+
+**GPU DB mapping:** This is directly relevant to GPU DB's WAL, checkpoint,
+and cold-tier publication path. The runtime should not treat every route
+boundary as "flush and wait" if the only required property is "these writes
+must become durable before those writes can be published." WAL-before-
+visibility still requires a durability proof before a committed SQL result is
+acknowledged, but many adjacent boundaries are ordering boundaries rather than
+acknowledgment boundaries: checkpoint metadata after data pages, manifest
+records after segment writes, resident-generation metadata after cold-tier
+blocks, or archive index updates after WAL segment creation.
+
+The epoch idea maps cleanly to owner-domain IO queues. A WAL/checkpoint owner
+can group writes into dependency epochs such as `wal_record_epoch`,
+`checkpoint_data_epoch`, `checkpoint_manifest_epoch`, and `resident_publish_epoch`.
+The route certificate or storage command should say whether a boundary needs
+ordering, durability, or both. That gives the benchmark harness a way to
+compare conservative `fdatasync` after every boundary against grouped write
+epochs with one durable publication wait at the point SQL semantics require.
+
+BarrierFS also reinforces the recent Horae and storage-mismatch entries:
+queue depth is a correctness-adjacent performance resource. A design that
+preserves WAL order by draining NVMe queues to depth one can be correct but
+leave most device throughput unused. GPU DB should make the cold-tier IO owner
+measure queue depth, ordered epoch size, flush count, bytes per durable
+publication, and time spent waiting for transfer versus waiting for flush.
+
+The ordering-only API is not directly user-visible for SQL commits, but it is
+useful internally. A resident refresh can write derived segment files or
+metadata in ordered epochs, then publish the resident generation only after the
+CPU/WAL truth and required manifest boundary are durable. Similarly, an async
+checkpoint can enforce data-before-manifest and manifest-before-control-file
+ordering while letting background IO stay deep.
+
+**Risks and mismatches:** GPU DB cannot rely on BarrierFS APIs or cache
+barrier firmware being available on ordinary Linux/NVMe deployments. Current
+portable code should assume `fsync`, `fdatasync`, `pwrite`, `io_uring`, and
+device flush/FUA semantics, then benchmark platform-specific improvements
+only behind a capability gate.
+
+The paper deliberately supports ordering-only calls that do not guarantee
+durability. That is not acceptable for SQL commit acknowledgment or WAL-before-
+visibility publication unless another durable boundary has already completed.
+Ordering-only should be used for internal dependency graph shaping, never as a
+substitute for the durable commit point.
+
+Filesystem journaling is not database WAL. The paper does not specify MVCC,
+transaction isolation, replay idempotence, group commit, torn database log
+records, or GPU resident cache invalidation. It also uses a short FAST paper
+format and a modified UFS firmware, so some storage-device behavior is not
+deployable as-is.
+
+**Benchmark candidates:**
+
+- Add WAL/checkpoint IO telemetry that separates write issue time, transfer
+  wait, flush wait, queue depth, epoch bytes, and durable publication latency.
+  Gate: current behavior remains unchanged while the measurements expose where
+  ordering is paid.
+- Build a checkpoint ordering benchmark with three policies: `fdatasync` after
+  every data file boundary, grouped data writes plus one manifest flush, and
+  capability-gated ordered epochs. Required proof: crash recovery never trusts
+  a manifest whose data boundary is missing.
+- Add a WAL group-commit experiment that varies epoch size and flush cadence
+  while preserving commit acknowledgment only after durable WAL. Measure write
+  throughput, p50/p99 commit latency, queue depth, and abort/fallback behavior
+  under COPY and hot-key OLTP mixes.
+- For resident refresh, model derived-state publication as ordered epochs:
+  segment bytes, segment metadata, generation manifest, route publication.
+  Failure condition: a strong retained read can observe a resident generation
+  whose source boundary is not durable and replayable.
+- Compare synchronous invalidation metadata writes against ordered async
+  invalidation plus durable publication before acknowledgment. Gate: stale GPU
+  routes are impossible after crash/replay and during delayed refresh.
+- Add a cold-tier IO owner benchmark that intentionally keeps NVMe queue depth
+  above one while preserving dependency epochs. Failure condition: preserving
+  order collapses queue depth to one for long stretches unless the operation
+  truly needs a flush.
+- Test platform capability detection for flush/FUA/barrier-like semantics.
+  The planner/storage layer should report when it is using portable flush-only
+  ordering versus an optimized device path.
+
+### 2026-06-05 - Cross-paper synthesis: route boundaries need three proofs
+
+FITing-Tree, CCaaS, Deuteronomy 2.0, and BarrierFS converge on the same
+architectural pressure: a fast path should not be admitted because it is merely
+"cached" or "batched." It needs three separate proofs. First, a cost proof:
+the route can explain its memory, queue, and refinement budget. Second, a
+visibility proof: the route knows which generation, read set, write set, or
+snapshot boundary it is serving. Third, a publication proof: the data or
+metadata it depends on has crossed the right ordering and durability boundary.
+
+For GPU DB, this means route certificates should grow toward a compact
+contract rather than a Boolean eligibility flag. A retained lookup route might
+name its FITing-style error window, resident bytes, delta generation, delete
+bitmap density, conflict-owner generation, and durable source boundary. A
+write route might name conflict metadata saturation, deterministic winner
+policy, WAL epoch, and resident-invalidation publication state. A refresh
+route might name whether its derived base is stable, delta-backed, under a
+rebuild notice, or waiting for an ordered manifest boundary.
+
+The category gap after these papers is not "more GPU scan kernels." The queue
+needs continued work on recovery/checkpoint algorithms, partition movement,
+and practical index update atomicity. Those are the pieces that decide whether
+GPU-resident acceleration remains a replayable cache or accidentally becomes
+an under-specified second source of truth.
+
+**Benchmark priorities:**
+
+- Route-certificate coverage: every GPU, CPU fallback, write, checkpoint, and
+  refresh route reports cost, visibility, and publication fields.
+- Publication-boundary tests: delay WAL flush, checkpoint manifest flush,
+  resident refresh, and index rebuild independently; strong reads and commits
+  must choose wait, fallback, reject, or acknowledge according to the proof.
+- Recovery pressure: replay after crashes at each publication boundary and
+  verify CPU truth, route metadata, and resident acceleration rebuild in the
+  intended order.
+- Hot-key/write batching: compare deterministic conflict-owner epochs against
+  simple arrival-order mutation while measuring abort storms, fairness, and
+  resident invalidation work avoided.
