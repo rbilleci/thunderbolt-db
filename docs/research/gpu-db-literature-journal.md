@@ -51669,3 +51669,136 @@ route estimates for admission, calibrated CPU metadata prefetching for lookup,
 and dependency markers for hot-key retry. The proof gate is not peak throughput
 alone; it is replay-equivalent WAL, deterministic visibility, bounded p99, and
 clear fallback when the active-window certificate cannot be proven.
+
+### 2026-06-05 - CPU prefetching needs fill-buffer and TLB budgets, not folklore
+
+**Citation:** Roland Kuehn, Jan Muhlig, and Jens Teubner. "How to Be Fast and
+Not Furious: Looking Under the Hood of CPU Cache Prefetching." DaMoN 2024.
+doi:10.1145/3662010.3663451. Retrieved 2026-06-05 from the TU Dortmund author
+PDF,
+`https://dbis.cs.tu-dortmund.de/storages/dbis-cs/r/papers/2024/sw-prefetching-survey/sw-prefetching.pdf`.
+
+**Category:** runtime / HFT / session scale; multi-tier cache / data placement.
+
+**Relevance tags:** software prefetching; CPU metadata lookup; future-tier
+latency; TLB misses; line fill buffers; B+tree node layout; coroutine
+interleaving; hardware-aware admission.
+
+**Core idea:** The paper treats software prefetching as a bounded hardware
+resource problem instead of a generic "add prefetch hints" optimization.
+Prefetches can hide random-access memory latency, especially on newer CPUs, but
+they are constrained by synchronous address translation and by the small number
+of pending L1 miss slots in the line fill buffer (LFB), or AMD's analogous miss
+address buffer. If a database route issues too many prefetches at once, the
+prefetch instructions themselves can stall or be dropped before they help the
+actual lookup.
+
+The paper's useful design message is that prefetch distance and granularity must
+be calibrated per hardware class and per data structure. In a B+tree experiment,
+a coroutine-prefetched tree with 256-byte nodes outperformed the best ordinary
+B+tree by 2.25x on the Cascade Lake test system, while 4 KiB prefetched nodes
+fell below the baseline because prefetching a whole node overflowed the LFB.
+Modern AMD platforms tolerated larger nodes better, which reinforces the same
+point: the safe prefetch envelope is hardware-specific.
+
+**Concrete mechanisms:**
+
+- A software prefetch first translates the virtual address. If the TLB lacks the
+  translation, the prefetch instruction waits for a page-table walk before it
+  can enqueue the cache-line request.
+- Once translation succeeds, the data transfer is asynchronous through the LFB
+  on Intel or MAB on AMD. The CPU can continue only while there is capacity for
+  pending miss requests.
+- The paper measures about 60 extra cycles for a single random cache-line
+  prefetch with ordinary 4 KiB pages on Cascade Lake, mostly tied to translation
+  stalls. Huge pages remove most of that overhead.
+- LFB capacity is small: the paper discusses 10-entry Intel generations,
+  16-entry newer Intel designs, and up to 24 MAB entries on modern AMD. Bursting
+  more prefetched cache lines than the structure can hold causes stalls.
+- Software and hardware prefetchers interact. Prefetching the first subset of a
+  larger block can train hardware prefetchers to fetch the remaining sequential
+  cache lines, avoiding the need to software-prefetch the full block.
+- Prefetch instruction choice matters. The paper finds that L2-directed
+  `prefetcht1` can reduce latency penalties in some block-prefetch cases because
+  it interacts differently with L1/L2 hardware prefetchers than L1-directed
+  hints.
+- Coroutine interleaving creates the needed time gap between discovering a
+  pointer and using it. The evaluated Bcoro-tree suspends after prefetching the
+  successor node so other lookup coroutines can run while memory is fetched.
+- SMT can make the LFB constraint worse because logical threads share fill
+  resources on the same physical core. A prefetch plan that works alone may
+  degrade when sibling threads run similar memory-stall-heavy work.
+
+**GPU DB mapping:** This is a direct calibration layer for the AMAC and
+CoroBase journal entries. GPU DB should treat CPU-side stall hiding as a
+route-owned lane with explicit hardware budgets. Candidate CPU hot paths include
+route metadata lookup, resident segment-map traversal, CPU fallback equality
+indexes, MVCC version headers, visibility-summary maps, and future CXL or
+remote-memory metadata. Each path needs a declared prefetch unit size, in-flight
+state count, page size assumption, and sibling-thread policy before it becomes a
+production optimization.
+
+For P8, the paper argues against blindly adopting 4 KiB or storage-shaped
+nodes for host-side warm indexes and metadata if those nodes will be traversed
+through coroutine or AMAC-style prefetching. A larger page can reduce tree
+depth, but a smaller prefetchable node or split metadata/data layout may win
+when the route is latency-bound and random. Resident GPU column groups still
+need GPU-shaped layouts, but the CPU structures that feed them should be shaped
+for the CPU miss resources they actually consume.
+
+For 1M logical sessions, prefetching is not a free way to hide all parked-session
+or active-route latency. A runtime worker that admits too many coroutine lookups
+can saturate shared LFB/TLB resources and harm mutation publication, response
+encoding, or other CPU fallback work. Prefetch-capable lanes should therefore
+have queue-depth gates and per-core active-state budgets just like GPU kernels
+have scratch and stream budgets.
+
+The software/hardware prefetcher interaction is a useful middle ground for
+future-tier scans. For scattered leaf pages or warm column chunks that contain a
+small sequential region, the route can prefetch only the first few cache lines
+and let hardware prefetchers take over. That suggests measuring prefetch seed
+count separately from total bytes touched instead of treating a page as either
+fully prefetched or not prefetched.
+
+**Risks and mismatches:** The paper is a microarchitectural characterization
+study, not a database concurrency-control or GPU execution paper. It does not
+address WAL-before-visibility, MVCC correctness, snapshot publication, CUDA
+execution, SQL planning, or pgwire response behavior.
+
+The detailed numbers come mostly from single-threaded microbenchmarks and a
+single-threaded B+tree lookup experiment, with emphasis on a Cascade Lake system
+for counter visibility. The absolute cycle counts and best node sizes may be
+wrong on the eventual GPU DB host, especially with different Intel, AMD, ARM,
+CXL, NUMA, or Grace-class memory systems. Huge pages reduce translation stalls
+but also introduce operational and fragmentation tradeoffs not evaluated here.
+
+Prefetching can also become negative under low queue depth, urgent single
+requests, SMT interference, or mixed workloads where mutation owners need the
+same miss resources. The engine should never bake in one prefetch distance or
+node shape without local measurement and fallback.
+
+**Benchmark candidates:**
+
+- Extend the AMAC/coroutine metadata probe with hardware-budget telemetry:
+  in-flight state count, prefetches per state, TLB misses, huge-page on/off,
+  LFB/full-stall counters where available, and sibling-thread interference.
+  Gate: improved p95/p99 under random metadata access without hurting isolated
+  p50 or mutation-owner publication latency.
+- Compare CPU host-index node sizes for a future warm equality/range index:
+  256 B, 512 B, 1 KiB, and 4 KiB nodes under direct lookup, coroutine prefetch,
+  and AMAC-style state machines. Failure condition: a prefetchable design wins
+  microbenchmarks but loses mixed read/write latency.
+- Add a prefetch seed-count sweep for warm column or leaf-page scans: prefetch
+  only the first 1, 2, 4, 8, or 12 cache lines and measure whether hardware
+  prefetchers handle the rest. Required metrics: CPU cycles, cache misses,
+  queue wait, and bytes actually consumed by the route.
+- Test a per-core active-prefetch budget in the runtime simulator. Admit only
+  `N` CPU metadata lookup states per physical core while retaining separate GPU
+  and mutation budgets. Expected result: lower p99 under mixed CPU fallback and
+  retained-read pressure.
+- Run the same benchmark with SMT enabled and disabled or with sibling workers
+  pinned apart. Failure condition: prefetch-heavy retained routes quietly steal
+  miss resources from write publication or response encoding.
+- Treat huge pages as a measured policy, not a default. Compare 4 KiB and huge
+  page allocation for route metadata and host indexes, including allocation
+  overhead, memory waste, TLB behavior, and invalidation/refresh interaction.

@@ -4072,12 +4072,26 @@ Append new candidates here as each paper is processed.
   Why: CXL Memory Performance points to software prefetching for random
   high-latency memory accesses; useful for deciding whether cold host indexes,
   far-memory B+trees, and route metadata can hide CXL/future-tier latency.
-- `queued` — **How to Be Fast and Not Furious: Looking Under the Hood of CPU
+- `reviewed` — **How to Be Fast and Not Furious: Looking Under the Hood of CPU
   Cache Prefetching**, Kuhn, Muhlig, and Teubner, DaMoN 2024.
   URL: `https://doi.org/10.1145/3662010.3663451`
+  PDF:
+  `https://dbis.cs.tu-dortmund.de/storages/dbis-cs/r/papers/2024/sw-prefetching-survey/sw-prefetching.pdf`
   Why: Fetch Me If You Can builds on this CPU-prefetch characterization work;
   useful for turning coroutine, AMAC, and state-machine prefetching into
   hardware-calibrated route policies instead of hard-coded prefetch distances.
+- `queued` — **APT-GET: Profile-guided Timely Software Prefetching**, Jamilan
+  et al., EuroSys 2022.
+  URL: `https://doi.org/10.1145/3492321.3519583`
+  Why: How to Be Fast and Not Furious points to profile-guided prefetch timing
+  as a way to adapt prefetch distance to workload and hardware; useful for
+  calibrating CPU metadata, host-index, and future-tier lookup lanes.
+- `queued` — **FetchBench: Systematic Identification and Characterization of
+  Proprietary Prefetchers**, Schluter et al., CCS 2023.
+  URL: `https://doi.org/10.1145/3576915.3623124`
+  Why: How to Be Fast and Not Furious depends on undocumented hardware
+  prefetcher behavior; useful for deciding which route-prefetch assumptions
+  require local hardware characterization before production use.
 - `reviewed` — **Databases in the Era of Memory-Centric Computing**, Chronis
   et al., CIDR 2025.
   URL:
