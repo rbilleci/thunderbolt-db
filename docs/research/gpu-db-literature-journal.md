@@ -68083,3 +68083,167 @@ SQL results.
 - Compare one global epoch barrier with partition-local sparse epoch chains
   for hot and cold partitions. Expected win: cold partitions avoid metadata
   churn while hot partitions still batch WAL, visibility, and refresh.
+
+### 2026-06-05 - Ultra Ethernet makes fabric flow control a route contract
+
+**Citation:** Torsten Hoefler, Karen Schramm, Eric Spada, Keith
+Underwood, Cedell Alexander, Bob Alverson, Paul Bottorff, Adrian
+Caulfield, Mark Handley, Cathy Huang, Costin Raiciu, Abdul Kabbani,
+Eugene Opsasnick, Rong Pan, Adee Ran, and Rip Sohan. "Ultra
+Ethernet's Design Principles and Architectural Innovations."
+arXiv:2508.08906v1, 2025. Retrieved 2026-06-05 from arXiv,
+`https://arxiv.org/abs/2508.08906`.
+
+**Category:** runtime / HFT / session scale; high-concurrency
+networking and admission; future accelerator fabrics.
+
+**Relevance tags:** connectionless transport; millions of endpoints;
+packet spraying; entropy values; reliable unordered delivery;
+out-of-order placement; packet trimming; fast loss detection; ECN/RTT
+congestion control; receiver credits; destination flow control;
+deferrable send; fabric endpoint addressing; response-ring admission.
+
+**Core idea:** Ultra Ethernet (UE) is a new Ethernet-based transport
+standard for AI/HPC backend networks. The paper is a specification
+overview by UE authors, not a database system paper, but its transport
+shape is directly relevant to a GPU DB that may eventually serve very
+large session counts through gateway workers, accelerator fabrics, or
+remote GPU/storage tiers.
+
+The strongest transferable idea is that the network fast path should
+not pretend every client or peer owns a heavyweight connection. UE
+separates semantic addressing, packet delivery, congestion management,
+and security; uses connectionless addressing to logical endpoint
+resources; creates packet-delivery contexts on first packet arrival;
+allows reliable unordered delivery with out-of-order writes into
+destination buffers; and treats flow control as a negotiated, measured
+property of endpoint pairs. That maps cleanly to GPU DB's target
+runtime: many logical sessions should flow through bounded resource
+contexts and route certificates, not through one thread or one mutable
+queue per session.
+
+**Concrete mechanisms:**
+
+- UE addresses work through Fabric Endpoints, JobIDs, per-endpoint
+  process identifiers, and resource indexes. Absolute addressing can
+  target fixed services such as storage or microservices without a
+  source-side queue-pair-like connection.
+- Packet Delivery Contexts are ephemeral reliability contexts. The
+  first packet can carry enough state to establish a context at the
+  target, while the sender can continue sending at full rate during
+  establishment.
+- Reliable Unordered Delivery is the default bulk mode. Packets can
+  arrive out of order and the transport tracks completion with packet
+  sequence numbers, cumulative ACKs, SACK bitmaps, and bounded maximum
+  PSN ranges.
+- UE exposes Entropy Values so senders can vary ECMP path selection
+  per packet. Oblivious spraying spreads packets statistically across
+  paths; path-aware schemes can use ECN marks, trimmed-packet NACKs,
+  or returned entropy values to avoid bad paths.
+- Packet trimming is an optional switch feature: a congested switch can
+  drop payload but forward headers so the receiver detects loss quickly
+  and requests retransmission without waiting for a long timeout.
+- UE distinguishes congestion, corruption, and configuration drops.
+  It also describes out-of-order-count and entropy-based loss detection
+  as alternatives to pure timeout-based retransmission.
+- Congestion control is per Congestion Control Context, typically
+  shared by all PDCs for the same traffic type between two endpoints.
+  The sender's window bounds unacknowledged bytes in flight.
+- Network Signal-based Congestion Control combines fast ECN signals
+  with slower RTT measurements. Receiver Credit-based Congestion
+  Control lets the receiver assign sender credits when incast or local
+  destination pressure is the main problem.
+- Destination Flow Control separately throttles senders when the
+  receiver, local memory, or local bus cannot absorb incoming packets
+  even if the fabric itself has capacity.
+- Large unexpected messages can use deferrable send: the receiver can
+  tell the sender to pause, remember restart tokens, and resume when
+  the matching receive buffer is posted. This removes fragile timeout
+  tuning from a common receiver-not-ready path.
+- UE is designed primarily for 400+ Gbps backend networks with medium
+  length links and relatively large messages. The paper explicitly
+  notes that frontend and very small-packet local networks would
+  optimize different tradeoffs.
+- The paper is descriptive and architectural. It reports design
+  rationale and points to related simulation papers such as SMaRTT, but
+  it does not provide a DBMS workload evaluation.
+
+**GPU DB mapping:** GPU DB's 1M logical-session target should model
+sessions more like UE resource-addressed transactions than durable
+thread/connection objects. Network IO workers can map many pgwire
+clients onto a smaller set of ingress contexts: session id, route id,
+response ring, command resource index, and admission credits. The
+runtime should then meter bytes, outstanding responses, and destination
+buffer pressure per route class rather than per OS thread.
+
+Reliable unordered delivery is a useful mental model for response
+rings. SQL results must preserve message order within a session, but
+the internal work fragments do not have to complete in FIFO order if
+each fragment carries request id, session epoch, portal/statement
+generation, and result-slot metadata. That suggests a benchmark where
+same-shape retained reads can scatter into preallocated response slots
+out of order, while the session writer publishes only the ordered
+frontend stream.
+
+UE's packet spraying maps to multi-gateway and multi-GPU response
+placement. If future GPU DB has several IO workers, gateways, GPUs, or
+remote tiers, a route certificate should expose whether the request
+needs in-order handling, can be unordered and idempotent, or can be
+sprayed across equivalent workers. In-order SQL protocol bytes, COPY
+stream chunks, idempotent retained reads, and refresh fragments deserve
+different routing modes instead of one generic queue.
+
+The congestion-control split is also a runtime design hint. Queue depth
+alone is too late and too local. GPU DB should combine fast local
+signals, such as response-ring free slots, pinned-buffer credits, GPU
+execution queue depth, and mutation-owner lag, with slower signals,
+such as p99 RTT, client write-back pressure, and fallback rate.
+Receiver-credit-like admission is especially attractive for incast:
+many sessions requesting the same hot retained snapshot should receive
+explicit credits from the response/GPU owner rather than all entering
+the hot path at once.
+
+Destination Flow Control maps to GPU/host memory pressure. A network
+path can be healthy while the destination cannot absorb D2H results,
+pinned staging buffers, or encoded pgwire bytes. Route admission should
+therefore include destination buffer credits separately from network or
+GPU execution credits.
+
+**Risks and mismatches:** UE is a transport standard for AI/HPC backend
+networks, not a DBMS runtime and not a benchmarked GPU database design.
+It targets relatively large backend messages over 400+ Gbps Ethernet;
+pgwire has many small request/response messages and strong per-session
+ordering requirements. Packet spraying and reliable unordered delivery
+may be unavailable on ordinary client networks, and UE 1.0 products and
+operational behavior are still emerging. The paper abstracts away many
+details into the 562-page specification and does not provide database
+latency numbers. GPU DB should treat UE as a design vocabulary for
+future gateway/fabric work, while keeping the first production runtime
+portable on ordinary TCP and explicit bounded queues.
+
+**Benchmark candidates:**
+
+- Add a logical-session admission benchmark with fixed IO workers and
+  resource-index-like session contexts. Measure memory per logical
+  session, p50/p99 request latency, response-ring pressure, and reject
+  reasons at 10K, 100K, and synthetic 1M parked sessions.
+- Prototype receiver-credit admission for hot retained reads: GPU or
+  response owners grant credits based on queue slots, pinned-buffer
+  budget, and D2H/result bytes. Compare against queue-depth-only
+  admission under incast to one retained snapshot.
+- Build an out-of-order internal completion benchmark: compatible reads
+  scatter results into request slots as they finish, while the session
+  writer emits ordered protocol responses. Failure condition: any
+  session observes reordered frontend messages or stale snapshot data.
+- Add route classes for `ordered`, `unordered-idempotent`, and
+  `unordered-retryable` internal fragments. Gate: only idempotent or
+  generation-guarded refresh/read fragments may use unordered retry.
+- Track a destination-flow-control metric set: response-ring free
+  slots, pinned bytes, encoded-result bytes, socket write backlog,
+  D2H queue depth, and GPU scratch pressure. Admission must be able to
+  reject or delay because the destination is full even when CPU/GPU
+  execution capacity remains.
+- For future multi-gateway experiments, simulate entropy-style request
+  placement across IO workers or GPU execution owners. Required
+  metrics: per-worker imbalance, tail latency, moved bytes, reorder
+  stalls, and correctness against session/request generations.

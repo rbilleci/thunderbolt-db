@@ -3705,12 +3705,13 @@ Append new candidates here as each paper is processed.
   datacenter schemes; useful for deciding whether GPU DB admission should
   combine delay, queue-depth, and optional explicit notification signals. The
   queued FASTFLOW title now resolves to the SMaRTT arXiv paper.
-- `queued` — **Ultra Ethernet's Design Principles and Architectural
+- `reviewed` — **Ultra Ethernet's Design Principles and Architectural
   Innovations**, Hoefler et al., arXiv 2025.
   URL: `https://arxiv.org/abs/2508.08906`
   Why: SMaRTT positions itself as the basis for UEC NSCC; the broader UEC
   design may inform future GPU DB transport assumptions, multipath routing,
   out-of-order placement, and packet-trimming availability.
+  Journal entry exists from 2026-06-05.
 - `reviewed` — **Bolt: Sub-RTT Congestion Control for Ultra-Low Latency**,
   Arslan et al., NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/arslan`
@@ -5393,3 +5394,21 @@ Append new candidates here as each paper is processed.
   geo-replicated transactions; useful for comparing epoch-sized durability
   barriers with lower-latency replicated commit paths if GPU DB later spreads
   owner domains across nodes or regions.
+- `queued` — **REPS: Recycled Entropy Packet Spraying for Adaptive Load
+  Balancing and Failure Mitigation**, Bonato et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2407.21625`
+  Why: Ultra Ethernet names REPS as a path-aware entropy recycling strategy;
+  useful for comparing self-clocking packet/path selection with GPU DB
+  response-ring and multi-gateway load balancing.
+- `queued` — **Flowcut Switching: High-Performance Adaptive Routing with
+  In-Order Delivery Guarantees**, Bonato et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2506.21406`
+  Why: Ultra Ethernet cites Flowcut as a newer routing direction; useful for
+  deciding whether future GPU DB transport paths need packet spraying,
+  flowlet switching, or in-order route classes for SQL responses.
+- `queued` — **Data Center Ethernet and Remote Direct Memory Access:
+  Issues at Hyperscale**, Hoefler et al., IEEE Computer 2023.
+  URL: `https://doi.org/10.1109/MC.2023.3261184`
+  Why: Ultra Ethernet motivates its design as an answer to RoCE/RDMA
+  deployment pain; useful background for avoiding fragile lossless-network
+  assumptions in GPU DB's future gateway and accelerator-fabric design.
