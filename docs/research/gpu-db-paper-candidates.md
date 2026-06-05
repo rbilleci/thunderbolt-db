@@ -2430,7 +2430,7 @@ Append new candidates here as each paper is processed.
   Why: Chiller's inner-region commit depends on careful replication and
   recovery; this follow-up is relevant to GPU DB durability and availability
   once owner domains, WAL publication, and resident refresh become distributed.
-- `queued` — **Towards an Adaptable Systems Architecture for Memory Tiering at
+- `reviewed` — **Towards an Adaptable Systems Architecture for Memory Tiering at
   Warehouse-Scale**, Duraisamy et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3582016.3582031`
   Why: TMTS is the warehouse-scale memory-tiering design contrasted by MEMTIS;
@@ -2442,6 +2442,14 @@ Append new candidates here as each paper is processed.
   Why: MEMTIS cites Mosaic Pages for address-translation pressure in large
   memory systems; relevant to choosing GPU DB host-page and resident-segment
   granularity without blindly relying on huge pages.
+- `queued` — **Beyond malloc efficiency to fleet efficiency: a hugepage-aware
+  memory allocator**, Hunter et al., OSDI 2021.
+  URL: `https://www.usenix.org/conference/osdi21/presentation/hunter`
+  PDF: `https://www.usenix.org/system/files/osdi21-hunter.pdf`
+  Why: TMTS uses allocation hints to separate hot and cold objects before
+  page-tiering policy runs; Temeraire/TCMalloc is the allocator-side source for
+  huge-page-aware packing and subrelease decisions that may inform GPU DB
+  object-family arenas.
 - `queued` — **Pond: CXL-Based Memory Pooling Systems for Cloud Platforms**,
   Li et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3575693.3578835`
@@ -4203,7 +4211,7 @@ Append new candidates here as each paper is processed.
   URL: `https://arxiv.org/abs/2403.18702`
   Why: CXL-native tiering design; useful for contrasting OS/hardware-managed
   placement with GPU DB's explicit object-family placement and route telemetry.
-- `queued` — **MEMTIS: Efficient Memory Tiering with Dynamic Page
+- `reviewed` — **MEMTIS: Efficient Memory Tiering with Dynamic Page
   Classification and Page Size Determination**, Lee et al., SOSP 2023.
   URL:
   `https://cosmoss-jigu.github.io/pages/pubs/memtis-lee-sosp23.pdf`

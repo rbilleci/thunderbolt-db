@@ -54666,3 +54666,190 @@ route used by real queries.
   `faults_enabled`, and `witness_artifact` fields. Gate: a fast
   route cannot be marked certified unless at least one generated
   history artifact covers its isolation claim.
+
+### 2026-06-05 - TMTS makes far-memory tiering an SLO-controlled admission problem
+
+**Citation:** Padmapriya Duraisamy, Wei Xu, Scott Hare, Ravi Rajwar,
+David Culler, Zhiyi Xu, Jianing Fan, Christopher Kennelly, Bill
+McCloskey, Danijela Mijailovic, Brian Morris, Chiranjit Mukherjee,
+Jingliang Ren, Greg Thelen, Paul Turner, Carlos Villavieja,
+Parthasarathy Ranganathan, and Amin Vahdat. "Towards an Adaptable
+Systems Architecture for Memory Tiering at Warehouse-Scale." ASPLOS
+2023, pp. 727-741. doi:10.1145/3582016.3582031. Retrieved
+2026-06-05 from `https://www.micahlerner.com/assets/pdf/adaptable.pdf`
+and the DOI page.
+
+**Category:** multi-tier cache / data placement; runtime / HFT /
+session scale.
+
+**Relevance tags:** memory tiering; CXL/far memory; SLO-aware
+placement; page promotion; page demotion; PEBS; cold-page histograms;
+cluster scheduling; huge pages; allocation hints; noisy-neighbor
+control; tier access telemetry.
+
+**Core idea:** TMTS is a production warehouse-scale memory-tiering
+system that replaces a fixed fraction of DRAM with a slower directly
+addressable memory tier while keeping application impact bounded by
+operational SLOs. The key framing is not "put cold pages somewhere
+cheap" in isolation. It is a closed-loop resource-management problem:
+track how much allocated memory lives in the slow tier, track how many
+actual memory accesses hit that tier, and let node and scheduler policy
+react before latency-sensitive workloads exceed their budget.
+
+The headline deployment target is useful but should be interpreted
+carefully. In Google's evaluated production fleet, TMTS provisions 25%
+of memory as the slower tier and reports less than 5% aggregate
+performance degradation for the target operating point. The mechanism
+that makes this credible is the pair of proxy metrics: Secondary Tier
+Residency Ratio (STRR), the fraction of allocated memory placed in
+tier2, and Secondary Tier Access Ratio (STAR), the fraction of memory
+accesses served from tier2. The system wants STRR close to the hardware
+replacement ratio while keeping STAR low enough that SLO impact stays
+bounded.
+
+**Concrete mechanisms:**
+
+- TMTS exposes tier2 memory as directly addressable NUMA-like memory,
+  not swap. Accessing a tier2 page does not fault, but the higher
+  latency and lower bandwidth can still hurt tail latency until the
+  page is promoted.
+- A userspace policy daemon, `ufard`, controls page migration policy,
+  while kernel mechanisms perform access scanning, PMU sampling, and
+  page migration. This split lets production policy iterate without
+  hard-coding every threshold in the kernel.
+- Cold-page demotion uses page idle age. The kernel builds cold-age
+  histograms, and `ufard` sets per-task cold thresholds through cgroup
+  policy. The evaluated static policy used a stricter cold threshold
+  for high-importance latency-sensitive workloads than for other work.
+- Hot-page promotion combines periodic page access-bit scanning with
+  hardware event sampling. The PMU path samples tier2-sourced LLC load
+  misses and promotes sampled pages, giving much faster promotion
+  reaction than scan-only policies.
+- The deployed policy avoids direct allocation into tier2. New
+  allocations land in tier1, and demotion fills tier2 after coldness is
+  observed. This avoids accidentally putting newly hot data in the slow
+  tier, at the cost of higher tier1 pressure.
+- The deployed policy also avoids demoting pages to a remote socket's
+  tier2 memory because the evaluated Optane hardware shared memory
+  channels in ways that could inflate DRAM tail latency and trigger
+  severe slowdown.
+- The node agent can ask the cluster scheduler to reduce load or evict
+  tasks when tier1 capacity cannot hold the hot working set or tier2
+  bandwidth remains congested.
+- Scheduler hints classify jobs as tiering-friendly, tiering-unfriendly,
+  or neutral using historical tier2 access and bandwidth behavior, then
+  bias placement toward or away from machines with tier2 memory.
+- Huge pages are a double-edged tool. Splitting cold huge pages into 4KB
+  pages helps demote only cold parts, but it lowers huge-page coverage
+  for the working set and can increase TLB misses.
+- Allocation hints can separate hot and cold objects before the OS sees
+  page-level access. In the Spanner case study, two cold allocation
+  annotations increased identified cold memory from 10% to 42% and
+  reduced query latency by 2% by improving TLB locality.
+- Evaluation used live A/B production experiments across thousands of
+  servers. Reported results include STAR below 1% in more than 99% of
+  socket-level instances, median application IPC impact around 2.3% in
+  one study, and about 3.5% aggregate performance impact in a larger
+  four-week study.
+- PMU-assisted promotion cut STAR materially relative to scan-only
+  promotion, and tier-aware scheduling experiments reduced STAR by 30%
+  with a reported 4% performance improvement for latency-sensitive
+  workloads in the tested cluster.
+
+**GPU DB mapping:** TMTS suggests that GPU DB tiering should promote
+and demote route-owned objects by SLO and observed access pressure, not
+only by byte capacity. The P8 storage tiers already distinguish CPU
+truth, CPU derived state, GPU resident snapshots, and cold storage.
+The missing production-style telemetry is the TMTS equivalent of STRR
+and STAR for each object family: how many bytes live in each tier, and
+how many route-critical touches hit that tier.
+
+For GPU DB, the object families are more meaningful than raw OS pages:
+hot catalog metadata, route certificates, MVCC visibility summaries,
+retained snapshot headers, column segments, resident key vectors,
+compressed host segments, old-snapshot side structures, WAL/recovery
+metadata, response buffers, and pinned GPU staging buffers. Each family
+should have its own residency target and slow-tier access budget. A
+single global "cold bytes" target would hide the difference between a
+cold analytical segment and a frequently touched visibility summary.
+
+The STAR idea maps naturally to admission control. A route should carry
+a predicted slow-tier touch budget, and runtime telemetry should record
+actual slow-tier hits, queue delay, and fallback cost. If CPU/CXL/NVMe
+metadata touches exceed the route's latency budget, the system can
+promote, rebuild a resident summary, switch to a CPU owner path, or
+reject/admit less work rather than silently letting tail latency drift.
+
+The allocation-hint lesson is especially relevant for P8. GPU DB can
+separate hot and cold structures at construction time instead of waiting
+for OS page classifiers: pack route metadata and hot visibility cells
+apart from old versions, graveyard tombstones, cold text payloads, and
+long-snapshot-only structures. This is the DB-native form of the
+Spanner cold-allocation hint.
+
+TMTS also reinforces the runtime document's owner model. A tiering
+owner should make promotion/demotion decisions asynchronously from
+query execution, but the decisions must feed back into admission and
+scheduling. Resident GPU execution should not block on slow-tier page
+movement in the critical path, and slow-tier bandwidth saturation should
+be visible at the same level as GPU queue saturation and pinned-buffer
+exhaustion.
+
+**Risks and mismatches:** TMTS is an OS and fleet-management system,
+not a DBMS buffer manager. Its policies operate at page granularity and
+optimize production task SLOs; GPU DB needs tuple, segment, visibility,
+index, and route semantics. Treating OS page placement as sufficient
+would lose DB-specific invariants such as WAL-before-visibility,
+snapshot generations, invalidation, and safe recovery.
+
+The evaluated tier2 was Optane-like memory with specific bandwidth,
+latency, and channel-interference behavior. Future CXL memory, pooled
+memory, NVMe, or GPU memory will need recalibrated thresholds. TMTS
+itself notes that hardware changes could alter STAR/STRR targets.
+
+The no-direct-allocation-to-tier2 policy is safe for unknown
+applications, but GPU DB may intentionally build cold structures
+directly in slower tiers when route semantics prove they are not on the
+latency path. Conversely, a DB-owned tier policy must be more careful
+than TMTS about old snapshots and recovery metadata because promotion
+or demotion cannot violate snapshot visibility or durable replay.
+
+Finally, TMTS's aggregate production evidence is strong but coarse. It
+does not say how a GPU-resident SQL route behaves under single-query
+p99 latency budgets, mixed read/write invalidation, or micro-batched
+GPU execution. Those require DB-specific benchmark gates.
+
+**Benchmark candidates:**
+
+- Add per-object-family tier telemetry: resident bytes, slow-tier
+  bytes, slow-tier touches, promotion count, demotion count, rebuild
+  count, and route-visible fallback count for catalog metadata,
+  visibility summaries, retained snapshots, column segments, indexes,
+  old versions, response buffers, and pinned staging buffers.
+- Define GPU DB analogs of STRR and STAR. STRR-GPU should measure byte
+  residency by tier and object family; STAR-GPU should measure the
+  fraction of route-critical touches or bytes served from a slower tier.
+  Gate: route telemetry can explain p99 latency changes when a hot
+  object moves between GPU memory, CPU DRAM, and a future slow tier.
+- Prototype route admission with a slow-tier touch budget. A retained
+  read route with too many CPU/CXL/NVMe metadata touches should promote,
+  switch route, or reject with an explicit overload reason. Failure
+  condition: p99 latency degrades without a corresponding budget event.
+- Build an object-packing experiment: pack hot visibility summaries and
+  route certificates separately from cold versions, text payloads, and
+  graveyard metadata. Measure TLB misses, cache misses, retained-read
+  latency, write throughput, and old-snapshot scan cost.
+- Add a cold-allocation hint to P8 segment construction: long-snapshot
+  side data and old tombstone structures are allocated in a demotion-
+  eligible region, while mutation-owner visibility metadata stays in a
+  hot region. Proof gate: identical visible rows under retained snapshots
+  and WAL replay.
+- Add a tier-noisy-neighbor stress test: one route repeatedly touches a
+  slow-tier object family while latency-sensitive retained reads run.
+  Measure queue delay, slow-tier access ratio, CPU/GPU fallback, and
+  admission behavior. Failure condition: the noisy route can consume
+  slow-tier bandwidth without backpressure.
+- Evaluate huge-page and segment-granularity tradeoffs for CPU-side
+  resident metadata. Compare 4KB pages, huge pages, and DB-owned segment
+  packing for hot metadata plus cold payload mixes. Gate: improved TLB
+  reach must not pin cold data on the hot path.
