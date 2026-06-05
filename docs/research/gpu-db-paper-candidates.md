@@ -3856,12 +3856,25 @@ Append new candidates here as each paper is processed.
   Why: recent semantic-aware concurrency-control work with a GPU-accelerated
   graph fallback path; useful for comparing O|R|P|E-style semantic classes with
   deterministic DAG fallback for constrained transaction domains.
-- `queued` — **Block-STM: Scaling Blockchain Execution by Turning Ordering
+- `reviewed` — **Block-STM: Scaling Blockchain Execution by Turning Ordering
   Curse to a Performance Blessing**, Gelashvili et al., PPoPP 2023.
   URL: `https://doi.org/10.1145/3572848.3577524`
+  arXiv: `https://arxiv.org/abs/2203.06871`
   Why: OCToPus cites Block-STM as a deterministic ordered blockchain execution
   baseline; useful for comparing optimistic parallel execution, dependency
   tracking, and re-execution costs against semantic fast paths.
+- `queued` — **Forerunner: Constraint-based Speculative Transaction Execution
+  for Ethereum**, Chen et al., SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483564`
+  Why: Block-STM contrasts against constraint/pre-execution hints for smart
+  contract transactions; useful for comparing off-critical-path route hints
+  with active-window dependency learning.
+- `queued` — **Processing Transactions in a Predefined Order**, Saad et al.,
+  PPoPP 2019.
+  URL: `https://doi.org/10.1145/3293883.3295700`
+  Why: Block-STM compares against predefined-order STM approaches; useful for
+  deciding whether GPU DB should use commit-order forwarding, flat combining,
+  or Block-STM-style collaborative validation for admitted write windows.
 - `queued` — **SPEEDEX: A Scalable, Parallelizable, and Economically Efficient
   Decentralized EXchange**, Ramseyer, Goel, and Mazieres, arXiv 2021.
   URL: `https://arxiv.org/abs/2111.02719`

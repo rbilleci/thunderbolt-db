@@ -51490,3 +51490,182 @@ budgets, not only per-route speedups.
   lane beside COPY/INSERT publication and retained-snapshot refresh. Failure
   condition: read throughput gains raise write p99 or snapshot publication
   latency past the configured admission budget.
+
+### 2026-06-05 - Block-STM turns preset transaction order into speculative parallelism
+
+**Citation:** Rati Gelashvili, Alexander Spiegelman, Zhuolun Xiang, George
+Danezis, Zekun Li, Dahlia Malkhi, Yu Xia, and Runtian Zhou. "Block-STM:
+Scaling Blockchain Execution by Turning Ordering Curse to a Performance
+Blessing." PPoPP 2023. doi:10.1145/3572848.3577524. Retrieved 2026-06-05
+from `https://arxiv.org/pdf/2203.06871`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; runtime / HFT / session scale.
+
+**Relevance tags:** deterministic execution; optimistic concurrency control;
+multi-version memory; preset serialization; collaborative scheduling;
+validation tasks; re-execution; dependency estimates; smart contracts; hot
+write batches.
+
+**Core idea:** Block-STM takes a workload that already has a required total
+order, a blockchain block, and executes it speculatively in parallel while
+guaranteeing the final result is equivalent to sequential execution in that
+preset order. Unlike deterministic database systems that need write sets before
+execution, Block-STM learns dependencies from failed incarnations. A failed
+transaction leaves its previous write set as estimates, so later transactions
+that would read those locations can stop early and wait for the lower-indexed
+transaction's next incarnation instead of doing doomed work.
+
+The useful twist for GPU DB is that ordering is not only a serialization cost.
+When a batch already has an admission order, the order can become a compact
+dependency coordinate. Workers can execute, validate, and retry within that
+coordinate while preserving deterministic publication.
+
+**Concrete mechanisms:**
+
+- Input is a fixed block order `tx1 < tx2 < ... < txn`; correctness requires
+  the same final state as sequential execution in that order.
+- Each execution attempt is an incarnation. The engine records a read set and
+  write set for the incarnation, then applies the write set to an in-memory
+  multi-version structure.
+- Reads choose the highest lower-indexed transaction version for a location.
+  If no lower transaction wrote the location, the read comes from the initial
+  storage state.
+- Validation re-reads the recorded read set and compares observed versions. A
+  mismatch aborts the incarnation.
+- On abort, the transaction's previous writes become `ESTIMATE` markers. A
+  higher transaction that reads such a marker aborts early and is registered as
+  dependent on the lower transaction.
+- When the lower transaction finishes its next incarnation, dependent higher
+  transactions are made ready for execution again.
+- The scheduler maintains ordered execution and validation task sets with
+  atomic index counters plus per-transaction status. Threads prefer lower
+  transaction indices because a lower abort can invalidate higher work.
+- Validation is optimistic and can run in parallel for multiple higher
+  transactions. Some validation may be wasted, but failed lower validations are
+  discovered sooner.
+- Completion is detected with execution and validation indices, an active-task
+  count, and a decrease counter so no worker exits while a task could still
+  create earlier work.
+- The Rust implementation is integrated into Diem/Aptos. It uses cache padding,
+  RAII-style active-task accounting, and a concurrent hashmap over access paths
+  with lock-protected search trees for transaction-index lookups.
+- The evaluation uses Diem and Aptos peer-to-peer Move transactions on one AWS
+  `c5a.16xlarge` socket with up to 32 physical cores, block sizes from 1,000 to
+  50,000, and account-count variation to control contention.
+- Reported maximum throughput is up to 110k transactions/s on Diem and 170k
+  transactions/s on Aptos with 32 threads. On highly contended workloads the
+  reported throughput reaches up to 50k and 80k transactions/s respectively;
+  on fully sequential workloads overhead is at most 30% versus sequential
+  execution.
+
+**GPU DB mapping:** The strongest transferable idea is an active-window
+transaction lane: once GPU DB admits a bounded batch of writes, refresh
+operations, or same-shape stored procedure calls, it can use the admission order
+as a deterministic coordinate for speculative parallelism instead of forcing
+all work through one owner at execution time. The mutation owner still owns
+WAL-before-visibility and final publication, but parts of validation,
+read/write set discovery, and dependency-aware retry can happen inside a
+bounded window.
+
+This maps best to narrow, instrumentable transaction shapes: batched account or
+inventory updates, stored procedures with known route families, refresh tasks
+that update segment metadata, and hot-key write batches whose SQL envelope can
+record touched logical keys. The Block-STM mechanism suggests maintaining
+per-window multi-version scratch state keyed by logical row, route metadata
+record, or segment descriptor. A transaction reads the latest lower-indexed
+scratch version, records the version it saw, and validates before publication.
+
+The `ESTIMATE` marker is also useful as a backpressure signal. If an early
+incarnation shows that a lower write probably owns a hot key or metadata
+record, later transactions should not continue burning CPU, GPU, or pinned
+buffer budget. They can yield their window slot, wait for the lower
+incarnation, and re-enter as a dependent task. That complements the existing
+active-window and route-certificate synthesis: admission can decide not only
+which route is allowed, but which speculative tasks are likely to be wasted.
+
+GPU DB should not copy the blockchain block model wholesale. Instead, the
+candidate production shape is a bounded speculative sub-lane under a mutation
+owner: append or reserve the batch in order, execute discoverable work in
+parallel against scratch versions, validate read dependencies, then publish
+visibility only after durable WAL and ordered validation succeed. Failed or
+ambiguous transactions fall back to owner-serialized execution.
+
+**Risks and mismatches:** Block-STM targets smart-contract execution with a VM
+that safely encapsulates inconsistent speculative reads. General SQL execution
+does not automatically have that property. Arbitrary PostgreSQL functions,
+external effects, nondeterminism, sequence behavior, triggers, and error timing
+would need strict admission rules before speculative re-execution is safe.
+
+The paper's commit granularity is an entire block, and it does not include the
+cost of persisting outputs to storage in the reported throughput. GPU DB cannot
+delay all visibility indefinitely under normal OLTP latency targets, and it
+must preserve WAL-before-visibility at command or configured batch boundaries.
+
+The mechanism also depends on instrumentation. GPU DB would need reliable read
+and write sets for admitted transaction shapes. If a route cannot expose those
+sets cheaply, speculative execution may become slower than direct owner
+serialization. Contended hot spots can also make the work inherently
+sequential; the paper's 30% sequential overhead is acceptable for its setting
+but still a real tax for latency-sensitive database commands.
+
+Finally, blockchain workloads have a preset consensus order. GPU DB must
+choose admission order locally and may need to honor client transaction
+boundaries, isolation level, lock semantics, and fairness. The order is useful
+only when it is explicit, bounded, and tied to publication semantics.
+
+**Benchmark candidates:**
+
+- Prototype a bounded Block-STM-style write window for one stored-procedure
+  shape with instrumented logical read/write keys. Compare owner-serialized
+  execution, optimistic OCC retry, and ordered speculative validation. Gate:
+  higher throughput under moderate contention with identical WAL replay
+  results and no stale visibility.
+- Add `ESTIMATE`-style dependency markers to a simulated hot-key write batch.
+  Measure wasted work, abort count, p95/p99, and owner publication latency
+  versus naive retry. Failure condition: early dependency aborts lower
+  throughput or increase tail latency on low-contention workloads.
+- Test commit-boundary choices: per-command, fixed-count window, fixed-time
+  micro-window, and COPY-like chunk. Required measurement: WAL flush timing,
+  visibility lag, abort/retry work, and read-snapshot freshness.
+- Run a mixed retained-read plus write-window benchmark. Reads must either use
+  an older immutable snapshot, wait for the new published generation, or route
+  through the owner. Failure condition: speculative scratch versions leak into
+  read snapshots before WAL-backed publication.
+- Measure instrumentation overhead for read/write-set capture by route family:
+  point update, secondary-index update, segment refresh metadata update, and
+  small stored procedure. Minimum proof: capture overhead is below the saved
+  abort or owner-queue cost.
+- Add a determinism audit. Re-run the same admitted window under different
+  worker interleavings and compare final CPU truth, WAL order, snapshot
+  generation, errors, and response order. Any divergence disqualifies the
+  route from speculative execution.
+
+### 2026-06-05 - Cross-paper synthesis: active windows need dependency evidence
+
+The last three papers sharpen route certificates from three angles. Count-sketch
+multi-join estimation says a route certificate needs live budget estimates,
+AMAC says a hot CPU-side route needs calibrated stall-hiding slots, and
+Block-STM says a speculative write window needs dependency evidence instead of
+blind retry.
+
+The converging design track is an active-window certificate. A window should
+name the route shape, snapshot or publication boundary, resource budget,
+expected cardinality or touched-key envelope, and the dependency signal that
+lets workers stop wasting work. For reads, that signal may be a route-sketch
+upper bound or AMAC queue-depth threshold. For writes, it may be a
+Block-STM-style estimate marker that says a lower ordered task probably owns
+the key or metadata record.
+
+The main category gap is still production SQL semantics. The recent papers
+provide useful mechanisms for estimates, state-machine latency hiding, and
+ordered speculative execution, but GPU DB still needs a small set of admitted
+SQL/stored-procedure shapes where read/write sets, deterministic retry, error
+behavior, and publication order are provable.
+
+Benchmark priority should therefore move toward one narrow active-window
+prototype: bounded point writes plus retained point reads on one table, with
+route estimates for admission, calibrated CPU metadata prefetching for lookup,
+and dependency markers for hot-key retry. The proof gate is not peak throughput
+alone; it is replay-equivalent WAL, deterministic visibility, bounded p99, and
+clear fallback when the active-window certificate cannot be proven.
