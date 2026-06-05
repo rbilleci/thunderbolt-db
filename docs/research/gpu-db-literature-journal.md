@@ -67264,3 +67264,179 @@ the reported speedups.
 - Teach route telemetry to report why a GPU plan was rejected: stale
   visibility frontier, missing residency, low pipeline density, unsupported
   operator, output ordering, saturated GPU queue, or transfer budget exceeded.
+
+### 2026-06-05 - F1 Lightning turns HTAP into a freshness-windowed service
+
+**Citation:** Jiacheng Yang, Ian Rae, Jun Xu, Jeff Shute, Zhan Yuan, Kelvin
+Lau, Qiang Zeng, Xi Zhao, Jun Ma, Ziyang Chen, Yuan Gao, Qilin Dong, Junxiong
+Zhou, Jeremy Wood, Goetz Graefe, Jeff Naughton, and John Cieslewicz. "F1
+Lightning: HTAP as a Service." PVLDB 13(12): 3313-3325, 2020.
+doi:10.14778/3415478.3415553. Retrieved 2026-06-05 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol13/p3313-yang.pdf`.
+
+**Category:** hybrid HTAP; MVCC / snapshot / visibility; multi-tier cache /
+data placement.
+
+**Relevance tags:** HTAP service; change data capture; safe timestamp;
+queryable window; transparent query rewrite; row-to-column deltas; LSM
+compaction; snapshot consistency; stale/fresh fallback; pushdown.
+
+**Core idea:** F1 Lightning provides HTAP as a loosely coupled service rather
+than as a replacement transactional engine. Existing OLTP systems remain the
+source of truth, while Lightning tails their change streams, transforms row
+updates into read-optimized columnar replicas, and exposes those replicas
+through F1 Query as transparent physical access paths. Users continue querying
+the original transactional tables; if the requested snapshot is within
+Lightning's safe timestamp window, F1 Query can route eligible tables to
+Lightning.
+
+For GPU DB, the strongest transferable idea is a freshness-windowed accelerator
+contract. GPU resident snapshots do not need to pretend they are the
+transactional owner. They need to prove the timestamp window they can serve,
+fall back or reject when outside that window, and preserve a route-visible
+reason for that decision.
+
+**Concrete mechanisms:**
+
+- OLTP systems expose change data capture or log-shipping interfaces.
+  Changepump hides source-specific CDC details and converts transaction-level
+  logs into partition-oriented streams for Lightning servers.
+- Each change keeps the original commit timestamp. Lightning promises snapshot
+  results equivalent to the source OLTP database for timestamps it has fully
+  ingested.
+- Lightning maintains a maximum safe timestamp and a minimum safe timestamp.
+  The interval between them is the queryable window; the paper reports a
+  typical production window of about ten hours.
+- Because per-key timestamp tracking is too expensive, Changepump emits
+  checkpoint timestamp updates that say all changes before a timestamp have
+  been delivered to a subscriber. Checkpoint frequency trades freshness against
+  change-processing efficiency.
+- New changes first enter memory-resident row-wise B-tree deltas. Those deltas
+  are queryable, copy-on-write for concurrent readers, and recoverable by
+  replaying the source OLTP log because Lightning does not maintain its own
+  WAL for them.
+- Large or pressured deltas are flushed to disk as read-optimized columnar
+  files. The paper describes a PAX-like layout with row bundles stored
+  column-wise and a sparse primary-key B-tree index over bundle key ranges.
+- Reads merge memory and disk deltas at the requested timestamp. Lightning
+  performs vectorized k-way merge and collapse, using merge-plan generation to
+  identify safe key/timestamp ranges and merge-plan application to copy and
+  aggregate columns.
+- Compaction has separate active, minor, major, and base tasks. Cheap active
+  compaction runs on Lightning servers; heavier compactions are scheduled by
+  servers but executed by dedicated workers, then asynchronously loaded.
+- F1 Query first plans logically as if reading the OLTP database, including
+  authorization semantics. During physical planning, Lightning becomes an
+  additional access path for tables whose timestamps are in the queryable
+  window; Lightning-only indexes and views may also be considered.
+- F1 Query embeds a vectorized evaluator in Lightning servers for richer
+  subplan pushdown, currently including leaf subtrees without shuffle such as
+  filters, partial aggregations, and projections.
+- Lightning can blacklist lagging or corrupt tables and fall back to OLTP
+  reads. Owners can choose stale-but-fast versus fresh fallback behavior,
+  including high-priority traffic failing over while lower-priority traffic
+  stays on Lightning.
+- Production evaluation reports single-node Lightning p50 latency around 8 ms
+  and p95 around 101 ms for point-style queries, distributed p50 around 0.15 s
+  and p95 around 2.4 s, and CPU efficiency improvements versus F1 DB of 2.3x,
+  11.8x, and 7.6x at the data-source layer for small, medium, and large query
+  buckets respectively. These numbers are workload-specific.
+
+**GPU DB mapping:** P8 already treats GPU state as an acceleration tier backed
+by WAL/checkpoint/archive and CPU MVCC truth. Lightning gives that tier a
+clear service shape: publish `min_safe_ts`, `max_safe_ts`, resident generation,
+partition coverage, and supported route features. A retained GPU route is valid
+only when the request snapshot falls inside that service window and every
+participating partition has caught up.
+
+Changepump's checkpoint timestamps map to refresh-frontier publication. Instead
+of tracking per-row freshness for every route, GPU DB can publish per-partition
+or per-segment safe frontiers, then let the planner decide whether to use GPU,
+warm CPU columnar, cold CPU tuple/index, or source-truth fallback. This fits the
+recent route-certificate synthesis: freshness is another certificate field,
+not a side condition hidden in cache metadata.
+
+The memory-row delta plus columnar disk delta design is also useful for
+resident refresh. GPU DB can keep fresh mutations in CPU MVCC/write-optimized
+form, build column-group snapshots asynchronously, and expose merged reads only
+when the snapshot frontier proves correctness. For GPU execution, the analogue
+of Lightning's vectorized merge is a refresh pipeline that merges base
+resident columns, recent deltas, delete markers, text dictionaries, and
+visibility bounds into a new immutable generation.
+
+For session concurrency, the fallback policy matters as much as the storage
+format. A 1M-session runtime should not send every stale retained read through
+the mutation owner. It should return a narrow reason such as
+`snapshot_too_new`, `partition_lagging`, `table_blacklisted`,
+`gpu_generation_stale`, or `fallback_to_cpu_truth`, with priority-aware routing
+for fresh high-priority requests and stale-tolerant analytical requests.
+
+**Risks and mismatches:** Lightning is optimized for read-only analytical and
+hybrid queries over existing distributed OLTP systems. It does not execute
+writes in the replica, does not solve GPU memory management, and depends on a
+CDC/log-shipping interface from the source system. Its loosely coupled design
+can intentionally reduce freshness to preserve availability and replica
+coverage; that is acceptable only when query semantics and user policy allow
+it.
+
+The paper's safe timestamp and ten-hour queryable window should not be copied
+as constants. GPU DB's retained snapshots may need much shorter windows for
+low-latency OLTP-style reads and much longer windows for analytical scans. The
+important mechanism is explicit window publication and fallback, not a specific
+freshness target.
+
+**Benchmark candidates:**
+
+- Add per-partition `min_safe_ts` / `max_safe_ts` route telemetry for retained
+  snapshots. Gate: a retained route never serves a timestamp outside every
+  participating partition's published window.
+- Prototype a CPU delta plus GPU column-generation refresh benchmark: apply
+  writes to CPU MVCC truth, asynchronously build a new resident generation, and
+  measure stale-window duration, refresh bytes, and p95 retained-read fallback.
+- Compare checkpoint publication intervals for resident refresh: publish every
+  mutation batch, every N milliseconds, or after byte thresholds. Measure
+  freshness, owner overhead, and route stability.
+- Add a fallback-policy benchmark with mixed priority: fresh point reads,
+  stale-tolerant analytical scans, and background refresh. Failure condition:
+  stale-tolerant work consumes mutation-owner or GPU credits needed by fresh
+  high-priority reads.
+- Test vectorized delta merge for one P8 table shape on CPU first, then GPU:
+  base column group plus update/delete delta sorted by key and timestamp.
+  Gate: identical visible rows to tuple-MVCC reads across snapshot timestamps.
+- Build a route-replay verifier inspired by Lightning: replay normalized query
+  shapes against CPU truth and retained GPU/warm-tier routes at the same
+  snapshot, compare normalized results, and record latency/resource deltas.
+
+### 2026-06-05 - Cross-paper synthesis: serviceable snapshots beat invisible acceleration
+
+The last three reviewed papers tighten the same design track from different
+directions. Indexed Log File says recovery should be addressable and
+demand-shaped rather than a single database-wide unavailable state. HorseQC says
+GPU routes should prove enough pipeline density to justify transfer, launch,
+and queue occupation. F1 Lightning says HTAP acceleration should publish the
+freshness window it can serve and fall back cleanly when the requested snapshot
+is outside that window.
+
+The convergence is a route-service contract: every retained route should expose
+freshness, recovery, residency, pipeline-density, and overload fields before
+execution starts. The route selector can then choose GPU resident, warm CPU
+columnar, CPU tuple/index, restore-on-demand, or explicit rejection without
+letting hidden cache state decide correctness.
+
+The category gap is now concrete MVCC/write-publication implementation under
+these route contracts. The next useful transaction papers should focus on how
+mutation owners publish timestamps, version chains, read frontiers, and cleanup
+boundaries without becoming the bottleneck for retained reads.
+
+**Benchmark priorities:**
+
+- Implement a route-certificate trace for retained reads with
+  `snapshot_ts`, safe window, recovery frontier, resident generation, pipeline
+  density, queue budget, selected tier, and fallback reason.
+- Build one CPU-truth versus retained-route replay verifier before expanding
+  GPU kernels, so route optimization cannot silently weaken snapshot results.
+- Measure stale-window and restore-window behavior under restart storms,
+  continuous writes, and mixed priority reads.
+- Keep GPU route benchmarks honest by requiring both correctness certificates
+  and density estimates before a resident or streamed route enters the GPU
+  execution queue.

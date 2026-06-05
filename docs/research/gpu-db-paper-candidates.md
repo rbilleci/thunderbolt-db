@@ -1363,13 +1363,13 @@ Append new candidates here as each paper is processed.
   reusable task/device layers; useful for deciding whether GPU DB route
   descriptors should expose device-specific kernels, portable fragments, or a
   layered execution abstraction.
-- `queued` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
+- `reviewed` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3313-yang.pdf`
   DOI: `https://doi.org/10.14778/3415478.3415553`
   Why: loosely coupled production HTAP system with transparent query federation
   over existing transactional stores; useful follow-up to PolarDB-IMCI for
   contrasting redo-replay replicas with service-layer freshness and route
-  integration.
+  integration. Journal entry added 2026-06-05.
 - `queued` — **TiDB: A Raft-based HTAP Database**, Huang et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3072-huang.pdf`
   DOI: `https://doi.org/10.14778/3415478.3415535`
@@ -1503,6 +1503,19 @@ Append new candidates here as each paper is processed.
   Why: Umbra's adaptive bytecode/JIT execution foundation; relevant to deciding
   when GPU DB should interpret, compile, batch, or route short SQL plans
   without paying excessive setup latency.
+- `queued` — **Procella: Unifying Serving and Analytical Data at YouTube**,
+  Chattopadhyay et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p2022-chattopadhyay.pdf`
+  DOI: `https://doi.org/10.14778/3352063.3352121`
+  Why: F1 Lightning reuses Procella-like encoded column/vectorized execution
+  ideas; useful for CPU/GPU shared columnar wire formats, high-QPS serving
+  caches, and avoiding data conversion at query/storage boundaries.
+- `queued` — **Parallel Replication across Formats in SAP HANA for Scaling Out
+  Mixed OLTP/OLAP Workloads**, Lee et al., PVLDB 2017.
+  URL: `https://doi.org/10.14778/3137765.3137767`
+  Why: F1 Lightning contrasts its loosely coupled CDC service with SAP HANA's
+  tighter log-replay replica architecture; useful for comparing freshness,
+  source-engine modification cost, and row-to-column replication paths.
 - `queued` — **Updatable Learned Index with Precise Positions**, Wu et al.,
   PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p1276-wu.pdf`
