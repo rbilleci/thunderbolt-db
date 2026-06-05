@@ -3851,13 +3851,14 @@ Append new candidates here as each paper is processed.
   Why: AOCC cites transaction healing as a semantic repair path for OCC; useful
   for deciding when GPU DB should retry, repair, or reissue only dependent
   pieces of a transaction instead of aborting the full command envelope.
-- `queued` — **BCC: Reducing False Aborts in Optimistic Concurrency Control
+- `reviewed` — **BCC: Reducing False Aborts in Optimistic Concurrency Control
   with Low Cost for In-Memory Databases**, Yuan et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p504-yuan.pdf`
   DOI: `https://doi.org/10.14778/2904121.2904126`
   Why: AOCC cites BCC as a low-overhead false-abort reduction baseline; useful
   for GPU DB contention handling where serializable write lanes should avoid
-  unnecessary aborts without weakening visibility guarantees.
+  unnecessary aborts without weakening visibility guarantees. Journal entry
+  added 2026-06-05.
 - `reviewed` — **O|R|P|E - A Data Semantics Driven Concurrency Control**,
   Lessner, Laux, and Connolly, International Journal On Advances in Software
   2016; arXiv 2023.

@@ -73013,3 +73013,168 @@ placement telemetry records what was not loaded.
 - Test batch size for segment reads under latency ceilings: small batches for
   p50, large batches for throughput, and dual-trigger batching. Record tier
   fan-out, queue wait, skipped pushdown work, and bytes saved per batch.
+
+### 2026-06-05 - BCC reduces false OCC aborts with bounded dependency checks
+
+**Citation:** Yuan Yuan, Kaibo Wang, Rubao Lee, Xiaoning Ding, Jing Xing,
+Spyros Blanas, and Xiaodong Zhang. "BCC: Reducing False Aborts in Optimistic
+Concurrency Control with Low Cost for In-Memory Databases." PVLDB 9(6),
+2016, pp. 504-515. doi:10.14778/2904121.2904126. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol9/p504-yuan.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** optimistic concurrency control; false abort reduction;
+serializability; high-contention OLTP; dependency tracking; Silo; read/write
+sets; bounded validation; snapshot reads; per-thread history metadata.
+
+**Core idea:** BCC argues that standard OCC aborts too eagerly under
+contention. A changed read set proves an anti-dependency, but it does not
+prove the transaction belongs to a dependency cycle. Balanced Concurrency
+Control keeps OCC's optimistic read phase and critical validation/write phase,
+but validates against a stricter "essential pattern": a committing transaction
+with an anti-dependency on a committed transaction is aborted only when it
+also has a second dependency with a concurrent transaction that can complete
+the necessary cycle shape.
+
+The paper's practical contribution is the boundedness of that extra check.
+BCC does not build a full serialization graph. It checks one additional
+dependency in a confined concurrent-transaction window, accepts that this is
+not maximum possible concurrency, and designs metadata so low-contention
+workloads stay close to Silo OCC. In the authors' Silo implementation on a
+32-core machine, BCC reports up to 3.68x higher throughput than OCC on a
+high-contention TPC-W-like workload, up to about 35.8% over OCC on the tested
+TPC-C mix, and 1.99x over OCC on the tested high-contention YCSB workload.
+
+**Concrete mechanisms:**
+
+- Transactions retain the OCC phase structure: read, validation, and write.
+  Validation and write remain inside the critical section, and reads only see
+  committed tuples.
+- BCC distinguishes write-read, write-write, and read-write dependencies.
+  The key false-abort case is when OCC observes a read-write anti-dependency
+  but no cycle is actually possible.
+- The essential pattern theorem says an unserializable schedule in this
+  transaction model must contain a committed transaction `T3`, a transaction
+  `T2` anti-dependent on `T3`, and another transaction `T1` that depends into
+  `T2` and commits after `T2` starts.
+- Validation first checks whether the committing transaction is
+  anti-dependent on any committed transaction. Only then does it search for a
+  wr, ww, or rw dependency with a concurrent transaction.
+- Read-only snapshot transactions get a lightweight synchronization point:
+  before taking a new read-only snapshot, the database waits for active
+  transactions to finish. This avoids retaining all historical
+  anti-dependency metadata for snapshot transactions.
+- A global TID vector acts as a low-synchronization clock. Each worker updates
+  its own entry when assigning a TID; tuple TIDs can then be compared with a
+  transaction's start and validation snapshots.
+- Each transaction records accessed tuples in a per-transaction hash table.
+  Per-thread history lists keep recent hash tables until all concurrent
+  transactions have finished, using conservative release based on the global
+  clock.
+- The implementation avoids latching the hash table during read-set insertion.
+  After insertion, the tuple is re-read; if it changed, the old table entry is
+  discarded and the tuple is read again, ensuring a concurrent rw dependency
+  is either discoverable later or the newer tuple version is observed.
+- For the TPC-C experiment described in the paper, average per-thread history
+  hash-table memory stayed below 56 KB, with maximum per-thread use below
+  1.6 MB; the configured per-thread history area was about 4.38 MB.
+- BCC can add latency for transactions that it saves from OCC aborts because
+  their write sets must be checked against other workers' history tables. The
+  paper reports that saved NewOrder transactions were roughly twice as slow as
+  OCC-committed ones, but still in the tens of microseconds in the experiment.
+
+**GPU DB mapping:** BCC is directly relevant to GPU DB's serializable write
+lanes and owner-domain admission. The transferable idea is not to copy BCC
+wholesale, but to make abort policy more precise only after the cheap OCC
+signal fires. For hot retained-read plus write workloads, a changed read set
+should trigger a bounded dependency probe before a full command envelope is
+discarded, especially when the command has already paid parsing, planning,
+WAL admission, GPU staging, or index-maintenance costs.
+
+The per-worker history-table design maps to mutation owners and partition
+owners. Each owner can maintain a short-lived, bounded history of read/write
+footprints for recently validated transactions, with release tied to a local
+generation frontier rather than a global graph. The GPU DB runtime already
+wants explicit owner domains and bounded rings; BCC suggests adding bounded
+conflict-history rings next to those owners, so high-contention validation can
+ask "is there a second dependency that makes this abort necessary?" without
+touching unrelated partitions.
+
+The global TID vector maps to the engine's generation and visibility fronts.
+Instead of one centralized timestamp allocator, each owner can publish a
+monotonic local commit or validation generation. A transaction's start vector
+and validation vector then define the window of concurrent work worth probing.
+That is attractive for 1M logical sessions because validation cost is bounded
+by active owner windows, not session count.
+
+For GPU execution, the main use is protecting batched write or refresh work
+from false abort churn. If a same-shape write micro-batch or resident-refresh
+delta conflicts on a hot row, the engine should know whether the conflict is a
+true serializability cycle, a harmless anti-dependency, or a route-local retry
+candidate. BCC-style classification could reduce wasted GPU/CPU staging and
+make retry/backoff policy more specific than "abort on any changed read."
+
+**Risks and mismatches:** BCC is single-node, CPU, in-memory OLTP work. It
+does not address MVCC version-chain scans, GPU snapshots, WAL durability,
+distributed transactions, DDL/catalog generations, or device memory pressure.
+Its implementation assumes short transactions and a Silo-like kernel; long SQL
+statements, interactive transactions, or multi-partition plans could make
+history retention and validation windows much larger.
+
+The snapshot synchronization point is a poor fit for always-fresh retained GPU
+reads if it blocks new work too often. GPU DB should instead treat it as a
+warning: read-only snapshot convenience can create hidden metadata costs, so
+snapshot publication and long-reader handling must have explicit frontiers.
+BCC also improves false aborts but does not eliminate all unnecessary aborts;
+under true high-contention cycles, its extra checks may only add latency.
+
+**Benchmark candidates:**
+
+- Add an OCC false-abort benchmark over hot-key transactions: baseline abort
+  on changed read set versus a bounded second-dependency probe. Measure commit
+  throughput, abort rate, true retry count, p50/p99 latency, and validation
+  CPU time.
+- Implement owner-local conflict-history rings for a single partition. Gate:
+  history memory remains bounded under 1M logical sessions because entries are
+  retained by active transaction window, not by session.
+- Compare three validation policies for hot writes: plain OCC, BCC-style
+  bounded probe, and conservative two-phase locking fallback. Failure
+  condition: the bounded probe wins only by violating serializable results or
+  WAL-before-visibility ordering.
+- Add a retained-read conflict workload where read snapshots, point writes,
+  and refresh deltas overlap. Measure whether dependency classification avoids
+  discarding already staged GPU refresh or lookup batches.
+- Test per-owner generation vectors as the concurrency window. Record how many
+  history entries are searched per commit and reject the design if validation
+  search grows with total client/session count.
+- Measure saved-transaction latency separately from ordinary commit latency.
+  A BCC-style path is only useful if the extra validation cost is smaller than
+  the cost of repeated abort/reparse/replan/restage cycles under contention.
+
+### 2026-06-05 - Cross-paper synthesis: staged acceleration needs precise fallback
+
+Selection Pushdown, Vegito, Taurus NDP, and BCC converge on the same design
+shape from different parts of the stack: accelerate only the part of the path
+whose correctness proof is cheap, and carry a precise fallback for the rest.
+Selection Pushdown compacts encoded values only after a bitmap proves they are
+still candidates. Vegito publishes analytical generations only at stable
+epochs. Taurus NDP pushes work to storage only for rows and pages whose
+predicate, projection, and visibility proof are local; ambiguous rows return
+to InnoDB. BCC aborts only after the cheap OCC anti-dependency signal is
+backed by a bounded second dependency check.
+
+The strongest track for GPU DB is therefore proof-carrying staged execution.
+Each route stage should produce both reduced work and a reason code:
+proven-visible, ambiguous-version, unsupported-expression, skipped-pressure,
+dependency-benign, dependency-dangerous, or stale-generation. GPU, CPU warm
+tier, NVMe/cold tier, and mutation owners can then cooperate without letting a
+fast lower tier silently erase MVCC, WAL, or serializability obligations.
+
+The remaining category gap is a combined benchmark that crosses transaction
+validation and tier placement. The next priority should be a hot-key mixed
+workload where writes create retained-read invalidations, selective scans use
+CPU/GPU/cold-tier stages, and validation distinguishes harmless
+anti-dependencies from true cycles. Benchmark pass/fail should track not just
+throughput, but bytes avoided, aborts avoided, ambiguous rows returned,
+generation lag, and the cost of every fallback.
