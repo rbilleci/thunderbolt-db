@@ -4962,7 +4962,7 @@ Append new candidates here as each paper is processed.
   Why: HybridTier cites FlexMem as a contemporary frequency-based tiering
   system; useful for comparing adaptive profiling overhead with GPU DB's
   route-object heat telemetry.
-- `queued` — **UniMem: Redesigning Disaggregated Memory within A Unified
+- `reviewed` — **UniMem: Redesigning Disaggregated Memory within A Unified
   Local-Remote Memory Hierarchy**, Zhong et al., USENIX ATC 2024.
   URL: `https://www.usenix.org/conference/atc24/presentation/zhong`
   PDF: `https://www.usenix.org/system/files/atc24-zhong.pdf`
@@ -4970,6 +4970,13 @@ Append new candidates here as each paper is processed.
   demote when a promotion is about to fail; UniMem is a modern disaggregated
   memory design for comparing hotness, fragmentation, and critical-path
   migration against GPU DB's explicit route-owned tier placement.
+- `queued` — **Using Local Cache Coherence for Disaggregated Memory Systems**,
+  Puddu et al., Operating Systems Review 2023.
+  URL: `https://ivanpuddu.com/files/papers/kona_osr2023.pdf`
+  Why: UniMem uses Kona as the cache-coherent disaggregated-memory baseline;
+  reviewing Kona would expose the baseline fake-physical-memory indirection,
+  accelerator-local cache design, and coherence assumptions that UniMem tries
+  to replace.
 - `queued` — **Tiered Memory Management: Access Latency is the Key!**,
   Vuppalapati and Agarwal, SOSP 2024.
   URL: `https://doi.org/10.1145/3694715.3695964`

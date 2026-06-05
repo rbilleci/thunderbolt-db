@@ -71424,3 +71424,189 @@ ordered after WAL durability and before SQL-visible route validity.
   previous pointers, and per-segment previous-generation records. Gate:
   retained reads and recovery get enough information without bloating GPU
   resident buffers.
+
+### 2026-06-05 - UniMem makes far memory useful by separating addressability, filtering, and promotion
+
+**Citation:** Yijie Zhong, Minqiang Zhou, Zhirong Shen, and Jiwu Shu.
+"UniMem: Redesigning Disaggregated Memory within A Unified Local-Remote Memory
+Hierarchy." USENIX ATC 2024, pp. 463-474. Retrieved 2026-06-05 from the
+official USENIX PDF:
+`https://www.usenix.org/system/files/atc24-zhong.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** disaggregated memory; CXL-like cache-coherent memory;
+RDMA-backed far memory; local cache filtering; sub-page caching; hotness
+fragmentation; page promotion; tiered memory; host/device-attached memory.
+
+**Core idea:** UniMem argues that cache-coherent disaggregated memory should
+not be treated as a simple larger NUMA node or as opaque swap. It splits the
+problem into three mechanisms: expose the remote memory pool directly in a
+unified local-remote physical address hierarchy, use a local accelerator-side
+cache that filters one-hit data from reusable data, and promote only fully-used
+hot pages from slower device-attached memory to faster host memory.
+
+The GPU DB transfer is not "put database pages in far memory." The stronger
+idea is that future tiers need different placement proof at each granularity:
+addressability at coarse allocation extents, cache filtering at sub-page or
+route-object granularity, and promotion only when the whole promoted unit has
+enough useful bytes to justify occupying the faster tier.
+
+**Concrete mechanisms:**
+
+- UniMem's Shadow-Region maps the entire remote memory pool into each compute
+  node's physical address space through PCIe BAR-style exposure. A CPU cache
+  miss to that range can be resolved by the cache-coherent accelerator without
+  a second fake-address to remote-address translation.
+- Remote-Balloon keeps an extent tree of remote memory allocations and uses
+  OS memory hot-plug and hot-unplug to online or offline remote ranges for a
+  specific compute node. Other nodes keep that range offline, so the design is
+  exclusive-allocation remote memory rather than shared-memory coherence across
+  writers.
+- Filter-Cache lives on device-attached memory as a cache for remote memory.
+  It uses active and inactive lists, with the active list allowed to occupy up
+  to 90% of cache space and the inactive list acting as a one-hit-wonder
+  filter.
+- A refault queue records remote addresses of evicted cache blocks. Refaulted
+  blocks can move directly into the active list, extending the observation
+  window beyond what the small inactive list alone can see.
+- UniMem uses 512-byte cache and swap blocks by default to reduce data
+  amplification relative to 4 KB page movement. The paper notes the tradeoff:
+  finer blocks reduce useless bytes but may increase miss count, metadata work,
+  and RDMA operations.
+- The fully-used page promotion scheme promotes pages from device-attached
+  memory to host memory only when both page hotness and low hotness
+  fragmentation indicate that the full 4 KB page is likely useful.
+- Hotness fragmentation is estimated from sub-page states. Sub-pages in the
+  active list score higher than sub-pages in the refault queue, and variance
+  across sub-page scores is used as the fragmentation signal.
+- Promotion is per process and batched. The paper assumes batches of 512 base
+  pages to amortize page-table changes, TLB invalidations, and shootdowns.
+- The evaluation is Pin-based simulation over CPU-cache-miss traces, not a
+  full hardware prototype. Workloads include Redis, YCSB-A/B on Redis,
+  Memcached Facebook ETC, PageRank on GraphLab, and Linear Regression on
+  Metis, with working sets from 4 GB to 40 GB.
+- Under the simulated parameters, UniMem reduces average memory access time by
+  33.4% versus Kona and 24.1% versus a Kona page-cache variation on average;
+  the largest reported AMAT reduction is 76.4% at 10% local-cache capacity.
+- Data amplification averages 2.6x working-set size for UniMem versus 20.6x
+  for Kona and 13.6x for Kona-PC. The benefit is strongest when local cache is
+  small and the access pattern has limited spatial locality.
+- Larger cache blocks reduce AMAT for some spatial workloads by acting like
+  prefetch, but can greatly raise data amplification; in YCSB-A, the paper
+  reports amplification rising from 2.8x to 74.2x as block size grows from
+  128 B to 4 KB.
+
+**GPU DB mapping:** UniMem fits P8 as a placement-policy paper. GPU DB should
+avoid treating future CXL, RDMA far memory, or host/device-attached memory as a
+single colder bucket. Placement metadata should distinguish at least four
+questions: whether an address range is available to this owner, whether a
+route-object fragment is worth caching at sub-page or sub-segment granularity,
+whether a whole page or segment is fully used enough to promote, and whether
+promotion is safe for the current visibility boundary.
+
+For GPU resident snapshots, the hotness-fragmentation idea maps to segment and
+column-group admission. A hot relation does not imply every column, predicate
+bitmap, text payload, or MVCC visibility side array deserves HBM. The route
+owner should compute useful-byte density per route family: equality lookup key
+vectors, selected payload columns, visible-row masks, text offset arrays, and
+compressed chunks may each need separate promotion scores.
+
+The Filter-Cache split suggests a cold-admission path for GPU DB's future
+tiers. First hits on a route shape, key range, or cold segment should land in a
+small probationary tier. Only refaulted or repeated shapes should move into a
+larger active resident tier. This is a useful guard against 1M logical sessions
+where many sessions may touch unique keys once and otherwise pollute HBM or
+pinned host buffers.
+
+Remote-Balloon maps to owner-granted placement rather than transparent
+allocation. A residency owner can allocate coarse extents in host memory,
+future CXL memory, or NVMe-backed staging, but execution workers should receive
+published handles only after the extent has a source WAL boundary, visibility
+boundary, and owner lease. That keeps Cherry Garcia's publication-state lesson
+and UniMem's allocation-control lesson aligned.
+
+For query latency, UniMem argues that promotion should not sit in the request
+critical path unless the batch amortization is explicit. GPU DB can promote
+route objects in refresh batches, warmup batches, or low-priority maintenance
+queues, while reads continue on the last published resident generation or CPU
+fallback. Promotion telemetry should report useful bytes, remote bytes fetched,
+misses avoided, promotion cost, and subsequent hit survival.
+
+**Risks and mismatches:** UniMem evaluates a simulated cache-coherent
+disaggregated-memory system, not a DBMS storage engine, GPU cache manager, or
+transactional tier. Its assumptions about CXL latency, RDMA fetch latency, and
+promotion cost should be treated as workload-shaping evidence rather than as
+hardware constants for GPU DB.
+
+The design allocates remote memory exclusively to compute nodes. It does not
+solve shared mutable pages, SQL snapshot visibility, WAL ordering, or
+multi-owner coherence. GPU DB should borrow the placement and filtering ideas,
+not the visibility model.
+
+Sub-page caching is attractive for reducing amplification, but GPU kernels and
+compressed column groups often prefer coalesced, vector-aligned chunks. The
+right unit for GPU DB may be a compressed block, key-vector tile, or route
+fragment rather than exactly 512 bytes.
+
+The fully-used page promotion logic depends on per-process page-cache
+observability and page migration. GPU DB's hot path is owner/ring based, so the
+equivalent signal should come from route telemetry and segment metadata, not
+from arbitrary OS page faults.
+
+**Benchmark candidates:**
+
+- Add a route-object probation benchmark: first-touch route fragments enter a
+  small probationary host tier; refaulted fragments move to active pinned host
+  or HBM residency. Measure HBM pollution, p50/p99 latency, and hit survival
+  under Zipfian plus one-hit session traffic.
+- Implement useful-byte-density scoring for resident segments. Compare whole
+  segment promotion, column-family promotion, and predicate-specific fragment
+  promotion. Gate: useful bytes per promoted byte must improve without breaking
+  snapshot correctness.
+- Measure promotion granularity for GPU-friendly chunks: 512 B, 4 KB, 64 KB,
+  compressed block, and key-vector tile. Track data amplification, kernel
+  coalescing, transfer count, route latency, and subsequent reuse.
+- Add a promotion-off-critical-path test. Reads should continue on the last
+  published generation or CPU fallback while a maintenance batch promotes a
+  hotter generation. Failure condition: unpublished or partially promoted
+  buffers become route-visible.
+- Prototype hotness-fragmentation telemetry for text columns: offsets,
+  payload bytes, prefix indexes, and visibility masks receive separate scores.
+  Gate: prefix queries do not promote full text payloads when offsets or prefix
+  slices are enough.
+- Compare DB-owned placement with OS-transparent tiering by replaying the same
+  route heat trace. Success criterion: DB-owned placement keeps route-critical
+  structures hot with lower amplification and fewer tail-latency spikes.
+
+### 2026-06-05 - Cross-paper synthesis: publication proof needs placement proof
+
+Recent entries now converge on a sharper rule for GPU DB: a route is not
+serviceable merely because its bytes exist. Serial Safety Net says a route must
+return dependency facts or safe-snapshot proof before serializable completion.
+Cherry Garcia says multi-artifact state needs a compact publication record so
+readers and recovery can distinguish prepared, committed, stale, and aborted
+artifacts. UniMem adds that route publication also needs placement proof:
+whether the promoted unit is hot, sufficiently dense in useful bytes, and
+stable enough to justify faster-tier space.
+
+The strongest design track is therefore a route certificate with three
+families of fields: visibility frontier, lineage/publication state, and
+placement score. A GPU retained route would name the source WAL boundary,
+snapshot or dependency mode, generation lineage, publication state, owner lease,
+resident byte families, useful-byte density, refault or reuse counters, and
+fallback tier. This keeps correctness and placement coupled without making the
+GPU tier durable truth.
+
+Category gaps remain around high-concurrency networking and admission after
+several MVCC/publication/tiering papers. The next high-value candidate should
+prefer runtime/session admission, network flow control, or transaction
+scheduling unless a newer MVCC or placement paper fills a clearly missing
+mechanism.
+
+Benchmark priority should move toward proof-carrying placement: combine an
+SSN-style retained-read certificate, TSR-like route-publication states, and
+UniMem-style probation/active placement into one synthetic workload. The gate
+is that no read observes an unpublished or uncertified generation, while
+one-hit sessions stop polluting HBM and hot repeated route shapes promote
+predictably.
