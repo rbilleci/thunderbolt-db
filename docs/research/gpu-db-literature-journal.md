@@ -70928,3 +70928,211 @@ telemetry shows bounded duration and interference.
   throughput without hurting foreground reads: run compute-heavy retained
   filters beside memory-heavy refresh or decompression chunks, then reverse
   the pairing and record when HBM contention makes colocation unsafe.
+
+### 2026-06-05 - L-Store stages write-optimized deltas into read-optimized pages by lineage
+
+**Citation:** Mohammad Sadoghi, Souvik Bhattacherjee, Bishwaranjan
+Bhattacharjee, and Mustafa Canim. "L-Store: A Real-time OLTP and
+OLAP System." arXiv:1601.04084v2, 2017; EDBT 2018 candidate queue
+context. Retrieved 2026-06-05 from `https://arxiv.org/abs/1601.04084`.
+
+**Category:** hybrid HTAP.
+
+**Relevance tags:** HTAP storage; lineage; base/tail pages; stable merge;
+snapshot visibility; append-only updates; resident refresh; cold historic
+tiers; update ranges; two-hop latest-version lookup.
+
+**Core idea:** L-Store keeps a single logical columnar storage architecture
+while separating stable read-optimized base pages from append-only
+write-optimized tail pages. Updates are not applied in place to data columns:
+they append new tail records for changed columns, update an embedded
+indirection pointer, and rely on a background merge to fold committed stable
+tail records into new read-only base pages. Each merged page carries its own
+lineage so the system can tell which tail records have been consolidated.
+
+The transferable idea for GPU DB is not "make every table columnar." It is
+that resident read snapshots can be refreshed by publishing new immutable
+pages from stable deltas while the write path keeps appending and publishing
+visibility independently. The refresh unit needs a lineage frontier, not just
+a dirty bit, so readers and refresh workers can prove which deltas are covered.
+
+**Concrete mechanisms:**
+
+- Base pages are compressed, read-only, columnar pages partitioned by record
+  range. Tail pages are append-only pages for updated columns in the same
+  range. Both base and tail records use record identifiers from the same key
+  space and are addressed through a page directory.
+- Each table has metadata columns including indirection, schema encoding,
+  start time, and last-updated time. The indirection column points from a base
+  record to the latest tail record and from tail records backward through
+  older versions. Schema encoding records which columns are present in a tail
+  record.
+- Reads reach the latest version in at most two hops when cumulative tail
+  records are maintained: index lookup lands on the stable base record, then
+  the reader follows indirection to the newest visible tail record if needed.
+  Without cumulation, readers may need to walk farther back through the tail
+  chain to reconstruct all requested columns.
+- Insert handling reserves an insert range of base RIDs plus aligned
+  table-level tail RIDs. New values are appended to table-level tail pages
+  and later transformed into stable base pages by a simplified merge.
+- The merge processes only stable data: read-only committed base pages and a
+  consecutive set of committed tail records. It creates new read-only merged
+  pages, swaps page-directory pointers, and leaves writers free to append new
+  tail records and update indirection pointers.
+- Each merged page tracks a tail-page sequence number, or TPS, that records
+  how many tail records have been applied. TPS lets readers detect whether
+  columns read from independently merged pages are at the same lineage point.
+  If not, the page can be brought to the desired snapshot by consulting tail
+  pages.
+- Historic tail pages that are already merged and outside all active query
+  snapshots are reorganized by base RID and version, then compressed. This
+  keeps time-travel data available while moving colder history to cheaper
+  storage.
+- The paper emphasizes update-range size as a locality and merge-amortization
+  knob. Smaller ranges improve locality for recent tail-page lookups; coarser
+  virtual merge ranges improve space utilization and compression.
+- Recovery is simplified because base pages are read-only and tail pages are
+  append-only. Tail pages need redo logging, not undo logging; aborted tail
+  records can be marked invalid and reclaimed later. The indirection column is
+  the exceptional in-place metadata column and can either be redo-logged or
+  rebuilt from tail records.
+- The prototype uses an optimistic concurrency-control model but presents the
+  storage layout as concurrency-control agnostic. It also proposes ownership
+  relaying to reduce exclusive-latch pressure for pageLSN maintenance.
+- In the evaluation, the Java prototype compares against in-place update plus
+  history and delta plus blocking merge. The reported results include up to
+  5.09x throughput improvement over in-place update plus history and 8.54x
+  over blocking merge under medium contention; up to 40.56x and 14.51x under
+  high contention; and up to 2.37x higher long-read analytical throughput
+  versus blocking merge in mixed workloads. Logging was disabled in the main
+  throughput comparison, which limits direct production interpretation.
+
+**GPU DB mapping:** P8 already treats GPU residency as an acceleration tier
+published as immutable read snapshots. L-Store suggests making the refresh
+contract more explicit: every resident segment should carry a source frontier
+and lineage frontier naming the WAL/transaction boundary and the stable delta
+range included in the device buffers. A mutation does not have to rebuild a
+resident segment immediately; it can append to a CPU delta/tail structure,
+invalidate or downgrade the old resident route, and let refresh publish a new
+immutable generation once stable deltas have been consolidated.
+
+The base/tail split maps naturally to GPU DB's hot table slice. CPU canonical
+MVCC state remains the authority, but P8 can add column-group base segments
+plus append-only delta vectors per partition. Retained reads can choose between
+base-only GPU routes, base-plus-delta GPU routes, or CPU fallback depending on
+whether the delta lineage is small enough to apply cheaply and whether the
+snapshot boundary is covered.
+
+TPS is the most important mechanism to borrow. A resident snapshot should not
+just say "valid." It should say "valid through generation G and delta frontier
+D for these columns." If columns or indexes refresh independently, every route
+certificate must verify compatible frontiers before executing. Otherwise a GPU
+route could combine a newly refreshed key vector with an older payload column
+and silently return a mixed snapshot.
+
+L-Store's stable-merge rule also protects foreground latency. Refresh workers
+should operate on immutable committed deltas and write new buffers, then publish
+by pointer/generation swap. They should not rewrite buffers that active GPU
+queries hold. Old GPU buffers, pinned host staging buffers, and CPU delta pages
+retire by reader epoch after all active snapshots release them.
+
+Historic tail-page compression maps to cold-tier design. Once a resident
+generation is superseded and no active query needs its exact delta chain, GPU
+DB can compact older deltas into compressed host/NVMe history while preserving
+time-travel or recovery support from WAL and CPU state. That should be an
+explicit tier transition, not an invisible garbage-collection side effect.
+
+**Risks and mismatches:** L-Store is a CPU in-memory HTAP storage design, not a
+GPU execution engine. It does not address CUDA kernel scheduling, HBM capacity,
+PCIe/NVLink transfers, GPU indexes, or device-side MVCC evaluation. Its "single
+representation" claim is also not the same as GPU DB's tiered reality, where
+CPU truth, CPU derived state, GPU resident buffers, and cold storage will all
+coexist by design.
+
+The paper's main evaluation disables logging across systems. That makes the
+relative storage-layout findings useful, but the absolute write-throughput
+claims should not override GPU DB's WAL-before-visibility requirement. The
+prototype is also Java on a 24-hardware-thread server, so hardware-scale claims
+need fresh measurement on the target CPU/GPU/NVMe stack.
+
+Cumulative tail records improve read hop count but can amplify write bytes
+when many columns have changed. GPU DB should not blindly copy cumulative
+deltas for wide rows or text payloads. It needs a measured choice between
+short lookup latency, delta-merge cost, write amplification, and device-transfer
+bytes.
+
+**Benchmark candidates:**
+
+- Add a lineage-frontier field to resident route certificates: table
+  generation, source WAL/transaction boundary, per-column delta frontier, and
+  resident index frontier. Proof gate: mixed-frontier column/index reads are
+  rejected or repaired before GPU execution.
+- Prototype a base-plus-delta retained read path for one int4 key table:
+  immutable GPU base segment plus a small CPU or GPU delta vector. Compare
+  immediate full rebuild, base-plus-delta apply, and CPU fallback under
+  varying update rates and read micro-batch sizes.
+- Benchmark refresh-by-stable-merge: append committed mutations into partition
+  deltas, build a new resident segment from stable base plus deltas, publish by
+  generation swap, and retire old buffers by epoch. Failure condition: refresh
+  blocks foreground writes or mutates buffers held by active readers.
+- Measure update-range size as a P8 knob: 4K, 16K, 64K, and table-wide delta
+  partitions. Track retained lookup p50/p99, scan throughput, refresh bytes,
+  compression ratio, and cache/TLB behavior.
+- Add a historic-delta compaction benchmark that demotes merged deltas to
+  compressed host/NVMe history while preserving snapshot/time-travel reads.
+  Proof gate: long readers keep their snapshot and newer readers use the
+  compacted lineage without seeing missing versions.
+- Compare sparse versus cumulative delta records for wide rows and text prefix
+  workloads. Gate: cumulative deltas may be admitted only when the reduction
+  in read hops beats write amplification and transfer bytes.
+
+### 2026-06-05 - Cross-paper synthesis: routes need ordered, profiled, lineage-certified publication
+
+The last three reviews point at the same runtime contract from different
+layers. ConWeave says dynamic routing needs an explicit ordering repair
+contract; Orion says GPU work needs resource-shape profiles before colocation;
+L-Store says refreshed read pages need lineage frontiers before publication.
+Together they argue that a GPU DB route is not just a selected operator. It is
+a proof bundle: ordering class, resource profile, snapshot lineage, and bounded
+fallback or rejection behavior.
+
+**Converging design tracks:** First, response routing and execution routing
+need separate certificates. A request may be free to execute on a fast retained
+snapshot worker, a GPU stream, or a CPU fallback lane, but the response writer
+still needs to enforce the session's protocol order unless the route class is
+declared reorderable. Second, GPU admission should use measured route profiles
+including kernel time, transfer bytes, memory footprint, and foreground versus
+background priority. Third, resident storage refresh should publish immutable
+generations with per-column and per-index lineage frontiers rather than a
+single coarse validity bit.
+
+The practical shape is a route certificate attached to every retained plan:
+`ordering_class`, `snapshot_generation`, `delta_frontier`, `resource_profile`,
+`priority`, `chunkability`, `fallback_policy`, and `retirement_epoch`. The
+scheduler can then decide whether work may bypass, colocate, refresh, or fall
+back without rediscovering invariants in each subsystem.
+
+**Category gaps:** The queue is well stocked on GPU execution and runtime
+scheduling. It still needs more modern OLTP/MVCC storage papers that connect
+write publication, snapshot retention, and recovery under high contention.
+There is also room for more query-optimizer work that treats queue delay,
+resident freshness, and tier placement as first-class plan risks rather than
+after-the-fact runtime events.
+
+**Benchmark priorities:**
+
+- Route-certificate conformance test: every retained read reports ordering
+  class, snapshot generation, delta frontier, resource profile, and fallback
+  policy. Missing fields fail admission.
+- Mixed-latency response-ring benchmark: let later retained hits complete
+  before earlier slow routes and verify protocol ordering, bounded reorder
+  buffers, and cancellation behavior.
+- Foreground/background GPU sharing benchmark: colocate retained reads,
+  refresh chunks, decompression, scans, and result scatter only when profiles
+  predict safe complementarity; reject or isolate unknown profiles.
+- Lineage-certified refresh benchmark: publish resident generations from
+  stable deltas by pointer swap, retire old buffers by epoch, and reject
+  cross-column or index/payload frontier mismatches.
+- Planner risk benchmark: compare routes that look cheap by scan cost alone
+  against routes that include queue delay, transfer pressure, refresh age, and
+  lineage compatibility.

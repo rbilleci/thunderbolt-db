@@ -1560,13 +1560,14 @@ Append new candidates here as each paper is processed.
   high-availability consensus; useful for comparing replica isolation,
   freshness, and performance predictability with GPU DB retained snapshot
   refresh.
-- `queued` — **L-Store: A Real-time OLTP and OLAP System**, Sadoghi et al.,
+- `reviewed` — **L-Store: A Real-time OLTP and OLAP System**, Sadoghi et al.,
   EDBT 2018.
   URL: `https://research.ibm.com/publications/l-store-a-real-time-oltp-and-olap-system`
   arXiv: `https://arxiv.org/abs/1601.04084`
   Why: TiDB contrasts L-Store's lineage-based single-engine HTAP design;
   useful for comparing contention-free staging, base/tail lineage, and
   historical query support with P8 stable-plus-delta resident generations.
+  Journal entry added 2026-06-05.
 - `queued` — **Updatable Learned Index with Precise Positions**, Wu et al.,
   PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p1276-wu.pdf`
@@ -1862,12 +1863,13 @@ Append new candidates here as each paper is processed.
   Why: FlexPushdownDB cites analytic query offloading as a near-storage
   pushdown direction; useful for comparing hardware-assisted pushdown and
   multiway SQL offload against GPU DB's explicit owner and tier boundaries.
-- `queued` — **L-Store: A Real-time OLTP and OLAP System**, Sadoghi et al.,
+- `reviewed` — **L-Store: A Real-time OLTP and OLAP System**, Sadoghi et al.,
   EDBT 2018.
   URL: `https://arxiv.org/abs/1601.04084`
   Why: Mainlining Databases contrasts L-Store's lineage/tail-page architecture
   with relaxed Arrow blocks; useful for evaluating lineage-based staging,
   historic visibility, and lazy columnar consolidation for retained snapshots.
+  Stale duplicate marked reviewed on 2026-06-05.
 - `queued` — **Real-Time LSM-Trees for HTAP Workloads**, Saxena et al.,
   arXiv 2021.
   URL: `https://arxiv.org/abs/2101.06801`
@@ -1945,6 +1947,12 @@ Append new candidates here as each paper is processed.
   Why: direct modern follow-up for causal consistency metadata and latency
   tradeoffs; useful for checking whether vector-clock or dependency-tracking
   snapshot frontiers can be latency-optimal under replicated retained reads.
+- `queued` — **DL-Store: A Distributed Hybrid OLTP and OLAP Data Processing
+  Engine**, Zhang, Sadoghi, and Jacobsen, ICDCS 2016.
+  URL: `https://doi.org/10.1109/ICDCS.2016.47`
+  Why: L-Store cites DL-Store as a distributed hybrid OLTP/OLAP follow-up;
+  useful for comparing lineage-style single-node base/tail publication with
+  distributed partitioning, freshness, and analytical routing.
 
 - `reviewed` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
   Control Schemes**, arXiv 2024.
