@@ -1009,12 +1009,19 @@ Append new candidates here as each paper is processed.
   layered filesystem designs; useful for evaluating whether GPU DB cold-tier
   placement should centralize data placement, caching, and failure recovery or
   keep them as explicit route-owned tiers.
-- `queued` — **HSM: A Hybrid Slowdown Model for Multitasking GPUs**,
-  Choi, Kim, and Eeckhout, ASPLOS 2020.
+- `reviewed` — **HSM: A Hybrid Slowdown Model for Multitasking GPUs**,
+  Zhao, Jahre, and Eeckhout, ASPLOS 2020.
   URL: `https://users.elis.ugent.be/~leeckhou/papers/asplos2020.pdf`
   Why: modern follow-up from the same GPU multitasking line that models
   cross-kernel slowdown; relevant to route resource-class calibration and
   conservative GPU co-scheduling.
+- `queued` — **Predicting and reining in application-level slowdown on
+  spatial multitasking GPUs**, Wei et al., JPDC 2020.
+  URL: `https://doi.org/10.1016/j.jpdc.2020.03.009`
+  PDF: `https://www.cs.sjtu.edu.cn/~leng-jw/resources/Files/wzhao_ipdps19.pdf`
+  Why: HSM compares against Themis/KSM-style neural slowdown prediction;
+  useful follow-up for contrasting low-counter hybrid models with learned
+  slowdown predictors and SM-allocation engines for GPU execution owners.
 - `queued` — **The Processing-in-Memory Model**, Kang et al., SPAA 2021.
   URL: `https://doi.org/10.1145/3409964.3461806`
   arXiv: `https://arxiv.org/abs/2105.04305`

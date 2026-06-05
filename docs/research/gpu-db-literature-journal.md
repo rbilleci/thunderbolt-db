@@ -60071,3 +60071,150 @@ credits could create hidden queue growth.
   selectivity, avoided H2D, avoided NVMe, merge rows/bytes, and fallback
   reason. Expected improvement: placement decisions explain observed latency
   better than raw resident byte count.
+
+### 2026-06-05 - HSM: A Hybrid Slowdown Model for Multitasking GPUs
+
+**Citation:** Xia Zhao, Magnus Jahre, and Lieven Eeckhout. "HSM: A
+Hybrid Slowdown Model for Multitasking GPUs." ASPLOS 2020, pp. 1371-1385.
+Retrieved 2026-06-05 from
+`https://users.elis.ugent.be/~leeckhou/papers/asplos2020.pdf`.
+
+**Category:** GPU execution / analytics, with runtime admission and
+resource-scheduling relevance.
+
+**Relevance tags:** GPU multitasking; slowdown prediction; SM partitioning;
+QoS; fairness; row-buffer hit rate; memory bandwidth interference; GPU
+execution owners; route admission; co-scheduling.
+
+**Core idea:** HSM tackles a specific problem in multitasking GPUs: two
+co-running kernels may use different mixes of SM compute and shared memory
+bandwidth, so even SM partitioning can be unfair or violate QoS. Pure
+white-box models that try to model every shared resource are too inaccurate
+on GPUs because thousands of outstanding requests overlap. Pure black-box
+models can be expensive and brittle. HSM combines a small set of GPU-specific
+white-box insights with a tiny learned component.
+
+The central observation is that compute-bound kernels scale roughly with
+allocated SM count, while memory-bound kernels depend on effective memory
+bandwidth. For memory-bound kernels, row buffer hit rate predicts the
+bandwidth utilization potential because row hits avoid activate/precharge
+overhead, and GPU memory controllers tend to preserve row-buffer locality
+even under co-running interference. HSM uses that signal to predict normalized
+progress and then repartitions SMs for fairness or QoS. In simulation, the
+paper reports 6.8% average slowdown-prediction error, versus 17.9% for DASE
+and 33.8% for Themis on its workload set. HSM-Fair improves fairness by 1.59x
+over even partitioning, while HSM-QoS improves system throughput by 18.9% on
+challenging mixed compute/memory-bound workloads while meeting the high-
+priority kernel's QoS target.
+
+**Concrete mechanisms:**
+
+- HSM predicts normalized progress, defined as shared-mode IPC divided by
+  private-mode IPC for the same kernel.
+- A classifier first separates compute-bound from memory-bound kernels. It
+  estimates bandwidth demand and compares it with predicted bandwidth
+  utilization potential.
+- For compute-bound kernels, predicted progress is the ratio of allocated
+  shared-mode SMs to private-mode SMs, assuming enough thread blocks exist to
+  use the allocation.
+- For memory-bound kernels, HSM predicts progress from current shared-mode
+  bandwidth utilization and predicted private-mode bandwidth utilization.
+- The private-mode bandwidth predictor uses row buffer hit rate as the main
+  signal and learns a linear relationship between RBH and bandwidth
+  utilization once per GPU architecture.
+- The model relies on five insights: GPU kernels are usually compute-bound or
+  memory-bound; compute-bound progress scales with SM count; memory-bound
+  progress tracks bandwidth; RBH determines effective DRAM bandwidth
+  potential; and shared/private RBH are often similar because GPU memory
+  controllers prioritize row hits.
+- The proposed hardware support records executed instructions, allocated SMs,
+  bandwidth utilization, memory requests, and row-buffer hits per co-runner
+  over short epochs.
+- HSM-Fair periodically compares predicted progress across co-runners. If
+  fairness is below a threshold, it removes SMs from the fastest-progressing
+  kernel and gives them to the slowest-progressing kernel.
+- HSM-QoS gives a high-priority kernel enough SMs to reach a target normalized
+  progress, then allocates leftover SMs to other kernels to improve system
+  throughput.
+- The paper argues SM partitioning indirectly manages memory bandwidth because
+  reducing a memory-bound kernel's SMs reduces its memory request injection
+  rate and memory-controller queue occupancy.
+- Evaluation uses a modified GPGPU-Sim with Ramulator and an 80-SM HBM-based
+  GPU model, plus sensitivity checks for GDDR5, memory-controller queue
+  length, row-hit capping, training-set choice, and four-program mixes.
+
+**GPU DB mapping:** HSM is useful for the GPU DB runtime as a route-class
+admission model, not as a complete execution scheduler. The current target
+has GPU execution owners that own CUDA streams, pinned buffers, scratch space,
+resident handles, and partition-local execution metadata. When retained
+lookups, scans, refresh kernels, compression/decompression, and over-resident
+IO kernels compete for the same device, the scheduler should not treat "one
+kernel per stream" or equal queue sharing as fair by default. A memory-bound
+resident scan can saturate HBM and delay a short lookup even if both appear to
+have separate stream slots.
+
+The transferable shape is a lightweight route resource certificate. Each GPU
+route should advertise or learn whether it is compute-bound, HBM-bound,
+transfer-bound, decompression-bound, or launch-bound, then record queue wait,
+kernel time, bytes moved, effective bandwidth, occupancy proxy, and co-runner
+slowdown. HSM's RBH counter may not be available through ordinary CUDA
+interfaces, but the design suggests an equivalent calibrated signal:
+effective bandwidth achieved at a given batch size and memory-access pattern,
+compared with the route's private baseline.
+
+For latency-sensitive retained reads, HSM-QoS maps to a priority lane. A small
+lookup batch or response-critical aggregate should get enough execution budget
+to meet a target progress or latency envelope before leftover GPU capacity is
+given to long scans, refreshes, or cold-tier kernels. This pairs with the
+runtime document's bounded GPU execution rings: co-scheduling should be
+conditional on measured slowdown, not only on queue depth.
+
+The paper also reinforces that memory-bandwidth management and SM allocation
+are coupled. In GPU DB terms, admitting too many same-shape lookup batches,
+refresh kernels, or decompression kernels can increase memory request
+pressure and hurt every co-runner. A route may need to reduce batch size,
+delay promotion, choose CPU fallback, or serialize with another route when
+the predicted slowdown would violate a retained-read or write-refresh SLA.
+
+**Risks and mismatches:** HSM is evaluated in simulation, not on production
+NVIDIA or AMD devices through commodity APIs. It assumes architectural
+support for per-kernel RBH and bandwidth counters plus SM partitioning control
+that may not be exposed to a user-space database. The workloads are GPU
+compute benchmarks, not SQL kernels with WAL, MVCC visibility, pgwire
+responses, cache refresh, or host/NVMe transfer stages. HSM predicts kernel
+slowdown, not end-to-end query latency, so GPU DB would need to include
+queueing, launch overhead, H2D/D2H transfer, CPU merge work, and snapshot
+retirement in the route model.
+
+The model's compute-bound versus memory-bound split may be too coarse for
+database kernels that change behavior with selectivity, compression ratio,
+string width, or result cardinality. RBH itself may be unavailable or less
+stable on current hardware and future memory systems. Any GPU DB adaptation
+must start as telemetry and admission policy, not as a correctness dependency.
+
+**Benchmark candidates:**
+
+- Build a two-kernel co-scheduling benchmark with retained point lookups,
+  resident scans, decompression, and refresh kernels. Measure private runtime,
+  co-run slowdown, HBM throughput, achieved occupancy, queue wait, and p99
+  query latency.
+- Add a route resource classifier for GPU work: launch-bound, compute-bound,
+  HBM-bound, transfer-bound, decompression-bound, and mixed. Gate: the
+  classifier predicts which route pairs can co-run without exceeding a
+  configured slowdown or latency budget.
+- Prototype HSM-QoS-style admission for retained reads: reserve a minimum GPU
+  execution budget for short high-priority routes and allocate leftover slots
+  to long scans or refresh. Failure condition: throughput improves while
+  retained-read p99 violates the target.
+- Compare equal stream admission, FIFO GPU queueing, static route classes, and
+  measured-slowdown admission under mixed lookup/scan/refresh workloads.
+  Required metrics: throughput, p50/p99, slowdown per route class, fallback
+  count, and GPU idle time.
+- Calibrate an RBH-free proxy using accessible telemetry: achieved bandwidth,
+  bytes per result row, memory coalescing pattern, batch size, kernel elapsed
+  time, and occupancy where available. Gate: the proxy is good enough to
+  reject harmful co-runs before p99 collapses.
+- Test batch-size throttling as a bandwidth-control knob. Expected result:
+  reducing a memory-bound scan or decompression batch can protect short
+  lookup latency with less throughput loss than disabling co-scheduling
+  entirely.
