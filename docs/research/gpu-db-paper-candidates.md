@@ -2286,7 +2286,7 @@ Append new candidates here as each paper is processed.
   Why: hardware-counter-guided page classification and dynamic page-size
   decisions compared against NOMAD; relevant to tier-placement telemetry,
   access-frequency sampling, and huge-page/subpage placement tradeoffs.
-- `queued` — **Larger-than-Memory Data Management on Modern Storage Hardware
+- `reviewed` — **Larger-than-Memory Data Management on Modern Storage Hardware
   for In-Memory OLTP Database Systems**, Ma et al., DaMoN 2016.
   URL: `https://doi.org/10.1145/2933349.2933358`
   PDF: `https://db.cs.cmu.edu/papers/2016/ma-damon2016.pdf`

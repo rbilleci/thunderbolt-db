@@ -58501,3 +58501,156 @@ or planner contracts to avoid bad rank orders.
   and compare against CPU-only execution. Required measurement:
   whether GPU launch and transfer overhead is amortized without hiding
   visibility or rollback cost.
+
+### 2026-06-05 - Larger-than-memory OLTP needs device-specific cold paths
+
+**Citation:** Lin Ma, Joy Arulraj, Sam Zhao, Andrew Pavlo, Subramanya
+R. Dulloor, Michael J. Giardino, Jeff Parkhurst, Jason L. Gardner,
+Kshitij Doshi, and Stanley Zdonik. "Larger-than-Memory Data Management
+on Modern Storage Hardware for In-Memory OLTP Database Systems."
+DaMoN 2016. Retrieved 2026-06-05 from the CMU Database Group PDF,
+`https://db.cs.cmu.edu/papers/2016/ma-damon2016.pdf`. DOI:
+`https://doi.org/10.1145/2933349.2933358`.
+
+**Category:** Multi-tier cache / data placement, with OLTP write-path
+implications.
+
+**Relevance tags:** anti-caching; cold tuple eviction; OLTP larger than
+memory; tombstones; Bloom filters; synchronous retrieval; abort and
+restart; merge threshold; count-min sketch; NVRAM; SSD; 3D XPoint; YCSB;
+TPC-C; TATP.
+
+**Core idea:** The paper treats larger-than-memory OLTP as a DBMS-owned
+placement problem rather than an operating-system paging problem. The
+main claim is not that one cold-data policy is universally best; it is
+that the retrieval, merge, block-size, and access-method choices must
+match the storage device. In H-Store with anti-caching, tuning those
+choices for HDD, SMR, SSD, 3D XPoint-like storage, and byte-addressable
+NVRAM improved throughput by 92-340% over a generic configuration.
+
+The strongest transferable lesson is that a hot in-memory OLTP path can
+survive data larger than memory only if cold access is explicit and
+observable. Virtual memory hides residency and can stall transactions at
+page-fault time. DBMS-owned cold metadata, retrieval policy, merge
+policy, and device-specific block sizing let the engine choose whether
+to stall, abort/restart, prefetch, or keep cold data out of the hot
+heap.
+
+**Concrete mechanisms:**
+
+- Cold tuple identification can be online, using per-tuple or sampled
+  access metadata, or offline, using log analysis. Online tracking gives
+  real-time eviction choices but adds hot-path overhead; offline analysis
+  lowers execution overhead but reacts only after log processing.
+- H-Store-style anti-caching keeps a tombstone in memory for each evicted
+  tuple. The tombstone records where the cold tuple lives and lets
+  indexes point at a small in-memory proxy instead of losing tuple
+  identity.
+- Hekaton/Siberia-style cold metadata can use per-index Bloom filters
+  rather than tombstones. This saves memory but can add false-positive
+  cold reads and requires filter checks during query execution.
+- OS virtual memory uses the least in-DB metadata, but the DBMS cannot
+  know whether an access will fault, cannot make transaction-aware
+  retrieval decisions, and cannot reliably bound latency.
+- Eviction timing can be threshold-driven by DBMS memory usage, delayed
+  by offline hot/cold analysis, OS-driven through paging, or manually
+  controlled through external table placement.
+- Cold tuple retrieval has two main policies. Abort-and-restart moves
+  cold reads out of the transaction critical path and works better for
+  high-latency devices and large sequential blocks. Synchronous retrieval
+  stalls the transaction but avoids abort/restart overhead and works
+  better for low-latency devices with smaller blocks.
+- The merge threshold decides whether a retrieved cold tuple is merged
+  back into the main heap, kept only in a temporary per-transaction
+  buffer, or merged only after becoming frequent enough. The paper uses a
+  count-min sketch to track access frequency for evicted tuples with
+  small memory overhead.
+- For byte-addressable NVRAM, the paper evaluates direct access through
+  a mapped persistent-memory file system rather than block-oriented
+  tuple migration. When persistent memory latency approaches DRAM,
+  tuple-to-block transformation and file-system-cache overhead become
+  material.
+- The recommended policy is hardware-dependent: large blocks plus
+  abort-and-restart for HDD/SMR; smaller blocks plus synchronous
+  retrieval and selective merge for SSD, 3D XPoint, and NVRAM; byte-level
+  access for NVRAM when available.
+- Evaluation uses YCSB, Voter, TPC-C, and TATP. The paper reports that
+  TATP benefits most from optimized policies because its less-skewed
+  access pattern and small tuples cause more cold accesses; TPC-C and
+  Voter show less gain when cold accesses are rare.
+
+**GPU DB mapping:** This maps directly to P8's explicit tier ownership.
+GPU memory should not behave like a transparent cache for CPU rows, and
+NVMe or future far memory should not behave like invisible backing
+store. The engine needs resident metadata that says whether a row,
+column group, partition, or snapshot segment is in HBM, CPU DRAM, a
+host-compressed warm tier, NVMe, or a future byte-addressable tier.
+
+For retained GPU snapshots, a tombstone-like proxy becomes a
+route-visible cold descriptor: table id, segment id, snapshot boundary,
+tier location, block or column-group address, and valid route families.
+A Bloom-filter-like summary may be useful for avoiding cold lookups, but
+false positives must be accounted for as route misses, not hidden stalls.
+The planner and runtime should see cold probability, expected retrieval
+bytes, and merge/admission policy before choosing a retained GPU route.
+
+The retrieval-policy distinction maps to route fallback. For slow NVMe
+or disk-backed cold segments, a read that misses HBM should often return
+an explicit queued/fallback path, prefetch asynchronously, or run on the
+CPU after admission rather than blocking a GPU execution owner. For low
+latency CXL/far memory or future NVRAM-like tiers, synchronous retrieval
+may be acceptable if bounded by route class and latency budget.
+
+The merge-threshold idea is especially relevant to refresh and promotion.
+GPU DB should not promote every cold segment touched by one query into
+HBM or even DRAM. A count-min-sketch-like cold-access counter per table,
+segment, key range, or column group could decide when repeated cold
+touches justify promotion, when temporary per-request staging is enough,
+and when cold data should remain cold.
+
+For writes, the paper reinforces that eviction and retrieval policy are
+part of transaction design. A cold tuple updated by a transaction may
+need to be merged or rewritten differently than a cold tuple only read by
+a snapshot. GPU DB must preserve WAL-before-visibility while still
+choosing whether a cold update installs into CPU canonical state, a warm
+segment, and eventually a refreshed GPU resident generation.
+
+**Risks and mismatches:** The system is H-Store anti-caching on a
+single-machine OLTP engine, not a GPU database with MVCC resident
+snapshots, SQL type semantics, GPU kernels, pgwire sessions, or
+over-resident CUDA execution. The hardware set is from 2016 and includes
+emulated 3D XPoint and NVRAM, so absolute timings do not transfer to
+current NVMe, CXL memory, or GPU Direct Storage.
+
+The tuple-granular anti-cache design may not fit GPU DB's first P8
+column-group resident layout. Tombstones for every row could be too much
+metadata if the hot path is vectorized segment scans, while block-level
+cold movement could be too coarse for point writes and lookups. The paper
+also focuses on single-partition transactions and does not address
+distributed commit, long MVCC readers, DDL invalidation, recovery replay
+of GPU-derived state, or GPU memory pressure.
+
+**Benchmark candidates:**
+
+- Build a P8 tier-miss simulator for retained lookup routes: HBM hit,
+  DRAM warm segment, NVMe cold segment, and CPU fallback. Compare
+  synchronous stall, explicit fallback, and async prefetch/admit policies.
+  Gate: every route reports tier, bytes, wait time, and fallback reason.
+- Add per-segment cold-access sketches for not-resident data. Promote only
+  when a segment crosses a configurable threshold; compare merge-all,
+  top-5%, top-20%, and read-only-temporary staging policies.
+- Sweep cold block or column-group size for point lookups and prefix
+  scans: 4 KB, 16 KB, 64 KB, 256 KB, and 1 MB. Measure p50/p99 latency,
+  host bytes read, H2D bytes, GPU queue wait, and wasted rows decoded.
+- Test write-touch behavior separately from read-touch behavior. A cold
+  updated row should prove WAL replay, CPU canonical install, resident
+  invalidation, and optional promotion without exposing a stale GPU
+  generation.
+- Compare metadata choices for evicted/resident-missing data: exact
+  segment descriptors, per-key tombstone-like row descriptors, and Bloom
+  filter summaries. Failure condition: a compact summary saves memory but
+  causes enough false-positive cold reads to dominate p99.
+- Re-run the policy matrix on current hardware once available: host DRAM,
+  NVMe, mmap, io_uring/SPDK-style reads, pinned staging buffers, and any
+  future CXL/far-memory tier. The useful result is policy shape, not raw
+  throughput copied from the 2016 devices.
