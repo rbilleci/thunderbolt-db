@@ -60218,3 +60218,161 @@ must start as telemetry and admission policy, not as a correctness dependency.
   reducing a memory-bound scan or decompression batch can protect short
   lookup latency with less throughput loss than disabling co-scheduling
   entirely.
+
+### 2026-06-05 - OCC batching makes commit order a bounded optimization problem
+
+**Citation:** Bailu Ding, Lucja Kot, and Johannes Gehrke. "Improving
+Optimistic Concurrency Control Through Transaction Batching and Operation
+Reordering." PVLDB 12(2), 2018, pp. 169-182. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol12/p169-ding.pdf`.
+
+**Category:** Transaction processing / write path and concurrency control,
+with runtime batching relevance.
+
+**Relevance tags:** optimistic concurrency control; semantic batching;
+operation reordering; validator batching; storage batching; feedback vertex
+set; tail latency; hot-key contention; bounded admission; write ordering.
+
+**Core idea:** The paper argues that batching should not be limited to
+low-level message packing or group commit. In an OCC system, the final
+serialization order is not fixed until validation, so a batch can be used as a
+small optimization window. Within that window, the system can reorder storage
+requests and validation order to reduce avoidable aborts caused by hot-key
+conflicts.
+
+The design has two main levers. Storage batching buffers reads and writes that
+arrive at storage, applies the highest-version write for each object first,
+then serves reads for that object so transactions avoid reading stale values
+that are already known to be obsolete. Validator batching collects validation
+requests, builds a dependency graph from intra-batch read-write dependencies,
+then chooses which transactions to abort so the remaining graph is acyclic and
+can be committed in a safe order. The exact minimum-abort choice maps to
+directed feedback vertex set and is NP-hard, so the paper uses greedy
+algorithms and policies.
+
+The evaluation reports that storage and validator batching consistently improve
+throughput under contention, with the full techniques improving throughput by
+up to 2.2x and reducing 99th-percentile latency by up to 71% in the
+decentralized OLTP-system experiment. The more important transferable result
+is not the absolute number; it is the shape of a bounded, semantics-aware
+reordering window that improves both throughput and tail latency when
+contention is concentrated.
+
+**Concrete mechanisms:**
+
+- The baseline OCC architecture separates processors, storage, and validators.
+  Transactions read from storage, execute against a private workspace, validate
+  read/write sets, then install writes if validation succeeds.
+- Storage requests are batched by object. For each object in a batch, the
+  storage layer applies the highest-version pending write and can discard
+  lower-version writes that have already been superseded, then processes reads.
+- Validator batching first removes transactions that already conflict with
+  previously committed work; those are non-viable regardless of intra-batch
+  order.
+- For the viable batch, the validator builds a directed dependency graph with
+  one node per transaction and read-write dependency edges derived by probing
+  write sets against read sets.
+- If the dependency graph is acyclic, a topological order gives a commit order.
+  If it has cycles, the validator chooses a feedback vertex set to abort,
+  leaving an acyclic graph for the survivors.
+- The exact minimum or weighted feedback vertex set is NP-hard and APX-hard,
+  so the paper proposes SCC-based greedy, sort-based greedy, and hybrid greedy
+  algorithms.
+- The sort-based greedy algorithm trims non-cyclic nodes, ranks vertices by a
+  policy, removes the top `k` candidates with Quickselect, then repeats. It is
+  less exact than SCC search but much cheaper in the reported experiments.
+- Policies can minimize abort count with degree heuristics, protect tail
+  latency by raising the priority of repeatedly restarted transactions, or
+  assign conflicting transactions to the same thread in decentralized
+  architectures to reduce inter-thread conflicts.
+- The prototype uses non-blocking processors, consumer-producer queues,
+  in-memory key-value storage, version-tagged reads and writes, a default
+  batch size of 40, and a sort-based greedy validator using a product-degree
+  policy.
+- The paper also sketches a parallel validator pipeline: dependency-graph
+  construction, transaction reordering, and validation/cache update can operate
+  on different batches or with multiple workers to reduce validator bottlenecks.
+
+**GPU DB mapping:** GPU DB should treat hot-write and retained-read batching
+as correctness-aware scheduling, not just kernel-launch amortization. The
+runtime already targets bounded mutation, read snapshot, GPU execution, and
+response rings. This paper suggests that a mutation-owner or partition-owner
+ring can drain a small batch, build a route-local conflict graph, and choose a
+commit/admission order that preserves WAL-before-visibility while reducing
+avoidable aborts or stale retained reads.
+
+For the write path, the closest mapping is a bounded hot-key write admission
+window. INSERT/UPDATE/DELETE commands that touch the same key, partition, or
+resident segment can be grouped under a microsecond or count ceiling. Within
+that window, superseded writes, incompatible updates, and repeatedly restarted
+transactions can be ordered deliberately before they enter WAL publication.
+Unlike the paper's storage layer, GPU DB cannot simply expose the newest write
+before durability; the reordering window must end with WAL append/flush and
+then visibility publication in the selected order.
+
+For retained reads, storage batching maps to "do not serve from a stale
+resident generation when a same-object write is already admitted but not yet
+published." If a mutation batch contains a write that will invalidate a
+resident segment, same-segment reads arriving behind it should either wait for
+the new visibility boundary, use an older valid snapshot only if their read
+timestamp allows it, or fall back explicitly. That is a route-certificate
+problem: each read needs the snapshot generation, source boundary, and pending
+mutation relation to be visible to admission.
+
+The feedback-vertex-set framing is useful for multi-step stored procedures or
+prepared write batches. If a batch's read/write sets are known or partially
+known, GPU DB can build a small dependency graph and choose which work to
+defer, abort, or send to a pessimistic fallback lane. Tail-sensitive policies
+map cleanly to retained reads and high-priority sessions: each retry or queue
+miss can raise priority so a hot transaction is less likely to be sacrificed by
+the next batch.
+
+Finally, the paper reinforces that batching has a sweet spot. Large windows
+give more reordering power but can add queueing delay and denser dependency
+graphs. GPU DB should make the batch window a measured budget per route class:
+hot writes, same-shape lookups, refresh/promotion work, and cold-tier requests
+should not share one universal batch size.
+
+**Risks and mismatches:** The paper assumes OCC with known read/write sets at
+validation time and a versioned datastore that can ignore older writes after a
+higher-version write exists. GPU DB's durable ordering is stricter: WAL must be
+the authority before visibility, and resident GPU state is only acceleration
+state. Any adaptation must preserve WAL-before-visibility, MVCC snapshot
+correctness, DDL invalidation, and replay.
+
+The storage-batching idea is easiest in a key-value model. SQL statements,
+indexes, range predicates, text predicates, foreign keys, and GPU-resident
+column groups create larger conflict surfaces than one object key. The paper's
+prototype uses in-memory key-value workloads, not pgwire sessions, SQL
+planning, GPU execution, NVMe tiers, or long retained analytical snapshots.
+
+Batching can also become a latency trap under 1M logical sessions. A validator
+window that waits for a large batch can hide overload, especially if graph
+construction grows with batch size and read/write set cardinality. GPU DB
+should implement the idea as bounded admission with explicit rejection,
+fallback, or priority aging, not as an unbounded queue.
+
+**Benchmark candidates:**
+
+- Add a mutation-owner simulation for hot-key OCC batches. Compare FIFO OCC,
+  count-bounded batching, microsecond-bounded batching, and degree/retry-aware
+  reordering. Gate: throughput improves without p99 inflation beyond the
+  configured latency ceiling.
+- Build a route-local dependency-graph benchmark for prepared transactions
+  with known read/write keys. Measure graph-build time, abort rate, retry
+  count, queue wait, and commit latency against no reordering and static
+  priority ordering.
+- Add a same-segment read/write admission test for resident snapshots: a read
+  arriving behind an admitted invalidating write must either bind to a valid
+  older snapshot, wait within a bounded budget, or fall back. Failure
+  condition: a stale resident generation is served after an invalidating write
+  is admitted for that read boundary.
+- Prototype retry-count priority aging for hot transactions and retained-read
+  refresh requests. Expected result: fewer starvation tails under contention
+  than pure degree/min-abort policies.
+- Measure batch-size sweet spots per route class: hot writes, point lookups,
+  resident refresh, and CPU fallback. Required metrics: p50/p99, abort rate,
+  WAL flush grouping, GPU queue wait, and fallback count.
+- Test "superseded write" elimination only after proving semantic equivalence
+  for simple primary-key upserts. Gate: PostgreSQL-comparator state and WAL
+  replay state match the unreordered path.

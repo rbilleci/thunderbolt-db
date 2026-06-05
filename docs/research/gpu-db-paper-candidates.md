@@ -4804,9 +4804,10 @@ Append new candidates here as each paper is processed.
   whether GPU DB route metadata, resident indexes, and queued intentions should
   expose data-structure-specific transaction hooks instead of generic tuple
   read/write validation only.
-- `queued` — **Improving Optimistic Concurrency Control through Transaction
+- `reviewed` — **Improving Optimistic Concurrency Control through Transaction
   Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
   URL: `https://doi.org/10.14778/3282495.3282502`
+  PDF: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
   Why: PLOR contrasts batching/reordering as a tail-latency-aware OCC
   direction; useful for deciding whether GPU DB hot-write admission should
   reorder compatible operations inside bounded latency ceilings instead of
@@ -4817,3 +4818,9 @@ Append new candidates here as each paper is processed.
   Why: PLOR cites Callas-style modular concurrency control as a mixed-protocol
   alternative; useful for comparing per-route concurrency-control modules with
   GPU DB owner domains, retained reads, and hot-write fallback lanes.
+- `queued` — **In-Network Support for Transaction Triaging**, Lerner et al.,
+  PVLDB 2021.
+  URL: `https://vldb.org/pvldb/vol14/p1626-lerner.pdf`
+  Why: modern follow-up for transaction admission before full execution;
+  useful for comparing engine-owned hot-key batching with earlier network or
+  gateway triage of likely-conflicting requests.
