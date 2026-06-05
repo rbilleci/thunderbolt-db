@@ -66580,3 +66580,126 @@ route compilation and fallback.
 - Make conflict lanes prove both abort reduction and tail-latency protection.
 - Treat any derived GPU/cold-tier route as unavailable unless its visibility
   proof and primitive budget are both within the route's latency class.
+
+### 2026-06-05 - CPU fallback scans need route-specific code shapes
+
+**Citation:** David Broneske, Andreas Meister, and Gunter Saake.
+"Hardware-Sensitive Scan Operator Variants for Compiled Selection Pipelines."
+In Datenbanksysteme fuer Business, Technologie und Web (BTW 2017), LNI
+P-265, pp. 403-412. Retrieved 2026-06-05 from the GI Digital Library handle
+`https://dl.gi.de/handle/20.500.12116/642` and PDF
+`https://dl.gi.de/bitstreams/6553ed86-57b6-4dad-a5ab-f8d25c646f2e/download`.
+
+**Category:** query optimization / planning; runtime / HFT / session scale.
+
+**Relevance tags:** compiled query pipelines; CPU fallback; scan variants;
+SIMD; predication; branch misprediction; selectivity; aggregation work;
+route-specific code generation; warm-tier scans.
+
+**Core idea:** The paper evaluates how a query compiler should choose among
+branching, predicated, SIMD, and predicated-SIMD scan pipelines when selections
+feed aggregation work. Its main lesson is that there is no single best scan
+loop. Predicate selectivity, the number of predicates, and the amount of work
+inside the loop change the winning implementation, and even the thresholds are
+hardware dependent.
+
+For GPU DB, the transferable point is not the exact 2017 Xeon threshold. It is
+that CPU fallback and warm-tier execution must be first-class route shapes
+rather than a single generic "not GPU" path. A resident GPU route may be
+wrong for a small, highly selective, branch-friendly query; a CPU SIMD route
+may be right for moderate selectivity; and a branchy loop may win when almost
+nothing passes the predicate or when aggregation work hides branch penalties.
+
+**Concrete mechanisms:**
+
+- The evaluated pipeline is a compiled scan over TPC-H `LineItem` scale factor
+  10, using less-than predicates and aggregation work inside the scan loop.
+  The table has about 60 million tuples, enough that scans exceed CPU cache
+  capacity.
+- The authors compare four single-predicate implementation families:
+  branching scan, predicated branch-free scan, SIMD scan that builds a mask
+  and branches over matching lanes, and predicated SIMD scan that masks
+  aggregate values and reduces vector registers.
+- For multi-predicate scans, the branching variant also has conditional-AND
+  short-circuiting and bitwise-AND evaluation choices. Conditional-AND can
+  skip later predicates when the first predicate is highly selective, but it
+  adds more branch behavior.
+- The amount of work inside the loop matters. As the number of aggregates
+  grows, branch-misprediction overhead is increasingly hidden by aggregation
+  work, so branching variants become more competitive.
+- For one predicate with aggregation work, the paper's decision tree chooses a
+  SIMD branching scan below roughly 0.05 selectivity for up to five aggregates,
+  ordinary branching for higher aggregate counts in the low-selectivity band,
+  and predicated SIMD for broader selectivity bands. Exact thresholds are
+  machine-specific.
+- For two predicates, conditional-AND is best when the first predicate is
+  extremely selective; otherwise predicated SIMD is often preferred when the
+  most selective predicate is not below the very-low-selectivity region.
+- For increasing predicate counts, SIMD becomes more attractive because it can
+  reuse vector-register predicate results. The paper reports that above four
+  predicates, SIMD branching consistently beats the bitwise-AND branching
+  scan in its setup.
+- Predicated variants are largely insensitive to selectivity because they do
+  the work for all tuples, while branching variants are selectivity-sensitive.
+- The authors explicitly warn that exact thresholds must be re-evaluated for
+  each CPU architecture.
+
+**GPU DB mapping:** This paper strengthens the planner side of the route
+certificate idea. A route should not only prove visibility, conflict shape, and
+primitive budget; it should also carry a code-shape choice for CPU and GPU
+execution: branchy CPU scan, predicated CPU scan, SIMD CPU scan, compressed
+warm-tier vector scan, resident GPU scan, or GPU lookup batch.
+
+The current P8 plan already distinguishes CPU tuple/index paths, CPU
+columnar/segment paths, GPU cold transfer, GPU resident scan, and GPU resident
+index paths. This paper suggests adding low-level scan features to those cost
+hooks: estimated selectivity, number of predicates, predicate ordering, number
+and type of aggregates, vector-width support, branch-misprediction risk, and
+whether the route needs grouped aggregation or scatter work that makes a
+predicated SIMD path less attractive.
+
+For retained reads, same-shape micro-batching should not erase this choice.
+If a batch contains many selective point or range predicates, grouping by
+snapshot and query shape is not enough; the runtime should also know whether
+the CPU fallback loop is branch-friendly or SIMD-friendly, and whether GPU
+launch overhead plus transfer/setup work beats a warmed CPU vector loop.
+
+The paper is also relevant to over-resident execution. Before pulling cold data
+to GPU, the planner should have a calibrated CPU warm-tier scan baseline. A
+GPU route that wins against a naive scalar CPU scan may still lose against the
+right compiled or vectorized CPU variant.
+
+**Risks and mismatches:** The evaluation is a ten-page BTW 2017 paper on a
+single Intel Xeon E5-2630 v3, GCC 5.1, one thread, and simple less-than
+predicates over TPC-H `LineItem`. It does not cover GPUs, MVCC visibility,
+nullable SQL semantics, string predicates, joins, DDL, WAL, or concurrent
+session admission. The exact thresholds are not portable, and the authors say
+they must be re-measured on new CPU architectures.
+
+The paper also notes that predicated SIMD is not directly applicable to
+grouped aggregations because it would require scatter operations. GPU DB
+should therefore avoid turning this into a blanket "predicated SIMD is good"
+rule. The value is the decision framework and benchmark shape.
+
+**Benchmark candidates:**
+
+- Add a CPU scan-variant microbenchmark for the first P8 `int4` slice:
+  branchy, predicated, SIMD/masked, and vectorized warm-column variants across
+  selectivity, predicate count, and aggregate count. Gate: route choice must
+  beat a fixed scalar baseline without changing SQL-visible results.
+- Add scan-code-shape fields to route telemetry: predicate count, estimated
+  selectivity, aggregate count/type, branchy versus predicated versus SIMD,
+  and fallback reason. Start as observation-only telemetry.
+- Compare CPU warm-tier vector scan against GPU resident scan and GPU cold
+  transfer for `COUNT`, `SUM`, and selective lookup-like filters. Failure
+  condition: a GPU route is selected when calibrated CPU fallback is faster
+  under the same visibility boundary.
+- Build a stale-estimate test where actual selectivity differs from planner
+  estimates. Require the route selector to report misprediction and optionally
+  switch variants on the next same-shape route.
+- For text prefix filters in P8, repeat the same route-shape benchmark with
+  prefix selectivity and string decoding cost, rather than assuming integer
+  predicate thresholds transfer.
+- Include grouped aggregation as a negative-control benchmark for predicated
+  SIMD and GPU scatter-heavy routes. The route should fall back or choose a
+  grouped-friendly implementation when scatter dominates.

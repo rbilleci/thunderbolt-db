@@ -615,9 +615,11 @@ Append new candidates here as each paper is processed.
   Why: Crystal highlights CPU fusion/vectorization limits on chained
   operators; useful CPU-side baseline before claiming GPU route wins for fused
   retained query shapes.
-- `queued` — **Hardware-Sensitive Scan Operator Variants for Compiled
+- `reviewed` — **Hardware-Sensitive Scan Operator Variants for Compiled
   Selection Pipelines**, Broneske, Meister, and Saake, BTW 2017.
   URL: `https://dl.gi.de/items/f0e4190e-8c26-4d8d-a46d-63e8c2a04569`
+  Handle: `https://dl.gi.de/handle/20.500.12116/642`
+  PDF: `https://dl.gi.de/bitstreams/6553ed86-57b6-4dad-a5ab-f8d25c646f2e/download`
   Why: ROF cites this as related work on compiled scan variants; useful for
   tuning CPU fallback and warm-tier scan routes before routing work to GPU.
 - `queued` — **One Loop Does Not Fit All**, Pantela and Idreos, SIGMOD 2015.
@@ -639,6 +641,18 @@ Append new candidates here as each paper is processed.
   Why: immediate predecessor to Fast Equi-Join that measures how older GPU
   join algorithms age across hardware generations; useful for separating
   hardware-refresh effects from algorithmic redesign in GPU DB benchmarks.
+- `queued` — **Rethinking SIMD Vectorization for In-Memory Databases**,
+  Polychroniou and Ross, SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2747645`
+  Why: hardware-sensitive scan variants cite modern SIMD selection work; useful
+  for calibrating CPU fallback, predicate-vector width, mask extraction, and
+  Bloom-filter-style prefilter routes against GPU resident scans.
+- `queued` — **Everything You Always Wanted to Know About Compiled and
+  Vectorized Queries But Were Afraid to Ask**, Kersten et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf`
+  Why: follow-up on compiled versus vectorized CPU query execution; useful for
+  deciding when GPU DB should rely on generated CPU fallback, vectorized warm
+  scans, or fused retained GPU routes.
 - `reviewed` — **High Performance Transactions via Early Write Visibility**,
   Faleiro, Abadi, and Hellerstein, PVLDB 2017.
   URL: `https://doi.org/10.14778/3055540.3055553`
