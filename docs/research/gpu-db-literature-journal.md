@@ -72439,3 +72439,138 @@ needs bounded probes, route-class fairness, and correctness-first invalidation.
 - Add a "tiny state" accounting gate for 1M logical sessions: idle sessions
   should not allocate route caches, active route caches should fit a fixed
   byte budget, and all route hints should be rebuildable from fresh feedback.
+
+### 2026-06-05 - Rethinking SIMD Vectorization for In-Memory Databases
+
+**Citation:** Orestis Polychroniou, Arun Raghavan, and Kenneth A. Ross.
+"Rethinking SIMD Vectorization for In-Memory Databases." SIGMOD 2015,
+pp. 1493-1508. doi:10.1145/2723372.2747645. Retrieved 2026-06-05 from
+`https://pages.cs.wisc.edu/~shivaram/cs744-readings/rethink-simd.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** SIMD; CPU fallback; warm-tier scans; selection pushdown;
+hash joins; Bloom filters; partitioning; cache-conscious execution; CPU/GPU
+route choice; predicate-vector execution.
+
+**Core idea:** The paper argues that in-memory analytical operators should be
+designed around explicit vector primitives rather than assuming ordinary scalar
+operators or horizontal SIMD tricks will use hardware well. It defines reusable
+operations such as selective load/store, gather, scatter, and selective
+gather/scatter, then applies them to selection scans, hash-table build/probe,
+Bloom filters, partitioning, radix sort, and hash joins.
+
+The strongest transferable point is that vectorization can change the best
+algorithm, not merely speed up an existing loop. Vertical vectorization
+processes one input key per SIMD lane and dynamically refills completed lanes,
+which differs from bucketized horizontal probing. For partitioned hash join on
+Xeon Phi, the fully partitioned design gets a 3.3x vector speedup and becomes
+the fastest variant, while no-partition and minimal-partition variants gain
+little. That is a warning for GPU DB planning: CPU fallback and warm-tier
+routes need operator-specific, layout-specific implementations before GPU
+speedups are treated as inevitable.
+
+**Concrete mechanisms:**
+
+- Selection scans evaluate predicates into masks and use selective stores to
+  materialize qualifying lanes. At very low selectivity, the implementation
+  stores qualifying tuple indexes in an L1-resident buffer, then gathers keys
+  and payloads only when flushing the buffer.
+- The branchless scalar selection baseline removes mispredictions but eagerly
+  reads payload columns and evaluates predicates. The paper therefore treats
+  selectivity and branch behavior as planner-visible route facts.
+- Vertical hash-table probing keeps each SIMD lane on a different input key,
+  gathers target buckets, selectively stores matches, and refills only lanes
+  whose key has finished probing. This avoids waiting for the worst lane in a
+  fixed W-key batch.
+- Vector hash-table build uses scatters, but first performs conflict detection
+  so multiple lanes do not write the same bucket. It can scatter unique lane
+  markers and gather them back, or use the key itself when input keys are
+  unique.
+- Interleaved key/value layouts pack adjacent key and payload data into wider
+  gathers/scatters, reducing random cache-line touches compared with separate
+  arrays.
+- Double hashing is used to avoid clustered duplicate-key regions when repeated
+  keys are stored inline, keeping bucket probes closer to true match counts.
+- Bloom-filter probing reuses selective loads/stores and reports 3.6-7.8x
+  speedup on Xeon Phi and 1.3-3.1x on Haswell in the paper's evaluated setup.
+- Partitioning covers radix, hash, and range functions. Histogram generation
+  can replicate counters per lane to reduce conflicts; range partitioning uses
+  vectorized binary search or range indexes; shuffling uses gathers/scatters
+  plus conflict offsets.
+- Buffered shuffling writes to cache-resident per-partition buffers before
+  flushing to output. On Xeon Phi, vectorized buffered shuffling reaches up to
+  2.85x over buffered scalar and uses up to 60% of copy bandwidth in the
+  reported experiment.
+- Radix sort and hash join are composed from the vectorized primitives. The
+  paper reports 2.2x radixsort speedup over state-of-the-art scalar code and a
+  3.3x speedup for fully partitioned hash join on Xeon Phi.
+- The GPU discussion is explicit about mismatch: SIMD lanes and GPU threads
+  resemble each other, but one-to-one translation is limited because GPUs hide
+  memory latency differently and may not need the same cache-conscious
+  partitioning.
+
+**GPU DB mapping:** This is primarily a CPU and planner paper, which is exactly
+why it matters. P8 treats GPU resident snapshots as acceleration state, but
+over-resident or invalidated routes still need a credible CPU/warm-tier
+fallback. A slow scalar fallback would make GPU DB look better in benchmarks
+while hiding a production risk. The engine should compare resident GPU scans
+against tuned CPU vector routes with branchless masks, selective materialization,
+index buffering, Bloom/predicate prefilters, and partition-aware hash joins.
+
+For retained equality lookups, vertical vectorization maps to GPU DB's
+same-shape micro-batching: each lane or request slot can carry an independent
+key, refill on completion, and scatter results by request id. The CPU version
+uses selective loads/stores and gathers; the GPU version would use warps,
+coalescing rules, and result compaction, but the scheduling invariant is the
+same: avoid letting one hard key or long probe stall the whole batch.
+
+For query planning, the paper suggests route descriptors should include
+selectivity, payload-column demand, branch predictability, resident/warm/cold
+placement, key uniqueness, hash-table load factor, and partitioning fanout.
+Those facts decide whether to run a CPU vector scan, CPU index/probe route,
+resident GPU scan, batched GPU lookup, or over-resident transfer route. They
+also decide whether to materialize full rows early or only compact row ids and
+fetch payloads after selectivity is known.
+
+For multi-tier placement, the L1-resident index buffer and cache-resident
+partition buffers are small analogues of P8's GPU/DRAM/NVMe tier boundaries.
+The engine should move compact row ids, masks, and predicates across expensive
+boundaries before moving text payloads or full tuples. This supports a warm CPU
+compressed segment route that can prefilter before GPU transfer.
+
+**Risks and mismatches:** The paper evaluates analytical operators, not OLTP
+transactions, MVCC validation, WAL-before-visibility, or PostgreSQL sessions.
+It is also a 2015 hardware paper centered on Xeon Phi and Haswell-era SIMD;
+absolute throughput and instruction choices will not transfer directly to
+modern AVX-512 CPUs or CUDA hardware.
+
+The authors explicitly warn that SIMD-to-SIMT translation is limited, so the
+GPU DB should not copy these loops into kernels mechanically. GPU kernels need
+their own coalescing, occupancy, divergence, and shared-memory measurements.
+The paper also assumes mostly in-memory column-oriented analytics. It does not
+address MVCC version visibility checks, long retained snapshots, cold-tier I/O,
+text-heavy SQL payloads, or write invalidation.
+
+**Benchmark candidates:**
+
+- Build a CPU warm-tier selection baseline with branchy scalar, branchless
+  scalar, and vector-style mask/compact implementations. Vary selectivity,
+  payload width, and predicate count before comparing with resident GPU scans.
+- Add a selective-materialization benchmark: compact row ids or tuple ordinals
+  first, gather payload columns only after the qualifier buffer fills, and
+  compare against eager payload transfer to GPU.
+- Implement a same-shape lookup micro-batch model that dynamically refills
+  completed request slots instead of waiting for the slowest key in a fixed
+  batch. Measure p50/p99 latency, throughput, and result-scatter overhead.
+- Compare CPU Bloom/predicate prefilter plus GPU transfer against direct
+  resident GPU scan and CPU-only scan for selective predicates. Failure
+  condition: transfer bytes or refresh cost dominate the saved GPU work.
+- For hash joins, benchmark no-partition, minimal-partition, and fully
+  partitioned routes on CPU fallback before adding GPU route claims. Gate:
+  planner must explain when partitioning fanout and payload materialization
+  change the winner.
+- Add route-cost fields for selectivity, projected payload bytes, key
+  uniqueness, hash load factor, partition fanout, and resident generation.
+  Minimum proof: route choice changes under synthetic workloads in the same
+  direction as measured operator latencies.

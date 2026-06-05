@@ -645,12 +645,14 @@ Append new candidates here as each paper is processed.
   Why: immediate predecessor to Fast Equi-Join that measures how older GPU
   join algorithms age across hardware generations; useful for separating
   hardware-refresh effects from algorithmic redesign in GPU DB benchmarks.
-- `queued` — **Rethinking SIMD Vectorization for In-Memory Databases**,
+- `reviewed` — **Rethinking SIMD Vectorization for In-Memory Databases**,
   Polychroniou and Ross, SIGMOD 2015.
   URL: `https://doi.org/10.1145/2723372.2747645`
   Why: hardware-sensitive scan variants cite modern SIMD selection work; useful
   for calibrating CPU fallback, predicate-vector width, mask extraction, and
-  Bloom-filter-style prefilter routes against GPU resident scans.
+  Bloom-filter-style prefilter routes against GPU resident scans. Journal entry
+  added 2026-06-05 using the accessible course PDF:
+  `https://pages.cs.wisc.edu/~shivaram/cs744-readings/rethink-simd.pdf`.
 - `reviewed` — **Everything You Always Wanted to Know About Compiled and
   Vectorized Queries But Were Afraid to Ask**, Kersten et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf`
@@ -5689,3 +5691,12 @@ Append new candidates here as each paper is processed.
   control as useful for reducing PFC generation but too delayed to eliminate it;
   useful for comparing end-to-end delay/rate feedback with GPU DB's local
   ring-pressure and credit signals.
+- `queued` — **Selection Pushdown in Column Stores using Bit Manipulation
+  Instructions**, Raghavan et al., SIGMOD 2023.
+  URL:
+  `https://www.microsoft.com/en-us/research/publication/selection-pushdown-in-column-stores-using-bit-manipulation-instructions/`
+  DOI: `https://doi.org/10.1145/3588913`
+  Why: modern compressed-column scan work using bit-manipulation and
+  SIMD-style mechanisms; useful follow-up after Rethinking SIMD for deciding
+  whether CPU warm-tier compressed scans can beat GPU transfer or resident
+  refresh on selective predicates.
