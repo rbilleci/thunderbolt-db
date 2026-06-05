@@ -3929,12 +3929,25 @@ Append new candidates here as each paper is processed.
   layout ideas; useful as the baseline for whether route-specific index
   construction should jointly optimize data layout, grid partitioning, and
   query workload rather than only adding a secondary resident index.
-- `queued` — **PACE: Poisoning Attacks on Learned Cardinality Estimation**,
+- `reviewed` — **PACE: Poisoning Attacks on Learned Cardinality Estimation**,
   Zhang, Zhang, Li, and Chai, PACMMOD 2024.
   URL: `https://doi.org/10.1145/3639292`
   Why: ICE treats estimator freshness and updateability as planner inputs, but
   route models also need robustness against bad or adversarial training/query
   feedback; useful for designing guarded learned route telemetry.
+- `queued` — **Detect, Distill and Update: Learned DB Systems Facing Out of
+  Distribution Data**, Kurmanji and Triantafillou, PACMMOD 2023.
+  URL: `https://doi.org/10.1145/3588929`
+  Why: PACE's VAE normality pressure shows simple distribution checks can be
+  modeled by an attacker; this related OOD-detection paper is useful for
+  comparing defensive workload gating, retraining, and route fallback policies.
+- `queued` — **AutoCE: An Accurate and Efficient Model Advisor for Learned
+  Cardinality Estimation**, Zhang et al., ICDE 2023.
+  URL: `https://doi.org/10.1109/ICDE55515.2023.00200`
+  Why: PACE suggests CE-model vulnerability varies by model family and
+  hyperparameters; AutoCE is a follow-up for choosing route-estimator families
+  by workload, robustness, and training cost instead of adopting one learned
+  model globally.
 - `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
   Learning**, Zhang et al., AIDB@VLDB 2020.
   URL:

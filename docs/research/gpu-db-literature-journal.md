@@ -55032,3 +55032,188 @@ serializability and replay evidence would be dangerous.
   and delete rows while retained GPU prefix scans and deterministic
   write batches run. Failure condition: a phantom anomaly appears
   because cross-lane validation only tracked point keys.
+
+### 2026-06-05 - PACE treats learned route models as poisonable state
+
+**Citation:** Jintao Zhang, Chao Zhang, Guoliang Li, and Chengliang
+Chai. "PACE: Poisoning Attacks on Learned Cardinality Estimation."
+Proceedings of the ACM on Management of Data 2(1), Article 37,
+SIGMOD/PACMMOD 2024. doi:10.1145/3639292. Retrieved 2026-06-05
+from the author PDF,
+`https://dbgroup.cs.tsinghua.edu.cn/ligl/papers/SIGMOD24-PACE.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** learned cardinality estimation; learned route
+models; query poisoning; optimizer robustness; anomaly detection;
+surrogate models; workload feedback; route guardrails; admission
+security.
+
+**Core idea:** PACE shows that learned query-driven cardinality
+estimators are not merely drift-prone; they can be intentionally
+poisoned through normal-looking query workload feedback. The attacker
+does not need database write privileges or white-box access to the
+estimator. If a DBMS updates a learned estimator from recently executed
+queries, a small crafted workload can move the model so that later
+target queries receive bad estimates and therefore bad plans.
+
+For GPU DB, the transferable idea is defensive rather than offensive:
+any learned CPU/GPU/tier route model trained from tenant query logs is
+mutable optimizer state. Route feedback should be treated like a
+visibility or cache-publication input with provenance, anomaly checks,
+bounded influence, and fallback rules. Fresh telemetry can improve
+route choice, but it must not be allowed to silently poison HBM
+admission, GPU batch sizing, CPU fallback, or response-buffer budgets.
+
+**Concrete mechanisms:**
+
+- PACE targets query-driven learned CE models that map encoded SQL
+  queries to cardinalities and are updated incrementally with newly
+  executed queries plus true cardinalities.
+- The attack is black-box. It first speculates the target CE model type
+  by comparing Q-error and inference-latency vectors for candidate
+  neural model families against the target model over generated test
+  queries.
+- After model-type speculation, PACE trains a surrogate model using both
+  the black-box model's estimated cardinalities and the ground-truth
+  cardinalities. The authors report this imitation strategy is more
+  effective than using black-box outputs alone.
+- A generator maps Gaussian noise into encoded poisoning queries. The
+  generator is optimized to maximize estimation loss after the surrogate
+  model is updated with the generated queries.
+- The optimization is modeled as a bivariate problem over generated
+  poisoning queries and the CE model parameters after update. PACE uses
+  a progressive update strategy so the generator and surrogate model
+  interact during training instead of fully retraining at each step.
+- To make poisoning queries look like the historical workload, PACE
+  trains a VAE anomaly detector on historical query encodings and pushes
+  generated queries toward low reconstruction error while preserving
+  poisoning effect.
+- The evaluation uses DMV, IMDB/JOB, TPC-H, and STATS/CEB-style
+  workloads, six neural query-driven CE model families, and Q-error plus
+  end-to-end query time metrics.
+- The paper reports that 450 poisoning queries, about 5% of the training
+  query count in its setup, are enough to reach most of the attack
+  effect; adding more queries gives little extra benefit in the shown
+  experiment.
+- Reported headline effects include up to 178x average learned-CE
+  accuracy degradation and up to 10x database end-to-end performance
+  degradation. The exact numbers should be treated as workload/model
+  evidence, not directly transferable GPU DB throughput predictions.
+- PACE also evaluates incremental retraining and reports that repeated
+  attack rounds remain effective after each incremental CE model update.
+- The authors list defensive directions: train detectors with generated
+  poisoning queries, compare CE model vulnerability, and apply similar
+  tests to other learned database components.
+
+**GPU DB mapping:** The planned route certificate should record whether
+cardinality, latency, queue-wait, and tier-placement estimates came from
+static DBMS statistics, measured telemetry, a learned model, or a
+recently updated learned model. A learned route estimate should not be
+allowed to independently certify a GPU-resident plan that risks HBM
+overflow, response-ring saturation, or stale snapshot use.
+
+PACE suggests a guardrailed feedback pipeline for route learning. Query
+logs first enter a quarantine window with tenant, role, query-shape,
+route-family, actual cardinality, actual bytes, queue delay, and
+fallback outcome. Before those samples update a model, the engine checks
+distribution distance against historical route families, influence on
+critical estimates, and whether the sample came from a workload class
+allowed to train shared models. Samples can train tenant-local or
+canary models before the production route model is promoted.
+
+For admission, GPU DB should treat unusual but syntactically valid
+query streams as potential model-pressure events. If many same-tenant
+queries shift learned selectivity, batch-size, or tier-cost estimates,
+the engine can slow model updates, pin routes to conservative DBMS
+statistics, or require a proof window before using learned GPU plans for
+latency-sensitive work.
+
+For benchmark design, PACE turns learned route correctness into a
+security and reliability problem. A GPU DB route predictor must be
+validated not only against natural drift but also against adversarial or
+accidental feedback loops: repeated lookups that train the model toward
+oversized GPU batches, narrow predicates that make HBM admission too
+eager, or cache-warming queries that distort hot-set estimates.
+
+**Risks and mismatches:** PACE studies cardinality estimation, not
+CPU/GPU route selection, MVCC visibility, WAL, GPU execution queues, or
+multi-tier cache placement. The attack machinery assumes differentiable
+query encodings and query-driven neural CE models; a hybrid rule-based
+route system with bounded learned hints would have a smaller attack
+surface.
+
+The paper's threat model allows an attacker to execute SELECT queries
+that later train the model. GPU DB can avoid some risk by separating
+training privileges, tenant-local feedback, canary models, and
+production model promotion. Those defenses are design choices not
+evaluated by PACE.
+
+The VAE anomaly detector is part of the attack, not a complete defense.
+It shows that simple distribution checks can be evaded if the attacker
+knows the workload family. GPU DB should combine distribution checks
+with influence limits, route-certification guardrails, and conservative
+fallbacks.
+
+**Benchmark candidates:**
+
+- Build a route-model poisoning harness. Feed crafted query sequences
+  into a learned or heuristic CPU/GPU route estimator and measure changes
+  in selected route, estimated rows, estimated bytes, GPU batch size,
+  HBM admission, queue wait, and p99 latency.
+- Add training-data provenance fields to route telemetry:
+  `sample_tenant`, `sample_role`, `query_shape`, `route_family`,
+  `actual_rows`, `actual_bytes`, `model_version`, `model_influence`, and
+  `promotion_state`. Proof gate: route decisions can be traced back to
+  the model version and training cohort that influenced them.
+- Prototype a conservative learned-route guardrail: a learned estimate
+  may improve ranking only inside hard DBMS-statistics, byte-budget, and
+  queue-budget envelopes. Failure condition: poisoning can make the
+  engine admit a plan that violates HBM, pinned-buffer, or response-ring
+  limits.
+- Test tenant-local versus shared model updates. One tenant issues
+  distribution-shaping reads while another tenant runs latency-sensitive
+  retained reads. Gate: the first tenant cannot degrade the second
+  tenant's route p99 without a recorded admission or model-quarantine
+  event.
+- Add a canary route-model promotion benchmark. New telemetry trains a
+  candidate model, but production routing uses it only after replaying a
+  fixed validation workload with bounded route changes. Failure
+  condition: a model can enter production after improving average error
+  while worsening high-risk GPU route decisions.
+- Use PACE-style anomaly pressure as an optimizer robustness test, not as
+  an implementation target. Generate unusual query-shape clusters and
+  assert that route certificates mark estimate confidence, OOD status,
+  and fallback reason explicitly.
+
+### 2026-06-05 - Cross-paper synthesis: route certificates need influence control
+
+The last set of reviews converges on one design rule: every fast route
+needs evidence about who can move its ordering, placement, isolation, and
+estimate state. Elle and IsoDiff make isolation evidence observable after
+the fact. TMTS shows that tier placement changes SLOs and therefore must
+be governed by hotness and slow-tier budgets. HDCC shows that mixed
+deterministic and optimistic write lanes need explicit cross-lane
+ordering and replay evidence. PACE adds the optimizer angle: learned
+route estimates are mutable state and can be shifted by workload
+feedback.
+
+The strongest design track is an influence-aware route certificate. A
+certificate should not only say "this query may use GPU route X." It
+should say which snapshot frontier, owner lane, tier placement, model
+version, training cohort, confidence/OOD state, and replay evidence made
+that route acceptable. That gives the runtime a compact place to reject
+routes that are too stale, too slow-tier-heavy, too cross-lane-conflicted,
+or too dependent on untrusted learned feedback.
+
+Category gaps after this batch are still runtime/session scale and
+storage-device scheduling. The queue has enough modern transaction and
+optimizer papers; the next useful picks should lean toward
+high-concurrency networking/admission or NVMe/ZNS/cold-tier write
+placement unless a clearly stronger MVCC/snapshot paper appears.
+
+Benchmark priority should move from isolated throughput to route safety
+under pressure: mixed Calvin/OCC replay, tenant-local learned-route
+poisoning, slow-tier noisy neighbors, and generated isolation histories.
+The proof gates should require explainable fallback or rejection, not
+just higher average throughput.
