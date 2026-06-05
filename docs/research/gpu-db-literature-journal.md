@@ -72724,3 +72724,146 @@ concurrent writes and retained reads: compact candidate row ids first, validate
 MVCC visibility second, move only selected payloads or ordinals across the
 CPU/GPU boundary, and reject the route if invalidation or feature gates make
 the staged proof stale.
+
+### 2026-06-05 - Vegito turns HA backups into fresh columnar HTAP replicas
+
+**Citation:** Sijie Shen, Rong Chen, Haibo Chen, and Binyu Zang. "Retrofitting
+High Availability Mechanism to Tame Hybrid Transaction/Analytical Processing."
+OSDI 2021, pp. 219-238. Retrieved 2026-06-05 from the USENIX page and PDF:
+`https://www.usenix.org/conference/osdi21/presentation/shen` and
+`https://www.usenix.org/system/files/osdi21-shen.pdf`.
+
+**Category:** hybrid HTAP.
+
+**Relevance tags:** HTAP freshness; multi-version columnar backups; stable
+epochs; log shipping; backup-based analytics; row-to-column refresh; read
+snapshot publication; recovery; index update batching.
+
+**Core idea:** Vegito observes that high-availability backups in distributed
+OLTP systems already receive fresh transaction logs, so one backup can be
+retrofitted into a multi-version columnar analytical replica instead of
+building a separate ETL or dual-layout HTAP path. Transactions execute on
+primaries, logs are synchronously shipped before commit as part of HA, and
+analytical queries read backup/AP replicas at a stable epoch.
+
+The paper's important design point is that freshness is not achieved by making
+the primary layout serve all workloads. Vegito keeps OLTP and OLAP workers on
+separate replicas and bridges them with epoch-assigned logs, parallel log
+cleaning, block-based multi-version column arrays, and batched index updates.
+In its CH-benCHmark evaluation on 16 machines, Vegito reports 1.9 million
+TPC-C NewOrder transactions per second and 24 TPC-H-equivalent queries per
+second concurrently, with about 5% OLTP slowdown, about 1% OLAP slowdown, less
+than 20 ms maximum freshness delay in the failure-free case, and less than
+60 ms recovery from cascading failures using the columnar backup.
+
+**Concrete mechanisms:**
+
+- Each machine has a transaction epoch. An epoch oracle periodically broadcasts
+  new epoch values, but does not assign timestamps per transaction or per
+  query.
+- Dependent distributed transactions synchronize the epoch across involved
+  machines during commit, after write locking and before read validation, so
+  epoch order respects dependencies and anti-dependencies.
+- Logs from different machines and worker queues can be drained in parallel
+  within the same epoch. Different backup machines do not need to clean at the
+  same pace.
+- Analytical queries read at `Epoch/Q`, the minimum cleaner epoch among the
+  machines involved, so a query sees a consistent stable prefix even while
+  cleaners continue applying newer logs elsewhere.
+- The backup/AP replica uses an epoch-level multi-version column store. The
+  naive chain design is cheap for writes but expensive for analytical scans;
+  the naive block design gives scan locality but copies too much data.
+- Row-split divides column values into pages and applies copy-on-write at page
+  granularity, so only pages changed in the current epoch get copied.
+- Insert-mostly tables avoid page copying by appending new values and keeping
+  per-epoch offsets.
+- Column-merge groups attributes that the same transaction type commonly
+  updates together into one page, using log-derived correlation statistics and
+  applying the reorganization at epoch boundaries.
+- For tree indexes on backup/AP replicas, inserts in an epoch are split into a
+  location phase and an update phase. The location phase appends values to
+  leaf interim buffers and updates counters; the update phase partitions the
+  tree into non-overlapping subtrees and applies batched inserts.
+- The backup/AP replica remains an HA backup. If it fails, it is rebuilt as a
+  columnar backup to the next epoch; if primary and backup/TP fail, the system
+  can rebuild a new primary from the surviving backup/AP instead of promoting
+  it directly.
+- The recovery policy favors OLTP: analytical queries touching failed machines
+  are aborted and retried after recovery unless all replicas carry enough epoch
+  metadata to suspend and resume long analytical queries.
+
+**GPU DB mapping:** Vegito is a useful shape for P8 retained snapshots. The
+GPU DB should treat a GPU resident snapshot more like a backup/AP generation
+than like a mutable primary layout: write authority stays with WAL and CPU
+truth, while a read-optimized generation is published at a stable boundary and
+retired independently.
+
+The stable-epoch idea maps to resident snapshot publication. A GPU read
+generation can be the minimum stable boundary across mutation owners,
+partition owners, catalog generation, and residency refresh workers. Freshness
+then becomes a measurable lag from committed WAL boundary to readable resident
+generation, not a vague "cache is valid" flag. That also gives a benchmarkable
+knob: epoch or refresh interval versus write slowdown, stale-read lag, and
+resident rebuild bandwidth.
+
+The row-split and column-merge mechanisms map directly to P8 segment design.
+For hot tables, rebuilding whole GPU column groups after every write is the
+bad block-copy extreme; chaining old versions through CPU metadata is the bad
+scan-locality extreme. A practical resident design should copy or rebuild only
+changed page/segment groups, append inserts into delta pages, and group
+columns that write together when refresh cost dominates query projection cost.
+
+The two-phase index update is relevant to resident key vectors and CPU/GPU
+route indexes. New keys for a refresh epoch can first accumulate in transparent
+per-leaf or per-partition buffers, then be merged into sorted resident
+structures in batched non-overlapping ranges. New readers use the next
+published generation; existing readers avoid conflict by staying on the old
+generation.
+
+Vegito also reinforces a recovery boundary for GPU DB. A resident GPU snapshot
+should be rebuildable acceleration state, but it may still be useful during
+failure recovery if it carries a coherent epoch and enough layout metadata.
+The engine should decide explicitly whether analytical/resident queries are
+aborted on owner failure, retried on a newer generation, or suspended and
+resumed. That choice needs to be documented and measured instead of falling
+out of cache invalidation behavior.
+
+**Risks and mismatches:** Vegito is a distributed in-memory CPU HTAP system,
+not a GPU database. Its backup/AP replica is main-memory columnar storage; it
+does not address GPU transfer, CUDA streams, pinned staging buffers, GPU
+memory pressure, or device-side indexes.
+
+The design assumes synchronous log shipping to backups is already part of the
+transactional HA protocol. GPU DB currently treats WAL/checkpoint/archive as
+durable truth and GPU residency as local acceleration, so adding backup-like
+generation semantics must not add hidden commit-time replication costs unless
+that is a separate HA goal. The epoch oracle and stable-minimum query epoch
+also need care under long GPU scans: a long reader should not freeze refresh,
+GC, or tombstone cleanup for fresh reads. Finally, Vegito's recovery policy
+aborts analytical queries on failure; that may be acceptable for short HTAP
+queries but may not be acceptable for long over-resident scans.
+
+**Benchmark candidates:**
+
+- Add a P8 refresh-lag benchmark: commit batches into CPU truth, publish
+  resident read generations at fixed intervals, and measure write throughput,
+  maximum freshness lag, rebuild bytes, and retained-read latency.
+- Compare three refresh layouts for a hot `int4`/`text` table: full column
+  rebuild, chain/delta lookup during scan, and page/segment copy-on-write with
+  append-only insert deltas. Failure condition: fresh retained scans require
+  traversing unbounded CPU version chains.
+- Add a column-correlation refresh experiment. Group columns updated together
+  versus projected together, then measure refresh bytes and query projection
+  bytes separately. Gate: the planner can explain when a write-correlated
+  group hurts read projection enough to split.
+- Prototype a two-phase resident index refresh: collect new keys into
+  partition-local interim buffers, publish old generation to current readers,
+  batch-merge non-overlapping ranges, then publish the next generation.
+  Minimum proof: no reader sees a partially merged index.
+- Track a stable-generation vector across mutation, catalog, residency, and
+  GPU execution owners. Route a retained read only when all required owners
+  have advanced to a compatible boundary.
+- Add recovery semantics for retained reads to benchmarks: abort-and-retry on
+  failed generation, retry on newer generation, or suspend/resume if enough
+  epoch metadata exists. Measure tail latency and correctness after simulated
+  owner or residency failure.

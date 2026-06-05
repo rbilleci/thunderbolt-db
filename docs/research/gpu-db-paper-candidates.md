@@ -1606,12 +1606,14 @@ Append new candidates here as each paper is processed.
   Why: G-Learned Index uses ALEX as a dynamic learned-index baseline; useful for
   comparing model-node expansion, update handling, and CPU fallback against GPU
   resident learned-index routes.
-- `queued` — **Retrofitting High Availability Mechanism to Tame Hybrid
+- `reviewed` — **Retrofitting High Availability Mechanism to Tame Hybrid
   Transaction/Analytical Processing**, Shen et al., OSDI 2021.
   URL: `https://www.usenix.org/conference/osdi21/presentation/shen`
+  PDF: `https://www.usenix.org/system/files/osdi21-shen.pdf`
   Why: ByteHTAP contrasts VEGITO's backup-based fresh HTAP design; useful for
   comparing log-apply replicas, block-based multiversion column layout, and
   high-availability/read-freshness tradeoffs against GPU DB resident snapshots.
+  Journal entry added 2026-06-05.
 - `queued` — **Real-Time LSM-Trees for HTAP Workloads**, Saxena et al.,
   arXiv 2021.
   URL: `https://arxiv.org/abs/2101.06801`
@@ -5709,3 +5711,10 @@ Append new candidates here as each paper is processed.
   Why: Selection Pushdown and Microsoft data-lake work point to a
   query-aware cache layer with push-down predicates and region caching; useful
   for GPU DB's warm/cold tier placement and cache-admission contract.
+- `queued` — **SyPer: Connecting the Pieces for Hybrid Transactional and
+  Analytical Processing**, Wang et al., PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p673-wang.pdf`
+  DOI: `https://doi.org/10.14778/3055540.3055545`
+  Why: Vegito contrasts SyPer as a snapshot/replica-style HTAP design; useful
+  for comparing virtual snapshot freshness, analytical isolation, and OLTP
+  degradation against backup-based and GPU-resident snapshot publication.
