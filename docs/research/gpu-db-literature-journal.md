@@ -58355,3 +58355,149 @@ conscious GPU joins.
   over-resident join, background refresh/checkpoint work, and skewed
   output. Pass condition: every fallback or delay is attributable to a
   named frontier, lane, or physical budget.
+
+### 2026-06-05 - Deferred runtime pipelining turns hot writes into ordered intentions
+
+**Citation:** Shuai Mu, Sebastian Angel, and Dennis Shasha.
+"Deferred Runtime Pipelining for Contentious Multicore Software
+Transactions." EuroSys 2019. Retrieved 2026-06-05 from the author
+PDF, `https://www.cis.upenn.edu/~sga001/papers/drp-eurosys19.pdf`.
+DOI: `https://doi.org/10.1145/3302424.3303966`.
+
+**Category:** Transaction processing / write path and runtime
+concurrency.
+
+**Relevance tags:** deferred execution; transaction pipelining;
+intentions; strict serializability; opacity; hot-key contention;
+early lock release; rank ordering; tame and wild transactions; STO;
+Silo; TPC-C.
+
+**Core idea:** DRP keeps the concurrency benefit of transaction
+chopping and runtime pipelining without requiring static analysis of
+the full workload. Instead of executing each operation as soon as the
+transaction body reaches it, DRP records operations as intentions:
+small deferred pieces of logic with explicit data dependencies. At
+commit time, the runtime acquires locks in rank order, appends the
+intentions to per-object queues, relaxes locks early, and lets the
+queued intentions execute once dependencies are satisfied.
+
+The important difference from ordinary optimistic retry is that a hot
+object can receive ordered future work without holding the lock for
+the whole transaction body. The paper reports up to 3.6x higher
+throughput than STO/TL2 on selected STAMP workloads, 6.6x higher
+throughput than OCC for a high-contention Silo/STO TPC-C variant, and
+3.3x higher throughput than IC3 at low contention. The evaluated
+machine is a 64-core CPU system, not a GPU system.
+
+**Concrete mechanisms:**
+
+- DRP separates transactions into tame and wild cases automatically.
+  Tame transactions know the objects they will access because their
+  operations can be deferred. Wild transactions still perform eager
+  reads or data-dependent work and therefore use a Wild-RP path closer
+  to OCC/TL2.
+- Every transactional object has a rank. Runtime pipelining acquires
+  locks in ascending rank order, tracks predecessor transactions, and
+  enforces commit order through those predecessor relationships.
+- A relaxed lock acts as a breadcrumb after the owner no longer needs
+  direct access to the object. Later transactions can acquire the
+  object while still preserving predecessor order.
+- An intention is queued under the object's lock, then the lock can be
+  relaxed before the intention actually executes. The intention may
+  depend on concrete values or on the result of earlier intentions.
+- Wild transactions use intentions for writes so they can pipeline lock
+  acquisition without causing cascading aborts. If certification fails,
+  the queued intentions are skipped rather than exposing dirty state.
+- The STO integration extends transactional objects with `Lock`,
+  `Unlock`, `Install`, optional `Rank`, optional `Relax`, and optional
+  `QueueIntention` hooks.
+- Deferred interfaces such as `defer_at` and `defer_update` collect
+  accesses in thread-local buffers during the transaction parse pass.
+  At commit, buffered items are processed by rank and installed into
+  intention queues.
+- The lock word is a 64-bit integer with bits for acquired/free state,
+  thread id, version metadata, and the added relaxed state. Commit
+  validation can use a global version for opacity.
+- Complex structures can expose finer-grained `TransItem` units so the
+  engine does not serialize an entire tree, map, or array when only a
+  row-level or node-level target is needed.
+- Rank tuning allows developers to put a custom rank above the default
+  object-address rank so high-value pipeline order can match the
+  workload's dependency shape.
+
+**GPU DB mapping:** DRP is useful for hot write templates and retained
+route maintenance because it decouples "know the operation" from
+"execute the operation now." A GPU DB write path could admit a batch
+of same-shape writes as route intentions: validate the command shape,
+name the affected row/key objects, order them by partition or key
+rank, append the write intentions into owner-local queues, and publish
+visibility only after the WAL and predecessor frontier prove safe.
+
+This maps naturally to the runtime document's fast/middle/owner lanes.
+The fast lane can keep ordinary retained reads and cold-key writes on
+cheap optimistic validation. The middle lane can convert recurring hot
+write templates into ranked intentions so the hot key's mutation queue
+stays ordered without retry storms. The owner lane remains the progress
+and correctness backstop for arbitrary SQL, DDL, large transactions,
+and transactions whose access set depends on values read at runtime.
+
+For MVCC, DRP's intention queue suggests a way to build placeholder
+versions before their payload is fully materialized: a queued intention
+can reserve a deterministic generation slot, but the version does not
+become visible until WAL-before-visibility, predecessor commit order,
+and snapshot metadata all agree. Failed certification should cancel the
+intention before any reader can observe the version. That is a better
+fit for GPU DB than exposing dirty reads merely to shorten locks.
+
+For GPU execution, the transfer is indirect but important. The GPU
+worker should not receive arbitrary divergent transaction logic. It
+should receive a compact intention vector: object ids or partition ids,
+operation family, dependency ids, expected visibility frontier, and
+result or rollback slots. That shape is much easier to micro-batch than
+general OLTP control flow, while still preserving a CPU-owned
+serializability proof.
+
+**Risks and mismatches:** DRP is a CPU transactional-memory and
+software-transactional-object protocol, not a database engine with SQL
+planning, WAL, MVCC visibility, pgwire sessions, indexes, and GPU
+resident caches. Its strongest correctness target is strict
+serializability or opacity inside STO; GPU DB also needs
+WAL-before-visibility, durable recovery, snapshot retention, DDL
+invalidation, and SQL result correctness.
+
+Deferred execution depends on being able to express operations as
+intentions. Many SQL transactions are wild: predicates, joins, trigger
+logic, constraint checks, or stored procedures may change their access
+set after a read. The paper's solution supports wild transactions, but
+the high-contention benefit is strongest when more of the workload is
+tame. Intention queues also add memory, dependency tracking, and
+retirement work; if every session creates unique wild intentions, the
+queue may become another hot object. Finally, rank tuning is a manual
+or workload-aware decision in the paper, so GPU DB would need telemetry
+or planner contracts to avoid bad rank orders.
+
+**Benchmark candidates:**
+
+- Prototype a hot-key write-template lane that records operations as
+  ranked intentions before owner execution. Compare pure OCC retry,
+  owner-serialized hot-key queue, and DRP-style intention queues.
+  Gate: identical committed rows, visibility boundaries, and WAL replay.
+- Add a tame/wild classifier for write routes: known key set,
+  known partition set, value-dependent key set, and arbitrary SQL.
+  Expected win: only tame or mostly tame routes receive GPU/middle-lane
+  batching.
+- Measure abort storms versus queue wait under Zipfian key contention.
+  Required metrics: abort count, predecessor wait time, owner queue
+  depth, intention queue length, p99 latency, and committed writes/sec.
+- Test placeholder MVCC versions backed by queued intentions. Proof
+  gate: no read snapshot can observe an uncommitted or canceled
+  intention, and recovery replay either reconstructs or discards the
+  placeholder deterministically.
+- For retained read invalidation, try DRP-style ranked intentions for
+  route metadata updates: invalidate segment, enqueue refresh, publish
+  new snapshot, retire old snapshot. Failure condition: rank order
+  reduces aborts but increases p99 due to dependency-chain waiting.
+- Feed GPU workers a compact intention vector for same-shape writes
+  and compare against CPU-only execution. Required measurement:
+  whether GPU launch and transfer overhead is amortized without hiding
+  visibility or rollback cost.

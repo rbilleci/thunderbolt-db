@@ -2666,7 +2666,7 @@ Append new candidates here as each paper is processed.
   Rebirth-Retire; useful for comparing active lock retirement, dirty
   dependency tracking, and hotspot write admission before adopting a
   passive-retire variant.
-- `queued` — **Deferred Runtime Pipelining for Contentious Multicore
+- `reviewed` — **Deferred Runtime Pipelining for Contentious Multicore
   Software Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
   URL: `https://doi.org/10.1145/3302424.3303966`
   PDF: `https://www.cis.upenn.edu/~sga001/papers/drp-eurosys19.pdf`
@@ -4103,7 +4103,7 @@ Append new candidates here as each paper is processed.
   Why: Adaptive HTAP contrasts runtime resource scheduling with hybrid access
   methods; useful for deciding when GPU DB should adapt physical route shape
   versus moving resources or freshness boundaries.
-- `queued` — **Deferred Runtime Pipelining for Contentious Multicore Software
+- `reviewed` — **Deferred Runtime Pipelining for Contentious Multicore Software
   Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
   URL: `https://doi.org/10.1145/3302424.3303966`
   PDF: `https://www.cis.upenn.edu/~sga001/papers/drp-eurosys19.pdf`
@@ -4685,9 +4685,18 @@ Append new candidates here as each paper is processed.
   Metadata: `https://www.dfki.de/en/web/research/projects-and-publications/publication/14419`
   Why: precursor to GaccO; useful for separating the early GPU OLTP execution
   argument from the later CPU/GPU co-execution and update-propagation design.
-- `queued` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
+- `reviewed` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
   Control Schemes**, arXiv 2024.
   URL: `https://arxiv.org/abs/2406.10158`
   Why: modern GPU OLTP concurrency-control comparison discovered while
   reviewing GaccO; useful for comparing GPU-friendly locking/OCC/MVCC choices
   before adopting large homogeneous transaction batches.
+- `queued` — **Transactional Data Structure Libraries**, Spiegelman et al.,
+  PLDI 2016.
+  URL: `https://doi.org/10.1145/2908080.2908111`
+  Author PDF:
+  `https://people.csail.mit.edu/idish/ftp/TransactionalLibrariesPLDI16.pdf`
+  Why: DRP builds on STO-style transactional objects; useful for deciding
+  whether GPU DB route metadata, resident indexes, and queued intentions should
+  expose data-structure-specific transaction hooks instead of generic tuple
+  read/write validation only.
