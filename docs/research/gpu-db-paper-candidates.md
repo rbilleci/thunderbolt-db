@@ -2565,14 +2565,25 @@ Append new candidates here as each paper is processed.
   Why: modern in-network/RDMA scheduling follow-up; useful for comparing
   switch-assisted scheduling against GPU DB's in-process route admission and
   for testing whether slice-aware scheduling maps to route lanes.
-- `queued` — **Releasing Locks As Early As You Can: Reducing Contention of
+- `reviewed` — **Releasing Locks As Early As You Can: Reducing Contention of
   Hotspots by Violating Two-Phase Locking**, Guo, Wu, Yan, and Yu,
   SIGMOD 2021.
   URL: `https://doi.org/10.1145/3448016.3457294`
+  PDF: `https://pages.cs.wisc.edu/~yxy/pubs/bamboo.pdf`
+  Code: `https://github.com/ScarletGuo/Bamboo-Public`
   Why: Bamboo/Wound-Retire is the direct baseline improved by
   Rebirth-Retire; useful for comparing active lock retirement, dirty
   dependency tracking, and hotspot write admission before adopting a
   passive-retire variant.
+- `queued` — **Deferred Runtime Pipelining for Contentious Multicore
+  Software Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
+  URL: `https://doi.org/10.1145/3302424.3303966`
+  PDF: `https://www.cis.upenn.edu/~sga001/papers/drp-eurosys19.pdf`
+  Why: Bamboo contrasts DRP's deferred execution and runtime
+  pipelining against active dirty-read lock retirement; useful for
+  deciding whether GPU DB hot-write templates should expose full
+  deferred operation graphs, retire locks opportunistically, or mix the
+  two per route class.
 - `queued` — **Dynamic Timestamp Allocation for Reducing Transaction
   Aborts**, Arora et al., IEEE CLOUD 2018.
   URL: `https://doi.org/10.1109/CLOUD.2018.00041`

@@ -55509,3 +55509,196 @@ proofs.
   shapes on HDD/SATA/NVMe-like profiles and assert that the route
   chooses device-sensitive batching, fallback, or warning states rather
   than assuming faster media automatically helps.
+
+### 2026-06-05 - Bamboo retires hotspot locks before transaction commit
+
+**Citation:** Zhihan Guo, Kan Wu, Cong Yan, and Xiangyao Yu.
+"Releasing Locks As Early As You Can: Reducing Contention of
+Hotspots by Violating Two-Phase Locking." SIGMOD 2021, pages
+658-670. doi:10.1145/3448016.3457294. Retrieved 2026-06-05 from
+the author-hosted SIGMOD PDF,
+`https://pages.cs.wisc.edu/~yxy/pubs/bamboo.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** hotspot contention; two-phase locking; dirty
+read dependency; cascading abort; Wound-Wait; lock retirement;
+active-window scheduling; WAL-before-visibility; hot-key admission;
+interactive transactions.
+
+**Core idea:** Bamboo targets transactions whose hot tuples are only
+a small part of total transaction work. Strict 2PL holds a hotspot
+lock until commit, and OCC often discovers the same contention only
+at validation. Bamboo instead lets a transaction retire a lock after
+its last write to that tuple, so following transactions can read the
+uncommitted value and continue while Bamboo records a commit
+dependency. The paper's central tradeoff is explicit: replace
+whole-transaction waiting with shorter hotspot serialization plus the
+risk and bookkeeping cost of cascading aborts.
+
+For GPU DB, the transferable idea is not to expose dirty data to
+ordinary SQL readers. It is to treat a hot write lane as an active
+dependency window. When a route can prove that a later operation
+depends only on a retired hot-key update, it may proceed behind a
+commit dependency instead of occupying a global mutation-owner wait
+slot. Visibility is still published only after WAL and dependency
+closure.
+
+**Concrete mechanisms:**
+
+- Bamboo extends Wound-Wait 2PL with a `retired` list in each lock
+  table entry beside `owners` and `waiters`. A transaction that has
+  finished writing a tuple can move from owner to retired while the
+  transaction continues to acquire locks elsewhere.
+- Transactions promoted while conflicting retired transactions exist
+  increment a `commit_semaphore`. They may execute against the dirty
+  value, but cannot commit until the depended-on retired transactions
+  clear.
+- `LockAcquire` wounds both active owners and retired transactions
+  when Wound-Wait priority requires it. `LockRelease` handles
+  cascading abort: if an exclusive-lock writer aborts, later dependent
+  transactions in the combined retired/owner order are notified to
+  abort.
+- `PromoteWaiters` moves compatible waiters into owners by timestamp
+  order and records dependency counts when those new owners conflict
+  with retired transactions.
+- `LockRetire` is optional per tuple and per transaction. If no route
+  calls it, Bamboo degenerates to ordinary Wound-Wait. This makes the
+  optimization tunable rather than a system-wide semantic mode.
+- Bamboo can place retire points by programmer annotation or static
+  analysis. Its analysis finds the last write to a tuple, synthesizes
+  conditions for later possible re-access, and uses loop fission for
+  fixed-iteration loops. If it cannot prove a useful retire point, it
+  can skip retirement.
+- The paper discusses phantom protection through next-key locking and
+  weaker isolation modes, but its main correctness claim is
+  serializability with dirty-read dependency tracking.
+- Optimizations include automatic retire for read operations, skipping
+  write retirement near the end of a transaction when little waiting
+  can be saved, eliminating some read-after-write aborts by reading
+  local copies, and assigning timestamps only when the first conflict
+  appears.
+- The implementation is in DBx1000 with stored-procedure and
+  interactive gRPC transaction modes. It compares Bamboo with
+  Wound-Wait, No-Wait, Wait-Die, Silo-style OCC, and IC3.
+- Reported results include up to 19x speedup on a single-hotspot
+  synthetic workload, up to 1.77x over Wound-Wait on highly skewed
+  YCSB at 64 threads, up to 5x for a YCSB mix with long read-only
+  transactions, up to 4x over the best TPC-C baseline in interactive
+  mode, and up to 1.5x over IC3 on a modified TPC-C workload where
+  payment and new-order truly conflict on a warehouse column.
+
+**GPU DB mapping:** The mutation owner in
+`11-high-throughput-query-runtime.md` currently preserves a simple
+WAL-before-visibility sequence. Bamboo suggests a future internal
+extension for declared hot-key write templates: split "hot-key value
+dependency is available" from "transaction is durable and globally
+visible." A dependent mutation batch could consume the retired value
+inside a private active window, but its route certificate must carry
+the dependency chain, abort propagation rule, and visibility barrier.
+
+This maps naturally to owner-domain rings. A hot-key owner can
+serialize only the short read-modify-write portion, publish a retired
+dependency token to the next compatible write, and let the remaining
+transaction work run on CPU workers or partition owners. The token is
+not a public snapshot. It is a commit-order dependency that expires
+only after WAL flush and commit/abort resolution.
+
+For retained GPU snapshots, Bamboo is a warning about invalidation
+timing. Early retirement may improve write throughput, but GPU read
+snapshots should not observe these uncommitted versions unless a
+special internal route proves the same dependency semantics. Ordinary
+retained reads should continue to use immutable committed snapshots.
+The useful P8 mapping is to shorten mutation-owner hotspot occupancy
+before refresh invalidation, not to make GPU cache state dirty-visible.
+
+The optional-retire design is important for route admission. GPU DB
+should enable dependency-window execution only for transaction shapes
+with bounded abort cost, known hot keys, and measured waiting pressure.
+When contention is low, when the hot operation is already near commit,
+or when user-driven aborts are frequent, the route should fall back to
+ordinary owner-serialized execution.
+
+**Risks and mismatches:** Bamboo deliberately reads uncommitted data
+inside the concurrency-control protocol. That is a sharp tool. It
+does not relax SQL visibility for normal reads, and GPU DB should not
+use it to bypass WAL-before-visibility or expose dirty GPU snapshots.
+
+The paper assumes tuple-level locks and a Wound-Wait-like lock
+manager. The current GPU DB architecture is owner/ring/MVCC oriented,
+so a direct lock-table transplant may fight the intended ownership
+model. The transferable unit is the dependency token and optional
+hotspot retirement policy, not necessarily per-tuple latch-heavy lock
+entries.
+
+Cascading aborts can waste work and amplify tail latency. Bamboo's
+evaluation argues the tradeoff is often favorable under hotspots, but
+the right GPU DB threshold depends on transaction shape, WAL flush
+latency, refresh invalidation cost, response bytes, and whether
+aborted work held GPU or pinned-memory resources.
+
+The retire-point analysis focuses on stored procedures and key-based
+tuple access. Ad-hoc SQL, predicates, range locks, triggers, and
+foreign-key checks would need stronger route-template proof before
+dependency-window execution is allowed.
+
+**Benchmark candidates:**
+
+- Build a synthetic hot-counter transaction lane with three policies:
+  strict owner serialization, optimistic restart, and Bamboo-style
+  retired dependency tokens internal to the mutation owner. Gate:
+  higher throughput under high skew while committed visibility and WAL
+  order remain identical to the strict baseline.
+- Add route-certificate fields for active dependency windows:
+  `retired_key`, `dependency_token`, `depends_on_txn`,
+  `commit_semaphore_count`, `cascade_abort_count`,
+  `dirty_window_us`, and `visibility_publish_txn`.
+- Stress cascading aborts with user-initiated aborts and injected WAL
+  failures. Failure condition: a dependent transaction commits after
+  its predecessor aborts, or an invalidated GPU snapshot is published
+  from a dirty dependency window.
+- Compare retire-near-end thresholds for prepared transaction shapes.
+  Expected result: retirement helps when hot-key work is early and
+  contention is high; it should be disabled when retire bookkeeping
+  costs more than saved wait time.
+- Test long read-only retained queries mixed with hot writes. Bamboo
+  suggests writes can avoid blocking each other on hotspots, but
+  committed read snapshots should remain abort-free and dirty-free.
+  Required metrics: writer throughput, retained-read p99, refresh lag,
+  invalidation count, and aborted-work CPU/GPU bytes.
+- Benchmark dependency-window admission against schedule-first OLTP
+  work already reviewed. The question is whether GPU DB gets more
+  value from predeclared schedule order, runtime lock retirement, or a
+  hybrid where only the hottest declared keys get Bamboo-style tokens.
+
+### 2026-06-05 - Cross-paper synthesis: admission needs pressure-shaped contracts across rings, IO, and hot keys
+
+The last three reviews converge on one design track: the runtime
+should stop admitting work based on coarse queue depth or static route
+labels alone. HPCC argues for precise in-flight telemetry and
+headroom-aware control loops; the storage-device mismatch paper shows
+that a cold-tier route must expose IO shape, flush cadence, and queue
+parallelism; Bamboo shows that a hot write route needs dependency and
+cascade-abort shape, not just a "write" label.
+
+For GPU DB, that points to route certificates as the shared control
+surface. A certificate should carry admitted work, retired work,
+resource budgets, flush epochs, and dependency windows. It should be
+small enough to attach to command and response rings, but rich enough
+to explain why a request was admitted, delayed, fell back, or
+rejected.
+
+The main category gap is still implementation proof for transaction
+routes that combine MVCC visibility with runtime admission. The
+journal now has plenty of GPU execution, tiering, and optimizer
+sources; the next high-value papers should keep leaning toward
+transaction scheduling, MVCC/visibility proofs, and hot-key write-path
+recovery.
+
+Benchmark priority should be an active-window harness: hold many
+logical sessions idle, drive a small hot set through read, write, WAL,
+NVMe, and response rings, and compare queue-depth-only admission
+against certificates that include in-flight bytes, flush epochs, and
+dependency tokens. A route passes only if p99 improves without
+weakening WAL-before-visibility, snapshot correctness, or abort
+propagation.
