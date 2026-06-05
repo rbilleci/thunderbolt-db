@@ -73178,3 +73178,182 @@ CPU/GPU/cold-tier stages, and validation distinguishes harmless
 anti-dependencies from true cycles. Benchmark pass/fail should track not just
 throughput, but bytes avoided, aborts avoided, ambiguous rows returned,
 generation lag, and the cost of every fallback.
+
+### 2026-06-06 - LiquidCache makes pushdown a cache-format problem
+
+**Citation:** Xiangpeng Hao, Andrew Lamb, Yibo Wu, Andrea
+Arpaci-Dusseau, and Remzi Arpaci-Dusseau. "LiquidCache:
+Efficient Pushdown Caching for Cloud-Native Data Analytics." PVLDB
+18(13), 2025, pp. 5662-5675. doi:10.14778/3773731.3773741.
+Retrieved 2026-06-06 from
+`https://www.vldb.org/pvldb/vol18/p5662-hao.pdf`.
+
+**Category:** multi-tier cache / data placement, with query pushdown and
+route planning relevance.
+
+**Relevance tags:** disaggregated cache; pushdown caching; Parquet;
+Arrow; DataFusion; encoding-aware filtering; selective decoding; late
+materialization; background transcoding; cache admission; warm/cold
+tier placement; network traffic reduction.
+
+**Core idea:** LiquidCache argues that in disaggregated analytical
+caches, filter pushdown is often limited by decoding cost rather than by
+predicate evaluation. Pushing filters to a cache server over Parquet can
+save network traffic, but it forces the cache server to decompress and
+decode Parquet before the cheap filter can run. Caching Arrow avoids
+decode cost but can multiply memory footprint. LiquidCache inserts a
+third representation: Parquet remains the compatible storage format,
+while the cache layer progressively transcodes accessed data into a
+cache-private Liquid format optimized for predicate evaluation.
+
+The key transferable idea is that a middle tier can own a physical
+format that is not the durable format and not the final execution
+format. The format exists only because it improves repeated route
+decisions at that tier. In the paper's ClickBench and TPC-H
+experiments, LiquidCache reports up to 10x lower cache CPU usage than
+Parquet pushdown without increasing memory footprint, and up to two
+orders of magnitude less network traffic than a non-pushdown file-server
+cache. The result is not that every filter should be pushed down; the
+paper explicitly shows non-selective filters can lose because filtered
+uncompressed output can exceed the compressed unfiltered input.
+
+**Concrete mechanisms:**
+
+- LiquidCache sits between compute nodes and object storage. Compute
+  nodes send pushdown work to cache servers over Arrow Flight; cache
+  servers return filtered batches while the rest of the query plan stays
+  on the compute node.
+- Pushdown is deliberately narrow: filters over one table without
+  expensive UDFs, projections, and inexpensive scalar aggregates such as
+  `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`. `DISTINCT` and hash-heavy
+  work stay on compute nodes.
+- Parquet bytes are cached on cache-local disk. Liquid data is cached in
+  memory by column batches of 8192 rows. Entries are keyed by file name,
+  row group, column index, and row number; the prototype uses a
+  column-level LRU and can spill evicted Liquid batches to disk with a
+  FlatBuffers-style representation.
+- The Liquid format is cache-private. It stores logical data in
+  filter-friendly encodings instead of requiring the Parquet ecosystem
+  to adopt a new durable file format.
+- String arrays use a cascade: dictionary encoding, bit-packed
+  dictionary keys, and FSST-compressed dictionary values. Integer arrays
+  use frame-of-reference normalization and FastLanes bit-packing.
+  Floating-point columns use ALP/PseudoDecimal-style compression where
+  applicable.
+- Encodings preserve independent element decodability, so filtering can
+  decode only selected elements rather than entire Parquet pages.
+- Late filter materialization applies earlier filter masks before
+  decoding later predicate or projection columns. The implementation
+  uses bit-mask operations, including bit deposit, to keep the mask
+  manipulation cheap.
+- Encoding-aware predicates can avoid materialization entirely. For
+  string equality, the search target can be encoded and compared against
+  encoded dictionary-key representations; prefix matching can stop after
+  dictionary-level materialization when the encoding supports it.
+- Transcoding is on demand and fine-grained. The cache converts only the
+  columns and batches touched by queries, and predicate pushdown can
+  avoid transcoding batches that will be filtered out.
+- Background transcoding hides conversion cost behind object-store or
+  network I/O. The cold query can proceed over Parquet/Arrow while the
+  cache prepares Liquid state for later hits.
+- The evaluation uses ClickBench queries over 15 GB / 100M rows and
+  TPC-H SF100 with an 8 GB cache. LiquidCache is compared against Arrow
+  pushdown, Parquet pushdown, and a Parquet file-server cache on a 10
+  Gbps CloudLab setup.
+- Known limitation: if selectivity is poor, pushdown can be worse than
+  shipping compressed Parquet because the pushed result is returned as
+  uncompressed or partially encoded data. The authors leave adaptive
+  pushdown based on cardinality estimation as future work.
+
+**GPU DB mapping:** LiquidCache maps directly to P8's unresolved
+question of what lives in each tier. GPU DB should not treat durable
+WAL/CPU tuples, warm host segments, and GPU resident buffers as one
+format with different addresses. LiquidCache suggests a tier-private
+format contract: every tier may transcode into a representation that is
+cheap for its local pushdown work, provided the durable source remains
+authoritative and invalidation is explicit.
+
+For GPU DB, a "Liquid-like" warm tier could sit between CPU MVCC truth
+and GPU resident snapshots. It would cache admitted columns or segments
+in a host-memory format optimized for cheap predicate proof, visibility
+summary checks, and transfer-size reduction. That cache does not need to
+be the durable table layout. It only needs a stable identity: relation
+generation, column set, segment id, WAL or visibility boundary, encoding
+chain, and fallback reason.
+
+The paper's per-batch encoding is useful for resident refresh. P8's
+first slice already builds column groups from CPU truth. A follow-up
+benchmark should let the warm tier transcode only the batches that
+recurring retained routes touch, then either run CPU-side encoded
+filters or transfer compacted candidate vectors to GPU. A resident GPU
+route can then choose among raw CPU scan, warm encoded filter, GPU
+resident scan, or rebuild/refresh based on bytes avoided and decode
+work avoided.
+
+LiquidCache also sharpens the route-planning contract. Pushdown should
+be admitted only when selectivity, compression ratio, output encoding,
+and cache pressure make the transfer smaller or latency lower. For GPU
+DB this becomes a route certificate: predicate support, visibility proof
+or ambiguity stream, estimated selectivity, compressed and uncompressed
+byte counts, queue pressure, and device memory pressure. Non-selective
+filters should stay compressed, stay on CPU, or bypass the GPU rather
+than expanding into a larger transfer.
+
+The background transcoding idea maps to residency refresh and tier
+warmup. When cold/warm reads are I/O-bound, the engine can use idle CPU
+to prepare GPU-friendly or warm-tier encodings without delaying the
+current request. This should remain best-effort and observable:
+transcoding may improve the next query, but the current query must have
+a correct ordinary path.
+
+**Risks and mismatches:** LiquidCache targets analytical data lakes with
+immutable Parquet files, not mutable OLTP tables. Its consistency story
+is file-catalog removal rather than MVCC row visibility, long readers,
+WAL-before-visibility, DDL generations, or per-row update chains. GPU DB
+cannot reuse the design without adding visibility boundaries and
+invalidation metadata to every cached batch.
+
+The prototype's LRU policy is intentionally simple and the authors call
+out better analytical cache management as future work. GPU DB should not
+copy LRU as the final resident or warm-tier policy. It also cannot
+always assume object-store I/O dominates transcoding; for host-memory or
+NVMe-hot paths, transcoding can become the bottleneck and must be
+budgeted.
+
+The strongest mismatch is output shape. LiquidCache returns filtered
+data to a compute node. GPU DB may need to return row ids, visibility
+ambiguous candidates, encoded values, or final pgwire rows depending on
+route stage. Treating all pushed output as uncompressed Arrow-like data
+would erase much of the benefit.
+
+**Benchmark candidates:**
+
+- Add a warm-tier encoded pushdown benchmark for retained filters:
+  baseline CPU tuple scan, CPU warm encoded filter, GPU resident scan,
+  and cold/NVMe segment scan. Measure decode CPU, transferred bytes,
+  p50/p99 latency, cache bytes, and fallback reasons.
+- Implement a route certificate for pushdown admission with selectivity,
+  compression ratio, projected output bytes, predicate support,
+  visibility proof state, and queue pressure. Failure condition:
+  non-selective filters expand traffic or latency versus compressed CPU
+  fallback.
+- Prototype background transcoding during I/O-bound reads. Gate:
+  current-request latency does not regress beyond a small threshold, and
+  repeat-query latency improves because the prepared encoding is reused.
+- Test per-batch warm encodings at 8192-row and P8 segment-sized
+  granularities. Measure whether smaller batches improve selective
+  decode enough to justify more metadata and eviction overhead.
+- Add encoded-predicate microbenchmarks for `int4` equality/range,
+  `text` equality, and prefix filters. Compare full decode, selective
+  decode, late materialization, and encoded comparison before deciding
+  which encodings to admit.
+- Add an MVCC ambiguity stream to warm-tier pushdown: provably visible
+  rows are filtered/compacted early, while ambiguous version-chain rows
+  return row ids or full records to CPU visibility resolution. Gate:
+  identical results under concurrent insert/update/delete and retained
+  snapshot reads.
+- Compare LRU against route-aware admission for warm/resident batches:
+  hottest bytes, highest bytes-saved-per-ms, freshness-sensitive
+  snapshots, and GPU-residency candidates. Reject any policy that
+  improves scan throughput while starving hot point lookups or refresh
+  work.

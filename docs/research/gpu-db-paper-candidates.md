@@ -3805,12 +3805,12 @@ Append new candidates here as each paper is processed.
   Why: discovered while chasing tiered-memory buffer-management follow-ups;
   variable-length mini-pages decouple cache granularity from disk pages and
   may inform GPU DB hot-record, warm-page, and cold-NVMe placement.
-- `queued` — **LiquidCache: Efficient Pushdown Caching for Cloud-Native Data
+- `reviewed` — **LiquidCache: Efficient Pushdown Caching for Cloud-Native Data
   Analytics**, Hao et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p5662-hao.pdf`
   Why: modern cache-placement follow-up from the same tiering research area;
   useful for comparing DB-owned cache admission and pushdown placement with
-  GPU DB resident, host, and cold-tier policies.
+  GPU DB resident, host, and cold-tier policies. Reviewed on 2026-06-06.
 - `queued` — **Making congestion control robust to per-packet load balancing in
   datacenters**, arXiv 2025.
   URL: `https://arxiv.org/abs/2509.07907`
@@ -5719,6 +5719,14 @@ Append new candidates here as each paper is processed.
   Why: Selection Pushdown and Microsoft data-lake work point to a
   query-aware cache layer with push-down predicates and region caching; useful
   for GPU DB's warm/cold tier placement and cache-admission contract.
+- `queued` — **ReCache: Reactive Caching for Fast Analytics over
+  Heterogeneous Data**, Azim, Karpathiotakis, and Ailamaki, PVLDB 2017.
+  URL: `https://infoscience.epfl.ch/record/232607/files/p375-azim.pdf`
+  DOI: `https://doi.org/10.14778/3157794.3157801`
+  Why: LiquidCache notes that simple LRU is weak for analytical cache
+  workloads; ReCache is a primary follow-up on workload-aware cache
+  replacement and layout adaptation that may inform GPU DB resident and
+  warm-tier admission policy.
 - `queued` — **SyPer: Connecting the Pieces for Hybrid Transactional and
   Analytical Processing**, Wang et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p673-wang.pdf`
