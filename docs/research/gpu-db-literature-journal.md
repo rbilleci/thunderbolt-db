@@ -69934,3 +69934,167 @@ GPU DB still needs measured route-specific overheads before acting on it.
   key-vector lookup, bitmap, and CPU fallback from workload stats plus tier
   budgets. Minimum proof gate: the selected route is explainable and never
   violates WAL-before-visibility or snapshot validity.
+
+### 2026-06-05 - NeurCC makes concurrency control a learned action table
+
+**Citation:** Hexiang Pan, Shaofeng Cai, Tien Tuan Anh Dinh, Yuncheng
+Wu, Yeow Meng Chee, Gang Chen, and Beng Chin Ooi. "Modeling
+Concurrency Control as a Learnable Function." arXiv:2503.10036v4,
+2026. Retrieved 2026-06-05 from `https://arxiv.org/abs/2503.10036`.
+
+**Category:** transaction processing / write path and concurrency
+control.
+
+**Relevance tags:** adaptive concurrency control; hot-key contention;
+operation-level CC actions; learned admission; workload drift; stored
+procedures; interactive transactions; serializability; owner-domain
+write routing.
+
+**Core idea:** NeurCC treats a concurrency-control algorithm as a
+function from cheap database state to conflict-handling actions. Instead
+of choosing one fixed protocol such as 2PL, OCC, Silo, IC3, or
+Polyjuice, it decomposes CC into action dimensions: conflict detection,
+timeout, priority, pipeline-wait barriers, and whether uncommitted
+writes may be exposed. The learned function is executed as an
+in-database lookup table so the hot path pays a table lookup rather than
+model inference.
+
+The paper's strongest claim is that CC choice should adapt at
+operation granularity under workload drift, but only with extremely
+cheap state features. In the reported Silo-based implementation,
+NeurCC outperforms Polyjuice, 2PL, and Silo by up to 3.32x, 4.38x, and
+4.27x respectively in stored-procedure YCSB-extended experiments, and
+optimizes about 11x faster than Polyjuice in the reported TPC-C
+optimization-time comparison. The paper also evaluates interactive
+transactions, where dirty reads and partial retry are disallowed because
+users may already have observed operation results.
+
+**Concrete mechanisms:**
+
+- Each operation collects a compact state vector from lock-free or cheap
+  features: number of executed SQLs, whether dirty data has been read,
+  transaction type, access ID, current operation type, data hotness,
+  number of dependent transactions, number of running transactions, and
+  out-degree in the dependency relation.
+- A feature selector maps the full feature vector to a smaller state so
+  the action table remains compact and optimization remains tractable.
+- The learned action table maps each state to conflict detection
+  (`no detection`, `detect critical`, or `detect all`), timeout,
+  priority, per-transaction-type pipeline-wait parameters, and an
+  `expose` bit for dirty-write visibility.
+- `no detection` behaves optimistically and relies on commit-time
+  validation. `detect all` behaves pessimistically and can block or
+  abort on all conflicts. `detect critical` performs early validation or
+  pipeline waits for conflicts likely to create aborts or dependency
+  cycles.
+- Transactions keep local read/write sets, dependencies, transaction
+  type, and operations needing validation. Operations track key, type,
+  whether they read clean data, and conflict priority.
+- Stored procedures may use dirty reads, pipeline waits, and dirty write
+  exposure because their operation sequence is known and results are not
+  returned before commit. Interactive transactions cannot use those
+  actions, so the action space is constrained for correctness.
+- Before exposing dirty writes, NeurCC performs early validation to
+  reduce cascading aborts. It also performs an OCC-like commit protocol:
+  wait for dependent transactions, abort if a dirty-read dependency
+  aborted, lock the write set, validate reads against latest committed
+  versions, then clean and publish writes.
+- Function updates are non-blocking. A transaction chooses the latest
+  function at transaction start; old functions remain available for
+  already-running transactions, and loading a new table completes with an
+  atomic pointer update.
+- Workload drift detection is throughput-threshold based in the paper's
+  implementation, using a 10% threshold chosen empirically. More advanced
+  drift detectors are explicitly left outside the paper's core scope.
+- Optimization decomposes the table into timeout, detection/priority, and
+  pipeline-wait sub-functions. It uses Bayesian optimization with a
+  Gaussian-process surrogate for expensive throughput evaluation and a
+  graph-reduction search for pipeline waits.
+- The correctness argument serializes committed transactions by their
+  commit-time serialization point after write-set locking and read-set
+  validation. Learned actions can change waiting, early abort, and dirty
+  exposure choices, but committed schedules are still validated to be
+  serializable.
+
+**GPU DB mapping:** This is directly relevant to the mutation-owner and
+route-admission model. GPU DB should not hard-code a single write-path
+conflict policy for all operations. A short retained read, hot-key
+update, COPY chunk, refresh transaction, metadata mutation, and
+multi-partition stored procedure can expose different cheap state and
+therefore deserve different conflict/admission actions.
+
+The transferable design is the table, not necessarily the learning
+algorithm. GPU DB can start with a hand-tuned action table keyed by route
+class, owner partition, key hotness, queue depth, snapshot age, operation
+position, and whether the route is stored-procedure-like or interactive.
+Later, optimizer or offline learning can tune the entries. That keeps the
+hot path explainable and bounded while still allowing adaptive behavior.
+
+NeurCC's stored-procedure versus interactive split maps cleanly to
+pgwire behavior. Stored procedure, prepared batch, or server-side
+transaction routes can use more aggressive pipeline waits, partial
+retry, or intra-batch visibility because no intermediate result has been
+delivered to the client. Interactive SQL must use stricter actions: once
+a statement result is visible to the user, dirty reads and partial retry
+become much harder to make safe.
+
+For GPU batching, the action-table idea suggests an admission certificate
+for hot write batches: route type, key-hotness bucket, dependency count,
+owner queue depth, active snapshot class, and GPU refresh debt choose
+among optimistic enqueue, early validation, wait, priority promotion,
+deterministic batch lane, CPU fallback, or rejection. The table should
+not replace WAL-before-visibility or MVCC validation; it should choose
+when to spend validation, waiting, and batching work.
+
+The non-blocking function-update mechanism also maps to route metadata.
+Planner routes, conflict policies, and resident admission policies should
+be versioned. Running transactions keep the policy version they started
+with, while new transactions atomically observe a newer table. This is
+the same shape as catalog generation, route certificate, and retained
+snapshot publication.
+
+**Risks and mismatches:** The paper is an arXiv preprint as retrieved,
+not a conference paper in the candidate's primary venue list. The
+implementation is CPU/Silo-based and evaluated on a 24-core server, not a
+GPU database. The learned state space excludes expensive features such as
+full conflict graphs, which is good for latency but may miss GPU-specific
+resource state unless GPU DB carefully summarizes it. The strongest
+actions, especially dirty reads, dirty-write exposure, and partial retry,
+apply only to stored procedures; using them for interactive pgwire would
+violate user-visible semantics. Throughput is the paper's main
+optimization objective, so tail latency, memory pressure, WAL flush cost,
+and GPU refresh fairness would need separate objectives or guardrails.
+Finally, a learned table can choose bad policies under unobserved
+workloads unless bounded by deterministic correctness and overload rules.
+
+**Benchmark candidates:**
+
+- Build a hand-tuned conflict-action table for mutation-owner admission:
+  route class, hotness bucket, owner queue depth, transaction mode,
+  dependency count, and snapshot class map to optimistic enqueue, early
+  validation, wait, priority promotion, deterministic batch lane, fallback,
+  or reject. Gate: identical SQL-visible results and WAL-before-visibility
+  under all actions.
+- Add separate stored-procedure-like and interactive transaction
+  benchmarks. Failure condition: any policy that reads dirty state or
+  partially retries a transaction after an intermediate pgwire result has
+  been returned.
+- Measure hot-key write contention with fixed OCC, fixed pessimistic wait,
+  deterministic batch lane, and table-selected actions. Required metrics:
+  throughput, aborts, p50/p99 latency, queue wait, WAL flush wait, and
+  fairness across low- and high-priority sessions.
+- Version route/conflict policy tables and update them atomically while
+  transactions are running. Proof gate: a transaction uses one policy
+  version from start to finish, and policy retirement waits for all
+  holders to finish.
+- Add drift probes that change skew, read/write ratio, and active session
+  count while logging which action-table entries are hit. Compare static
+  policies with periodic offline retuning before adding online learning.
+- Extend route certificates with cheap conflict/resource features only:
+  hotness bucket, dependency count, queue depth, snapshot age, refresh debt,
+  and pinned-buffer budget. Failure condition: feature collection costs more
+  than the saved abort or wait time on low-contention workloads.
+- For future learning, evaluate multi-objective scores that include
+  throughput, abort rate, p99 latency, WAL wait, GPU refresh starvation, and
+  memory pressure rather than optimizing committed transactions per second
+  alone.

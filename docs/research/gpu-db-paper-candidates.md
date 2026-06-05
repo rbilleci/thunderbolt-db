@@ -1344,6 +1344,14 @@ Append new candidates here as each paper is processed.
   asynchronous log push-down, and independently scalable conflict-resolution
   resources; directly relevant to mutation-owner decomposition and write-path
   admission.
+- `reviewed` — **Modeling Concurrency Control as a Learnable Function**,
+  Pan et al., arXiv 2026.
+  URL: `https://arxiv.org/abs/2503.10036`
+  Why: modern learned concurrency-control design selected after the queue had
+  no stronger queued 2023-present OLTP/concurrency paper that improved recent
+  category balance; useful for operation-level conflict-action tables,
+  workload drift handling, stored-procedure versus interactive transaction
+  policy splits, and hot-write admission benchmarks.
 - `reviewed` — **A Hybrid Approach to Integrating Deterministic and
   Non-deterministic Concurrency Control in Database Systems**, Hong et al.,
   PVLDB 2025.
