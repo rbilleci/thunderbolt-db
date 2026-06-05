@@ -568,12 +568,26 @@ Append new candidates here as each paper is processed.
   Why: cited by the GPU OLTP CC study as a hybrid pessimistic/optimistic
   concurrency-control direction; useful for tail-latency-aware retained reads
   and hot-write fallback lanes.
-- `queued` — **A Study of the Fundamental Performance Characteristics of GPUs
+- `reviewed` — **A Study of the Fundamental Performance Characteristics of GPUs
   and CPUs for Database Analytics**, Shanbhag, Yu, and Madden, SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3380595`
+  PDF: `https://anilshanbhag.com/static/papers/crystal_sigmod20.pdf`
   Why: Crystal's tile-based execution model is the execution substrate used by
   the SIGMOD 2022 GPU compression paper; useful for separating compression
   effects from baseline GPU query operator and memory-traffic behavior.
+- `queued` — **HorseQC: A GPU-accelerated Query Compiler for Query Processing**,
+  Rui et al., VLDB Journal 2021.
+  URL: `https://doi.org/10.1007/s00778-020-00646-9`
+  Why: Crystal evaluates GPU-as-coprocessor query compilation against efficient
+  CPU baselines; useful follow-up for deciding whether GPU DB should ever use
+  pipelined transfer routes when data is not resident.
+- `queued` — **Relaxed Operator Fusion for In-Memory Databases: Making
+  Compilation, Vectorization, and Prefetching Work Together at Last**,
+  Menon et al., PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol11/p1-menon.pdf`
+  Why: Crystal highlights CPU fusion/vectorization limits on chained
+  operators; useful CPU-side baseline before claiming GPU route wins for fused
+  retained query shapes.
 - `queued` — **Hardware-Conscious Hash-Joins on GPUs**, Sioulas et al.,
   ICDE 2019.
   URL: `https://doi.org/10.1109/ICDE.2019.00068`

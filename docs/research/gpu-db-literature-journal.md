@@ -60376,3 +60376,203 @@ fallback, or priority aging, not as an unbounded queue.
 - Test "superseded write" elimination only after proving semantic equivalence
   for simple primary-key upserts. Gate: PostgreSQL-comparator state and WAL
   replay state match the unreordered path.
+
+### 2026-06-05 - Crystal: resident GPU execution wins when transfer is not the bottleneck
+
+**Citation:** Anil Shanbhag, Samuel Madden, and Xiangyao Yu. "A Study of the
+Fundamental Performance Characteristics of GPUs and CPUs for Database
+Analytics." SIGMOD 2020, pp. 1617-1632. doi:10.1145/3318464.3380595.
+Retrieved 2026-06-05 from the author PDF,
+`https://anilshanbhag.com/static/papers/crystal_sigmod20.pdf`.
+
+**Category:** GPU execution / analytics, with query planning and resident
+placement relevance.
+
+**Relevance tags:** GPU-resident execution; CPU/GPU cost models; tile-based
+execution; block-wide primitives; shared memory; materialization avoidance;
+PCIe transfer; operator fusion; hash joins; Star Schema Benchmark.
+
+**Core idea:** Crystal re-centers the GPU database question around where the
+working set lives. The paper argues that treating the GPU as a coprocessor is
+usually the wrong baseline for analytics because PCIe bandwidth is far below
+both CPU DRAM bandwidth and GPU HBM bandwidth. If every query ships columns
+from CPU DRAM to the GPU, an optimized CPU engine can beat or match the GPU
+route even when the GPU kernel itself is fast.
+
+The positive result is a GPU-resident execution model. Crystal treats a CUDA
+thread block as the execution unit and processes a tile of tuples or values at
+a time. Threads within the block cooperate through shared memory and registers
+to evaluate predicates, compact selected rows, aggregate, or probe hash tables
+without repeatedly materializing global-memory intermediates. On the paper's
+V100/Skylake setup, individual projection and selection speedups track the
+GPU/CPU memory-bandwidth ratio, while joins gain less when random probes miss
+caches. Full SSB query speedup is reported around 25x over the authors'
+standalone CPU implementation because GPUs hide irregular multi-join memory
+stalls better and avoid CPU vectorization limits across chained operators.
+
+**Concrete mechanisms:**
+
+- The paper first models the coprocessor path. For SSB-style scans, shipping
+  four 4-byte columns over PCIe lower-bounds GPU-coprocessor time by PCIe
+  bandwidth, while an optimized CPU scan is bounded by CPU DRAM bandwidth.
+  Since measured PCIe bandwidth was 12.8 GB/s and CPU memory bandwidth was
+  54 GB/s in the setup, the transfer path is structurally disadvantaged.
+- Crystal assumes data is already resident in each device's memory for fair
+  CPU-versus-GPU operator comparisons: CPU operators run from CPU DRAM and GPU
+  operators run from GPU global memory.
+- The tile-based execution model maps one thread block to one tile. A tile is
+  loaded from global memory into registers or shared memory, then subsequent
+  passes over the tile use on-chip storage instead of re-reading global
+  memory.
+- Selection uses block-local predicate bitmaps, block-wide prefix sums, one
+  global atomic counter update per tile, block-local shuffling into contiguous
+  selected output, and coalesced global writes.
+- The tile design reduces global atomic updates by the tile size and avoids
+  the older three-kernel selection shape that reads input twice, writes count
+  and prefix-sum intermediates, and scatters output writes.
+- Crystal expresses kernels as block-wide functions: `BlockLoad`,
+  `BlockLoadSel`, `BlockStore`, `BlockPred`, `BlockScan`, `BlockShuffle`,
+  `BlockLookup`, and `BlockAggregate`.
+- The implementation uses templated CUDA device functions. The paper reports
+  a default thread block size of 128 and four items per thread after tile-size
+  sweeps on its selection microbenchmark.
+- Projections use block loads for input columns and one block store for the
+  result. CPU baselines include non-temporal writes and SIMD so the comparison
+  is against a strong memory-bandwidth-saturating implementation.
+- Selection comparisons include branching, predicated, and SIMD-predicated CPU
+  variants plus branch/predicated GPU variants. Efficient CPU and GPU
+  implementations both track bandwidth models, with GPU speedup near the
+  bandwidth ratio.
+- Hash join uses a no-partitioning linear-probing design. GPU probes load a
+  tile of keys and payloads, iterate over probes independently, and aggregate
+  locally. Runtime steps appear when hash-table size exceeds cache sizes.
+- For joins whose hash table does not fit in cache, GPU gains are below the
+  raw bandwidth ratio because global-memory probes fetch larger cache lines
+  and experience memory stalls, though SIMT latency hiding still helps.
+- The SSB implementation uses block-wide functions for fused query kernels and
+  compares against the authors' CPU implementation, Hyper, and OmniSci. All
+  GPU-resident comparisons keep the working set in GPU memory before query
+  execution.
+- The paper explicitly identifies future work around compression, strings and
+  arrays, and multi-GPU systems; it does not claim to solve data sets much
+  larger than GPU memory.
+
+**GPU DB mapping:** The first direct mapping is to P8's resident-snapshot
+premise. GPU DB should not expect sustained wins from "ship the columns for
+this query, run one GPU kernel, ship the answer back" unless the CPU baseline
+is weak or the query is unusually compute-heavy. The route certificate should
+therefore distinguish resident GPU routes from cold-transfer GPU routes and
+make transfer bytes a first-class cost. For many retained reads, a CPU path may
+be the right fallback until the relevant column group is already resident.
+
+Crystal's tile model is a good kernel-shape baseline for P8's first `int4` and
+`text` resident column groups. Same-shape retained filters, counts, and simple
+aggregates should be expressed as block-wide tile pipelines that keep a tile in
+registers/shared memory across predicate evaluation, compaction, aggregation,
+and result scattering. That maps naturally to the runtime document's
+micro-batching rule: compatible work should share snapshot generation,
+relation/partition identity, query shape, selected columns, and response shape.
+
+The paper also gives GPU DB a fair CPU comparator rule. Before claiming GPU
+speedups, compare against CPU implementations that use SIMD, non-temporal
+writes, prefetching where appropriate, and fused operator code. Otherwise the
+engine may optimize the wrong route. For query planning, route estimates should
+start from bandwidth lower bounds and then adjust for irregular access, cache
+fit, selectivity, materialization, and transfer.
+
+For hash joins and lookup-like routes, Crystal is a warning that "GPU
+resident" is still not automatically best. Random probe tables that exceed L2
+or HBM-friendly locality can fall below bandwidth-ratio speedups. GPU DB's
+resident key-vector or hash-index route should record cache-fit, probe
+regularity, and output cardinality, then compare partitioned hash, simple
+scan, CPU index, and CPU fallback rather than assuming one universal GPU
+lookup kernel.
+
+The block-wide primitive list can become an implementation checklist for a
+small benchmark harness: load tile, evaluate predicate, compact selected rows,
+aggregate within block, probe optional resident hash/index, and store or
+scatter results. The point is not to vendor Crystal, but to adopt its execution
+unit: tiles, not independent threads or operator-at-a-time global
+materialization.
+
+**Risks and mismatches:** Crystal is an analytical SQL paper, not a
+transactional engine. It does not address WAL-before-visibility, MVCC
+visibility, snapshot retirement, DDL invalidation, pgwire response encoding,
+write throughput, or 1M logical sessions. Its strongest result assumes the
+working set fits in GPU memory before query execution starts, which is exactly
+the constraint P8 must measure and manage.
+
+The evaluation hardware is a V100-era GPU and an 8-core Skylake CPU. Absolute
+speedups should be remeasured on the target GPU and CPU, and modern CPU
+baselines may be stronger. The paper mostly covers integer/floating analytical
+operators; text, nulls, variable-length data, updates, indexes, and serializable
+reads need separate proof. Multi-GPU execution and over-resident data are
+called out as future directions rather than implemented mechanisms.
+
+**Benchmark candidates:**
+
+- Build a resident-versus-transfer route benchmark for one filtered
+  aggregate. Compare CPU fused scan, GPU cold transfer, GPU resident scan, and
+  GPU resident micro-batch. Gate: route choice matches measured winner across
+  selectivity and resident-state changes.
+- Implement a Crystal-shaped tile kernel for P8's first `int4` filter/count
+  path: block load, predicate bitmap, block scan, optional compaction, block
+  aggregate, and coalesced output. Required metrics: achieved HBM bandwidth,
+  kernel time, launch count, output rows, and p50/p99 end-to-end latency.
+- Add a fair CPU baseline for the same route using fused loops, SIMD where
+  available, and low-allocation output. Failure condition: GPU wins only
+  against the old unfused CPU path.
+- Measure tile configuration on target hardware: thread block size, items per
+  thread, shared-memory usage, register pressure, occupancy, and atomics per
+  output row. Gate: the chosen configuration is within a small tolerance of
+  best measured latency and bandwidth.
+- Add a hash-lookup locality benchmark: resident GPU hash probe, resident
+  sorted/key-vector scan, CPU index lookup, and CPU prefetch path under
+  varying cache fit and skew. Required metrics: cache-fit proxy, probe
+  throughput, result cardinality, and retained-read p99.
+- Extend route certificates with transfer bytes, resident bytes, expected HBM
+  bytes, materialization bytes, cache-fit class, and CPU comparator estimate.
+  Proof gate: the planner rejects cold-transfer GPU routes when PCIe/NVMe
+  movement dominates.
+
+### 2026-06-05 - Cross-paper synthesis: resident routes need fairness, resource class, and transfer proof
+
+The last four reviewed papers, FlexPushdownDB, HSM, OCC batching, and Crystal,
+converge on one practical rule: every fast route needs a certificate that
+explains why it is fast now, not just why it was fast in isolation.
+
+**Converging design tracks:**
+
+- Placement should be segment-local and evidence-based. FlexPushdownDB says a
+  query can split across cached and remote segments only when operators are
+  separable; Crystal says a GPU route is only compelling when data is already
+  resident or transfer is cheap enough to justify it.
+- GPU admission needs a route resource class. HSM shows that co-running
+  kernels can interfere through SM and memory bandwidth pressure, while
+  Crystal shows that operator speedups depend on memory-access shape, cache
+  fit, and materialization.
+- Batching needs semantic proof as well as performance proof. OCC batching
+  permits useful reordering only inside a bounded validation window; Crystal's
+  tile batching permits useful fusion only when all work in the tile shares a
+  compatible shape and visibility boundary.
+- Route certificates should now include resident segment set, transfer bytes,
+  cache-fit/probe-locality class, separability proof, queue wait, co-run
+  slowdown estimate, and any pending invalidating write relation.
+
+**Category gaps:** The queue still has GPU join and CPU many-core join papers,
+but recent reviews now include enough GPU-execution material to justify a
+runtime/MVCC/tiering turn next. The best next balancing choices are **In the
+Search for Optimal Concurrency** for correctness boundaries in concurrent
+metadata, or **HorseQC** only if the next run explicitly needs a transfer-route
+counterexample.
+
+**Benchmark priorities:**
+
+- A route-certificate benchmark that logs resident status, transfer cost,
+  route resource class, separability, queue pressure, and fallback reason for
+  every retained query.
+- A four-route comparator for the same query shape: CPU fused, GPU cold
+  transfer, GPU resident single request, and GPU resident micro-batch.
+- A mixed workload that combines hot writes, resident reads, and long GPU
+  scans to verify that batching/fusion does not serve stale snapshots or
+  violate retained-read latency while chasing bandwidth.
