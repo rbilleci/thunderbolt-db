@@ -2366,12 +2366,21 @@ Append new candidates here as each paper is processed.
   cost of exchanging ordering information; useful for evaluating whether GPU
   DB should ever merge cross-owner commit ordering with replication or keep
   owner-local WAL publication simpler.
-- `queued` — **Scheduling OLTP Transactions via Learned Abort Prediction**,
+- `reviewed` — **Scheduling OLTP Transactions via Learned Abort Prediction**,
   Sheng, Tomasic, Zhang, and Pavlo, aiDM 2019.
   URL: `https://doi.org/10.1145/3329859.3329871`
+  PDF: `https://db.cs.cmu.edu/papers/2019/a1-sheng.pdf`
   Why: lightweight learned transaction-to-thread assignment cited by TSkd;
   relevant to admission-time prediction before choosing an owner, CPU route,
   or deferred execution path.
+- `queued` — **Intelligent Transaction Scheduling via Conflict Prediction in
+  OLTP DBMS**, Zhang, Tomasic, and Pavlo, arXiv 2024.
+  URL: `https://arxiv.org/abs/2409.01675`
+  Why: longer modern follow-up to abort-prediction scheduling that studies
+  lightweight history/state policies, canonical references, continuous
+  adaptation, and workload-distribution shifts; useful for deciding whether
+  GPU DB should start with interpretable conflict-history admission before
+  heavier learned schedulers.
 - `queued` — **Design Principles for Scaling Multi-core OLTP Under High
   Contention**, Ren, Faleiro, and Abadi, SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2882955`

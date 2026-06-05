@@ -64568,3 +64568,220 @@ tier, not table alone.
   Minimum proof gate: filter refresh either publishes with the resident
   snapshot generation or logs a reason-coded fallback until the summary is
   current.
+
+### 2026-06-05 - Learned abort prediction makes hot-write admission a queueing problem
+
+**Citation:** Yangjun Sheng, Anthony Tomasic, Tieying Zhang, and Andrew
+Pavlo. "Scheduling OLTP Transactions via Learned Abort Prediction." aiDM
+2019, pp. 1:1-1:8. doi:10.1145/3329859.3329871. Retrieved 2026-06-05 from
+`https://db.cs.cmu.edu/papers/2019/a1-sheng.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale; query optimization / planning.
+
+**Relevance tags:** OLTP scheduling; abort prediction; hot-key admission;
+conflict-aware routing; learned scheduling; queue assignment; owner-domain
+routing; transaction latency; workload balance; bounded scheduler overhead.
+
+**Core idea:** The paper argues that main-memory OLTP systems lose throughput
+because random transaction-to-thread scheduling maximizes core occupancy but
+ignores likely conflicts. Fully serializing a workload removes aborts but
+wastes parallelism. The proposed middle ground learns which transaction pairs
+are likely to abort each other, then places likely-conflicting transactions
+into the same FIFO queue so they execute sequentially while unrelated work
+can still run on other queues.
+
+The most useful transfer to GPU DB is the framing: hot-write admission is not
+only a concurrency-control decision after execution starts. It is a queueing
+and routing decision at request arrival time. If the runtime can cheaply
+predict that two writes, refreshes, or mixed read/write routes will collide,
+it can avoid enqueueing them into independent owners or GPU/resource lanes
+that merely race, abort, or invalidate each other.
+
+The authors evaluate supervised and unsupervised scheduling over TPC-C, TATP,
+and Epinions workloads in Peloton on a 20-core machine. They report that the
+best intelligent scheduler, with appropriate settings, improves throughput by
+54% and reduces abort rate by 80% relative to random scheduling. The paper
+calls the result preliminary evidence, and the implementation is a prototype
+rather than a production DBMS scheduler.
+
+**Concrete mechanisms:**
+
+- The scheduler sits between the incoming transaction stream and the DBMS run
+  queues. It needs to capture incoming transactions, place a transaction in a
+  chosen queue, log transaction abort/commit events, and observe real-time
+  response time.
+- The DBMS must identify at least one transaction that caused an internal
+  abort, for example the transaction that held a lock or modified a row during
+  the victim transaction's execution.
+- Transactions are represented by SQL-derived features rather than full
+  read/write sets. A feature is typically an `attribute operator value`
+  reference from `SELECT`, `UPDATE`, `DELETE`, or `INSERT` statements.
+- The feature encoding hashes each transaction's feature set into a fixed-size
+  binary vector. For a transaction pair, the classifier input concatenates the
+  first transaction vector, the second transaction vector, and their bitwise
+  intersection so shared references are explicit.
+- Canonical features map schema-specific column names to the same underlying
+  domain when possible, for example treating related warehouse-id columns as
+  the same conflict dimension. The paper borrows this idea from earlier
+  intelligent scheduling work.
+- Training examples come from execution logs. Abort examples are pairs of an
+  aborted transaction and the transaction identified as conflicting with it.
+  Commit examples pair a committed transaction with a randomly chosen
+  concurrently running transaction.
+- The supervised model is logistic regression. The paper chooses it because it
+  is cheap to train, fast to evaluate on sparse feature vectors, and produces
+  a probability-like abort score for a transaction pair.
+- The search scheduler compares a new transaction with queued transactions,
+  finds the queued transaction with the highest predicted abort probability,
+  and enqueues the new transaction behind that transaction's queue. This
+  intentionally serializes likely conflicts.
+- Breadth-first and depth-first queue searches are considered. The paper
+  reports that depth-first search spends too much time searching for high-risk
+  pairs, so cheaper policies are preferred.
+- The balanced vector scheduler keeps a representative feature centroid per
+  queue and assigns a new transaction to the queue whose centroid has the
+  highest predicted conflict with the new transaction, reducing assignment
+  cost to the number of queues rather than the number of waiting transactions.
+- The unsupervised scheduler logs only abort pairs, clusters shared-feature
+  vectors with k-means, and maps clusters to queues. A new transaction is sent
+  to the closest cluster/queue, with response-time balancing to avoid
+  overloaded queues.
+- Queue balance is part of correctness for throughput. The schedulers monitor
+  response-time history and redirect work when a queue is too slow, because
+  conflict avoidance that collapses all work onto one queue recreates serial
+  execution.
+- Experiments use an open queue model. Each worker thread both schedules and
+  executes transactions, so scheduling overhead is included in measured
+  response time and throughput.
+- The paper states that the balanced k-means scheduler performed best among
+  the evaluated schedulers; at a given arrival rate it cut response time by
+  about 10% in their summarized result.
+
+**GPU DB mapping:** GPU DB can use the same arrival-time idea without adopting
+the exact ML machinery first. The mutation owner, partition owners, residency
+owner, and GPU execution owners should receive route descriptors that include
+likely write keys, affected resident segments, snapshot generation, refresh
+target, and route family. A lightweight conflict predictor can then choose
+whether to serialize a hot write behind an existing owner queue, admit it to a
+parallel partition owner, defer it, or send it through a lower-latency urgent
+lane.
+
+This complements the current route-certificate direction. Recent papers in
+the journal focus on visibility certificates, device/resource certificates,
+and planner-visible route traits. This paper adds a conflict certificate:
+which queued or running work is this request likely to abort, invalidate, or
+be invalidated by? A request with a high conflict score should not be admitted
+to a separate lane just because there is spare CPU or GPU capacity.
+
+Canonical features map well to database route metadata. For ad-hoc SQL, the
+engine may only have approximate predicate columns and literals. For prepared
+statements, stored procedures, COPY chunks, refresh jobs, and supported
+retained routes, the feature set can be more exact: table OID, key range,
+partition id, mutation kind, resident segment id, and visibility boundary.
+Those features are cheaper and more stable than parsing arbitrary SQL text in
+the hot path.
+
+The queue-centroid idea maps to owner rings. Each owner or route lane can
+maintain a compact summary of recently queued work: hot key ranges, table ids,
+write/read mix, invalidation generations, and observed conflict or fallback
+counts. Admission compares a new request against these summaries before
+choosing the queue. This is more practical at 1M logical sessions than
+scanning all queued work.
+
+For GPU execution, conflict prediction should include invalidation and
+refresh conflict, not only transaction abort. A hot write batch can invalidate
+a resident read generation; a refresh can become obsolete before it publishes;
+a long GPU scan can pin snapshot retirement. Scheduling those routes with
+conflict summaries can reduce wasted refresh work and unnecessary GPU queue
+occupancy.
+
+**Risks and mismatches:** The paper is a short workshop paper and explicitly
+presents preliminary evidence. It does not prove production robustness, broad
+SQL coverage, distributed operation, MVCC correctness, WAL ordering, recovery,
+GPU execution, or million-session admission.
+
+The evaluated system is Peloton on a 20-core CPU. The conflict model assumes
+the DBMS can name a conflicting transaction on abort, which may be simple for
+lock conflicts but less obvious for validation failures, predicate conflicts,
+snapshot anomalies, or resident-generation invalidations. GPU DB should avoid
+making an opaque model the authority for correctness.
+
+Feature extraction is also a risk. SQL-derived references are cheap but may
+miss range predicates, expression predicates, foreign-key/domain equivalence,
+or writes hidden behind functions. Canonicalization improves grouping but
+requires schema/domain knowledge. Incorrect features can create false
+serialization, load imbalance, or missed hot conflicts.
+
+The scheduling policies can distort workload balance. The paper includes
+response-time balancing because blindly grouping conflicts can overload one
+queue. GPU DB needs the same guard: a hot queue should expose "serialize
+because conflict" separately from "overloaded and should reject, defer, or
+fallback."
+
+**Benchmark candidates:**
+
+- Add a conflict-certificate prototype for mutation and refresh admission:
+  table OID, key/range hash, mutation kind, resident generation, expected
+  invalidation target, and route family. Gate: identical WAL/MVCC correctness
+  while abort, retry, invalidated-refresh, and fallback counts become visible.
+- Compare three hot-write admission policies on a TPC-C-like key distribution:
+  random owner queue, deterministic key-owner routing, and conflict-summary
+  routing with queue balance. Measure write throughput, p50/p99 latency,
+  abort/retry count, queue wait, and resident invalidation rate.
+- Implement queue summaries instead of scanning all queued work: per-owner hot
+  key sketches, latest conflict counts, queue depth, and response-time
+  average. Failure condition: scheduler CPU grows with active session count
+  rather than owner count or bounded queue-window size.
+- Add a refresh-waste benchmark where writes repeatedly invalidate resident
+  generations while refresh jobs are queued. Expected result: conflict-aware
+  admission defers or coalesces refreshes and reduces GPU work that cannot
+  publish.
+- Test prepared-statement feature extraction versus ad-hoc SQL extraction.
+  Prepared routes should produce stable conflict features; ad-hoc routes must
+  fail closed to conservative owner routing when features are unknown.
+- Add a negative control where the scheduler over-serializes all writes sharing
+  a table but not a key/range. Failure condition: aborts decrease but
+  throughput and p99 latency collapse from false conflicts.
+
+### 2026-06-05 - Cross-paper synthesis: route choice now needs cost, resource, and conflict certificates
+
+The last three reviewed papers form a useful planning stack. HetExchange says
+CPU/GPU/tier movement should be explicit plan structure rather than a hidden
+"GPU or not" branch. Performance-optimal filtering says route-local summaries
+need measured false-positive budgets because continuation cost differs across
+GPU memory, CPU DRAM, pinned host buffers, NVMe, and future tiers. Learned
+abort prediction adds the write-path analogue: the planner and scheduler
+should know whether a request is likely to collide with already queued work
+before it chooses an owner or route lane.
+
+The converging design track is a route certificate with three independent
+parts:
+
+- **Cost certificate:** estimated rows, bytes, transfer, filter lookup cost,
+  false-positive continuation cost, and fallback edge.
+- **Resource certificate:** GPU stage class, scratch/pinned-buffer bytes,
+  queue class, batch ceiling, and co-scheduling constraints.
+- **Conflict certificate:** affected table/key/range, mutation or refresh
+  target, resident generation, likely queued conflicts, and serialization
+  reason.
+
+The next gap is how to make these certificates cheap enough for point
+queries and high session counts. Heavy route graphs and learned schedulers
+must be bypassed or cached for simple retained reads, while writes and
+refreshes need enough metadata to avoid wasting WAL/MVCC, GPU, and residency
+work.
+
+Benchmark priorities:
+
+- Build one route-certificate struct for a narrow retained lookup and hot
+  write path, then measure certificate construction overhead separately from
+  execution.
+- Add reason-coded route outcomes: resident GPU, CPU fallback, owner
+  serialization, conflict deferral, filter-negative skip, refresh coalesced,
+  and overload rejection.
+- Run a mixed benchmark with point reads, hot writes, and resident refreshes
+  to measure whether conflict-aware admission protects retained-read p99 and
+  reduces wasted refresh work.
+- Keep negative controls for all three certificate parts: hidden copies,
+  wrong false-positive budget, and false conflict serialization.
