@@ -53498,3 +53498,252 @@ the sole mechanism that governs device-resource reclamation.
   publications. A descriptor can be reused immediately after the CPU
   publication completes, but HBM buffers and pinned memory must remain
   live until retained snapshot handles release them.
+
+### 2026-06-05 - Socrates separates log truth, page availability, and cheap durable storage
+
+**Citation:** Panagiotis Antonopoulos, Alex Budovski, Cristian
+Diaconu, Alejandro Hernandez Saenz, Jack Hu, Hanuma Kodavalla,
+Donald Kossmann, Sandeep Lingam, Umar Farooq Minhas, Naveen
+Prakash, Vijendra Purohit, Hugh Qu, Chaitanya Sreenivas Ravella,
+Krystyna Reisteter, Sheetal Shrotri, Dixin Tang, and Vikram Wakade.
+"Socrates: The New SQL Server in the Cloud." SIGMOD 2019,
+pp. 1743-1756. doi:10.1145/3299869.3314047. Retrieved
+2026-06-05 from Microsoft Research,
+`https://www.microsoft.com/en-us/research/uploads/prod/2019/05/socrates.pdf`.
+
+**Category:** multi-tier cache / data placement; transaction
+processing / write path; MVCC / snapshot / visibility.
+
+**Relevance tags:** disaggregated storage; separated log service;
+page servers; GetPage@LSN; persistent version store; accelerated
+database recovery; resilient SSD cache; bounded restore; snapshot
+backup; storage pushdown; availability versus durability.
+
+**Core idea:** Socrates is a production SQL Server cloud architecture
+that decomposes a monolithic or replicated-state-machine database into
+compute nodes, a separate XLOG service, partitioned Page Servers, and
+cheap durable object storage. The key transferable idea is not simply
+"remote storage." It is the explicit split between durability, page
+availability, local performance caches, and compute ownership.
+
+The log is treated as a first-class tier. The primary compute node is
+the update writer and commits after log blocks are hardened in a fast
+durable landing zone. XLOG then disseminates only hardened log blocks
+asynchronously to Page Servers and secondaries. Page Servers apply
+only the log records relevant to their partition, maintain local
+main-memory/SSD caches, serve pages at requested LSNs, checkpoint to
+cheap durable storage, and can be seeded asynchronously. This turns
+large database operations such as backup, restore, scale-up, and page
+server replacement into bounded workflows rather than size-of-data
+copies through the primary compute node.
+
+For GPU DB, the strongest idea is to make every tier's authority
+explicit. WAL/log durability should remain separate from GPU resident
+availability. CPU/NVMe page or segment services can make cold data
+available and replayable, while HBM resident snapshots remain
+performance state. A read route should carry a freshness frontier, not
+an informal "cache hit" promise.
+
+**Concrete mechanisms:**
+
+- Socrates uses a shared version store for read snapshots and
+  accelerated database recovery. With committed versions available
+  after failure, recovery can avoid an unbounded undo phase in many
+  cases and make the database available after analysis and redo,
+  bounded by the checkpoint interval.
+- The resilient buffer pool extension (RBPEX) extends the buffer pool
+  onto local SSD and makes that SSD cache recoverable after failure.
+  Compute nodes use sparse hot-page caches; Page Servers use dense,
+  covering partition caches.
+- The architecture has four main tiers: compute nodes, XLOG, Page
+  Servers, and Azure XStore. Compute nodes and Page Servers are
+  availability/performance tiers; XLOG and XStore hold durable truth.
+- The XLOG service uses a fast durable landing zone for commit
+  latency, then destages log blocks to local SSD and long-term cheap
+  storage. Consumers pull log blocks from XLOG instead of being pushed
+  by the primary.
+- XLOG disseminates only hardened log blocks. The primary can send log
+  blocks to XLOG asynchronously, but XLOG waits for the primary to
+  identify hardened blocks before moving them to the dissemination
+  broker.
+- Page Servers are partition-owned page services. They apply relevant
+  log records, answer page requests, checkpoint pages, and create
+  backups. Log blocks include enough out-of-band partition annotations
+  for XLOG/Page Servers to filter irrelevant log.
+- `GetPage@LSN` makes cold-page retrieval freshness explicit. A compute
+  node requests a page with a lower-bound page LSN; the Page Server
+  waits until it has applied log through that LSN before returning the
+  page.
+- Secondaries can receive a page "from the future" during B-tree
+  traversal. Socrates relies on detectable structural inconsistency,
+  pause/retry, and SQL Server's version store to preserve logical
+  snapshot traversal.
+- Page Server RBPEX is dense and stride-preserving so multi-page range
+  reads can become single IOs at the Page Server. It also insulates
+  the system from transient XStore outages and can be seeded
+  asynchronously while serving requests.
+- Backups and point-in-time restore use XStore snapshots plus replay of
+  the needed log range. Restored Page Servers can become available
+  before caches are fully warm, with degraded performance rather than
+  size-of-data unavailability.
+- The evaluation reports Socrates goals of 100TB database size, O(1)
+  scale-up/down, O(1) recovery, sub-millisecond commit latency, and
+  100+ MB/s log throughput. In the reported production CDB default mix
+  at 1TB, Socrates was about 5% below HADR throughput, mainly due to
+  remote IO/log overhead. In an update-heavy CDB mix, Socrates reported
+  higher log throughput than HADR because backup work was pushed into
+  the storage tier. The paper also reports useful cache-hit examples:
+  about 52% hit rate with a 224GB main-memory/SSD cache over a 1TB CDB
+  database and about 32% hit rate with a 408GB cache over a 30TB TPC-E
+  database.
+
+**GPU DB mapping:** Socrates maps directly to the P8 tiering plan, but
+with a clearer authority split. GPU DB should treat WAL/checkpoint
+metadata as durable truth, CPU/NVMe page or segment owners as
+availability and rebuild services, and GPU resident snapshots as
+performance publications. HBM should never be the only source of truth
+and should not be asked to carry durability or checkpoint semantics.
+
+`GetPage@LSN` suggests a `GetSegment@Generation` or
+`GetColumnGroup@VisibilityBoundary` contract for over-resident GPU DB.
+When a retained read cannot find a resident HBM segment, it should ask
+the CPU/NVMe tier for a segment at least as fresh as the route's
+visibility boundary. The provider can wait for WAL replay, return a
+newer compatible segment, or force route retry/fallback if structural
+metadata changed. The important property is that freshness becomes a
+typed parameter on cold-tier reads.
+
+The Page Server partition model also fits GPU DB's owner domains.
+Instead of a single residency owner holding every cold and warm
+decision, CPU/NVMe segment services can own disjoint table or partition
+families, apply log/invalidation streams, maintain dense warm caches,
+and expose read-only segment handles. GPU execution owners then route
+to HBM, warm host/NVMe segment service, or CPU fallback using a route
+certificate that names the durability boundary and resident generation.
+
+The RBPEX distinction between sparse compute caches and dense Page
+Server caches is valuable. GPU HBM should remain a sparse, expensive
+hot-resident tier. Host/NVMe warm storage may be denser and
+stride-preserving so range scans, refresh builds, and over-resident
+column reads avoid scatter amplification. That argues for different
+layout policies per tier rather than one universal "cache page" shape.
+
+Socrates also reinforces that bounded operations are product features.
+GPU DB should design resident refresh, cold-tier rebuild, snapshot
+backup, and scale-out warmup so they are decoupled from foreground
+mutation owners. A new warm segment owner should be able to start
+serving some requests and applying log before every cache line is
+prewarmed, with telemetry that explains degraded mode.
+
+Finally, the XLOG landing-zone/destage split is a useful warning for
+WAL-before-visibility. GPU DB can use fast durable log admission and
+asynchronous segment propagation, but downstream readers should consume
+only hardened log frontiers. Speculative resident refreshes may be
+useful internally, yet they must not publish as route-valid snapshots
+until the corresponding log boundary is durable.
+
+**Risks and mismatches:** Socrates is a cloud SQL service architecture,
+not a GPU execution engine. The paper does not evaluate HBM, CUDA
+streams, GPU kernels, GPU memory oversubscription, or device-side
+snapshot indexes. Its Page Server page abstraction may be too row/page
+oriented for GPU DB's column-group resident layout.
+
+The design also preserves a single primary writer for updates. That
+fits early GPU DB WAL-before-visibility discipline, but it may not
+reach the long-term 1M-session write-concurrency target without
+partitioned mutation owners or sharded log admission. Socrates'
+solution to read scale-out via secondaries and Page Servers does not
+by itself solve hot-row write contention or multi-partition transaction
+scheduling.
+
+Returning newer pages under `GetPage@LSN` works because SQL Server's
+persistent data structures and version store can detect or tolerate
+specific logical traversal cases. GPU DB cannot assume arbitrary
+resident indexes, column dictionaries, Bloom filters, or learned-index
+segments are similarly composable across generations. Each route family
+needs its own "newer is safe" proof or must retry on generation
+mismatch.
+
+The performance claims are production-relevant but workload-specific.
+The reported default CDB throughput was slightly lower than HADR at
+1TB, and cache-hit rates depend on workload locality. GPU DB should
+treat Socrates as an architectural source for bounded tier contracts,
+not as evidence that remote cold-tier reads are cheap enough for
+latency-critical retained reads.
+
+**Benchmark candidates:**
+
+- Implement a `GetSegment@Boundary` microbenchmark for cold/warm
+  column groups. Inputs: table/partition id, column family, visibility
+  boundary, schema generation, and resident generation. Gate: the
+  returned segment is at least as fresh as the route boundary or the
+  request retries/falls back with an explicit generation reason.
+- Compare sparse HBM residency with dense host/NVMe warm segment
+  layout. Measure point lookups, prefix text scans, 128-page-equivalent
+  range reads, refresh build time, and read amplification.
+- Add a log-frontier publication test: a refresh worker may build from
+  speculative WAL bytes, but route-visible publication must wait until
+  the WAL boundary is hardened. Failure condition: any retained read
+  observes a generation whose source WAL is not durable.
+- Prototype partition-owned warm segment services that apply filtered
+  invalidation/log records. Compare one global residency owner with
+  partitioned warm owners for refresh latency, owner queue depth,
+  route-decision p99, and recovery/warmup behavior.
+- Test degraded warmup explicitly. Start a new warm segment owner with
+  empty or partially seeded cache, allow it to serve compatible cold
+  reads while applying log, and measure foreground latency until cache
+  heat stabilizes.
+- Add structural generation-race tests for route families. A read may
+  receive a newer segment only if its route certificate proves schema,
+  dictionary, index, and visibility compatibility; otherwise it must
+  retry or fall back.
+- Measure whether storage-tier pushdown helps foreground owners:
+  checkpoint, backup, scan prefiltering, and refresh-build work should
+  move out of the mutation owner without increasing freshness lag beyond
+  the configured route SLA.
+
+### 2026-06-05 - Cross-paper synthesis: route publication needs durable, visible, and resource-safe frontiers
+
+The last three reviews combine CPU-side publication mechanics
+(PathCAS), bounded helper metadata (descriptor reuse), and tiered
+storage authority (Socrates). Together they point toward a route design
+where a visible read or refresh route is not just a pointer to cached
+data. It is a compact certificate over several frontiers: durable WAL
+boundary, schema/catalog generation, resident or warm segment
+generation, route-metadata publication sequence, and resource lifetime.
+
+**Converging design tracks:**
+
+- Keep row MVCC, WAL durability, and route metadata publication as
+  separate layers. PathCAS/descriptor reuse may help publish bounded
+  CPU metadata, while Socrates-style log and storage tiers decide
+  durability and freshness.
+- Use generation-bearing route certificates. Metadata pointers should
+  validate like PathCAS search paths, helper descriptors should be
+  sequence-tagged and reusable, and cold/warm segment retrieval should
+  require an explicit freshness boundary.
+- Make helper work and tier movement bounded. A route publication,
+  resident-root swap, or warm-segment fetch should expose maximum
+  descriptor count, helper steps, queue wait, WAL frontier wait, and
+  resource-retirement lag.
+- Treat GPU HBM as sparse performance state and CPU/NVMe warm storage
+  as denser availability state. They should have different layout,
+  cache, and scan-read-amplification contracts.
+
+**Category gaps:** The recent set is strong on runtime metadata,
+lock-free helper discipline, and storage tiering. The queue should next
+prefer GPU write/concurrency, transaction scheduling, or query-route
+optimizer papers unless a newer storage-tier paper directly closes a
+frontier or warmup gap.
+
+**Benchmark priorities:**
+
+- Route-certificate race harness: mutate schema, visibility, residency,
+  and warm-tier segments while retained reads validate and execute.
+- Durable-before-visible refresh benchmark: compare speculative build
+  latency with hardened-boundary publication latency.
+- Bounded publication primitive benchmark: owner queue versus
+  PathCAS-style publication with reusable descriptors.
+- Sparse-HBM/dense-warm-tier benchmark: measure lookup, scan, refresh,
+  and fallback costs when hot segments fit in HBM but full partitions
+  live in host/NVMe.

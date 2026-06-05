@@ -1385,7 +1385,7 @@ Append new candidates here as each paper is processed.
   Why: TOPSI names Aurora as a disaggregated-storage target; useful for
   comparing GPU DB's WAL/storage-publication boundaries with a log-structured
   cloud relational storage service.
-- `queued` — **Socrates: The New SQL Server in the Cloud**, Antonopoulos et
+- `reviewed` — **Socrates: The New SQL Server in the Cloud**, Antonopoulos et
   al., SIGMOD 2019.
   URL: `https://doi.org/10.1145/3299869.3314047`
   Why: Aurora-related cloud database storage/compute separation; useful for
@@ -1538,6 +1538,19 @@ Append new candidates here as each paper is processed.
   Why: policy-focused evaluation of work stealing, static allocation, and
   core reallocation for microsecond tasks; useful before choosing GPU DB
   IO-worker, retained-read, and background-refresh scheduling policies.
+- `queued` — **PolarDB Serverless: A Cloud Native Database for
+  Disaggregated Data Centers**, Cao et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457550`
+  Why: Socrates and Aurora leave open how elastic compute interacts with a
+  disaggregated storage layer; PolarDB Serverless is a modern follow-up for
+  elastic buffer ownership, cold-page access, and storage/compute separation.
+- `queued` — **FoundationDB: A Distributed Unbundled Transactional Key Value
+  Store**, Zhou et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457559`
+  Why: Socrates uses separate services for log, page serving, and durable
+  storage; FoundationDB is a useful contrast for unbundled transactional
+  storage, log/transaction service separation, and deterministic recovery
+  boundaries.
 - `reviewed` — **Syrup: User-defined Scheduling across the Stack**,
   Kaffes et al., SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483548`
