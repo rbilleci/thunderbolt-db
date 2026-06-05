@@ -5279,12 +5279,26 @@ Append new candidates here as each paper is processed.
   Why: Index Checkpoints uses PACMAN-style parallel recovery as a baseline;
   useful for separating parallel log replay, index rebuild, and GPU resident
   acceleration rebuild in recovery benchmarks.
-- `queued` — **A Comparative Study of Consistent Snapshot Algorithms for
+- `reviewed` — **A Comparative Study of Consistent Snapshot Algorithms for
   Main-Memory Database Systems**, Li et al., IEEE TKDE 2021.
-  URL: `https://doi.org/10.1109/TKDE.2019.2925876`
+  URL: `https://doi.org/10.1109/TKDE.2019.2930987`
+  arXiv: `https://arxiv.org/abs/1810.04915`
   Why: Index Checkpoints relies on tuple snapshot consistency while accepting
   non-transaction-consistent index checkpoints; useful for choosing CPU truth
   checkpoint algorithms before deciding which derived indexes are persisted.
+- `queued` — **Low-Overhead Asynchronous Checkpointing in Main-Memory
+  Database Systems**, Ren, Diamond, Abadi, and Thomson, SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915226`
+  Why: Li et al. use CALC as the virtual-snapshot baseline; useful for
+  comparing deferred consistent snapshots that avoid blocking active
+  transactions with GPU DB retained snapshot publication and checkpoint
+  boundaries.
+- `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using
+  both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882925`
+  Why: Li et al. cite it as an HTAP snapshot consumer; useful for comparing
+  compressed read-optimized blocks with GPU DB resident column groups and
+  CPU/GPU route selection.
 - `reviewed` — **Chablis: Fast and General Transactions in Geo-Distributed
   Systems**, Eldeeb et al., CIDR 2024.
   URL:

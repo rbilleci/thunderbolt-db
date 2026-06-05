@@ -68247,3 +68247,162 @@ portable on ordinary TCP and explicit bounded queues.
   placement across IO workers or GPU execution owners. Required
   metrics: per-worker imbalance, tail latency, moved bytes, reorder
   stalls, and correctness against session/request generations.
+
+### 2026-06-05 - Snapshot algorithms must be measured for spikes, not only throughput
+
+**Citation:** Liang Li, Guoren Wang, Gang Wu, Ye Yuan, Lei Chen,
+and Xiang Lian. "A Comparative Study of Consistent Snapshot
+Algorithms for Main-Memory Database Systems." IEEE TKDE 33(2),
+2021, pp. 316-330. doi:10.1109/TKDE.2019.2930987. Retrieved
+2026-06-05 from arXiv, `https://arxiv.org/abs/1810.04915`.
+
+**Category:** MVCC / snapshot / visibility; checkpointing and
+HTAP snapshot publication.
+
+**Relevance tags:** consistent snapshots; checkpoint latency;
+latency spikes; fork snapshots; copy-on-update; virtual snapshots;
+HTAP; retained read snapshots; memory footprint; recovery frontier.
+
+**Core idea:** The paper compares mainstream in-memory consistent
+snapshot algorithms for update-intensive systems and explains why
+industrial systems often keep using `fork()` despite newer academic
+algorithms. For a consistent in-memory snapshot, clients must still
+read latest data and snapshot data must not be overwritten. That
+definition is narrower than full MVCC isolation, but it is directly
+relevant to checkpointing, HTAP snapshot sharing, and retained read
+publication.
+
+The main lesson is that average throughput hides the important
+failure mode. `fork()` performs well on average and is simple, but
+its page-table copy has O(data-size) trigger cost and can create
+large latency spikes as memory grows. The authors propose Hourglass
+and Piggyback, two pointer-swap-based variants that keep update
+latency low while making snapshot trigger cost effectively O(1) in
+their abstract page-array model. In Redis experiments up to roughly
+50 GB, the modified Redis variants keep maximum latency stable as
+record count and update proportion grow, while default Redis latency
+increases sharply once `fork()` becomes expensive.
+
+**Concrete mechanisms:**
+
+- The paper models the database as a page array and evaluates
+  snapshot algorithms with client threads continuously reading and
+  writing while a snapshotter periodically triggers, takes, and
+  traverses snapshots.
+- Naive Snapshot blocks the client while bulk-copying the full data
+  set, then lets the snapshotter traverse the copy asynchronously.
+- Copy-on-Update keeps a shadow copy and a bit array. The first
+  update to a page during a snapshot period copies the old page to
+  the shadow copy and marks the bit, so the snapshotter can read the
+  prior state.
+- `fork()` is treated as an OS-level copy-on-update variant. It wins
+  in average latency and engineering simplicity but still copies the
+  process page table at trigger time; the paper estimates a 50 GB
+  address space can imply about 100 MB of page-table copying.
+- Zigzag uses a main copy, a shadow copy, and read/write bit arrays
+  to decide which copy clients read or write and which copy the
+  snapshotter may safely traverse.
+- Ping-Pong uses three copies and pointer swapping to avoid trigger
+  latency spikes, but pays with redundant updates and a larger memory
+  footprint.
+- Hourglass keeps two data copies and bit arrays. During a period,
+  clients update one copy while old values remain available in the
+  other; triggering swaps update and snapshot pointers instead of
+  scanning the full data set.
+- Piggyback keeps two copies plus a compact per-page state. Pages
+  that are stale in the online copy are copied back gradually together
+  with ordinary client updates, so the snapshot state is maintained
+  without a large trigger-time scan.
+- For concurrent transaction execution, the paper discusses virtual
+  snapshots. CALC delays the logical snapshot until transactions
+  active at trigger time complete, and the authors adapt Hourglass
+  and Piggyback into vHG/vPB by keeping each transaction on the same
+  target copy for its lifetime, swapping pointers at trigger time,
+  and waiting for active transactions before traversal.
+- Synthetic experiments use 1-8 GB data sets, update frequencies up
+  to 256K updates per 100 ms tick, and 10-second checkpoint
+  intervals. The authors report that Hourglass, Piggyback, and
+  `fork()` have similar average latency, while pointer-swap methods
+  have much lower maximum latency than full-scan trigger paths.
+- In Redis/YCSB experiments with 1M-16M records, Redis-HG and
+  Redis-PB show similar throughput to default Redis, more stable
+  maximum latency, and lower measured peak memory than default
+  `fork()` under the tested update-heavy workloads. Dump overhead
+  still grows with data size because all variants materialize full
+  snapshots.
+
+**GPU DB mapping:** GPU DB should treat retained read snapshot
+publication, checkpointing, and resident refresh as latency-spike
+surfaces, not only throughput surfaces. A design that copies route
+metadata, active transaction vectors, page tables, or resident
+segment descriptors at every snapshot boundary may look fine in
+average throughput and still fail p99/p999 latency as table count,
+resident bytes, or session count grows.
+
+The pointer-swap lesson maps to immutable retained snapshot handles.
+Publishing a new GPU-readable generation should be an O(1) pointer or
+generation swap over already-built structures whenever possible:
+relation id, catalog generation, MVCC frontier, resident generation,
+layout handles, and validity state. The expensive work of copying,
+refreshing, encoding, or dumping should happen before or after the
+publication boundary, not inside the boundary that blocks mutations
+or network workers.
+
+The virtual-snapshot discussion is relevant to mixed pgwire work.
+If transactions are active when a checkpoint or retained snapshot is
+requested, GPU DB should not quiesce all sessions just to get a
+physical instant. It can instead name a virtual frontier, keep active
+transactions on their existing owner/generation path, admit newer
+work into a newer generation, and publish the retained snapshot only
+after the active set that defines the frontier has drained. That
+requires clear transaction-generation ownership so a request never
+writes half its effects before and half after a pointer swap.
+
+Piggyback suggests a refresh policy for resident state: stale pieces
+can be copied or reconciled gradually with normal mutation/refresh
+traffic, as long as the route certificate knows which generation a
+reader is using. This fits P8's rebuildable GPU cache model: old
+resident snapshots can remain readable, new mutations target a newer
+generation, and refresh debt is paid outside the user-visible
+publication step.
+
+**Risks and mismatches:** The paper's snapshot definition is a full
+in-memory image for checkpoint/HTAP consumers, not a complete SQL
+MVCC semantics model. It assumes page-array-style data and often a
+physical consistent trigger point; GPU DB has WAL, relation
+metadata, indexes, text buffers, resident device memory, and prepared
+statement state. Hourglass and Piggyback use multiple copies or
+equivalent shadow state, so naive adoption could double memory before
+GPU data is considered. The Redis experiments are NoSQL key-value
+workloads, not PostgreSQL protocol, SQL transactions, or GPU query
+execution. Finally, the paper evaluates full snapshot dumping; GPU
+DB may need incremental resident refresh and WAL replay more than
+full image materialization.
+
+**Benchmark candidates:**
+
+- Add a retained snapshot publication microbenchmark that measures
+  p50/p95/p99/p999 publication latency while table count, catalog
+  entries, active sessions, and resident segment descriptors scale.
+  Gate: publication stays near O(1) with respect to resident bytes.
+- Build a virtual-frontier snapshot test: start long write
+  transactions, request a retained read/checkpoint frontier, admit
+  newer writes into a later generation, then verify the retained
+  snapshot excludes newer writes and includes exactly the drained
+  active set intended by the frontier.
+- Compare full metadata copying against pointer/generation swapping
+  for route certificates. Required metrics: owner pause time, network
+  queue stall, resident refresh lag, and retained read correctness.
+- Add a refresh-debt benchmark inspired by Piggyback: after
+  invalidation, reconcile stale resident segments gradually under
+  normal read/write traffic and compare against full rebuild at
+  publication time.
+- Track memory amplification for snapshot publication: CPU MVCC
+  versions, CPU indexes, catalog metadata, encoded response buffers,
+  pinned staging buffers, and GPU resident generations. Failure
+  condition: a single retained snapshot can silently double total
+  memory without an admission decision.
+- Add a crash/recovery proof gate for virtual snapshots: if a failure
+  occurs after a virtual frontier is named but before snapshot
+  materialization finishes, recovery must either discard the snapshot
+  or reconstruct it from WAL and committed generation metadata.
