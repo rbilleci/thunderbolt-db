@@ -734,13 +734,21 @@ Append new candidates here as each paper is processed.
   Why: CCaaS motivates independently scaled conflict-resolution resources;
   RCBench may provide a modern distributed/RDMA concurrency-control benchmark
   framework for comparing protocol scalability under data-node fan-out.
-- `queued` — **Epoxy: ACID Transactions Across Diverse Data Stores**,
+- `reviewed` — **Epoxy: ACID Transactions Across Diverse Data Stores**,
   Kraft et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2742-kraft.pdf`
   DOI: `https://doi.org/10.14778/3611479.3611484`
   Why: CCaaS contrasts Epoxy's MVCC control-panel approach; useful for
   comparing cross-store MVCC metadata, global snapshots, and atomic commit
   without forcing all stores to implement a 2PC participant protocol.
+  Journal entry exists from 2026-06-05.
+- `queued` — **Scalable Distributed Transactions across Heterogeneous
+  Stores**, Dey, Fekete, and Rohm, ICDE 2015.
+  URL: `https://doi.org/10.1109/ICDE.2015.7113278`
+  Why: Epoxy compares against Cherry Garcia's key-value-oriented
+  heterogeneous-store transaction protocol; useful for contrasting
+  client-coordinated commit and minimal-store assumptions with Epoxy-style
+  coordinator-owned global snapshots.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for Microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`

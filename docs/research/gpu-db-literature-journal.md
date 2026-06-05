@@ -66067,3 +66067,162 @@ an under-specified second source of truth.
 - Hot-key/write batching: compare deterministic conflict-owner epochs against
   simple arrival-order mutation while measuring abort storms, fairness, and
   resident invalidation work avoided.
+
+### 2026-06-05 - Epoxy makes snapshot metadata a cross-engine contract
+
+**Citation:** Peter Kraft, Qian Li, Xinjing Zhou, Peter Bailis, Michael
+Stonebraker, Matei Zaharia, Xiangyao Yu. "Epoxy: ACID Transactions Across
+Diverse Data Stores." PVLDB 16(11), 2023, pp. 2742-2754.
+doi:10.14778/3611479.3611484. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol16/p2742-kraft.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing / write
+path; hybrid HTAP.
+
+**Relevance tags:** cross-engine transactions; MVCC metadata; global
+snapshots; snapshot isolation; atomic commit; durable writes; coordinator
+truth; secondary-store shims; read-only snapshot caching; garbage collection;
+route certificates.
+
+**Core idea:** Epoxy provides ACID transactions across heterogeneous data
+stores without requiring those stores to implement XA or a 2PC participant
+protocol. It does this by moving isolation into a shim layer: writes attach
+MVCC metadata to records, reads add metadata predicates so each store returns
+only versions visible in the transaction's global snapshot, and a primary
+transactional DBMS acts as the coordinator and commit authority.
+
+The most transferable idea for GPU DB is that every derived engine can remain
+fast and specialized if it accepts a small visibility contract. Epoxy does not
+ask Elasticsearch, MongoDB, MySQL, or GCS to understand one another. It asks
+them to durably store versioned records and support either efficient metadata
+filtering or a side metadata lookup. For GPU DB, that maps to CPU truth, GPU
+resident snapshots, route metadata, cold objects, and future tiers: each can
+be a separate execution or placement engine, but strong routes need an
+explicit snapshot boundary and visibility predicate rather than an informal
+"cache is fresh" bit.
+
+**Concrete mechanisms:**
+
+- Epoxy assumes the primary database provides ACID transactions with at least
+  snapshot isolation. Its implementation uses Postgres as the coordinator.
+- Secondary stores must provide durable linearizable single-object writes,
+  uniquely identifiable record keys, and exclusive Epoxy-mediated access to
+  participating tables.
+- For performance, secondary stores should allow record metadata and
+  efficient metadata filtering. MongoDB, Elasticsearch, and MySQL store
+  `beginTxn` and `endTxn` as indexed fields or columns; GCS uses primary-DB
+  side metadata because object-store latency dominates.
+- A transaction snapshot is summarized with `xmin`, `xmax`, and
+  `rc_txns`, the recently committed transactions above `xmin`. A transaction
+  id is visible if it is below `xmin` or appears in `rc_txns`.
+- Secondary versions carry `beginTxn` and `endTxn`. A read adds predicates so
+  it sees versions whose creator is in the snapshot and whose superseding or
+  deleting transaction is not, while also seeing its own writes.
+- Writes acquire an exclusive key lock in the secondary shim, create a new
+  version with `beginTxn = txID` and `endTxn = infinity`, and set the previous
+  live version's `endTxn` to the writing transaction id.
+- Validation is OCC-style snapshot-isolation validation. Each secondary shim
+  checks that no committed transaction outside the reader's snapshot has
+  written the same key; if validation passes, the shim provisionally marks the
+  transaction committed and votes yes.
+- Commit is decided by the primary database. Once all secondary stores have
+  validated and persisted their changes, committing in the primary database
+  makes the transaction visible to future global snapshots.
+- Abort deletes secondary versions created by the transaction and resets
+  `endTxn` fields that the transaction wrote, then releases locks.
+- Read-only secondary-store transactions can use cached snapshot information
+  and bypass the coordinator, which lets them continue during coordinator
+  failure as long as they only need an already-known snapshot.
+- Secondary-store recovery asks the coordinator for committed transactions
+  involving that store, removes versions from aborted transactions, and resets
+  `endTxn` values written by aborted transactions. Epoxy relies on the
+  coordinator as commit truth instead of adding Epoxy-specific logs to every
+  secondary store.
+- Garbage collection uses the smallest `xmin` across active transactions and
+  instructs secondary shims to delete versions whose `endTxn` is older.
+- The evaluation reports performance comparable to XA on a multi-DBMS TPC-C
+  workload while providing isolation, under 10% overhead on read-mostly
+  microservice workloads, 72% overhead on a write-heavy microservice case, and
+  point-update overheads up to 120-249% because updates both create a new
+  version and update the old version's `endTxn`.
+
+**GPU DB mapping:** Epoxy is a useful model for making GPU resident state and
+future tiers act like specialized secondary stores under one transaction
+authority. CPU WAL/MVCC state should remain the coordinator truth. GPU
+resident segments, GPU indexes, cold object files, search-oriented side
+structures, and derived route metadata should expose compact visibility
+fields: source WAL boundary, schema generation, `begin`/`end` generation or
+delete bitmap boundary, and whether the route can filter by that metadata.
+
+The read predicate maps directly to route certificates. A retained GPU read
+should prove that the resident segment contains all candidate versions for the
+requested snapshot and that its delete/update metadata excludes versions
+created after the snapshot. If the GPU route cannot evaluate the predicate
+cheaply, it should either use CPU side metadata, fall back, or reject with a
+boundary reason.
+
+Epoxy's coordinator commit rule also sharpens WAL-before-visibility. Derived
+stores may durably stage changes before the coordinator commit, but they do
+not become visible until the CPU coordinator commits. For GPU DB, resident
+refreshes, cold-tier manifests, and secondary indexes can be prepared or
+updated ahead of route publication, but the SQL-visible commit point remains
+the WAL/CPU visibility boundary.
+
+The cached read-only snapshot optimization is especially relevant to 1M
+logical sessions. Idle or read-mostly sessions should not all hit the mutation
+owner just to obtain a snapshot if a safe cached boundary is available.
+Network/read workers can serve retained read-only routes from a cached
+snapshot handle, with an explicit staleness or freshness contract.
+
+Finally, the update overhead is a warning. If GPU DB stores visibility as
+per-record `begin`/`end` metadata inside every resident format, point updates
+may double-write metadata and create expensive index churn. Hot writes may
+need a CPU-side version/delta table plus periodic resident consolidation,
+rather than immediate in-place update of every derived GPU/cold structure.
+
+**Risks and mismatches:** Epoxy provides snapshot isolation, not serializable
+isolation. It relies on write-write validation and does not detect read-write
+dependency cycles. GPU DB must keep serializable-read work separate from
+Epoxy-style SI route admission.
+
+Epoxy also requires exclusive shim-mediated access to secondary tables. GPU DB
+can enforce this internally for resident caches, but future external tiers or
+foreign data integrations would need a similar ownership rule. Its secondary
+stores execute high-level queries and metadata filters; GPU kernels may not
+support arbitrary predicate injection unless the resident format is designed
+for it. The reported workloads are multi-store services on ordinary cloud VMs,
+not GPU-resident SQL execution, so the transferable claim is the visibility and
+commit shape, not the absolute latency.
+
+The GC model uses the oldest active `xmin`; long retained GPU snapshots could
+therefore pin versions if GPU DB copies this directly. The engine should
+combine Epoxy-style per-route metadata with earlier long-reader robustness
+work, including separate snapshot classes and old-version side structures.
+
+**Benchmark candidates:**
+
+- Add a route-certificate visibility experiment: every retained GPU route
+  reports source WAL boundary, schema generation, begin/end generation source,
+  delete/update side structure, and whether the route evaluated visibility on
+  GPU, CPU side metadata, or fallback.
+- Prototype an Epoxy-style resident segment with `begin_generation` and
+  `end_generation` columns or side arrays. Compare GPU predicate filtering
+  against CPU prefiltering and exact CPU fallback for point lookup, prefix
+  scan, and bounded aggregate shapes.
+- Add a stale-derived-store test: stage resident refresh or cold-tier metadata
+  before the CPU commit point, crash or abort, and verify no strong read can
+  observe the staged state after recovery.
+- Build a read-only cached-snapshot path for retained reads that bypasses the
+  mutation owner under a bounded staleness/freshness contract. Measure owner
+  queue traffic, p50/p99 latency, and correctness under concurrent writes.
+- Measure write amplification for three visibility layouts: inline
+  begin/end per resident row, CPU side metadata plus resident row ids, and
+  append-only deltas with periodic consolidation. Failure condition: hot
+  updates force every derived resident structure to update before commit
+  acknowledgment.
+- Add a long-retained-snapshot GC test modeled on Epoxy's `xmin` rule. Hold a
+  GPU snapshot open while updating and deleting hot keys; measure pinned
+  versions, resident bytes, fresh write latency, and old-snapshot correctness.
+- For future external tiering, test the exclusive-access assumption explicitly:
+  inject an out-of-band cold-tier or resident metadata write and require route
+  certification to reject the tier until it is reconciled.
