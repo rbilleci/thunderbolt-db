@@ -624,10 +624,11 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/2723372.2737796`
   Why: ROF contrasts one-size-fits-all compiled loops with staged route shapes;
   useful for route-specific code generation and planner decisions.
-- `queued` — **Hardware-Conscious Hash-Joins on GPUs**, Sioulas et al.,
+- `reviewed` — **Hardware-Conscious Hash-Joins on GPUs**, Sioulas et al.,
   ICDE 2019.
   URL: `https://doi.org/10.1109/ICDE.2019.00068`
   Metadata: `https://www.eurecom.fr/en/publication/5780`
+  PDF: `https://www.eurecom.fr/publication/5780/download/data-publi-5780.pdf`
   Why: direct follow-up to Fast Equi-Join that systematically evaluates
   partitioning, data location, and skew for GPU hash joins; useful for
   deciding when resident joins should use partitioned hash routes versus
@@ -753,6 +754,17 @@ Append new candidates here as each paper is processed.
   Why: AMAC cites many-core hash-join tuning as related hardware-conscious
   database work; useful for separating CPU many-core memory-level parallelism
   from GPU/accelerator route choices when joins or grouped lookups spill to CPU.
+- `queued` — **Robust Query Processing in Co-Processor-accelerated Databases**,
+  Bress, Funke, and Teubner, SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882936`
+  Why: cited by the GPU hash-join paper as a GPU co-processor DBMS baseline;
+  useful for route robustness, placement decisions, and CPU/GPU fallback
+  behavior under operator-at-a-time execution.
+- `queued` — **An Experimental Comparison of Thirteen Relational Equi-Joins in
+  Main Memory**, Schuh, Chen, and Dittrich, SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882917`
+  Why: cited as a CPU join baseline source; useful for keeping GPU resident
+  join claims honest against CPU warm-tier and fallback join implementations.
 - `reviewed` — **Optimistic Concurrency with OPTIK**, Guerraoui and
   Trigonakis, PPoPP 2016.
   URL: `https://doi.org/10.1145/2851141.2851146`

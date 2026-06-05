@@ -64785,3 +64785,169 @@ Benchmark priorities:
   reduces wasted refresh work.
 - Keep negative controls for all three certificate parts: hidden copies,
   wrong false-positive budget, and false conflict serialization.
+
+### 2026-06-05 - GPU joins need partitioning, placement, and skew as explicit route traits
+
+**Citation:** Panagiotis Sioulas, Periklis Chrysogelos, Manos
+Karpathiotakis, Raja Appuswamy, and Anastasia Ailamaki. "Hardware-conscious
+Hash-Joins on GPUs." ICDE 2019. Retrieved 2026-06-05 from
+`https://www.eurecom.fr/publication/5780/download/data-publi-5780.pdf`.
+DOI: `https://doi.org/10.1109/ICDE.2019.00068`.
+
+**Category:** GPU execution / analytics; multi-tier cache / data placement;
+query optimization / planning.
+
+**Relevance tags:** GPU hash join; radix partitioning; GPU shared memory;
+PCIe pipelining; CPU/GPU co-processing; pinned memory; NUMA-aware staging;
+skew handling; output materialization; over-resident execution; route traits.
+
+**Core idea:** The paper argues that GPU hash joins cannot be treated as a
+single operator with a "run on GPU" switch. Performance depends on whether
+the data is already resident, whether one relation can fit in GPU memory,
+whether neither relation can fit, how skew shapes partitions, and whether
+result materialization pushes data back across PCIe. A hardware-conscious GPU
+join must therefore choose a different execution shape for each placement and
+distribution case.
+
+For GPU-resident inputs, the paper builds partitioned radix hash joins whose
+working sets fit in GPU shared memory. For out-of-GPU inputs, it uses explicit
+asynchronous transfer pipelines and CPU/GPU co-processing instead of relying on
+Unified Memory or implicit page movement. The strongest transferable idea for
+GPU DB is that join route selection should expose partitioning fanout, build
+side residency, interconnect traffic, pinned-buffer budget, and skew as
+planner-visible traits.
+
+The evaluation uses narrow 4-byte-key/4-byte-payload join workloads, TPC-H
+join cases, a GTX 1080, CUDA 9.0, and a dual-socket Xeon server. Reported
+headline results include up to about 4.5 billion tuples/second when data is
+GPU resident, about 1 billion tuples/second when no data is GPU resident, and
+PCIe saturation in the explicit out-of-GPU strategies. Those are useful
+directional claims, but the paper is an analytical hash-join study rather
+than an OLTP or MVCC system.
+
+**Concrete mechanisms:**
+
+- GPU-resident joins use radix partitioning so at least one co-partition can
+  fit in shared memory, mirroring CPU cache-conscious radix joins but sizing
+  partitions around shared-memory capacity and GPU metadata overhead.
+- The partitioning algorithm uses multiple passes and bucket chains. Buckets
+  are arrays sized as multiples of the thread block size to improve coalesced
+  scans and amortize pointer chasing.
+- Later partitioning passes can assign work by bucket or by whole partition.
+  Bucket-at-a-time assignment is less ideal for uniform data but avoids severe
+  load imbalance under skew, so the implementation chooses it.
+- The probe phase uses shared-memory hash tables for smaller co-partitions.
+  Hash-table chains use compact offsets, and insertion relies on CUDA atomic
+  exchange in shared memory.
+- The nested-loop variant uses warp-level ballot operations so a warp can
+  cooperatively compare an outer value against 32 shared-memory inner values
+  with fewer memory reads. The hash-join variant is generally faster for
+  larger partitions.
+- Result materialization is buffered per warp in shared memory, then flushed
+  sequentially to device memory with atomic global offset allocation to reduce
+  random writes.
+- If one relation fits on the GPU, the larger relation is split into chunks.
+  One CUDA stream transfers the next chunk while another stream joins the
+  current chunk, with events coordinating double-buffered input.
+- If neither relation fits, the CPU radix-partitions both inputs into
+  co-partitions small enough for GPU processing. CPU partitioning, host-to-GPU
+  transfer, and GPU join execute as an overlapped pipeline.
+- The out-of-GPU strategy stores CPU-side partitions in pinned memory for
+  asynchronous transfer. On a dual-socket system, the implementation copies
+  far-socket data into near-socket pinned memory before GPU transfer to avoid
+  QPI traffic hurting PCIe throughput.
+- CPU partitioning bandwidth is deliberately throttled using non-temporal
+  hints and fewer threads so partitioning does not starve GPU transfers on the
+  memory system's critical path.
+- Skewed partitions are packed into GPU working sets with a knapsack step for
+  the first working set and greedy packing afterward, with constraints to
+  avoid placing too many large partitions into one GPU memory budget.
+- The paper finds that Unified Virtual Addressing and Unified Memory are poor
+  fits for these join access patterns because irregular partition and bucket
+  scans move too much data or fail to saturate the interconnect cleanly.
+
+**GPU DB mapping:** The P8 storage engine should treat GPU joins as a family
+of route shapes rather than one resident operator. A route certificate for
+joins should state: build/probe sizes, resident generation, build-side
+placement, partition fanout, expected partition skew, GPU memory budget,
+pinned-buffer bytes, H2D and D2H transfer bytes, output materialization mode,
+and whether CPU partitioning is on the critical path.
+
+This maps directly to multi-tier placement. If both inputs are resident in GPU
+memory, a shared-memory partitioned route can be tested against simpler
+non-partitioned kernels. If only one side is resident, GPU DB can stream the
+other side from pinned host memory or a decompressed warm tier. If neither side
+is resident, the planner needs to compare a CPU-only join, CPU-prefilter plus
+GPU join, and CPU partition plus GPU co-processing route. Hidden movement must
+be a route failure, not an implementation detail.
+
+The paper also sharpens the current route-certificate synthesis. Cost and
+resource certificates for joins must include output size, not just input
+movement. A selective join that aggregates on GPU may hide D2H cost; a
+high-multiplicity join that materializes results can become output-transfer
+bound and should not occupy GPU execution rings blindly.
+
+For session concurrency, the mechanisms imply bounded admission rather than
+free-form GPU launch. Join routes need pinned-buffer budgets, CUDA stream
+ownership, per-route GPU memory ceilings, and queue wait telemetry. At 1M
+logical sessions, only a small number of physical join pipelines should exist;
+requests should batch into compatible route shapes or fall back before they
+fragment GPU memory and staging buffers.
+
+For MVCC, resident join inputs must be immutable snapshots tied to the same
+visibility boundary or to a route that can prove compatible boundaries. CPU
+partitioning for an out-of-GPU join must not race with mutation visibility or
+resident invalidation. The transferable design is explicit staging; the
+correctness rule remains WAL-before-visibility and snapshot compatibility.
+
+**Risks and mismatches:** The paper is focused on analytical equi-joins over
+narrow columns. It does not cover transaction processing, MVCC visibility,
+WAL ordering, snapshot publication, deletes, DDL invalidation, SQL semantics
+beyond joins, text columns, null behavior, or short point-query latency.
+
+The hardware is also older than the target future GPU. PCIe, NVLink, HBM,
+shared-memory size, atomics, CUDA scheduling, and Unified Memory behavior have
+all changed. GPU DB should copy the measurement axes and route decomposition,
+not the exact fanout constants or performance thresholds.
+
+Skew handling is partial. The paper handles partition-size imbalance and
+shows that identical heavy skew can still collapse performance when popular
+keys create long chains or huge output. GPU DB needs a skew-sensitive fallback
+or special hot-key route before using partitioned GPU joins for production
+workloads.
+
+The CPU co-processing route spends CPU bandwidth to feed the GPU. That can
+conflict with pgwire parsing, MVCC/index maintenance, WAL flushing, and read
+snapshot workers. Any benchmark must measure system-level queueing, not only
+operator throughput.
+
+**Benchmark candidates:**
+
+- Add a narrow resident equi-join route certificate with build/probe rows,
+  resident generations, partition fanout, scratch/shared-memory budget,
+  estimated output rows, H2D/D2H bytes, and fallback reason. Proof gate:
+  every join route explains resident, streamed, co-processed, CPU fallback,
+  or rejected.
+- Compare resident non-partitioned hash join, resident partitioned hash join,
+  and CPU fallback on `int4` keys across 1K to 128M rows. Expected result:
+  small joins avoid heavy partition setup while larger joins benefit from
+  shared-memory partitioned execution.
+- Build a streamed-probe benchmark where the build side is GPU resident and
+  the probe side comes from pinned host memory. Measure whether transfer and
+  kernel execution overlap, plus p50/p99 queue wait under concurrent retained
+  reads.
+- Simulate neither-input-resident joins with CPU partitioning plus GPU join.
+  Measure CPU memory bandwidth, pinned-buffer pressure, GPU occupancy, and
+  whether CPU partitioning steals throughput from mutation/WAL and network IO
+  workers.
+- Add skew stressors with uniform keys, probe-only skew, build-only skew, and
+  identical hot-key skew. Failure condition: the planner routes a hot-key
+  explosion to GPU without detecting output-transfer or chain-length risk.
+- Add an output-materialization benchmark: aggregate-on-GPU versus
+  materialize-to-CPU for selectivity 1:1, 1:2, 1:4, and hot-key many-match
+  cases. Minimum proof gate: output bytes participate in route admission and
+  GPU queue budgeting.
+- Compare explicit pinned-buffer transfers against Unified Memory on the
+  target hardware. Expected result is not assumed; the pass condition is that
+  the planner has measured movement telemetry instead of a hidden placement
+  policy.
