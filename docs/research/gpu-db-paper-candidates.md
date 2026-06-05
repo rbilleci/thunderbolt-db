@@ -1339,12 +1339,31 @@ Append new candidates here as each paper is processed.
   useful counterpoint to FastLanes for whether GPU DB cold/warm segments can
   also serve point lookups and mutation-adjacent routes without separate
   row-store copies.
-- `queued` — **LithOS: An Operating System for Efficient Machine Learning on
+- `reviewed` — **LithOS: An Operating System for Efficient Machine Learning on
   GPUs**, Coppock et al., arXiv 2025.
   URL: `https://arxiv.org/abs/2504.15465`
   Why: GPU multitasking paper cites LithOS as a recent GPU OS direction;
   useful for comparing OS-like GPU scheduling and isolation with database-owned
   GPU execution owners.
+- `queued` — **KRISP: Enabling Kernel-wise Right-sizing for Spatial
+  Partitioned GPU Inference Servers**, Chow, Jahanshahi, and Wong, HPCA 2023.
+  URL: `https://doi.org/10.1109/HPCA56546.2023.10071121`
+  Why: LithOS contrasts KRISP's kernel-wise resource sizing with transparent
+  TPC scheduling; useful for GPU DB route admission when kernels have uneven
+  SM/TPC scaling and a fixed per-query reservation wastes accelerator capacity.
+- `queued` — **CoFRIS: Coordinated Frequency and Resource Scaling for GPU
+  Inference Servers**, Chow and Wong, IGSC 2023.
+  URL: `https://doi.org/10.1145/3634769.3634808`
+  Why: LithOS cites CoFRIS as a GPU frequency/resource scaling predecessor;
+  useful for separating route latency budgets, energy-aware DVFS, and
+  capacity-right-sizing policies for always-on retained read services.
+- `queued` — **SGDRC: Software-Defined Dynamic Resource Control for
+  Concurrent DNN Inference on NVIDIA GPUs**, Zhang et al., PPoPP 2025.
+  URL: `https://doi.org/10.1145/3710848.3710863`
+  Why: recent GPU resource-control follow-up cited by LithOS; useful for
+  comparing software-visible GPU partition control against LithOS-style
+  transparent atomization before GPU DB relies on hardware-specific scheduling
+  hooks.
 - `reviewed` — **Microsecond-scale Preemption for Concurrent GPU-accelerated DNN
   Inferences**, Han et al., OSDI 2022.
   URL: `https://www.usenix.org/conference/osdi22/presentation/han`

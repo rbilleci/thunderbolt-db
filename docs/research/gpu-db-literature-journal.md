@@ -59120,3 +59120,145 @@ fan-out, shard colocation, tenancy, transaction mix, and cache pressure.
 - Use high fan-out transactions as an admission test. The route must either
   reserve enough owner/GPU/response budget up front or reject/fallback before
   partial fan-out fills bounded queues.
+
+### 2026-06-05 - LithOS treats GPU sharing as an OS scheduling problem
+
+**Citation:** Patrick H. Coppock, Brian Zhang, Eliot H. Solomon,
+Vasilis Kypriotis, Leon Yang, Bikash Sharma, Dan Schatzberg, Todd C. Mowry,
+and Dimitrios Skarlatos. "LithOS: An Operating System for Efficient Machine
+Learning on GPUs." arXiv:2504.15465, 2025. Retrieved 2026-06-05 from
+`https://arxiv.org/pdf/2504.15465`.
+
+**Category:** GPU execution / runtime scheduling and admission.
+
+**Relevance tags:** GPU multitasking; TPC scheduling; kernel atomization;
+spatial sharing; head-of-line blocking; resource right-sizing; DVFS;
+transparent CUDA interposition; latency prediction; high-priority lanes.
+
+**Core idea:** LithOS argues that modern datacenter GPUs need OS-like resource
+management rather than only framework-level batching, driver time slicing, MPS,
+or coarse MIG partitions. The paper's target is ML serving, not databases, but
+the problem shape is familiar for GPU DB: high-priority short work and
+best-effort long work share an expensive accelerator whose default scheduling
+can either waste capacity or damage tail latency.
+
+LithOS moves scheduling into a transparent CPU-side layer that interposes on
+the CUDA Driver API. Applications enqueue kernels, but LithOS decides when and
+where to dispatch them. Its main abstraction is the thread processing cluster
+or TPC, a GPU compute-unit grouping below the whole-device level. The system
+combines TPC-level allocation, idle TPC stealing, transparent kernel
+atomization, online latency prediction, per-kernel resource right-sizing, and
+DVFS-based power management.
+
+**Concrete mechanisms:**
+
+- LibLithOS interposes on CUDA driver calls, maintains per-stream launch
+  queues, and returns control to applications after enqueueing work instead of
+  eagerly submitting kernels to the device.
+- The TPC scheduler assigns kernels to individual TPCs according to quotas and
+  priority. Idle TPCs can be stolen by other work, while timers based on online
+  latency prediction reduce priority inversion and head-of-line blocking.
+- Kernel atomization wraps an original kernel in a prelude kernel and divides
+  the kernel grid into atoms, each covering a range of thread blocks. This
+  allows long kernels to be scheduled in smaller pieces without source, PTX,
+  framework, or compiler changes.
+- LithOS throttles outstanding atoms through sync queues so the GPU does not
+  become filled with work whose priority or resource allocation can no longer
+  be changed after dispatch.
+- The hardware right-sizing model estimates each kernel's scaling from one-TPC
+  and all-TPC observations, then chooses the smallest TPC allocation that stays
+  within a configured latency-slip parameter. A thread-block occupancy
+  heuristic filters short or poorly scaling kernels.
+- The DVFS policy uses per-kernel sensitivity estimates and a conservative
+  learning period to reduce frequency when the configured latency slip allows
+  it. Unseen kernels initially run at maximum frequency.
+- The latency predictor identifies operators by launch-queue context and
+  ordinal position within a batch, because one kernel function can have
+  different latency at different model layers or input shapes.
+- The prototype is about 5,000 lines of Rust plus generated CUDA-driver
+  interposition code. It builds on MPS for concurrent execution across GPU
+  contexts, so it is not a pure replacement for vendor mechanisms.
+- Evaluation on one A100 compares against NVIDIA time slicing, MPS, stream
+  priority, MIG, and prior systems including TGS, REEF, and Orion. Reported
+  results include 13x lower inference tail latency than MPS for inference
+  stacking, 3x lower tail latency than the best prior system in that setting,
+  4.7x lower tail latency than MPS for inference/training stacking, mean 26%
+  capacity savings from right-sizing with about 4% p99/throughput cost, and
+  mean 26% energy savings from DVFS with about 7% p99 cost.
+
+**GPU DB mapping:** The direct transfer is not "run SQL through LithOS." It is
+the control-plane shape. GPU DB should treat retained point reads, short
+aggregates, long scans, refresh jobs, and cold-tier decompression as different
+GPU service classes with explicit accelerator budgets. A resident read route
+should not sit behind a long scan or refresh kernel merely because both use the
+same CUDA stream or because MPS happens to be the available sharing primitive.
+
+The TPC-scheduler idea maps to GPU execution owners owning resource-class
+budgets rather than only FIFO streams. Current architecture already calls for
+GPU workers to own CUDA streams, pinned buffers, and queue telemetry. LithOS
+suggests adding a route certificate field for accelerator reservation:
+expected kernel family, launch count, rough duration, required HBM bytes,
+allowed co-runners, priority class, and whether the work may be split at a
+kernel or chunk boundary. Even if current NVIDIA APIs do not expose portable
+TPC control for arbitrary database kernels, the engine can still make those
+contracts visible and emulate part of the policy with stream lanes, bounded
+queues, chunked kernels, and admission.
+
+Kernel atomization is especially relevant to P8 refresh and over-resident
+execution. Large table refreshes, decompression passes, and scans should be
+expressed as independently schedulable chunks with deterministic continuation
+metadata. That gives short retained reads a chance to run between chunks while
+preserving SQL-visible ordering and snapshot boundaries. The same principle
+applies to GPU micro-batches: do not submit so much work that a later
+high-priority read, invalidation, or overload decision cannot change course.
+
+Right-sizing also maps cleanly to route choice. Some SQL kernels scale with
+more SMs/TPCs, while others are memory-bound, launch-bound, or output-bound.
+The planner and admission layer should learn per-kernel scaling curves instead
+of assuming every GPU route deserves the whole device. For 1M logical sessions,
+this matters because multiple small retained-read batches may provide better
+tail latency and aggregate throughput than one over-provisioned scan.
+
+**Risks and mismatches:** LithOS is built and evaluated for ML inference and
+training, not SQL execution, MVCC snapshots, WAL ordering, database refresh
+jobs, or mixed CPU/GPU query plans. Its kernel atomization assumes kernels can
+be safely split by thread-block ranges; database kernels with global
+coordination, shared hash tables, reductions, or ordered output may need
+explicit chunk boundaries and merge steps rather than transparent wrapping.
+
+The prototype targets NVIDIA GPUs, builds on MPS, and leaves some low-level
+implementation details to a technical report. TPC-level control may depend on
+driver behavior that is not portable or stable enough for a production
+database. GPU DB should therefore treat LithOS as a design guide for visible
+resource contracts and benchmarkable scheduling policies, not as an immediate
+dependency.
+
+The evaluation uses one A100 and ML workloads. The reported tail-latency,
+capacity, and energy gains are strong evidence for the mechanism under that
+domain, but they do not quantify database kernels, HBM-resident column groups,
+NVMe-fed decompression, result materialization, or pgwire response effects.
+
+**Benchmark candidates:**
+
+- Add a GPU route scheduling harness with at least three classes: short
+  retained lookups, medium aggregates, and long scans or refreshes. Compare
+  FIFO stream submission, priority streams, chunked long work, and bounded
+  admission. Gate: identical query results and snapshot compatibility.
+- Implement chunkable versions of one long GPU scan or refresh kernel. Measure
+  whether interleaving retained reads between chunks improves p99 without
+  lowering overall throughput beyond an explicit budget.
+- Record per-kernel route certificates: kernel family, input rows, HBM bytes,
+  output bytes, launch count, queue wait, execution time, selected priority,
+  chunk id, and co-runner state. Use these to learn simple scaling and
+  interference curves before adding any complex scheduler.
+- Test "do not over-submit" policy for GPU micro-batches. Limit in-flight
+  chunks or atoms so high-priority invalidation or retained reads can enter
+  the device within a bounded time. Failure condition: better throughput but
+  stale reads, missed invalidation windows, or worse p99 under mixed workloads.
+- Evaluate resource right-sizing by running multiple concurrent retained-read
+  batches and one scan with different SM/TPC-equivalent reservations where the
+  platform permits it, or with chunk/interleave approximations otherwise.
+- Add an energy-aware serving experiment only after latency and correctness
+  gates pass: compare fixed max clocks with conservative DVFS or power caps
+  for always-on retained-read workloads. Failure condition: energy savings
+  come from hidden p99 regressions or delayed refresh/invalidation work.
