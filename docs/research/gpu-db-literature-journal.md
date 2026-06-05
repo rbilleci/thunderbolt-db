@@ -61383,3 +61383,155 @@ and measure symptoms before assuming direct hardware control.
   local resident execution versus remote peer access versus CPU fallback plus
   transfer. The decision gate is end-to-end latency under queue pressure, not
   only kernel bandwidth.
+
+### 2026-06-05 - Learned route hints should be bounded, inspectable, and opt-in
+
+**Citation:** Ryan Marcus, Parimarjan Negi, Hongzi Mao, Nesime Tatbul,
+Mohammad Alizadeh, and Tim Kraska. "Bao: Making Learned Query Optimization
+Practical." SIGMOD 2021, pp. 1275-1288. doi:10.1145/3448016.3452838.
+Retrieved 2026-06-05 from the author PDF,
+`https://people.csail.mit.edu/tatbul/publications/bao_sigmod21.pdf`, with DOI
+metadata cross-checked through ACM.
+
+**Category:** query optimization / planning, with route-choice and admission
+relevance.
+
+**Relevance tags:** learned query optimization; bounded hints; Thompson
+sampling; tail latency; route selection; cache-aware planning; advisor mode;
+per-query opt-in; CPU/GPU fallback; route certificates.
+
+**Core idea:** Bao argues that a learned optimizer becomes practical when it
+does not replace the database optimizer. Instead, Bao asks the native optimizer
+to produce plans under a finite set of hint sets, predicts which hinted plan is
+best for the current query, executes that plan, and learns from the observed
+reward. The action space is intentionally small: the prototype uses PostgreSQL
+and commercial-system hints such as disabling join or scan families, not an
+unbounded learned plan generator.
+
+The paper's main transfer is the shape of the control loop. Bao combines a
+tree-convolution model over native plan trees with Thompson sampling over hint
+sets, so it can explore alternatives while continuing to exploit the native
+optimizer. It is designed for dynamic workloads, data, and schema, and it
+emphasizes tail-latency improvement over median-only wins. In cloud
+experiments, the paper reports roughly 50% cost and latency improvement over
+PostgreSQL across three workloads, roughly 20% over a commercial optimizer,
+and an IMDb N1-8 p99 reduction from about 130 seconds to under 20 seconds.
+
+**Concrete mechanisms:**
+
+- Bao treats every hint set as one arm in a contextual multi-armed bandit. The
+  context is the set of native query plans produced for the same SQL query
+  under each hint set.
+- The selected performance metric is user-defined. The paper evaluates query
+  latency and also shows regret can be trained against CPU time or physical IO.
+- For each incoming query, Bao invokes the underlying optimizer once per hint
+  set, vectorizes each plan tree, predicts plan quality, selects a hint set,
+  executes the resulting plan, and stores the observed performance as
+  experience.
+- Plan trees are binarized and represented as node vectors containing operator
+  one-hot features, cardinality estimates, cost estimates, and optional cache
+  state such as the cached fraction of the target file for scan nodes.
+- The predictor uses three tree-convolution layers, dynamic pooling, and fully
+  connected layers. Tree convolution gives the model a plan-structure bias
+  without hard-coding all bad plan patterns.
+- Thompson sampling is approximated by training the neural network on
+  bootstrapped samples from recent experience. The prototype limits experience
+  to the most recent `k` executions and retrains every `n` queries; the paper
+  finds `k = 2000` and `n = 100` a good tradeoff in its setup.
+- Model training can be overlapped with query execution and, in cloud setups,
+  moved to a temporarily attached GPU. The paper includes training and GPU
+  costs in its cloud cost measurements.
+- Bao integrates into PostgreSQL through hooks and session variables. It can
+  run in active mode, advisor mode, or be enabled/disabled per query.
+- Advisor mode observes ordinary optimizer choices, trains from their
+  execution, and adds the predicted Bao hint and expected improvement to
+  `EXPLAIN` output without automatically changing the plan.
+- Performance-critical queries can trigger explicit exploration of each hint
+  set. Those observations are marked critical and weighted so Bao does not keep
+  selecting a regressing hint for that query.
+- The paper reports an optimization-time tradeoff. Bao's prototype takes up to
+  about 230 ms versus 140 ms for PostgreSQL and 165 ms for the commercial
+  system; this is acceptable mainly for tail-dominated or long-running queries.
+- The evaluated 48 hint sets combine subsets of join and scan hints. The top
+  five hint sets account for 93% of Bao's improvement over PostgreSQL on the
+  IMDb workload, suggesting a small, curated action set can capture most of the
+  practical benefit.
+
+**GPU DB mapping:** Bao is a strong fit for GPU DB route choice. The engine
+should not learn arbitrary plans before the deterministic planner, visibility
+rules, and resident-route certificates are solid. A safer first step is a
+Bao-like route-hint layer that chooses among bounded, semantically equivalent
+route families: CPU tuple/index path, CPU fused scan, GPU resident scan, GPU
+resident key-vector lookup, GPU cold transfer, delayed refresh, or explicit
+overload/fallback.
+
+The finite action-space idea maps directly to route certificates. Each learned
+arm must be a named route hint whose correctness conditions are already
+checked by deterministic code: snapshot boundary, schema generation, resident
+segment validity, WAL/visibility frontier, supported predicates, response
+shape, and fallback semantics. The learned component may choose a route; it
+must not waive the certificate.
+
+Bao's cache-aware vectorization is especially relevant to P8. GPU DB features
+should include resident bytes, invalidation age, refresh cost, GPU queue depth,
+CPU fallback queue depth, pinned-buffer pressure, expected transfer bytes,
+expected response bytes, and snapshot class. These signals are much more useful
+than table names if the route model must survive schema and data changes.
+
+For 1M logical sessions, per-query opt-in matters. Short point lookups and
+simple prepared statements may not tolerate a 100-200 ms learned planning tax.
+The learned route layer should start in advisor or shadow mode, learn from
+executed route certificates, and become active only for shapes whose historical
+tail cost justifies extra planning work. Hot retained reads can use cheaper
+precomputed shape-level hints, while long analytical or over-resident routes
+can spend more planning budget.
+
+Bao also suggests a human-debuggable path. Every GPU route decision should log
+the native deterministic route, the learned hint if any, predicted improvement,
+observed latency, fallback reason, and whether the route was active or advisor
+only. If a hint regresses, it should be disableable for that query shape or
+session class without disabling the rest of the system.
+
+**Risks and mismatches:** Bao is evaluated mostly on analytical workloads with
+long-running queries, not OLTP writes, MVCC validation, WAL publication, or GPU
+resident snapshot invalidation. It assumes all hints are semantically
+equivalent, which is true for join/scan choices but must be proven for GPU DB
+routes that may differ in visibility boundary, supported expressions,
+collation behavior, memory placement, or fallback timing.
+
+The optimization overhead is dangerous for short queries and high-concurrency
+session admission. Bao's prototype also parallelizes plan generation across
+hint sets, which could compete with network IO workers, mutation owners, GPU
+execution owners, and background refresh. Thompson sampling may choose a bad
+route while exploring, so active mode needs guardrails for latency-critical
+queries. Finally, cache effects make the bandit assumption imperfect; GPU DB's
+route choices can change residency, queue pressure, and cache state for later
+queries even more strongly than CPU OLAP plans do.
+
+**Benchmark candidates:**
+
+- Add advisor-mode route hints before any active learned routing. For each
+  eligible query, log the deterministic route, candidate bounded route hints,
+  certificate fields, predicted latency, observed latency, and whether the
+  learned hint would have changed the route.
+- Define a small first action set: CPU tuple/index path, CPU fused scan, GPU
+  resident scan, GPU resident key-vector lookup, GPU cold transfer, and reject
+  or defer on overload. Gate: every arm must pass the same SQL correctness and
+  visibility tests as the deterministic route.
+- Build a tail-dominated route benchmark with many cheap retained lookups plus
+  a few expensive scans or over-resident routes. Success condition: advisor
+  decisions identify tail routes without adding p50 latency to the cheap path.
+- Train on route features rather than relation names: estimated rows,
+  resident bytes, transfer bytes, refresh age, queue depth, snapshot class,
+  response size, and invalidation generation. Failure condition: the model only
+  works on one schema or table name.
+- Compare active, advisor, and disabled modes for prepared statements. Active
+  mode is allowed only when the measured planning overhead is below the
+  query-shape latency budget or amortized across repeated executions.
+- Add regression guardrails for performance-critical shapes: exhaustively test
+  candidate route hints offline or in shadow traffic, then pin the best safe
+  hint until telemetry shows the workload or residency state changed.
+- Measure whether learned route planning competes with owner queues. Required
+  metrics: planning CPU time, model-training time, GPU training overlap, queue
+  wait added to mutation/read/GPU owners, and number of route hints abandoned
+  because execution finished first.

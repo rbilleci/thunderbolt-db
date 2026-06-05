@@ -2165,9 +2165,10 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1007/978-3-030-18576-3_41`
   Why: dual-snapshot HTAP design cited by Steam; relevant to separating
   retained analytical snapshots from fresh transactional visibility.
-- `queued` — **Bao: Making Learned Query Optimization Practical**,
+- `reviewed` — **Bao: Making Learned Query Optimization Practical**,
   Marcus et al., SIGMOD 2021.
   URL: `https://doi.org/10.1145/3448016.3452838`
+  PDF: `https://people.csail.mit.edu/tatbul/publications/bao_sigmod21.pdf`
   Why: learned hint-based optimizer baseline compared by PAR2QO; useful for
   deciding whether GPU route tuning should learn bounded hints around a
   deterministic planner rather than replace route rules.
@@ -2185,6 +2186,17 @@ Append new candidates here as each paper is processed.
   Why: lazy physical migration for online schema changes in PostgreSQL;
   useful contrast to Tesseract's MVCC-native out-of-place migration and
   CDC design for retained snapshots and catalog generations.
+- `queued` — **Learned Query Superoptimization**, Trummer, arXiv 2023.
+  URL: `https://arxiv.org/abs/2303.15308`
+  Why: Bao follow-up direction that learns improvements beyond bounded native
+  hint sets; useful contrast once GPU DB has a safe route-certificate action
+  space and needs to decide whether to widen learned route search.
+- `queued` — **Learned Query Optimizer in Alibaba MaxCompute: Challenges,
+  Analysis, and Solutions**, Zhou et al., arXiv 2026.
+  URL: `https://arxiv.org/abs/2602.07336`
+  Why: modern deployability-focused learned-optimizer paper from a production
+  cloud analytics setting; useful for stress-testing Bao-style route learning
+  against dynamic execution environments and missing statistics.
 
 - `reviewed` — **AGILE: Lightweight and Efficient Asynchronous GPU-SSD
   Integration**, Yang et al., SC 2025.
