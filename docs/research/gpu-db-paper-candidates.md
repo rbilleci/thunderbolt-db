@@ -1585,9 +1585,10 @@ Append new candidates here as each paper is processed.
   externally consistent read-only transactions without centralized
   synchronization; useful for comparing PSI freshness against stronger
   client-visible ordering.
-- `queued` — **Cure: Strong Semantics Meets High Availability and Low
+- `reviewed` — **Cure: Strong Semantics Meets High Availability and Low
   Latency**, Akkoorath et al., ICDCS 2016.
   URL: `https://doi.org/10.1109/ICDCS.2016.98`
+  PDF: `https://webperso.info.ucl.ac.be/~pvr/icdcs2016-cure.pdf`
   Why: SSS contrasts stronger external consistency with causally consistent
   transactional replication; useful for deciding which weaker snapshot or
   replica-freshness guarantees are acceptable, if any, for remote retained
@@ -1706,6 +1707,18 @@ Append new candidates here as each paper is processed.
   Why: cited as a modern lightweight string-compression technique;
   directly relevant to P8 text column layout, prefix predicates, and
   CPU/GPU tradeoffs for retained string routes.
+- `queued` — **Antidote: A Highly-Available Geo-Replicated Database with
+  Stronger Guarantees**, Akkoorath et al., arXiv 2018.
+  URL: `https://arxiv.org/abs/1802.06459`
+  Why: Cure was implemented over the Antidote platform; the later system paper
+  may add production-oriented detail on causal transactions, CRDT execution,
+  and globally stable snapshot management.
+- `queued` — **Causal Consistency and Latency Optimality: Friend or Foe?**,
+  Mehdi et al., PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol11/p161-mehdi.pdf`
+  Why: direct modern follow-up for causal consistency metadata and latency
+  tradeoffs; useful for checking whether vector-clock or dependency-tracking
+  snapshot frontiers can be latency-optimal under replicated retained reads.
 
 - `reviewed` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
   Control Schemes**, arXiv 2024.

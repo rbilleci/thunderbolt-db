@@ -63255,3 +63255,152 @@ main-plus-delta freshness with row-id overlays and warm page pinning. Third,
 make temporary route state visible: tuple-id vectors, dictionary/index pages,
 pinned host buffers, GPU input batches, and response buffers should all count
 against admission budgets.
+
+### 2026-06-05 - Cure makes weak global snapshots explicit with per-origin frontiers
+
+**Citation:** Deepthi Devaki Akkoorath, Alejandro Z. Tomsic, Manuel Bravo,
+Zhongmiao Li, Tyler Crain, Annette Bieniusa, Nuno Preguica, and Marc
+Shapiro. "Cure: Strong Semantics Meets High Availability and Low Latency."
+ICDCS 2016. doi:10.1109/ICDCS.2016.98. Retrieved 2026-06-05 from
+`https://webperso.info.ucl.ac.be/~pvr/icdcs2016-cure.pdf`.
+
+**Category:** MVCC / snapshot / visibility; distributed transaction
+semantics; replicated session guarantees.
+
+**Relevance tags:** causally consistent snapshots; transaction atomicity;
+vector-clock visibility; globally stable snapshot; session monotonicity;
+partitioned replication; CRDT updates; replica freshness; snapshot GC.
+
+**Core idea:** Cure targets the strongest semantics the authors consider
+compatible with high availability: transactional causal consistency with
+interactive read/write transactions and convergent CRDT updates. It is not a
+serializable or snapshot-isolation system; it explicitly allows short and long
+fork anomalies. The transferable idea is that even a weaker consistency model
+needs a precise snapshot frontier, a commit frontier, session monotonicity, and
+a garbage-collection frontier. Those fronts are small enough to carry in
+metadata because Cure tracks one vector-clock entry per data center rather
+than one dependency per partition or transaction.
+
+Cure decouples update propagation from update visibility. Local transactions
+become visible immediately after commit because their dependencies are already
+known locally. Remote transactions may be received by partitions before they
+are visible; they become readable only when the local data center's globally
+stable snapshot proves that every local partition has received the required
+remote prefix. That distinction is useful for GPU DB: receiving or building a
+resident generation is not the same as publishing it as a route-safe snapshot.
+
+**Concrete mechanisms:**
+
+- Each object is multiversioned. A version stores its value plus metadata that
+  captures the causal dependencies needed for snapshot reads.
+- Each data center has the same key partitioning. Partition `m` at data center
+  `d` tracks a partition vector clock `pvc` whose entry for remote data center
+  `k` records the update prefix received from sibling partition `m` at `k`.
+- Partitions in one data center periodically exchange their `pvc` values and
+  compute a globally stable snapshot `GSS` as the per-entry minimum across
+  partitions. A remote update is visible only when `GSS` covers its commit
+  vector clock.
+- A transaction starts with a snapshot vector clock `svc`. Remote entries come
+  from `GSS`; the local entry is the maximum of the client's previous clock
+  and the coordinator's physical clock. Starting may wait until the server's
+  `GSS` covers the client's clock to preserve monotonic session reads.
+- Reads are sent to the owning partitions and wait until the local partition's
+  `pvc` covers the transaction snapshot's local component. The partition then
+  returns the newest version whose commit vector clock is no newer than
+  `svc`.
+- Writes are buffered per updated partition. Commit uses two-phase commit
+  inside the local data center. Each participant proposes its current physical
+  timestamp during prepare; the coordinator chooses the maximum proposal as
+  the transaction commit time and embeds it in the local component of the
+  transaction's commit vector clock.
+- Choosing the maximum prepare timestamp is a correctness requirement. If the
+  commit timestamp were lower than a participant's prepare timestamp, a reader
+  could choose a snapshot that should include the transaction but does not wait
+  at that partition.
+- Prepared-but-not-committed transactions constrain local `pvc` advancement:
+  a partition advertises the minimum prepared timestamp minus one, preventing
+  later snapshots from skipping transactions that may still commit.
+- Remote replication sends committed updates, or heartbeats when no updates
+  exist. Receiving partitions append remote updates to their logs and advance
+  the corresponding remote `pvc` entry, but visibility waits for `GSS`.
+- Clients carry the vector clock returned by the previous transaction. The
+  next transaction uses it as a minimum snapshot requirement, giving read-your-
+  writes and monotonically increasing snapshots inside a session.
+- Garbage collection exchanges the oldest active snapshot vector clock and
+  removes versions/log records older than the aggregate minimum.
+- CRDT updates are operation based. Cure stores enough vector-clock context to
+  apply operations to the right causal state and uses unique identifiers to
+  filter duplicate operation delivery.
+- Evaluation on Antidote with 3 data centers and 25 servers per data center
+  reports throughput close to GentleRain for LWW registers, about 30 percent
+  below eventual consistency, and better behavior than state-based eventual
+  consistency for update-heavy CRDT sets because Cure ships operations rather
+  than full object state. Reported median read latency is about 0.7 ms in the
+  scalability experiment; remote visibility latency is around 80-90 ms under
+  the simulated 50 ms inter-data-center delay.
+
+**GPU DB mapping:** Cure is not a target isolation level for a single-node SQL
+engine, but its frontiers map cleanly to route certificates. A GPU DB route
+should distinguish "received", "built", "visible", "stable for all needed
+owners", and "safe to garbage collect". GPU resident buffers, warm host pages,
+replicated or remote future tiers, and page-loadable dictionaries need
+frontier metadata as explicit as Cure's `pvc` and `GSS`, not a single boolean
+residency bit.
+
+The strongest direct transfer is session monotonicity. If a logical session
+observes a visibility generation, later reads from that session must not be
+routed to an older retained snapshot just because a GPU cache hit is cheaper.
+The session's last-observed generation should be an admission input. If the
+target GPU generation, warm page set, remote partition, or analytical replica
+has not caught up to that generation, the route must wait, choose a fresher CPU
+path, or explicitly reject/fallback.
+
+Cure's prepared-transaction rule also fits mutation owners. GPU DB should not
+advance a public visibility frontier past in-flight write batches, refreshes,
+or partition-owner commits that may still publish at an earlier logical
+generation. A single global "latest" timestamp is too weak; each owner or
+partition needs an advertised durable/visible prefix, with prepared ranges
+holding the prefix back until commit or abort is settled.
+
+For future replicated owners or remote GPU snapshots, Cure's vector clock is a
+good shape: keep the vector dimension at owner/domain granularity, not at
+session or transaction granularity. That keeps metadata small while preserving
+enough information to route reads by freshness and recover from partial
+replica/tier lag.
+
+**Risks and mismatches:** Cure deliberately provides weaker semantics than SQL
+serializability or snapshot isolation. Its CRDT convergence model is not a
+substitute for SQL write/write conflict handling, constraints, WAL durability,
+or exact query results. The protocol is for geo-replicated key-value/CRDT data
+centers implemented in Erlang/Antidote, not for a CUDA-backed SQL engine. It
+uses loosely synchronized physical clocks, and clock skew affects waiting and
+latency even if correctness does not depend on tight synchronization. The
+evaluation uses synthetic key-value workloads, not TPC-C, joins, DDL, GPU
+kernels, NVMe paging, or million-session pgwire pressure. The useful part is
+the explicit frontier machinery, not the consistency contract itself.
+
+**Benchmark candidates:**
+
+- Add a session-monotonic retained-read test: after a session observes
+  generation `g`, force the encoded response cache or resident snapshot cache
+  to contain only `g-1`. Proof gate: the route waits, rebuilds, falls back, or
+  rejects; it must never return the older result as a cache hit.
+- Prototype per-owner visible-frontier telemetry: mutation owner, catalog
+  owner, residency owner, GPU execution owner, and optional partition owners.
+  Gate: a route certificate names which owner fronts it requires and why.
+- Add a prepared-frontier stress test where a write batch prepares, stalls
+  before commit, and concurrent retained reads arrive. Failure condition:
+  public snapshot publication advances past the stalled batch in a way that
+  can later make the committed batch appear out of order.
+- For future replicated/remote tiers, model a Cure-like vector with entries
+  for local CPU truth, GPU resident generation, warm host page generation, and
+  remote/cold tier generation. Measure how often reads wait, fall back, or hit
+  a stale tier under delayed refresh.
+- Add GC telemetry based on oldest active snapshot by route class: short OLTP
+  reads, retained GPU reads, long analytical scans, refresh jobs, and recovery.
+  Gate: version or resident-buffer reclamation is blocked only by the classes
+  that can actually still observe the old generation.
+- Build a negative-control benchmark that routes by a scalar latest timestamp
+  instead of per-owner fronts. Expected failure: either stale reads are possible
+  under partial refresh lag, or the scalar frontier over-waits and suppresses
+  otherwise safe fresh-owner routes.
