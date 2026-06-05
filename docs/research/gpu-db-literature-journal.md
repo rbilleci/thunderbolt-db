@@ -57136,3 +57136,205 @@ without a priority, reservation, or fallback policy.
   old retained snapshots and invalidation buffers await reclamation. Win
   condition: no use-after-free of resident buffers, sentinel metadata, or
   pending response buffers.
+
+### 2026-06-05 - PIM-Tree makes near-data ordered indexes skew-resistant
+
+**Citation:** Hongbo Kang, Yiwei Zhao, Guy E. Blelloch,
+Laxman Dhulipala, Yan Gu, Charles McGuffey, and Phillip B. Gibbons.
+"PIM-tree: A Skew-resistant Index for Processing-in-Memory." PVLDB
+16(4), 2022, pp. 946-958. doi:10.14778/3574245.3574275. Retrieved
+2026-06-05 from `https://www.vldb.org/pvldb/vol16/p946-kang.pdf`.
+Artifact: `https://github.com/cmuparlay/PIM-tree`.
+
+**Category:** multi-tier cache / data placement; runtime / HFT /
+session scale.
+
+**Relevance tags:** processing-in-memory; ordered indexes; skew;
+load balance; batch-parallel lookup; future tiers; route metadata;
+range scans; update traces; CPU/accelerator labor division.
+
+**Core idea:** PIM-Tree targets a specific near-data failure mode:
+range-partitioned ordered indexes minimize communication when data
+and requests are uniform, but collapse under data or query skew because
+one PIM module receives the hot range while the rest sit idle. The paper
+argues that near-data index design needs an explicit CPU/PIM division
+of labor rather than a fixed "always push work to memory" rule.
+
+Its key mechanism is push-pull search. When a search node has only a
+small number of requests, the host pushes those requests to the PIM
+module that owns the node. When a node becomes a contention point, the
+host pulls that node's keys back and performs the branching work on the
+CPU, where skew has cache locality instead of load imbalance. Shadow
+subtrees and chunked skip-list nodes then reduce communication and
+improve locality. On a UPMEM system with 2048 PIM modules, 32 CPU
+cores, 500 million keys, and batches of 1 million point operations,
+PIM-Tree reports up to 59.1x higher throughput than a range-partitioned
+PIM index and up to 69.7x higher throughput than the prior
+skew-resistant PIM skip-list baseline.
+
+**Concrete mechanisms:**
+
+- The PIM model has a multicore CPU host and many PIM modules with
+  local memory and simple processors. The paper tracks CPU work/depth,
+  maximum PIM local work, and maximum per-module communication.
+- Baseline range-partitioned PIM indexes store one key range per module
+  and a top-level routing structure on the CPU. They are cheap for
+  uniform accesses but load-imbalanced under hot ranges and expensive to
+  rebalance under skewed inserts.
+- The base structure is a skip-list-derived ordered index. The upper
+  layer is replicated across modules so searches can progress locally;
+  lower nodes are distributed randomly with remote pointers of the form
+  `(PIM id, address)`.
+- Push-pull search runs a batch in rounds. The CPU records each query's
+  next PIM pointer, counts how many queries target each node, pushes
+  lightly used nodes to PIM, and pulls hot nodes back to CPU.
+- The pulled-node path is not a correctness fallback; it is part of the
+  load-balancing algorithm. Skew that is harmful to distributed PIM work
+  becomes favorable CPU cache locality.
+- Search traces are retained on the CPU side and reused for updates.
+  Inserts search first, modify affected physical skip-list nodes, and
+  then update shadow subtrees.
+- Shadow subtrees selectively replicate lower-level search subtrees at
+  selected ancestors. This gives local shortcuts through much of the
+  lower index without full replication's space and update cost.
+- The structure has three logical layers after shadowing: fully
+  replicated top layer, shadowed middle layer, and randomly distributed
+  bottom layer.
+- Chunking merges multiple skip-list nodes into larger blocks, making
+  PIM accesses more locality-friendly and reducing tree height. The
+  paper uses a B+-tree for the replicated CPU-visible top and chunked
+  skip lists for distributed lower layers because batch-parallel updates
+  are simpler there.
+- Range scans first merge overlapping query ranges on the CPU into
+  disjoint groups. Interior nodes can be marked fetch-all, while boundary
+  nodes still use push-pull search.
+- The implementation pipelines independent read batches so CPU-only
+  work can overlap with PIM execution and communication. Update batches
+  are not pipelined together; mixed operation protection uses a
+  read-write lock.
+- UPMEM implementation constraints shape the design: PIM code runs with
+  12 hardware threads to fill the pipeline, instruction memory is small,
+  and loading extra PIM program modules can take about 25% of Insert
+  execution time.
+- The evaluation uses uniform and Zipfian spatial-skew workloads,
+  including a Wikipedia-derived workload. It measures throughput,
+  memory-bus communication, and energy.
+- PIM-Tree is robust across increasing Zipfian skew in the reported
+  point, predecessor, insert, delete, and scan experiments; the
+  range-partitioned baseline degrades and even crashes for skewed
+  Insert at alpha 1.2 due to PIM local-memory overflow.
+- Against conventional CPU indexes, PIM-Tree uses less memory-bus
+  communication and usually higher throughput, but one predecessor
+  case is slower than the compared `(a,b)` tree.
+
+**GPU DB mapping:** PIM-Tree is a future-tier paper, but its strongest
+lesson applies immediately to GPU DB route metadata and resident lookup
+indexes: accelerator placement cannot be a static partitioning rule.
+A GPU-resident key vector, learned segment, hash/range index, or
+old-version visibility summary may work under uniform requests and fail
+under hot ranges or hot keys unless the runtime measures contention
+points and has a cheap CPU-side route for those points.
+
+Push-pull search maps to route admission. A retained lookup batch can
+push uniform key vectors to GPU-resident metadata, while hot keys or hot
+index nodes are pulled back to CPU or owner-domain execution when the
+batch histogram predicts GPU lane imbalance, repeated dependent rounds,
+or poor coalescing. The important design detail is that CPU fallback is
+not only an overload escape hatch; it can be the intended path for
+skewed subproblems where CPU caches and branchy control flow win.
+
+Shadow subtrees suggest a middle ground between fully replicating
+resident route metadata on every execution owner and leaving everything
+behind remote owner messages. GPU DB could keep small replicated route
+prefixes, table-generation summaries, or hot segment descriptors on
+network/read workers, while deeper resident metadata remains owned by
+GPU or residency domains. Selective shortcut replication should be tied
+to update cost and invalidation generation, not treated as durable truth.
+
+The scan algorithm also reinforces route-shape preprocessing. Before a
+GPU batch, merge overlapping retained range requests, classify interior
+segments as fetch-all, and reserve boundary checks for precise
+visibility or predicate work. That could reduce duplicate GPU work for
+range-heavy sessions without changing SQL-visible snapshot semantics.
+
+**Risks and mismatches:** PIM modules are not GPUs. PIM-Tree assumes
+bulk-synchronous batches, explicit CPU/PIM transfers, no direct
+PIM-to-PIM communication, and simple PIM cores with local memory. CUDA
+GPUs have different latency, SIMT divergence, memory coalescing,
+kernel-launch cost, and synchronization constraints. The paper is about
+ordered key-value indexes, not SQL MVCC, WAL, joins, prepared statements,
+or durable recovery.
+
+The design also wants large batches. GPU DB has to serve low-latency
+interactive sessions, so the batch size needed for load balance may
+conflict with p50/p99 goals. PIM-Tree records CPU-side traces for a
+batch and can overflow CPU cache; GPU DB would need explicit active
+context budgets for traces, route histograms, and result scattering.
+
+Finally, PIM-Tree's correctness model is an index-operation model, not a
+transaction-isolation model. Any adoption for resident indexes must be
+wrapped in WAL-before-visibility, snapshot generation checks,
+invalidation, and rebuild-from-CPU-truth rules.
+
+**Benchmark candidates:**
+
+- Add a skew-aware retained lookup simulator with three modes:
+  GPU-push-only, CPU-pull-only, and hybrid push-pull by hot key or hot
+  segment. Metrics: throughput, p50/p99 latency, queue wait, H2D/D2H
+  bytes, result correctness, and fallback reason.
+- Build a route-histogram stage for lookup microbatches. Gate: identical
+  rows to the existing CPU route under inserts, updates, deletes, and
+  retained snapshots; win condition: lower p99 under Zipfian skew.
+- Compare range-partitioned resident key vectors with randomly
+  distributed or hashed lower-level metadata plus replicated route
+  prefixes. Failure condition: one hot partition saturates GPU or owner
+  queues while other partitions are idle.
+- Prototype selective shortcut replication for route metadata:
+  replicated table/schema generation and segment prefix descriptors on
+  read workers, deeper index state owned by residency/GPU workers. Proof
+  gate: DDL and mutation invalidation remove every stale shortcut before
+  new readers can use it.
+- Add overlapping-range batch preprocessing for retained range scans:
+  merge ranges, classify full segments versus boundary segments, and
+  scatter results per original request. Gate: stable ordering and
+  snapshot visibility per request.
+- Track active context bytes for route traces, histograms, pulled nodes,
+  and response scatter state. Failure condition: larger batches improve
+  throughput only by blowing CPU cache or pinned-buffer budgets.
+- Test skewed insert/update invalidation against resident index metadata.
+  Win condition: no local-memory or queue overflow equivalent when one
+  key range receives most changes; the system should rebalance, pull to
+  CPU, or reject with an explicit reason.
+
+### 2026-06-05 - Cross-paper synthesis: accelerator metadata needs affinity, publication, and skew gates
+
+OLTPim, MOT, and PIM-Tree converge on a more precise rule for GPU DB's
+accelerated state: never ask "can this table be on the accelerator?"
+without also asking which metadata has accelerator affinity, how it is
+published, and when skew makes the accelerator path the wrong choice.
+
+OLTPim separates tuple payloads from index and MVCC metadata because
+not all bytes benefit equally from near-data placement. MOT shows that
+fast transactional metadata must still pass through production gates:
+WAL alignment, sentinels/placeholders, checkpoint recovery, DDL cleanup,
+and planner integration. PIM-Tree adds the missing skew gate: even a
+well-placed near-data index needs runtime push-pull behavior when hot
+keys or ranges concentrate work on one execution domain.
+
+The emerging design track is a route certificate with three explicit
+contracts: placement affinity for payload and metadata, publication
+safety for WAL/snapshot/resident generation, and skew/admission policy
+for each batch. A route that has GPU-resident data but no skew gate
+should not be considered fully eligible; it is only eligible for the
+uniform part of the workload.
+
+Category gaps: the queue still needs more modern GPU OLTP and
+deterministic GPU transaction papers, plus more recovery-oriented work
+that covers rebuildable accelerator metadata after crash. The LTPG and
+GaccO candidates are now the highest-value GPU transaction follow-ups.
+
+Benchmark priority: build a skew-aware retained-route harness before
+optimizing kernels. Use the same logical lookup/range workload under
+uniform and Zipfian keys, switch CPU-only, GPU-push-only, and hybrid
+push-pull routes, and require identical MVCC-visible results after WAL
+replay and resident metadata rebuild.

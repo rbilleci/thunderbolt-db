@@ -530,7 +530,7 @@ Append new candidates here as each paper is processed.
   Why: modern OLTP near-data system that separates tuple payloads from
   pointer-chasing index and MVCC metadata; relevant to accelerator-side
   visibility summaries, rebuildable metadata, batching, and tier placement.
-- `queued` — **PIM-Tree: A Skew-Resistant Index for
+- `reviewed` — **PIM-Tree: A Skew-Resistant Index for
   Processing-in-Memory**, Kang et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol16/p946-kang.pdf`
   Why: OLTPim cites PIM-Tree as the skew-resistant alternative to its simpler
@@ -538,7 +538,7 @@ Append new candidates here as each paper is processed.
   key-vector and metadata placement.
 - `queued` — **GaccO: A GPU-Accelerated OLTP DBMS**, Boeschen and Binnig,
   SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3526126`
+  URL: `https://doi.org/10.1145/3514221.3517876`
   Why: OLTPim contrasts prior GPU OLTP systems; useful follow-up for
   comparing GPU transaction batching and conflict handling with OLTPim-style
   near-data metadata placement.
@@ -978,6 +978,18 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up from the same GPU multitasking line that models
   cross-kernel slowdown; relevant to route resource-class calibration and
   conservative GPU co-scheduling.
+- `queued` — **The Processing-in-Memory Model**, Kang et al., SPAA 2021.
+  URL: `https://doi.org/10.1145/3409964.3461806`
+  arXiv: `https://arxiv.org/abs/2105.04305`
+  Why: source model used by PIM-Tree for host/PIM work, depth, IO rounds, and
+  communication analysis; useful for defining future-tier cost metrics for
+  accelerator-side metadata placement.
+- `queued` — **Concurrent Data Structures with Near-Data-Processing: an
+  Architecture-Aware Implementation**, Choe et al., SPAA 2019.
+  URL: `https://doi.org/10.1145/3323165.3323200`
+  Why: PIM-Tree contrasts prior range-partitioned near-data ordered indexes;
+  useful for understanding when simple per-tier range partitioning fails under
+  skew and how much explicit rebalancing or route fallback GPU DB needs.
 - `queued` — **NUBA: Non-Uniform Bandwidth GPUs**, Zhao et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3575693.3575745`
   Why: newer off-chip/on-chip bandwidth-aware GPU architecture work from the
