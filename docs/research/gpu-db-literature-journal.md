@@ -59439,3 +59439,142 @@ Benchmark priorities:
   GPU chunk wait, visibility boundary, and fallback reason for every request.
 - A tail gate: a policy only passes if it improves p99.9 without stale reads,
   hidden WAL-order violations, or unbounded queue growth.
+
+### 2026-06-05 - Ocean Vista turns visibility into batched watermark gossip
+
+**Citation:** Hua Fan and Wojciech Golab. "Ocean Vista:
+Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions."
+PVLDB 12(11):1471-1484, 2019. DOI `10.14778/3342263.3342627`.
+Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol12/p1471-fan.pdf`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** visibility watermarks; multi-version storage; strict
+serializability; asynchronous concurrency control; write-quorum/read-one;
+batch commit visibility; read/write transaction functors; gossip; hot
+conflicts; route certificates.
+
+**Core idea:** Ocean Vista reframes geo-distributed transaction coordination
+as visibility control. Instead of resolving every conflicting transaction with
+synchronous blocking, abort, or per-transaction commit coordination, it assigns
+globally ordered versions, records each transaction's write-set as invisible
+multi-version placeholders, and makes groups of versions visible when gossiped
+watermarks prove that all lower-version store phases have completed.
+
+The paper targets geo-replicated ACID transactions, not a single-node GPU
+database. Still, the transferable idea is strong: visibility can be a compact,
+monotone boundary that lets many readers and writers move in parallel while
+publication waits for an explicit proof. That is close to GPU DB's need to
+separate WAL admission, resident snapshot invalidation, refresh execution, and
+read-route publication without forcing every retained read through the mutation
+owner.
+
+**Concrete mechanisms:**
+
+- OV combines concurrency control, transaction commitment, and replication
+  into one visibility-control protocol over multi-version storage.
+- Each read-write transaction receives a globally unique version from a
+  coordinator using clock-derived timestamp, server id, and counter metadata.
+- The asynchronous concurrency-control path splits a transaction into a
+  store phase, execution phase, and asynchronous writes. The store phase writes
+  functor placeholders for every key in the known write set; the functor
+  contains the read set, write set, and parameters needed to compute results.
+- A transaction version becomes executable only after it is below the
+  visibility watermark. The execution phase reads the latest versions below
+  `ts - 1`, runs deterministic stored-procedure logic, and replaces functors
+  with final values.
+- Server visibility watermark (`Svw`) tracks the minimum in-flight store-phase
+  version on a server. Datacenter visibility watermark (`Dvw`) is the minimum
+  server watermark in that datacenter. Global `Vwatermark` is the minimum
+  gossiped datacenter watermark.
+- Versions below `Vwatermark` are safe to make visible because no lower
+  version can later appear and all lower store phases have completed.
+- A separate replica watermark (`Rwatermark`) tracks versions whose write-only
+  operations have fully replicated. Reads below `Rwatermark` can use any one
+  replica; reads between `Rwatermark` and `Vwatermark` may need quorum checks.
+- OV writes with a fast write-quorum path and asynchronous write-all
+  finalization. Because the store phase inserts unique versions without
+  reading, conflicts do not force the same slow path that TAPIR takes under
+  conflicting reads/writes.
+- The protocol assumes deterministic stored procedures and known write sets in
+  the common case. It mentions reconnaissance queries for dependent
+  transactions without predeclared write sets.
+- The paper sketches strict serializability from version order plus monotone
+  visibility publication. Clock skew can hurt performance but is not supposed
+  to break correctness because watermarks, not raw clock reads alone, govern
+  visibility.
+- Evaluation on AWS EC2 across US, EU, and Asia regions compares OV-DB with
+  TAPIR on YCSB+T and Retwis. Reported results include more than 10x higher
+  peak throughput on a Zipf 0.5 distributed workload, around 43k read-write
+  transactions/s, 30x higher peak throughput on a high-conflict workload, and
+  roughly 16x higher peak throughput on Retwis. The main cost is about one WAN
+  RTT of added latency for watermark gossip in common cases.
+
+**GPU DB mapping:** GPU DB can use the same shape locally even without geo
+replication. A mutation owner can publish a monotone visibility boundary only
+after WAL admission, invalidation, and any required resident-route store phase
+are complete. Read snapshot workers and GPU execution owners can then treat
+the boundary as a certificate: all data below this generation is visible, all
+newer mutation work is invisible unless routed through a stronger owner path.
+
+The functor placeholder idea maps to prepared write templates and refresh
+continuations. For routes with known write sets or declared preconditions, the
+owner could reserve versioned placeholders and let CPU/GPU workers compute
+deterministic results after a boundary advances. This is not general SQL
+execution, but it could fit batched inserts, CAS-style updates, materialized
+refresh fragments, and retained read invalidation work.
+
+`Vwatermark` and `Rwatermark` also suggest splitting visibility from placement.
+GPU DB needs at least two boundaries: a durable CPU/MVCC boundary that is safe
+to read, and a resident boundary that is safe to read from GPU memory. Reads
+below the durable boundary may run on CPU even if resident refresh is behind;
+reads below the resident boundary may use GPU snapshots or read-one-style local
+resident partitions. This makes fallback explicit instead of treating residency
+as a boolean cache hit.
+
+For 1M logical sessions, batched watermark publication is attractive because
+many waiting reads can be released by one boundary advance. The route
+certificate should therefore record requested read boundary, required resident
+boundary, mutation/write-set boundary, and whether the request can wait for a
+near-future watermark or must use the current visible snapshot.
+
+**Risks and mismatches:** Ocean Vista assumes geo-distributed replication,
+deterministic stored procedures, and known write sets. GPU DB's SQL surface
+will include ad hoc statements, range predicates, DDL, planner fallback, and
+queries whose write set is not known until execution. Reconnaissance queries
+may help only for a constrained subset.
+
+The paper accepts extra latency from gossip to gain throughput under WAN
+contention. A single-node GPU DB cannot hide behind WAN latencies; a local
+watermark path must be microsecond-scale and should not delay short retained
+reads unnecessarily. Watermark batching is useful only if it does not become a
+coarse global barrier.
+
+OV's multi-version storage and functor replacement are not a WAL protocol by
+themselves. GPU DB must still preserve WAL-before-visibility, recovery replay,
+snapshot retirement, and invalidation ordering. Any placeholder or functor
+must be replayable or derivable from durable state before it can affect a
+published read boundary.
+
+**Benchmark candidates:**
+
+- Add a local visibility-watermark harness: enqueue mutations, publish a
+  durable visibility boundary after WAL/invalidation, and release compatible
+  retained reads in batches. Measure boundary advance latency, waiting reads
+  released per boundary, p99, and stale-read failures.
+- Split CPU-visible and GPU-resident watermarks. Compare CPU fallback below
+  durable boundary versus GPU execution below resident boundary under refresh
+  lag, memory pressure, and invalidation bursts.
+- Prototype known-write-set placeholders for a narrow CAS/update template.
+  Gate: deterministic replay from WAL and identical SQL-visible results
+  versus owner-serialized execution.
+- Add "wait for near watermark" admission for reads with freshness targets.
+  Compare immediate stale-compatible snapshot, bounded wait, CPU owner route,
+  and overload rejection.
+- Stress a hot-key workload where many writes reserve later versions while
+  reads target older generations. Failure condition: higher throughput from
+  hidden read/write anomalies or placeholders becoming visible before durable
+  completion.
+- Track per-request route fields: requested snapshot, durable watermark,
+  resident watermark, wait budget, write-set known/unknown, placeholder id,
+  fallback reason, and boundary that released the response.

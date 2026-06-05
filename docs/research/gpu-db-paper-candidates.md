@@ -542,16 +542,18 @@ Append new candidates here as each paper is processed.
   Why: OLTPim contrasts prior GPU OLTP systems; useful follow-up for
   comparing GPU transaction batching and conflict handling with OLTPim-style
   near-data metadata placement.
-- `queued` — **LTPG: Large-Batch Transaction Processing on GPUs with
+- `reviewed` — **LTPG: Large-Batch Transaction Processing on GPUs with
   Deterministic Concurrency Control**, Wei et al., ICDE 2024.
   URL: `https://doi.org/10.1109/ICDE60146.2024.00296`
+  PDF:
+  `https://vbn.aau.dk/ws/portalfiles/portal/821323666/New_LTPG.pdf`
   Metadata:
   `https://vbn.aau.dk/en/publications/ltpg-large-batch-transaction-processing-on-gpus-with-deterministi`
   Why: modern GPU transaction-processing paper discovered while searching for
   underrepresented transaction/GPU concurrency work; relevant to deterministic
-  GPU batches without predefined read/write sets. The author-manuscript PDF
-  was behind a Cloudflare challenge during the 2026-06-05 cron run, so use
-  IEEE, author, or institutional access if available.
+  GPU batches without predefined read/write sets. Journal entry exists from
+  2026-06-04; the accessible author-manuscript URL above replaces the
+  previously blocked `/files/` link.
 - `reviewed` — **GPU-Accelerated OLTP: An In-Depth Analysis of Concurrency
   Control Schemes**, Sun et al., arXiv 2024/2026.
   URL: `https://arxiv.org/abs/2406.10158`
@@ -2480,9 +2482,10 @@ Append new candidates here as each paper is processed.
   Why: DINT contrasts against SmartNIC transaction offload; useful for
   comparing eBPF/kernel-side admission with future NIC/DPU-side transaction
   routing and request steering.
-- `queued` — **Ocean Vista: Gossip-based Visibility Control for Speedy
+- `reviewed` — **Ocean Vista: Gossip-based Visibility Control for Speedy
   Geo-Distributed Transactions**, Fan and Golab, PVLDB 2019.
-  URL: `https://doi.org/10.14778/3342263.3342644`
+  URL: `https://doi.org/10.14778/3342263.3342627`
+  PDF: `https://www.vldb.org/pvldb/vol12/p1471-fan.pdf`
   Why: Mako contrasts against integrated replication and concurrency-control
   protocols; useful for comparing visibility-control metadata against GPU DB
   snapshot publication and route certificates.
@@ -2563,6 +2566,22 @@ Append new candidates here as each paper is processed.
   replication motivation; useful for comparing input replication,
   deterministic ordering, and low-latency commit paths when GPU DB eventually
   separates local owner domains from replicated durability.
+- `queued` — **ALOHA-KV: High Performance Read-only and Write-only
+  Distributed Transactions**, Fan, Golab, and Morrey, SoCC 2017.
+  URL: `https://doi.org/10.1145/3127479.3127487`
+  PDF:
+  `https://acmsocc.org/2017/assets/socc17-finalpapers/socc17-final249-acmpaginated.pdf`
+  Why: Ocean Vista builds on the epoch/watermark line from ALOHA-KV; useful
+  for comparing route classes where GPU DB can prove requests are read-only or
+  write-only and batch visibility without full read/write transaction
+  coordination.
+- `queued` — **Scalable Transaction Processing Using Functors**, Fan and
+  Golab, ICDCS 2018.
+  URL: `https://doi.org/10.1109/ICDCS.2018.00101`
+  Why: Ocean Vista uses functor placeholders for read-write transactions;
+  useful for deciding whether GPU DB can store deterministic transaction
+  continuations at visibility boundaries and execute them after snapshot
+  watermarks advance.
 - `queued` — **An Evaluation of Distributed Concurrency Control**,
   Harding et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p553-harding.pdf`
