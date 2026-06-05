@@ -64069,3 +64069,188 @@ useful part.
   into one scalar frontier, then run long transactions, slow DC apply, and
   slow GPU refresh. Expected failure: either GC stalls too much work or a
   route frees/serves state before the right downstream owner has caught up.
+
+### 2026-06-05 - KRISP makes GPU partitions a per-kernel admission decision
+
+**Citation:** Marcus Chow, Ali Jahanshahi, and Daniel Wong. "KRISP:
+Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference
+Servers." HPCA 2023. Retrieved 2026-06-05 from
+`https://www.cs.ucr.edu/~ajaha004/files/KRISP.pdf`.
+
+**Category:** GPU execution / analytics; runtime / HFT / session scale.
+
+**Relevance tags:** GPU spatial partitioning; kernel-wise right-sizing;
+resource-class profiling; compute-unit masks; shader-engine locality;
+co-scheduling; SLO-preserving admission; tail latency; energy per request;
+GPU execution owner policy.
+
+**Core idea:** KRISP argues that model-wide or process-wide GPU
+partitioning leaves capacity idle because different kernels inside one
+request tolerate very different amounts of GPU compute restriction. Instead
+of assigning a fixed partition to a whole process, KRISP profiles the
+minimum compute-unit requirement for each kernel and injects that
+requirement into the kernel launch path. A kernel-scoped partition instance
+then generates a resource mask for the next kernel, allowing concurrent
+work to share the GPU at a finer granularity while still protecting latency
+targets.
+
+For GPU DB, the transferable idea is not the ML-specific serving stack. It
+is the admission unit: a retained route should not reserve "the GPU" or
+even a fixed stream share for its whole request when its kernels have
+different bottlenecks. Lookup, filter, decode, join-build, join-probe,
+aggregate, result-scatter, and refresh kernels may each need different SM,
+memory-bandwidth, scratch, and overlap budgets. GPU execution owners should
+therefore learn resource classes at kernel or route-stage granularity and
+batch only combinations that fit both latency and interference constraints.
+
+**Concrete mechanisms:**
+
+- Existing commercial GPU partitioning is usually process-scoped or
+  stream-scoped. The paper cites MPS/MIG-style reconfiguration costs in the
+  seconds range and prior shadow-instance approaches that hide downtime but
+  still change partitions only at coarse epochs.
+- KRISP profiles each model/kernel to find the minimum required compute
+  units that preserve the tail-latency target. The paper uses 2x isolated
+  inference tail latency as its SLO threshold, following prior inference
+  serving work.
+- The proposed hardware/runtime path extends AMD ROCm-style AQL kernel
+  dispatch packets with a partition-size field. The packet processor then
+  creates a per-kernel CU mask before dispatch.
+- Resource-mask generation tracks per-CU kernel counters, selects the least
+  loaded shader-engine groups first, and uses a "Conserved" placement policy:
+  allocate the minimum number of shader engines needed, then spread CUs
+  across those selected engines. This avoids both over-packing and
+  pathological imbalance across shader engines.
+- The algorithm supports an overlap limit. Isolated mode avoids assigning
+  multiple concurrent kernels to the same CU; oversubscribed mode allows
+  overlap when aggregate demand exceeds physical CUs.
+- The paper's reference design adds a CPU-side required-CU table and
+  per-CU kernel counters in the command processor. For the evaluated 60-CU
+  AMD MI50, the paper reports 5 bits per CU, or 300 bits total, for the
+  counters. Their software implementation of resource-mask generation had
+  about 1 microsecond tail latency.
+- Because the authors could not change GPU firmware or AQL packet formats
+  on real hardware, evaluation uses an emulation over AMD CU Masking:
+  barrier packets are inserted before kernel launch, a callback computes the
+  right-sized mask, and an IOCTL changes the stream mask. They subtract
+  modeled emulation overhead to estimate native KRISP behavior.
+- Evaluation uses an AMD MI50, ROCm 4.5, and a custom inference server over
+  multiple PyTorch/MIOpen model workloads. KRISP isolated mode is the best
+  overall policy in their reported tests: about 2x average throughput over
+  isolated inference, 1.22x over prior model-wise spatial partitioning at
+  four workers, and 33% lower energy per inference while meeting most SLOs.
+- Limits show up for models whose kernels mostly require high CU counts.
+  In those cases, isolation can under-provision kernels when four workers
+  contend for one GPU, and no spatial partitioning policy can satisfy all
+  SLOs for every model.
+
+**GPU DB mapping:** GPU DB should treat route admission as a vector of
+stage-level resource claims, not as a single "uses GPU" flag. A retained
+lookup batch may need a short launch, modest SM occupancy, and tiny D2H
+scatter. A compressed scan may be bandwidth-bound. A hash join may need
+large scratch and longer occupancy. A resident refresh may tolerate delay
+but should not steal resources from short read routes. KRISP suggests
+profiling each kernel/route stage and scheduling compatible combinations
+from bounded GPU execution rings.
+
+The conserved placement idea maps to future multi-GPC, multi-SM, and
+multi-GPU route placement. Today this can be approximated with CUDA streams,
+batch sizing, launch ordering, and conservative non-overlap classes. On
+hardware with MIG/MPS, CUDA stream priorities, cooperative kernels, or future
+partitioning controls, the same metadata can become a stronger enforcement
+policy. The important near-term deliverable is the route certificate field:
+`resource_class`, `expected_kernel_sequence`, `scratch_bytes`,
+`bandwidth_class`, `max_batch_wait_us`, and `co_schedule_group`.
+
+The overlap-limit result is also useful for session concurrency. Instead of
+letting 1M logical sessions all enqueue GPU work into one opaque queue, the
+runtime can admit short retained reads into latency-protected classes and
+let scans, joins, and refreshes consume leftover GPU windows. If observed
+queue delay or CUDA event time breaches the class budget, the route should
+fall back to CPU, defer, or reject with an overload reason rather than
+unboundedly co-scheduling kernels.
+
+**Risks and mismatches:** KRISP is an ML inference paper, not a database
+paper. Its kernels come from neural-network libraries, its SLO is an
+inference-latency convention, and its evaluation focuses on AMD MI50/ROCm
+rather than CUDA database kernels. The paper does not address SQL
+correctness, MVCC visibility, WAL ordering, pinned-buffer budgets, GPU memory
+capacity, or data movement from NVMe/host memory.
+
+The strongest KRISP mechanism assumes hardware or firmware support for
+per-kernel partition fields. The evaluation emulates this behavior and
+models away barrier/IOCTL overhead; a production GPU DB cannot assume such
+control exists on the target NVIDIA card. The practical first step is
+profiling and admission classes, not promising true SM masks.
+
+Kernel-wise partitioning may also be too granular for database routes if
+planner, launch, and telemetry overhead exceed the saved GPU capacity.
+Database kernels may be larger and more memory-bandwidth-limited than the
+inference kernels studied here. Any co-scheduling policy must include memory,
+L2/cache, scratch, PCIe/NVLink, and D2H response pressure, not just SM/CU
+counts.
+
+**Benchmark candidates:**
+
+- Add a GPU route-stage profiler that records kernel name/shape, batch size,
+  rows, input/output bytes, scratch bytes, CUDA event time, queue wait, and
+  observed slowdown when co-run with one other route class. Start with
+  retained lookup, count/sum scan, compressed decode, hash build/probe, and
+  resident refresh stages.
+- Build a software-only co-scheduling matrix: lookup+lookup, lookup+scan,
+  lookup+refresh, scan+aggregate, join+scan, and refresh+join. Proof gate:
+  p95/p99 retained lookup latency stays under a configured budget while
+  background throughput improves versus serialized GPU execution.
+- Compare three GPU admission policies: single FIFO stream, fixed route-class
+  stream lanes, and KRISP-inspired stage-aware overlap limits. Measure GPU
+  utilization, kernel launches/s, p50/p99 read latency, refresh lag, fallback
+  count, and overload reason distribution.
+- Add a negative control where long resident refresh kernels can overlap
+  freely with short retained lookup kernels. Expected failure: lookup p99
+  rises even when average GPU utilization appears better.
+- Extend route certificates with resource-class metadata and require the
+  GPU execution owner to log why a request was admitted, batched, deferred,
+  CPU-fell-back, or rejected. Failure condition: a saturated GPU queue has no
+  class-specific reason for tail-latency growth.
+- Test batch-size sensitivity separately from resource overlap. KRISP shows
+  smaller batches change contention behavior; GPU DB should measure whether
+  micro-batches of 1, 4, 16, 64, and 256 rows should occupy different route
+  classes even for the same SQL template.
+
+### 2026-06-05 - Cross-paper synthesis: frontiers and schedulers must become stage-level contracts
+
+The last three reviewed papers converge on a common implementation shape:
+do not serialize all correctness and performance state behind one scalar
+owner or one scalar queue. Deuteronomy's range-MVCC paper makes range
+visibility a logical certificate instead of a storage-side afterthought.
+Deuteronomy's high-performance transaction paper splits durable commit,
+storage apply, read-version retention, and old-version reclamation into
+separate frontiers. KRISP adds the GPU-side analogue: execution capacity
+should be admitted at route-stage or kernel-class granularity instead of
+claimed by a whole request.
+
+The promising design track is a contract-first runtime. A read route should
+carry both a visibility certificate and a resource certificate: which
+snapshot/range/frontier makes the result legal, and which owner queues,
+buffers, GPU stages, and fallback paths make the result timely. This points
+to benchmark work that measures certificates as first-class overhead:
+frontier checks, delta merges, range certificates, GPU class admission,
+co-scheduling slowdown, and reason-coded fallback.
+
+The category gap after this batch is query planning for these contracts.
+The queue has enough raw mechanisms for MVCC frontiers and GPU resource
+classes; the next high-value paper should ideally be a planner, optimizer,
+or route-selection paper that decides when a certified resident/GPU route is
+too risky compared with a CPU or tiered fallback route.
+
+Benchmark priorities:
+
+- Implement route certificates with both visibility frontiers and GPU
+  resource-class fields, then measure their p50/p99 overhead on retained
+  lookups.
+- Build a correctness stressor for late inserts, resident range scans, slow
+  storage apply, and slow GPU refresh with reason-coded fallback.
+- Build a GPU co-scheduling stressor that protects retained lookup latency
+  while consuming spare capacity with scans, joins, and refresh work.
+- Add planner telemetry that records why a route used resident GPU, CPU
+  fallback, owner serialization, or overload rejection.

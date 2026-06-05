@@ -1447,9 +1447,10 @@ Append new candidates here as each paper is processed.
   Why: GPU multitasking paper cites LithOS as a recent GPU OS direction;
   useful for comparing OS-like GPU scheduling and isolation with database-owned
   GPU execution owners.
-- `queued` — **KRISP: Enabling Kernel-wise Right-sizing for Spatial
+- `reviewed` — **KRISP: Enabling Kernel-wise Right-sizing for Spatial
   Partitioned GPU Inference Servers**, Chow, Jahanshahi, and Wong, HPCA 2023.
   URL: `https://doi.org/10.1109/HPCA56546.2023.10071121`
+  PDF: `https://www.cs.ucr.edu/~ajaha004/files/KRISP.pdf`
   Why: LithOS contrasts KRISP's kernel-wise resource sizing with transparent
   TPC scheduling; useful for GPU DB route admission when kernels have uneven
   SM/TPC scaling and a fixed per-query reservation wastes accelerator capacity.
@@ -1694,6 +1695,25 @@ Append new candidates here as each paper is processed.
   optimization; useful for comparing cloud/cold-tier column groups,
   metadata layout, and coalesced reads against P8 resident and
   over-resident segment directories.
+- `queued` — **GSLICE: Controlled Spatial Sharing of GPUs for a Scalable
+  Inference Platform**, Dhakal, Kulkarni, and Ramakrishnan, SoCC 2020.
+  URL: `https://doi.org/10.1145/3419111.3421284`
+  Why: KRISP compares against GSLICE's model-wise GPU spatial sharing and
+  shadow-instance resizing; useful for GPU DB admission when route classes need
+  spatial isolation but kernel-wise control is unavailable.
+- `queued` — **Multi-model Machine Learning Inference Serving with GPU Spatial
+  Partitioning**, Choi et al., arXiv 2021.
+  URL: `https://arxiv.org/abs/2109.01611`
+  Why: KRISP compares against Gpulet-style model-wise right-sizing; useful for
+  contrasting request-epoch GPU partition changes with per-route and
+  per-kernel GPU DB resource reservations.
+- `queued` — **PARIS and ELSA: An Elastic Scheduling Algorithm for
+  Reconfigurable Multi-GPU Inference Servers**, Kim, Choi, and Rhu, arXiv
+  2022.
+  URL: `https://arxiv.org/abs/2202.13481`
+  Why: KRISP contrasts PARIS/ELSA's model- and batch-size-aware MIG scheduling;
+  useful for future multi-GPU resident-route placement and shadow-capacity
+  planning.
 - `reviewed` — **BtrBlocks: Efficient Columnar Compression for Data Lakes**,
   Kuschewski et al., SIGMOD 2023.
   URL: `https://doi.org/10.1145/3589263`
