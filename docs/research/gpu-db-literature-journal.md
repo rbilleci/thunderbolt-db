@@ -56788,3 +56788,172 @@ placement on/off, and cross-tier snapshot registry on/off. The proof gate is
 identical SQL-visible results and replay under all switch settings; the win
 condition is lower aborts, lower wrong-tier accesses, and stable p99 latency
 when the switches are enabled.
+
+### 2026-06-05 - OLTPim splits pointer-chasing metadata from tuple payloads for near-memory OLTP
+
+**Citation:** Hyoungjoo Kim, Yiwei Zhao, Andrew Pavlo, and
+Phillip B. Gibbons. "No Cap, This Memory Slaps: Breaking Through
+the Memory Wall of Transactional Database Systems with
+Processing-in-Memory." PVLDB 18(11), 2025, pp. 4241-4254.
+doi:10.14778/3749646.3749690. Retrieved 2026-06-05 from
+`https://www.pdl.cmu.edu/PDL-FTP/associated/p4241-kim.pdf`.
+
+**Category:** transaction processing / write path; multi-tier cache /
+data placement.
+
+**Relevance tags:** OLTP; processing-in-memory; MVCC metadata
+placement; version-chain traversal; index placement; near-data execution;
+batching; coroutine scheduling; NUMA partitioning; recovery rebuilds;
+future tiers.
+
+**Core idea:** OLTPim argues that the useful unit of near-data execution is
+not "move the whole database engine to the accelerator." Instead, an OLTP
+engine should place only operations with high near-memory affinity near the
+data. On current UPMEM PIM hardware, pointer-chasing index traversals and
+MVCC version-chain walks are good PIM work because they turn many random
+far-memory accesses into local module accesses with small CPU/PIM request
+and response records. Tuple payload access is bad PIM work because returning
+the payload moves the same bytes back over the memory channel and pays PIM
+control overhead.
+
+The resulting design keeps transaction orchestration, logging, tuple
+payloads, and transaction contexts on the CPU/DRAM side, while placing
+primary indexes and MVCC version metadata in PIM modules. A lightweight
+batcher hides PIM round latency, but the paper is explicit about the trade:
+larger batches improve throughput and memory-channel traffic while raising
+p99 latency, in-flight context size, and conflict probability. On a real
+UPMEM system with 2048 PIM modules, OLTPim reports up to 1.71x throughput
+and up to 6.14x lower per-transaction memory-channel traffic than MosaicDB,
+with the strongest wins on large, low-to-moderate-skew, read-heavy OLTP
+workloads.
+
+**Concrete mechanisms:**
+
+- OLTPim defines near-memory affinity as the reduction in far-memory
+  cache-line traffic after accounting for the request and return bytes
+  needed to offload an operation.
+- It classifies B+tree traversal and version-chain traversal as
+  near-memory-friendly, while tuple access is not, so indexes and MVCC
+  metadata live in PIM and tuple payloads remain in DRAM.
+- PIM-side primary indexes are hash/range partitioned by key across modules.
+  The configurable key shift trades range-query locality against skew and
+  load balance.
+- Version chains are newest-to-oldest and co-located with the primary index
+  partition for the tuple, so a PIM engine can traverse the index and the
+  visible-version chain in one local operation.
+- Garbage collection is split: PIM traverses version metadata and returns the
+  first obsolete tuple pointer plus count; the CPU then reclaims the
+  redundant DRAM tuple chain without traversing all MVCC metadata itself.
+- Writes acquire a module-local PIM-side write lock on version metadata.
+  Commit or abort sends write-set object ids back to the relevant modules to
+  publish or remove modifications and release locks.
+- WAL records are written from CPU-owned information: index id, PIM id, object
+  id, and tuple data. PIM-side indexes and version chains are rebuilt during
+  recovery rather than logged as durable authority.
+- Secondary indexes cannot generally be co-located with primary-key version
+  chains. A secondary-index lookup may therefore require one PIM round to
+  find `(PIM id, object id)` and another to traverse the version chain.
+- The batcher is per PIM rank because current hardware exposes rank-level
+  control. It uses flat combining so worker threads perform combiner work
+  without adding dedicated batching threads.
+- Coroutines interleave CPU work with PIM execution: a coroutine can start
+  PIM work, yield while the PIM rank runs, and let another coroutine advance
+  different transaction work.
+- NUMA-aware partitioning prevents worker threads from repeatedly becoming
+  combiners for remote PIM ranks, avoiding cross-socket cache-line movement
+  in the batcher hot path.
+- Implementation constraints matter: UPMEM lacks dynamic allocation on PIM
+  modules, has very limited arbitrary-address atomics, small instruction
+  memory, explicit scratchpad management, and expensive mux switches. OLTPim
+  uses fixed-size arrays, software latch bitmaps, and an optimized SDK path
+  that removes helper-thread and excessive polling overhead.
+- Evaluation shows the batch-size cliff: OLTPim's best YCSB-B throughput is
+  at batch size 256, while MosaicDB's is eight. Larger batches eventually
+  overflow CPU LLC with transaction contexts and increase memory traffic.
+- Update-heavy workloads expose a mismatch: larger in-flight batches increase
+  abort probability and keep more non-obsolete versions alive. The paper
+  reports YCSB-A with 1M tuples reaching 21% aborts for OLTPim versus 1.1%
+  for MosaicDB at each system's throughput-oriented setting.
+- Insert-heavy paths suffer because PIM-side B+tree inserts need coarse
+  latching on current hardware; logging is not the main insert bottleneck in
+  the reported experiment.
+- High skew reduces OLTPim's advantage because CPU caches benefit from hot
+  data locality while PIM parallelism benefits from uniform distribution.
+
+**GPU DB mapping:** OLTPim is a useful future-tier paper even though it is
+about PIM rather than GPUs. Its main transferable rule is to place metadata
+by operation affinity, not by object type alone. GPU DB should ask which parts
+of MVCC, indexing, visibility, and route metadata turn many random CPU cache
+misses into small accelerator-side summaries. Resident tuple columns may stay
+GPU-friendly for scans and vectorized predicates, while version metadata,
+old-snapshot side structures, key vectors, or route filters may need separate
+placement based on whether the request/response footprint is tiny.
+
+The WAL/recovery choice is especially aligned with P8: accelerated metadata
+can be rebuildable. GPU resident indexes, visibility summaries, key vectors,
+and old-version filters should not become independent durable authority
+unless there is a deliberate logging design. A crash should be able to replay
+WAL into CPU truth and rebuild accelerator-side metadata for valid tuples,
+just as OLTPim rebuilds PIM indexes and version chains.
+
+The batcher is directly relevant to the high-throughput runtime. GPU DB's
+read-snapshot and GPU execution rings need the same explicit latency trade:
+larger compatible batches can hide launch, transfer, and scheduling cost, but
+they also increase active transaction/session state, conflict windows, queue
+wait, and p99 latency. The runtime should expose the active batch size and the
+conflict/latency slope rather than only chasing peak throughput.
+
+The version-chain placement points to a concrete MVCC benchmark. For hot
+read-mostly retained routes, store visibility metadata in a compact,
+accelerator-friendly side array or key/version bundle, but keep tuple payloads
+and WAL-owned truth in CPU storage until the query shape proves the GPU should
+own the payload too. For secondary indexes and non-primary route filters, the
+paper warns that one lookup can become multiple dependent accelerator rounds
+unless related metadata is co-located by route family.
+
+**Risks and mismatches:** PIM modules are not GPUs. UPMEM cores are simple
+in-order processors with local memory; CUDA GPUs have different latency,
+bandwidth, synchronization, launch, and memory-coalescing behavior. The paper
+targets in-memory OLTP, not SQL analytics, joins, text-heavy payloads, or
+over-resident GPU/NVMe execution.
+
+The strongest OLTPim gains appear when large uniform working sets defeat CPU
+caches. Highly skewed workloads may favor CPU caches, and insert-heavy or
+update-heavy workloads can lose ground due to coarse PIM latching, GC cost,
+and higher aborts from larger batches. GPU DB should therefore avoid a blanket
+"put MVCC/index metadata on GPU" rule. It needs per-route admission and
+fallback when skew, write rate, or secondary-index dependencies make the
+accelerator path worse.
+
+OLTPim uses asynchronous RAM-disk logging in the evaluation and rebuilds PIM
+metadata during recovery. That supports the rebuildable-state principle, but
+the absolute latency and throughput claims do not directly transfer to a
+durable GPU DB path with fsync, WAL archive, checkpoints, and cold-tier
+frontiers.
+
+**Benchmark candidates:**
+
+- Build a placement-affinity simulator for GPU DB metadata: CPU-only
+  visibility/index lookup, GPU-resident tuple payload plus CPU visibility,
+  and GPU/accelerator-side compact visibility summaries. Gate: identical MVCC
+  visible sets and WAL replay behavior.
+- Add a retained-lookup microbatch sweep with batch sizes
+  `1,2,4,8,16,32,64,128,256`. Measure throughput, p50/p99 latency, active
+  context bytes, conflict/abort rate, queue wait, and CUDA launch count.
+- Prototype rebuildable resident key/version metadata tied to a WAL
+  generation. Recovery proof gate: replay CPU truth, rebuild metadata, and
+  produce identical retained lookup results without trusting pre-crash GPU
+  state.
+- Add a skew benchmark that varies Zipfian hotness for GPU-resident lookup
+  routes. Failure condition: the GPU path remains admitted after CPU cache
+  locality makes it slower or higher latency than CPU fallback.
+- Test secondary-index route co-location: compare one accelerator round for
+  primary-key lookup with two dependent rounds for secondary-index lookup plus
+  version visibility. Required metrics: p99 latency, bytes moved, and fallback
+  threshold.
+- Add a GC/version-chain stress test with large active batches. Win condition:
+  throughput improves without unbounded old-version growth, rising p99, or
+  retained snapshot visibility regressions.
+- Track route-certificate fields for `operation_affinity`,
+  `metadata_placement`, `payload_placement`, `dependent_round_count`,
+  `batch_size`, `active_context_bytes`, and `rebuildable_acceleration_state`.

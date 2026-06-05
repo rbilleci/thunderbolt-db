@@ -521,6 +521,37 @@ Append new candidates here as each paper is processed.
   URL: `https://vldb.org/pvldb/vol18/p4629-afroozeh.pdf`
   Why: modern file-format follow-up that may connect GPU-friendly compressed
   vectors to disk/NVMe cold-tier layout and CPU/GPU shared data placement.
+- `reviewed` — **No Cap, This Memory Slaps: Breaking Through the Memory
+  Wall of Transactional Database Systems with Processing-in-Memory**,
+  Kim et al., PVLDB 2025.
+  URL: `https://www.pdl.cmu.edu/PDL-FTP/associated/p4241-kim.pdf`
+  DOI: `https://doi.org/10.14778/3749646.3749690`
+  Code: `https://github.com/hyoungjook/OLTPim`
+  Why: modern OLTP near-data system that separates tuple payloads from
+  pointer-chasing index and MVCC metadata; relevant to accelerator-side
+  visibility summaries, rebuildable metadata, batching, and tier placement.
+- `queued` — **PIM-Tree: A Skew-Resistant Index for
+  Processing-in-Memory**, Kang et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol16/p946-kang.pdf`
+  Why: OLTPim cites PIM-Tree as the skew-resistant alternative to its simpler
+  hash/range partitioned PIM indexes; useful for GPU DB skew-aware resident
+  key-vector and metadata placement.
+- `queued` — **GaccO: A GPU-Accelerated OLTP DBMS**, Boeschen and Binnig,
+  SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526126`
+  Why: OLTPim contrasts prior GPU OLTP systems; useful follow-up for
+  comparing GPU transaction batching and conflict handling with OLTPim-style
+  near-data metadata placement.
+- `queued` — **LTPG: Large-Batch Transaction Processing on GPUs with
+  Deterministic Concurrency Control**, Wei et al., ICDE 2024.
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00296`
+  Metadata:
+  `https://vbn.aau.dk/en/publications/ltpg-large-batch-transaction-processing-on-gpus-with-deterministi`
+  Why: modern GPU transaction-processing paper discovered while searching for
+  underrepresented transaction/GPU concurrency work; relevant to deterministic
+  GPU batches without predefined read/write sets. The author-manuscript PDF
+  was behind a Cloudflare challenge during the 2026-06-05 cron run, so use
+  IEEE, author, or institutional access if available.
 - `queued` — **A Study of the Fundamental Performance Characteristics of GPUs
   and CPUs for Database Analytics**, Shanbhag, Yu, and Madden, SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3380595`
