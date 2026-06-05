@@ -642,7 +642,8 @@ Append new candidates here as each paper is processed.
   Why: AMAC cites many-core hash-join tuning as related hardware-conscious
   database work; useful for separating CPU many-core memory-level parallelism
   from GPU/accelerator route choices when joins or grouped lookups spill to CPU.
-- `queued` — **Optimistic Concurrency with OPTIK**, David et al., PPoPP 2016.
+- `reviewed` — **Optimistic Concurrency with OPTIK**, Guerraoui and
+  Trigonakis, PPoPP 2016.
   URL: `https://doi.org/10.1145/2851141.2851146`
   PDF: `https://infoscience.epfl.ch/record/217219/files/PPoPP16_OPTIK.pdf`
   Why: ASCY follow-up from the same group; useful for optimistic read/validate
@@ -655,6 +656,13 @@ Append new candidates here as each paper is processed.
   Why: ASCY-related concurrency-optimality work; useful as a correctness
   counterweight when deciding whether simplified route metadata structures
   sacrifice valid concurrent schedules for speed.
+- `queued` — **PathCAS: An Efficient Middle Ground for Concurrent Search Data
+  Structures**, Brown, Sigouin, and Alistarh, PPoPP 2022.
+  URL: `https://doi.org/10.1145/3503221.3508410`
+  PDF: `https://research-explorer.ista.ac.at/download/11181/11731`
+  Why: modern follow-up that combines multi-word CAS and transactional-memory
+  ideas for concurrent search structures; useful for route metadata updates
+  that need atomic multi-location publication without full STM overhead.
 - `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`

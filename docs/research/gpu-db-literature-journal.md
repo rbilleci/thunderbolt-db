@@ -51936,3 +51936,169 @@ missing accounting.
 - Add telemetry to catch accidental shared stores in hot read paths, such as
   global hit counters, LRU touches, or debug fields. Proof gate: retained-read
   execution remains low-store under perf/counter inspection.
+
+### 2026-06-05 - Optimistic Concurrency with OPTIK
+
+**Citation:** Rachid Guerraoui and Vasileios Trigonakis. "Optimistic
+Concurrency with OPTIK." PPoPP 2016. doi:10.1145/2851141.2851146. Retrieved
+2026-06-05 from the EPFL Infoscience PDF,
+`https://infoscience.epfl.ch/record/217219/files/PPoPP16_OPTIK.pdf`.
+
+**Category:** runtime / HFT / session scale; transaction processing /
+concurrency control.
+
+**Relevance tags:** optimistic validation; versioned locks; route metadata;
+CPU indexes; retained snapshot maps; hot-key updates; bounded queues; memory
+reclamation; lock contention telemetry.
+
+**Core idea:** OPTIK turns a common optimistic-concurrency shape into a reusable
+data-structure pattern. An operation reads a version, does unsynchronized
+optimistic work, and then enters the synchronized region only if the protected
+version is still the one it observed. The paper's key implementation idea is
+the OPTIK lock: validation and lock acquisition are merged into one atomic
+operation, so a thread does not wait behind a lock only to discover that the
+version changed and the work must be retried.
+
+The paper applies the pattern to linked lists, hash tables, skip lists, and
+Michael-Scott queues. The headline result that transfers best is not one
+specific container, but the lock/validation contract: protect a small region
+with a version, keep the read phase unsynchronized, and make failed validation
+cheap. In the paper's lock microbenchmark, OPTIK locks are more than 10x faster
+than a normal lock plus separate version validation on average because they
+avoid queued lock acquisition followed by failed validation.
+
+**Concrete mechanisms:**
+
+- Each protected region has a version number at the same granularity as the
+  lock: one node, bucket, queue endpoint, or other small mutable region.
+- A reader/updater records the current version, performs the optimistic parse
+  or traversal, then calls `optik_trylock_version(lock, observed_version)`.
+- `optik_trylock_version` succeeds only when the lock is free and the current
+  version still matches the observed version. If it succeeds, the critical
+  section is guaranteed to run; if it fails, the operation retries without
+  having waited behind a stale lock.
+- Unlocking increments the version, so publication of the modification and
+  invalidation of old optimistic observations are coupled.
+- The paper gives implementations over versioned locks and ticket locks. The
+  ticket-lock implementation can expose queue length and distance-from-owner
+  information for contention-aware backoff or route decisions.
+- Lock nesting is not automatically atomic. If a later lock validation fails,
+  the algorithm must define whether to undo, restart, or keep already published
+  partial progress if the data-structure semantics allow it.
+- OPTIK deliberately separates concurrency control from memory reclamation.
+  Hazard pointers, RCU, quiescent states, or other reclamation schemes remain
+  responsible for pointer lifetime.
+- In hash-table buckets, OPTIK can avoid a second traversal after locking:
+  once the bucket version validates, no completed concurrent modification has
+  changed the bucket since the optimistic traversal.
+- In queues, the ticket-lock queue-length signal drives a victim-queue path:
+  when enqueue contention exceeds a threshold, new enqueues go to a secondary
+  queue that is later linked into the main queue by the thread that acquired
+  the main lock.
+- The paper is explicit that OPTIK is not STM. It allows partial progress and
+  does not automatically provide all-or-nothing transaction semantics.
+
+**GPU DB mapping:** OPTIK is a good fit for CPU-side route metadata that must
+stay cheap under many read workers: relation-to-resident-generation maps,
+session credit buckets, prepared-route certificates, resident segment maps,
+and small CPU fallback indexes. The retained-read path can optimistically read
+a generation pointer and route facts, then validate one compact version before
+enqueueing GPU work. If validation fails, the route retries or falls back
+without having blocked the metadata owner.
+
+For mutation and residency publication, OPTIK suggests a small-region
+publication contract. A mutation owner can keep WAL-before-visibility as the
+durable rule, while route metadata updates use versioned publication cells:
+invalidate or replace only the affected table/partition/segment cell, increment
+its version, and let readers cheaply detect stale optimistic observations. This
+matches the ASCY rule that searches should be read-only and updates should
+write a minimal region.
+
+The ticket-lock queue-length feature is also useful for admission. It is a
+local signal that a metadata bucket, hot key, or response lane is congested.
+GPU DB should not necessarily adopt ticket locks, but the route certificate
+should expose comparable small-region contention signals: retry count, version
+change rate, queued waiters, and fallback reason. Those signals can steer
+requests into owner serialization, CPU fallback, or a secondary lane before
+they burn GPU or pinned-buffer budget.
+
+OPTIK's warning about lock nesting maps directly to multi-object SQL and
+multi-partition writes. Versioned route cells are attractive for single-table
+metadata and point indexes, but a transaction touching multiple cells needs a
+separate ordered publication protocol, Block-STM-style window, or owner-domain
+serialization. OPTIK by itself is not enough to make multi-row SQL atomic.
+
+**Risks and mismatches:** OPTIK is a concurrent data-structure paper, not a
+database MVCC protocol. It does not provide SQL transaction atomicity,
+serializability, WAL ordering, snapshot publication, DDL safety, recovery, or
+GPU execution scheduling. The paper explicitly leaves all-or-nothing semantics
+to the programmer, so it must be restricted to metadata and index substructures
+whose publication protocol is separately proven.
+
+The evaluation targets 2016-era multicore machines and in-memory containers.
+Exact lock, cache, and NUMA behavior may differ on the eventual GPU DB host.
+Spin-style locks can also hurt under oversubscription or preempted owners,
+which matters for an async SQL server. Memory reclamation is out of scope; any
+route map visible to retained readers needs epoch, hazard, RCU, or immutable
+snapshot lifetime rules before old cells can be freed.
+
+Finally, version counters can wrap or suffer ABA-like hazards if the width and
+lifetime assumptions are wrong. The paper notes that ticket-lock versions are
+32-bit; GPU DB should use wide generations for route metadata and treat version
+reuse across retained snapshots as a correctness bug.
+
+**Benchmark candidates:**
+
+- Prototype a versioned route-cell map for `relation_oid -> resident_generation`
+  lookup. Compare owner-serialized lookup, generic concurrent map, and
+  OPTIK-style read/validate cells. Gate: identical route correctness with lower
+  p95/p99 under many retained-read workers.
+- Add stale-route retry measurement: hold many readers on one resident
+  generation while a mutation invalidates and republishes it. Failure
+  condition: readers wait behind a metadata lock only to discover stale
+  generation facts.
+- Measure contention signals per metadata cell: version-change rate, failed
+  validation count, queue wait, and fallback reason. Use them to steer a hot
+  relation into owner serialization or delayed retry. Gate: lower wasted work
+  without hiding overload.
+- Test single-cell versus multi-cell publication. Single table invalidation may
+  use one versioned cell; multi-table or index-plus-table updates must use an
+  ordered owner protocol. Proof gate: no reader can combine old and new cells
+  into an impossible route certificate.
+- Add a reclamation stress test for retired route cells under retained
+  snapshots. Compare epoch reclamation, immutable generation snapshots, and
+  hazard-pointer-like guards. Failure condition: memory grows without bound or
+  old cells are freed while a reader can still validate them.
+- Build a hot-bucket CPU fallback index probe using bucket-local version
+  validation. Required measurements: read throughput, update latency, retries,
+  cache misses, NUMA sensitivity, and write publication latency.
+
+### 2026-06-05 - Cross-paper synthesis: route metadata needs read-mostly validation cells
+
+The last three reviews form a clean stack for CPU-side runtime metadata.
+Prefetching says a lookup path must respect fill-buffer and TLB budgets, ASCY
+says read paths should avoid shared stores and retry-heavy traversal, and OPTIK
+gives a concrete read-then-validate cell for the small mutable regions that
+cannot be made immutable forever.
+
+**Converging design tracks:** GPU DB should treat route metadata as a versioned
+publication layer, not as a generic shared map. Immutable retained snapshots
+remain the preferred read surface, but the live indirection points that choose
+those snapshots need small validation cells: relation-to-generation pointers,
+segment-map roots, session-credit buckets, and hot CPU fallback index buckets.
+Reads should traverse them without writes, validate a wide generation before
+enqueueing GPU or CPU fallback work, and retry or fall back cheaply when the
+generation changes.
+
+**Category gaps:** The recent runtime papers still do not prove SQL transaction
+semantics. They help with metadata mechanics, but multi-table writes,
+DDL/catalog changes, secondary-index publication, and retained-snapshot
+retirement still need owner-domain ordering, WAL-before-visibility, and a
+separate memory-reclamation plan.
+
+**Benchmark priorities:** The next runtime benchmark should combine the three
+ideas in one route-metadata probe: calibrated prefetch or coroutine lookup for
+cold metadata, ASCY-style no-store read admission, and OPTIK-style
+read/validate publication cells. The proof gate is lower p99 route lookup
+latency at high read concurrency without stale route certificates, hidden
+metadata lock waits, or unbounded retired-cell memory.
