@@ -1193,7 +1193,7 @@ Append new candidates here as each paper is processed.
   key-position models for GPU resident predicate filters. Journal entry added
   2026-06-06 using the accessible author PDF:
   `https://cs-people.bu.edu/mathan/publications/sigmod16-athanassoulis.pdf`.
-- `queued` — **CUBIT: Concurrent Updatable Bitmap Indexing**, Wang and
+- `reviewed` — **CUBIT: Concurrent Updatable Bitmap Indexing**, Wang and
   Athanassoulis, PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p399-athanassoulis.pdf`
   arXiv: `https://arxiv.org/abs/2410.16929`
@@ -1201,7 +1201,20 @@ Append new candidates here as each paper is processed.
   Why: modern concurrent successor to UpBit that adds real-time updates,
   lightweight snapshotting, wait-free queries, and latch-free consolidation;
   useful follow-up for GPU DB resident predicate indexes under concurrent
-  mutation and retained snapshot reads.
+  mutation and retained snapshot reads. Journal entry added 2026-06-06.
+- `queued` — **In-Place Updates in Tree-Encoded Bitmaps**, Weissenberger,
+  Vaitl, and Markl, SSDBM 2022.
+  URL: `https://doi.org/10.1145/3538712.3538745`
+  Why: CUBIT cites tree-encoded bitmap updates as recent bitmap-index update
+  work; useful for comparing structure-modifying compressed bitmap updates
+  against CUBIT-style horizontal deltas and GPU DB generationed predicate
+  masks.
+- `queued` — **Harnessing Epoch-Based Reclamation for Efficient Range
+  Queries**, Arbel-Raviv and Brown, PPoPP 2018.
+  URL: `https://doi.org/10.1145/3178487.3178489`
+  Why: CUBIT uses epoch/RCU-style reclamation ideas for bitmap snapshot
+  versions; useful for retained-snapshot retirement, route metadata
+  reclamation, and wait-free range/read paths under concurrent updates.
 - `queued` — **Designing Access Methods: The RUM Conjecture**,
   Athanassoulis et al., EDBT 2016.
   URL: `https://doi.org/10.5441/002/edbt.2016.42`

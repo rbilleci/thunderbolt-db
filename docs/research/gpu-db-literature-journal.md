@@ -73750,3 +73750,182 @@ Benchmark priorities:
 - Merge-mode benchmarks that separate stream merge, memory merge, aggregate
   merge, and response encoding so route plans cannot hide fanout or buffering
   costs.
+
+### 2026-06-06 - CUBIT makes updatable bitmap indexes concurrent with logged horizontal deltas
+
+**Citation:** Junchang Wang and Manos Athanassoulis. "CUBIT:
+Concurrent Updatable Bitmap Indexing." PVLDB 18(2), 2024,
+pp. 399-412. doi:10.14778/3705829.3705854. Retrieved 2026-06-06
+from the PVLDB PDF at
+`https://www.vldb.org/pvldb/vol18/p399-athanassoulis.pdf`.
+
+**Category:** MVCC / snapshot / visibility and multi-tier cache / data
+placement, with HTAP indexing relevance.
+
+**Relevance tags:** concurrent bitmap index; wait-free analytical reads;
+horizontal update deltas; lightweight snapshotting; latch-free update
+consolidation; epoch reclamation; HTAP secondary indexes; clustered tuple-id
+lists; predicate filters; retained snapshot correctness.
+
+**Core idea:** CUBIT is the direct modern successor to UpBit for the gap the
+last synthesis called out: UpBit separates stable value bitvectors from sparse
+per-value update bitvectors, but its core update path is not a scalable
+concurrent design. CUBIT changes the update representation and publication
+protocol so updates, deletes, inserts, and analytical bitmap reads can proceed
+concurrently.
+
+The transferable idea is to treat mutable bitmap-index state as a versioned
+publication stream. CUBIT logs each update as horizontal update deltas, takes
+read snapshots from a global timestamp, and lets queries apply only the delta
+range needed for their snapshot. Updates append compact log entries instead of
+locking and rewriting whole compressed bitvectors. Merges create new bitvector
+versions and move future reads closer to the base representation, while older
+readers can keep using the snapshot they already selected.
+
+The paper reports 3-16x higher throughput and 3-220x lower update/delete/insert
+latency than parallelized updatable bitmap baselines, plus 1.2-2.7x speedups
+over an optimized DuckDB baseline on selected TPC-H queries and 2-11x HTAP
+analytical-query improvements under CH-benCHmark-style real-time updates. Those
+numbers are from CPU in-memory prototypes and DBx1000/DuckDB integrations, so
+the GPU DB takeaway is the concurrency and publication shape, not direct GPU
+throughput.
+
+**Concrete mechanisms:**
+
+- Each indexed value still has compressed value bitvectors, but updates are
+  represented as horizontal update deltas: compact records that say which row's
+  membership changed from one value to another, was deleted, or was inserted.
+- Deltas are appended to a Delta Log made of UDI log entries. Entries carry a
+  commit timestamp, and commit timestamps increase monotonically from log head
+  to tail.
+- A query reads the global timestamp at start, selects the newest value
+  bitvector version whose commit timestamp is at or before that start
+  timestamp, then traverses the relevant Delta Log range to collect deltas with
+  timestamps between the bitvector version and the query snapshot.
+- Applying different delta sets to the same underlying bit-matrix creates
+  different logical snapshots. Large delta sets are sorted by row id and applied
+  in parallel across bitvector segments.
+- CUBIT segments each bitvector into fixed-size raw-bit ranges and compresses
+  segments independently, bounding update work to the affected segment and
+  enabling parallel segment processing for queries.
+- Updates and deletes read their own snapshot to find the old value, generate
+  one or more horizontal deltas, validate against later conflicting deltas for
+  the same row, append a log entry, and advance the timestamp.
+- The basic design uses a short latch around tail append and timestamp advance,
+  but queries never acquire that latch.
+- The latch-free version uses helping and CAS: an operation that fails to append
+  helps the winning operation finish its recorded state transition before
+  retrying, reducing long update-tail latency under contention.
+- Consolidation arrays let blocked/conflicting updates combine their deltas so
+  later operations can commit a group with one append operation.
+- Merge operations turn accumulated deltas into new value-bitvector versions;
+  synthetic log entries mark which deltas were absorbed, allowing future log
+  traversal and delta application to shrink.
+- Retired bitvector versions and log entries are reclaimed with epoch/RCU-style
+  grace-period tracking delegated to background maintenance threads.
+- The implementation preallocates common 32-byte log entries to avoid hot-path
+  allocation and to make Delta Log traversal prefetch-friendly.
+- For logical operations across multiple bitvectors, CUBIT keeps intermediate
+  results compressed when sparse and decompressed when density is high enough
+  for branch-free SIMD-style operations.
+- In DBx1000 TPC-H Q6 experiments, CUBIT's tuple-id lists are naturally ordered
+  by physical tuple order, giving clustered secondary-index behavior and lower
+  LLC/TLB pressure than tree/hash indexes for selected analytical predicates.
+- In DuckDB integration, CUBIT-powered scan, aggregation, and join paths use
+  bitmap evidence to avoid reading some columns or building some intermediate
+  structures, but the evaluated paths are selective and hand-integrated.
+- In the HTAP experiment, the authors use a post-timestamping MVCC variant so
+  analytical queries are not blocked or aborted by ongoing updates; CUBIT itself
+  provides atomic index operations, not a complete DBMS transaction protocol.
+
+**GPU DB mapping:** CUBIT is a strong candidate shape for generationed resident
+predicate indexes. The storage design already treats GPU state as immutable,
+versioned acceleration state derived from CPU/WAL truth. A CUBIT-like resident
+predicate index would keep a base compressed mask per segment/value, append
+small generationed horizontal deltas from the mutation owner, and let retained
+reads select the base-plus-delta interval compatible with their snapshot
+boundary.
+
+For GPU DB, the Delta Log should not become an independent source of truth. The
+mutation owner would still enforce WAL-before-visibility, CPU MVCC visibility,
+and resident invalidation. After the durable mutation is safe, it can publish a
+predicate-index delta tied to table OID, schema generation, resident segment,
+row id, old/new value, and visibility generation. Retained reads can then prove
+which delta interval belongs to their snapshot before choosing the bitmap route.
+
+The horizontal-delta representation maps better to retained snapshots than
+UpBit's per-value update bitvector alone. Instead of mutating one current delta
+mask and risking old-snapshot corruption, GPU DB can treat each delta entry as a
+visibility-stamped fact. A query route certificate can name `base_generation`,
+`delta_start`, `delta_end`, segment set, predicate value/range, and merge
+generation. A GPU kernel can apply a compact row/value delta batch to a local
+mask tile before scan or result compaction.
+
+CUBIT's segmentation is also useful for tiering. A warm CPU segment can keep
+compressed base masks plus deltas in DRAM, a hot GPU-resident segment can keep
+base masks and a bounded device-side delta tile, and a cold segment can skip
+bitmap maintenance until promoted. Segment-local dirty-delta length becomes a
+route-cost feature: execute from base only, base plus delta on GPU, base plus
+delta on CPU, trigger refresh-owner merge, or fall back to CPU MVCC scan.
+
+The latch-free append/helping design is less directly portable to the first GPU
+DB slice because mutation ownership should stay simple. Its useful lesson is
+that the critical publication path should append small descriptors and advance
+generations, not decode/re-encode compressed masks. Later, if partition owners
+publish predicate deltas concurrently, CUBIT's CAS/helping and preallocated log
+entry patterns become candidates for per-partition publication logs.
+
+**Risks and mismatches:** CUBIT is a CPU secondary index, not a GPU storage
+engine. It assumes in-memory indexes, CPU threads, CPU cache behavior, WAH-style
+compression, and DBMS-owned tuple storage. It does not define WAL durability,
+crash recovery, GPU residency invalidation, CUDA stream ownership, NVMe tiers,
+or SQL plan fallback.
+
+The paper focuses on bitmap-index atomicity and snapshot reads, while full
+transaction isolation is delegated to an external DBMS mechanism. GPU DB must
+not confuse CUBIT's index snapshot with transaction visibility. The index route
+is valid only after CPU MVCC and WAL publication prove the read boundary.
+
+CUBIT is most attractive for low-cardinality and moderate-selectivity
+predicates. The paper itself shows access-path choice depends on update rate
+and selectivity; bitmap indexes are not a universal replacement for scans,
+trees, learned indexes, or sorted key vectors. Range queries also require ORing
+multiple value bitvectors.
+
+Finally, the merge and reclamation machinery adds background work and memory
+pressure. GPU DB needs bounded merge budgets and explicit telemetry so a large
+delta interval does not turn a supposedly low-latency retained read into hidden
+maintenance.
+
+**Benchmark candidates:**
+
+- Build a generationed segment predicate-index prototype:
+  `base_mask_generation`, append-only `delta_log`, and retained snapshot
+  interval selection. Gate: two concurrent retained snapshots around an
+  update/delete/insert return the same rows as CPU MVCC.
+- Compare UpBit-style per-value delta masks with CUBIT-style horizontal delta
+  logs for low-cardinality tenant/status/region filters. Measure write
+  publication latency, read p50/p99, delta bytes, merge frequency, and resident
+  memory.
+- Add a route certificate field for predicate-index delta interval:
+  `base_generation`, `delta_begin`, `delta_end`, `merge_generation`, and
+  fallback reason. Failure condition: a route executes after a delta merge or
+  resident invalidation without revalidation.
+- Benchmark segment sizes for resident predicate masks: smaller segments reduce
+  delta application and transfer bytes, while larger segments improve
+  compression and scan throughput. Measure CPU warm, GPU resident, and
+  over-resident paths.
+- Prototype bounded refresh-owner merge. Reads may enqueue merge requests or
+  apply only a capped delta batch; large merges run outside the read p99 path.
+  Gate: hot-value update bursts do not create unbounded read latency spikes.
+- Add a GPU mask-tile experiment: transfer or retain base mask tiles plus a
+  compact horizontal delta batch, apply deltas in a kernel, then compact row ids
+  for a selective predicate. Compare against full resident scan and CPU MVCC
+  scan.
+- Test ordered tuple-id output from bitmap routes as an input to fetch,
+  aggregation, and response encoding. Gate: ordered IDs reduce cache misses or
+  response scatter cost enough to justify bitmap maintenance.
+- Add an HTAP freshness benchmark with append-heavy updates and retained
+  analytical reads. Failure condition: predicate-index maintenance improves
+  read latency only by delaying WAL visibility, invalidation, or refresh
+  publication.
