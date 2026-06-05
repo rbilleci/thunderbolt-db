@@ -5558,12 +5558,21 @@ Append new candidates here as each paper is processed.
   geo-replicated transactions; useful for comparing epoch-sized durability
   barriers with lower-latency replicated commit paths if GPU DB later spreads
   owner domains across nodes or regions.
-- `queued` — **REPS: Recycled Entropy Packet Spraying for Adaptive Load
-  Balancing and Failure Mitigation**, Bonato et al., arXiv 2025.
+- `reviewed` — **REPS: Recycled Entropy Packet Spraying for Adaptive Load
+  Balancing and Failure Mitigation**, Bonato et al., arXiv 2024/EuroSys 2026.
   URL: `https://arxiv.org/abs/2407.21625`
+  DOI: `https://doi.org/10.1145/3767295.3769320`
   Why: Ultra Ethernet names REPS as a path-aware entropy recycling strategy;
   useful for comparing self-clocking packet/path selection with GPU DB
-  response-ring and multi-gateway load balancing.
+  response-ring and multi-gateway load balancing. Reviewed on 2026-06-05.
+- `queued` — **An Edge-Queued Datagram Service for All Datacenter Traffic**,
+  Olteanu et al., NSDI 2022.
+  URL: `https://www.usenix.org/conference/nsdi22/presentation/olteanu`
+  PDF: `https://www.usenix.org/system/files/nsdi22-paper-olteanu.pdf`
+  Why: REPS uses EQDS as a congestion-control/transport baseline; useful for
+  comparing receiver-driven credits, edge queuing, and packet trimming with GPU
+  DB's owner-ring admission, response backpressure, and future internal
+  transport paths.
 - `reviewed` — **Flowcut Switching: High-Performance Adaptive Routing with
   In-Order Delivery Guarantees**, Bonato et al., arXiv 2025.
   URL: `https://arxiv.org/abs/2506.21406`

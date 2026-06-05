@@ -72282,3 +72282,160 @@ resident refresh, slow-client response backpressure, and a quiesced snapshot
 gate. Success means the engine can explain exactly which authority blocked or
 published each route, why unrelated work kept moving, and which durable
 frontier a restored system would trust.
+
+### 2026-06-05 - REPS turns path choice into tiny recycled endpoint state
+
+**Citation:** Tommaso Bonato, Abdul Kabbani, Ahmad Ghalayini, Michael
+Papamichael, Mohammad Dohadwala, Lukas Gianinazzi, Mikhail Khalilov, Elias
+Achermann, Daniele De Sensi, and Torsten Hoefler. "REPS: Recycled Entropy
+Packet Spraying for Adaptive Load Balancing and Failure Mitigation." EuroSys
+2026; arXiv:2407.21625v6. doi:10.1145/3767295.3769320. Retrieved 2026-06-05
+from the arXiv PDF: `https://arxiv.org/pdf/2407.21625`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** endpoint load balancing; packet spraying; recycled
+entropy; ECN feedback; failure mitigation; tiny per-connection state;
+out-of-order transport; gateway routing; response lanes; path adaptation.
+
+**Core idea:** REPS is a decentralized endpoint load-balancing scheme for
+modern datacenter transports that tolerate out-of-order packet delivery. It
+keeps the simplicity of per-packet spraying, but avoids spraying blindly:
+senders cache entropy values for paths that recently returned ACKs without
+ECN marks, reuse those good values, and explore randomly only when they lack
+fresh path evidence. During suspected failures, REPS enters a conservative
+freezing mode that stops random exploration and reuses recently healthy
+entropy values so traffic moves away from failed paths before ECMP routing
+converges.
+
+The transferable idea for GPU DB is not packet spraying itself. It is the
+shape of the control loop: useful runtime routing hints can live in very small
+per-session or per-lane state if the system recycles successful recent choices
+and treats negative signals as reasons to narrow exploration. That is directly
+relevant to 1M logical sessions, where route choice, response-lane choice, and
+gateway choice cannot require large per-session history.
+
+**Concrete mechanisms:**
+
+- REPS relies on entropy values that participate in normal ECMP hashing. The
+  sender changes the entropy value to affect path choice without requiring
+  switch changes beyond ECMP hashing and ECN marking.
+- At connection start or after idleness, the sender explores random entropy
+  values for roughly the first bandwidth-delay-product worth of packets,
+  behaving similarly to oblivious packet spraying until it has feedback.
+- Receivers copy the packet entropy value into ACKs, so the sender learns
+  which entropy values produced returning traffic without adding a new packet
+  header field.
+- On ACK receipt, the sender caches the entropy value only if the ACK is not
+  ECN-marked. ECN-marked ACKs are treated as congested-path evidence and are
+  not recycled.
+- The cache is a fixed circular buffer, empirically eight entries in the
+  paper. Sends consume the oldest valid cached entropy value; if no valid value
+  exists and the sender is not freezing, the sender explores a random value.
+- The design keeps most "state" on the wire in in-flight data and ACK packets.
+  The paper reports about 25 bytes of per-connection endpoint state for an
+  eight-entry buffer, including entropy values, validity bits, head pointer,
+  valid-entry count, freezing flag, timeout, and exploration counter.
+- Freezing mode is entered on failure detection, using timeout feedback and,
+  where available, packet trimming. In freezing mode REPS avoids random
+  entropy exploration and reuses current buffer entries even if their validity
+  bits have already been consumed.
+- Freezing mode exits after probes or a fixed timeout, then REPS occasionally
+  explores again. If the failure remains, it re-enters freezing with small
+  additional loss.
+- The paper's example estimates that a 10 ms routing-group convergence delay
+  on a 400 Gbps link with a 4 KiB MTU could lose over 120,000 packets, while
+  freezing mode reduces the example to about 1,000 drops.
+- Evaluation uses htsim packet-level simulations on 128- and 1024-node fat
+  trees with 400 Gbps links, synthetic incast/permutation/tornado traffic,
+  datacenter traces, AI collectives, asymmetric links, background ECMP traffic,
+  and forced cable/switch failures.
+- The hardware evaluation uses modified FPGA-based RDMA-capable NICs and an
+  out-of-order transport with SACK bitmaps. The reported implementation stores
+  eight UDP source-port entropy values per connection and supports 256
+  connections with about 4 KB of REPS buffer memory.
+- Reported claims include up to 25% advantage over oblivious packet spraying
+  in healthy symmetric simulations because short-term path collisions create
+  queues, 799 microseconds versus 1400 microseconds in a simple asymmetric
+  link example, up to 35% faster completion and 2.5x fewer drops than OPS in
+  a short two-failure example, and close-to-ideal behavior in an extreme
+  simulation with up to 50% cable failures. The exact benefit is workload- and
+  topology-dependent; ring AllReduce has little opportunity for improvement.
+
+**GPU DB mapping:** GPU DB's high-throughput runtime has several routing
+choices that look like endpoint path selection: which IO worker owns a socket,
+which response lane carries a result, which GPU execution owner receives a
+retained lookup, which gateway or future node handles a session, and whether a
+route should keep using a warm resident snapshot after a pressure signal. REPS
+suggests a cheap policy: cache the recent successful route choices for that
+lane or session class, attach the route id to completion feedback, and recycle
+only routes that returned without saturation marks.
+
+For 1M logical sessions, this argues against per-session scoreboards with many
+counters. A tiny circular route cache per active lane, plus shared telemetry
+per worker/route class, may be enough for most admission decisions. Idle
+sessions can have no hot state; active sessions can warm up with exploration
+and then use recycled route choices.
+
+For response rings, the analogy is strong. If a socket writer, gateway, or
+response lane reports saturation, its lane id should not be recycled for new
+large responses until clean completions return. If a lane is suspected failed
+or severely backpressured, the runtime can enter a freezing-like mode: stop
+exploring that lane class, reuse known-good lanes, and probe recovery on a
+bounded schedule.
+
+For GPU execution workers, recycled hints should be tied to route shape and
+snapshot generation. A same-shape lookup batch can remember recent GPU worker
+and stream choices that completed without queue or memory-pressure marks, but
+must discard them on invalidation, generation mismatch, or pinned-buffer
+pressure. This keeps the control loop subordinate to correctness metadata.
+
+For future multi-gateway or RDMA paths, REPS is a reminder that out-of-order
+completion support changes the design space. GPU DB cannot assume PostgreSQL
+responses can be arbitrarily reordered within a session, but it can route
+independent sessions, COPY chunks, refresh transfers, or future internal
+messages with looser ordering if each response carries enough identity to be
+placed correctly.
+
+**Risks and mismatches:** REPS is a network transport paper for AI and
+datacenter traffic, not a database runtime or SQL session manager. Its
+mechanisms assume entropy-controlled ECMP paths, ECN feedback, ACKs, and
+out-of-order-capable transports. PostgreSQL wire sessions are ordered, and GPU
+DB correctness depends on WAL-before-visibility and snapshot compatibility,
+not only on path health.
+
+The paper's strong failure claims come from simulations plus FPGA NIC
+experiments, not from commodity TCP sockets or database gateways. A GPU DB
+implementation should borrow the recycled-hint control loop and benchmark it
+inside owner rings and response lanes before assuming network-level speedups.
+
+Freezing can also overfit recent good choices. In a database, reusing only
+currently good lanes may starve underutilized workers, hide a route-quality
+change, or concentrate load after a batch mix changes. Any freezing-like mode
+needs bounded probes, route-class fairness, and correctness-first invalidation.
+
+**Benchmark candidates:**
+
+- Add an active-session route-cache prototype: per active IO lane keeps a tiny
+  circular cache of worker/response-lane ids that completed without saturation
+  marks. Measure memory per active session, p50/p99 latency, and throughput
+  against round-robin and global least-queue routing.
+- Add completion-carried route feedback for retained reads: response messages
+  report worker id, snapshot generation, route class, queue wait, and pressure
+  marks. Gate: only clean completions are recycled into fast-path route hints.
+- Build a freezing-mode stress test for response lanes. Force one slow or
+  failed socket writer, stop exploring that lane for large responses, probe it
+  periodically, and verify unrelated short responses keep moving.
+- Compare per-route-class recycled hints for retained lookups, refresh work,
+  COPY admission, and large scans. Failure condition: pressure on one class
+  poisons routing for unrelated classes that do not share the scarce resource.
+- Test route-cache invalidation on MVCC, catalog, and residency generation
+  changes. Gate: a recycled worker or route id is ignored when its snapshot
+  generation no longer matches the request boundary.
+- Simulate multi-gateway session admission with asymmetric gateway capacity.
+  Compare random assignment, least-queue, and recycled-good-gateway hints
+  under gateway failure and recovery. Measure recovery time, rejected requests,
+  queue depth, and ordering violations.
+- Add a "tiny state" accounting gate for 1M logical sessions: idle sessions
+  should not allocate route caches, active route caches should fit a fixed
+  byte budget, and all route hints should be rebuildable from fresh feedback.
