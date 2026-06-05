@@ -5038,7 +5038,7 @@ Append new candidates here as each paper is processed.
   commit work; useful for comparing fast commit-state durability and
   coordinator failure handling when GPU DB separates WAL, owner ordering, and
   resident publication state.
-- `queued` — **EasyCommit: A Non-blocking Two-phase Commit Protocol**,
+- `reviewed` — **EasyCommit: A Non-blocking Two-phase Commit Protocol**,
   Gupta and Sadoghi, EDBT 2018.
   URL: `https://expolab.org/papers/easy-commit.pdf`
   DOI: `https://doi.org/10.5441/002/edbt.2018.15`
@@ -5054,11 +5054,10 @@ Append new candidates here as each paper is processed.
   this is a 2015-present primary source for range-level MVCC concurrency that
   may inform prefix scans, resident key-range certificates, and lock-free
   retained reads.
-- `queued` — **Releasing Locks as Early as You Can: Reducing Contention of
+- `skipped` — **Releasing Locks as Early as You Can: Reducing Contention of
   Hotspots by Violating Two-Phase Locking**, Guo, Wu, Yan, and Yu,
   SIGMOD 2021.
-  URL: `https://doi.org/10.1145/3448016.3457263`
-  Why: Chardonnay frames contention footprint as time under locks and cites
-  early lock-release hotspot work; useful for judging whether any GPU DB
-  hot-write lane can safely retire conflict metadata before full response
-  completion without weakening WAL-before-visibility.
+  URL: `https://doi.org/10.1145/3448016.3457294`
+  PDF: `https://pages.cs.wisc.edu/~yxy/pubs/bamboo.pdf`
+  Why: duplicate queue entry; Bamboo was already reviewed under the earlier
+  Rebirth-Retire follow-up block.

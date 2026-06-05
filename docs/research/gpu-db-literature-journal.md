@@ -63547,3 +63547,171 @@ dominate.
 - Add a negative-control test that publishes a resident generation after buffer
   build but before durable decision state. Expected failure: recovery can no
   longer prove whether readers saw a generation that should have aborted.
+
+### 2026-06-05 - EasyCommit makes non-blocking commit a message-redundancy tradeoff
+
+**Citation:** Suyash Gupta and Mohammad Sadoghi. "EasyCommit: A
+Non-blocking Two-phase Commit Protocol." EDBT 2018, pages 157-168.
+doi:10.5441/002/edbt.2018.15. Retrieved 2026-06-05 from
+`https://expolab.org/papers/easy-commit.pdf`.
+
+**Category:** transaction processing / write path; commit protocols;
+distributed recovery.
+
+**Relevance tags:** atomic commit; two-phase commit; non-blocking
+termination; message redundancy; coordinator failure; participant
+recovery; owner-domain commit; WAL-before-visibility; multi-partition
+writes.
+
+**Core idea:** EasyCommit tries to keep the two communication phases of
+2PC while avoiding 2PC's blocking behavior under node failures. It does
+this with two rules: transmit the global decision before committing or
+aborting locally, and have every participant forward the global decision
+to every other participant. The extra redundancy means a surviving
+participant can often learn the decision from another participant rather
+than waiting for the original coordinator.
+
+The useful lesson for GPU DB is that non-blocking progress can be bought
+with either a shared decision authority, as in Cornus, or with redundant
+decision dissemination, as in EasyCommit. Both designs separate "the
+decision is known durably enough to finish" from "every participant has
+finished cleanup." That separation is directly relevant once mutation,
+catalog, residency, partition, and future cold-tier owners participate in
+one transaction or resident-generation publication.
+
+**Concrete mechanisms:**
+
+- The coordinator sends `Prepare` to all cohorts and waits for votes. If
+  every cohort votes commit, the coordinator logs that the global commit
+  decision was reached, sends `Global-Commit` to participants, then commits
+  locally. If any cohort votes abort or the coordinator times out while
+  waiting for votes, it reaches and sends a global abort decision.
+- A cohort that receives a global decision logs receipt, forwards that same
+  decision to all participants and the coordinator, then commits or aborts
+  locally. It does not need to wait for the coordinator if another cohort
+  forwarded the decision.
+- The protocol's hidden `TRANSMIT-C` and `TRANSMIT-A` states model the
+  period after a node has received a commit or abort decision but before it
+  has transmitted the decision to peers and entered the final local state.
+- The termination protocol handles coordinator timeout in `WAIT`, cohort
+  timeout before `Prepare`, and cohort timeout while waiting for a global
+  decision. Cohorts elect a leader, consult active participants for any
+  known global decision, and abort if none is known.
+- The safety proof depends on node failures, not arbitrary message delay or
+  message loss. The paper explicitly says 2PC, 3PC, and EasyCommit are
+  unsafe under unbounded message delay/loss because timeouts can make active
+  nodes infer failures incorrectly.
+- EasyCommit has higher message complexity than 2PC or 3PC: forwarding the
+  global decision among participants is O(n^2), although it avoids 3PC's
+  extra pre-commit phase.
+- Independent recovery is partial. A node can abort if it failed before
+  voting, a coordinator can abort if it failed before sending the global
+  decision, and a node that logged a global decision can recover to that
+  decision. A cohort that failed in `READY` without the decision still needs
+  others.
+- The ExpoDB implementation uses TCP/IP sockets, stored procedures, NO_WAIT
+  concurrency control for the main evaluation, and YCSB/TPC-C workloads on
+  Azure up to 64 nodes. Read-only and single-partition transactions skip the
+  commit protocol.
+- Evaluation reports EasyCommit throughput close to 2PC and substantially
+  better than 3PC when commit-protocol overhead matters. Its relative
+  advantage shrinks when high contention, abort cleanup, or transaction
+  management dominate. The paper also notes EC can hold locks/resources
+  longer than 2PC because participants wait for extra decision messages
+  before cleanup in the implementation.
+
+**GPU DB mapping:** EasyCommit is not needed for the current single-owner
+prototype, but it is a good design contrast for future multi-owner commit.
+Cornus says "centralize the final decision in a shared conditional-write
+object"; EasyCommit says "make the decision visible through redundant
+participant forwarding before anyone finalizes." GPU DB should benchmark
+both shapes before choosing a multi-partition or catalog-plus-data commit
+protocol.
+
+The owner-domain mapping is straightforward. If a transaction touches a
+mutation owner, catalog owner, residency owner, and two partition owners,
+the route certificate should identify which owners have prepared, which
+global decision they know, who is allowed to complete cleanup, and whether a
+recovering owner can finish without the original coordinator. A GPU resident
+generation should be routed only after the decision and visibility frontier
+are settled, not merely because a build owner completed buffers.
+
+EasyCommit also highlights a cost that can be easy to miss at 1M logical
+sessions: message redundancy is not free even inside one process. O(n^2)
+decision fan-out among owners or partitions could inflate response-ring
+traffic, metadata buffers, cache-line bouncing, and cleanup delay. For small
+owner counts it may be fine; for many partitions or shards, a shared
+decision object or tree fan-out may beat all-to-all forwarding.
+
+The timeout discussion matters for GPU DB overload policy. Queue wait and
+backpressure are not the same as owner failure. A timeout-driven termination
+protocol must not interpret a saturated GPU execution owner, stalled NVMe
+flush, or delayed response ring as proof that a participant failed unless the
+failure detector and fencing rules are explicit.
+
+**Risks and mismatches:** EasyCommit assumes node failures in a distributed
+database, and explicitly does not solve safety under unbounded message delay
+or message loss. A local GPU DB's main problem is usually deterministic
+publication and resource pressure, not WAN failure termination. The paper's
+implementation also uses NO_WAIT in-memory OLTP and logs enough protocol
+state for recovery, but it does not cover MVCC snapshot publication, CUDA
+resource ownership, pgwire response ordering, DDL, or GPU-resident cache
+invalidation.
+
+The protocol may hold transaction resources longer than 2PC during cleanup,
+which is dangerous for hot-key writes or pinned-buffer budgets. Its O(n^2)
+decision forwarding can become a scalability bottleneck when the number of
+participants grows. The evaluated latency numbers are cloud testbed results,
+not direct evidence for in-process owner rings.
+
+**Benchmark candidates:**
+
+- Add a multi-owner commit simulator with 2PC, Cornus-style shared decision
+  record, and EasyCommit-style redundant decision forwarding. Measure
+  durable writes, internal messages, p50/p99 commit latency, owner cleanup
+  delay, and coordinator-failure completion.
+- Prototype route-certificate fields for `prepared_owners`,
+  `known_decision_owners`, `decision_source`, `decision_fanout_count`,
+  `cleanup_pending_owners`, and `termination_reason`.
+- Add a resource-retention benchmark: hold locks, WAL batch slots, pinned
+  buffers, and resident-generation handles until commit cleanup completes.
+  Failure condition: a non-blocking protocol improves failure progress but
+  reduces steady-state throughput by retaining hot resources too long.
+- Test timeout semantics under artificial queue stalls. Gate: owner
+  saturation, delayed GPU kernels, and slow NVMe flushes produce wait/fallback
+  telemetry, not false transaction termination.
+- Compare all-to-all decision fan-out with tree fan-out and shared decision
+  state for 2, 4, 8, 16, and 64 owner participants. Expected outcome: all-to-all
+  is acceptable only for small fixed owner sets.
+- Add a negative-control recovery test that publishes a resident generation
+  after one owner learns the commit decision but before all required owner
+  frontiers know or can recover the decision. Expected failure: replay cannot
+  prove whether the generation was safely visible.
+
+### 2026-06-05 - Cross-paper synthesis: commit decisions need a recoverable visibility contract
+
+Cure, Cornus, and EasyCommit converge on a sharper contract for GPU DB
+frontiers. Cure says every route needs explicit per-origin visibility and
+session-monotonic fronts. Cornus says the final decision can live in a small
+durable state object that other owners can complete after coordinator
+failure. EasyCommit says the same non-blocking goal can be pursued by
+redundantly transmitting the global decision before any participant finalizes.
+
+The design track is a recoverable visibility contract: a route should know
+which owners prepared, which durable decision exists, which owner fronts
+cover the decision, which resident generation is allowed to publish, and
+which cleanup work can lag behind visibility. This contract should be a
+route-certificate and recovery artifact, not just transient control flow.
+
+The category gap is now less about distributed commit mechanics and more
+about range-level MVCC and retained-read correctness. The next high-value
+queued paper should likely be Deuteronomy's multi-version range concurrency
+control, a consistent snapshot algorithm survey, or a cache/tiering paper
+only if the loop needs balance away from transaction protocols.
+
+Benchmark priority is a commit-frontier harness: inject coordinator stalls,
+owner stalls, refresh-build completion, WAL flush delay, and session reads
+while comparing scalar latest-generation routing against explicit
+decision-plus-frontier routing. The pass gate is identical committed results
+and recoverable resident-publication state with lower p99 than a global
+owner-serialized baseline.
