@@ -62229,3 +62229,149 @@ Benchmark priorities:
   and CPU fallback do not hide conflicts behind one owner queue.
 - Test adaptive fallback from optimistic hot-write lanes into ordered lanes
   under abort or retry spikes.
+
+### 2026-06-05 - Chablis decouples global snapshot epochs from local transaction latency
+
+**Citation:** Tamer Eldeeb, Philip A. Bernstein, Asaf Cidon, and
+Junfeng Yang. "Chablis: Fast and General Transactions in
+Geo-Distributed Systems." CIDR 2024. Retrieved 2026-06-05 from
+`https://vldb.org/cidrdb/papers/2024/p4-eldeeb.pdf`.
+
+**Category:** MVCC / snapshot / visibility and transaction processing /
+write path.
+
+**Relevance tags:** strict serializability; lock-free snapshot reads;
+epoch-based MVCC; local and global epochs; fast local transactions;
+range-sharded ownership; leader leases; 2PL; 2PC; fast RPC; route
+certificates; snapshot publication.
+
+**Core idea:** Chablis targets the geo-distributed case, but its most useful
+idea for GPU DB is local fast-path isolation from slower global snapshot
+coordination. It keeps ordinary read-write transactions fast when they touch
+data homed in one region, while still offering global strictly serializable
+snapshot reads. The mechanism is not clock synchronization. Chablis uses
+epoch-based versioning and separates maintaining a global epoch from publishing
+that epoch to regions that local transactions can read cheaply.
+
+This is close to the runtime problem in GPU DB: most requests should commit or
+read through an owner-local path, but retained snapshots, residency refresh,
+and cross-owner reads still need a shared visibility frontier. Chablis suggests
+that the shared frontier can be advanced by a slower global publisher without
+putting every hot local write or local retained read on that slower path.
+
+**Concrete mechanisms:**
+
+- Chablis is built from one Chardonnay-style deployment per region plus a
+  global epoch service. Each record has a home region, and writes for that
+  record go to its home region.
+- Read-write transactions use classical 2PL and 2PC. During prepare, the
+  client reads the local epoch and the global epoch in parallel with Prepare
+  RPCs rather than adding a serial step after all participant work.
+- A local epoch service is a replicated state machine that maintains a
+  monotonically increasing counter. Reading the epoch serves as the
+  serialization point for committing transactions.
+- Range leaders hold leases over local epoch intervals. Prepare responses
+  include the leader's lease interval, and the client aborts if the local epoch
+  it read is outside the lease interval. This validates that locks were held by
+  the correct leader for the transaction's serialization epoch.
+- The global epoch service advances a single global counter, but clients do
+  not read it directly on the hot commit path. Instead, each region has an
+  epoch publisher that the global service updates. A publisher is either at the
+  current global epoch or one epoch behind while an update is in progress.
+- Because regional publishers can be one epoch behind, Chablis weakens the
+  global epoch invariant: later reads may return at least the previous value
+  rather than a fully monotonic latest value. The snapshot protocol compensates
+  for this by choosing when to wait and which epoch to read.
+- Multi-region snapshot reads first choose a global epoch, then read local
+  epochs for the regions they access. They wait for current holders of write
+  locks on the read set to release, but they do not acquire read locks, so they
+  do not block read-write transactions.
+- Linearizable multi-region snapshots can read the epoch directly from the
+  global epoch service after the transaction starts, wait for regional
+  publishers to advance, and then read at the next global epoch. A cheaper
+  variant can read from the local publisher and wait for two advances.
+- Single-region snapshots can use local-epoch versions only, which reduces
+  latency but may store each version twice. If such a read crosses into another
+  region, it restarts as a multi-region query.
+- Under regional failure, read-write transactions and regional snapshot reads
+  can continue, but the global snapshot frontier can become stale. Publishers
+  stop serving stale epochs after missing updates; operators can exclude a
+  failed region so the remaining regions continue global epoch advancement.
+- The evaluation uses two Azure regions with two shards per region and YCSB-A
+  local transactions. Reported local median latencies are 214 us for reads and
+  199 us for writes. The global epoch median update interval is about 47 ms
+  with p99 about 76 ms, and a two-region linearizable snapshot read averages
+  about 107 ms, including about 82 ms waiting for the global epoch path.
+
+**GPU DB mapping:** GPU DB can map "region" to an owner-local state domain:
+mutation owner, partition owner, residency owner, GPU execution owner, or a
+future shard owner. Chablis argues that owner-local writes should not have to
+round-trip through the slowest global snapshot mechanism when their data and
+conflicts are local. They should publish a local visibility epoch cheaply, then
+participate in a broader frontier only when a retained snapshot or cross-owner
+route needs it.
+
+The global epoch publisher maps to a route-visible snapshot frontier. Instead
+of making every transaction query every owner or residency domain, GPU DB can
+benchmark a two-level publication model: local owner generations for fast
+commit/read routing, plus a slower retained-read frontier that advances when
+mutation, catalog, and residency owners have all published compatible
+boundaries. A route certificate would carry both fields: local owner epoch and
+global retained-snapshot epoch.
+
+The lock-free snapshot protocol is a useful target for retained reads. A GPU
+resident read should not acquire ordinary write locks or block the mutation
+owner just to prove visibility. It can select a published snapshot frontier,
+wait only for in-flight writers whose locks or publish records overlap the
+read set, and then execute against immutable buffers. For P8, the overlap unit
+could be key range, resident segment, partition, or table generation.
+
+Leader leases over epoch intervals are a good analogy for resident generation
+ownership. A GPU execution worker should be able to prove that the resident
+buffers it used were owned by the right residency generation for the requested
+visibility epoch. If an owner moved or a segment was evicted/refreshed outside
+the certificate interval, the route should fail or restart rather than
+silently reading stale memory.
+
+Chablis also reinforces the value of fast RPC and batched epoch reads. The GPU
+DB runtime should avoid per-session or per-request synchronous calls to a
+central epoch owner. IO workers and execution workers can batch visibility
+frontier reads, cache stable frontier values for a bounded interval, and attach
+the chosen epoch to request descriptors before queueing compatible work.
+
+**Risks and mismatches:** Chablis is a short CIDR paper and an early prototype,
+not a full SQL engine or a GPU system. It assumes a multi-version key-value
+store with range leaders, 2PL, 2PC, Paxos-backed logs, and fast eRPC-style
+communication. GPU DB's bottlenecks include CUDA scheduling, GPU memory
+residency, pgwire response flow, CPU/GPU transfer, and WAL/checkpoint replay,
+none of which Chablis evaluates. The evaluation uses a small two-region Azure
+setup, uniform YCSB-A, and all data fits in DRAM, so it does not prove
+million-session admission, skewed hot keys, over-resident storage, or complex
+SQL plans. Global snapshot latency is deliberately much higher than local
+transaction latency; GPU DB should not copy that shape for local retained reads
+unless the frontier is only for genuinely cross-owner routes.
+
+**Benchmark candidates:**
+
+- Prototype a two-level visibility frontier: owner-local epochs for mutation
+  and retained-read routing, plus a global retained-snapshot epoch that only
+  advances after participating owners publish compatible boundaries. Measure
+  write latency, retained-read p50/p99, frontier staleness, and restart count.
+- Add route certificates with both local generation and global snapshot
+  fields. Gate: if residency ownership, schema generation, or invalidation
+  generation moves outside the certificate interval, the read restarts or
+  falls back instead of reading stale buffers.
+- Benchmark lock-free retained reads that choose a snapshot frontier and wait
+  only for overlapping in-flight writers by key range or segment. Compare
+  against routing every retained read through the mutation owner.
+- Batch epoch/frontier reads in IO workers and GPU execution workers. Success
+  condition: fewer central frontier reads per request without stale visibility
+  or inflated p99 under mixed reads and writes.
+- Add a failed-owner or stalled-residency simulation: one owner stops
+  publishing the global frontier while local writes and local retained reads
+  continue where valid. Failure condition: global retained reads silently use a
+  stale frontier or block unrelated local routes indefinitely.
+- Compare single-owner retained snapshots against cross-owner snapshots. A
+  single-owner route should use a cheaper local epoch; a cross-owner route
+  should pay the global frontier cost only when it actually touches multiple
+  owner domains.

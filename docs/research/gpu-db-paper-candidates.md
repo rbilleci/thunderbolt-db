@@ -4966,11 +4966,19 @@ Append new candidates here as each paper is processed.
   Why: Index Checkpoints relies on tuple snapshot consistency while accepting
   non-transaction-consistent index checkpoints; useful for choosing CPU truth
   checkpoint algorithms before deciding which derived indexes are persisted.
-- `queued` — **Chablis: Fast and General Transactions in Geo-Distributed
-  Systems**, Lu et al., CIDR 2024.
+- `reviewed` — **Chablis: Fast and General Transactions in Geo-Distributed
+  Systems**, Eldeeb et al., CIDR 2024.
   URL:
-  `https://mail.vldb.org/cidrdb/2024/chablis-fast-and-general-transactions-in-geo-distributed-systems.html`
+  `https://vldb.org/cidrdb/2024/chablis-fast-and-general-transactions-in-geo-distributed-systems.html`
+  PDF: `https://vldb.org/cidrdb/papers/2024/p4-eldeeb.pdf`
   Why: discovered while reviewing Callas and modern transaction-routing
   follow-ups; useful for comparing multi-versioned transactional routing,
   fast local read-write transactions, and lock-free snapshot reads against GPU
   DB route certificates and owner-local hot paths.
+- `queued` — **Chardonnay: Fast and General Datacenter Transactions for
+  On-Disk Databases**, Eldeeb et al., OSDI 2023.
+  URL: `https://www.usenix.org/conference/osdi23/presentation/eldeeb`
+  Why: Chablis builds on Chardonnay's local epoch service and lock-free
+  snapshot-read protocol; useful for a deeper single-datacenter version of
+  epoch publication, fast 2PC, and on-disk MVCC visibility without geo
+  publisher latency.
