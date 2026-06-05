@@ -58157,3 +58157,201 @@ or large resident segment rewrites.
   implement the same three-lane admission shape with ordinary owner
   queues and compare direct fallback-to-owner against fast/middle/owner
   escalation.
+
+### 2026-06-05 - GPU joins need hardware-shaped partition and output contracts
+
+**Citation:** Ran Rui and Yi-Cheng Tu. "Fast Equi-Join Algorithms
+on GPUs: Design and Implementation." SSDBM 2017. Retrieved
+2026-06-05 from the author PDF,
+`https://cse.usf.edu/~tuy/pub/SSDBM17.pdf`. DOI:
+`https://doi.org/10.1145/3085504.3085521`.
+
+**Category:** GPU execution / analytics.
+
+**Relevance tags:** GPU joins; radix hash join; sort-merge join;
+shared-memory histograms; register blocking; direct output buffers;
+dynamic parallelism; CUDA streams; over-resident execution; skew.
+
+**Core idea:** Rui and Tu revisit GPU equi-join implementation for
+newer CUDA hardware instead of assuming that older GPU join kernels
+will scale automatically with more cores. Their redesigned hash join
+uses register blocking, shared-memory histograms with native atomics,
+two-pass radix partitioning, a one-pass direct output buffer, and
+dynamic parallelism for skewed partitions. Their redesigned
+sort-merge join uses Merge Path, per-thread register sorting, and
+shared-memory block merges so that the algorithm follows the GPU
+memory hierarchy more closely than older bitonic-sort-based joins.
+
+The paper is not an OLTP design, but it is useful for GPU DB because
+joins are where the resident-query path can become bandwidth,
+output-buffer, and skew limited. The evaluation reports 2.0-14.6x
+speedup for the new GPU hash join over the older GPU baseline and
+4.0-4.9x for sort-merge join, plus up to 5.5x and 10.5x over the
+compared CPU hash and sort-merge joins respectively. For data larger
+than GPU memory, chunked execution with CUDA streams reports about
+3.6-4.3x speedup for hash join and 11-12.8x for sort-merge join
+against the CPU baseline.
+
+**Concrete mechanisms:**
+
+- Hash join first reorders both relations by radix hash so each
+  partition is contiguous, combining partitioning and build layout
+  rather than constructing a separate pointer-heavy hash table.
+- Each thread loads multiple tuples into registers (`VT`, values per
+  thread), increasing instruction-level parallelism and letting memory
+  operations overlap with per-thread work.
+- Each thread block keeps one shared histogram in shared memory and
+  updates it with atomics. This replaces per-thread private histograms,
+  reduces shared-memory use by roughly the block-size factor, and lets
+  the authors use larger blocks with higher occupancy.
+- The radix partitioner uses two passes: the first pass creates no
+  more than 1024 partitions, and the second pass subdivides them so
+  probe partitions remain small enough to fit in shared memory.
+- Reordering uses prefix scans over per-block histograms to find
+  partition output ranges. Threads in the same block write to localized
+  output regions, improving cache locality.
+- Probe loads one relation's partition into shared memory and the
+  matching partition from the other relation into registers.
+- The direct output buffer avoids the traditional two-probe approach.
+  Threads acquire output pages from a global pointer only when their
+  current page fills, trading occasional atomic allocation for removing
+  a full second scan.
+- A block-level output-buffer variant assigns chunks per block and uses
+  a shared-memory pointer for threads in that block, helping high
+  selectivity cases where many results are emitted.
+- Skew handling uses CUDA dynamic parallelism. When a partition exceeds
+  a threshold, the block processing it launches a child kernel sized
+  for that partition, instead of letting one block become the long tail.
+- Sort-merge join uses Merge Path for balanced parallel merge ranges,
+  avoiding binary search per tuple and giving threads independent,
+  equal-sized merge work.
+- The sort stage begins with per-thread chunks sorted in registers,
+  then shared-memory block merges, then global-memory merges.
+- For tables larger than GPU memory, one input relation is kept or
+  staged as the reusable side when possible, the other side is sliced
+  into chunks, and CUDA streams overlap host-to-device transfer, join
+  execution, and device-to-host result transfer.
+- The evaluation uses simple two-column tuples with 32-bit integer keys
+  and payloads, mostly uniform shuffled keys, plus Zipf experiments for
+  skew. It measures Titan X / Titan GPUs against contemporary CPU join
+  implementations and older GPU join code.
+
+**GPU DB mapping:** The strongest transferable idea is that a resident
+join route should not be a generic "launch hash join on GPU" decision.
+The route certificate needs a physical join contract: key width,
+partition count, expected partition size, output selectivity, skew
+signal, buffer budget, and whether one input remains resident while
+the other streams. Those facts determine whether a route should use
+partitioned hash join, sort-merge join, CPU fallback, or a staged
+over-resident path.
+
+For P8 resident snapshots, the two-pass partitioning rule maps to
+resident segment preparation. If a table is admitted for repeated joins,
+the residency owner can maintain a hash-partitioned or key-ordered
+side structure tied to a snapshot generation rather than repartitioning
+from raw columns on every request. The partition size target should be
+expressed in GPU-shared-memory and register terms, not just rows or
+bytes.
+
+The direct output-buffer design matters for SQL response rings. Joins
+with unknown or high selectivity should not require a full pre-count
+kernel before producing any results unless correctness or memory
+budgeting demands it. A bounded page or chunk allocator for GPU result
+fragments, followed by deterministic scatter into per-request response
+buffers, is a concrete benchmark alternative to count-then-emit.
+
+Skew handling maps to both GPU kernel scheduling and runtime
+admission. A route that detects a hot partition should have a
+partition-specific expansion lane or CPU fallback decision instead of
+letting one GPU block create p99 latency. The current runtime's
+micro-batch metadata should therefore include skew histograms or
+recent partition tail telemetry for batched joins and grouped lookups.
+
+The over-resident CUDA-stream design also fits the P8 cold-tier
+question. A future resident route can keep the smaller or hotter side
+in HBM and stream cold chunks from host memory, NVMe, or future tiers,
+but only when the planner sees enough reuse and output-buffer capacity
+to hide transfer behind useful GPU work.
+
+**Risks and mismatches:** The paper targets analytical equi-joins over
+fixed-width integer tuples, not SQL transactions, MVCC visibility,
+variable-length text, NULL semantics, collation, DDL invalidation, or
+WAL-before-visibility. The output-buffer shortcut must be bounded and
+failure-aware in GPU DB; unbounded result emission would compete with
+response rings, pinned buffers, and session memory budgets.
+
+Dynamic parallelism is convenient in the paper, but kernel-launch
+overhead and modern CUDA alternatives may change the right skew
+strategy on current GPUs. The evaluation hardware is older than the
+target newer GPU, and absolute speedups should not be reused as
+claims. The experiments mostly use uniform keys with one output per
+tuple, so real SQL joins with high fanout, low selectivity, composite
+keys, strings, or snapshot filters need separate tests.
+
+**Benchmark candidates:**
+
+- Add a resident equi-join route prototype over two `int4` key columns:
+  compare CPU join, cold GPU transfer, resident hash-partitioned join,
+  and resident sort-merge join. Gate: PostgreSQL comparator equality
+  for result rows and ordering where SQL requires it.
+- Build a partition-size sweep for GPU hash joins tied to shared-memory
+  and register budgets. Metrics: p50/p95 latency, occupancy, shared
+  memory bandwidth, global H2D/D2H bytes, and partition tail time.
+- Prototype bounded GPU result pages for join output and compare
+  count-then-emit versus direct page allocation. Failure condition:
+  direct output improves average throughput but causes unbounded memory
+  pressure or response-ring stalls under high selectivity.
+- Add skew telemetry to retained route decisions: largest partition
+  share, Zipf-style synthetic skew factor, child-work/fallback count,
+  and partition tail time. Proof gate: skewed input produces an
+  explicit route decision instead of a silent p99 spike.
+- Test over-resident join streaming: keep the smaller relation resident
+  and stream chunks of the larger relation through pinned host buffers.
+  Compare no-overlap, dual-stream overlap, and CPU fallback. Required
+  measurement: whether transfer is hidden behind kernels or merely
+  shifted into queue wait.
+- For micro-batched retained lookups, reuse the same partition-tail
+  benchmark shape: many same-shape key probes should scatter results
+  without one hot key range monopolizing a GPU execution owner.
+
+### 2026-06-05 - Cross-paper synthesis: frontiers, fallback lanes, and GPU route contracts
+
+The last three reviewed papers add a useful triangle around the
+runtime design. CALC says long maintenance work should name a virtual
+frontier and preserve only the overwritten state needed by the
+background copier. Brown's three-path HTM template says the common
+metadata route should stay uninstrumented, while middle and fallback
+lanes preserve concurrency and progress under aborts. Fast Equi-Join
+says GPU kernels need physical contracts for partitioning, output, skew,
+and stream overlap rather than generic accelerator admission.
+
+The converging design track is a route contract with three independent
+axes: a visibility or maintenance frontier, a fallback lane, and a
+physical execution shape. A resident read, refresh, checkpoint, GPU
+write batch, or join should identify which generation it consumes or
+publishes, where it escalates after a fast-path miss, and which buffer
+or partition assumptions make GPU execution safe. This keeps
+throughput work tied to database invariants instead of turning
+"offload to GPU" into an opaque planner flag.
+
+Category gaps remain in accessible 2024-present GPU transaction papers
+with full mechanism detail, DB-owned CXL/far-memory placement with SQL
+snapshot semantics, and end-to-end benchmarks that combine writes,
+resident joins, long snapshots, and high session counts. The LTPG ICDE
+2024 candidate is still the preferred next transaction/GPU paper if an
+IEEE, author, or institutional PDF can be retrieved; otherwise the next
+queue item should lean toward CPU/GPU route modeling or hardware-
+conscious GPU joins.
+
+**Benchmark priorities:**
+
+- Add route-contract telemetry to resident execution: snapshot or
+  checkpoint frontier, fast/middle/fallback lane, physical kernel family,
+  partition/output budget, and skew signal.
+- Combine CALC-style refresh frontiers with direct GPU output pages:
+  background refresh and retained joins must compete through explicit
+  buffer budgets, not hidden allocation.
+- Benchmark p99 under mixed pressure: hot retained lookups, one
+  over-resident join, background refresh/checkpoint work, and skewed
+  output. Pass condition: every fallback or delay is attributable to a
+  named frontier, lane, or physical budget.

@@ -408,7 +408,7 @@ Append new candidates here as each paper is processed.
   PDF: `https://users.elis.ugent.be/~leeckhou/papers/ics18.pdf`
   Why: low-overhead SM partitioning search for multitasking GPUs; relevant to
   GPU execution-owner admission, resident query co-scheduling, and fairness.
-- `queued` — **Fast Equi-Join Algorithms on GPUs: Design and Implementation**,
+- `reviewed` — **Fast Equi-Join Algorithms on GPUs: Design and Implementation**,
   Rui and Tu, SSDBM 2017.
   URL: `https://doi.org/10.1145/3085504.3085521`
   PMC: `https://pmc.ncbi.nlm.nih.gov/articles/PMC10829000/`
@@ -558,6 +558,20 @@ Append new candidates here as each paper is processed.
   Why: Crystal's tile-based execution model is the execution substrate used by
   the SIGMOD 2022 GPU compression paper; useful for separating compression
   effects from baseline GPU query operator and memory-traffic behavior.
+- `queued` — **Hardware-Conscious Hash-Joins on GPUs**, Sioulas et al.,
+  ICDE 2019.
+  URL: `https://doi.org/10.1109/ICDE.2019.00068`
+  Metadata: `https://www.eurecom.fr/en/publication/5780`
+  Why: direct follow-up to Fast Equi-Join that systematically evaluates
+  partitioning, data location, and skew for GPU hash joins; useful for
+  deciding when resident joins should use partitioned hash routes versus
+  simpler non-partitioned kernels.
+- `queued` — **Join Algorithms on GPUs: A Revisit After Seven Years**, Rui,
+  Li, and Tu, IEEE Big Data Workshop 2015.
+  PDF: `https://cse.usf.edu/~tuy/pub/BigData15-Join.pdf`
+  Why: immediate predecessor to Fast Equi-Join that measures how older GPU
+  join algorithms age across hardware generations; useful for separating
+  hardware-refresh effects from algorithmic redesign in GPU DB benchmarks.
 - `reviewed` — **High Performance Transactions via Early Write Visibility**,
   Faleiro, Abadi, and Hellerstein, PVLDB 2017.
   URL: `https://doi.org/10.14778/3055540.3055553`
