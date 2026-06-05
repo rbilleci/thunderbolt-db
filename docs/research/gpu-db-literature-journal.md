@@ -53147,3 +53147,186 @@ GPU operator papers.
 - Mixed churn benchmarks where hot writes, resident refresh, and
   retained reads run together; failure is any stale read, unbounded
   retained memory, or queue family that starves another.
+
+### 2026-06-05 - PathCAS validates search paths without full transactional memory
+
+**Citation:** Trevor Brown, William Sigouin, and Dan Alistarh.
+"PathCAS: An Efficient Middle Ground for Concurrent Search Data
+Structures." PPoPP 2022, pp. 385-397. doi:10.1145/3503221.3508410.
+Retrieved 2026-06-05 from the ISTA accepted-version PDF,
+`https://research-explorer.ista.ac.at/download/11181/11731`.
+
+**Category:** runtime / HFT / session scale; concurrent metadata and
+multi-location publication.
+
+**Relevance tags:** lock-free search structures; multi-word CAS;
+bounded read-set validation; route metadata; descriptor reuse; HTM
+fast path; software fallback; versioned nodes; memory reclamation.
+
+**Core idea:** PathCAS targets the space between intricate fine-grained
+lock-free data structures and general transactional memory. It gives
+programmers a primitive for operations with a read phase followed by a
+small write phase: visit the nodes on the search path, record the
+fields to update, then atomically apply the updates only if the visited
+nodes' versions have not changed. The paper shows this is expressive
+enough to build lock-free internal BST and relaxed AVL-tree variants,
+while avoiding much of the opacity, dynamic read-set, and global
+validation overhead that make generic STM/HTM hybrids expensive.
+
+For GPU DB, the transferable idea is not "use PathCAS for rows." It is
+a disciplined publication primitive for CPU-side route metadata,
+resident-generation indexes, catalog-derived maps, and partition
+descriptors where each operation searches a bounded path and then
+publishes a small set of pointer/version changes. A route map should be
+readable without serializing every retained read through an owner, but
+updates still need atomic multi-location publication and validation of
+the path the updater reasoned about.
+
+**Concrete mechanisms:**
+
+- A PathCAS descriptor has a status, a bounded list of update triples
+  `<addr, old, new>`, and a bounded path list of visited
+  `<node, version>` pairs.
+- `start` begins descriptor construction. `read(addr)` reads a field
+  that PathCAS may modify; if it encounters another descriptor, it
+  helps that operation complete before retrying.
+- `visit(node)` reads the node version through `read`, records the
+  node/version pair in the descriptor path, and lets subsequent
+  validation prove the search path was still valid.
+- `add(addr, old, new)` records a field that must atomically change
+  from `old` to `new`. The programmer is responsible for adding version
+  increments for modified nodes.
+- `vexec` first uses DCSS/KCAS-style descriptor installation to
+  conceptually lock all updated addresses. If any address no longer
+  has its expected old value, the operation fails and releases the
+  addresses.
+- After update addresses are locked, validation rereads every visited
+  node version. Validation fails if a version changed, a node is marked
+  deleted, or a different descriptor still owns that version word.
+- A successful operation linearizes when the descriptor status changes
+  to succeeded; helpers then replace descriptor pointers with the new
+  values. A failed operation restores old values.
+- `exec` is a lower-overhead form without path validation, useful when
+  traversal happened but the final operation does not need to prove the
+  whole path.
+- To avoid spurious progress failures, "strong vexec" can retry and
+  then convert visited version checks into explicit KCAS triples,
+  sorted by address. This gives a slow path where one of competing
+  reasonable operations makes progress.
+- The software implementation can reuse per-thread descriptors using
+  prior weak-descriptor transformations, avoiding per-operation
+  descriptor allocation and reclamation overhead.
+- On hardware with transactional memory, PathCAS can use HTM as a fast
+  path and the software descriptor algorithm as fallback. The paper
+  also emphasizes the software-only path because HTM availability is
+  inconsistent across modern CPUs.
+- Removed nodes are reclaimed with epoch-style reclamation such as
+  DEBRA/NBR after a successful `vexec` or `exec` unlinks and marks
+  them.
+- In the BST example, searches visit each node on the path. Inserts
+  update the parent child pointer and parent version. Deletes atomically
+  unlink or replace nodes, mark removed nodes, and increment affected
+  versions.
+- For relaxed AVL trees, local rotations and height fixes become small
+  PathCAS operations; threads repair violations they create while
+  walking toward the root.
+- Evaluation uses Setbench on an AMD EPYC system up to 256 hardware
+  threads, with 1%, 10%, and 100% update workloads and uniform key
+  ranges. The PathCAS trees are reported as competitive with strong
+  hand-crafted trees and substantially faster than the tested STM,
+  MCMS, and elastic-transaction alternatives in the paper's workloads.
+- The paper attributes part of the unbalanced BST result to lower tree
+  depth and memory footprint: fewer LLC misses outweighed more
+  instructions per operation in the reported 100% update case.
+
+**GPU DB mapping:** PathCAS maps most cleanly to CPU-side structures
+whose correctness depends on a search path and a small atomic publish:
+route-template indexes, partition/range maps, resident-generation root
+tables, catalog-to-residency descriptors, and possibly per-owner
+admission lanes. A retained read can traverse such metadata with a
+snapshot/generation handle; an update can publish a new descriptor only
+if the nodes it searched are still the same generation.
+
+This strengthens the existing owner-domain plan. Mutation, catalog, and
+residency owners should remain the authority for WAL-before-visibility,
+DDL, and resident publication, but not every read-only route decision
+has to enqueue through them. For metadata that has bounded path length,
+PathCAS-style validation could let readers use shared structures while
+publishers atomically swing a few pointers, versions, and route
+certificates.
+
+The bounded read-set requirement is a feature for the 1M-session goal.
+It forces route metadata operations to declare practical bounds: tree
+height, descriptor size, number of fields updated, helper work, and
+reclamation budget. That is preferable to a generic STM-style route map
+whose read-set can grow with catalog size or partition count and whose
+validation cost appears in p99 latency.
+
+The descriptor/helping pattern also maps to command and response rings.
+For hot publication paths, per-worker reusable descriptors are more
+compatible with preallocated buffers than allocation-heavy multi-word
+updates. If GPU DB later needs atomic publication of a route descriptor,
+resident generation, and invalidation frontier, a bounded descriptor
+with helping is a plausible primitive to benchmark before adopting
+locks or global owner serialization.
+
+Finally, PathCAS is a reminder that "snapshot metadata" and "row MVCC"
+should stay separate. The primitive can validate metadata paths and
+publish route roots, but row visibility, WAL durability, transaction
+commit ordering, and serializable behavior still belong to the database
+MVCC and owner protocols.
+
+**Risks and mismatches:** PathCAS does not provide opacity. Code that
+uses values read before validation must tolerate inconsistent
+intermediate observations until `validate` or `vexec` succeeds. That is
+acceptable for carefully designed data structures, but it is dangerous
+for arbitrary SQL planning logic unless route code is kept small and
+auditable.
+
+The read-set is bounded. If a route map or catalog search can traverse
+many partitions, follow overflow chains, or perform broad predicate
+analysis, PathCAS either asserts/fails or needs a different path.
+Manual node-version increments are another risk: missing one version
+increment is a correctness bug. The paper suggests debugging checks,
+but production GPU DB code would need type-level or API-level guardrails
+before trusting this pattern.
+
+The evaluation is for in-memory search trees, not databases, WAL,
+MVCC, GPU execution, or pgwire sessions. Results from BST/AVL workloads
+do not imply route-map speedups automatically. Descriptor helping can
+also amplify tail latency if an IO worker or latency-sensitive reader
+is forced to help a large update. GPU DB should restrict helping to
+bounded metadata operations and avoid running it on paths that own
+network progress or CUDA completion.
+
+Memory reclamation is still a first-class problem. Epoch reclamation
+works for CPU nodes in the paper, but GPU DB metadata may reference HBM
+buffers, pinned staging memory, and cold-tier descriptors. A successful
+unlink must retire all related resources only after every retained
+snapshot and route handle is done.
+
+**Benchmark candidates:**
+
+- Prototype a bounded versioned route-map tree for resident table or
+  partition descriptors. Compare owner-serialized route lookup with
+  PathCAS-style validated lookup/update under refresh and invalidation.
+  Gate: route certificates never mix visibility, schema, or resident
+  generations from different publications.
+- Measure descriptor budgets explicitly: maximum visited nodes, update
+  triples, helper steps, retries, and per-worker descriptor bytes.
+  Failure condition: any normal route update needs an unbounded
+  descriptor or dynamic allocation on the hot path.
+- Add a stale-path stress test where refresh, eviction, and DDL-like
+  metadata updates race retained read route lookup. Required result:
+  failed validations retry or fall back without returning stale routes.
+- Compare three publication strategies for resident-generation roots:
+  owner queue only, coarse lock, and bounded PathCAS descriptor. Measure
+  p50/p99 route-decision latency, LLC misses, allocation rate, and
+  update throughput.
+- Test helper containment. A network IO worker should not be required
+  to help a long metadata update before it can return an overload,
+  cancellation, or response-credit message. Gate: bounded helper work or
+  explicit fallback to owner-mediated lookup.
+- Extend snapshot retirement tests so route-map nodes, resident
+  descriptors, pinned buffers, and HBM handles are reclaimed together
+  after the last retained route handle releases.

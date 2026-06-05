@@ -656,13 +656,22 @@ Append new candidates here as each paper is processed.
   Why: ASCY-related concurrency-optimality work; useful as a correctness
   counterweight when deciding whether simplified route metadata structures
   sacrifice valid concurrent schedules for speed.
-- `queued` — **PathCAS: An Efficient Middle Ground for Concurrent Search Data
+- `reviewed` — **PathCAS: An Efficient Middle Ground for Concurrent Search Data
   Structures**, Brown, Sigouin, and Alistarh, PPoPP 2022.
   URL: `https://doi.org/10.1145/3503221.3508410`
   PDF: `https://research-explorer.ista.ac.at/download/11181/11731`
   Why: modern follow-up that combines multi-word CAS and transactional-memory
   ideas for concurrent search structures; useful for route metadata updates
   that need atomic multi-location publication without full STM overhead.
+- `queued` — **Reuse, Don't Recycle: Transforming Lock-Free Algorithms That
+  Throw Away Descriptors**, Arbel-Raviv and Brown, DISC 2017.
+  URL: `https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.DISC.2017.4`
+  PDF:
+  `https://drops.dagstuhl.de/storage/00lipics/lipics-vol091-disc2017/LIPIcs.DISC.2017.4/LIPIcs.DISC.2017.4.pdf`
+  Why: PathCAS relies on descriptor reuse to avoid descriptor allocation and
+  reclamation overhead; useful for bounded per-worker command descriptors,
+  route-publication descriptors, and lock-free helper metadata under high
+  session counts.
 - `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`
