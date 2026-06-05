@@ -63090,3 +63090,168 @@ cold access, not sustained high-throughput retained GPU scans.
 - Add route-certificate fields for required dictionary/index/vector pages and
   enforce that a page cannot be evicted while a retained read or GPU transfer
   still holds it.
+
+### 2026-06-05 - Relaxed Operator Fusion makes materialization a route-shape decision
+
+**Citation:** Prashanth Menon, Todd C. Mowry, and Andrew Pavlo.
+"Relaxed Operator Fusion for In-Memory Databases: Making Compilation,
+Vectorization, and Prefetching Work Together At Last." PVLDB 11(1),
+2017, pp. 1-13. doi:10.14778/3136610.3136611. Retrieved
+2026-06-05 from `https://www.vldb.org/pvldb/vol11/p1-menon.pdf`.
+
+**Category:** query optimization / planning and GPU execution baseline.
+
+**Relevance tags:** route shape; query compilation; vectorized execution;
+software prefetching; staged materialization; CPU fallback; join probes;
+SIMD predicates; cache-resident buffers; route certificates.
+
+**Core idea:** Data-centric query compilation usually fuses every operator
+inside a pipeline to avoid materialization. ROF argues that this can be too
+rigid: some routes need a small, cache-resident staging point so the engine can
+look across multiple tuples, apply SIMD to qualifying predicates, or prefetch
+future random accesses into hash tables and aggregation state. The paper's
+useful correction is that materialization is not always the enemy; opaque
+materialization is. Small, typed, cache-resident vectors can expose enough
+inter-tuple parallelism to make compiled code faster.
+
+The paper implements ROF in Peloton and evaluates TPC-H SF10 on a Broadwell
+server. Against a compiled data-centric baseline, ROF improves seven of eight
+selected TPC-H queries, with reported gains around 1.7x to 2.5x in the main
+comparison. Its detailed cases show that selective SIMD scans help, but the
+larger gains often come from reusing stage vectors to prefetch random
+hash-table build/probe or aggregation accesses. The non-beneficial cases are
+also important: high-selectivity scans and tiny hash tables can make staging
+or prefetch overhead outweigh the benefit.
+
+**Concrete mechanisms:**
+
+- ROF splits a compiled pipeline into stages. Operators inside a stage remain
+  fused; adjacent stages communicate through fixed-size vectors of tuple ids
+  and, when needed, companion vectors of pointers or positions.
+- A stage continues producing output until its vector is full or its input is
+  exhausted. With one active stage at a time, the input/output vectors are
+  intended to stay cache resident.
+- Tuple-at-a-time compiled execution is represented as one stage per pipeline.
+  Fully vectorized execution is represented by a stage boundary between each
+  operator. ROF chooses intermediate points.
+- SIMD predicate routes install a boundary after SIMD-able scans. The scan
+  writes only valid tuple ids into the output vector, so later stages do not
+  carry a selection mask through unrelated scalar work.
+- SIMD compaction uses precomputed permutation masks and masked stores to turn
+  predicate bitmasks into dense tuple-id vectors.
+- Prefetch-enabled operators receive a full vector of independent tuple ids.
+  The generated code can issue prefetches for future hash-table buckets or
+  aggregation slots, then consume earlier prefetched entries.
+- ROF installs stage boundaries before operators that perform random access to
+  data structures estimated to exceed cache size. The alternative described in
+  the paper is generating both prefetch and non-prefetch operator paths and
+  choosing at runtime from collected structure sizes.
+- The paper uses open-addressing hash tables with linear probing and
+  MurmurHash3. Prefetching matters because hash joins and hash aggregations
+  become memory-bound once their tables exceed cache.
+- Evaluation finds prefetch group size is sensitive. On the tested CPU, groups
+  around 16 tuples worked well despite ten line-fill-buffer slots, while larger
+  groups stopped helping once memory-level parallelism and instruction count
+  were saturated.
+- Stage vector size was mostly insensitive for the evaluated queries after the
+  vector was large enough, except where larger vectors reduced outer-loop
+  overhead for a moderately selective scan-heavy query.
+- Multi-threaded evaluation shows ROF still helps under morsel-like parallel
+  execution, though low thread counts pay synchronization overhead and higher
+  counts can show NUMA jitter around shared hash-table counters.
+
+**GPU DB mapping:** ROF is a useful CPU-side counterweight to naive GPU route
+claims. A retained query should not be routed to GPU just because a whole
+compiled CPU pipeline looks memory-bound. The route certificate should identify
+which part of the pipeline benefits from staging: a selective predicate, a
+random hash probe, a resident key-vector lookup, a dictionary lookup, a
+changed-row overlay merge, or an aggregation update. If a small CPU stage vector
+and prefetch path already hides the latency, GPU transfer or launch may be the
+wrong route.
+
+The stage vector maps directly to GPU DB micro-batch descriptors. For same-shape
+lookups or warm-tier scans, the runtime can first materialize a bounded vector
+of tuple ids, keys, row ordinals, or dictionary value ids, then choose a CPU
+prefetch route, GPU batch route, or fallback route. That vector should be part
+of the route's temporary-state budget, not an invisible allocation inside the
+operator.
+
+ROF also refines the meaning of operator fusion for P8. Fully fused resident
+GPU kernels may be right for dense scans or simple aggregates, but point
+lookups, joins, text-prefix routes, and main-plus-delta reads may need staged
+boundaries to expose compatible work and keep random memory accesses from
+stalling. The route planner should allow "relaxed GPU fusion": fuse inside a
+device kernel where memory is regular, but split at boundaries where a CPU
+prefetch pass, dictionary page pin, changed-row overlay, or GPU key-vector
+batch is required.
+
+For high-concurrency serving, ROF's fixed stage vectors are also an admission
+tool. A million logical sessions cannot each own arbitrary intermediate
+buffers. The IO/runtime layer should admit only bounded active stage vectors
+per route class, with separate budgets for CPU cache-resident vectors, pinned
+host buffers, and GPU input/output vectors. Stage size, prefetch distance, and
+GPU batch size should be measured route parameters.
+
+Finally, the planner lesson is sharp: prefetching and staging need statistics
+and runtime validation. Tiny hash tables and high-selectivity scans can make
+prefetch/stage overhead a regression. GPU DB should put the same burden on GPU
+routes: if the resident structure is small enough for CPU cache, if the
+predicate is not selective enough, or if the delta overlay is too large, the
+certificate should choose CPU execution or a different staging boundary.
+
+**Risks and mismatches:** ROF is an OLAP CPU execution paper, not an OLTP,
+MVCC, or GPU paper. It does not address WAL-before-visibility, snapshot
+publication, write admission, session scale, CUDA launch overhead, GPU memory
+pressure, or NVMe tiers. The evaluation uses selected TPC-H queries at SF10
+and single-query execution for many experiments, so it does not prove behavior
+under mixed OLTP/OLAP pressure. The implementation relies on query-specific
+code generation and careful CPU hardware details; GPU DB may need route
+descriptors before it can safely specialize code this way. The reported
+absolute speedups should not be transferred to GPU routes; the transferable
+claim is the staged route-shape mechanism.
+
+**Benchmark candidates:**
+
+- Add a CPU fallback baseline for retained join/lookup routes: fully fused
+  scalar, staged tuple-id vector without prefetch, and staged vector with
+  prefetch. Gate: GPU routes must beat the best CPU staged baseline after
+  transfer, launch, and response costs.
+- Add route-certificate fields for temporary vector bytes, vector element type,
+  stage boundary, prefetch distance, and expected random-access structure size.
+  Failure condition: a route allocates unbounded intermediate state per session.
+- Benchmark staged main-plus-delta scans: materialize changed row ids or stable
+  row ordinals into bounded vectors before CPU prefetch or GPU processing.
+  Measure selectivity, vector fill rate, cache misses, H2D bytes, and p99.
+- Add a negative-control benchmark with tiny hash/index structures and
+  high-selectivity predicates. Proof gate: planner avoids prefetch/GPU staging
+  when overhead dominates.
+- Compare micro-batch sizes for same-shape retained lookups as ROF-style stage
+  vector sizes: 64, 256, 1k, 4k, 16k, and latency-capped dynamic fill. Measure
+  p50/p99, launch count, cache misses, and active temporary bytes.
+- For text-prefix routes, test whether a CPU paged-dictionary prefetch stage
+  beats a GPU route when the dictionary page set is small or already warm.
+
+### 2026-06-05 - Cross-paper synthesis: staged route boundaries should be budgeted first-class state
+
+**Converging design tracks:** Hermes, Page As You Go, and ROF all argue for
+the same missing middle layer between "fully resident fused route" and
+"fallback to owner CPU path." Hermes supplies freshness-bounded main plus
+delta generations. Page As You Go supplies page-granular vector, dictionary,
+and index residency with pin/unpin contracts. ROF supplies cache-resident
+stage vectors that make selective predicates, random probes, and prefetching
+explicit. Together they say the GPU DB route certificate should name staged
+inputs, page handles, delta overlays, temporary vector budgets, and freshness
+frontiers before a route enters CPU or GPU execution.
+
+**Category gaps:** Recent work has been heavy on HTAP/tiering and execution
+shape. The next queued review should lean toward GPU route baselines or CPU
+fallback operator mechanics only if it closes a concrete planner gap; otherwise
+return to OLTP concurrency, MVCC/snapshot cleanup, runtime admission, or
+storage recovery.
+
+**Benchmark priorities:** First, add a best-CPU-staged baseline before claiming
+GPU wins for retained lookups, joins, or prefix scans. Second, measure
+main-plus-delta freshness with row-id overlays and warm page pinning. Third,
+make temporary route state visible: tuple-id vectors, dictionary/index pages,
+pinned host buffers, GPU input batches, and response buffers should all count
+against admission budgets.

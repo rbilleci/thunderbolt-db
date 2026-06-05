@@ -608,13 +608,22 @@ Append new candidates here as each paper is processed.
   Why: Crystal evaluates GPU-as-coprocessor query compilation against efficient
   CPU baselines; useful follow-up for deciding whether GPU DB should ever use
   pipelined transfer routes when data is not resident.
-- `queued` — **Relaxed Operator Fusion for In-Memory Databases: Making
+- `reviewed` — **Relaxed Operator Fusion for In-Memory Databases: Making
   Compilation, Vectorization, and Prefetching Work Together at Last**,
   Menon et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol11/p1-menon.pdf`
   Why: Crystal highlights CPU fusion/vectorization limits on chained
   operators; useful CPU-side baseline before claiming GPU route wins for fused
   retained query shapes.
+- `queued` — **Hardware-Sensitive Scan Operator Variants for Compiled
+  Selection Pipelines**, Broneske, Meister, and Saake, BTW 2017.
+  URL: `https://dl.gi.de/items/f0e4190e-8c26-4d8d-a46d-63e8c2a04569`
+  Why: ROF cites this as related work on compiled scan variants; useful for
+  tuning CPU fallback and warm-tier scan routes before routing work to GPU.
+- `queued` — **One Loop Does Not Fit All**, Pantela and Idreos, SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2737796`
+  Why: ROF contrasts one-size-fits-all compiled loops with staged route shapes;
+  useful for route-specific code generation and planner decisions.
 - `queued` — **Hardware-Conscious Hash-Joins on GPUs**, Sioulas et al.,
   ICDE 2019.
   URL: `https://doi.org/10.1109/ICDE.2019.00068`
