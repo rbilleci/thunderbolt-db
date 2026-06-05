@@ -52102,3 +52102,149 @@ cold metadata, ASCY-style no-store read admission, and OPTIK-style
 read/validate publication cells. The proof gate is lower p99 route lookup
 latency at high read concurrency without stale route certificates, hidden
 metadata lock waits, or unbounded retired-cell memory.
+
+### 2026-06-05 - SSS: Scalable Key-Value Store with External Consistent and Abort-free Read-only Transactions
+
+**Citation:** Masoomeh Javidi Kishi, Sebastiano Peluso, Henry F. Korth, and
+Roberto Palmieri. "SSS: Scalable Key-Value Store with External Consistent and
+Abort-free Read-only Transactions." ICDCS 2019. doi:10.1109/ICDCS.2019.00065.
+Retrieved 2026-06-05 from the author-hosted PDF,
+`https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-icdcs2019.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing /
+concurrency control.
+
+**Relevance tags:** abort-free read-only transactions; external consistency;
+strict serializability; vector clocks; snapshot queues; anti-dependency
+tracking; read freshness; update response delay; admission control.
+
+**Core idea:** SSS targets replicated key-value transactions where read-only
+transactions should observe the latest non-concurrent state, never abort due to
+concurrent updates, and still preserve external consistency without a global
+clock, total-order broadcast, or specialized hardware. It combines vector
+clocks with per-key snapshot queues. Read-only transactions leave visible queue
+entries on keys they read; update transactions that internally commit behind
+those readers may expose their writes to later transactions, but must delay the
+client-visible response until earlier conflicting readers complete.
+
+The transferable point is the distinction between internal commit and external
+commit. SSS lets an update become usable by later internal work once 2PC,
+validation, version installation, and per-node ordering have succeeded, while
+holding the client response when necessary to keep the externally observed
+order consistent with the serialization order. In the paper's YCSB-style
+evaluation on up to 20 nodes, SSS outperforms a validating 2PC baseline by up
+to 7x and ROCOCO by up to 2.2x on long read-only transactions, while update
+transactions spend about 30% of their latency between internal and external
+commit in one reported configuration.
+
+**Concrete mechanisms:**
+
+- Each transaction carries a vector clock `VC` and a `hasRead` vector that
+  records which nodes have contributed to its read visibility.
+- Each key has an ordered snapshot queue containing read-only transactions
+  that read the key and update transactions that wrote the key after their
+  commit decision. Queue entries include transaction id, insertion snapshot,
+  and transaction type.
+- Read-only transactions initialize from the local node's latest committed
+  vector clock, contact replicas for each key, and use the fastest response.
+  The first read from a node waits until that node has internally committed all
+  transactions already included in the reader's visibility bound.
+- Version selection builds a visible set from per-node logs and removes update
+  transactions in the key's snapshot queue whose insertion snapshot is greater
+  than the reader's bound. The reader then queues itself on the key with the
+  chosen snapshot.
+- Update transactions buffer writes, read latest versions, and validate read
+  keys during a 2PC prepare phase. Participants lock relevant keys, propose
+  vector-clock advances, and add the transaction to a per-node commit queue.
+- Commit queues order ready update transactions by the local vector-clock
+  component before applying versions, updating the node log, and releasing
+  locks.
+- After internal commit, an update enters pre-commit. It inserts itself in the
+  snapshot queues of written keys and waits behind read-only entries with lower
+  insertion snapshots before replying to its client.
+- Update transactions propagate transitive anti-dependencies: if an update read
+  from another update that was held behind a reader, it carries that reader's
+  queue entry into the snapshot queues of its own written keys.
+- Read-only commit replies immediately, then sends remove messages to clear its
+  snapshot-queue entries. Remove messages may be forwarded along propagated
+  anti-dependency chains.
+- Starvation is handled by admission control: if a read-only operation targets a
+  key whose update has waited in a snapshot queue too long, SSS delays that
+  read with exponential backoff.
+- Fault recovery for 2PC logging or consensus-based 2PC message ordering is
+  explicitly outside the evaluated protocol; the paper disables node-failure
+  recovery mechanics to focus on concurrency-control performance.
+
+**GPU DB mapping:** SSS is a useful model for separating GPU DB's internal
+publication events from SQL-visible completion. The engine already requires
+WAL-before-visibility. SSS suggests a finer split for future multi-owner or
+replicated routes: a write batch may become internally known to mutation,
+residency, or partition owners before its client-visible response is released,
+provided every retained reader that could force an earlier external order is
+tracked and respected.
+
+Snapshot queues map to per-key, per-range, or per-resident-generation reader
+traces. A retained GPU read that starts before a conflicting mutation should
+not necessarily abort or block the mutation owner's internal progress. Instead,
+the mutation owner can publish a new internal generation, keep the older
+generation alive for the reader, and delay only the external response or route
+certificate when client-visible ordering would otherwise be inverted. This is
+most relevant to long retained reads, refresh jobs, queue-like tables, and
+future partition owners rather than today's single-owner benchmark path.
+
+The transitive anti-dependency mechanism is also a caution for route metadata.
+If update batch `B` reads state produced by a pre-committed update held behind a
+long reader, then `B` may need to inherit that reader dependency before its own
+generation or response becomes externally visible. GPU DB should not treat
+generation numbers as independent scalar facts once multi-owner reads and
+writes are allowed; dependencies may have to be carried in compact certificates
+or collapsed at owner boundaries.
+
+Finally, SSS's starvation backoff gives a benchmarkable admission policy: long
+retained readers can be abort-free, but they cannot be admitted without bound
+if they keep delaying externally visible writes. Read-snapshot admission should
+watch per-key or per-generation writer wait time and throttle new long readers
+before they turn update response latency into an unbounded queue.
+
+**Risks and mismatches:** SSS is a distributed key-value protocol, not a SQL
+engine, GPU runtime, or storage engine. Its vector clocks scale with node count
+unless compressed or coarsened, and per-key snapshot queues may be too expensive
+for tuple-level SQL workloads without grouping by key range, partition, or
+generation. The protocol assumes applications identify read-only transactions
+up front, which is easier for retained read routes than arbitrary interactive
+SQL transactions.
+
+The design delays update responses to protect external consistency, so it can
+improve read abort behavior while still hurting write tail latency under long
+readers and hot keys. Its evaluation disables crash-recovery details for 2PC,
+so it does not answer GPU DB's WAL replay, checkpoint, or durable recovery
+questions. It also targets replicated nodes over a network; a single-host GPU
+DB should first use cheaper owner-local generation and reader-trace structures
+before paying vector-clock or per-key distributed metadata costs.
+
+**Benchmark candidates:**
+
+- Prototype internal versus external publication states for one mutation path:
+  WAL durable, internally visible to owners, resident generation invalidated or
+  rebuilt, and client response released. Gate: no SQL-visible response can
+  precede a retained reader that must serialize earlier.
+- Add a retained-reader trace for hot keys or resident generations. Compare no
+  trace, per-key trace, and per-generation trace under one long reader plus
+  hot updates. Failure condition: write p99 grows without telemetry or stale
+  routes can observe mixed generations.
+- Build a snapshot-queue-inspired benchmark for queue-like tables: long
+  read-only retained scan, concurrent inserts/deletes, and short point reads.
+  Measure aborts, delayed write responses, reader latency, and tombstone or
+  old-generation retention.
+- Test transitive dependency propagation in a small multi-partition simulator:
+  update `B` reads from pre-committed update `A`, then writes another key while
+  `A` waits behind a reader. Proof gate: no later retained read can observe an
+  external order that contradicts the dependency chain.
+- Add admission control for long retained reads when a writer has waited past a
+  configurable microsecond budget. Expected result: bounded write tail latency
+  with explicit read delay/rejection reasons. Failure condition: unlimited
+  abort-free reads starve externally visible writes.
+- Compare vector-clock-like dependency certificates with scalar generation
+  boundaries for future partition owners. Use the scalar form as the baseline
+  and only keep vector-style metadata if it catches real cross-owner ordering
+  anomalies that scalar generations miss.

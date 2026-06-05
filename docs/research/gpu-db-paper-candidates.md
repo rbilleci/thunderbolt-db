@@ -1336,7 +1336,7 @@ Append new candidates here as each paper is processed.
   Why: full FPSI successor that evaluates fresher PSI snapshots on YCSB and
   TPC-C; useful for checking whether version-access metadata remains practical
   under OLTP contention and read-mostly workloads.
-- `queued` — **SSS: Scalable Key-Value Store with External Consistent and
+- `reviewed` — **SSS: Scalable Key-Value Store with External Consistent and
   Abort-free Read-only Transactions**, Javidi Kishi, Peluso, Korth, and
   Palmieri, ICDCS 2019.
   URL: `https://doi.org/10.1109/ICDCS.2019.00065`
@@ -1346,6 +1346,13 @@ Append new candidates here as each paper is processed.
   externally consistent read-only transactions without centralized
   synchronization; useful for comparing PSI freshness against stronger
   client-visible ordering.
+- `queued` — **Cure: Strong Semantics Meets High Availability and Low
+  Latency**, Akkoorath et al., ICDCS 2016.
+  URL: `https://doi.org/10.1109/ICDCS.2016.98`
+  Why: SSS contrasts stronger external consistency with causally consistent
+  transactional replication; useful for deciding which weaker snapshot or
+  replica-freshness guarantees are acceptable, if any, for remote retained
+  GPU snapshots or future replicated owners.
 - `queued` — **GMU: Genuine Multiversion Update-Serializable Partial Data
   Replication**, Peluso et al., IEEE TPDS 2016.
   URL: `https://doi.org/10.1109/TPDS.2015.2465906`
