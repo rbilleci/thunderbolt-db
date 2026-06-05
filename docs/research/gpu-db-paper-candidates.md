@@ -1054,8 +1054,9 @@ Append new candidates here as each paper is processed.
   Why: PIM-Tree contrasts prior range-partitioned near-data ordered indexes;
   useful for understanding when simple per-tier range partitioning fails under
   skew and how much explicit rebalancing or route fallback GPU DB needs.
-- `queued` — **NUBA: Non-Uniform Bandwidth GPUs**, Zhao et al., ASPLOS 2023.
+- `reviewed` — **NUBA: Non-Uniform Bandwidth GPUs**, Zhao et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3575693.3575745`
+  PDF: `https://users.elis.ugent.be/~leeckhou/papers/ASPLOS_2023.pdf`
   Why: newer off-chip/on-chip bandwidth-aware GPU architecture work from the
   CD-search authors; relevant to treating GPU bandwidth locality and
   partitioning as route-certificate inputs for future hardware.
@@ -1178,6 +1179,19 @@ Append new candidates here as each paper is processed.
   Why: follow-up to PARQO that focuses on parametric robust query
   optimization and plan-penalty profile caching; relevant to repeated retained
   GPU route templates and admission-time route reuse.
+- `queued` — **Griffin: Hardware-Software Support for Efficient Page Migration
+  in Multi-GPU Systems**, Baruah et al., HPCA 2020.
+  URL: `https://doi.org/10.1109/HPCA47549.2020.00055`
+  Why: NUBA contrasts page migration with LAB/MDR placement; useful for
+  evaluating when GPU DB should migrate, replicate, or rebuild resident
+  segment pages across future multi-GPU and partitioned-memory hardware.
+- `queued` — **Locality-Centric Data and Threadblock Management for Massive
+  GPUs**, Khairy et al., MICRO 2020.
+  URL: `https://doi.org/10.1109/MICRO50266.2020.00087`
+  Why: NUBA cites locality-centric data/threadblock management for massive GPU
+  locality; useful for mapping query fragments, CTAs, and resident segment
+  placement to hardware-local partitions instead of relying only on generic
+  GPU scheduling.
 - `reviewed` — **Concurrency Control as a Service**, Zhou et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p2761-zhou.pdf`
   DOI: `https://doi.org/10.14778/3746405.3746406`

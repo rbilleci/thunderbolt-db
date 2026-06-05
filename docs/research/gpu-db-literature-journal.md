@@ -61242,3 +61242,144 @@ that distinguishes transparent page movement from DB-owned hot/cold routing.
   fallback, generic GPU kernels, specialized GPU kernels, resident refresh, and
   response batching. Failure condition: a route wins kernel time but loses
   end-to-end latency under realistic admission pressure.
+
+### 2026-06-05 - GPU locality is a bandwidth contract, not just a cache hint
+
+**Citation:** Xia Zhao, Magnus Jahre, Yuhua Tang, Guangda Zhang, and Lieven
+Eeckhout. "NUBA: Non-Uniform Bandwidth GPUs." ASPLOS 2023, pp. 544-559.
+doi:10.1145/3575693.3575745. Retrieved 2026-06-05 from the author PDF,
+`https://users.elis.ugent.be/~leeckhou/papers/ASPLOS_2023.pdf`, with metadata
+cross-checked through the DOI and Ghent University publication page.
+
+**Category:** GPU execution / analytics, with multi-tier cache / data placement
+relevance.
+
+**Relevance tags:** GPU memory locality; non-uniform GPU bandwidth; LLC slices;
+page placement; read-only replication; CTA locality; route certificates;
+resident segment placement; future hardware tiers.
+
+**Core idea:** NUBA argues that future GPUs should expose non-uniform bandwidth
+inside the GPU instead of forcing every SM to have equal bandwidth to every LLC
+slice through an expensive uniform NoC. A NUBA GPU groups nearby SMs, LLC
+slices, and a memory controller into partitions. Local accesses use high
+bandwidth point-to-point links; remote accesses still work through an
+inter-partition NoC, but they are the path to avoid.
+
+The paper's most transferable point is that non-uniformity is useful only when
+software, compiler analysis, and hardware policy cooperate. Its Local-And-
+Balanced page allocation places pages close to the partition that first uses
+them while correcting load imbalance. Its Model-Driven Replication replicates
+read-only shared cache lines only when a small runtime model predicts that
+extra local bandwidth outweighs lost cache capacity. In simulation, NUBA with
+LAB and MDR improves average performance by 23.1% over an iso-resource
+memory-side UBA GPU, raises perceived memory bandwidth by 38.9% on average,
+and can trade the locality benefit for much lower NoC power at similar
+performance.
+
+**Concrete mechanisms:**
+
+- The architecture forms GPU partitions from co-located SMs, LLC slices, and a
+  memory controller. Local L1 misses reach local LLC/memory over high-bandwidth
+  links; remote misses are forwarded through the inter-partition NoC.
+- The address mapping reserves channel bits outside the page offset and avoids
+  randomizing them, so the driver can choose the memory partition for a page
+  while still randomizing bank bits.
+- LAB tracks the number of pages allocated to each partition and computes a
+  normalized page-balance score. If allocation is balanced enough, it behaves
+  like first-touch; otherwise, it allocates the next page to a least-filled
+  partition.
+- The paper uses an empirically chosen LAB threshold of 0.9. The sensitivity
+  study reports that nearby thresholds change average speedup only modestly,
+  which suggests the mechanism is not hypersensitive to one magic constant.
+- MDR uses PTX-level data-flow analysis to mark read-only shared data within a
+  kernel. Read-write shared data is not replicated, avoiding coherence updates
+  for dirty copies.
+- At runtime, MDR profiles a small sample of LLC sets, estimates local/remote
+  access fractions plus LLC hit/miss behavior, and re-evaluates replication
+  every 20K cycles.
+- MDR compares estimated effective bandwidth with and without replication. It
+  replicates cache lines on demand only when the predicted bandwidth gain beats
+  the added cache-capacity pressure.
+- Replicated read-only cache lines are treated as normal LLC contents for
+  replacement. LLCs are flushed at kernel boundaries because data that is
+  read-only in one kernel may become writeable in the next.
+- The evaluation uses a modified GPGPU-Sim with Ramulator, TLB/MMU support,
+  64 SMs, 64 LLC slices, 32 memory channels, and workloads spanning low-sharing
+  and high-sharing GPU applications. Claims are simulation results, not a
+  measurement on production NVIDIA hardware.
+- LAB alone improves NUBA's average performance by 88.9% versus first-touch and
+  14.3% versus round-robin in the reported setup. MDR adds 15.1% over
+  no-replication for high-sharing behavior by avoiding full-replication cases
+  that would thrash LLC capacity.
+
+**GPU DB mapping:** This is directly relevant to route certificates for future
+GPU hardware. A resident route should not merely say "data is on GPU." It
+should eventually say which device partition, memory slice, stream owner, and
+resident segment family the route expects to use, and whether the request is
+local, remote, replicated read-only, or likely to pressure the interconnect.
+The current P8 snapshot metadata already names relation, generation, and
+resident layout identity; a future version should be able to attach locality
+and bandwidth-class metadata when hardware exposes it.
+
+LAB maps to resident segment placement. Hot retained point lookups and scans
+should prefer first-use locality when a partition owner or GPU execution owner
+has a natural segment affinity, but the cache manager also needs a balance
+guard so one hot relation does not strand memory bandwidth in a few partitions.
+The benchmarkable analogue is not GPU driver page placement yet; it is a
+software policy for assigning resident column chunks, key vectors, and CUDA
+work queues to execution owners with local byte budgets.
+
+MDR is a useful warning for replicated GPU snapshots. Replicating every hot
+read-only structure can hurt by consuming cache or HBM capacity. Replication
+should be per-structure or per-segment and driven by measured local/remote
+traffic, reuse, and resident-memory pressure. Good candidates are read-only
+route metadata, small dimension/key dictionaries, predicate constants, stable
+row-id maps, and shared compressed dictionaries; poor candidates are large
+scan payloads that would evict more useful resident columns.
+
+For 1M logical sessions, the paper reinforces that locality metadata belongs
+before execution. Network IO workers and read admission should steer same-shape
+retained reads to the GPU owner that already has the relevant resident segment
+and staging buffers. If requests are blindly spread across GPU workers, the
+system may manufacture remote traffic and lose the locality that made
+residency valuable.
+
+**Risks and mismatches:** NUBA is an architecture simulation paper, not a
+database system paper, and current GPUs may not expose the partition-level
+placement controls assumed by the design. The compiler analysis targets PTX
+kernels and read-only data within a kernel boundary; SQL plans with MVCC,
+updates, DDL invalidation, and resident snapshot refresh need stronger
+semantic metadata before anything can be treated as read-only. The evaluation
+uses benchmark kernels, not database scans, joins, point lookups, response
+encoding, WAL, or multi-session workloads. Finally, remote/local GPU bandwidth
+may be hidden or reshaped by vendor features such as MIG, multi-GPU fabrics,
+or future cache policies, so the first implementation should model placement
+and measure symptoms before assuming direct hardware control.
+
+**Benchmark candidates:**
+
+- Add locality fields to resident-route telemetry: GPU id, execution owner,
+  resident segment id, intended locality class, transferred bytes, reused
+  resident bytes, and fallback reason. Gate: every retained route can explain
+  whether it used an already-owned resident segment or forced a cross-owner
+  movement.
+- Build a software LAB analogue for resident segment assignment across GPU
+  execution owners. Compare first-touch, round-robin, and local-and-balanced
+  placement for same-shape scans and key-vector lookups. Failure condition:
+  one owner saturates while other owners have free resident byte budget and
+  stream capacity.
+- Add a selective-replication benchmark for small read-only GPU metadata:
+  dictionaries, route tables, row-id maps, and predicate constants. Measure
+  p50/p99 latency, HBM footprint, cache hit behavior if available, and
+  throughput under many concurrent retained reads.
+- Test "replicate everything" against model-driven replication for shared
+  read-only structures. Expected result: full replication wins only for small
+  high-reuse data and loses once it evicts hot resident columns or indexes.
+- Extend route certificates with a locality-pressure clause: expected resident
+  bytes, expected shared metadata bytes, replication eligibility, and owner
+  affinity. Gate: a route can be rejected or steered differently when locality
+  pressure exceeds its latency budget.
+- For future multi-GPU hardware, add a synthetic remote-resident benchmark:
+  local resident execution versus remote peer access versus CPU fallback plus
+  transfer. The decision gate is end-to-end latency under queue pressure, not
+  only kernel bandwidth.
