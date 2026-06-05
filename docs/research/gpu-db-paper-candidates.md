@@ -4975,10 +4975,34 @@ Append new candidates here as each paper is processed.
   follow-ups; useful for comparing multi-versioned transactional routing,
   fast local read-write transactions, and lock-free snapshot reads against GPU
   DB route certificates and owner-local hot paths.
-- `queued` — **Chardonnay: Fast and General Datacenter Transactions for
+- `reviewed` — **Chardonnay: Fast and General Datacenter Transactions for
   On-Disk Databases**, Eldeeb et al., OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/eldeeb`
   Why: Chablis builds on Chardonnay's local epoch service and lock-free
   snapshot-read protocol; useful for a deeper single-datacenter version of
   epoch publication, fast 2PC, and on-disk MVCC visibility without geo
   publisher latency.
+- `queued` — **Cornus: Atomic Commit for a Cloud DBMS with Storage
+  Disaggregation**, Guo et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol16/p379-guo.pdf`
+  DOI: `https://doi.org/10.14778/3565816.3565821`
+  Why: Chardonnay's transaction-state-store path cites Cornus-style atomic
+  commit work; useful for comparing fast commit-state durability and
+  coordinator failure handling when GPU DB separates WAL, owner ordering, and
+  resident publication state.
+- `queued` — **Multi-version Range Concurrency Control in Deuteronomy**,
+  Levandoski et al., PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol8/p2146-levandoski.pdf`
+  DOI: `https://doi.org/10.14778/2831360.2831367`
+  Why: Chardonnay relies on range leaders, range locking, and MVCC versions;
+  this is a 2015-present primary source for range-level MVCC concurrency that
+  may inform prefix scans, resident key-range certificates, and lock-free
+  retained reads.
+- `queued` — **Releasing Locks as Early as You Can: Reducing Contention of
+  Hotspots by Violating Two-Phase Locking**, Guo, Wu, Yan, and Yu,
+  SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457263`
+  Why: Chardonnay frames contention footprint as time under locks and cites
+  early lock-release hotspot work; useful for judging whether any GPU DB
+  hot-write lane can safely retire conflict metadata before full response
+  completion without weakening WAL-before-visibility.

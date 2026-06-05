@@ -62534,3 +62534,209 @@ values should not be used as local GPU DB targets.
 - Simulate remastering a hot partition or resident segment between owners.
   Success condition: stale route certificates abort before lock acquisition or
   GPU launch, and throughput recovers after route metadata caches update.
+
+### 2026-06-05 - Chardonnay turns cold-data reads into pre-lock admission work
+
+**Citation:** Tamer Eldeeb, Xincheng Xie, Philip A. Bernstein,
+Asaf Cidon, and Junfeng Yang. "Chardonnay: Fast and General
+Datacenter Transactions for On-Disk Databases." OSDI 2023,
+pp. 343-360. Retrieved 2026-06-05 from the USENIX publication page
+and PDF, `https://www.usenix.org/conference/osdi23/presentation/eldeeb`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; multi-tier cache / data placement.
+
+**Relevance tags:** fast 2PC; strict serializability; lock-free snapshot
+reads; epoch publication; cold-data prefetch; lock contention footprint;
+ordered lock acquisition; range reads; MVCC version GC; admission before
+locks; on-disk OLTP.
+
+**Core idea:** Chardonnay is a single-datacenter, shared-nothing,
+on-disk transactional key-value store designed for the world where fast RPCs
+and fast transaction logs make 2PC much less expensive. Once the commit
+protocol shrinks, the bottleneck moves: a transaction can still hold locks
+while waiting for cold records to come from slower storage. Chardonnay's main
+move is to shift that slow data-read work outside the contention window.
+
+It does that with a strongly consistent lock-free snapshot protocol. A
+transaction can first run its logic as a dry run against a snapshot, load and
+pin the keys or ranges it will need, then rerun normally with 2PL and 2PC.
+The actual transaction acquires locks in a deterministic key order using the
+dry-run access set, which avoids most deadlock aborts and reduces the time hot
+records are held. The paper reports that under an extremely high-contention
+microbenchmark Chardonnay's throughput is only about 15% lower than under
+extremely low contention, while a fast System R-style baseline drops by more
+than 85%.
+
+**Concrete mechanisms:**
+
+- Chardonnay has an epoch service, range-sharded KV service, transaction
+  state store, and client library. The client acts as 2PC coordinator.
+- The epoch service is a Multi-Paxos replicated counter advanced periodically
+  in the prototype every 10 ms. Transactions read, but do not increment, the
+  epoch.
+- A read-epoch call returns the value accepted by a majority of epoch replicas,
+  preserving a monotonic epoch invariant even if a leader changes.
+- The client reads the epoch in parallel with Prepare RPCs. Participants reply
+  with the epoch interval covered by their leader lease; the client commits
+  only if the chosen epoch is inside every participant lease interval.
+- Range leaders hold leases over epoch intervals. Lease acquisition is logged
+  through Paxos and includes a sequence number so clients can detect leadership
+  changes observed during one transaction.
+- Read-write transactions use strict 2PL and 2PC. Commit state is stored in a
+  separate transaction state store, using presumed abort and one tiny
+  per-transaction replicated log with Started, Committed/Aborted, and Done
+  positions.
+- Versions use a version id whose prefix is the commit epoch and whose suffix
+  distinguishes writes in the same epoch. Deletes create tombstone versions;
+  an unversioned latest record is also maintained for ordinary reads.
+- The snapshot read protocol chooses a current epoch, validates that the epoch
+  falls below the range leader's lease upper bound, waits for current holders
+  of overlapping write locks to release, and then reads the largest version
+  below the chosen epoch. It does not acquire read locks.
+- Linearizable snapshot reads can be obtained by waiting for the epoch to
+  advance after the read starts, at the cost of extra latency. In the reported
+  YCSB experiment, strict-serializable snapshot reads added about 5 ms because
+  of the 10 ms epoch interval.
+- Version GC uses the lower end of the range leader lease interval. Snapshot
+  reads validate that their epoch remains within the configured retention delta
+  after reading; the experiments keep versions for about one minute.
+- Dry-run prefetch executes transaction logic through the snapshot protocol,
+  pins read keys or key ranges in a range-local prefetch buffer, discards dry
+  run writes at the client, and then reruns the transaction normally.
+- The prefetch buffer is write-through for pinned records. Committed writes to
+  pinned keys update the buffer, and inserts/deletes inside pinned ranges are
+  also reflected so range reads can be satisfied from memory.
+- If the dry-run access set changes before actual execution, correctness is
+  preserved, but the transaction may need additional reads while holding locks
+  and falls back to Wound-Wait for unexpected locks.
+- Prefetch admission happens before acquiring locks. If a range leader cannot
+  pin the requested data because memory is exhausted, the dry run can delay or
+  abort before it increases lock contention.
+- Ordered lock acquisition uses the approximate read/write set from the dry
+  run. Locks are acquired in ascending key order, and RPC chaining avoids one
+  network round trip per key.
+- The evaluation uses Azure VMs, eRPC, an emulated fast NVMe WAL on RAM disk,
+  RocksDB-backed data on SSD, and YCSB/TPC-C-style benchmarks. The epoch
+  microbenchmark reports 1.2 million read-epoch calls per second with median
+  latency below 60 us, and the TPC-C New Order experiment scales linearly in
+  the measured range with stable 2PC latency.
+
+**GPU DB mapping:** Chardonnay's most direct lesson for GPU DB is that
+contention footprint includes waiting for cold tiers, not only lock manager
+time. A write that needs CPU index pages, host-warm segments, NVMe pages,
+resident invalidation metadata, or GPU staging buffers should not acquire hot
+row, key-range, or owner-order locks and then discover that the data or buffer
+budget is unavailable. The runtime should make those resource reads and pins
+part of admission before the request enters the narrow mutation or
+cross-owner conflict window.
+
+The dry-run idea maps to route preflight rather than blindly rerunning SQL.
+For prepared statements, stored procedures, COPY chunks, and same-shape
+retained reads, GPU DB can preflight the route certificate: key/range set,
+resident segments, CPU index pages, pinned host buffers, GPU scratch, WAL
+budget, response buffer, and owner domains touched. If the preflight cannot
+pin or reserve the needed tier resources, the request should delay, fall back,
+or reject before it holds mutation-owner locks or invalidates resident state.
+
+The snapshot protocol strengthens the two-level frontier design from Chablis.
+GPU DB can use owner-local epochs for ordinary write publication and retained
+read routing, while lock-free retained reads select a snapshot frontier and
+wait only for overlapping in-flight writers by key range, segment, or table
+generation. The read path should not acquire ordinary write locks, but it must
+prove that no older writer can still commit below the chosen frontier.
+
+Range pinning is especially relevant to P8 text-prefix scans and resident
+segment routes. A retained scan over a key range should carry a certificate
+that says which key range, segment generation, and delete/tombstone overlay
+are pinned or immutable. Inserts/deletes into that range should update the
+overlay or invalidate the certificate before new readers use it, while old
+readers finish against the snapshot they already hold.
+
+Ordered lock acquisition maps to cross-owner route descriptors. If a request
+touches multiple partition owners, resident segments, or index ranges, the
+route should acquire conflict rights in a deterministic order or insert small
+ordering descriptors in that order. That is safer than allowing arbitrary
+owner-rings to wait on each other and then relying on timeouts under high
+session concurrency.
+
+Finally, Chardonnay's epoch batching and majority read path are a reminder not
+to put a central visibility read on every logical session operation. Epoch or
+frontier reads should be batched by IO workers and execution workers, attached
+to route descriptors, and measured separately from GPU kernel time and WAL
+time.
+
+**Risks and mismatches:** Chardonnay is a distributed key-value store, not a
+SQL engine, GPU engine, or full PostgreSQL protocol runtime. Its strongest
+techniques assume transaction logic can be executed through a client library
+twice; interactive SQL transactions with side effects outside the database do
+not fit that model. Dry runs add latency and CPU work under low contention,
+and the paper explicitly allows disabling them. The implementation assumes
+fast RPCs and a fast separate WAL device; ordinary TCP/pgwire and commodity
+NVMe may move bottlenecks. The 10 ms epoch interval creates millisecond-scale
+latency for linearizable snapshots, which would be too high for many local
+retained GPU reads if copied literally. Range pinning and prefetch buffers may
+consume memory under high logical session counts, so they need strict budgets.
+The evaluation does not cover CUDA scheduling, GPU memory, compressed
+columnar segments, query optimization, or recovery of resident acceleration
+state.
+
+**Benchmark candidates:**
+
+- Add a pre-lock route-preflight benchmark for one hot write path. Preflight
+  should reserve CPU index/page state, WAL batch capacity, resident invalidation
+  metadata, response buffer, and optional GPU staging before acquiring
+  mutation-owner conflict rights. Measure lock hold time and p99 under cold
+  page misses.
+- Build a retained read snapshot test that selects a frontier, waits only for
+  overlapping in-flight writers, and reads immutable segment buffers without
+  acquiring write locks. Gate: identical visible rows versus owner-routed MVCC
+  reads under concurrent insert/update/delete.
+- Prototype key-range or segment-range pinning for one resident text-prefix
+  or integer-range route. Compare invalidate-on-write, overlay-update, and
+  preflight-delay policies under mixed range reads and writes.
+- Add deterministic cross-owner lock/order acquisition for one multi-partition
+  route descriptor. Failure condition: owner rings can deadlock or rely on a
+  timeout to break cycles.
+- Measure dry-run-like route preflight under low and high contention. Expected
+  result: high-contention lock hold time falls; failure condition: low
+  contention p50/p99 regresses without an adaptive bypass.
+- Add telemetry separating contention footprint into queue wait, preflight
+  tier read, lock/order hold, WAL flush, resident invalidation, GPU staging,
+  and response completion.
+
+### 2026-06-05 - Cross-paper synthesis: frontiers must preflight both ownership and tiers
+
+**Papers covered:** Chablis, SLOG, and Chardonnay.
+
+The three-paper batch converges on a more precise route contract. Chablis says
+local transactions should publish through cheap owner-local epochs while only
+cross-owner snapshots pay for a broader frontier. SLOG says cross-owner work
+should be represented by compact ordering records, not by dragging full
+execution state through every owner. Chardonnay adds the missing tiering
+dimension: before a request enters the conflict window, it should know whether
+cold data, range pins, buffers, and version state are available.
+
+For GPU DB, the emerging design track is a route certificate with three proof
+sections: visibility frontier, ownership/order, and tier resource readiness.
+The certificate should say which owner-local epoch or global retained frontier
+it uses, which owners or resident segments can order the request, and which
+host/GPU/NVMe resources were pinned or reserved before locks or invalidations
+were taken.
+
+The category gap after this batch is not more geo-transaction theory. The next
+useful work should lean toward runtime/session admission or storage-tier IO
+scheduling so the frontier design has pressure signals: i10, sRoute,
+Crash-Consistent NVMe, BarrierFS, or a modern credit/admission paper would
+balance the recent transaction-heavy sequence.
+
+Benchmark priorities:
+
+- Measure route preflight as an admission boundary before mutation-owner lock
+  hold time begins.
+- Add stale-certificate tests for owner movement, resident refresh, eviction,
+  and GC of old versions.
+- Track separate counters for local frontier reads, global frontier reads,
+  cross-owner ordering descriptors, and tier-pin failures.
+- Compare adaptive preflight bypass under low contention against mandatory
+  preflight under hot-key or cold-tier contention.
