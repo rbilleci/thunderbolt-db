@@ -38,6 +38,177 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - ROME: Robust Query Optimization via Parallel Multi-Plan Execution
+
+**Citation:** Ziyun Wei and Immanuel Trummer. "ROME: Robust Query
+Optimization via Parallel Multi-Plan Execution." Proceedings of the ACM
+on Management of Data 2(3), article 170, 2024, pp. 1-25.
+doi:10.1145/3654973. Retrieved 2026-06-06 from the ACM DOI metadata,
+NSF public-access metadata, and the accessible CMU course PDF,
+`https://15799.courses.cs.cmu.edu/spring2025/papers/23-mongodb/wei-sigmod2024.pdf`.
+
+**Category:** query optimization / planning, with runtime admission and
+fallback relevance.
+
+**Relevance tags:** robust query optimization; multi-plan execution;
+route choice; cardinality uncertainty; plan diversity; speculative
+execution; CPU/GPU fallback; admission control; tail latency; resource
+budgets.
+
+**Core idea:** ROME treats bad optimizer choices as a tail-risk problem.
+Instead of trying to make one cost estimate perfect, it generates several
+locally optimal plans by changing optimizer settings, selects a small
+complementary subset, runs those plans in parallel, and returns the first
+finished result while terminating the rest. The redundant work is
+intentional insurance against cardinality errors that can make one plan
+orders of magnitude slower than another.
+
+The paper's strongest database-engine lesson is not that every query
+should speculatively run multiple full plans. It is that route selection
+under uncertainty can spend bounded parallel resources when the cost of a
+wrong route is high. For GPU DB, that applies directly to CPU versus
+resident GPU versus over-resident GPU-tail decisions where stale
+statistics, transfer estimates, queue wait, or selectivity errors can
+otherwise send a query down a disastrous path.
+
+**Concrete mechanisms:**
+
+- ROME is implemented as a non-intrusive layer over PostgreSQL. It asks
+  the underlying optimizer for alternative plans by issuing `EXPLAIN`
+  under different optimizer flag settings such as enabling or disabling
+  join and scan operator families.
+- Candidate plans are modeled primarily by join trees and the
+  intermediate results they produce. The paper focuses on intermediate
+  result cardinality because optimizer mistakes often come from bad size
+  estimates under skew and correlation.
+- Multi-plan selection is formulated as choosing at most `n` plans from a
+  candidate set to maximize a utility function. The default experiments
+  select up to three plans.
+- The simpler utility model maximizes plan diversity, defined as the
+  number of distinct intermediate results covered by the selected plan
+  set. The intuition is that plans sharing many intermediate results are
+  vulnerable to the same cardinality-estimation error.
+- Plan diversity is shown to be monotone and submodular, so a greedy
+  selection algorithm gives a near-optimal approximation while remaining
+  cheap.
+- An exact integer-linear-program formulation is also provided for the
+  diversity model. It improves utility but can cost more planning time.
+- A richer probabilistic model assigns selected intermediate results a
+  cardinality distribution, starting from optimizer estimates and
+  uncertainty assumptions. Plan-set utility becomes expected minimum cost,
+  because execution stops when the fastest selected plan finishes.
+- Greedy and ILP variants are provided for the probabilistic model. The
+  richer ILP can improve execution time for expensive queries, but
+  planning cost rises with the number of uncertain intermediate results
+  and distribution buckets.
+- Execution uses separate PostgreSQL sessions or subprocesses with the
+  selected optimizer settings. When one finishes, the framework terminates
+  the others and returns that result.
+- The evaluation uses JOB and a StackExchange-derived Stack benchmark on
+  PostgreSQL 12.11, with a 24-core server. The main comparisons include
+  PostgreSQL's default optimizer, Plan Bouquets variants, AQO, Bao
+  variants, lowest-cost multi-plan execution, and an oracle over the
+  candidate space.
+- In the reported experiments, the diversity and probabilistic ROME
+  variants avoid all 60-second query timeouts on both benchmarks, while
+  several baselines still time out. The probabilistic model performs best
+  among non-oracle approaches.
+- The paper reports that executing multiple plans in parallel adds about
+  35% relative overhead compared with executing the selected plans alone
+  and taking the fastest result offline. Missing the candidate-space
+  optimal plan accounts for about 16% relative overhead. This makes
+  shared work or earlier loser cancellation an important future direction.
+- The authors explicitly scope the work to analytical processing by a
+  single user or low concurrent query load. If many independent queries
+  are already active, using parallelism for different queries may be the
+  better resource choice.
+
+**GPU DB mapping:** ROME maps naturally to route choice rather than to
+blind duplicate execution. A GPU DB route planner will often choose among
+CPU tuple/index execution, CPU columnar or compressed segment filtering,
+resident GPU kernels, over-resident CPU-prefilter plus GPU tail, and
+fallback or rejection under pressure. The wrong choice can be severe:
+streaming a cold partition to GPU when CPU filtering would have removed
+99% of rows, launching a GPU kernel for a stop-early point lookup, or
+falling back to CPU while a resident batch could have amortized launch
+cost.
+
+The transferable mechanism is bounded speculative route insurance. For
+queries with high estimate uncertainty and enough available budget, the
+runtime could run two complementary route fragments in parallel: for
+example a CPU stop-early/index route against a resident GPU scan, or a
+CPU prefilter route against a direct resident aggregate. The first route
+to prove a complete SQL-visible result wins, while the loser is cancelled
+only at safe boundaries. This should be rare and telemetry-driven, not
+the default for every request.
+
+Plan diversity becomes route-diversity for this engine. Candidate routes
+should not all depend on the same uncertain fact. If every candidate
+assumes the same stale selectivity estimate, they are not useful
+insurance. Better complementary candidates differ by physical dependency:
+resident key-vector lookup versus CPU B-tree lookup, compressed CPU
+prefilter versus GPU full scan, stop-early ordered projection versus
+staged predicate mask, or warm-tier CPU join versus GPU hash join.
+
+ROME also fits the high-throughput runtime's admission model. Speculative
+routes must debit explicit credits for CPU worker time, GPU queue slots,
+pinned buffers, resident snapshot references, response buffers, and
+loser-cancellation work. Under 1M logical sessions, speculative execution
+cannot be a hidden multiplier on scarce resources. It should be allowed
+only for expensive, high-uncertainty queries when the extra route does not
+violate p99 latency or queue budgets for ordinary requests.
+
+For MVCC and retained snapshots, loser cancellation must be snapshot-safe.
+Both candidate routes need the same relation identity, schema generation,
+visibility boundary, and route certificate. Cancelling a losing GPU route
+must release snapshot references, CUDA events, pinned buffers, scratch
+space, and response handles without publishing partial rows or weakening
+WAL-before-visibility.
+
+**Risks and mismatches:** ROME is evaluated on CPU analytical workloads
+with low query concurrency, not PostgreSQL-compatible serving at high
+session counts. It does not address transaction writes, MVCC visibility,
+DDL invalidation, WAL replay, GPU execution, pinned memory ownership, or
+network response rings. Its implementation terminates full PostgreSQL
+subprocesses; GPU DB would need cooperative cancellation points for CPU
+routes, CUDA streams, and response assembly.
+
+The paper's main benefit comes from avoiding rare terrible plans. If GPU
+DB already has many concurrent sessions, spending extra CPU/GPU work on
+one query can harm global latency. ROME's 35% multi-plan execution
+overhead is a warning: speculative route execution must be guarded by
+uncertainty, cost, and spare-capacity thresholds. It should not become a
+normal path for simple retained lookups or short writes.
+
+**Benchmark candidates:**
+
+- Add route-uncertainty telemetry to resident and over-resident planning:
+  estimated selectivity, observed selectivity, resident bytes touched,
+  CPU filter time, GPU queue wait, H2D/D2H bytes, and route mismatch
+  reason. Gate: every fallback or accepted GPU route records the facts
+  needed to identify bad route choices.
+- Prototype a two-route insurance benchmark for one read-only query
+  family: run CPU stop-early/index execution and resident GPU scan in
+  parallel under the same snapshot, return the first complete result, and
+  cancel the loser at a safe boundary. Measure p50/p99, extra CPU/GPU
+  work, cancellation latency, and correctness.
+- Compare route-diversity selection against lowest-estimated-cost route
+  selection for skewed predicates. Candidate routes should differ in
+  physical dependency, not just in cost estimate. Failure condition:
+  "diverse" routes all lose together when one selectivity estimate is
+  wrong.
+- Add a speculation admission policy: enable multi-route execution only
+  when CPU worker, GPU queue, pinned buffer, response buffer, and retained
+  snapshot budgets have spare capacity. Failure condition: speculation
+  improves one query while degrading unrelated retained lookup p99.
+- Implement loser-cleanup assertions for speculative routes: cancelled
+  routes must release snapshot refs, command descriptors, pinned buffers,
+  CUDA events, scratch allocations, and response handles exactly once.
+- Add a benchmark mode that compares single best-estimated route, bounded
+  speculative two-route execution, and oracle best route for skewed
+  CH-benCHmark-derived queries. Report total work as well as latency so
+  route insurance does not hide resource waste.
+
 ### 2026-06-06 - Decibel: The Relational Dataset Branching System
 
 **Citation:** Michael Maddox, David Goehring, Aaron J. Elmore,

@@ -1038,6 +1038,16 @@ Append new candidates here as each paper is processed.
   Why: modern listwise follow-up to Lero-style plan ranking; relevant to
   whether GPU DB route selection should rank candidate CPU/GPU/tiered plans as
   a set instead of pairwise comparisons only.
+- `reviewed` — **ROME: Robust Query Optimization via Parallel Multi-Plan
+  Execution**, Wei and Trummer, PACMMOD/SIGMOD 2024.
+  URL: `https://doi.org/10.1145/3654973`
+  PDF:
+  `https://15799.courses.cs.cmu.edu/spring2025/papers/23-mongodb/wei-sigmod2024.pdf`
+  Why: modern robust query-optimization work discovered because the remaining
+  queued optimizer papers were older 2015-2016 sources; useful for bounded
+  speculative CPU/GPU route insurance, route diversity, and loser-cancellation
+  benchmarks under uncertain selectivity and transfer costs. Journal entry
+  added 2026-06-06.
 - `reviewed` — **OLTP Through the Looking Glass 16 Years Later:
   Communication is the New Bottleneck**, Zhou et al., CIDR 2025.
   URL:
