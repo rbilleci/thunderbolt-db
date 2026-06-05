@@ -74618,3 +74618,198 @@ kernels can all lose when used outside the pattern they fit.
   dispatch counts, mask bytes, branch counts where available, and
   materialized intermediate row ids. Gate: route metadata compiles
   down to bounded buffers or scalar state in the measured path.
+
+### 2026-06-06 - Epoch reclamation can double as a range-query snapshot source
+
+**Citation:** Maya Arbel-Raviv and Trevor Brown. "Harnessing
+Epoch-based Reclamation for Efficient Range Queries." PPoPP 2018,
+pp. 14-27. doi:10.1145/3178487.3178489. Retrieved 2026-06-06
+from `https://www.cs.toronto.edu/~tabrown/ebrrq/paper.ppopp18.pdf`
+and the DOI metadata page.
+
+**Category:** MVCC / snapshot / visibility, with runtime / concurrent
+index relevance.
+
+**Relevance tags:** epoch reclamation; RCU; range queries; concurrent
+indexes; linearizability; retained snapshots; limbo lists; timestamped
+publication; lock-free metadata; TPC-C range indexes.
+
+**Core idea:** The paper observes that epoch-based reclamation already
+keeps recently deleted nodes reachable until every operation that could
+have seen them has finished. That reclamation property can be reused as
+a missing-node source for linearizable range queries: traverse the live
+data structure, then inspect announcements and EBR limbo lists for keys
+deleted during the range query.
+
+The design avoids taking a full snapshot of the data structure for every
+range query. Each range query increments a global timestamp and
+linearizes at that increment. Updates record the timestamp at their
+linearization point into inserted and deleted nodes. A range query keeps
+nodes whose insertion time precedes the query and whose deletion time is
+absent or after the query. If a concurrent delete removes a node before
+the range traversal reaches it, the query can still find the node in a
+delete announcement or limbo list.
+
+The authors provide lock-based, HTM-assisted, and lock-free provider
+variants, then apply them to lists, skiplists, binary trees, Citrus, and
+an ABTree. Their TPC-C experiment replaces DBx1000 hash indexes with
+range-query-capable concurrent indexes and reports that their algorithms
+run close to an unsafe non-linearizable traversal, while a snap-collector
+approach is impractical on the large TPC-C index set.
+
+**Concrete mechanisms:**
+
+- The underlying data structure must provide a traversal satisfying
+  `COLLECT`: it visits each node whose key is in the requested range and
+  remains in the structure throughout traversal, and does not visit keys
+  that were never in the structure during traversal.
+- Each range query calls `TraversalStart(low, high)`, increments the
+  shared timestamp, records its query time, traverses the structure, calls
+  `Visit(node)` on encountered nodes, and finishes with `TraversalEnd()`.
+- Updates wrap the write or CAS that is already the update's
+  linearization point. The wrapper reads the current timestamp at that
+  point and then writes that value into inserted nodes' `itime` or deleted
+  nodes' `dtime`.
+- Deleting updates announce nodes before removing them, then put deleted
+  nodes into the current EBR limbo list with `Retire(node)`, then remove
+  the announcement. Range-query cleanup checks announcements before limbo
+  lists so it cannot miss a node in the gap between removal and retirement.
+- `TryAdd` waits for or discovers a node's insertion/deletion timestamp,
+  rejects nodes inserted after the range query, rejects nodes deleted
+  before the range query, and adds in-range keys that existed at the
+  query's linearization time.
+- If per-thread limbo lists are maintained in deletion-time order, range
+  queries can stop scanning a list once they reach nodes deleted before
+  the query timestamp. They can also skip nodes deleted after the data
+  structure traversal finished.
+- The HTM variant avoids most shared-lock acquisition on update paths by
+  executing the timestamp read and update CAS transactionally, with a
+  lock-based fallback after repeated aborts.
+- The lock-free variant replaces timestamp/CAS critical sections with
+  DCSS and uses descriptors carrying inserted/deleted node payloads.
+  Threads that see missing timestamps help finish the relevant DCSS and
+  learn the correct timestamp from the descriptor.
+- The evaluation uses DEBRA-style EBR, pinned threads on a 48-thread
+  two-socket Intel system, microbenchmarks with updates/searches/range
+  queries, and a DBx1000 TPC-C benchmark with real range-query indexes.
+- The paper's artifact notes that its HTM results require Intel TSX; the
+  non-HTM variants and relative comparisons are still meaningful without
+  TSX.
+
+**GPU DB mapping:** The direct lesson is that reclamation metadata is not
+just cleanup bookkeeping. It can be part of the read snapshot contract.
+For GPU DB, retained CPU indexes, resident key vectors, bitmap fragments,
+route metadata, and old GPU snapshot handles all need an epoch or
+generation discipline anyway. That same discipline can help prove that a
+range read did not miss keys deleted during traversal or publication.
+
+For P8, this suggests a three-source range route for CPU-side and
+resident-index reads: traverse the current index or resident key-vector
+generation, inspect delete/update announcements from owners whose changes
+may overlap the snapshot, and consult bounded retired-fragment lists for
+objects still protected by the reader's epoch. The SQL-visible snapshot
+boundary remains the authority, but epoch lists provide the physical
+reachability needed to reconstruct the set without full index snapshots.
+
+The announcement-before-retire rule maps neatly to mutation owners and
+residency owners. A delete, update, index fragment split, bitmap delta
+consolidation, or resident buffer retirement should publish a small
+descriptor before unlinking old state. Readers starting before or during
+that unlink can then find either the live structure, the announcement, or
+the retired list. That is especially relevant for CUBIT/UpBit-style
+predicate masks and GPU multiversion indexes, where rebuilding a whole
+snapshot per range query would waste memory and refresh bandwidth.
+
+The lock-free descriptor path also fits high-session runtime goals.
+Instead of allocating fresh descriptors for every metadata publication,
+the engine should prefer reusable per-owner descriptors with generation,
+affected key range, pointer payload, and completion state. Readers that
+encounter in-flight publication can help, wait within a bounded policy,
+or fall back, but they should not need unbounded object allocation on the
+hot range-read path.
+
+Finally, `COLLECT` is a useful correctness gate for resident route
+implementations. A GPU range kernel, CPU fallback tree walk, or
+two-cursor merge over sorted key vectors must state what traversal
+property it satisfies under concurrent publication. Without that property,
+adding timestamps and retired lists is not enough.
+
+**Risks and mismatches:** This is a concurrent data-structure paper, not a
+full DBMS storage engine. It proves linearizable set range queries, not SQL
+snapshot isolation across multiple indexes, tuple payloads, predicates,
+joins, WAL replay, or DDL. It does not evaluate GPUs, CUDA memory
+ownership, device-side reclamation, pinned buffers, or NVMe tiers.
+
+The design uses a global timestamp increment per range query. That may be
+too expensive if every retained point lookup or GPU micro-batch takes the
+same path; GPU DB should test per-owner generations or batched snapshot
+acquisition before copying this literally. Limbo-list scans can also grow
+with update churn, even though the paper's optimizations limit practical
+work. Long retained GPU scans may pin retired state for much longer than
+the short operations in the evaluation.
+
+HTM results are hardware-dependent, and TSX is not a portable production
+assumption. The lock-free path relies on DCSS descriptors and helping,
+which adds implementation complexity and requires careful reclamation of
+descriptors themselves. The paper assumes known update linearization
+points; a database route that batches WAL, index updates, visibility, and
+resident invalidation must define those points explicitly.
+
+**Benchmark candidates:**
+
+- Add a retained-range correctness harness for CPU indexes: hold a read
+  snapshot, concurrently insert/delete/update keys in the range, and verify
+  live traversal plus announcements plus retired fragments returns the same
+  keys as a serial snapshot oracle.
+- Prototype per-owner retired-fragment lists for resident key vectors or
+  bitmap fragments. Gate: a range route can find keys removed during
+  traversal without cloning the whole index generation.
+- Compare three range-read strategies under TPC-C-like index traffic:
+  full snapshot copy, live traversal plus epoch-retired fragments, and CPU
+  owner fallback. Measure p50/p99 latency, update throughput, retained
+  bytes, and snapshot correctness.
+- Track retired-state pinning by snapshot class: short OLTP read,
+  retained GPU lookup batch, long analytical scan, and refresh. Failure
+  condition: one long GPU scan causes unbounded retired-index or retired
+  buffer growth on the mutation owner's hot path.
+- Add a `COLLECT` proof gate for each resident index/range route. The
+  implementation must document whether concurrent publication can make the
+  traversal miss a stable in-range key; tests should force split, merge,
+  unlink, and delete races.
+- Benchmark descriptor reuse for route publication descriptors. Compare
+  fresh allocation, per-owner reusable descriptors, and fixed ring slots
+  under high session fan-in. Measure allocations, cache misses where
+  available, range-read latency, and failed/helped publication counts.
+
+### 2026-06-06 - Cross-paper synthesis: snapshots need reachability, not just timestamps
+
+Recent route-format and execution-shape papers keep converging on the same
+rule: a fast route is only valid when its private physical representation
+also carries proof that the right rows are reachable at the requested
+snapshot. Crystal's semantic regions prove coverage by table generation,
+columns, predicates, and overlap rules. Push/pull fusion shows that the
+execution shape must match the route's stop/skip/yield behavior. CUBIT and
+UpBit show that mutable predicate indexes need delta state and consolidation
+boundaries. The epoch-based range-query paper adds the missing physical
+reachability piece: if a row, key, bitmap word, or resident fragment is
+unlinked during traversal, readers need a bounded way to find it.
+
+The strongest GPU DB design track is therefore a publication certificate
+that includes both semantic coverage and physical reachability. A retained
+route should not merely say "snapshot generation 42"; it should say which
+columns/predicate region/output shape it covers, which execution shape is
+valid, which mutation-owner generation it observes, and which announcement
+or retired-fragment lists remain protected while the route runs.
+
+Category gaps remain around multi-index SQL snapshot consistency and
+cross-table joins under concurrent update. The next best reviews should
+prefer modern MVCC/range-index reclamation, transaction metadata authority,
+or robust CPU/GPU fallback papers over more pure GPU-OLAP operator work.
+
+Benchmark priorities:
+
+- semantic-region cache with overlap correctness and generation proof
+- retained range/index reads with announcement plus retired-fragment repair
+- execution-shape comparison for stop-early, skip-heavy, and fused routes
+- retired-state pressure under long GPU snapshots and high update churn
+- CPU fallback fairness gates for every claimed GPU route win

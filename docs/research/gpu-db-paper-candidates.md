@@ -1231,12 +1231,14 @@ Append new candidates here as each paper is processed.
   work; useful for comparing structure-modifying compressed bitmap updates
   against CUBIT-style horizontal deltas and GPU DB generationed predicate
   masks.
-- `queued` — **Harnessing Epoch-Based Reclamation for Efficient Range
+- `reviewed` — **Harnessing Epoch-Based Reclamation for Efficient Range
   Queries**, Arbel-Raviv and Brown, PPoPP 2018.
   URL: `https://doi.org/10.1145/3178487.3178489`
   Why: CUBIT uses epoch/RCU-style reclamation ideas for bitmap snapshot
   versions; useful for retained-snapshot retirement, route metadata
   reclamation, and wait-free range/read paths under concurrent updates.
+  Journal entry added 2026-06-06 using the author PDF:
+  `https://www.cs.toronto.edu/~tabrown/ebrrq/paper.ppopp18.pdf`.
 - `queued` — **Designing Access Methods: The RUM Conjecture**,
   Athanassoulis et al., EDBT 2016.
   URL: `https://doi.org/10.5441/002/edbt.2016.42`
@@ -1258,6 +1260,18 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up from the same GPU multitasking line that models
   cross-kernel slowdown; relevant to route resource-class calibration and
   conservative GPU co-scheduling.
+- `queued` — **EEMARQ: Efficient Lock-Free Range Queries with Memory
+  Reclamation**, Arbel-Raviv and Brown, arXiv 2022.
+  URL: `https://arxiv.org/abs/2210.17086`
+  Why: modern follow-up to epoch-based range queries that explicitly combines
+  lock-free range queries and memory reclamation; useful for checking whether
+  retained route metadata can avoid blocking reclamation while preserving
+  linearizable/range-snapshot semantics.
+- `queued` — **VBR: Version Based Reclamation**, Sheffi et al., arXiv 2021.
+  URL: `https://arxiv.org/abs/2107.13843`
+  Why: optimistic memory reclamation scheme related to EBR/hazard-pointer
+  tradeoffs; useful for deciding whether route metadata and resident-index
+  descriptors can reclaim aggressively without global epoch stalls.
 - `queued` — **Predicting and reining in application-level slowdown on
   spatial multitasking GPUs**, Wei et al., JPDC 2020.
   URL: `https://doi.org/10.1016/j.jpdc.2020.03.009`
