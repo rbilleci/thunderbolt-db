@@ -59723,3 +59723,192 @@ benchmarks must include write-rate caps and cold-tier contention.
 - Add a planner experiment where "wait for resident," CPU fallback, promote,
   and reject are chosen from measured route pressure rather than static tier
   priority. Gate: lower p99 without stale reads or hidden queue growth.
+
+### 2026-06-05 - HTM is a primitive for tiny atomic publications, not a general index concurrency plan
+
+**Citation:** Darko Makreshanski, Justin Levandoski, and Ryan Stutsman.
+"To Lock, Swap, or Elide: On the Interplay of Hardware Transactional Memory
+and Lock-Free Indexing." PVLDB 8(11), 2015, pp. 1298-1309.
+doi:10.14778/2809974.2809990. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol8/p1298-makreshanski.pdf`.
+
+**Category:** Runtime / HFT / session scale, with concurrency-control and
+CPU index metadata relevance.
+
+**Relevance tags:** hardware transactional memory; lock elision; lock-free
+indexes; Bw-tree; multi-word CAS; route metadata publication; reader
+stability; epoch reclamation; hot-key contention; index update atomicity.
+
+**Core idea:** The paper asks whether commodity HTM can replace careful
+lock-free main-memory index design. Its answer is no for general B-tree
+concurrency, but yes for a narrow helper role. HTM lock elision scales well
+for small, fixed-width, predictable B-tree operations, then becomes fragile
+when key size, payload size, tree size, skew, false sharing, page faults, and
+retry policy interact. Under contention, update-in-place HTM aborts readers
+that touch hot cache lines, while copy-on-write lock-free indexes let readers
+continue on old versions.
+
+The transferable lesson is that HTM should be treated like a small atomic
+publication primitive, not like a blanket concurrency-control substrate. The
+authors show that using HTM as a multi-word compare-and-swap for tiny Bw-tree
+mapping-table updates can simplify multi-page structure modifications with
+roughly 10-15% overhead in the favorable designs, while avoiding most HTM
+capacity pathologies because each transaction touches only a few words.
+
+**Concrete mechanisms:**
+
+- The HTM baseline wraps each operation on a memory-optimized B-tree in a
+  global elided lock. Hardware executes the critical section speculatively
+  when cache-line conflicts and capacity limits permit, otherwise it falls
+  back to a real lock.
+- Haswell TSX tracks transactional read/write sets through cache structures.
+  The paper observes abort sensitivity to key size, payload size, index size,
+  address patterns, hyper-threading, false sharing, interrupts, context
+  switches, and page faults.
+- With larger variable-length keys and larger payloads, global elision can
+  collapse toward serialized execution or worse because aborted transactions
+  waste work and fallback lock acquisition aborts other speculative sections.
+- Increasing RTM retry count mitigates the high-skew cliff for small payloads,
+  but too many retries can make progress worse with larger payloads because
+  conflicting writers repeatedly abort each other.
+- The paper argues current TSX is incompatible with classic B-tree
+  lock-coupling because nested HTM transactions cannot overlap in the
+  non-two-phase way lock-coupling needs, and there is no instruction to remove
+  an old page lock or word from the transaction's tracked read set.
+- The lock-free comparison uses the Bw-tree. Bw-tree updates create delta
+  records and publish them through a single-word CAS on a mapping-table entry;
+  splits and deletes are decomposed into multiple atomic steps with
+  help-along protocols.
+- Copy-on-write publication gives lock-free readers pointer stability:
+  concurrent writers publish newer versions without modifying the old page
+  image that a reader may still be traversing.
+- Lock-free indexing pays for that reader stability with epoch reclamation,
+  mapping-table indirection, allocation pressure, and copy overhead. In the
+  paper's breakdown, epoch protection consumes measurable CPU time for both
+  lookups and updates.
+- The HTM-as-MW-CAS design allocates and prepares page data outside the
+  hardware transaction, then uses a tiny transaction to compare and update
+  multiple mapping-table words atomically.
+- Bracketing whole tree traversals inside HTM transactions performs poorly
+  because traversal logic and page searches enlarge the transactional read set.
+  Singleton mapping-table reads inside tiny transactions avoid capacity aborts
+  but add setup/teardown overhead.
+- A non-transactional-read variant removes read overhead but forfeits the
+  simplification unless readers can tolerate seeing partially installed
+  fallback writes. The safer infinite-retry variant lets singleton reads and
+  single-slot updates remain non-transactional while multi-slot updates use
+  HTM and retry on conflicts.
+- Because Intel does not guarantee HTM progress, the paper adds fallback
+  machinery: pre-fault target mapping-table words outside the transaction and,
+  when needed, use deterministic thread-local read/write locks to gain
+  exclusive access before applying the multi-word update non-transactionally.
+
+**GPU DB mapping:** GPU DB should not rely on HTM to protect large route
+execution, retained read traversals, MVCC validation, or CPU index operations
+whose footprint depends on key width, text payloads, or tree depth. Those are
+exactly the conditions where abort behavior becomes workload- and
+hardware-dependent. The runtime target should keep immutable snapshots,
+owner-domain rings, and explicit publication protocols as the primary
+concurrency model.
+
+The useful HTM shape is a tiny publication gate for CPU-side metadata:
+installing a new route-generation descriptor, swapping two or three resident
+snapshot pointers, publishing a split in a rebuildable CPU index, or atomically
+moving a table between cache-manager states when a single-word CAS is not
+expressive enough. The transaction should touch bounded metadata words only;
+all allocation, GPU buffer preparation, WAL work, checkpoint state, and
+visibility computation must happen before or after the tiny atomic section.
+
+The Bw-tree reader-stability contrast maps directly to retained read
+snapshots. Readers should not be aborted because a mutation owner, catalog
+owner, or residency owner publishes newer metadata. They should keep a stable
+descriptor until retirement, with epoch or reference tracking deciding when
+old descriptors and resident buffers can be reclaimed.
+
+The paper also warns that every lock-free or wait-free-looking publication
+choice has hidden costs: epoch tracking, indirection, allocator pressure, and
+copy overhead. For 1M logical sessions, route descriptors and response-ring
+metadata should reuse bounded descriptor pools and expose reclamation pressure;
+otherwise the cost merely moves from locks into memory management and cache
+misses.
+
+**Risks and mismatches:** The experiments are on 2015-era Haswell TSX, one
+machine, and B-tree index workloads. Modern CPUs may change abort behavior,
+but the core warning remains: HTM capacity, liveness, and page-fault behavior
+are not database invariants. The paper does not address GPU kernels, WAL,
+MVCC serializability, PostgreSQL protocol semantics, or multi-tier storage.
+
+Using HTM in GPU DB also risks non-portability. Some CPUs disable TSX or lack
+HTM entirely, and correctness must not depend on HTM success. Any HTM fast
+path needs a simple lock/CAS/owner-message fallback with identical visibility
+and recovery behavior. HTM should be benchmarked as an optional CPU metadata
+optimization, not as an architectural requirement.
+
+**Benchmark candidates:**
+
+- Prototype a tiny route-descriptor publication primitive with three variants:
+  owner-message serialization, single-word CAS descriptor swap, and optional
+  HTM multi-word publication with fallback. Gate: identical retained-read
+  visibility and no stale route after mutation, DDL, refresh, eviction, or
+  WAL replay.
+- Add a hot metadata contention benchmark: many sessions acquire retained
+  snapshots while catalog/residency owners publish new generations. Measure
+  reader aborts or retries, publication latency, epoch-retirement lag, cache
+  misses, and descriptor-pool pressure.
+- Stress variable-width keys and text metadata in CPU indexes. Failure
+  condition: an HTM-protected traversal improves only on fixed-width synthetic
+  keys and collapses with real text or large payload metadata.
+- Measure epoch/reference tracking overhead for retained snapshots and route
+  descriptors under 1K, 100K, and simulated 1M logical sessions with a bounded
+  active set.
+- Add an optional HTM capability probe in the benchmark harness only, with
+  fallback always enabled. Required metrics: abort reason, retry count,
+  fallback count, and whether p99 worsens under high skew.
+- Compare copy-on-write descriptor publication against update-in-place
+  metadata protected by a lock or HTM. Expected result: readers stay stable
+  with copy-on-write, while update-in-place paths require stronger blocking or
+  retry rules.
+
+### 2026-06-05 - Cross-paper synthesis: publish small, retire explicitly, place by pressure
+
+The last three reviews converge on boundary management. Ocean Vista turns
+visibility into batched watermarks, TMO turns placement into a pressure
+feedback loop, and To Lock, Swap, or Elide narrows HTM to tiny atomic
+publications. Together they argue that GPU DB should publish small immutable
+certificates and keep the expensive work outside the publication point.
+
+Converging design tracks:
+
+- Route certificates should separate durable visibility, resident visibility,
+  placement pressure, and metadata publication state. A reader should know
+  which boundary released it and why it chose GPU, CPU, wait, promote, or
+  reject.
+- Publication should be narrow: WAL and invalidation first, build or refresh
+  outside the critical section, then atomically publish a compact descriptor.
+  HTM may be tested for multi-word descriptor swaps, but owner messages and
+  CAS remain the correctness fallback.
+- Retained readers need stable copy-on-write descriptors plus explicit
+  epoch/reference retirement. Long readers must not force hot metadata,
+  tombstones, route descriptors, or old resident buffers to stay on fresh
+  write/read paths.
+- Tier movement should be driven by route pressure, not cache-hit rate alone:
+  cold I/O wait, refault latency, refresh wait, GPU queue wait, pinned-buffer
+  wait, and WAL wait should influence placement decisions.
+
+Category gaps: the queue is healthy on runtime, MVCC, and tiering, but still
+has direct HTAP engine-routing and checkpointed-index papers queued. The next
+best balancing choices are **Index Checkpoints for Instant Recovery in
+In-Memory Database Systems** for recovery/index frontiers, **Harmony** for
+heterogeneous HTAP placement, or **GalOP** for GPU OLTP execution lineage.
+
+Benchmark priorities:
+
+- A route-certificate trace format containing durable watermark, resident
+  watermark, descriptor generation, publication mechanism, pressure fields,
+  fallback reason, and retirement epoch.
+- A retained-snapshot publication benchmark that sweeps CAS, owner-message,
+  and optional HTM descriptor publication while many readers hold old
+  generations.
+- A pressure-aware placement benchmark that decides wait/promote/fallback from
+  measured stalls and verifies that p99 improves without hidden queue growth
+  or stale reads.

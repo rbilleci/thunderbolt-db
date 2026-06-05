@@ -741,7 +741,7 @@ Append new candidates here as each paper is processed.
   fast paths but still needs an efficient lock-free fallback; useful for
   evaluating whether route metadata updates should use HTM as an optional fast
   path while keeping descriptor-reuse fallback progress.
-- `queued` — **To Lock, Swap, or Elide: On the Interplay of Hardware
+- `reviewed` — **To Lock, Swap, or Elide: On the Interplay of Hardware
   Transactional Memory and Lock-Free Indexing**, Makreshanski, Levandoski, and
   Stutsman, PVLDB 2015.
   URL: `https://www.vldb.org/pvldb/vol8/p1298-makreshanski.pdf`
