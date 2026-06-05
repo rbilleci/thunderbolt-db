@@ -74455,3 +74455,166 @@ changes still need a small reactive tier and overload-safe fallback.
 - Test background region building under foreground OLTP/read pressure.
   Gate: low-priority refresh never consumes pinned buffers, GPU memory,
   or response-ring credits needed by latency-sensitive retained reads.
+
+### 2026-06-06 - Push and pull are route shapes, not engine religions
+
+**Citation:** Amir Shaikhha, Mohammad Dashti, and Christoph Koch.
+"Push vs. Pull-Based Loop Fusion in Query Engines." arXiv:1610.09166,
+2016; Journal of Functional Programming 28:e10, 2018.
+doi:10.1017/S0956796818000102. Retrieved 2026-06-06 from
+`https://arxiv.org/abs/1610.09166` and
+`https://arxiv.org/pdf/1610.09166`.
+
+**Category:** query optimization / planning, with runtime/code-shape
+relevance.
+
+**Relevance tags:** query compilation; push pipelines; pull iterators;
+stream fusion; loop fusion; code shape; branch prediction; limit;
+merge join; materialization; CPU fallback; route certificates.
+
+**Core idea:** The paper argues that push-based and pull-based query
+engines should be compared only after separating the control-flow
+model from code generation and inlining. Earlier claims that push
+engines dominate pull engines often compared compiled/inlined push
+code against non-inlined iterator code. In a shared query compiler
+with comparable specialization, neither push nor pull is a universal
+winner.
+
+The useful abstraction is that push and pull correspond to known loop
+fusion strategies. Push resembles fold fusion: data and control move
+forward and selections become simple skip/continue points. Pull
+resembles unfold fusion: downstream operators request the next tuple
+and can naturally stop early. The authors then propose a stream-fusion
+engine: coarse-grained pull, but each `stream()` call returns a
+`Step` value with `Yield`, `Skip`, or `Done`, giving the compiled code
+both early termination and cheap skipping after specialization.
+
+The evaluation is CPU/in-memory and analytical, not GPU. Still, it is
+valuable because it replaces a blanket "push is better" rule with a
+route-shape rule. Push tends to produce simpler control flow for
+filters; pull handles `LIMIT` and merge joins without forcing
+unwanted production or materialization; stream fusion tries to combine
+both when the compiler can remove the intermediate `Step` abstraction.
+
+**Concrete mechanisms:**
+
+- The paper models pull engines as iterator-style `next()` chains.
+  Inlining removes virtual calls, but selection in a pull pipeline can
+  introduce nested loops because the consumer waits until a satisfying
+  tuple is produced.
+- Push engines use producer/consumer `consume()` calls. Selections
+  become a local conditional or continue-like skip, giving simpler
+  control-flow graphs for filter-heavy pipelines.
+- Pure push has trouble with `LIMIT` because downstream operators
+  cannot naturally tell the source to stop. It also has trouble with
+  merge join because the join wants to control which sorted input
+  advances next; at least one side may need materialization or special
+  handling.
+- The loop-fusion mapping is explicit: pull engines map to unfold
+  fusion/iterator patterns; push engines map to fold fusion/visitor
+  patterns; stream fusion adds an explicit step algebra with `Yield`,
+  `Skip`, and `Done`.
+- The stream-fusion engine invokes `stream()` instead of `next()`.
+  `Skip` lets filters ignore the current tuple without nested
+  selection loops, while `Done` preserves pull-style early
+  termination.
+- Intermediate `Step` objects are dangerous if left as heap objects or
+  virtual calls. The implementation needs scalar replacement, escape
+  analysis, or a visitor encoding of `Step` so the generated code
+  collapses to local branches rather than allocations.
+- The authors implement the variants in DBLAB with shared
+  transformations: dead-code elimination, common subexpression/global
+  value numbering, partial evaluation, inlining, constant propagation,
+  and scalar replacement unless otherwise stated.
+- Microbenchmarks show push/visitor stream-fusion do well on filter
+  pipelines, pull does well for high-selectivity skipping and
+  stop-early cases, and push suffers on limit and merge-join cases
+  that force extra production or pipeline breaks.
+- In TPC-H SF8 experiments over an in-memory row store, overall
+  differences are usually modest when both engines are specialized
+  fairly. The paper reports notable pull advantages for queries using
+  `LIMIT` or merge join; it also reports that an inline-aware pull
+  selection implementation reduces query-processing code size and
+  improves TPC-H Q19 performance versus a naive pull implementation.
+- Leaving stream-fusion `Step` objects heap allocated is a severe
+  performance bug in the evaluated system. Removing those allocations
+  through visitor/scalar replacement is part of the mechanism, not an
+  optional cleanup.
+
+**GPU DB mapping:** GPU DB should not pick "push pipeline" or "pull
+iterator" as a global runtime identity. It should record execution
+shape as a route property. A retained GPU scan, a warm CPU fallback
+pipeline, a top-k route, a merge-like ordered route, and a batched
+lookup route may each want different control flow.
+
+For retained GPU routes, push-like fusion is attractive when a kernel
+streams resident columns through predicates and aggregates without
+materializing intermediate tuple-id lists. But pull-like stop control
+matters for bounded projections, `LIMIT`, top-k, ordered reads, and
+merge/intersection over sorted resident key vectors or bitmap/delta
+structures. A route certificate should include whether the selected
+shape is fused-push, pull/stop-early, stream-step, staged mask, or
+materialized-breaker.
+
+The `Yield`/`Skip`/`Done` model maps cleanly to CPU fallback and to
+GPU result-scattering contracts. A batch route can produce three
+classes of per-row or per-key outcome: yielded result, skipped by
+predicate/visibility, or finished/no more rows. That is also a useful
+debugging and correctness vocabulary for MVCC visibility filters,
+tenant predicates, and bounded result emission.
+
+The paper also warns against benchmark bias. If GPU DB compares a
+fully generated fused GPU route against a naive boxed CPU iterator,
+it will overstate GPU benefit. CPU fallback baselines for P8 should
+include compiled/vectorized and inline-aware shapes for the same
+predicate, limit, join, and output semantics before the planner
+claims a resident GPU route is better.
+
+Finally, `Step` allocation is a reminder for runtime route metadata.
+Route certificates, visibility decisions, predicate outcomes, and
+per-row tags are useful abstractions, but the hot path must compile or
+lower them into simple masks, branches, counters, or compact buffers.
+If every row allocates a route object or outcome wrapper, the
+abstraction has leaked into the performance path.
+
+**Risks and mismatches:** The evaluation is single-node CPU query
+compilation over an in-memory row store, mostly analytical
+workloads. It does not evaluate GPUs, CUDA launch overhead, warp
+divergence, HBM/coalescing, compressed resident segments, MVCC
+visibility, write concurrency, network sessions, or tiered storage.
+The stream-fusion engine depends on compiler optimizations that may
+not be available in Rust/CUDA in the same form.
+
+The paper's "no clear winner" conclusion is about fair CPU
+specialization. It should not be read as saying code shape is
+unimportant. The more precise takeaway is that code shape must be
+chosen per route and benchmarked under equal specialization. Push,
+pull, staged masks, bitmap deltas, vectorized CPU loops, and GPU
+kernels can all lose when used outside the pattern they fit.
+
+**Benchmark candidates:**
+
+- Add a route-shape benchmark for retained `int4` scans with filters,
+  bounded projection, `LIMIT`, and ordered key-vector reads. Compare
+  fused-push GPU, staged-mask GPU, stop-early CPU, and vectorized CPU
+  fallback under identical snapshot and output semantics.
+- Extend route certificates with `pipeline_shape` values such as
+  `fused_push`, `pull_stop_early`, `stream_step`, `staged_mask`, and
+  `pipeline_breaker`. Gate: planner decisions and benchmark output
+  expose why a shape was chosen.
+- Build a stop-early resident route for bounded ordered projection.
+  Failure condition: the route scans or launches work for the full
+  resident segment when the result limit can be satisfied from a small
+  ordered prefix/range.
+- Compare merge/intersection over resident sorted key vectors using a
+  pull-style two-cursor loop against a push-style materialized side
+  input. Measure bytes touched, allocations, p50/p99 latency, and
+  duplicate/missing-row correctness.
+- Add a CPU fallback fairness gate: every GPU route benchmark must
+  include an inline-aware generated/vectorized CPU route for the same
+  predicates and result shape. Failure condition: reported GPU win is
+  only against a naive interpreted/boxed iterator path.
+- Track hot-path abstraction leaks: per-row allocations, dynamic
+  dispatch counts, mask bytes, branch counts where available, and
+  materialized intermediate row ids. Gate: route metadata compiles
+  down to bounded buffers or scalar state in the measured path.

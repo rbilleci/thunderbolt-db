@@ -647,7 +647,7 @@ Append new candidates here as each paper is processed.
   Why: immediate predecessor to Fast Equi-Join that measures how older GPU
   join algorithms age across hardware generations; useful for separating
   hardware-refresh effects from algorithmic redesign in GPU DB benchmarks.
-- `queued` — **Push vs. Pull-Based Loop Fusion in Query Engines**, Shaikhha,
+- `reviewed` — **Push vs. Pull-Based Loop Fusion in Query Engines**, Shaikhha,
   Dashti, and Koch, arXiv 2016 / Journal of Functional Programming 2018.
   arXiv: `https://arxiv.org/abs/1610.09166`
   DOI: `https://doi.org/10.1017/S0956796818000102`
@@ -655,6 +655,18 @@ Append new candidates here as each paper is processed.
   push and pull pipelining under fair query-compilation conditions and may help
   decide whether GPU DB's CPU fallback and retained routes should use push,
   pull, or stream-fusion-like generated pipelines.
+- `queued` — **How to Architect a Query Compiler**, Shaikhha et al.,
+  SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915244`
+  Why: implementation context for DBLAB-style query compiler architecture used
+  by the push/pull paper; useful for lowering route certificates into
+  specialized CPU fallback and generated retained-route code without leaking
+  abstractions into hot loops.
+- `queued` — **Fast Queries over Heterogeneous Data Through Engine
+  Customization**, Karpathiotakis, Alagiannis, and Ailamaki, PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p972-karpathiotakis.pdf`
+  Why: cited as modern engine customization work; relevant to CPU/GPU route
+  specialization when data lives in heterogeneous formats and tiers.
 - `reviewed` — **Rethinking SIMD Vectorization for In-Memory Databases**,
   Polychroniou and Ross, SIGMOD 2015.
   URL: `https://doi.org/10.1145/2723372.2747645`
