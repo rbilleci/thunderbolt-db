@@ -62938,3 +62938,155 @@ shape, not the absolute speedup.
   support, null behavior, output format, and fallback reason. Proof
   gate: accelerated and owner-routed CPU results match on adversarial
   cast/null/text-prefix cases.
+
+### 2026-06-05 - Page As You Go makes columnar residency page-granular without abandoning vectorized execution
+
+**Citation:** Reza Sherkat, Colin Florendo, Mihnea Andrei, Anil K.
+Goel, Anisoara Nica, Peter Bumbulis, Ivan Schreter, Gunter Radestock,
+Christian Bensberg, Daniel Booss, and Heiko Gerwens. "Page As You Go:
+Piecewise Columnar Access In SAP HANA." SIGMOD 2016, pp. 1295-1306.
+doi:10.1145/2882903.2903729. Retrieved 2026-06-05 from the ACM DOI
+metadata and an accessible PDF mirror,
+`https://static.aminer.org/pdf/20170130/pdfs/sigmod/k80ohehfxxsdwgn4ftyl6crp2ita35uq.pdf`.
+
+**Category:** multi-tier cache / data placement and hybrid HTAP.
+
+**Relevance tags:** page-loadable columns; warm/cold columnar storage;
+data aging; dictionary encoding; paged inverted indexes; memory manager;
+buffer-cache policy; vectorized scans; column lifecycle; delta/main merge.
+
+**Core idea:** SAP HANA's normal in-memory column store keeps a column
+fragment's data vector, dictionary, and optional inverted index fully
+resident during access. Page As You Go lowers the residency unit from an
+entire column to pages inside each columnar data structure while preserving
+the logical behavior of ordinary SQL columns and the vectorized operators
+above them. The intended use case is aged or cold data that must remain
+queryable in the same database and table, but should not force full-column
+loads or evict hot operational data.
+
+The paper's transferable idea is that a warm column is not just "a cold
+file behind a cache." The encoded value vector, order-preserving string
+dictionary, helper dictionaries, and inverted index each need their own
+page layout, iterator contract, pinning rule, and eviction policy. HANA
+then uses a memory manager with reactive and proactive unload thresholds
+for page-loadable resources, so cold-data pages can be admitted and evicted
+separately from fully resident hot structures.
+
+**Concrete mechanisms:**
+
+- A page-loadable column remains logically a normal column. The loading
+  behavior is chosen at creation time; ordinary SQL access paths continue to
+  operate through the column-store engine.
+- HANA's column fragments have a read-optimized main fragment and a
+  write-optimized delta fragment. Inserts and updates go to the delta; delta
+  merge builds a new main fragment. Page-loadable structures are applied to
+  the main fragment, not to the write-optimized delta.
+- The paged data vector stores dictionary value identifiers using uniform
+  n-bit compression, split into chunks of 64 identifiers. Uniform chunking
+  lets an iterator map a row-position range to logical pages and load only
+  the needed pages.
+- Data-vector iterators expose point decode, range decode, and search
+  operations. They pin the current page while reading a chunk and release it
+  before repositioning to another page, preventing resource-manager eviction
+  while a page is in active use.
+- The paged string dictionary keeps a sparse value-id directory and a sparse
+  value-separator directory resident or cheaply loadable, then loads only
+  target dictionary pages. Strings are prefix encoded in blocks; large
+  strings can have off-page pieces referenced by logical pointers.
+- Dictionary iterators use a handle cache so repeated lookups into the same
+  dictionary pages during one iterator lifetime do not reload pages and so
+  those pages remain pinned while needed.
+- The paged inverted index stores a directory of posting-list offsets and a
+  posting list of row positions in a chain of index pages. Unique indexes can
+  omit the directory because the posting list is effectively identity-like.
+- Inverted-index iterators load at most the directory and posting-list pages
+  needed to return row positions for a value identifier, keeping memory use
+  proportional to the pages touched by the query rather than to the full
+  index.
+- Data aging moves rows from hot to cold partitions through ordinary DML on
+  an artificial temperature column. The cold partition can use page-loadable
+  columns, and the move eventually reaches the page-loadable main fragment
+  through asynchronous delta merge.
+- The memory manager registers fully resident structures as one logical
+  resource but registers each page-loadable page as its own resource. It uses
+  weighted LRU for general low-memory unloading, plus lower and upper limits
+  for paged-attribute resources. Above the upper limit, proactive unload
+  evicts paged resources down toward the lower limit even if the system is
+  not yet globally low on memory.
+- Evaluation on a 100M-row, 128-column ERP-like table reports large memory
+  reductions for selective cold access. Single numeric point reads over paged
+  data vectors reduced memory from about 8.2 GB to 3.6 GB with average
+  runtime ratio about 1.07 versus fully loaded columns. Full-column loads are
+  expensive; one reported comparison is 43.5 s for a full column load versus
+  9.6 s for loading a page-loadable piece.
+- The expensive case is first access to paged dictionaries or indexes under
+  random workloads: cold page faults can create large latency spikes, and
+  dictionary search showed severe early slowdowns until helper and target
+  pages were loaded. The design relies on memory budget, helper indexes, and
+  cached page handles to keep this bounded.
+
+**GPU DB mapping:** Page As You Go is directly relevant to P8's question of
+whether "resident" should mean table, segment, column group, dictionary,
+key vector, or smaller page. A GPU resident snapshot can keep the hot route
+as fully materialized device buffers, but a warm route should be allowed to
+load only the column-vector pages, dictionary pages, changed-row overlays,
+or resident-index pages required by a prepared query shape.
+
+The iterator contract maps well to GPU DB route certificates. A retained
+read route should name the specific resident or warm pages it needs, pin
+them for the lifetime of the route or micro-batch, and expose whether a page
+fault, CPU decode, GPU transfer, or dictionary lookup happened. That gives
+the scheduler a clearer admission signal than a binary "table resident" flag.
+
+The separation between data vector, dictionary, and inverted index is a good
+warning for `int4`/`text` P8 layouts. Text-prefix routes may be bottlenecked
+by dictionary residency rather than by the data vector. Equality routes may
+need warm resident index/posting pages while scans need data-vector pages.
+The planner should cost these pieces separately instead of treating a column
+as one cache object.
+
+The delta/main split also matches the GPU DB main-plus-delta direction from
+Hermes. Writes should enter CPU row/MVCC or hot delta structures first.
+Warm or GPU-resident main pages should be rebuilt, merged, invalidated, or
+augmented later under explicit publication boundaries. That keeps
+WAL-before-visibility and OLTP write latency out of the cold-page rebuild
+path.
+
+The resource-manager limits provide a concrete cache-manager surface for
+GPU DB: separate budgets for GPU HBM resident buffers, pinned host staging,
+host warm column/dictionary/index pages, and cold NVMe pages; proactive
+eviction within the warm pool; and reactive eviction only under broader
+memory pressure. The runtime should report page-loadable misses separately
+from GPU queue wait and kernel time.
+
+**Risks and mismatches:** Page As You Go is CPU/SAP HANA work, not a GPU
+execution paper. It does not evaluate CUDA transfers, device memory
+fragmentation, pinned host buffers, GPUDirect Storage, or million-session
+admission. The paper assumes the column main fragment is read optimized and
+rebuilt by delta merge; GPU DB must preserve WAL, MVCC, snapshot, and
+resident invalidation semantics across a different storage engine. Cold
+dictionary and inverted-index first access can create large latency spikes,
+so page granularity alone is not enough without prefetch, admission, and
+explicit fallback. The reported data-aging use case optimizes low-frequency
+cold access, not sustained high-throughput retained GPU scans.
+
+**Benchmark candidates:**
+
+- Prototype cache metadata below table/segment granularity: data-vector page,
+  dictionary page, posting/index page, and changed-row overlay. Gate: route
+  telemetry identifies exactly which piece caused a fallback or wait.
+- Add a page-loadable text-prefix benchmark for one `text` column. Compare
+  fully resident dictionary, warm paged dictionary with helper index, and CPU
+  fallback under random prefix probes and repeated hot prefixes.
+- Add a warm-column point lookup benchmark with `int4` key and `text` payload:
+  measure first-touch p50/p99, warmed p50/p99, memory footprint, and number
+  of pages pinned per request.
+- Test micro-batch pinning: group same-shape retained reads by warm page set
+  and keep page handles pinned for the batch. Failure condition: page churn
+  dominates latency or pinned pages exceed the configured budget.
+- Extend cache-manager policy experiments with lower/upper warm-tier limits.
+  Measure proactive eviction effects on hot GPU routes versus cold
+  audit-style reads.
+- Add route-certificate fields for required dictionary/index/vector pages and
+  enforce that a page cannot be evicted while a retained read or GPU transfer
+  still holds it.

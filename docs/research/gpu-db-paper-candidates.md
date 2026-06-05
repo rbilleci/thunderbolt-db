@@ -590,14 +590,16 @@ Append new candidates here as each paper is processed.
   Why: HANA NSE contrasts SQL Server's columnstore-on-OLTP approach; useful for
   comparing dual-store maintenance, operational analytics freshness, and write
   overhead against GPU DB resident snapshots.
-- `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using
+- `reviewed` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using
   both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2882925`
   Why: HANA NSE cites Data Blocks as a hybrid compressed-storage approach;
   useful for CPU/GPU shared compressed segments and fused vectorized execution.
-- `queued` — **Page As You Go: Piecewise Columnar Access in SAP HANA**,
+  Journal entry exists from 2026-06-04; this stale duplicate was marked
+  reviewed on 2026-06-05.
+- `reviewed` — **Page As You Go: Piecewise Columnar Access in SAP HANA**,
   Sherkat et al., SIGMOD 2016.
-  URL: `https://doi.org/10.1145/2882903.2882906`
+  URL: `https://doi.org/10.1145/2882903.2903729`
   Why: direct predecessor to HANA NSE's pageable column design; useful if the
   GPU DB needs more detail on piecewise dictionary/vector access and prefetch.
 - `queued` — **HorseQC: A GPU-accelerated Query Compiler for Query Processing**,
@@ -2458,12 +2460,13 @@ Append new candidates here as each paper is processed.
   Why: modern enough follow-up in the anti-caching line; useful contrast for
   tuple-granular cold movement versus LeanStore-style page/index-transparent
   placement.
-- `queued` — **Page As You Go: Piecewise Columnar Access In SAP HANA**,
+- `reviewed` — **Page As You Go: Piecewise Columnar Access In SAP HANA**,
   Sherkat et al., SIGMOD 2016.
-  URL: `https://doi.org/10.1145/2882903.2903734`
+  URL: `https://doi.org/10.1145/2882903.2903729`
   Why: production columnar cold-block access design cited by LeanStore; useful
   for deciding whether GPU DB should page full resident segments, column
-  groups, or smaller compressed blocks.
+  groups, or smaller compressed blocks. Journal entry exists from 2026-06-05;
+  this stale duplicate was marked reviewed on 2026-06-05.
 - `reviewed` — **TPP: Transparent Page Placement for CXL-Enabled Tiered-Memory**,
   Al Maruf et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3582016.3582063`
@@ -3795,12 +3798,14 @@ Append new candidates here as each paper is processed.
   Why: FastLanes explicitly targets in-flight compressed vectors used by
   engines such as Velox; useful for comparing vector representation,
   operator reuse, and CPU/GPU route compatibility for compressed execution.
-- `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage Using
+- `reviewed` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage Using
   Both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2882925`
   Why: FastLanes cites it as compressed execution context; useful for deciding
   whether GPU DB should keep one compressed storage representation that serves
-  OLTP lookups, retained scans, and compiled/vectorized operators.
+  OLTP lookups, retained scans, and compiled/vectorized operators. Journal
+  entry exists from 2026-06-04; this stale duplicate was marked reviewed on
+  2026-06-05.
 - `queued` — **ByteSlice: Pushing the Envelope of Main Memory Data Processing
   with a New Storage Layout**, Feng et al., SIGMOD 2015.
   URL: `https://doi.org/10.1145/2723372.2747642`
@@ -4922,6 +4927,13 @@ Append new candidates here as each paper is processed.
   whether GPU DB route metadata, resident indexes, and queued intentions should
   expose data-structure-specific transaction hooks instead of generic tuple
   read/write validation only.
+- `queued` — **DB2 with BLU Acceleration: So Much More Than Just a Column
+  Store**, Raman et al., ICDE 2015.
+  URL: `https://doi.org/10.1109/ICDE.2015.7113303`
+  Why: Page As You Go contrasts HANA page-loadable columns with DB2 BLU's
+  page-backed compressed column groups and scan prefetch; useful for comparing
+  warm-tier page/cache policy and columnar metadata placement before picking a
+  GPU DB warm-column format.
 - `reviewed` — **Improving Optimistic Concurrency Control through Transaction
   Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
   URL: `https://doi.org/10.14778/3282495.3282502`
