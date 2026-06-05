@@ -4086,11 +4086,24 @@ Append new candidates here as each paper is processed.
   useful for comparing simple CXL memory expansion with DBMS-owned storage
   functions, logging, and cold-tier pushdown. Marked reviewed because the
   same paper already has a journal entry from the earlier queued copy.
-- `queued` — **NeoMem: Hardware/Software Co-Design for CXL-Native Memory
+- `reviewed` — **NeoMem: Hardware/Software Co-Design for CXL-Native Memory
   Tiering**, Zhong et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2403.18702`
   Why: CXL-native tiering design; useful for contrasting OS/hardware-managed
   placement with GPU DB's explicit object-family placement and route telemetry.
+- `queued` — **MEMTIS: Efficient Memory Tiering with Dynamic Page
+  Classification and Page Size Determination**, Lee et al., SOSP 2023.
+  URL:
+  `https://cosmoss-jigu.github.io/pages/pubs/memtis-lee-sosp23.pdf`
+  Why: NeoMem compares against Memtis as a distribution-aware software tiering
+  baseline; useful for separating hardware-side access telemetry from
+  application-visible page-size and hot-set classification policy.
+- `queued` — **Lightweight Frequency-Based Tiering for CXL Memory Systems**,
+  Liu et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2312.04789`
+  Why: NeoMem frames frequency-sensitive page promotion as the central CXL
+  tiering challenge; useful for comparing software frequency estimation with
+  device-side hot-page telemetry before relying on OS-transparent placement.
 - `reviewed` — **Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its
   Reliability on High Latency Memory**, Mahling, Weisgut, and Rabl, DaMoN 2025.
   URL: `https://doi.org/10.1145/3736227.3736231`

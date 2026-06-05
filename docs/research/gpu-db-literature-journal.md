@@ -52248,3 +52248,151 @@ before paying vector-clock or per-key distributed metadata costs.
   boundaries for future partition owners. Use the scalar form as the baseline
   and only keep vector-style metadata if it catches real cross-owner ordering
   anomalies that scalar generations miss.
+
+### 2026-06-05 - NeoMem: Hardware/Software Co-Design for CXL-Native Memory Tiering
+
+**Citation:** Zhe Zhou, Yiqi Chen, Tao Zhang, Yang Wang, Ran Shu,
+Shuotao Xu, Peng Cheng, Lei Qu, Yongqiang Xiong, Jie Zhang, and
+Guangyu Sun. "NeoMem: Hardware/Software Co-Design for CXL-Native
+Memory Tiering." arXiv:2403.18702v2, 2024. Retrieved 2026-06-05 from
+`https://arxiv.org/abs/2403.18702`.
+
+**Category:** multi-tier cache / data placement; future memory-tier
+telemetry; runtime admission.
+
+**Relevance tags:** CXL memory; device-side profiling; hot-page
+promotion; Count-Min Sketch; page migration; bandwidth telemetry;
+read/write ratio; ping-pong control; future tiers.
+
+**Core idea:** NeoMem argues that CXL memory tiering is limited less by
+the mechanics of page migration than by low-quality visibility into which
+slow-tier pages are actually worth promoting. Existing OS-visible methods
+such as PTE scanning, hint faults, and PMU sampling either see too little,
+see the wrong level of the hierarchy, or cost too much CPU time at the
+resolution needed for timely promotion.
+
+The paper moves profiling into the CXL memory device controller. Its
+NeoProf unit observes CXL-side memory requests, tracks true LLC-miss
+accesses to 4 KiB pages, and exports hot-page and runtime state to a
+Linux tiering daemon. On an FPGA-based CXL memory platform, the reported
+geomean speedup is 32% over a PEBS-based tiering baseline and 67% over
+first-touch NUMA placement, with especially large gains on skewed
+workloads whose hot sets can fit in the fast tier.
+
+**Concrete mechanisms:**
+
+- NeoProf sits in the CXL device-side controller and snoops memory
+  requests before they reach the device memory controller, avoiding
+  CPU-side hardware changes.
+- The profiler tracks accesses at 4 KiB page granularity and focuses on
+  true LLC misses rather than TLB-level events, since cached hot pages do
+  not need promotion.
+- Hot-page detection is implemented as a Count-Min Sketch with two lanes
+  in the prototype. Each sketch entry carries a counter, valid bit, and
+  hot bit.
+- The hot bit acts as a lightweight duplicate filter so one page that
+  crosses the hotness threshold does not repeatedly fill the hot-page
+  buffer during the same detection period.
+- NeoProf includes a histogram unit over sketch counters. The host uses
+  the histogram to estimate both access-frequency distribution and a
+  practical error bound for sketch saturation.
+- The host controls NeoProf through MMIO commands to reset profiling
+  state, set a hotness threshold, read hot-page addresses, read sampled
+  read/write counts, and retrieve histogram bins.
+- NeoMem's daemon dynamically adjusts the hotness percentile rather than
+  relying on a fixed threshold. It uses access-frequency distribution,
+  CXL bandwidth utilization, ping-pong severity, sketch error bound, and
+  a migration quota.
+- The default policy migrates every 10 ms, updates the threshold every
+  second, limits migration to 256 MB/s, and clears NeoProf counters every
+  5 seconds in the reported configuration.
+- Page promotion still uses Linux page-migration machinery, so the design
+  is hardware-assisted telemetry plus OS policy rather than a purely
+  hardware-managed cache.
+- The prototype reports about 0.021% slowdown from host interaction with
+  NeoProf when profiling overhead is isolated on GUPS.
+- The hardware implementation on the FPGA consumes about 10% ALMs and 12%
+  BRAMs; the paper also estimates a 22 nm ASIC implementation at about
+  5.3 mm2 and 152.2 mW for W=256K, D=2 sketch parameters.
+
+**GPU DB mapping:** NeoMem is a useful future-tier warning for GPU DB:
+transparent page placement can be helpful, but the planner and runtime
+need access telemetry at the object shape they route. A page may be hot
+because of MVCC headers, route metadata, a CPU fallback index leaf,
+encoded text bytes, resident snapshot descriptors, or column payload.
+Promoting all of those with one OS-visible page policy can improve
+average memory latency while still hiding the reason a route became fast
+or slow.
+
+For P8, the transferable design is not to wait for CXL devices before
+building tier telemetry. Each resident or host-side object family should
+have a NeoProf-like stream of placement facts: access count, miss count,
+read/write mix, bytes touched, promotion cost, demotion count, and
+ping-pong events. The GPU cache manager can then decide whether a hot
+CPU segment should be copied to HBM, kept in DRAM, moved to future CXL
+memory, or left cold on NVMe. If future CXL hardware exposes device-side
+profiling, those counters become another input to the same policy rather
+than an opaque OS event.
+
+For runtime admission, NeoMem's dynamic threshold is directly relevant.
+GPU DB should not use a fixed "promote after N reads" rule for resident
+snapshots or CPU metadata. The threshold should move with HBM pressure,
+host memory pressure, CXL or NVMe bandwidth, write invalidation rate, and
+ping-pong count. A hot segment that is repeatedly invalidated by writes
+may deserve delayed admission even if its read count is high.
+
+For 1M logical sessions, the paper reinforces that placement telemetry
+must be low overhead and off the hot request path. Per-session reads
+cannot update global LRU state or page counters synchronously. Instead,
+GPU DB should favor sampled, sharded, owner-owned, or device-side
+telemetry streams and make promotion decisions in background lanes with
+explicit migration quotas.
+
+**Risks and mismatches:** NeoMem is an OS and architecture paper, not a
+database storage engine. It does not address WAL-before-visibility, MVCC
+snapshot correctness, SQL route planning, GPU execution, pinned-buffer
+budgets, or crash recovery. It moves 4 KiB and huge pages, while GPU DB's
+natural placement units may be column chunks, text byte buffers, index
+levels, route metadata cells, or immutable resident generations.
+
+The evaluation uses an FPGA-based CXL 1.1 memory prototype with higher
+latency than some emulated assumptions. That is valuable because it uses
+real hardware, but the absolute numbers may not transfer to future CXL,
+Grace-class, NUMA, or GPU-attached memory systems. The paper also leaves
+multi-device interleaving, virtualized deployments, and fragmented
+hotness aggregation as future work. Those are precisely the hard cases for
+a multi-tenant database.
+
+A second mismatch is control. NeoMem is transparent to applications.
+GPU DB often should not be transparent: planner route choice, resident
+snapshot freshness, write invalidation, and query admission need
+database-visible explanations. CXL-native telemetry should augment the
+DBMS placement model, not replace it with hidden page migration.
+
+**Benchmark candidates:**
+
+- Add a tier-telemetry simulator for CPU DRAM versus future CXL memory:
+  track per-object access count, miss-like delay, read/write mix,
+  promotion cost, demotion count, and ping-pong events. Gate: placement
+  choices are explainable per route and reduce p95 without increasing
+  write invalidation cost.
+- Compare fixed and dynamic promotion thresholds for resident GPU
+  snapshots. Inputs: read count, HBM pressure, invalidation rate, refresh
+  cost, queue wait, and host-tier bandwidth. Failure condition: a fixed
+  threshold admits write-hot data that repeatedly refreshes or evicts.
+- Build a migration-quota benchmark for cold-to-warm host segments.
+  Sweep 64, 128, 256, 512, and 1024 MB/s equivalent promotion budgets and
+  measure read latency, mutation publication delay, and refresh backlog.
+- Add ping-pong telemetry to the cache manager state machine. A table or
+  segment that is repeatedly admitted, invalidated, and evicted should be
+  demoted from automatic admission until its read/write phase changes.
+- Test object-shaped placement against page-shaped placement: whole table
+  pages, column chunks, index upper levels, index leaves, MVCC visibility
+  summaries, and route metadata cells. Proof gate: the policy can explain
+  which object family should occupy fast memory under mixed OLTP/HTAP
+  pressure.
+- If CXL hardware becomes available, run a NeoMem-style microbenchmark
+  against route metadata, CPU fallback indexes, and retained-snapshot host
+  buffers. Required metrics: CXL access latency, bandwidth utilization,
+  migration count, perf-counter misses, p99 route latency, and write-path
+  interference.
