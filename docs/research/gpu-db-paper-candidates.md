@@ -4341,12 +4341,20 @@ Append new candidates here as each paper is processed.
   Why: HybridTier omits end-to-end comparison because source was unavailable at
   submission; MTM is a modern multi-tier profiling/migration baseline for
   comparing DB-owned placement against application-transparent page movement.
-- `queued` — **FlexMem: Adaptive Page Profiling and Migration for Tiered
+- `reviewed` — **FlexMem: Adaptive Page Profiling and Migration for Tiered
   Memory**, Xu et al., USENIX ATC 2024.
   URL: `https://www.usenix.org/conference/atc24/presentation/xu-dong`
   Why: HybridTier cites FlexMem as a contemporary frequency-based tiering
   system; useful for comparing adaptive profiling overhead with GPU DB's
   route-object heat telemetry.
+- `queued` — **UniMem: Redesigning Disaggregated Memory within A Unified
+  Local-Remote Memory Hierarchy**, Zhong et al., USENIX ATC 2024.
+  URL: `https://www.usenix.org/conference/atc24/presentation/zhong`
+  PDF: `https://www.usenix.org/system/files/atc24-zhong.pdf`
+  Why: FlexMem contrasts demand-triggered page demotion with systems that
+  demote when a promotion is about to fail; UniMem is a modern disaggregated
+  memory design for comparing hotness, fragmentation, and critical-path
+  migration against GPU DB's explicit route-owned tier placement.
 - `queued` — **Tiered Memory Management: Access Latency is the Key!**,
   Vuppalapati and Agarwal, SOSP 2024.
   URL: `https://doi.org/10.1145/3694715.3695964`

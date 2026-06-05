@@ -57632,3 +57632,198 @@ rules.
   the GPU write/read route. Proof gate: cold rows remain correct through
   CPU fallback, and hot resident subsets invalidate before stale reads
   or writes can use them.
+
+### 2026-06-05 - FlexMem adapts tier migration to emerging hot pages and promotion failures
+
+**Citation:** Dong Xu, Junhee Ryu, Jinho Baek, Kwangsik Shin,
+Pengfei Su, and Dong Li. "FlexMem: Adaptive Page Profiling and
+Migration for Tiered Memory." USENIX ATC 2024, pp. 817-833.
+Retrieved 2026-06-05 from the USENIX page and PDF,
+`https://www.usenix.org/conference/atc24/presentation/xu-dong`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** tiered memory; CXL/far memory; page placement;
+hotness profiling; promotion/demotion; warm pages; fast-memory budget;
+route heat telemetry; migration overhead.
+
+**Core idea:** FlexMem argues that tiered-memory performance is lost
+not only by choosing the wrong hotness signal, but by coordinating
+promotion and demotion poorly. Fault-based profiling can find newly hot
+pages quickly but produces false positives. Performance-counter/PEBS
+profiling is more accurate after enough samples but reacts slowly when
+access patterns shift. Fixed demotion policies then make the problem
+worse: they either leave too little free fast memory for real hot pages
+or demote pages that are about to become hot.
+
+FlexMem combines both profilers and ties movement decisions to feedback.
+It synchronizes page promotion at a common migration point, gives
+fault-discovered and histogram-discovered hot pages equal chances to
+enter fast memory, adjusts demotion rate from observed promotion
+failures, and expands the warm-page range when pages in lower hotness
+bins are moving upward. On six memory-intensive workloads, including
+Silo and a B-tree lookup benchmark, the paper reports average
+performance improvements of 32%, 23%, and 27% over Tiering-0.8, TPP,
+and MEMTIS respectively.
+
+**Concrete mechanisms:**
+
+- FlexMem keeps a PEBS-style performance-counter profiler that samples
+  memory accesses, updates an exponential moving average per page, and
+  places pages into a 16-bin hotness histogram.
+- The hot threshold is recomputed when the migration worker runs, not on
+  a stale independent interval. This couples threshold adaptation with
+  actual migration.
+- Histogram bins store page addresses, split by fast-memory and
+  slow-memory residency, so the migration worker can find pages to move
+  without a separate promotion list.
+- FlexMem also keeps a NUMA-hinting-fault profiler. A page discovered by
+  the fault path is moved to the active list, but immediate promotion is
+  suspended until the shared migration worker runs.
+- At migration time, pages from the active list and hot histogram bins
+  are selected in round-robin fashion when fast memory cannot hold every
+  candidate, giving both profilers equal opportunity.
+- Fault-discovered pages that still look cold in the PEBS histogram get
+  a countdown timer. They are protected from immediate demotion for a few
+  intervals so truly emerging hot pages can accumulate enough samples;
+  false positives are demoted after the timer expires.
+- Demotion is handled by the performance-counter side only, because the
+  histogram is the more reliable signal for coldness.
+- Adaptive demotion computes a demotion rate from cold pages currently in
+  fast memory, failed promotions from the histogram, failed promotions
+  from the fault profiler, and an `alpha` term that reflects how many
+  recently promoted fault-discovered pages turned out to be mistakes.
+- Adaptive warm bins replace MEMTIS's single warm bin. A colder bin is
+  treated as warm when enough pages in that bin recently shifted upward
+  toward hotness; warm pages are spared from demotion unless pressure
+  requires it.
+- The implementation modifies Linux 5.15 and extends MEMTIS. It records
+  page-frame numbers in histogram bins, promotion failures, bin movement,
+  and demotion statistics. The paper reports at most 0.19% memory
+  overhead for page lists and less than 1% runtime overhead for histogram
+  maintenance in the evaluated setup.
+- Evaluation uses one socket of a dual-socket Xeon Gold 6252 machine,
+  DDR4 DRAM as the fast tier, Optane DCPMM as the slow tier, 30 GB fast
+  memory limit, and workloads FT, LU, SP, Graph500, Btree, and Silo.
+
+**GPU DB mapping:** FlexMem is a warning against treating future CXL,
+far memory, host DRAM, or even GPU HBM residency as a simple LRU or
+hotness-threshold problem. Promotion and demotion need to be linked to
+route demand. A page or segment that is warming because many retained
+lookups, snapshot scans, or refresh jobs are about to use it should not
+be evicted merely because the last long-window counter still calls it
+cold.
+
+For GPU DB, the page is probably the wrong permanent unit, but the
+control loop transfers well. P8 resident objects should have both
+long-window heat and short-window emergence signals: route hits, queued
+compatible requests, failed resident admissions, CPU fallback caused by
+missing residency, refresh requests, and maybe hardware counters for
+host/future-tier memory. Promotion should be driven by a shared
+residency owner, not by independent fast paths that move data without a
+single budget view.
+
+FlexMem's adaptive demotion maps to a concrete cache-manager policy:
+demote enough cold resident segments to satisfy observed failed
+promotions, but scale speculative promotions down when recently promoted
+objects did not become route-hot. The `alpha` idea can become a
+route-object confidence score: if speculative warmups repeatedly lead to
+resident-route hits, keep making room for them; if they age out unused,
+reduce their demotion pressure on current residents.
+
+The warm-bin mechanism is also relevant to retained snapshots. A segment
+whose accesses are climbing should be protected from eviction even before
+it crosses the official hot threshold, especially if evicting it would
+cause repeated CPU fallback or cold transfer. This argues for telemetry
+that records not only resident hit count, but movement between heat
+classes and the cost of mistakenly demoting a route object.
+
+**Risks and mismatches:** FlexMem is transparent OS page management, not
+a DBMS cache manager. Its decisions use 4 KiB page movement in CPU
+memory tiers, while GPU DB moves relation segments, column buffers,
+resident indexes, pinned host buffers, WAL/checkpoint state, and device
+allocations with stronger correctness metadata. Transparent page
+migration also cannot know SQL snapshot boundaries, invalidation
+frontiers, WAL-before-visibility, or route-shape compatibility.
+
+The evaluated slow tier is Optane DCPMM, not CXL memory, NVMe, or GPU
+memory. PEBS and NUMA hint faults observe CPU memory behavior; they do
+not directly capture device-side HBM pressure, CUDA stream contention,
+or GPUDirect/NVMe transfer queues. The paper evaluates memory-intensive
+benchmarks rather than full mixed OLTP/HTAP service workloads, and the
+best policy may change when SQL tail latency, admission control, and
+query freshness matter more than average runtime.
+
+Finally, FlexMem's transparency is a double-edged sword. It improves
+applications without modification, but GPU DB should not let opaque page
+migration move route-critical metadata on the p99 path unless the route
+can observe and bound the migration cost.
+
+**Benchmark candidates:**
+
+- Add residency telemetry for heat movement, not only hit count:
+  cold-to-warm, warm-to-hot, hot-to-warm, failed resident admission,
+  fallback due to missing residency, and unused speculative warmup.
+  Gate: every eviction or promotion decision names the signal that drove
+  it.
+- Prototype adaptive demotion in `RelationalResidentCache`: demote enough
+  cold resident segments to cover observed failed promotions, and scale
+  speculative warmup pressure by the fraction of recent warmups that
+  became route hits. Failure condition: speculative warmups evict stable
+  hot residents without later producing resident-route hits.
+- Build a phase-shifting workload where the hot key range moves across
+  resident segments. Compare LRU, fixed hotness threshold, and
+  FlexMem-style heat-momentum protection. Metrics: p95/p99 query
+  latency, resident hit ratio, H2D bytes, refresh bytes, and eviction
+  churn.
+- Add a warm-segment protection experiment for retained snapshots: hold a
+  workload whose access count is rising but still below the hot threshold
+  and test whether early demotion causes repeated CPU fallback or cold
+  transfer.
+- For future CXL/far-memory hosts, measure whether OS-transparent page
+  migration of CPU indexes or route metadata creates p99 spikes. Proof
+  gate: route telemetry can attribute latency to page migration or tier
+  miss instead of hiding it in generic CPU time.
+- Compare DB-owned segment promotion with OS-owned page placement for a
+  CPU-primary/GPU-secondary table larger than HBM. Expected result:
+  DB-owned placement should produce fewer stale or wrong-route decisions
+  because it sees snapshot and invalidation metadata.
+
+### 2026-06-05 - Cross-paper synthesis: accelerator routes need adaptive tier confidence
+
+The last three papers sharpen one shared design track. REEF says urgent
+GPU work needs a side-effect and restart contract before background work
+can be safely displaced or padded around it. GaccO says GPU transaction
+throughput depends on admitting only compatible, high-volume shapes while
+CPU/WAL truth keeps publication authority. FlexMem says tier placement
+must adapt to emerging heat and failed promotions, not only to stale
+long-window hotness.
+
+The converging route certificate is now broader than `can execute on GPU`.
+It needs four fields: side-effect safety, transaction-shape compatibility,
+snapshot/publication boundary, and tier-confidence state. A retained read,
+GPU write batch, refresh, or warmup should carry enough metadata for the
+runtime to answer: can it be restarted, can it join this batch, which
+visibility generation does it publish or consume, and why is its resident
+placement expected to pay off soon?
+
+Category gaps remain in direct GPU OLTP algorithms with accessible primary
+mechanism detail, in DB-owned CXL/far-memory policies that include SQL
+snapshot semantics, and in benchmarks that combine write batches with
+phase-shifting retained reads. The next high-value papers should stay in
+transaction/MVCC/tiering/runtime rather than another pure GPU analytics
+operator unless the queue needs a specific kernel baseline.
+
+**Benchmark priorities:**
+
+- Combine GaccO-style same-shape write batching with FlexMem-style
+  adaptive residency: hot write/read templates should earn resident GPU
+  placement only when recent batches and failed admissions justify the
+  memory they displace.
+- Add a route-certificate log for every GPU execution or residency
+  decision: side-effect class, batch shape, snapshot generation, WAL
+  boundary if any, resident heat class, and fallback reason.
+- Stress p99 latency with urgent retained reads while background scans,
+  refreshes, and speculative warmups compete for GPU memory and streams.
+  The pass condition is bounded urgent latency plus explicit discarded or
+  delayed background work, not just higher average throughput.
