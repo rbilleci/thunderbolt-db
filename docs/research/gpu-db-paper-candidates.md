@@ -2896,13 +2896,28 @@ Append new candidates here as each paper is processed.
   Why: cited by the MVGC paper as a practical multiversioning system; useful
   for contrasting reader-side logging, version lifetime, and reclamation costs
   with GPU DB MVCC chains and long retained snapshots.
-- `queued` — **Constant-Time Snapshots with Applications to Concurrent Data
+- `reviewed` — **Constant-Time Snapshots with Applications to Concurrent Data
   Structures**, Wei et al., PPoPP 2021.
   URL: `https://arxiv.org/abs/2007.02372`
   Why: the bounded MVGC paper applies its collector to this versioned-CAS
   snapshot framework; useful for deciding whether GPU DB should expose
   retained snapshot handles over lock-free CPU data structures before or
   alongside SQL-facing MVCC chains.
+- `queued` — **KiWi: A Key-Value Map for Scalable Real-Time Analytics**,
+  Basin et al., PPoPP 2017.
+  URL: `https://doi.org/10.1145/3018743.3018761`
+  PDF: `https://people.csail.mit.edu/idish/ftp/kiwi.pdf`
+  Why: compared by constant-time snapshots as a state-of-the-art range-query
+  key-value map; useful for evaluating per-key publication, range-query
+  atomicity, and update/query tradeoffs for retained metadata indexes.
+- `queued` — **Lock-free Contention Adapting Search Trees**, Winblad,
+  Sagonas, and Jonsson, SPAA 2018.
+  URL: `https://doi.org/10.1145/3210377.3210413`
+  PDF: `https://user.it.uu.se/~bengt/Papers/Full/spaa18.pdf`
+  Why: constant-time snapshots compares against LFCA's adaptive synchronization
+  granularity; useful for route metadata and resident index structures whose
+  best synchronization granularity changes with range-query size and
+  contention.
 - `queued` — **Triton Join: Efficiently Scaling to a Large Join State on GPUs
   with Fast Interconnects**, Lutz et al., SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3517911`

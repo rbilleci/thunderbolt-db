@@ -52948,3 +52948,202 @@ inside a transport-style queue.
   scans completing together. The scheduler should prioritize short
   completions without starving large responses beyond an explicit age
   or byte budget.
+
+### 2026-06-05 - Constant-Time Snapshots make snapshot handles cheap but old-object reads pay the update distance
+
+**Citation:** Yuanhao Wei, Naama Ben-David, Guy E. Blelloch,
+Panagiota Fatourou, Eric Ruppert, and Yihan Sun.
+"Constant-Time Snapshots with Applications to Concurrent Data
+Structures." PPoPP 2021; arXiv:2007.02372v3. Retrieved
+2026-06-05 from arXiv,
+`https://arxiv.org/abs/2007.02372`.
+
+**Category:** MVCC / snapshot / visibility; concurrent data
+structures and retained snapshot handles.
+
+**Relevance tags:** constant-time snapshot handle; versioned CAS;
+wait-free snapshot reads; version chains; range queries; lock-free
+metadata; snapshot garbage collection; retained read generations.
+
+**Core idea:** The paper gives a general way to add atomic
+multi-point queries to CAS-based concurrent data structures. A
+global camera object returns a snapshot handle in constant time.
+Shared mutable locations become versioned CAS objects, where each
+successful update adds a timestamped version node. Later, a reader
+can use the handle to read each object as it existed at the snapshot
+time and run an ordinary sequential range query, multi-search, or
+predicate search over that logical frozen view.
+
+The key trade is useful for GPU DB: snapshot acquisition can be very
+cheap, but reading an old value is not free. A snapshotted object read
+walks that object's version list until it finds the newest version at
+or before the handle timestamp, so the read cost is proportional to
+the number of successful updates on that object since the snapshot.
+That is a good shape for mostly-stable route metadata, catalog maps,
+or resident index roots, and a risky shape for hot rows, hot keys, or
+refresh metadata that churns faster than readers retire snapshots.
+
+**Concrete mechanisms:**
+
+- A camera object owns an integer timestamp. `takeSnapshot` reads the
+  current timestamp, tries one CAS to advance it, and returns the read
+  value as the handle; concurrent snapshot calls may share a handle
+  when no object changes distinguish them.
+- Each versioned CAS object stores a head pointer to a version list.
+  A successful `vCAS` allocates a node containing the new value, a
+  next-version pointer, and a timestamp initially marked TBD, then
+  CASes that node onto the head.
+- `initTS` turns TBD into a concrete timestamp read from the camera.
+  Reads, failed CAS operations, and snapshot reads help initialize the
+  head node so publication of the version node and assignment of its
+  timestamp appear atomic.
+- `vRead` only needs the current head after helping initialize its
+  timestamp, so current-state reads remain constant-time apart from
+  the extra indirection.
+- `readSnapshot(handle)` starts from the current head, helps initialize
+  it if needed, and follows older-version pointers until it finds a
+  timestamp no newer than the handle.
+- The construction supports dynamically created versioned CAS objects
+  associated with an existing camera, which matters for growing trees,
+  indexes, and route maps.
+- The paper highlights a recorded-once optimization: when a data
+  structure node becomes the new value of a successful CAS at most
+  once, timestamp and older-version metadata can live directly in the
+  node, avoiding one level of indirection.
+- The evaluation applies the method to balanced and unbalanced binary
+  search trees. The authors report low overhead for adding snapshots,
+  cite about 9% overhead for one mixed update/query current-version
+  workload, and show range-query performance generally competitive
+  with specialized atomic range-query structures such as KiWi, LFCA,
+  PNB-BST, and SnapTree. The exact numbers depend heavily on range
+  size, update/query mix, implementation language, and key-set size.
+- The implementation relies on epoch-based garbage collection, so
+  version retention is still a first-class resource-management problem.
+
+**GPU DB mapping:** This paper is strongest as a model for CPU-side
+route metadata and retained snapshot handles, not as a replacement
+for SQL MVCC. The current P8 design already says resident GPU state is
+published as immutable read snapshots. Constant-time snapshots suggest
+that the handle itself can be tiny: a generation or camera timestamp
+plus references to versioned metadata roots. New retained reads can
+capture that handle without queueing through the mutation owner.
+
+For 1M logical sessions, the attractive property is that idle or
+short read-only sessions do not need per-session deep copies of route
+metadata. They can hold a compact handle while shared metadata evolves.
+Point lookups, range metadata walks, route-template certification, and
+resident index probes can use the handle to see a consistent route map
+or resident-index root while refresh, eviction, DDL, or catalog changes
+publish newer nodes.
+
+The update-distance cost should become an explicit routing signal. A
+snapshot handle over a hot versioned object is only cheap to acquire;
+reading through a long version chain can become a latency trap. GPU DB
+should track per-object or per-root update distance since the oldest
+active retained handle. If a route metadata root, resident index node,
+or catalog entry crosses a configured distance, new readers should use
+a newer handle, rebuild a compact root, or fall back to owner-mediated
+execution instead of walking arbitrary chains.
+
+The recorded-once optimization maps well to immutable resident
+generations. A resident generation descriptor, route certificate, or
+index root can be published once and never mutated in place. That
+allows version/timestamp fields to live with the descriptor, reducing
+pointer chasing in the hot read path. Mutable row chains and WAL state
+should stay under database MVCC and WAL-before-visibility rules, but
+route metadata can use a simpler publication discipline when nodes are
+append-only or single-publication.
+
+The paper also sharpens snapshot GC design. Epoch reclamation is
+enough for their experiments, but GPU DB has HBM, pinned buffers, CPU
+DRAM, and future tiers. Snapshot retirement must release not just CPU
+nodes but also resident device buffers, pinned staging slots, and
+route-cache references. A constant-time handle is only production-safe
+if the retained resources behind old handles are bounded and visible.
+
+**Risks and mismatches:** The mechanism is for CAS-based concurrent
+data structures, not for relational transactions. It does not provide
+SQL isolation levels, predicate locking, phantoms, WAL durability,
+crash recovery, or transaction commit ordering. GPU DB cannot replace
+MVCC tuple visibility with versioned CAS lists without re-proving
+database correctness.
+
+The unbounded counter assumption and per-object version chains matter.
+In a long-running database, timestamp wraparound, chain compaction,
+and memory reclamation need explicit policies. The per-object update
+distance can also be pathological for a hot root pointer or hot catalog
+cell, exactly the objects a route planner might touch on every query.
+
+The extra indirection and version-list traversal are CPU-cache costs.
+They are acceptable only for metadata or CPU resident indexes whose
+saved owner-queue traffic outweighs cache misses. They do not map
+directly to GPU kernels unless a snapshot has already been flattened
+into GPU-friendly arrays or compact root descriptors.
+
+**Benchmark candidates:**
+
+- Implement a small versioned route-metadata map with camera handles:
+  new retained reads capture a handle in constant time, while refresh
+  and DDL publish new route descriptors by CAS. Gate: same-handle
+  reads see a consistent route generation even while newer descriptors
+  publish.
+- Add an update-distance metric per versioned metadata object. Measure
+  p50/p99 lookup latency as hot metadata cells churn under 1K, 100K,
+  and 1M simulated logical sessions. Failure condition: old-handle
+  reads walk unbounded chains without fallback or compaction.
+- Compare recorded-once route descriptors against indirect version
+  nodes for resident-generation metadata. Required measurements:
+  cache misses, pointer loads, allocation rate, route decision latency,
+  and snapshot retirement lag.
+- Prototype snapshot-handle retirement across CPU metadata plus GPU
+  resident buffers. Proof gate: an old retained handle keeps exactly
+  the needed generation alive and releases HBM/pinned resources after
+  the last reader without blocking new route publication.
+- Run a range-route metadata benchmark: atomic range scan over
+  partition descriptors or resident index roots while refresh moves
+  partitions between valid, invalidated, refreshing, and evicted
+  states. Compare owner-serialized reads with versioned snapshot reads.
+- Add a route policy: when update distance or retained bytes behind
+  old handles exceed a threshold, new reads must choose a newer handle,
+  compact a root, or fall back to the owner. Gate: throughput improves
+  without violating route-certificate generation checks.
+
+### 2026-06-05 - Cross-paper synthesis: cheap handles still need bounded payloads
+
+MgCrab, NDP, and constant-time snapshots converge on the same runtime
+shape: make the control decision cheap and explicit, then bound the
+payload work behind it. MgCrab uses a migration window and route
+certificates before source/destination execution can race. NDP uses
+small feedback headers and receiver-issued pulls before large payloads
+consume buffers. Constant-time snapshots use a tiny handle before old
+object reads pay version-chain distance.
+
+For GPU DB, this suggests three design tracks. First, route
+certificates should be compact handles containing visibility boundary,
+schema generation, resident generation, estimator generation, and
+movement or tier state. Second, every handle needs payload budgets:
+version-chain distance, response bytes, HBM residency bytes, pinned
+buffer slots, movement bytes, and refresh work. Third, owners should
+publish demand or certificates separately from payload transfer, so
+network writers, GPU workers, residency installers, and mutation
+owners can pull work when they have capacity.
+
+The category gap after these papers is not GPU scan speed; it is
+transactional snapshot and write-path evidence under heavy churn.
+Next reviews should prefer modern MVCC, logging, recoverability,
+transaction scheduling, or HTAP freshness papers before returning to
+GPU operator papers.
+
+**Benchmark priorities:**
+
+- Route-certificate invariant tests that reject duplicate execution
+  unless visibility, schema, resident, movement, and estimator
+  generations match.
+- Receiver-owned credit benchmarks for response rings, refresh
+  installs, and movement chunks, with control metadata bypassing large
+  payload queues.
+- Snapshot-handle stress tests that track version-chain distance,
+  retained bytes, and retirement lag under 100K to 1M logical sessions.
+- Mixed churn benchmarks where hot writes, resident refresh, and
+  retained reads run together; failure is any stale read, unbounded
+  retained memory, or queue family that starves another.
