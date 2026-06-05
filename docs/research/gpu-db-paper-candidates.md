@@ -575,6 +575,31 @@ Append new candidates here as each paper is processed.
   Why: Crystal's tile-based execution model is the execution substrate used by
   the SIGMOD 2022 GPU compression paper; useful for separating compression
   effects from baseline GPU query operator and memory-traffic behavior.
+- `reviewed` — **Native Store Extension for SAP HANA**, Sherkat et al.,
+  PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p2047-sherkat.pdf`
+  DOI: `https://doi.org/10.14778/3352063.3352123`
+  Why: selected after the last synthesis called for HTAP freshness and
+  warm-tier DBMS designs; relevant to byte-compatible hot/warm column formats,
+  load-unit placement, buffer-cache prefetch, page-level eviction, and
+  advisor-driven tiering.
+- `queued` — **Real-time Analytical Processing with SQL Server**, Larson et al.,
+  PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol8/p1740-larson.pdf`
+  DOI: `https://doi.org/10.14778/2824032.2824091`
+  Why: HANA NSE contrasts SQL Server's columnstore-on-OLTP approach; useful for
+  comparing dual-store maintenance, operational analytics freshness, and write
+  overhead against GPU DB resident snapshots.
+- `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using
+  both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882925`
+  Why: HANA NSE cites Data Blocks as a hybrid compressed-storage approach;
+  useful for CPU/GPU shared compressed segments and fused vectorized execution.
+- `queued` — **Page As You Go: Piecewise Columnar Access in SAP HANA**,
+  Sherkat et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882906`
+  Why: direct predecessor to HANA NSE's pageable column design; useful if the
+  GPU DB needs more detail on piecewise dictionary/vector access and prefetch.
 - `queued` — **HorseQC: A GPU-accelerated Query Compiler for Query Processing**,
   Rui et al., VLDB Journal 2021.
   URL: `https://doi.org/10.1007/s00778-020-00646-9`

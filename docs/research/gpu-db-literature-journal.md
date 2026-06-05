@@ -61711,3 +61711,154 @@ Benchmark priorities:
   completions return directly to the owning query/session response ring.
 - Keep learned route hints in advisor mode until deterministic routes expose
   enough telemetry for p99 regression gates.
+
+### 2026-06-05 - SAP HANA NSE makes warm data a first-class column-store load unit
+
+**Citation:** Reza Sherkat, Colin Florendo, Mihnea Andrei, Rolando Blanco,
+Adrian Dragusanu, Amit Pathak, Pushkar Khadilkar, Neeraj Kulkarni, Christian
+Lemke, Sebastian Seifert, Sarika Iyer, Sasikanth Gottapu, Robert Schulze,
+Chaitanya Gottipati, Nirvik Basak, Yanhong Wang, Vivek Kandiyanallur, Santosh
+Pendap, Dheren Gala, Rajesh Almeida, and Prasanta Ghosh. "Native Store
+Extension for SAP HANA." PVLDB 12(12), 2019, pp. 2047-2058.
+doi:10.14778/3352063.3352123. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol12/p2047-sherkat.pdf`.
+
+**Category:** hybrid HTAP and multi-tier cache / data placement.
+
+**Relevance tags:** HTAP; warm data; load units; byte-compatible persistence;
+columnar paging; buffer cache; prefetch; compression; partition-level tiering;
+advisor-driven placement; online conversion; MVCC-friendly DDL.
+
+**Core idea:** HANA's Native Store Extension extends an in-memory HTAP column
+store with a paged warm tier without building a separate disk engine or forcing
+queries through a different logical representation. The core move is a unified
+persistent format whose paged structures are byte-compatible with contiguous
+pieces of HANA's in-memory column vectors, dictionaries, indexes, and
+compression formats. The same upper-level column-store and execution code can
+therefore operate over hot in-memory structures or page-loaded warm structures,
+while load-unit metadata decides which table, partition, column, or column
+substructure should be fully loaded.
+
+The paper's most transferable lesson is that tiering should be a physical
+property with stable APIs, not an afterthought hidden behind the OS page cache.
+NSE exposes page-loadable and column-loadable objects, uses a dedicated buffer
+cache for paged resources, lets the execution engine issue best-effort fair
+prefetch, and adds a load-unit advisor that uses observed access density to
+recommend hot versus warm placement. In the reported S/4HANA-style workload,
+NSE reduces memory substantially while preserving OLTP performance within a
+small reported overhead because OLTP writes hit the delta store and NSE targets
+the read-optimized main fragments.
+
+**Concrete mechanisms:**
+
+- The hybrid column store keeps HANA's main/delta split: inserts and updates go
+  to the write-optimized delta fragment, while NSE primarily pages the large
+  read-optimized main fragment.
+- Unified persistence represents columnar data structures in a page-aligned
+  format that can be accessed as paged primitives or copied into contiguous
+  in-memory primitives without a persistent format conversion.
+- Paged primitives mirror in-memory vectors, n-bit compressed vectors, bit
+  vectors, arbitrary-size items, dictionaries, RowID columns, geospatial
+  values, and hash-index row-position mappings behind common APIs.
+- Some compressed formats need tiny resident helper structures. For example,
+  RLE start-position pages and fixed-width dictionary pages keep compact
+  per-page boundary vectors in memory so probes can avoid loading many pages.
+- Small vectors can be mapped directly from a loaded page during scans instead
+  of copied into temporary memory.
+- The buffer cache is separate from HANA's broader memory resource manager and
+  manages multiple page-size pools, domain-specific page pools, free lists, LRU
+  state, hot-buffer retention, and pool rebalancing through a housekeeper.
+- Page prefetch is asynchronous and bounded to a fraction of cache capacity so
+  prefetch cannot starve synchronous loads or allocations.
+- For parallel scans, HEX creates prefetch operators early and advances
+  per-subrange watermarks fairly, so one scan job does not receive a large head
+  start while others stall.
+- If normal buffer allocation fails, ordinary queries can fail with an
+  operator-visible capacity problem, but critical undo, crash recovery, and
+  continuous log replay use an emergency overflow provider that allocates a
+  temporary buffer and destroys it immediately after use.
+- Load-unit hints exist at column, partition, and table levels:
+  column-loadable, page-loadable, or default-loadable, with narrower scopes
+  overriding broader scopes.
+- Online load-unit conversion uses column versioning. Existing readers keep
+  accessing the old column version while the new version is built; the new load
+  unit becomes active when the DDL commits, preserving column identifiers across
+  partitions.
+- Unbalanced partitioning lets different ranges use different second-level
+  partitioning and load-unit choices, which maps naturally to hot and cold
+  partition trees.
+- The Load Unit Advisor records main-fragment physical accesses in an access
+  statistics cache and recommends page-loadable or column-loadable placement
+  from scan density, object size, and hot/cold thresholds.
+
+**GPU DB mapping:** P8 should treat GPU, host DRAM, and NVMe placement as load
+units over a shared logical segment contract. A resident GPU segment, a
+warm host-compressed segment, and a cold paged/NVMe segment should expose
+compatible vector/dictionary/null/visibility APIs where practical, while their
+resource budgets and latency profiles stay explicit. That is a stronger design
+than copying CPU rows into one-off GPU buffers or relying on OS paging to hide
+tier movement.
+
+The byte-compatible primitive idea maps to resident segment design. If GPU DB
+chooses an encoded column-group layout for `int4` and `text`, the on-disk or
+host-warm representation should be deliberately close enough that admission,
+refresh, decompression, and GPU upload do not require rebuilding unrelated
+substructures. Dictionaries, offsets, visibility vectors, key vectors, and
+compressed tiles can each have their own load unit, so a hot dictionary or
+page synopsis may stay in host memory or GPU memory while colder value pages
+remain on NVMe.
+
+NSE's load-unit metadata is also a good model for route certificates. A GPU
+route should be able to say that a table, partition, column family, dictionary,
+visibility vector, or key vector is GPU-resident, host-resident, page-loadable,
+or absent, and the planner should choose routes from those facts. The advisor's
+scan-density rule is simple but useful: start with object size, access count,
+miss cost, refresh cost, and invalidation age before attempting a learned
+placement model.
+
+The paper reinforces that OLTP write path and analytical warm-tier design can
+coexist if the write-optimized delta path stays cheap and warm paging targets
+read-optimized immutable or mostly immutable fragments. For GPU DB, that points
+toward append/WAL-owned mutable deltas plus immutable resident or warm column
+groups, rather than trying to update GPU-resident analytical structures in
+place for every transaction.
+
+**Risks and mismatches:** NSE is an industrial HANA design for CPU column-store
+execution and block-device warm storage; it does not evaluate GPU execution,
+CUDA pinned buffers, GPUDirect Storage, or GPU-resident MVCC visibility. Its
+reported benchmark is an in-house SAP workload, so exact reproducibility and
+full workload details are limited. The paper mostly discusses main-fragment
+paging and does not solve high-contention transaction scheduling or GPU
+micro-batch admission. Byte compatibility can also constrain future encodings:
+GPU DB should not freeze a bad disk or host layout just to avoid conversion.
+Finally, an advisor based only on scan density may miss latency-critical point
+lookups, write invalidation churn, queue pressure, and pinned-buffer scarcity.
+
+**Benchmark candidates:**
+
+- Define explicit load units for the first P8 segment slice: GPU resident,
+  host resident, host compressed, cold paged/NVMe, and absent. Gate: every
+  retained route reports the load unit of data vectors, text offsets/bytes,
+  dictionaries, key vectors, visibility vectors, and response metadata.
+- Build a byte-compatibility experiment for one `int4` column group: compare
+  rebuilding a GPU vector from CPU rows against uploading from a host-warm
+  encoded vector with matching tile boundaries. Measure refresh latency,
+  bytes copied, CPU cycles, and GPU kernel compatibility.
+- Add a warm-tier advisor trace using object size, access count, miss count,
+  scan density, point-lookup density, invalidation age, refresh cost, and GPU
+  queue pressure. Start in recommendation-only mode.
+- Compare table-level, partition-level, and column-level residency decisions
+  on a mixed workload with hot recent partitions, cold historical partitions,
+  and one hot column in an otherwise cold table. Success condition: resident
+  bytes fall without p99 retained-read regression beyond a measured budget.
+- Prototype fair prefetch for cold scan chunks: advance per-partition or
+  per-subrange watermarks rather than filling the queue for one scan first.
+  Failure condition: prefetch improves throughput but creates p99 stalls for
+  other subranges or point misses.
+- Add an emergency-buffer policy for recovery and WAL replay distinct from
+  user-query buffers. Proof gate: user query overload can reject safely while
+  crash recovery or replay has a bounded path to make progress.
+- Test mutable-delta plus immutable-main behavior for GPU residency: writes
+  append to CPU/WAL deltas, retained reads combine a resident main segment with
+  a bounded delta overlay or force refresh. Measure write throughput,
+  freshness lag, read latency, and refresh frequency.
