@@ -5610,14 +5610,14 @@ Append new candidates here as each paper is processed.
   Why: Ultra Ethernet names REPS as a path-aware entropy recycling strategy;
   useful for comparing self-clocking packet/path selection with GPU DB
   response-ring and multi-gateway load balancing. Reviewed on 2026-06-05.
-- `queued` — **An Edge-Queued Datagram Service for All Datacenter Traffic**,
+- `reviewed` — **An Edge-Queued Datagram Service for All Datacenter Traffic**,
   Olteanu et al., NSDI 2022.
   URL: `https://www.usenix.org/conference/nsdi22/presentation/olteanu`
   PDF: `https://www.usenix.org/system/files/nsdi22-paper-olteanu.pdf`
   Why: REPS uses EQDS as a congestion-control/transport baseline; useful for
   comparing receiver-driven credits, edge queuing, and packet trimming with GPU
   DB's owner-ring admission, response backpressure, and future internal
-  transport paths.
+  transport paths. Reviewed on 2026-06-06.
 - `reviewed` — **Flowcut Switching: High-Performance Adaptive Routing with
   In-Order Delivery Guarantees**, Bonato et al., arXiv 2025.
   URL: `https://arxiv.org/abs/2506.21406`
@@ -5767,3 +5767,16 @@ Append new candidates here as each paper is processed.
   Why: Vegito contrasts SyPer as a snapshot/replica-style HTAP design; useful
   for comparing virtual snapshot freshness, analytical isolation, and OLTP
   degradation against backup-based and GPU-resident snapshot publication.
+- `queued` — **1RMA: Re-Envisioning Remote Memory Access for Multi-Tenant
+  Datacenters**, Singhvi et al., SIGCOMM 2020.
+  URL: `https://doi.org/10.1145/3387514.3405873`
+  Why: EQDS builds on 1RMA-style receiver-driven credits for RDMA-compatible
+  traffic; useful for comparing tenant isolation, pull-based admission, and
+  remote-memory access semantics against GPU DB's future storage or gateway
+  fabric.
+- `queued` — **Aeolus: A Building Block for Proactive Transport in
+  Datacenters**, Hu et al., SIGCOMM 2020.
+  URL: `https://doi.org/10.1145/3387514.3405883`
+  Why: EQDS names Aeolus as a Homa-like proactive transport option; useful for
+  comparing receiver-driven low-latency request/response transport with GPU
+  DB's command-ring credits and micro-batch admission.

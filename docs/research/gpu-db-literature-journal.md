@@ -73929,3 +73929,183 @@ maintenance.
   analytical reads. Failure condition: predicate-index maintenance improves
   read latency only by delaying WAL visibility, invalidation, or refresh
   publication.
+
+### 2026-06-06 - EQDS moves network queues to the edge and clocks admission with receiver credits
+
+**Citation:** Vladimir Olteanu, Haggai Eran, Dragos Dumitrescu,
+Adrian Popa, Cristi Baciu, Mark Silberstein, Georgios Nikolaidis,
+Mark Handley, and Costin Raiciu. "An Edge-Queued Datagram Service
+for All Datacenter Traffic." NSDI 2022. Retrieved 2026-06-06 from
+the USENIX paper page and PDF,
+`https://www.usenix.org/conference/nsdi22/presentation/olteanu`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** receiver-driven credits; edge queuing; admission
+control; response backpressure; packet spraying; reorder buffers;
+bounded per-destination state; TCP/RDMA coexistence; incast control;
+future storage/gateway fabric.
+
+**Core idea:** EQDS argues that datacenter protocols fight because
+their control loops interact through switch queues. Its answer is to
+move most shared queuing out of the network core and into edge queues
+at sending hosts or NICs, then let the receiver clock packets into the
+network with credits. Higher-layer protocols such as TCP, RDMA, DPDK
+stacks, and future native transports can keep their own semantics while
+EQDS provides a common datagram layer with low in-network queues.
+
+The transferable lesson for GPU DB is not packet tunneling by itself;
+it is the separation between demand storage and admission clocking.
+The sender can accumulate buffered demand, but the receiver decides
+which sender is allowed to inject work next. That shape maps closely
+to owner rings, response rings, resident snapshot workers, and future
+multi-node or storage-fabric paths: keep queueing at explicit edges,
+make credits visible, and avoid letting hidden shared queues become the
+place where latency-sensitive reads, bulk refreshes, and write streams
+silently interfere.
+
+EQDS reports several useful evaluation signals. In a permutation
+traffic matrix on its BlueField-2 testbed, TCP and RDMA flows over
+EQDS average about 22 Gbps versus about 12-14 Gbps without EQDS. For
+1 MB random TCP flows, median and 95th-percentile flow completion times
+drop by about 2.4x and 2x. In Amazon EC2, an 850-to-1 incast increases
+ping latency by about 9 ms in the baseline but only about 21 us with
+EQDS while preserving similar throughput. The paper also reports 20-30x
+better memcached mean request latency on busy EC2 receivers and improved
+NVMeOF-RDMA throughput, though some of that path requires deeper queues
+because the evaluated SmartNIC implementation adds latency.
+
+**Concrete mechanisms:**
+
+- EQDS exposes virtual interfaces called EQIFs. Sending EQIFs implement
+  protocol-specific queue disciplines; a receiving EQIF owns short
+  reorder queues, sequence state, and the credit policy for incoming
+  tunnels.
+- Tunnels are soft-state, unidirectional, and established on demand with
+  zero RTT. Either endpoint can discard idle tunnel state and recreate it
+  when packets return.
+- The receiver sends `PULL` packets that grant byte credit. A sending
+  EQIF must hold enough credit before sending data, so after the initial
+  burst the receiver clocks aggregate arrivals at no more than its access
+  link speed.
+- The receiver keeps an active sender list and grants one MTU of credit
+  per MTU-time to the head sender. FIFO active-sender scheduling provides
+  fair sharing; a PIFO can encode priority or proportional policies.
+- Senders include a pull target, capped around one bandwidth-delay
+  product, so the receiver knows queued demand without granting unbounded
+  injection.
+- A busy-time signal discourages intermittent senders from immediately
+  bursting again while the receiver's access link is known to remain
+  saturated.
+- Where packet trimming is available, EQDS can send an initial RTT of
+  packets and recover trimmed payloads with NACKs and later credits.
+  Without trimming, it uses request-to-send before sending bursts.
+- Per-packet ECMP spreads packets across paths. Because TCP and RDMA
+  dislike reordering, the receiving EQIF maintains bounded reorder
+  buffers; the paper states practical reorder queues are usually under
+  ten packets, with worst-case bounds tied to the EQDS window.
+- Sending EQIF classes specialize feedback: TCP-compatible queues use
+  drop-tail or RED/ECN behavior, RDMA EQIFs provide markings suitable
+  for RDMA control loops, and native EQIFs expose a lower-level shared
+  memory style path for EQDS-aware transports.
+- Multiple sending EQIFs on one host share the uplink with deficit round
+  robin unless priority is configured.
+- The implementation exists as DPDK and Linux kernel versions, and was
+  also evaluated on SmartNICs. The DPDK design burns two cores for
+  polling and paced credits; the kernel design is easier to deploy but
+  has timer jitter and stack overhead.
+- Memory is bounded by active destinations and per-tunnel buffers. The
+  paper estimates 1.5 GB can cover packet buffers for about 10,000 active
+  destinations, and reports under 100 MB receiver memory in the EC2
+  experiment with 850 senders.
+
+**GPU DB mapping:** Treat each runtime boundary as an EQDS-like edge:
+network IO workers, mutation owners, residency owners, GPU execution
+workers, response encoders, and future storage or RDMA gateways should
+own explicit queues rather than pushing work into opaque shared pools.
+The receiver of a resource should grant credits, because that owner has
+the best local knowledge of buffer space, snapshot pins, CUDA streams,
+resident bytes, response-ring capacity, and latency class.
+
+For 1M logical sessions, EQDS reinforces a multiplexed-session design:
+many clients can accumulate demand at IO edges, but only bounded
+credits enter mutation, read-snapshot, GPU, or response domains. A
+session should not own a thread or unbounded queue; it should own a
+small protocol state record plus pending demand that is admitted by the
+resource owner. The active-sender-list idea maps to active-session,
+active-tenant, or active-route lists for fair draining under saturation.
+
+For read throughput and latency, the strongest mapping is receiver-driven
+response backpressure. If a GPU retained read produces a large result,
+the network IO worker or response encoder should clock result chunks
+back from GPU/owner buffers instead of letting a kernel or user-space
+socket queue absorb arbitrary bytes. This prevents bulk analytical
+responses from hiding memory pressure that should feed into route choice,
+micro-batch limits, or overload responses.
+
+For write throughput, credits can protect WAL and MVCC publication.
+The mutation owner can grant append credits based on preallocated chunk
+space, WAL fsync window, visibility-generation budget, and downstream
+invalidation pressure. Bulk COPY, point writes, and refresh-triggering
+updates can then share a visible admission policy rather than competing
+inside a single unobservable channel.
+
+For tiering, EQDS suggests making cross-tier movement receiver-clocked:
+the GPU residency owner grants refresh DMA credits; the host warm tier
+grants decompression or prefetch credits; the NVMe tier grants IO-depth
+credits. Over-resident execution should carry a route certificate with
+the current credit source, not merely enqueue reads until hidden queues
+inflate p99.
+
+**Risks and mismatches:** EQDS is a network layer, not a database
+runtime or transaction protocol. It does not solve SQL ordering, WAL
+durability, snapshot visibility, GPU memory residency, or plan
+correctness. Its credit loop is packet/byte-oriented, while GPU DB work
+units vary by query shape, row count, result size, pinned memory, and
+kernel occupancy.
+
+The evaluated SmartNIC path adds latency, and the DPDK implementation
+spends dedicated cores. A GPU DB mapping should copy the admission
+principles before assuming specialized NIC support. Also, receiver-driven
+credits can underutilize resources if credit pacing is too conservative
+or if demand estimates are stale; the route scheduler will need telemetry
+for queue wait, credit starvation, and wasted capacity.
+
+Finally, reorder buffers are acceptable for packet delivery but dangerous
+as a database analogy unless ordering classes are explicit. SQL responses,
+transaction commits, invalidations, and snapshot publication cannot be
+freely reordered across visibility boundaries. Any packet-spraying or
+multi-path response idea needs per-request ordering proof and clear
+failure semantics.
+
+**Benchmark candidates:**
+
+- Add a receiver-credit admission prototype for read snapshot workers:
+  IO workers can enqueue pending read demand, but snapshot workers grant
+  credits based on queue depth, snapshot pins, and output buffer budget.
+  Gate: p99 lookup latency remains bounded during bulk analytical reads.
+- Implement response-ring chunk credits for large result sets. Compare
+  unbounded socket writes, bounded response rings, and receiver-clocked
+  chunks. Measure memory use, response latency, and impact on unrelated
+  point queries.
+- Build an active-session-list scheduler for 100K-1M simulated logical
+  sessions with a small active subset. Measure fairness, CPU per session,
+  queue memory, p50/p99 admission delay, and overload behavior.
+- Add write-path append credits tied to preallocated WAL/MVCC chunk
+  capacity. Compare bulk COPY plus point writes under FIFO, tenant fair
+  sharing, and priority classes. Failure condition: throughput improves
+  only by delaying WAL-before-visibility or invalidation work.
+- Prototype GPU execution credits by resident partition and CUDA stream.
+  A route receives credit only when pinned buffers, output buffers, and a
+  stream slot are available. Measure kernel occupancy versus queue wait.
+- Add a deadlock audit for backpressure graphs: network IO, mutation,
+  read snapshots, residency, GPU workers, response rings, and disk/NVMe
+  queues. Gate: no cycle can require every participant to hold a buffer
+  while waiting for another buffer.
+- Compare active-route scheduling policies: FIFO, deficit round robin,
+  priority, and PIFO-like rank by deadline or tenant weight. Benchmark
+  latency-sensitive retained lookups mixed with bulk refresh and large
+  scans.
+- Track a `busy_until` or saturation horizon per owner domain, inspired
+  by EQDS busy time. Use it to decide whether new reads should wait,
+  fallback to CPU, be micro-batched, or return overload.
