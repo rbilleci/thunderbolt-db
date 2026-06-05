@@ -5160,7 +5160,7 @@ Append new candidates here as each paper is processed.
   Why: GenericVC cites TARDiS as branch/merge related work; useful for
   contrasting database-layer reconciliation with application-visible
   branch-and-merge semantics under weaker consistency.
-- `queued` — **OrpheusDB: Bolt-on Versioning for Relational Databases**,
+- `reviewed` — **OrpheusDB: Bolt-on Versioning for Relational Databases**,
   Huang et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p1130-huang.pdf`
   DOI: `https://doi.org/10.14778/3115404.3115417`
@@ -5459,3 +5459,18 @@ Append new candidates here as each paper is processed.
   Why: Ultra Ethernet motivates its design as an answer to RoCE/RDMA
   deployment pain; useful background for avoiding fragile lossless-network
   assumptions in GPU DB's future gateway and accelerator-fabric design.
+- `queued` — **Decibel: The Relational Dataset Branching System**,
+  Maddox et al., PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p624-maddox.pdf`
+  DOI: `https://doi.org/10.14778/2947618.2947619`
+  Why: OrpheusDB contrasts its bolt-on relational approach with Decibel's
+  native versioned storage engine; useful for comparing branch-aware storage
+  primitives against GPU DB's MVCC lineage, retained snapshots, and
+  old-version reconstruction cost.
+- `queued` — **Principles of Dataset Versioning: Exploring the
+  Recreation/Storage Tradeoff**, Bhattacherjee et al., PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol8/p1346-bhattacherjee.pdf`
+  arXiv: `https://arxiv.org/abs/1505.05211`
+  Why: OrpheusDB builds on the recreation/storage tradeoff for versioned
+  datasets; useful for turning GPU DB snapshot-retention, checkpoint, and
+  cold-version reconstruction policy into an explicit cost frontier.

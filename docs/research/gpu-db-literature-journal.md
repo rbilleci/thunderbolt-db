@@ -68771,3 +68771,176 @@ HBM, DRAM, NVMe, and future tiers.
   keeping workload constant, and let policy change compression pressure.
   Required metrics: resident bytes, fallback rate, refresh debt, CPU/GPU queue
   wait, and query p99.
+
+### 2026-06-05 - OrpheusDB makes old-version lookup a partitioning problem
+
+**Citation:** Silu Huang, Liqi Xu, Jialin Liu, Aaron J. Elmore, and
+Aditya Parameswaran. "OrpheusDB: Bolt-on Versioning for Relational
+Databases." PVLDB 10(10), 2017, pp. 1130-1141.
+doi:10.14778/3115404.3115417. Retrieved 2026-06-05 from VLDB,
+`https://www.vldb.org/pvldb/vol10/p1130-huang.pdf`.
+
+**Category:** MVCC / snapshot / visibility; multi-tier cache / data
+placement; versioned storage layout.
+
+**Relevance tags:** version lineage; old-version reconstruction;
+snapshot retention; storage/recreation tradeoff; partitioned version
+metadata; immutable records; SQL-accessible version graph; online
+repartitioning; migration debt.
+
+**Core idea:** OrpheusDB adds dataset versioning on top of a normal
+relational DBMS instead of replacing the storage engine. It stores
+immutable records, a version graph, and version-to-record membership
+metadata, then rewrites checkout and version-query operations into
+ordinary SQL. Its most transferable idea for GPU DB is that old-version
+access is not only an MVCC timestamp check; it is also a physical
+placement problem. If all versions share one giant membership table,
+checkout reads too many irrelevant records. If every version is fully
+materialized, storage explodes. OrpheusDB's LyreSplit partitioning
+chooses a middle point by grouping similar versions so checkout touches
+less unrelated data while bounded duplication buys latency.
+
+The paper is not an OLTP MVCC engine and does not claim transaction
+isolation semantics for a running DBMS. It is still useful because GPU
+DB will face the same storage/recreation frontier for retained
+snapshots, cold historical tuple versions, CPU checkpoints, and
+GPU-resident generations. The lesson is to make the frontier explicit:
+which versions are materialized, which are reconstructed, which share
+physical partitions, and when background migration is worth the debt.
+
+**Concrete mechanisms:**
+
+- A collaborative versioned dataset corresponds to a relation plus a
+  DAG of versions. Records are immutable; modifying attributes creates
+  a new record id. A version is a set of record ids, and a record may
+  belong to many versions.
+- Checkout materializes one or more versions as a regular DBMS table.
+  Commit compares the modified checkout table to its parent version(s)
+  and adds changed records as new immutable records plus a new version
+  node.
+- The implementation uses a no-cross-version-diff rule: commit compares
+  to parent versions rather than scanning all historical records to find
+  whether a deleted-and-readded record existed in the past. This trades
+  modest extra storage for much cheaper commits.
+- The preferred data model is split-by-rlist: one data table stores
+  immutable records keyed by record id, while a versioning table maps
+  each version id to an array of record ids. Commit inserts one
+  versioning tuple instead of appending a new version id into every
+  affected record's membership array.
+- Checkout in split-by-rlist fetches the record-id list for a version
+  through a primary-key lookup on version id, unnests it, and joins
+  against the data table. This avoids expensive array membership scans
+  but still grows with data-table size.
+- Metadata stores parent and child versions, checkout and commit times,
+  commit messages, and per-version attributes, giving SQL access to the
+  version graph and provenance.
+- The partitioning problem models versions and records as a bipartite
+  graph. Each version belongs to exactly one partition; records may be
+  duplicated across partitions. Checkout cost is approximated by the
+  number of records in the partition containing the requested version;
+  storage cost is the sum of records stored across partitions.
+- The paper shows the storage-bounded checkout-minimization problem is
+  NP-hard, then uses LyreSplit, a lightweight version-graph algorithm
+  that cuts low-overlap parent/child edges instead of operating on the
+  much larger version-record graph.
+- LyreSplit is parameterized by a tradeoff value and can be searched to
+  fit a storage budget. Its analysis gives an approximation bound under
+  assumptions in the paper and a running time tied to the version graph
+  rather than all version-record edges.
+- Online maintenance places a new version into a parent's partition
+  when overlap is high, or creates a new partition when overlap is low
+  and the storage budget allows it. A tolerance factor triggers
+  migration when current checkout cost drifts too far from a fresh
+  LyreSplit solution.
+- Migration is incremental: instead of rebuilding every partition, the
+  system matches new partitions to close old partitions and applies
+  inserts/deletes, approximating closeness through shared versions and
+  version-graph structure.
+- Evaluation uses PostgreSQL 9.5 under a C++ wrapper, generated
+  versioning benchmarks, 100 sampled checkouts, cold OS cache runs, and
+  datasets up to 10K versions and 9.8M records. Reported results:
+  split-by-rlist gives much cheaper commits than combined-table or
+  split-by-vlist; LyreSplit is about 1000x faster than competing
+  partitioning algorithms in the tested setting; with a 2x storage
+  budget it reduces average checkout time by up to 21x on SCI_10M; and
+  incremental migration is about 10x faster than rebuilding from
+  scratch on average.
+
+**GPU DB mapping:** Treat each retained read snapshot, CPU checkpoint
+generation, and GPU-resident generation as a point in a version graph,
+not merely as an opaque timestamp. Adjacent generations with high row
+or segment overlap should share physical storage; low-overlap edges are
+candidates for partition splits, independent resident segments, or
+explicit cold reconstruction boundaries.
+
+For P8, split-by-rlist suggests separating immutable data payloads from
+membership/visibility metadata. Dense GPU column buffers, CPU tuple
+versions, and cold NVMe records can remain payload objects, while a
+compact generation-to-segment or generation-to-row map proves which
+payloads are visible for a read boundary. The map must be designed for
+fast route proof, not just for storage savings.
+
+The no-cross-version-diff rule maps to a conservative write-path choice:
+do not scan all historic versions on the commit path just to deduplicate
+old physical payloads. Append new immutable payloads or deltas cheaply,
+then let background compaction, checkpointing, or resident rebuild
+discover cross-generation sharing when the system has budget.
+
+LyreSplit's partition model is a good analogy for retained snapshot
+retention. A hot read generation can be fully materialized in GPU memory
+when latency matters. Older or low-demand generations can be
+reconstructed from parent segments, CPU truth, or checkpoint deltas. The
+storage budget should drive where GPU DB duplicates data, where it
+stores membership metadata only, and where it drops acceleration state.
+
+Online maintenance and tolerance-triggered migration fit the runtime
+frontier model. New WAL/MVCC generations should be attached to existing
+resident partitions while overlap stays high; when invalidation,
+updates, or deletes make checkout/reconstruction cost drift too far, a
+background migration or refresh can publish a new partitioned layout.
+That migration must be visible as conversion debt and must not rewrite a
+snapshot still held by readers.
+
+**Risks and mismatches:** OrpheusDB targets collaborative analytical
+dataset versioning, not PostgreSQL-compatible OLTP isolation. Checkout
+materializes tables, so its latency model is much coarser than GPU DB's
+per-query retained-route latency target. Its membership arrays and SQL
+joins may not map directly to GPU kernels, HBM-resident metadata, or
+high-concurrency pgwire sessions. The no-cross-version-diff rule is a
+storage/performance shortcut, not a correctness rule for SQL MVCC.
+Also, the paper evaluates integer-heavy generated datasets on
+PostgreSQL 9.5 with cold OS page cache; GPU memory, NVMe, and
+write-heavy transactional mixes need separate measurement.
+
+**Benchmark candidates:**
+
+- Add a retained-snapshot storage/reconstruction benchmark: fully
+  materialized GPU generation, shared payload plus generation map,
+  parent-plus-delta reconstruction, and CPU-only fallback. Measure
+  p50/p99 route proof time, bytes retained, bytes reconstructed, and
+  correctness across active readers.
+- Prototype generation-to-segment membership metadata for P8 resident
+  column groups. Gate: a read route can prove table oid, schema
+  generation, source WAL boundary, visibility boundary, segment ids, and
+  row membership without scanning unrelated generations.
+- Measure commit-path no-cross-generation-diff versus background
+  compaction. Expected win: writes append or invalidate cheaply, while
+  compaction finds sharing off the p50 path. Failure condition: storage
+  debt grows enough to force frequent GPU eviction or route fallback.
+- Implement a LyreSplit-inspired simulator over WAL/MVCC generations:
+  edge weight is overlapping visible row or segment count, storage budget
+  is HBM/DRAM bytes, and checkout cost is route reconstruction bytes.
+  Compare one giant partition, every generation materialized, and
+  overlap-based partitioning.
+- Add migration-debt telemetry for resident layouts: records or segments
+  inserted, deleted, copied, reused, and blocked by active snapshot
+  readers. Gate: refresh/migration can be bounded without mutating
+  published snapshots in place.
+- Test workload drift: start with high-overlap append-only generations,
+  then introduce deletes/updates that reduce overlap. The policy should
+  trigger a new partition or refresh only when measured reconstruction
+  cost crosses a tolerance threshold.
+- For cold-tier recovery, compare eager materialization of every retained
+  generation with on-demand reconstruction from checkpoint plus WAL
+  deltas. Required metrics: startup time, first-query latency, recovery
+  read amplification, and resident warmup debt.
