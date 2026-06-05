@@ -56329,3 +56329,135 @@ policy, WAL/control frontier, fixed-capacity completion cells, and retained
 snapshot visibility. The proof gate is not just higher throughput. It is
 higher p99 stability with identical committed results, deterministic replay,
 and no exposure of private repair or non-public batch versions.
+
+### 2026-06-05 - MindPalace makes auto-mergeability an instance-specific validation target
+
+**Citation:** Nalin Ranjan, Zechao Shang, Sanjay Krishnan, and
+Aaron J. Elmore. "Version Reconciliation for Collaborative Databases."
+SoCC 2021, pp. 473-488. doi:10.1145/3472883.3486980. Retrieved
+2026-06-05 from arXiv, `https://arxiv.org/abs/2110.01778`, and the
+ACM DOI page.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** version reconciliation; auto-mergeability; conflict
+detection; logical update histories; commutativity; false-abort reduction;
+route validation; retained snapshots; branch/merge semantics.
+
+**Core idea:** MindPalace studies disconnected collaborative databases where
+two users independently edit copies of a dataset and later merge their update
+histories. Its useful database contribution is the formalization of
+auto-mergeability: two ordered histories are safe to merge automatically when
+every valid interleaving that preserves each history's local order produces
+the same final database state.
+
+The paper's important distinction is that auto-mergeability is
+instance-specific, not just operation-type-specific. Two updates that look
+conflicting under ordinary read/write locking may commute on the actual data
+because predicates, values, and final tuple states make the order irrelevant.
+MindPalace exploits logical SQL update histories to identify the tight set of
+non-auto-mergeable tuples, rather than materializing every possible
+interleaving or relying on physical diffs. In its evaluation, MindPalace
+reports conflict sets within less than 1% relative error in varied simple and
+general-update workloads, avoids false negatives in the tested settings, and
+is orders of magnitude faster than dynamic-programming ground truth.
+
+**Concrete mechanisms:**
+
+- A history is a sequence of SQL modifications. A valid interleaving combines
+  two histories while preserving the order inside each source history.
+- A conflict exists when valid interleavings can produce different final
+  database states. Tuple-level conflict sets identify records whose removal
+  would make the remaining histories auto-mergeable.
+- The main theorem gives a sufficient condition: if every pair of
+  cross-history modifications commutes at every relevant prefix point, the
+  two histories are auto-mergeable.
+- Pairwise conflict detection distinguishes write-write, read-write, and
+  write-read conflicts, but uses predicates and values rather than coarse
+  lock compatibility. Two writes to the same cell are not a conflict if they
+  write the same value or cannot both affect the tuple under the relevant
+  orderings.
+- Instead of materializing intermediate database versions, MindPalace derives
+  conflict predicates by backtracking conditions through prior updates until
+  they can be evaluated on the common ancestor database.
+- Inserts and deletes are treated as special updates involving `NULL` values:
+  inserts are checked against the inserted tuple, while deletes add a
+  not-deleted condition during backtracking.
+- The supported general query model includes state-independent predicates,
+  ranges, logical conditions, set containment, and joins against read-only
+  relations or sets. State-dependent predicates are outside the clean model.
+- When conflicts remain, the resolution algorithm repeatedly finds an early
+  conflicting pair and asks for an ordering between those two modifications.
+  The number of user questions is bounded by the combined history lengths,
+  not by the exponential number of interleavings.
+- The prototype is a Python auxiliary client over PostgreSQL 10. It records
+  logical histories and queries PostgreSQL to evaluate derived predicates;
+  it is not a production concurrency-control implementation.
+
+**GPU DB mapping:** MindPalace is a useful counterweight to treating every
+read/write overlap as an abort. For GPU DB, the transferable shape is a
+route-validation layer that proves when a prepared write template, refresh
+template, or semantic repair route is order-insensitive on the current
+snapshot. A route certificate could carry derived conflict predicates and a
+statement about the template's commutativity class, letting the mutation owner
+avoid false aborts for supported cases while preserving strict default MVCC
+elsewhere.
+
+The backtracking idea maps to retained snapshots and WAL generations. If a
+batch contains known update templates, the engine can derive a compact
+predicate describing rows that would make a different commit order visible.
+That predicate should be evaluated against the source snapshot or active
+window before visibility publication. If it is empty, the batch can be
+ordered by the owner's normal scheduling rule without adding application
+round trips.
+
+MindPalace also sharpens the difference between semantic validation and
+physical diffing. GPU resident segments, old CPU deltas, and cold lineage
+records should not be compared by raw bytes when deciding whether a refresh,
+repair, or replay path is safe. The route proof should talk about table ids,
+row ids, predicates, written columns, and final values, then let each tier use
+its own physical layout.
+
+For multi-tier placement, derived conflict predicates could become cheap
+filter work on CPU or GPU. A hot active-window table could keep small
+predicate indexes or bitmap summaries for columns that route validation uses,
+while old lineage remains in cold storage unless a long retained snapshot or
+manual diagnostic needs it.
+
+**Risks and mismatches:** MindPalace targets offline collaborative analytics,
+not online OLTP concurrency control. Its correctness model permits manual
+merge choices and branch semantics that ordinary SQL clients do not expect.
+The paper's main theorem is sufficient but not necessary, so it can still
+flag some auto-mergeable histories as conflicts. The prototype is Python over
+PostgreSQL 10 and does not evaluate high-concurrency commit paths, WAL
+ordering, crash replay, secondary-index maintenance, triggers, foreign keys,
+or serializable predicate conflicts.
+
+The supported query model assumes deterministic, state-independent predicates
+or joins against read-only relations. Many production SQL updates depend on
+subqueries, constraints, indexes, generated columns, triggers, and catalog
+state. GPU DB should therefore treat auto-mergeability as a narrow
+route-proof tool for explicit templates, not as a generic permission to merge
+arbitrary SQL updates.
+
+**Benchmark candidates:**
+
+- Build a validation simulator for two prepared write histories. Compare
+  strict read/write conflict aborts with MindPalace-style predicate/value
+  commutativity checks. Metrics: false aborts, validation CPU time, p95 commit
+  latency, and identical final states.
+- Add route-certificate fields for `commutativity_class`,
+  `derived_conflict_predicate`, `conflict_predicate_empty`,
+  `validated_on_generation`, and `validation_fallback_reason`.
+- Test active-window batches where updates touch the same columns but write
+  the same final values or affect disjoint predicate-selected rows. Gate:
+  no additional visible outcomes versus serial execution.
+- Evaluate derived conflict predicates against CPU row state versus a
+  GPU-resident bitmap/filter summary. Expected win: validation speedup without
+  moving semantic authority to GPU execution workers.
+- Add a replay test where a batch was admitted because a derived conflict
+  predicate was empty. Failure condition: crash replay can expose a different
+  final tuple set than the committed serial order.
+- Stress unsupported SQL shapes, including state-dependent subqueries,
+  triggers, unique constraints, and foreign keys. Required result: explicit
+  fallback to strict validation, not silent auto-merge admission.

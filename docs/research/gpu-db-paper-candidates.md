@@ -4513,9 +4513,17 @@ Append new candidates here as each paper is processed.
   Why: GenericVC contrasts bolt-on relational versioning with a unified
   transaction/version layer; useful for deciding whether GPU DB old-version
   lineage should be a first-class MVCC structure or an external branch table.
-- `queued` — **MindPalace: Version Reconciliation for Collaborative
+- `reviewed` — **MindPalace: Version Reconciliation for Collaborative
   Databases**, Ranjan, Shang, Krishnan, and Elmore, SoCC 2021.
-  URL: `https://doi.org/10.1145/3472883.3486994`
+  URL: `https://doi.org/10.1145/3472883.3486980`
+  arXiv: `https://arxiv.org/abs/2110.01778`
   Why: GenericVC cites MindPalace's auto-mergeability as related
   reconciliation work; useful for comparing semantic merge rules against
   strict SQL validation and retained-snapshot correctness.
+- `queued` — **Skeena: Efficient and Consistent Cross-Engine Transactions**,
+  Zhang et al., arXiv 2021.
+  URL: `https://arxiv.org/abs/2108.00632`
+  Why: MindPalace's branch reconciliation raises the broader question of how
+  version and snapshot metadata crosses engines; Skeena is a modern
+  cross-engine transaction source for comparing lightweight snapshot tracking
+  and atomic commit across CPU, GPU, and cold-tier execution engines.
