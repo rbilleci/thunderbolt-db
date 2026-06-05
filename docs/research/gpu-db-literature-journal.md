@@ -68406,3 +68406,211 @@ full image materialization.
   occurs after a virtual frontier is named but before snapshot
   materialization finishes, recovery must either discard the snapshot
   or reconstruct it from WAL and committed generation metadata.
+
+### 2026-06-05 - CPU/GPU placement needs an explicit route taxonomy
+
+**Citation:** Marcos N. L. Carvalho, Alkis Simitsis, Anna Queralt,
+and Oscar Romero. "Workload Placement on Heterogeneous CPU-GPU
+Systems." PVLDB 17(12), 2024, pp. 4241-4244.
+doi:10.14778/3685800.3685845. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol17/p4241-carvalho.pdf`.
+
+**Category:** query optimization / planning; GPU execution and
+batching; multi-tier cache / data placement.
+
+**Relevance tags:** CPU/GPU route choice; heterogeneous placement;
+data shipping; function shipping; GPU cache policy; cost models;
+learned placement; task granularity; runtime placement; code
+management.
+
+**Core idea:** This PVLDB tutorial is a compact taxonomy rather than
+a new DBMS implementation. It frames heterogeneous CPU/GPU systems
+around the placement decision: what work should run on CPU or GPU,
+how much data movement the decision causes, how runtime cost is
+estimated, and how much device-specific code must be maintained.
+The useful contribution for GPU DB is the checklist: placement is not
+one optimizer knob. It has strategy, cache policy, granularity, timing,
+decision automation, prediction model, monitored objective, and code
+management dimensions.
+
+The paper studies 77 CPU/GPU workload-placement papers from 2009 to
+2024 and presents an abridged taxonomy. Its strongest warning is that
+choosing the "fastest processor" can lose to the data-transfer cost,
+while choosing "where the data already is" can lose to a poorly matched
+processor. Good placement must balance processor fit, data locality,
+runtime load, memory capacity, implementation availability, and the
+metric being optimized. The paper does not report a new GPU DB
+benchmark, so its transferable value is design structure, not a
+performance number.
+
+**Concrete mechanisms:**
+
+- Placement strategy is split into data shipping and function shipping.
+  Data shipping first assigns work to the processor with the best
+  estimated execution cost, then moves data there. Function shipping
+  sends the function to the processor or memory tier that already holds
+  the data, reducing movement but sometimes using a less suitable
+  processor.
+- Function-shipping designs often rely on off-chip caches. The paper
+  groups cache policies as frequency-based, greedy-based,
+  semantic-aware, or no caching. GPU caches have high bandwidth but
+  smaller capacity, so placement needs both a victim policy and a
+  choice of CPU versus GPU cache residency.
+- Placement granularity ranges from job and application level down to
+  task, function, pipeline, segment, and bit-level placement. The
+  taxonomy observes that most approaches use task-level placement as a
+  practical balance between generality and application-specific detail.
+- Placement time is classified as runtime, compilation-time, or hybrid.
+  Runtime placement can react to load, memory use, and out-of-memory
+  events, but has fewer factors available. Static placement can use more
+  expensive global analysis, but depends on estimates such as
+  cardinality and may miss runtime changes.
+- Placement decisions may be automatic, semi-automatic, or manual.
+  Automatic designs generally rely on cost models, heuristics, or
+  learned models; semi-automatic designs automate placement but still
+  require tuning; manual placement depends on developer profiling.
+- Prediction models are cost-based, heuristic-based, or learned.
+  Cost models are often tailored to one hardware or workload setting.
+  Heuristics commonly route low-parallelism work to CPUs and
+  high-parallelism work to GPUs. Learned placement uses historical
+  execution logs, but the paper calls out training cost and
+  catastrophic-forgetting risk.
+- Monitored objectives include latency, throughput, energy, and price.
+  Latency is the dominant metric in the taxonomy, but comparing systems
+  that optimize different metrics is itself a design problem.
+- Heterogeneous code management is classified into kernel templates,
+  compilers, and raw kernels. Templates improve productivity but limit
+  tuning; compilers give more flexibility from higher-level code; raw
+  CUDA/HIP/SYCL/OpenCL kernels maximize control at the cost of
+  specialized engineering effort.
+- Open issues named by the paper include complex performance
+  prediction, non-linear and conflicting factors, load imbalance,
+  expensive learned-model training, lack of automated fine tuning, and
+  the need for suitable benchmarks and simulators for comparing
+  strategies.
+
+**GPU DB mapping:** The current P8 route contract should become a
+multi-dimensional placement certificate, not only "resident GPU route
+accepted." For every supported read path, the planner should record:
+placement strategy, expected data movement, resident data location,
+cache policy, route granularity, placement time, decision source,
+prediction model, optimization objective, and code path. A retained
+lookup, resident aggregate, over-resident scan, CPU fallback, refresh,
+and COPY admission path should therefore carry comparable facts even
+when they end up on different processors.
+
+Data shipping versus function shipping maps directly to P8. A cold GPU
+transfer route is data shipping: move selected CPU data to the GPU
+because the kernel is expected to win. A retained resident route is
+function shipping: execute the function where the GPU data already is.
+Warm CPU scans, NVMe-backed segments, future CXL tiers, and GPUDirect
+paths should be classified the same way so route telemetry can explain
+whether latency came from transfer, execution, queueing, or placement
+error.
+
+Placement granularity is a benchmark design guide. GPU DB should avoid
+only table-level or query-level decisions. The natural granularity for
+the current architecture is route-shaped tasks: same snapshot
+generation, relation/partition identity, selected columns, predicate
+family, output shape, and resource budget. That gives the runtime a
+unit small enough to micro-batch and large enough to avoid per-row
+placement overhead.
+
+The placement-time taxonomy fits the separation between the storage
+planner and high-throughput runtime. The planner can make a static or
+compile-time-like route decision from catalog, residency, shape, and
+estimated bytes. The runtime can revise that decision with dynamic
+signals such as GPU queue depth, pinned-buffer pressure, response-ring
+capacity, memory pressure, and resident refresh lag. This argues for a
+hybrid decision record: planned route plus runtime admission outcome,
+not a single opaque GPU/CPU choice.
+
+The code-management point is also practical. For first P8 kernels, raw
+CUDA is justified for retained aggregate/lookup kernels where tight
+control over memory traffic matters. For broader CPU fallback and
+future heterogeneous warm-tier operators, the engine should keep a
+template or code-generation path under consideration so every new SQL
+shape does not require separate hand-written CPU, GPU, and tier-specific
+kernels before it can be measured.
+
+**Risks and mismatches:** This is a four-page tutorial proposal and
+taxonomy, not a full experimental paper. It does not provide a new
+placement algorithm, DBMS implementation, or evaluated CPU/GPU
+benchmark. Its taxonomy includes work outside databases, so the
+mapping to SQL correctness, MVCC, WAL-before-visibility, pgwire
+ordering, and retained snapshot invalidation is inferential. Some cited
+approaches target iGPUs, HPC workflows, ML training, graph processing,
+or stream processing rather than a PostgreSQL-compatible transactional
+engine. Finally, the paper emphasizes CPU-dGPU systems, while future GPU
+DB tiers may include NVMe, CXL, DPUs, multi-GPU fabrics, and remote
+memory, which need additional dimensions.
+
+**Benchmark candidates:**
+
+- Extend resident-route telemetry with a placement certificate:
+  strategy, granularity, placement time, decision source, prediction
+  model, objective, resident bytes, H2D/D2H bytes, queue pressure, and
+  code path. Gate: every accepted, rejected, and fallback route reports
+  comparable placement facts.
+- Add a data-shipping versus function-shipping benchmark for the same
+  query shapes. Compare CPU scan, cold GPU transfer, retained GPU
+  execution, and warm CPU/GPU split under growing selected bytes and
+  queue pressure.
+- Build a hybrid placement replay test: planner chooses a GPU route,
+  runtime admission changes it because queue or memory pressure exceeds
+  a threshold, and the route record explains the revised outcome without
+  changing query results.
+- Measure route granularity: table-level resident decisions versus
+  route-shaped decisions for lookup, aggregate, projection, and grouped
+  aggregate workloads. Failure condition: coarse placement hides
+  transfer or queue costs and causes worse p99 latency for one shape.
+- Compare heuristic placement rules against measured-cost placement for
+  retained routes: low selectivity CPU, high parallelism GPU, no
+  transfer retained GPU, saturated GPU fallback. Minimum gate: route
+  decisions remain explainable and do not regress correctness.
+- Track code-path maintenance cost in benchmark metadata: raw retained
+  kernel, generated CPU fallback, vectorized CPU path, or template
+  kernel. This is not a performance metric alone; it helps decide which
+  SQL shapes deserve raw GPU specialization.
+
+### 2026-06-05 - Cross-paper synthesis: routes need placement, flow, and frontier proofs
+
+Recent papers converge on a stronger route contract. COCO shows that
+commit and replication can be batched into epoch barriers, but only if
+the barrier is explicit. Ultra Ethernet shows that large-scale
+communication needs separate flow-control signals for sender, receiver,
+fabric, and destination pressure. Consistent snapshot algorithms show
+that publication spikes matter as much as average throughput. Workload
+Placement on Heterogeneous CPU-GPU Systems adds that CPU/GPU routing is
+a multi-dimensional placement decision, not simply a GPU preference.
+
+The design track is now a route certificate with three proof families:
+frontier proof, placement proof, and flow proof. Frontier proof names
+the WAL, MVCC, catalog, residency, and snapshot generation that make a
+route correct. Placement proof explains why the route runs on CPU, GPU,
+resident GPU memory, cold transfer, warm tier, or future fabric. Flow
+proof names the bounded resources that admit the route: command slots,
+response slots, pinned buffers, GPU queue depth, D2H bytes, refresh
+debt, and client write pressure.
+
+Category gaps remain around production-grade heterogeneous placement
+and warm-tier code generation. The queue has plenty of GPU analytics
+and networking work, but the next high-value papers should keep mixing
+transaction/runtime work with placement, index, and HTAP sources. Good
+next candidates include Adaptive Compression for Databases, RateupDB,
+Parla, Bwe-tree if a primary full text is accessible, and VLL or
+Harmony if the loop needs more OLTP/MVCC balance.
+
+Benchmark priorities:
+
+- Add route certificates that include frontier, placement, and flow
+  proof fields for accepted, fallback, and rejected routes.
+- Measure publication p999 and route-admission p999 together, because a
+  cheap GPU kernel is not useful if snapshot or flow-control boundaries
+  spike.
+- Run CPU/GPU placement benchmarks across retained, cold-transfer,
+  CPU-fallback, and split routes with the same query shapes and explicit
+  transfer-byte accounting.
+- Treat route admission as receiver-credit flow control: a GPU or
+  response owner grants work based on destination capacity, not only
+  on the caller's desire to submit work.

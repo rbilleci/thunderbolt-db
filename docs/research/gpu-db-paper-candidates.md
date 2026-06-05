@@ -3818,14 +3818,14 @@ Append new candidates here as each paper is processed.
   disk-backed analytics; useful for comparing cache-placement decisions against
   GOLAP-style compressed SSD-to-GPU streaming and GPU DB's explicit residency
   manager.
-- `queued` — **Workload Placement on Heterogeneous CPU-GPU Systems**,
+- `reviewed` — **Workload Placement on Heterogeneous CPU-GPU Systems**,
   Carvalho, Simitsis, Queralt, and Romero, PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p4241-carvalho.pdf`
   DOI: `https://doi.org/10.14778/3685800.3685845`
   Why: modern tutorial and taxonomy for CPU/GPU placement strategies, cost
   prediction, placement granularity, and code-management choices; useful for
   turning HetCache-style access-path hints into a broader route-placement
-  contract.
+  contract. Journal entry exists from 2026-06-05.
 - `queued` — **Adaptive Compression for Databases**, Windheuser et al.,
   EDBT 2024.
   URL: `https://doi.org/10.48786/EDBT.2024.13`
@@ -3833,6 +3833,19 @@ Append new candidates here as each paper is processed.
   deciding whether GPU DB cold/warm segments should choose compression
   parameters from access statistics instead of a single fixed resident/cold
   format.
+- `queued` — **The Art of Balance: A RateupDB Experience of Building a
+  CPU/GPU Hybrid Database Product**, Lee et al., PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p2999-lee.pdf`
+  DOI: `https://doi.org/10.14778/3476311.3476372`
+  Why: cited by the CPU/GPU placement taxonomy as a product-oriented hybrid
+  database placement source; useful for comparing automatic route placement
+  against operator-tuned balance rules and production code-management costs.
+- `queued` — **Parla: A Python Orchestration System for Heterogeneous
+  Architectures**, Lee et al., SC 2022.
+  URL: `https://doi.org/10.1109/SC22.2022.00032`
+  Why: cited by the CPU/GPU placement taxonomy as a task-level heterogeneous
+  orchestration system; useful for comparing GPU DB owner rings with
+  dependency-aware runtime task placement across CPU and GPU resources.
 - `queued` — **ByteSlice: Pushing the Envelope of Main Memory Data
   Processing with a New Storage Layout**, Feng, Lo, Kao, and Xu, SIGMOD 2015.
   URL: `https://doi.org/10.1145/2723372.2747642`
