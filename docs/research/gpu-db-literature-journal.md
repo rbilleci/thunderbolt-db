@@ -62740,3 +62740,201 @@ Benchmark priorities:
   cross-owner ordering descriptors, and tier-pin failures.
 - Compare adaptive preflight bypass under low contention against mandatory
   preflight under hot-key or cold-tier contention.
+
+### 2026-06-05 - Hermes keeps HTAP freshness cheap with row-id deltas and mergeable columnar generations
+
+**Citation:** Tim Gubner, Rune Humborstad, and Manyi Lu. "Freely
+Moving Between the OLTP and OLAP Worlds: Hermes - an High-Performance
+OLAP Accelerator for MySQL." PVLDB 18(12), 2025, pp. 5113-5125.
+doi:10.14778/3750601.3750631. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol18/p5113-gubner.pdf`.
+
+**Category:** hybrid HTAP and multi-tier cache / data placement.
+
+**Relevance tags:** HTAP; MySQL acceleration; binlog replication;
+fresh analytical snapshots; delta/main storage; row-id filtering;
+columnar compression; update propagation; checkpointed read store;
+route offload; query compatibility; morsel-driven execution.
+
+**Core idea:** Hermes is a single-node analytical accelerator for
+MySQL. Instead of turning the OLTP system itself into a universal
+HTAP engine or moving moderate-size workloads into a distributed
+analytics cluster, it keeps MySQL as transactional authority and
+continuously replicates committed changes into a lean OLAP engine.
+Queries are still issued through MySQL; expensive supported queries
+are re-parsed and executed by Hermes, then returned to MySQL in
+Arrow format.
+
+The paper's strongest transferable idea is that HTAP freshness can
+be represented as a precise version mapping plus a cheap delta/main
+merge discipline. Hermes stores most rows in compressed columnar
+RowGroups, sends new modifications to an uncompressed row delta, and
+adds an intermediate columnar delta so random small updates do not
+force immediate rewrites of large compressed RowGroups. For a fresh
+analytical query, Hermes waits until the needed MySQL GTID has been
+replicated into a Hermes timestamp mapping; reported wait times are
+low milliseconds versus analytical runtimes that are usually hundreds
+of milliseconds or more.
+
+**Concrete mechanisms:**
+
+- Hermes subscribes to the MySQL binary log. Initial ingestion can
+  chunk and parallel-load table data directly into the Main store
+  when MySQL row order matches row ids, avoiding an immediate
+  delta-to-main rewrite.
+- Each replicated MySQL transaction receives a Hermes transaction id
+  and start timestamp. On commit, Hermes allocates a commit timestamp
+  from the same counter and records the GTID-to-HTID/timestamp
+  mapping that later queries use for snapshot selection.
+- Change propagation is pipelined through binlog parsing,
+  transformation into delta operations, and application to Hermes.
+  The implementation does not require strict GTID commit order when
+  transactions are independent; it tracks dependencies in a cyclic
+  buffer of recent transactions so some changes can commit
+  out-of-order internally while preserving the visible mapped state.
+- Main store data is horizontally partitioned into RowGroups and
+  then PaxGroups. PaxGroups are columnar and compressed inside
+  allocation units, with per-column metadata such as min/max
+  zonemaps stored out-of-band for pruning and optimization.
+- Compression is lightweight and SIMD-oriented. Integers and decimals
+  use frame-of-reference or dictionary compression with exceptions;
+  strings use dictionary compression. The best scheme is selected
+  when a RowGroup is created.
+- The row-based Delta contains a RowIdMap from MySQL row id to
+  physical RowSpace offset, an append-oriented RowSpace, UndoSpace
+  for reconstructing older versions, a DeleteLog for rows not present
+  in the Delta, and a string heap.
+- Updates use Hyper-like undo/version vectors. The latest Delta row
+  is updated in place, older versions are reconstructed through undo
+  entries, and row latches are taken from a hash of the row id.
+- Scans combine Main and Delta by filtering and appending rather than
+  probing the Delta for every Main row. Hermes first buffers visible
+  Delta rows and collects changed row ids, then scans the ordered Main
+  store while filtering changed row ids with a merge-style integer
+  algorithm, and finally emits Delta rows.
+- A Columnar Delta sits between row Delta and compressed Main store.
+  It stores the most recent committed rows and deleted-row list in
+  row-id order, reducing write amplification when uniformly random
+  changes touch many RowGroups.
+- Update propagation first moves row Delta data into Columnar Delta
+  and creates a new row Delta. Later, when size or time thresholds are
+  hit, Hermes merges Columnar Delta rows into matching Main RowGroups,
+  creating new RowGroup versions only for affected groups and reusing
+  pointers for unchanged groups.
+- Garbage collection is coarse-grained. Old row Deltas are dropped
+  once no active transaction can need them; Columnar Deltas are
+  dropped after merge; Main store versions keep only the newest
+  version or the last one still needed by active transactions.
+- Checkpointing uses Main store RowGroup versions to determine which
+  RowGroups changed since the previous checkpoint. The paper's
+  evaluation focuses on the main-memory setup, while noting that
+  Hermes can offload Main store parts to object storage and cache hot
+  data in memory.
+- The query engine uses vectorized execution, AVX-512 filters,
+  micro-adaptive full-vector shortcuts, and morsel-driven parallelism.
+  MySQL performs initial parse/optimization and offload checks;
+  Hermes receives annotated SQL that handles MySQL-specific semantics
+  such as implicit casts.
+- Evaluation reports TPC-H SF100 speedups of 2-3 orders of magnitude
+  over MySQL and total runtime about 1.9x faster than reported
+  four-node PolarDB-IMCI numbers. On TPC-H SF1000, Hermes reports all
+  22 queries complete and total runtime again about 1.9x faster than
+  PolarDB-IMCI. Replication throughput peaks around 60k single
+  inserts/updates per second on an i9-13900K-class machine, while
+  compound transactions process more bytes per second but fewer
+  transactions per second.
+- In the update-scan microbenchmark, no-update scans run at about
+  11.5 cycles per row over ten 64-bit payload columns. Scan overhead
+  remains roughly modest below 0.2% modified rows, roughly doubles by
+  1% modified rows, and reaches about 4x by 3% modified rows. Hermes
+  therefore tries to merge eagerly enough to keep deltas small.
+
+**GPU DB mapping:** Hermes strengthens the P8 direction that GPU
+resident analytical state should be an accelerator copy with explicit
+freshness metadata, not the durable authority. For GPU DB, the
+equivalent of the GTID-to-HTID mapping is a WAL/transaction boundary
+mapped to a resident snapshot generation. A retained GPU read should
+know exactly which WAL boundary, schema generation, visibility
+frontier, and resident segment generation it is reading.
+
+The delta/main merge design maps directly to GPU resident segments.
+The current P8 first slice can keep CPU MVCC row truth and build
+compressed GPU column groups, but Hermes argues for an intermediate
+delta layer that is already scan-friendly before a full resident
+rebuild. GPU DB could benchmark three read inputs: immutable resident
+main segments, a small GPU- or host-columnar committed delta, and a
+row/MVCC delta for very fresh writes. A query route would filter old
+main rows using changed row ids, then append eligible delta rows,
+instead of invalidating the entire resident table after every write.
+
+The row-id merge filter is especially relevant to P8's key-vector and
+resident snapshot design. If tuple ids or row ordinals are stable
+inside a resident generation, changed-row masks can be represented as
+sorted row-id vectors, bitmaps, or small GPU-friendly overlays. That
+would let fresh retained scans avoid per-row hash lookups against a
+mutation table, while still proving that updated/deleted rows from
+the main segment are hidden.
+
+Hermes also gives a practical freshness policy: wait for replication
+only when the query asks for a newer version than the accelerator has
+reached. GPU DB can express the same rule for retained snapshots:
+execute immediately on the newest compatible resident generation, or
+wait/fallback when a session requires a WAL boundary or read
+timestamp not yet built into resident state. That wait should be
+reported separately from GPU queue wait and kernel time.
+
+The Columnar Delta is a useful middle ground for P8 refresh. A full
+GPU-resident rebuild may have too much write amplification under
+random updates, while a row delta may be too slow for scans. A
+host-columnar or device-columnar delta, ordered by stable row id, can
+absorb recent changes and be merged into main resident segments at a
+threshold chosen by delta scan overhead, refresh cost, and memory
+budget.
+
+Finally, Hermes' MySQL integration is a reminder that offload routing
+has semantic costs. GPU DB's PostgreSQL-compatible routes should
+carry a "supported semantics" certificate, including type casts,
+collations, null behavior, visibility boundary, and output format.
+Fast routes that cannot prove equivalence should fall back rather
+than approximate the SQL behavior.
+
+**Risks and mismatches:** Hermes is CPU-only and single-node. It does
+not evaluate CUDA launch costs, GPU memory pressure, pinned buffers,
+GPU/CPU transfer, NVMe tiers, or million-session admission. Its OLTP
+truth is MySQL, so Hermes does not own WAL-before-visibility or the
+primary transaction path in the same way GPU DB does. The row-id
+strategy depends on stable externally supplied row ids and on most
+updates remaining a small fraction of each table; GPU DB may need
+different overlays for HOT updates, tuple movement, compaction, or
+partition remastering. The scan-with-updates result shows that delta
+overhead grows quickly by 1-3% modified rows, so a retained-GPU
+design cannot rely on deltas indefinitely. The reported performance
+numbers compare against selected external PolarDB figures and a
+single MySQL version; the transferable claim is the storage/freshness
+shape, not the absolute speedup.
+
+**Benchmark candidates:**
+
+- Build a retained-snapshot freshness map from WAL transaction
+  boundary to resident generation. Gate: a read requiring a newer
+  boundary waits, falls back, or rejects explicitly; it never reads a
+  stale resident generation.
+- Prototype a main-plus-delta retained scan: resident main segment,
+  sorted changed-row-id filter, and appended committed delta rows.
+  Compare per-row hash probing, sorted row-id merge, and bitmap
+  overlays on update ratios from 0.01% to 5%.
+- Add a Columnar Delta refresh slice for one `int4`/`text` table:
+  row/MVCC delta to host-columnar delta to GPU-resident main segment.
+  Measure write amplification, refresh latency, retained read p99,
+  and bytes moved across CPU/GPU boundaries.
+- Add a delta-size admission policy: keep retained GPU scans on the
+  accelerator below a measured delta threshold, switch to CPU or wait
+  for refresh above it, and record the reason in route telemetry.
+- Benchmark row-id stability under update/delete/compaction. Failure
+  condition: changed-row overlays cannot prove which main-segment
+  rows to filter after compaction or snapshot retirement.
+- Add semantic route certificates for accelerated PostgreSQL queries:
+  visibility frontier, schema generation, type/cast support, collation
+  support, null behavior, output format, and fallback reason. Proof
+  gate: accelerated and owner-routed CPU results match on adversarial
+  cast/null/text-prefix cases.

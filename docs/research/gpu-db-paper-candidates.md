@@ -978,13 +978,27 @@ Append new candidates here as each paper is processed.
   Why: source design for the GPU-PGM paper; useful for understanding update,
   error-bound, and space guarantees before adapting a learned index to MVCC
   resident snapshots.
-- `queued` — **Freely Moving Between the OLTP and OLAP Worlds**, Gubner et al.,
+- `reviewed` — **Freely Moving Between the OLTP and OLAP Worlds**, Gubner et al.,
   PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p5113-gubner.pdf`
   Why: modern SQL Server/Azure SQL HTAP follow-up cited by the search path for
   SQL Server real-time analytics; useful for comparing newer hot/cold
   movement, analytical freshness, and operational workload isolation against
   the 2015 columnstore-on-OLTP design.
+- `queued` — **PolarDB-IMCI: A Cloud-Native HTAP Database System at Alibaba**,
+  Wang et al., SIGMOD 2023.
+  URL: `https://arxiv.org/abs/2305.08468`
+  PDF: `https://haozesong.github.io/data/sigmod23-polar.pdf`
+  Why: Hermes compares against PolarDB-IMCI's cloud-native analytical
+  accelerator; useful for contrasting row-id mapping, log replication, vector
+  execution, and multi-node HTAP placement against a single-node accelerator.
+- `queued` — **ByteHTAP: ByteDance's HTAP System with High Data Freshness and
+  Strong Data Consistency**, Chen et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p3411-chen.pdf`
+  DOI: `https://doi.org/10.14778/3554821.3554832`
+  Why: Hermes directly compares its delta/main-store merge strategy with
+  ByteHTAP; useful for evaluating shared-storage HTAP, freshness thresholds,
+  delete bitmaps, and storage-layer pushdown against GPU DB retained snapshots.
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
