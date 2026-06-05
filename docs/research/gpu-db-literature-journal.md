@@ -69303,3 +69303,155 @@ under 1M logical sessions and many admitted tables.
   undo, invalidation, and snapshot retirement should either reserve buffers or
   use a separately measured overflow path rather than failing behind cold scan
   prefetch.
+
+### 2026-06-05 - SKQ makes event delivery a schedulable resource
+
+**Citation:** Siyao Zhao, Haoyu Gu, and Ali Jose Mashtizadeh. "SKQ: Event
+Scheduling for Optimizing Tail Latency in a Traditional OS Kernel." USENIX ATC
+2021, pp. 759-772. Retrieved 2026-06-05 from USENIX,
+`https://www.usenix.org/conference/atc21/presentation/zhao-siyao` and
+`https://www.usenix.org/system/files/atc21-zhao.pdf`.
+
+**Category:** runtime / HFT / session scale; high-concurrency networking and
+admission.
+
+**Relevance tags:** event scheduling; tail latency; kernel event queues;
+connection affinity; workload imbalance; priority delivery; epoll/kqueue
+analogs; pgwire IO workers; response-ring scheduling; overload control.
+
+**Core idea:** SKQ redesigns FreeBSD Kqueue so event-driven applications can
+share one scalable event facility across many worker threads while still
+controlling where and when events are delivered. The paper argues that
+traditional event APIs force an awkward choice: one queue per thread preserves
+connection affinity but makes migration and balancing expensive, while one
+shared queue balances work but creates lock contention and destroys cache
+locality. SKQ exposes a shared event object to the application, but internally
+uses per-thread event queues plus a scheduler that chooses a target queue on
+each event activation.
+
+For GPU DB, the transferable lesson is that "event loop" is not one generic
+queue. Socket readiness, decoded frontend messages, response writes, retained
+read completions, COPY chunks, and overload notices each need a delivery policy:
+affinity when cache and ownership matter, balancing when service time is
+skewed, and priority when a latency-sensitive route must not wait behind bulk
+or background work.
+
+**Concrete mechanisms:**
+
+- SKQ replaces Kqueue's single activated-event queue and large lock with
+  lightweight per-thread `kevq` queues inside one shared SKQ object. Worker
+  threads retrieve events from their private queue, reducing multicore lock
+  contention while preserving the application's shared-event programming model.
+- The event scheduler runs on every event activation, so the paper keeps the
+  policy state compact and explicitly trades scheduling optimality against
+  activation overhead.
+- Queue-affinity scheduling sends a connection's events back to the core where
+  the event first fired. This preserves userspace cache locality when
+  connections are stable.
+- CPU-affinity scheduling sends socket events to the worker local to the core
+  that processed the NIC interrupt and packet. This follows RSS or kernel
+  connection migration and reduces the mismatch between kernel packet handling
+  and userspace event processing.
+- A `kqdom` topology tree tracks cores, shared caches, and NUMA domains. When
+  a worker moves between cores, its `kevq` moves in the topology tree.
+- Best-of-two load balancing randomly samples two queues and chooses the one
+  with lower expected wait time. The wait estimate uses queued events, events
+  returned to userspace by the last event query, the last query timestamp, and
+  an exponentially smoothed average processing time per event.
+- Work stealing runs when a worker would otherwise block. It uses trylocks,
+  bounded scans, and a "stolen" flag to avoid queue-lock contention and event
+  bouncing between idle workers.
+- Hybrid policies combine cache locality and balancing by considering the
+  affinity target plus a sampled alternative, then applying a cache-miss
+  penalty before moving work away from the local target.
+- Event pinning lets applications force individual control events to a specific
+  thread when migration would break application-level coordination.
+- Event prioritization adds separate high-priority queues. `rtshare` bounds the
+  fraction of high-priority events returned per call to reduce starvation, and
+  `rtfreq` bounds how long a worker can process a large batch before checking
+  again for high-priority events.
+- The implementation modifies FreeBSD 13 and includes SKQ-aware event
+  libraries. Evaluation covers microbenchmarks, Memcached, RocksDB, a custom
+  application server, a web server, and a comparison with Shenango.
+- Reported results include linear scalability for shared SKQ where shared
+  Kqueue collapses under lock contention, lower L2 misses for cache-affinity
+  policies, 27.4x more low-latency throughput on a RocksDB/ZippyDB workload,
+  and 8x lower latency for a high-priority client at saturation with little
+  impact on regular clients. The absolute numbers are FreeBSD and benchmark
+  specific.
+
+**GPU DB mapping:** The current runtime target already splits network IO
+workers, command rings, owner domains, GPU execution workers, and response
+rings. SKQ suggests making the scheduling policy explicit at each boundary
+instead of letting FIFO channels decide all delivery. Pgwire socket readiness
+should prefer CPU/cache affinity when requests are short and uniform; decoded
+work should move to a balancing policy when service time is skewed by SEEK-like
+operations, cold-page faults, CPU fallback, long prefix scans, or GPU queue
+waits.
+
+The best-of-two wait estimator maps well to owner and response rings. Each
+ring can expose queue depth, last drain time, last drained count, and moving
+average service time. A network worker can then decide whether to keep a
+session on its local IO path, enqueue to a sibling worker, or reject/fallback
+because estimated wait exceeds the route's latency budget.
+
+Event priority is directly relevant to 1M logical sessions. High-priority
+control messages, cancellation, short retained point reads, transaction
+commit/abort responses, and overload responses should not be trapped behind
+large COPY chunks, cold scans, refresh completions, or batched response writes.
+The important part is the pair of controls: a share cap to prevent starvation
+and a polling frequency or batch ceiling so new urgent events are seen quickly.
+
+Event pinning maps to owner-domain correctness. Some events must not migrate:
+mutation-owner commands that preserve WAL-before-visibility, catalog
+publication, pinned CUDA stream completions, and per-session protocol state
+that is not yet safely shareable. SKQ's model is useful because it does not
+pretend all events can be balanced; it lets the application name which events
+require affinity or pinning.
+
+The CPU-affinity result is a warning for pgwire and future kernel-bypass work.
+If Linux RSS, socket steering, or io_uring completion placement handles packets
+on one core while the application responds on another, the engine can lose tail
+latency through avoidable cache misses before SQL execution begins. Runtime
+telemetry should record socket/core affinity misses, not just SQL queue depth.
+
+**Risks and mismatches:** SKQ is a FreeBSD Kqueue design, while the GPU DB
+endpoint currently targets ordinary TCP/pgwire and may run on Linux epoll or
+io_uring. The mechanisms are therefore design evidence, not an implementation
+recipe. SKQ optimizes event delivery but does not address PostgreSQL protocol
+semantics, transaction isolation, WAL durability, CUDA stream ownership, or
+resident snapshot validity. Its priority model has only two levels; GPU DB may
+need route classes such as control, short retained read, mutation, COPY,
+refresh, cold scan, and background maintenance. The evaluation uses 12 server
+threads and 10 GbE-era hardware, far below 1M logical sessions and modern NIC
+speeds. Work stealing can also fight owner locality if applied blindly to
+stateful database domains.
+
+**Benchmark candidates:**
+
+- Add an event-delivery policy simulator for pgwire IO workers: local affinity,
+  best-of-two by estimated wait, work stealing, and pinned owner events.
+  Required metrics: queue wait, cache-affinity misses if observable, p50/p99
+  latency, throughput, and overload counts.
+- Add per-ring wait estimators modeled on SKQ: queued work, last drain
+  timestamp, last drained count, and moving-average service time. Gate: the
+  estimator predicts saturation early enough to reject or reroute before p99
+  spikes.
+- Build a mixed service-time pgwire benchmark with short point reads, long
+  prefix scans, cold CPU fallback, and COPY chunks. Compare FIFO per-worker
+  assignment against hybrid affinity plus balancing.
+- Prototype route-priority classes for response rings: control/error/cancel,
+  short retained read, mutation result, COPY acknowledgment, and background
+  refresh notification. Include a share cap and batch-frequency ceiling.
+  Failure condition: high-priority routes starve regular traffic or regular
+  routes can delay cancellation and overload responses unboundedly.
+- Add pinned-event tests for mutation owner, catalog owner, residency owner,
+  and GPU stream completions. Proof gate: balancing never moves correctness-
+  critical events away from their owner domain.
+- Record socket-to-worker affinity telemetry in the benchmark endpoint. If a
+  request is parsed on one worker but served or written from another, count the
+  handoff and measure whether it correlates with response tail latency.
+- Compare ordinary epoll, io_uring completions, and a simulated SKQ-style
+  delivery policy for the same logical workload before adopting kernel bypass.
+  Expected outcome: identify whether kernel event delivery or SQL owner queues
+  dominate the first tail-latency frontier.

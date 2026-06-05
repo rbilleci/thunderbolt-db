@@ -2183,7 +2183,7 @@ Append new candidates here as each paper is processed.
   Why: RingLeader contrasts against nanoPU-style CPU/network-interface
   redesign and per-service JBSQ; useful as a more radical endpoint for
   request dispatch, packet steering, and CPU/NIC co-design.
-- `queued` — **SKQ: Event Scheduling for Optimizing Tail Latency in a
+- `reviewed` — **SKQ: Event Scheduling for Optimizing Tail Latency in a
   Traditional OS Kernel**, Zhao, Gu, and Mashtizadeh, USENIX ATC 2021.
   URL: `https://www.usenix.org/conference/atc21/presentation/zhao-siyao`
   PDF: `https://www.usenix.org/system/files/atc21-zhao.pdf`
@@ -5492,3 +5492,10 @@ Append new candidates here as each paper is processed.
   useful for comparing byte-compatible hot/warm structures against persistent
   memory placement, restart, and tier-specific durability behavior before GPU
   DB adds future CXL/NVM tiers.
+- `queued` — **Characterizing, Modeling, and Benchmarking RocksDB Key-Value
+  Workloads at Facebook**, Cao et al., FAST 2020.
+  URL: `https://www.usenix.org/conference/fast20/presentation/cao-zhichao`
+  Why: SKQ's RocksDB evaluation uses the ZippyDB workload model from this
+  paper; useful for constructing realistic GET/SEEK/PUT service-time mixes,
+  skewed tail-latency probes, and storage-adjacent runtime benchmarks before
+  testing GPU DB pgwire/event-loop admission against only synthetic clients.
