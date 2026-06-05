@@ -67440,3 +67440,158 @@ boundaries without becoming the bottleneck for retained reads.
 - Keep GPU route benchmarks honest by requiring both correctness certificates
   and density estimates before a resident or streamed route enters the GPU
   execution queue.
+
+### 2026-06-05 - Snapper mixes deterministic batches with dynamic transactions
+
+**Citation:** Yijian Liu, Li Su, Vivek Shah, Yongluan Zhou, and Marcos
+Antonio Vaz Salles. "Hybrid Deterministic and Nondeterministic Execution of
+Transactions in Actor Systems." SIGMOD 2022, pp. 65-78.
+doi:10.1145/3514221.3526172. Retrieved 2026-06-05 from the University of
+Copenhagen author PDF,
+`https://hjemmesider.diku.dk/~vmarcos/pubs/LSS_22-hybridtxnsactors.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale; commit protocols.
+
+**Relevance tags:** deterministic scheduling; actor transactions; hybrid
+concurrency control; batch commit; 2PC; WAL-before-message; hot-key skew;
+serializability check; owner domains; transaction admission lanes.
+
+**Core idea:** Snapper observes that many actor-system transactions know their
+participating actors and per-actor access counts before execution. It exposes
+those requests as predeclared actor transactions (PACTs), assigns them a global
+deterministic order, and lets each actor execute only the relevant sub-batches
+in that order. Transactions that cannot predeclare their actor set run as
+ordinary actor transactions (ACTs) under nondeterministic S2PL plus 2PC.
+
+The interesting part for GPU DB is the hybrid rule: a system can keep a fast
+deterministic lane for known-shape hot work while still allowing dynamic
+transactions, but the dynamic lane must carry extra dependency metadata and be
+willing to abort when it cannot prove a serializable position between
+deterministic batches. Snapper's evaluation is not a database-storage result,
+but it is a useful owner-domain scheduling result. On SmallBank and TPC-C
+variants, PACTs outperform ACTs under skew because batching amortizes messages
+and logging while avoiding conflict aborts; hybrid execution stays close to the
+deterministic path only when the ACT fraction is small.
+
+**Concrete mechanisms:**
+
+- Snapper provides two transaction APIs. PACTs predeclare the initiating actor,
+  first method/input, participating actor ids, and number of accesses per actor.
+  ACTs declare only the initiating method/input and discover participants while
+  executing.
+- Coordinators assign PACT transaction ids in a global monotonically increasing
+  order using a token ring. Each coordinator accumulates requests while waiting
+  for the token, forms a batch when the token arrives, assigns tids, and passes
+  the token on without waiting for that batch to finish.
+- A PACT batch is split into actor-local sub-batches. Each sub-batch carries
+  `bid`, `prev_bid`, and the PACT ids/access counts relevant to that actor, so
+  actors can repair out-of-order message arrival into a local ordered schedule.
+- Actor method calls for a PACT can arrive before their scheduled turn. The
+  actor suspends that invocation and, because Orleans reentrancy is enabled,
+  can process other turns while waiting for the deterministic schedule to
+  unblock it.
+- PACTs are speculatively executed after previous sub-batches on that actor
+  complete operations, before prior batches globally commit. This pipelines
+  execution but creates cascading abort risk if a PACT raises an exception.
+- PACT commit is batch-level. Batch messages act like prepare, actors respond
+  with `BatchComplete`, and the coordinator sends `BatchCommit` after all
+  participating actors vote. Snapper commits all batches in `bid` order instead
+  of maintaining a precise dependency graph.
+- WAL records are written before messages: coordinators log batch participant
+  information before emitting a batch and committed batch ids before commit
+  messages; actors log updated state before `BatchComplete`. Read-only actor
+  participation does not need state logging.
+- ACTs use S2PL with wait-die deadlock avoidance, then 2PC with presumed abort.
+  The first actor that initiated the ACT coordinates 2PC after participant
+  information is propagated back along the call chain.
+- Hybrid scheduling inserts ACTs dynamically between adjacent PACT batches in
+  each actor's local schedule. An ACT may execute after the previous batch has
+  completed operations; a following PACT batch waits until previous ACTs on the
+  actor have committed or aborted.
+- Hybrid deadlocks are resolved by prioritizing PACTs and aborting ACTs. The
+  implementation uses timeout detection.
+- Hybrid serializability is checked with `BeforeSet` and `AfterSet` metadata for
+  each ACT. The required condition is that the maximum deterministic batch that
+  precedes the ACT is less than the minimum deterministic batch that follows it.
+  If the after-set is incomplete and the optimization for already-committed
+  before batches does not apply, the ACT aborts rather than risk a cycle.
+- Evaluation uses SmallBank MultiTransfer and a TPC-C NewOrder variant on AWS
+  c5n instances. The paper reports PACT throughput up to 2x ACT throughput
+  under skew, ACT abort rates reaching 90% at transaction size 64 in one
+  experiment, PACT logging throughput around 70% of no-logging versus 50% for
+  ACT, and near-linear scaling to 32 cores under low-skew workloads.
+
+**GPU DB mapping:** Snapper maps naturally onto the owner-domain runtime. GPU
+DB should not force every write through one concurrency-control shape. Known
+prepared writes, COPY chunks, single-partition mutations, refresh-publication
+steps, and repeated retained lookup batches can use a deterministic or
+owner-ordered lane with predeclared read/write or partition touches. Dynamic SQL
+transactions, ad hoc multi-partition writes, or queries whose touched keys are
+discovered after reads belong in a nondeterministic lane with stricter
+validation, possible abort, and lower scheduling priority under contention.
+
+The predeclared actor-access count is a concrete route-certificate field. For
+GPU DB, the equivalent is not "actor id" but mutation partition, table, key
+range, catalog generation, resident generation, and number/type of owner
+touches. A prepared transaction whose certificate says it will touch
+partition A once and partition B once can be admitted to an ordered batch. A
+transaction that discovers more touches than declared must leave the fast lane
+or abort cleanly.
+
+Snapper's `prev_bid` chain is also a useful model for partition-local
+visibility frontiers. A global transaction generation can be sparse for any
+given partition; the partition owner only needs to know its previous relevant
+generation to execute ordered local work. That fits retained GPU snapshots:
+each resident partition can publish a local frontier chain instead of forcing
+every global generation into every partition's hot path.
+
+The hybrid ACT serializability check is a warning for fallback paths. If a
+dynamic CPU transaction interleaves around a deterministic GPU/owner batch, the
+engine needs a proof of where that dynamic transaction sits relative to the
+batch's visibility frontier. If the proof is incomplete, aborting or retrying
+the dynamic transaction is safer than letting it observe a half-ordered state.
+
+Snapper's WAL-before-message discipline reinforces the current design. GPU DB's
+mutation owners should log enough batch/participant/visibility state before
+publishing messages that unblock other owners or resident refresh. Auxiliary
+GPU buffers and route descriptors can be rebuilt, but the commit decision and
+visibility frontier must survive coordinator or owner failure.
+
+**Risks and mismatches:** Snapper targets actor-system state, not a SQL storage
+engine. Its state logging is coarse and the authors explicitly note that
+logging whole actor blobs hurts TPC-C; GPU DB needs tuple/segment/delta logging,
+not actor-value snapshots. The paper evaluates single-server actor
+transactions; distributed placement, coordinator locality, and hierarchical
+ordering are future work. PACTs require accurate predeclaration and can suffer
+cascading aborts if user logic aborts late. Hybrid execution works best when
+dynamic ACTs are a small fraction; a workload with many ad hoc SQL transactions
+could spend too much time in abort/retry or block deterministic batches. The
+reported latencies are actor-library latencies on small AWS instances, not GPU
+kernel, WAL fsync, NVMe, or pgwire measurements.
+
+**Benchmark candidates:**
+
+- Add a two-lane write-path microbenchmark: predeclared single/multi-partition
+  writes in an owner-ordered batch lane versus dynamic writes in an optimistic
+  validation lane. Gate: deterministic lane preserves WAL-before-visibility and
+  dynamic lane either proves a serializable frontier or aborts.
+- Extend route certificates with declared owner touches: partition ids, key
+  ranges, catalog generation, resident generation, and touch counts. Failure
+  condition: a fast-lane transaction touches an undeclared owner without
+  fallback or abort.
+- Prototype sparse per-partition generation chains like `prev_bid`: global
+  batches advance only partitions they touch, and retained reads verify local
+  partition frontiers. Measure hot-partition throughput and cold-partition
+  metadata overhead.
+- Build a skewed hot-key benchmark with PACT-like ordered batches and ACT-like
+  dynamic fallback. Required metrics: committed throughput, abort/retry rate,
+  p50/p99 latency, batch size, queue wait, and WAL bytes per committed row.
+- Add a hybrid serializability stress harness where a dynamic transaction reads
+  before and writes after an ordered batch on different partitions. Gate: the
+  system rejects or retries incomplete frontier proofs rather than accepting a
+  cyclic history.
+- Compare batch commit publication policies: commit all batches in global
+  generation order versus precise dependency frontiers per owner. Expected win:
+  less cross-partition head-of-line blocking for sparse multi-partition writes;
+  failure condition: retained reads can observe incompatible owner frontiers.

@@ -4197,9 +4197,10 @@ Append new candidates here as each paper is processed.
   Why: ACC cites Leopard as online partitioning for dynamic datasets; useful
   for comparing lightweight scoring and incremental boundary changes against
   route-descriptor based hot-key clustering.
-- `queued` — **Hybrid Deterministic and Nondeterministic Execution of
+- `reviewed` — **Hybrid Deterministic and Nondeterministic Execution of
   Transactions in Actor Systems**, Liu et al., SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526172`
+  PDF: `https://hjemmesider.diku.dk/~vmarcos/pubs/LSS_22-hybridtxnsactors.pdf`
   Why: HDCC contrasts against Snapper's batch-level Calvin/2PL validation;
   useful for comparing coarse batch validation with finer per-transaction
   dependency tracking when GPU DB mixes deterministic batches and optimistic
@@ -5338,3 +5339,16 @@ Append new candidates here as each paper is processed.
   Why: HorseQC's CoGaDB integration reuses Hawk-style code generation; useful
   for route-specific CPU/GPU codegen without tying planner correctness to one
   hardware backend.
+- `queued` — **Reactors: A Case for Predictable, Virtualized Actor Database
+  Systems**, Shah and Vaz Salles, SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3190663`
+  Why: Snapper uses actor-database work as its programming-model baseline;
+  useful for comparing actor-style owner domains, predictable virtualized
+  state, and transaction placement against GPU DB partition owners.
+- `queued` — **Epoch-based Commit and Replication in Distributed OLTP
+  Databases**, Lu, Yu, Cao, and Madden, PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p743-lu.pdf`
+  DOI: `https://doi.org/10.14778/3446095.3446105`
+  Why: Snapper cites epoch-style batching as a related deterministic commit
+  mechanism; useful for comparing batch/epoch visibility publication with
+  GPU DB mutation-owner generations and retained read frontiers.
