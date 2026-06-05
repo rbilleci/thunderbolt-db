@@ -65149,3 +65149,205 @@ age, and output materialization.
 - Stress long snapshots plus compaction: hold one analytical snapshot while
   updates punch holes in column groups, then measure scan degradation,
   compaction backlog, and safe retirement once readers release.
+
+### 2026-06-05 - ByteHTAP makes freshness an LSN window with explicit delta/base pressure
+
+**Citation:** Jianjun Chen, Yonghua Ding, Ye Liu, Fangshi Li, Li Zhang,
+Mingyi Zhang, Kui Wei, Lixun Cao, Dan Zou, Yang Liu, Lei Zhang, Rui Shi,
+Wei Ding, Kai Wu, Shangyu Luo, Jason Sun, and Yuming Liang. "ByteHTAP:
+ByteDance's HTAP System with High Data Freshness and Strong Data
+Consistency." PVLDB 15(12), 2022, pp. 3411-3424. Retrieved 2026-06-05
+from `https://www.vldb.org/pvldb/vol15/p3411-chen.pdf`.
+DOI: `https://doi.org/10.14778/3554821.3554832`.
+
+**Category:** hybrid HTAP; MVCC / snapshot / visibility; multi-tier cache
+/ data placement; query optimization / planning.
+
+**Relevance tags:** HTAP freshness; LSN snapshots; shared storage;
+delta/base store; delete bitmaps; primary-key ordered blocks; freshness
+thresholds; storage pushdown; partition pruning; compaction; metadata
+versioning; resource isolation.
+
+**Core idea:** ByteHTAP builds a production HTAP system by keeping OLTP and
+OLAP engines separate while making them share a storage layer with globally
+ordered log sequence numbers. OLTP remains the authority for transactions and
+constraints. The OLAP side reads a columnar store that is continuously fed by
+logical logs, using a read LSN as the snapshot boundary. The interesting
+transferable design is that freshness is not a cache hint; it is an explicit
+LSN window over an in-memory row-format Delta Store plus a persistent
+columnar Base Store.
+
+The system's target is sub-second analytical visibility with strong
+snapshot consistency across OLTP and OLAP components. The paper reports less
+than one second freshness for typical workloads; in one SysBench-based
+freshness experiment, 16 write threads and about 22681 KB/s of data changes
+produced an average freshness time of 606 ms. On CH-benCHmark, ByteHTAP
+reports that OLTP throughput is barely affected by OLAP clients under its
+separate-engine design, while analytical latency grows when high write
+throughput overloads log replication.
+
+**Concrete mechanisms:**
+
+- ByteHTAP uses a separate-engine/shared-storage architecture: ByteNDB handles
+  OLTP, Flink handles OLAP, a proxy routes SQL, and the shared storage layer
+  exposes both row and column representations.
+- ByteNDB's replicated storage follows a "log is database" model with a Log
+  Store, Page Store, unique LSNs assigned by persistence order, batched
+  transaction log replication, quorum replication, LSN sorting, back-links for
+  hole detection, and gossip repair for missing logs.
+- The OLAP Columnar Store has an in-memory row-format Delta Store and a
+  durable PAX-like Base Store. OLAP scans read both with a specified read LSN.
+- Logical DML logs are partitioned to Delta Store replicas. Inserts append to
+  an insertion list, deletes append to a deletion list and a delete hash map,
+  and updates become logical delete plus insert with the same LSN.
+- Delta Store supports four concurrent operations: LogApply, Flush, garbage
+  collection, and Scan. LogApply is append-oriented; Flush converts a selected
+  LSN range to columnar Base Store blocks; GC frees flushed entries no active
+  scan can still need; Scan unions Delta Store and Base Store at a read LSN.
+- Base Store does not store an LSN per record. Instead, it keeps only a
+  current persisted block version and relies on Delta Store history for
+  recent snapshot windows. This reduces scan/update overhead but means
+  snapshots older than the retained Delta Store window cannot be served.
+- Base Store blocks are ordered by primary key and store block metadata such
+  as row count, key range, primary-key bloom filter, and min/max statistics.
+  The paper says only primary-key value indexing is currently supported.
+- Deletes against immutable Base Store blocks are represented with per-block
+  delete bitmaps stored in RocksDB, keyed by block id. Delta Store also keeps
+  a delete hash map for unflushed deletes.
+- Base Store grooming has compaction and GC. Compaction prioritizes blocks
+  with high delete ratios or overlapping primary-key ranges, rewrites live
+  rows into new blocks, atomically switches metadata, and puts stale blocks on
+  a GC list.
+- Delta Store memory uses a vector of arenas. Arenas grow up to a 1 MB cap
+  and carry the LSN of their last row, so Delta Store GC can free entire
+  arenas below the GC LSN.
+- Snapshot consistency is defined with several LSNs: `LSN_DSmin`,
+  `LSN_DSmax`, read `LSN_r`, active-scan minimum read LSN, scan-start LSN,
+  flush-end LSN, Delta Store GC LSN, and Base Store truncate LSN.
+- For a partition scan, if `LSN_r > LSN_DSmax`, the scan waits for logs to
+  arrive. If `LSN_r < LSN_DSmin`, the snapshot is invalid and the OLAP engine
+  retries with a newer read LSN. Otherwise, the scan uses Base Store plus
+  Delta Store entries in the active LSN window.
+- A scan snapshots the relevant Base Store block names and copies current
+  delete bitmaps because Base Store records do not carry per-record LSNs.
+- Flush normally chooses the current active-scan minimum read LSN as its
+  flush end to avoid invalidating later scans, then atomically adds new Base
+  Store blocks, updates delete bitmaps, persists the flush-end LSN, and
+  advances `LSN_DSmin`.
+- Delta Store GC uses the minimum scan-start LSN and `LSN_DSmin`; Base Store
+  GC reclaims stale blocks only when their truncate LSN is older than the
+  current active-scan minimum read LSN.
+- Long-running queries can block Delta Store Flush, and the production system
+  currently kills long queries after a configured threshold.
+- DDL consistency uses multi-version metadata in a centralized Metadata
+  Service. DDL logical logs carry metadata changes, and the DDL LSN becomes
+  the metadata version. The paper says only DDL changes that do not require
+  data reorganization are currently supported.
+- Delete handling during Base Store scans uses either lazy delete lookups
+  against the Delta Store delete hash map or eager precomputation from
+  Delta Store deletes through Base Store primary-key indexes. A cost model
+  chooses between the two using Delta/Base statistics.
+- Predicate and aggregate pushdown run in the storage layer to reduce data
+  transfer. Base Store block min/max statistics support block skipping, and
+  lazy materialization evaluates predicate columns before loading unneeded
+  projected columns.
+- The Flink connector is split into reader and processor threads with an
+  adjustable buffer. The paper reports a 10% TPC-DS total runtime reduction
+  from this asynchronous read path and a 20% cluster-QPS improvement from
+  data-size-aware source parallelism rules.
+
+**GPU DB mapping:** ByteHTAP is a strong complement to the prior PolarDB-IMCI
+entry. PolarDB-IMCI emphasizes physical REDO reuse and read-only column-index
+replicas; ByteHTAP sharpens the retained-window contract. GPU DB should make
+resident freshness a source/applied boundary with an explicit valid LSN or
+transaction-generation window, not a Boolean "cache valid" flag.
+
+The Delta Store/Base Store split maps well to P8. GPU DB can treat recent
+mutation batches as a CPU-resident delta window and older compacted segments
+as GPU-friendly base column groups. Reads against a retained generation would
+combine the compacted resident base with a bounded delta or reject/fallback
+when the requested snapshot falls outside the retained delta window. That is
+more precise than either full resident rebuild on every mutation or silent
+stale reads.
+
+The lack of per-record LSNs in Base Store is the key design tradeoff to
+benchmark. For GPU DB, avoiding per-row visibility metadata in resident base
+segments could improve scan bandwidth and memory footprint, but only if the
+engine can bound the delta window and make snapshot invalidation explicit.
+If long retained reads or repeatable-read sessions need old versions beyond
+the delta window, the route must fall back or use a separate versioned side
+structure.
+
+Delete bitmaps are directly transferable. Immutable GPU-resident base
+segments can stay compact while deletes accumulate in a CPU/GPU bitmap or
+side vector. The lazy/eager choice becomes a route trait: apply delete
+bitmaps during the GPU scan, precompute a selection vector before launch, or
+fall back when delete density makes resident scan unprofitable.
+
+The LSN accounting suggests a concrete resident snapshot state machine. Each
+resident table or segment should expose `source_boundary`, `delta_min`,
+`delta_max`, `oldest_active_reader`, `flush_boundary`, and `retire_boundary`.
+Those numbers should drive route admission, refresh, compaction, and GC,
+especially when long GPU scans pin old generations.
+
+ByteHTAP's admission lesson matters for the 1M-session target. A logical
+session should be cheap, but a strong fresh read should not enter the GPU
+route until the resident or delta pipeline can prove the requested boundary.
+Otherwise it should wait with a reason, retry with a newer boundary if the
+snapshot expired, or use CPU fallback.
+
+**Risks and mismatches:** ByteHTAP is production HTAP over ByteNDB, Flink,
+and distributed storage, not a single-node GPU database. Its executor is CPU
+and Flink-based, and the paper does not address CUDA kernels, HBM pressure,
+pinned-buffer budgets, GPU stream scheduling, or device-resident indexes.
+
+The Base Store tradeoff is risky for GPU DB. Not keeping per-record LSNs in
+base segments saves space, but invalidates old snapshots once the Delta Store
+history moves on. That may conflict with SQL isolation expectations,
+long-running retained snapshots, or future repeatable-read sessions unless
+the route contract is strict.
+
+The paper's long-query policy is also too blunt for GPU DB as a general
+database. Killing long analytical scans may be acceptable for ByteHTAP's
+production constraints, but GPU DB should first explore separate snapshot
+classes, old-snapshot side structures, or bounded-staleness modes before
+making long reads victims of refresh pressure.
+
+Several details are product-specific or not fully specified: workload
+management behavior under Delta Store memory pressure, failure handling for
+all storage components, exact routing thresholds, and DDL coverage beyond
+non-reorganizing changes. The reported freshness depends on their cluster,
+storage, network, and workload mix, so the transferable claim is the LSN
+window design rather than the absolute latency.
+
+**Benchmark candidates:**
+
+- Add a resident freshness-window prototype with `delta_min`, `delta_max`,
+  `source_boundary`, and `applied_boundary` per resident segment. Gate:
+  strong reads either prove their boundary, wait with telemetry, retry/fallback
+  after expiry, or reject with an explicit stale-window reason.
+- Compare two resident visibility layouts: per-row begin/end metadata in GPU
+  base segments versus compact base segments plus a bounded CPU/GPU delta
+  window. Measure scan bandwidth, memory footprint, refresh cost, and old
+  snapshot failure rate.
+- Implement delete bitmap route variants for resident scans: lazy bitmap
+  apply in kernel, eager precomputed selection vector, and CPU fallback.
+  Vary delete density and selected row count. Failure condition: planner keeps
+  routing dense-delete scans to GPU when bitmap/refinement dominates runtime.
+- Build a Delta Store memory-pressure benchmark for COPY/update/delete:
+  arena or chunk allocation, flush threshold, oldest active reader, and
+  forced fallback/kill policy. Required metric: freshness lag versus memory
+  retained by active snapshots.
+- Add Base Store compaction analogues for GPU resident segments: overlap
+  count, delete ratio, compaction backlog, and stale-generation retirement.
+  Measure scan degradation with and without compaction while one long reader
+  pins an old generation.
+- Add storage pushdown telemetry to route certificates: predicate columns
+  loaded first, skipped segment count, min/max false positives, aggregate
+  pushdown bytes saved, and output materialization bytes.
+- Test asynchronous scan staging with separate reader and executor queues for
+  over-resident CPU/NVMe-to-GPU scans. Measure whether double-buffering helps
+  p95 latency without starving mutation, WAL, or network owners.
+- Add a freshness benchmark modeled on the paper's freshness-time metric:
+  time from WAL-visible mutation to read visibility in strong resident mode
+  across append, update, delete, and compaction-heavy workloads.

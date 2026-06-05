@@ -1015,7 +1015,7 @@ Append new candidates here as each paper is processed.
   Why: Hermes compares against PolarDB-IMCI's cloud-native analytical
   accelerator; useful for contrasting row-id mapping, log replication, vector
   execution, and multi-node HTAP placement against a single-node accelerator.
-- `queued` — **ByteHTAP: ByteDance's HTAP System with High Data Freshness and
+- `reviewed` — **ByteHTAP: ByteDance's HTAP System with High Data Freshness and
   Strong Data Consistency**, Chen et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p3411-chen.pdf`
   DOI: `https://doi.org/10.14778/3554821.3554832`
@@ -1451,6 +1451,24 @@ Append new candidates here as each paper is processed.
   Why: G-Learned Index uses ALEX as a dynamic learned-index baseline; useful for
   comparing model-node expansion, update handling, and CPU fallback against GPU
   resident learned-index routes.
+- `queued` — **Retrofitting High Availability Mechanism to Tame Hybrid
+  Transaction/Analytical Processing**, Shen et al., OSDI 2021.
+  URL: `https://www.usenix.org/conference/osdi21/presentation/shen`
+  Why: ByteHTAP contrasts VEGITO's backup-based fresh HTAP design; useful for
+  comparing log-apply replicas, block-based multiversion column layout, and
+  high-availability/read-freshness tradeoffs against GPU DB resident snapshots.
+- `queued` — **Real-Time LSM-Trees for HTAP Workloads**, Saxena et al.,
+  arXiv 2021.
+  URL: `https://arxiv.org/abs/2101.06801`
+  Why: ByteHTAP cites real-time LSM-tree work in the HTAP freshness ecosystem;
+  useful for evaluating whether GPU DB cold/warm tiers should expose
+  LSM-style freshness windows, merge pressure, and snapshot-aware compaction.
+- `queued` — **Adaptive HTAP through Elastic Resource Scheduling**, Raza,
+  Chrysogelos, Anadiotis, and Ailamaki, SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3389723`
+  Why: ByteHTAP compares against elastic HTAP scheduling; useful for deciding
+  when GPU DB should shift resources between mutation, refresh, and retained
+  read owners instead of fixing static OLTP/OLAP resource splits.
 - `reviewed` — **An Empirical Evaluation of Columnar Storage Formats**,
   Zeng et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol17/p148-zeng.pdf`
