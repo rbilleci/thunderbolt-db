@@ -5379,10 +5379,17 @@ Append new candidates here as each paper is processed.
   Why: Snapper uses actor-database work as its programming-model baseline;
   useful for comparing actor-style owner domains, predictable virtualized
   state, and transaction placement against GPU DB partition owners.
-- `queued` — **Epoch-based Commit and Replication in Distributed OLTP
+- `reviewed` — **Epoch-based Commit and Replication in Distributed OLTP
   Databases**, Lu, Yu, Cao, and Madden, PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p743-lu.pdf`
-  DOI: `https://doi.org/10.14778/3446095.3446105`
+  DOI: `https://doi.org/10.14778/3446095.3446098`
   Why: Snapper cites epoch-style batching as a related deterministic commit
   mechanism; useful for comparing batch/epoch visibility publication with
   GPU DB mutation-owner generations and retained read frontiers.
+- `queued` — **Minimizing Commit Latency of Transactions in Geo-Replicated
+  Data Stores**, Nawab et al., SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2723729`
+  Why: COCO cites Helios as a commit/consensus optimization for
+  geo-replicated transactions; useful for comparing epoch-sized durability
+  barriers with lower-latency replicated commit paths if GPU DB later spreads
+  owner domains across nodes or regions.

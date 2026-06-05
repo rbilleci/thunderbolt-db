@@ -67926,3 +67926,160 @@ snapshot proof, locality proof, GPU execution, fallback, and response
 publication. Without that trace, isolated GPU speedups can look good
 while hiding stale snapshots, remote-memory traffic, or unbounded queue
 delay.
+
+### 2026-06-05 - COCO batches commit and replication into epoch barriers
+
+**Citation:** Yi Lu, Xiangyao Yu, Lei Cao, and Samuel Madden.
+"Epoch-based Commit and Replication in Distributed OLTP Databases."
+PVLDB 14(5), 2021, pp. 743-756. doi:10.14778/3446095.3446098.
+Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol14/p743-lu.pdf`.
+
+**Category:** transaction processing / write path; commit protocols;
+MVCC / snapshot / visibility.
+
+**Relevance tags:** epoch commit; group durability; asynchronous
+replication; OCC; logical timestamps; snapshot isolation; read-from-replica;
+write lock duration; recovery frontier; mutation-owner generations.
+
+**Core idea:** COCO argues that distributed OLTP systems pay too much
+when 2PC and synchronous replication enforce durability and consistency
+one transaction at a time. It groups transactions into short epochs and
+makes the epoch the atomic commit and recovery unit: either all
+ready-to-commit transactions in an epoch become durable and visible to
+clients, or the epoch rolls back after failure. Individual transactions
+can release write locks after their writes reach the primary replica, while
+client results are withheld until the epoch barrier commits.
+
+The paper combines this epoch barrier with optimistic concurrency control.
+Records carry transaction ids, reads may come from nearby replicas, and
+validation happens at primaries. Backup replicas can receive writes
+asynchronously within an epoch and apply out-of-order updates with the
+Thomas write rule because record TIDs monotonically encode commit order.
+On an eight-node EC2 cluster, the paper reports up to 4x higher throughput
+than fine-grained 2PC plus synchronous replication on YCSB/TPC-C, larger
+gains in a WAN setting, and about 20% higher throughput for snapshot
+isolation than serializability in its YCSB skew experiment. With 10 ms
+epochs, COCO reaches more than 93% of its 100 ms epoch throughput while
+keeping p99 latency roughly at the epoch-size scale.
+
+**Concrete mechanisms:**
+
+- The global epoch advances every few milliseconds, 10 ms by default in the
+  paper. An epoch coordinator sends prepare requests, receives participant
+  acknowledgements, writes a durable commit record for the epoch, increments
+  the epoch, then sends commit messages.
+- Participants force-log a prepared-write record containing ready
+  transaction ids and the epoch number. The concurrency-control layer must
+  durably log each ready transaction's writes before that prepared-write
+  record.
+- If any participant fails to acknowledge prepare, the whole epoch aborts.
+  Once the coordinator's durable epoch commit record exists, recovery treats
+  the epoch as committed even if some commit messages or acknowledgements
+  were lost.
+- Transactions write to primaries and asynchronously replicate to backups.
+  Results are not returned to users until the epoch commits, so in-epoch
+  visibility to other transactions is separated from externally released
+  durability.
+- Recovery rolls back to the last successful epoch. COCO keeps two versions
+  per tuple: the latest value and the latest value up to the last successful
+  epoch.
+- The execution phase reads records from the local or nearest replica and
+  stores both value and TID in the transaction read set. The commit phase
+  locks the write set at primaries, validates the read set at primaries,
+  assigns a TID, and writes changes.
+- PT-OCC adapts Silo-style physical-time OCC. The generated TID must be in
+  the current epoch, larger than all read/write-set TIDs, and larger than
+  the worker's previous TID.
+- LT-OCC adapts TicToc-style logical timestamps. Each record has `wts` and
+  `rts`; a transaction chooses the smallest TID in the current epoch that is
+  not less than read-set `wts` values and larger than write-set `rts`
+  values, extending read-set `rts` values at primaries only when needed.
+- Snapshot transactions avoid read/write conflict detection. In PT-OCC,
+  read validation can happen after execution without holding write locks. In
+  LT-OCC, the system computes a separate `TIDSI` that need not exceed the
+  write-set `rts`.
+- Snapshot isolation enables a parallel locking and validation optimization:
+  write-set locking and read-set validation can run in parallel, removing
+  one network round trip from the commit phase.
+- TIDs encode epoch number, transaction id within epoch, and status bits.
+  Deletes mark records until the next epoch, and inserts create placeholders
+  that are either filled at commit or marked deleted after abort.
+- Worker-local logs contain table/partition ids, TID, primary key, and
+  value. Checkpoints record the current epoch and scan the database; replay
+  applies only epochs with committed epoch records and can run in parallel.
+
+**GPU DB mapping:** COCO is a useful shape for GPU DB mutation-owner
+generations. The current runtime already wants deterministic publication
+boundaries for COPY admission, mutation batches, refresh, and retained
+snapshot generation. COCO shows a concrete rule: the hot write path can
+release fine-grained locks or owner slots early, but the externally
+released result and the retained read frontier should advance only at a
+durable epoch boundary.
+
+For a single-node first slice, the "epoch" need not mean distributed 2PC.
+It can be a mutation-owner generation with a WAL-flushed boundary, a set of
+ready transaction ids, and a route-publication record. Retained GPU
+snapshots should reference that generation explicitly: `source_wal_txn`,
+commit epoch, catalog generation, resident generation, and whether the
+epoch is committed, aborted, or still in the wait-for-durability window.
+
+The read-from-replica pattern maps to read-from-snapshot workers. A
+retained read worker can read from immutable GPU or CPU snapshots without
+round-tripping through the mutation owner, but validation/freshness must be
+against the authoritative owner frontier. The Thomas-write-rule lesson also
+maps to asynchronous resident refresh: if deltas or refresh fragments arrive
+out of order, each fragment needs a monotonic generation/TID guard so an old
+refresh cannot overwrite a newer resident state.
+
+COCO's snapshot-isolation optimization is a benchmark target for GPU DB.
+When a route is explicitly snapshot-only, read validation and write-lock
+or owner-touch acquisition may be overlapped, and a retained GPU read can
+use a stable `TIDSI` rather than waiting for serializable write-conflict
+proofs. That should be exposed as a distinct isolation lane, not hidden
+inside generic SQL execution.
+
+The two-version rollback model is also relevant to P8 recovery. GPU DB's
+CPU truth can keep the latest state plus the last committed route frontier,
+while GPU resident snapshots and derived indexes remain rebuildable. If an
+epoch aborts after a failure, resident generations derived from that epoch
+must be invalidated or discarded before serving retained reads.
+
+**Risks and mismatches:** COCO deliberately adds epoch-sized client-visible
+latency, making it a poor fit for ultra-low-latency transactions unless the
+engine uses very small epochs or only applies the mechanism to batchable
+lanes. A single long-running update transaction can delay an epoch's commit,
+so GPU DB needs route classes and deadlines rather than one global barrier
+for all work. COCO assumes stored procedures and short OLTP transactions;
+ad hoc SQL, pgwire portals, COPY, DDL, and long analytical reads need
+separate handling. Its replication model is fail-stop and distributed CPU
+OLTP, not GPU-resident execution. Finally, the paper's in-epoch writes may
+be visible to other transactions before client release; GPU DB must be very
+explicit about which internal visibility is allowed before WAL and route
+publication, because stale GPU snapshots must never escape as committed
+SQL results.
+
+**Benchmark candidates:**
+
+- Add a mutation-owner epoch frontier prototype: group committed writes into
+  1, 5, 10, and 25 ms durable generations, publish retained snapshots only
+  at generation boundaries, and compare throughput, p50/p99 latency, WAL
+  bytes, and freshness lag against per-transaction publication.
+- Build a COPY/mutation batch benchmark where locks or owner slots release
+  after CPU-visible write application, but client completion and resident
+  route publication wait for the epoch WAL boundary. Failure condition:
+  any post-crash replay exposes a result from an uncommitted epoch.
+- Add an out-of-order refresh-fragment test using generation/TID guards.
+  Old resident deltas or refresh chunks must be ignored when a newer
+  generation has already been installed.
+- Measure snapshot-only retained reads with parallel validation versus
+  serializable retained reads with stricter conflict proof. Required metrics:
+  abort/retry rate, owner queue wait, read latency, and exact result
+  equivalence at the chosen snapshot frontier.
+- Prototype epoch rollback invalidation: inject a failure after writes are
+  applied but before the durable epoch commit record, recover to the prior
+  committed epoch, and verify CPU indexes, resident-route metadata, and GPU
+  snapshots all discard aborted-generation state.
+- Compare one global epoch barrier with partition-local sparse epoch chains
+  for hot and cold partitions. Expected win: cold partitions avoid metadata
+  churn while hot partitions still batch WAL, visibility, and refresh.
