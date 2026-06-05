@@ -2329,13 +2329,28 @@ Append new candidates here as each paper is processed.
   Why: Mako cites DINT among recent fast distributed transaction systems;
   relevant to comparing kernel/eBPF-assisted transaction routing with GPU DB's
   user-space rings, admission queues, and protocol-edge ownership.
-- `queued` — **Electrode: Accelerating Distributed Protocols with eBPF**,
+- `reviewed` — **Electrode: Accelerating Distributed Protocols with eBPF**,
   Zhou, Wang, Dharanipragada, and Yu, NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/zhou`
+  PDF: `https://www.usenix.org/system/files/nsdi23-zhou.pdf`
   Why: DINT builds on the broader idea of moving distributed-protocol
   frequent paths into eBPF; useful for deciding whether GPU DB should use
   kernel-side protocol classification or keep all route-state transitions in
   user-space owner rings.
+- `queued` — **SPRIGHT: Extracting the Server from Serverless Computing!
+  High-Performance eBPF-Based Event-Driven, Shared-Memory Processing**,
+  Qi et al., SIGCOMM 2022.
+  URL: `https://doi.org/10.1145/3544216.3544225`
+  Why: Electrode cites SPRIGHT as another eBPF/shared-memory fast path; useful
+  for comparing packet-edge acceleration with shared-memory response pipelines
+  and sidecar/proxy bypass for high-session SQL routing.
+- `queued` — **XRP: In-Kernel Storage Functions with eBPF**, Zhong et al.,
+  OSDI 2022.
+  URL: `https://www.usenix.org/conference/osdi22/presentation/zhong`
+  Why: Electrode discusses XRP as a related eBPF offload for storage
+  functions; useful for deciding whether tiny validated index or metadata
+  probes can live near the kernel/storage boundary without violating SQL
+  visibility or WAL recovery contracts.
 - `queued` — **Xenic: SmartNIC-Accelerated Distributed Transactions**,
   Schuh et al., SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483565`

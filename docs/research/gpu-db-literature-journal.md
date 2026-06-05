@@ -55977,3 +55977,177 @@ the absolute speedup.
   CPU path. If the control record forces a 4 KB synchronous write per
   transaction, GPU DB should batch the frontier or choose a different
   substrate before relying on NVMe parallelism.
+
+### 2026-06-05 - Electrode keeps protocol fast paths in the kernel, not full logic
+
+**Citation:** Yang Zhou, Zezhou Wang, Sowmya Dharanipragada, and
+Minlan Yu. "Electrode: Accelerating Distributed Protocols with eBPF."
+NSDI 2023, pages 1391-1406. Retrieved 2026-06-05 from the USENIX
+publication page and PDF,
+`https://www.usenix.org/conference/nsdi23/presentation/zhou`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** eBPF; XDP; TC; kernel networking; distributed
+protocols; quorum waiting; bounded in-kernel rings; session admission;
+protocol-edge offload; latency; throughput; route certificates.
+
+**Core idea:** Electrode asks whether a distributed protocol can keep the
+standard Linux networking stack's compatibility, security, isolation, and
+load-aware CPU scaling while avoiding the most repetitive kernel-stack work.
+The answer is not to move Paxos entirely into the kernel. Instead,
+Electrode offloads only small, common, statically verifiable fast-path
+operations: leader-side message broadcasting, follower-side early
+acknowledgment, and leader-side quorum counting.
+
+The paper's CPU breakdown motivates the design: in a five-replica
+Multi-Paxos/Viewstamped Replication deployment, most leader CPU time is
+spent around send/receive calls and kernel networking bookkeeping. By
+handling repeated packet work at TC and XDP hooks before normal socket
+delivery, Electrode reduces user-kernel crossings, avoids waking user-space
+for acknowledgments that do not change quorum state, and keeps failure
+recovery, retransmission, log repair, request parsing, and application logic
+in user space. In the reported evaluation, Electrode improves Multi-Paxos
+maximum throughput by 34.9%, 104.8%, and 128.4% for three, five, and seven
+replicas, respectively; it also lowers median latency by up to 25.6% and
+99th-percentile latency by up to 41.7%. On a Paxos-backed transactional
+key-value store, the paper reports 32.3%-112.9% higher throughput and
+5.9%-19.3% lower average latency.
+
+**Concrete mechanisms:**
+
+- Electrode attaches eBPF programs to TC and XDP hooks. XDP runs directly
+  after packet receive in the NIC driver path, before `sk_buff` allocation
+  and higher UDP/TCP/socket processing. TC can see outgoing packets and can
+  clone or rewrite `sk_buff` structures.
+- Message broadcasting runs at TC on the leader. User space sends one
+  preparation or commit packet, while the eBPF program uses
+  `bpf_clone_redirect()` to clone the in-kernel packet, rewrite
+  destinations, and send copies to followers.
+- Fast acknowledgment runs at XDP on followers. For normal in-order
+  preparation messages, the eBPF program appends the packet to a fixed-size
+  `BPF_MAP_TYPE_RINGBUF` log, constructs an ACK by modifying packet fields,
+  and sends the ACK without traversing the full network stack or waking the
+  user-space Paxos process.
+- User-space Paxos logic polls the in-kernel ring in batches through an
+  Electrode API. The design relies on the leader-assigned sequence number
+  for replaying buffered preparation messages in protocol order.
+- Wait-on-quorums uses a fixed-length array of bitsets indexed by request
+  sequence number modulo array length. An outgoing preparation packet clears
+  the bitset at TC; incoming follower ACKs set follower bits at XDP.
+- The eBPF quorum logic forwards only the ACK that reaches quorum, dropping
+  non-quorum ACKs. Bitsets are used instead of counters so duplicate ACKs
+  from retransmissions do not double count.
+- If the fixed bitset slot has been overwritten, the eBPF program marks the
+  ACK as not quorum-reaching and forwards it to user space. The application
+  can resend preparation messages and wait through the ordinary slow path.
+- The implementation splits logic across six small eBPF programs connected
+  with tail calls to fit verifier and instruction-count constraints:
+  broadcast/quorum clearing, XDP dispatch, ACK handling, preparation
+  handling, ring-buffer writes, and fast ACK generation.
+- Non-critical cases remain in user space. The eBPF path detects follower
+  view changes, recovery state, stale or newer view numbers, packet loss,
+  reordering, duplication, and ring overflow, then drops or forwards packets
+  according to the Multi-Paxos state.
+- To avoid user/kernel races during view change or state transfer, the paper
+  describes detaching the eBPF program, draining the ring and socket queues,
+  updating eBPF map state, then reattaching. An alternative branch-through
+  map is mentioned, but not used as the main design.
+- Electrode targets UDP protocols with application-level retransmission and
+  messages that fit in one Ethernet packet, up to jumbo-frame size. It does
+  not offload client-facing protocol parsing, protobuf work, application
+  operation execution, failure recovery, or dynamic log repair.
+- The evaluation compares against vanilla Linux and a Caladan DPDK
+  kernel-bypass baseline. Electrode beats vanilla Linux but remains slower
+  than full kernel bypass because many client-facing and protocol packets
+  still go through ordinary Linux packet-buffer management.
+
+**GPU DB mapping:** Electrode is a useful boundary-setting paper for the
+1M logical-session goal. It suggests that the first kernel-side or
+protocol-edge experiments should offload tiny repeated classification and
+bookkeeping, not SQL execution, MVCC, WAL sequencing, or route publication.
+The GPU DB analog is an edge fast path that can reject obvious overload,
+classify a pgwire message into a known route family, maintain cheap credits,
+or suppress redundant wakeups, while leaving semantic ownership with network
+IO workers, mutation owners, catalog owners, and read-snapshot workers.
+
+The wait-on-quorums bitset is especially relevant to response-ring and
+route-certificate design. Many GPU DB requests wait on a small number of
+frontiers: WAL flush, visibility generation, resident refresh, GPU kernel
+completion, response-buffer ownership, or socket writability. A compact
+fixed-capacity frontier cell can turn many low-value notifications into one
+completion event, provided overflow and stale-generation handling are
+explicit.
+
+Fast acknowledgment maps to COPY admission and write batching only as a
+shape, not as a correctness shortcut. The engine could acknowledge receipt
+or buffering of a COPY chunk before full SQL commit, but it must not publish
+commit success or snapshot visibility until WAL-before-visibility and MVCC
+rules are satisfied. For reads, the safe analog is to accept and queue a
+retained-read request near the network edge while preserving snapshot
+generation, route support, and response-buffer ownership in the ordinary
+runtime.
+
+The eBPF ring-buffer lesson is more broadly useful than the Paxos details.
+Any near-kernel fast path must have fixed capacities, observable overflow,
+and a deliberate fallback path. That fits the runtime document's bounded
+command and response rings. It also argues for "fast path closed" switches:
+when catalog generation, prepared statement state, transaction state, or
+session error recovery leaves the verifier-friendly common case, the edge
+path should forward to user-space workers and stop trying to be clever.
+
+Finally, Electrode gives a sober comparison against kernel bypass. For GPU
+DB, full DPDK-style pgwire service may be too invasive early, but eBPF/XDP
+classification or wakeup suppression could capture a smaller fraction of the
+benefit while preserving ordinary Linux TCP, security, and deployment
+behavior. The benchmark question should be whether this reduces p99 queueing
+and CPU wakeups under high idle-session count, not whether it replaces the
+owner-domain runtime.
+
+**Risks and mismatches:** Electrode targets UDP Paxos messages, not TCP
+pgwire, SQL sessions, TLS, authentication, prepared statements, portals,
+COPY state, or row/result serialization. Its direct packet rewriting and
+early ACK pattern cannot be copied into SQL commit behavior without changing
+client-visible semantics.
+
+The eBPF verifier is also a hard design constraint. Dynamic memory, complex
+parsing, unbounded loops, variable log repair, and rich protocol recovery
+are intentionally left out. That means GPU DB should treat eBPF as a narrow
+edge assist, not as a place to run arbitrary route selection or MVCC checks.
+
+Correctness boundaries are subtle. Electrode relies on sequence numbers,
+view state, explicit non-critical path detection, and detach/drain/reattach
+steps when user-space recovery must regain exclusive control. A database
+version would need equally explicit transitions for transaction state,
+catalog invalidation, route-cache invalidation, and session error recovery.
+
+The reported gains come from Multi-Paxos over UDP on a CloudLab 25 Gbps
+testbed with small messages and rare packet loss. They do not prove benefits
+for ordinary TCP pgwire, Linux versions with different eBPF capabilities, or
+GPU execution paths where kernel overhead may be dominated by planning,
+snapshot checks, CUDA work, WAL flushing, or response encoding.
+
+**Benchmark candidates:**
+
+- Add a protocol-edge wakeup accounting benchmark for the pgwire endpoint:
+  10K to 1M idle or mostly idle logical sessions, small repeated read
+  requests, and controlled response-ring backpressure. Measure syscalls,
+  wakeups, p50/p99 latency, CPU utilization, and owner-ring depth.
+- Prototype a user-space fixed-capacity frontier cell before any eBPF work:
+  many producers complete WAL, residency, GPU, and socket events; only the
+  quorum/frontier-reaching event wakes the session task. Gate: identical
+  response ordering and error behavior under overflow.
+- Test an eBPF/XDP or socket-filter classifier only for safe metadata:
+  target port, message size, startup/authenticated phase flag, and overload
+  rejection. Failure condition: any transaction-state, catalog-generation, or
+  prepared-statement decision moves into eBPF without a user-space proof.
+- Add an overflow benchmark for fixed rings and bitset-like completion
+  arrays. Required result: overflow is observable, bounded, and falls back to
+  ordinary user-space processing without lost completions.
+- Compare ordinary TCP, io_uring, and a minimal eBPF-assisted path for
+  repeated small messages. Measure whether the bottleneck is user-kernel
+  crossings, socket stack traversal, response encoding, owner queue wait, or
+  GPU launch/transfer time before pursuing deeper kernel work.
+- Add a "fast path closed" route certificate field for protocol-edge
+  decisions: `edge_classified`, `edge_rejected`, `edge_overflow`,
+  `edge_generation_mismatch`, and `edge_forwarded_to_user_space`.
