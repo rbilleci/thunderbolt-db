@@ -4851,12 +4851,30 @@ Append new candidates here as each paper is processed.
   Why: PLOR cites Callas-style modular concurrency control as a mixed-protocol
   alternative; useful for comparing per-route concurrency-control modules with
   GPU DB owner domains, retained reads, and hot-write fallback lanes.
-- `queued` — **In-Network Support for Transaction Triaging**, Lerner et al.,
+- `reviewed` — **In-Network Support for Transaction Triaging**, Lerner et al.,
   PVLDB 2021.
   URL: `https://vldb.org/pvldb/vol14/p1626-lerner.pdf`
   Why: modern follow-up for transaction admission before full execution;
   useful for comparing engine-owned hot-key batching with earlier network or
   gateway triage of likely-conflicting requests.
+- `queued` — **Infinite Resources for Optimistic Concurrency Control**,
+  Jepsen et al., NetCompute 2018.
+  URL: `https://doi.org/10.1145/3229591.3229597`
+  Why: cited by Transaction Triaging as in-network transaction execution work;
+  useful for comparing switch/NIC-level conflict prefilters with GPU DB's
+  owner-domain validation and hot-key admission queues.
+- `queued` — **Eris: Coordination-Free Consistent Transactions Using
+  In-Network Concurrency Control**, Li, Michael, and Ports, SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132751`
+  Why: Transaction Triaging contrasts portable stream shaping with
+  concurrency-control-specific in-network ordering; useful for deciding whether
+  any GPU DB gateway or NIC prefilter should ever participate in serial order.
+- `queued` — **Harmonia: Near-Linear Scalability for Replicated Storage with
+  in-Network Conflict Detection**, Zhu et al., PVLDB 2019.
+  URL: `https://doi.org/10.14778/3368289.3368301`
+  Why: Transaction Triaging cites Harmonia as in-network conflict detection for
+  replicated storage; useful for separating cheap conflict hints from
+  authoritative WAL/MVCC visibility decisions.
 - `queued` — **Indexed Log File: Towards Main Memory Database Instant
   Recovery**, Magalhaes, Brayner, Monteiro, and Moraes, EDBT 2021.
   URL: `https://openproceedings.org/2021/conf/edbt/p172.pdf`

@@ -61040,3 +61040,205 @@ the main benefit.
   Expected result: first execution starts on a low-setup route; repeated hot
   fragments become eligible for optimized CPU/GPU variants without changing
   SQL-visible semantics.
+
+### 2026-06-05 - Transaction triaging turns admission metadata into execution locality
+
+**Citation:** Theo Jepsen, Alberto Lerner, Fernando Pedone, Robert Soulé, and
+Philippe Cudré-Mauroux. "In-Network Support for Transaction Triaging." PVLDB
+14(9), 2021, pp. 1626-1639. doi:10.14778/3461535.3461551. Retrieved
+2026-06-05 from `https://vldb.org/pvldb/vol14/p1626-lerner.pdf`.
+
+**Category:** runtime / HFT / session scale, with transaction processing and
+write-path admission relevance.
+
+**Relevance tags:** transaction admission; high-concurrency networking;
+semantic request steering; request batching; response batching; transaction
+reordering; partition-local execution; programmable switches; RDMA; latency
+ceilings; hot-key contention.
+
+**Core idea:** Transaction Triaging argues that transaction streams can be made
+cheaper before they reach the database server. A programmable switch recognizes
+small OLTP transaction metadata, groups compatible requests, steers packets to
+the server core that owns the target partition, optionally reorders by
+transaction affinity, and converts the last hop to a cheaper protocol such as
+RDMA. The database still executes transactions and retains its concurrency
+control semantics; the network shapes arrival order, batching, and delivery
+location.
+
+The useful lesson for GPU DB is not that correctness should move into the
+network. It is that lightweight route metadata can do real work before the
+mutation owner or GPU execution owner spends cycles. The paper reports that
+networking overhead can account for a large fraction of small in-memory OLTP
+latency. On its Silo-based TPC-C setup, the UDP/IP baseline reaches 182 Ktps,
+all triaging techniques reach 373 Ktps, and local pregenerated execution
+reaches 386 Ktps. On YCSB, triaging improves UDP/IP throughput from 377 Ktps to
+3 Mtps and RDMA throughput from 4.5 Mtps to 8.56 Mtps, with additional latency
+from buffering.
+
+**Concrete mechanisms:**
+
+- Requests carry a standard transaction metadata header with client id,
+  partition id, transaction type, and optional affinity fields. The switch can
+  manipulate this metadata without understanding the full transaction payload.
+- Batching maps `partID` or `(partID, affinity)` to a queue id in a
+  match-action table. Each queue has bounded slots across pipeline stages; when
+  it reaches the configured batch size, the packet drains the queue into a
+  multi-transaction request.
+- The control plane injects per-queue timeout packets so partial batches do not
+  wait indefinitely. The paper omits detailed timeout evaluation, but names it
+  as the practical latency-control mechanism.
+- Response splitting reverses server-side response batching. A batched response
+  is copied and recirculated through the switch pipeline until each individual
+  response is addressed to the original client.
+- Reordering can group transactions by type, access-shape affinity, or priority
+  within a partition queue. The paper's TPC-C contention experiment uses
+  transaction type so read-only and write-heavy transactions are separated
+  enough to reduce aborts.
+- Semantic RSS steering changes a UDP source port so the server NIC's RSS hash
+  interrupts the core that owns the target partition rather than a random core.
+  The switch restores the client-visible port on responses.
+- Protocol conversion uses RDMA on the switch-to-server hop. The switch writes
+  full transaction payloads into a server ring buffer with RDMA WRITE, then
+  sends a metadata batch that tells the server which buffered payloads to
+  execute.
+- The server initializes switch tables for batching policy, client addresses,
+  steering ports, and transaction-buffer addresses. It can update triage policy
+  at runtime when partitioning or affinity choices change.
+- Reliability is handled outside the switch logic. The implementation assumes
+  UDP/IP or RDMA UD, unique client and transaction ids, client retries, client
+  acknowledgements, and a server response cache for resending completed results.
+- Hardware constraints shape the algorithms: no loops in the switch data
+  plane, fixed pipeline stages, limited per-stage state, and recirculation only
+  at a throughput cost.
+
+**GPU DB mapping:** The strongest transfer is an admission header for every
+frontend request before it enters owner queues. A pgwire session should expose
+or derive route metadata such as session id, transaction id, statement shape,
+target relation or partition, estimated key set, read/write mode, snapshot
+class, response shape, and latency budget. Network IO workers, gateway
+admission, or future smart-NIC/switch paths can use that metadata to choose a
+bounded queue before the mutation owner, residency owner, or GPU worker sees
+the request.
+
+For 1M logical sessions, semantic steering maps directly to the runtime
+document's owner-domain model. Idle sessions stay cheap, but active requests
+should be steered to the partition owner, read snapshot worker, or GPU
+execution owner that can actually run them. A generic load-balanced ingress
+queue risks recreating the paper's "wrong core" problem as "wrong owner":
+extra cross-owner hops, cold cache lines, response-ring indirection, and
+unnecessary context switches.
+
+The batching result fits retained reads and hot writes differently. Same-shape
+read requests can be micro-batched by snapshot generation, relation, predicate
+family, and response shape. Hot writes can be batched by partition and conflict
+shape, but the batch boundary must preserve WAL-before-visibility and SQL
+transaction error behavior. Partial-batch timeout is mandatory for p50/p99
+latency; a full-batch-only policy would harm quiet sessions and sparse
+transaction types.
+
+Reordering is most interesting as a hot-key and conflict-shape admission lane.
+GPU DB could separate read-only snapshot requests from write-heavy mutations
+for the same partition, or group compatible updates within a bounded latency
+ceiling so validation, WAL append, invalidation, and response encoding are more
+cache-local. The paper's reduction in TPC-C aborts under higher contention is
+a useful benchmark shape, but the engine must treat reordering as an admitted
+optimization, not as permission to violate user-visible transaction order
+inside a session.
+
+Protocol conversion maps to staging ownership. Pgwire request buffers, decoded
+COPY chunks, WAL batches, CUDA pinned buffers, and response buffers should have
+explicit ownership states like the paper's server ring buffer. Future NIC or
+gateway offload can fill staging slots, but the authoritative engine owner
+still decides visibility, durable commit, invalidation, and response outcome.
+
+**Risks and mismatches:** The paper assumes stored-procedure-like OLTP requests
+where the client library can fill a compact metadata header up front. Ad-hoc
+SQL, prepared statement portals, multi-statement transactions, DDL, and
+parameter-sensitive plans may not expose partition and affinity before parsing
+or planning. The evaluated database is Silo, not a pgwire SQL engine with
+MVCC/WAL/recovery requirements and GPU-resident snapshots.
+
+The switch algorithms are intentionally shallow. They cannot perform arbitrary
+SQL parsing, deep dependency checks, WAL ordering, MVCC visibility, or
+serializability validation. The paper's reliability model relies on client
+retries and response caching for unreliable transports; GPU DB cannot let
+duplicate execution leak through non-idempotent mutations. Batching and
+reordering add latency, especially for sparse transaction types, so every route
+needs a timeout and fairness policy. Finally, programmable-switch or smart-NIC
+hardware may not be present in the first deployment, so the first benchmark
+should implement the same triage logic in ordinary IO workers and rings before
+assuming hardware offload.
+
+**Benchmark candidates:**
+
+- Add a route-admission header in the pgwire benchmark path with session id,
+  statement shape, target table/partition, read/write mode, snapshot boundary,
+  estimated response shape, and latency budget. Gate: route decisions are
+  logged before owner enqueue without changing SQL results.
+- Compare generic ingress queueing with semantic owner steering for a
+  partitioned hot-key workload. Measure owner queue hops, p50/p99 latency,
+  cache misses if available, and committed transactions per second.
+- Implement same-shape retained-read batching with both count and microsecond
+  timeout triggers. Failure condition: full-batch throughput improves but
+  sparse-request p99 exceeds the baseline by more than the configured latency
+  budget.
+- Add a hot-write admission experiment that groups transactions by partition
+  and conflict shape under a bounded timeout. Required proof: WAL order,
+  visibility order, per-session ordering, and abort/error semantics remain
+  unchanged.
+- Benchmark response batching at the network IO worker boundary: reusable row
+  descriptions and command-complete frames for identical response shapes,
+  followed by per-session scattering. Measure response-ring pressure and socket
+  write calls.
+- Model future offload with an in-process "triage worker" that cannot inspect
+  full SQL execution state. Gate: it may steer, batch, and reject by metadata,
+  but only engine owners can commit, publish visibility, invalidate residency,
+  or report success.
+
+### 2026-06-05 - Cross-paper synthesis: route metadata must prove both correctness and pressure shape
+
+**Papers synthesized:** In the Search for Optimal Concurrency; Index
+Checkpoints for Instant Recovery in In-Memory Database Systems; Adaptive
+Execution of Compiled Queries; In-Network Support for Transaction Triaging.
+
+**Converging design tracks:** The last four papers all push the same theme
+from different layers: do not send work blindly into a generic executor.
+Concurrency research asks whether an accepted schedule is correct and close to
+optimal. Index checkpointing asks which derived structures are valid enough to
+serve immediately after recovery. Adaptive execution asks whether a fragment
+has enough remaining work to justify a more expensive route. Transaction
+triaging asks whether cheap request metadata can steer, batch, and shape work
+before it reaches the server's hot owners.
+
+For GPU DB, this strengthens the route-certificate idea. A route certificate
+should carry two classes of proof. The correctness proof names snapshot
+boundary, owner authority, WAL/visibility frontier, route metadata generation,
+and derived-state validity. The pressure proof names destination owner, queue
+budget, latency budget, setup cost, expected work size, response shape,
+fallback lane, and timeout condition. A route is not fully admitted unless both
+proofs fit current state.
+
+**Category gaps:** The queue has enough GPU execution and learned-planning
+work for now. The more valuable near-term gap is transaction/runtime work that
+connects admission to correctness: modular concurrency control, transaction
+triage, in-network or gateway conflict hints, and recovery frontiers for
+derived indexes. Multi-tier placement also needs more device-sensitive work
+that distinguishes transparent page movement from DB-owned hot/cold routing.
+
+**Benchmark priorities:**
+
+- Add route-certificate logging before owner enqueue and after route completion.
+  Minimum fields: correctness frontier, destination owner, queue wait, selected
+  execution variant, fallback reason, and response shape.
+- Build a three-lane admission benchmark: retained reads, hot writes, and
+  recovery/rebuild work. Gate: one lane saturating does not silently consume
+  the others' correctness-critical buffers or owner slots.
+- Measure semantic steering against generic ingress with partitioned hot keys.
+  Required output: queue hops, abort rate, p50/p99 latency, and committed TPS.
+- Add a restart-readiness benchmark where checkpointed indexes or route
+  metadata are valid, stale, rebuilding, or absent. Gate: route certificates
+  explain which reads can use derived state before GPU warmup completes.
+- Evaluate adaptive route setup costs separately from execution costs for CPU
+  fallback, generic GPU kernels, specialized GPU kernels, resident refresh, and
+  response batching. Failure condition: a route wins kernel time but loses
+  end-to-end latency under realistic admission pressure.
