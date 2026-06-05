@@ -57338,3 +57338,152 @@ optimizing kernels. Use the same logical lookup/range workload under
 uniform and Zipfian keys, switch CPU-only, GPU-push-only, and hybrid
 push-pull routes, and require identical MVCC-visible results after WAL
 replay and resident metadata rebuild.
+
+### 2026-06-05 - REEF protects urgent GPU work by resetting idempotent best-effort kernels
+
+**Citation:** Mingcong Han, Hanze Zhang, Rong Chen, and Haibo Chen.
+"Microsecond-scale Preemption for Concurrent GPU-accelerated DNN
+Inferences." OSDI 2022, pp. 539-558. Retrieved 2026-06-05 from
+`https://www.usenix.org/system/files/osdi22-han.pdf`. Artifact:
+`https://github.com/SJTU-IPADS/reef`.
+
+**Category:** runtime / HFT / session scale; GPU execution /
+analytics.
+
+**Relevance tags:** GPU scheduling; preemption; latency-critical
+requests; best-effort work; idempotent kernels; controlled concurrency;
+kernel padding; admission; GPU execution owners; tail latency.
+
+**Core idea:** REEF addresses a GPU sharing problem that maps cleanly
+to GPU DB's retained-read target: dedicating a GPU to urgent requests
+protects latency but wastes throughput, while ordinary stream-level
+concurrency lets background work inflate urgent latency. The paper's
+answer is not generic fair sharing. It separates latency-critical and
+best-effort GPU work, lets urgent kernels preempt running best-effort
+kernels at microsecond scale, and then selectively pads the urgent
+kernel with compatible best-effort kernels when spare GPU parallelism
+exists.
+
+The key enabling assumption is idempotence. DNN inference kernels can
+often be killed and restarted because rerunning a kernel from the same
+inputs produces the same outputs. REEF exploits this by resetting
+software/device queues and compute units while preserving GPU memory,
+rather than waiting for long-running best-effort kernels to finish or
+saving full GPU contexts. In the reported AMD evaluation, REEF keeps
+real-time end-to-end latency overhead under 2% while improving overall
+throughput by up to 7.7x versus dedicating the GPU to real-time work;
+the paper also reports a restricted NVIDIA port that reduces
+preemption latency by up to 12.3x compared with a wait-based approach.
+
+**Concrete mechanisms:**
+
+- REEF classifies work into real-time and best-effort tasks. Real-time
+  tasks should start quickly; best-effort tasks fill otherwise idle GPU
+  capacity.
+- The paper observes two properties of DNN inference kernels: many are
+  idempotent, and their latency is predictable because the kernels are
+  mostly fixed-shape dense computations.
+- Reset-based preemption proactively kills running best-effort kernels
+  and restores them later, avoiding both full context save/restore and
+  passive waits for block completion.
+- The AMD implementation resets multiple queues in the GPU runtime and
+  uses driver-level mechanisms to reset compute units while preserving
+  device memory.
+- REEF reports launching real-time work in tens of microseconds,
+  independent of the number and duration of preempted kernels in its
+  target workload.
+- Dynamic kernel padding uses offline profiles to pair a real-time
+  kernel with best-effort kernels that fit into unused parallelism
+  without interfering with the real-time kernel's latency.
+- The compiler/runtime path builds padded-kernel templates with
+  function pointers, then uses proxy kernels to avoid indirect-call and
+  register-allocation overhead at runtime.
+- Padding is deliberately conservative: a best-effort kernel must fit
+  under the real-time kernel's expected execution window.
+- The evaluated DISB benchmark mixes diverse inference workloads and a
+  real-world Apollo autonomous-driving trace on AMD Radeon Instinct
+  MI50 hardware; the paper also evaluates a restricted NVIDIA path.
+- The paper explicitly notes limitations around non-idempotent kernels,
+  conservative kernel selection, and ignoring GPU memory contention in
+  the padding policy.
+
+**GPU DB mapping:** REEF's strongest transferable idea is not "kill
+database kernels." It is a contract for urgent GPU work: a route can
+only be preemptible if its side effects are either absent, buffered, or
+restartable from a precise input snapshot. Retained point lookups,
+predicate scans over immutable resident snapshots, and read-only
+aggregate kernels are closer to REEF's idempotent inference kernels
+than mutation, refresh, compaction, or write-back kernels.
+
+GPU DB should therefore split GPU execution classes before trying to
+co-schedule everything. Latency-critical retained reads need a
+protected lane. Best-effort scans, refresh builds, statistics work, and
+background validation can fill spare GPU capacity only when they carry
+a restart certificate: snapshot generation, input buffers, output
+buffer ownership, WAL boundary if relevant, and proof that partial
+device writes are not externally visible.
+
+Dynamic padding maps to micro-batch admission. If a short retained
+lookup kernel uses only part of the GPU, the execution owner can pad it
+with background work whose profiled execution window and memory
+footprint fit below the lookup's latency ceiling. This is more useful
+than unconstrained CUDA stream concurrency because the admission
+decision names the protected route and the tolerated interference.
+
+The reset idea also sharpens the publication rule for GPU DB. Any
+kernel whose partial output is visible to other workers, tied to a WAL
+publication step, or mutates a resident generation in place cannot be
+treated as REEF-style restartable work. Those kernels need either
+chunk-boundary preemption, double-buffered output with publish-on-close,
+or non-preemptive admission.
+
+**Risks and mismatches:** REEF is a DNN inference system, not a
+database engine. Its idempotence assumption is much safer for fixed DNN
+layers than for SQL kernels that may scatter variable-size rows,
+update indexes, refresh resident generations, or interact with WAL and
+MVCC visibility. GPU DB should not adopt reset-based preemption for
+mutation or publication kernels unless every side effect is made
+private and replayable.
+
+The full implementation relies on AMD ROCm and driver/runtime changes;
+the NVIDIA version is explicitly restricted. Depending on commodity
+driver support, GPU DB may only be able to use the higher-level policy:
+small kernels, deadline admission, cooperative chunking, stream
+priorities, and restartable background kernels. The paper also does
+not model GPU memory-bandwidth contention in padding, which matters
+for database scans, decompression, joins, and result scattering.
+
+Finally, DNN kernel times are more predictable than many database
+kernels. SQL predicates, result cardinality, skew, compression, and
+visibility checks can change runtime and memory traffic, so GPU DB
+would need live telemetry and conservative route envelopes before
+padding background work behind urgent reads.
+
+**Benchmark candidates:**
+
+- Classify GPU DB kernels into preemptible read-only, restartable
+  best-effort, chunk-boundary preemptible, and non-preemptible
+  publication kernels. Gate: every class has a documented side-effect
+  and visibility contract.
+- Build a retained-read latency harness with short point lookups as
+  urgent work and long scans/refresh builds as best-effort work.
+  Compare exclusive GPU, normal stream concurrency, priority stream
+  scheduling, and cooperative chunk-boundary cancellation. Metrics:
+  p50/p99 lookup latency, best-effort throughput, GPU utilization, and
+  wasted work after cancellation.
+- Prototype double-buffered output for restartable background GPU
+  kernels: all writes go to private buffers and publish only after the
+  owning snapshot/generation check succeeds. Failure condition: a
+  killed or retried kernel can expose partial rows or resident metadata.
+- Add a padding policy for lookup micro-batches that admits only
+  background kernels with profiled runtime and memory-traffic envelopes
+  below the lookup latency budget. Gate: no p99 regression beyond the
+  configured ceiling under uniform and Zipfian keys.
+- Measure whether route predictions stay stable for SQL kernels:
+  profile variance by predicate selectivity, result cardinality,
+  compression format, and visibility density. Failure condition:
+  padding decisions depend on stale averages that miss p99 latency.
+- Test restart safety across WAL/recovery boundaries by killing a
+  refresh or statistics kernel mid-flight, replaying CPU truth, and
+  rebuilding resident metadata. Proof gate: no recovered route trusts
+  pre-crash partial GPU state.

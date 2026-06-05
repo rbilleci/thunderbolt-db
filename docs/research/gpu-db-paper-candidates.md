@@ -1311,7 +1311,7 @@ Append new candidates here as each paper is processed.
   Why: GPU multitasking paper cites LithOS as a recent GPU OS direction;
   useful for comparing OS-like GPU scheduling and isolation with database-owned
   GPU execution owners.
-- `queued` — **Microsecond-scale Preemption for Concurrent GPU-accelerated DNN
+- `reviewed` — **Microsecond-scale Preemption for Concurrent GPU-accelerated DNN
   Inferences**, Han et al., OSDI 2022.
   URL: `https://www.usenix.org/conference/osdi22/presentation/han`
   Why: REEF-style GPU preemption is cited by the multitasking paper; useful
@@ -1360,6 +1360,18 @@ Append new candidates here as each paper is processed.
   Why: Eiffel motivates software scheduling at end hosts and virtualized
   networks; Andromeda is a primary large-scale system source for isolation,
   fast path design, and software/hardware network split tradeoffs.
+- `queued` — **Clockwork: Predictable Low Latency for Deep Learning Inference**,
+  Gujarati et al., OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/gujarati`
+  Why: REEF contrasts predictable DNN serving systems; useful for comparing
+  admission-time latency prediction, batching, and deadline scheduling against
+  GPU DB retained-read and best-effort scan co-scheduling.
+- `queued` — **Baymax: Qos Awareness and Increased Utilization for Non-Preemptive
+  Accelerators in Warehouse Scale Computers**, Chai et al., ASPLOS 2019.
+  URL: `https://doi.org/10.1145/3297858.3304018`
+  Why: REEF cites QoS-aware non-preemptive accelerator sharing; useful as a
+  counterpoint when GPU DB cannot kill or restart long-running database kernels
+  and must rely on padding, admission, or spatial isolation instead.
 - `reviewed` — **MRVs: Enforcing Numeric Invariants in Parallel Updates to
   Hotspots with Randomized Splitting**, Faria and Pereira, PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3588723`
