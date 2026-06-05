@@ -2669,7 +2669,7 @@ Append new candidates here as each paper is processed.
   source in the journal. Shinjuku follow-up direction for rack-scale request scheduling;
   relevant to comparing centralized, partitioned, and rack-aware admission
   when GPU DB eventually spans multiple owners, devices, or nodes.
-- `queued` — **SLOG: Serializable, Low-latency, Geo-replicated
+- `reviewed` — **SLOG: Serializable, Low-latency, Geo-replicated
   Transactions**, Ren et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p1747-ren.pdf`
   Why: deterministic-transaction follow-up direction related to Aria's
@@ -4747,10 +4747,10 @@ Append new candidates here as each paper is processed.
   Why: TiDB cites SQL Server's integrated Hekaton/Apollo HTAP path; useful for
   comparing migration from hot transactional rows into compressed columnar
   structures against GPU DB's resident refresh and safe-generation policy.
-- `queued` — **SLOG: Serializable, Low-latency, Geo-replicated
+- `reviewed` — **SLOG: Serializable, Low-latency, Geo-replicated
   Transactions**, Ren, Li, and Abadi, PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p1747-ren.pdf`
-  DOI: `https://doi.org/10.14778/3324623.3342647`
+  DOI: `https://doi.org/10.14778/3342263.3342647`
   Why: Hermes builds on deterministic execution and partition/locality
   assumptions; SLOG is a follow-up line for locality-aware routing under
   strict serializability and may inform owner-placement and route-freshness

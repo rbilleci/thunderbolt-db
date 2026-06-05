@@ -62375,3 +62375,162 @@ unless the frontier is only for genuinely cross-owner routes.
   single-owner route should use a cheaper local epoch; a cross-owner route
   should pay the global frontier cost only when it actually touches multiple
   owner domains.
+
+### 2026-06-05 - SLOG keeps local transactions fast with lock-only cross-owner ordering
+
+**Citation:** Kun Ren, Dennis Li, and Daniel J. Abadi. "SLOG:
+Serializable, Low-latency, Geo-replicated Transactions." PVLDB 12(11),
+2019, pp. 1747-1761. doi:10.14778/3342263.3342647. Retrieved
+2026-06-05 from `https://www.vldb.org/pvldb/vol12/p1747-ren.pdf`.
+
+**Category:** transaction processing / write path and runtime / session
+scale.
+
+**Relevance tags:** strict serializability; deterministic transactions;
+locality-aware routing; owner placement; lock-only ordering records;
+partition routing; low-latency commit; cross-owner conflicts; remastering;
+route certificates.
+
+**Core idea:** SLOG targets geo-replication, but its transferable idea is a
+locality-aware transaction path that keeps local work off the slow global
+coordination path. Each data granule has one home region. Transactions whose
+read and write sets all belong to one home are routed there and commit after
+the local deterministic log has processed them, while transactions that touch
+multiple homes pay cross-region ordering cost.
+
+The key trick is that multi-home transactions are not allowed to turn every
+local transaction into a global one. SLOG globally orders multi-home
+transactions, then inserts small LockOnlyTxn records into each affected home
+region's local log. Those records order the cross-home transaction relative to
+single-home transactions that touch the same granules, while the actual
+transaction code can arrive separately and block only when it reaches data
+whose lock-only record has not yet completed. This moves much of the expensive
+coordination outside the conflict window.
+
+**Concrete mechanisms:**
+
+- Data is assigned to home regions at a granule level. A granule can be a
+  record or sorted record range, and the home metadata is stored with the
+  granule.
+- The first region that receives a transaction looks up the cached home
+  metadata for every granule in the transaction read/write set. If all homes
+  match, the transaction is initially treated as single-home; otherwise it is
+  routed to the multi-home ordering module.
+- Every region maintains a Paxos-backed local input log for transactions that
+  modify data homed there. Local log batches are sent to other regions, and
+  every region reconstructs and deterministically replays the other regions'
+  local logs.
+- Single-home transactions are appended to the home local log. Deterministic
+  lock acquisition follows global-log order within each region, so local
+  deadlock is avoided and conflicting transactions serialize in log order.
+- Multi-home transactions are ordered with respect to each other by a global
+  multi-home ordering path. The implementation routes all multi-home
+  transactions through one ordering region for simplicity, while noting that
+  cross-region Paxos would be more failure tolerant.
+- For each home touched by a multi-home transaction, SLOG inserts a
+  LockOnlyTxn into that home region's local log. It carries the local access
+  set, orders the multi-home transaction against single-home transactions at
+  that home, and usually does not carry executable transaction code.
+- A multi-home transaction's code may start when its code record appears in a
+  region's global log, but it blocks when it tries to access a granule whose
+  corresponding LockOnlyTxn has not yet completed.
+- Local logs from different homes can be interleaved differently at different
+  replicas because conflicting transactions for a given granule always appear
+  in that granule's home log. The paper's correctness argument relies on all
+  regions preserving each local log order and on all reads/writes for a
+  granule being managed by its home.
+- Dynamic remastering changes a granule's home using an ordinary single-home
+  transaction at the old home. Each granule stores both home id and remaster
+  counter, compact enough for an 8-region deployment to fit in one byte.
+- Transactions carry the home/counter metadata observed at lookup time. Before
+  lock acquisition and again during execution, SLOG compares that metadata with
+  storage. Stale metadata causes abort/restart; future metadata causes waiting
+  until the remaster operation reaches the local log.
+- SLOG-B reports commit after the home region completes the transaction.
+  SLOG-HA waits until the input log batch has also been synchronously
+  replicated to a configured nearby region, but input replication overlaps
+  with deterministic processing.
+- Evaluation uses a Calvin-derived prototype on six AWS regions, four
+  machines per region, transactional YCSB, and TPC-C New Order. SLOG reports
+  near-Calvin throughput when workloads are mostly single-home or when
+  multi-home cost overlaps with multi-partition cost, while reducing
+  single-home latency to mostly below 10 ms versus Calvin's more than 200 ms
+  global-Paxos path. Under high contention, SLOG's throughput is reported as
+  over an order of magnitude above a strict-serializable 2PL coordination
+  baseline and degrades by less than 5x in the Spanner trend comparison where
+  Spanner degrades by 37x.
+
+**GPU DB mapping:** GPU DB can map SLOG's home region to an owner domain:
+partition owner, mutation owner, residency owner, or a future table/range
+owner. The practical design rule is that a request with a provably local
+conflict set should stay on the local owner path. It should not synchronously
+touch a global visibility, residency, or scheduling owner unless the route
+actually crosses owner domains.
+
+LockOnlyTxn maps to a cross-owner ordering descriptor. A multi-partition write,
+resident refresh that overlaps a hot mutation range, or cross-table
+transaction could insert compact ordering records into each affected owner
+ring rather than moving the full SQL request and all execution state through
+every owner. The descriptor would carry request id, route family, access range
+or segment id, requested visibility generation, and conflict mode. The full
+work can proceed where possible and block only at owner boundaries whose
+ordering record has not reached the required point.
+
+The home/counter metadata is a useful shape for P8 route certificates. A
+retained GPU read should carry the resident segment's owner id and generation
+counter observed during planning. Before execution, the GPU execution owner or
+residency owner should compare that certificate against current metadata. If
+the segment was remastered, refreshed, evicted, invalidated, or moved to
+another owner generation, the route restarts or falls back instead of reading
+stale buffers.
+
+SLOG also strengthens the case for classifying locality before admission. A
+session request that is single-owner, single-snapshot, and same-shape can use
+fast retained-read or local-write rings. A cross-owner request should consume
+a more expensive coordination budget and expose that in telemetry. This is
+important for the 1M logical-session target because idle or local sessions
+should not reserve global coordination slots.
+
+For WAL and recovery, SLOG's input-log replication is not directly
+transferable, but the distinction between compact ordering inputs and full
+execution state is. GPU DB can keep WAL as durable authority while using
+small, rebuildable owner-order descriptors and route certificates to move
+coordination out of per-request execution where correctness allows it.
+
+**Risks and mismatches:** SLOG assumes stored or analyzable transactions with
+known read/write sets before execution. Fully interactive SQL, dynamic plans,
+and PostgreSQL protocol transaction blocks may not provide that information
+early enough. The design is geo-distributed and Calvin-derived, not a GPU
+engine, and it does not evaluate CUDA scheduling, GPU memory residency,
+pgwire response flow, NVMe tiers, or MVCC version-chain layout. Its snapshot
+read-only transactions are serializable rather than strict-serializable, and
+the paper does not give a detailed SQL snapshot implementation. The
+multi-home ordering implementation uses one ordering region for simplicity,
+which would become a bottleneck or availability risk if copied literally. Its
+latency numbers include 5 ms batching and WAN assumptions, so the absolute
+values should not be used as local GPU DB targets.
+
+**Benchmark candidates:**
+
+- Add owner-local versus cross-owner route classification to the runtime
+  benchmark harness. Measure p50/p99 latency and queue wait for single-owner
+  retained reads, single-owner writes, and cross-owner writes under the same
+  session load.
+- Prototype compact cross-owner ordering descriptors for one multi-partition
+  write path. Compare full request serialization through the mutation owner
+  against descriptor insertion into affected owner rings. Gate: identical WAL,
+  visibility, and replay results.
+- Add route-certificate generation counters to resident segments. Force
+  refresh, invalidation, eviction, and owner movement during retained reads.
+  Failure condition: a GPU route reads a segment whose certificate no longer
+  matches current ownership/generation metadata.
+- Benchmark delayed blocking: allow a cross-owner request to execute
+  independent CPU/GPU work before blocking at the first missing owner-order
+  descriptor. Measure wasted work on abort/restart versus latency saved under
+  mostly-local workloads.
+- Add telemetry for coordination budget consumption: local owner ring slots,
+  cross-owner descriptor slots, global frontier reads, and restarts caused by
+  stale placement metadata.
+- Simulate remastering a hot partition or resident segment between owners.
+  Success condition: stale route certificates abort before lock acquisition or
+  GPU launch, and throughput recovers after route metadata caches update.
