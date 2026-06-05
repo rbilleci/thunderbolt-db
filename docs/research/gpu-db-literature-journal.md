@@ -66394,3 +66394,189 @@ prefix scans, and analytical reads are called out as future work.
 - Add a failure guard for latency: if conflict grouping reduces aborts but
   increases p99 beyond the route's budget, the scheduler must switch to a
   fallback policy, split the hot bucket, or reject/defer lower-priority work.
+
+### 2026-06-05 - RCBench makes remote concurrency-control cost a primitive budget
+
+**Citation:** Hongyao Zhao, Jingyao Li, Wei Lu, Qian Zhang, Wanqing Yang,
+Jiajia Zhong, Meihui Zhang, Haixiang Li, Xiaoyong Du, and Anqun Pan.
+"RCBench: an RDMA-enabled transaction framework for analyzing concurrency
+control algorithms." The VLDB Journal 33(2), 2024, pp. 543-567; published
+online 2023-12-14. doi:10.1007/s00778-023-00821-0. Retrieved 2026-06-05 from
+`https://doi.org/10.1007/s00778-023-00821-0`, the Springer page, and the
+project technical-report PDF at `https://github.com/dbiir/RCBench`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale; high-concurrency networking/admission.
+
+**Relevance tags:** RDMA; distributed transactions; concurrency-control
+primitives; one-sided verbs; primitive-call budget; serializable isolation;
+Silo; MVCC; Cicada; 2PL; transaction scalability; coroutine scheduling;
+remote metadata.
+
+**Core idea:** RCBench asks whether distributed transaction throughput must
+collapse as a transaction touches more data nodes, or whether the collapse is
+mostly a communication and coordination artifact. The paper builds a shared
+remote-memory testbed that re-expresses several concurrency-control protocols
+using one-sided RDMA primitives, then compares the resulting implementations
+against TCP/IP and two-sided RDMA baselines.
+
+The transferable idea is not "use RDMA everywhere." It is that remote
+concurrency-control work should be counted as a small set of explicit
+primitive operations. Once lock, timestamp, version, validation, and commit
+steps are expressed as `Read`, `Write`, and `CAS`-like metadata operations,
+protocol choices become measurable by primitive count, metadata complexity,
+and contention behavior rather than by protocol name alone.
+
+**Concrete mechanisms:**
+
+- RCBench stores data items in remote memory and uses a key-to-address index
+  so transaction executors can locate remote records before issuing one-sided
+  RDMA operations.
+- The index is an n-way cuckoo hash table. Index entries carry address, size,
+  primary key, and a small lock. The default in the technical report is three
+  candidate hash locations.
+- Range access is handled by partitioning index entries by key prefix and
+  taking shared or exclusive locks on the relevant hash indexes to prevent
+  phantom anomalies.
+- The framework abstracts six primitives: `ReadD`, `WriteD`, `AtomicD` for
+  remote data items and `ReadT`, `WriteT`, `AtomicT` for transaction metadata.
+  `Atomic` is implemented with RDMA compare-and-swap on small metadata fields.
+- General remote operation templates read the remote item, perform local
+  concurrency-control logic, then write or atomically update the remote
+  metadata or value.
+- Five optimization principles reduce primitive cost: `One-Cas`, `One-Write`,
+  `One-Read`, `Read-Cas`, and `Double-Read`. The first four avoid unnecessary
+  generic read/modify/write templates; `Double-Read` can replace explicit
+  latching when two reads can detect unexpected concurrent modification.
+- The authors reimplement lock-based algorithms, timestamp ordering, MVCC,
+  Silo, MaaT, Cicada, and Calvin over the primitive layer.
+- For lock-based algorithms, a 64-bit lock word can encode exclusive/shared
+  lock state and shared-reader count. Under low or moderate contention, a
+  single exclusive-lock path can beat shared/exclusive locks because it uses
+  fewer remote primitive calls; under high contention, shared locks regain
+  value.
+- The evaluation reports 18.0x to 42.8x throughput improvement for one-sided
+  RDMA implementations over TCP/IP variants on YCSB, excluding Calvin. Silo is
+  often best because it has a low average primitive count.
+- Coroutine scheduling is the largest general optimization in the study,
+  improving throughput by roughly 1.7x to 2.5x by hiding RDMA wait time.
+- Hybrid two-sided/one-sided designs improve some phases but remain behind
+  all-one-sided variants in the paper's setup because two-sided operations
+  still require remote CPU scheduling and transaction-context work.
+- Transaction scalability is evaluated by increasing the number of data nodes
+  touched per transaction while keeping the system size fixed. In the RCBench
+  setup, throughput and aggregate effective CPU use drop only modestly from
+  3 to 12 accessed nodes.
+
+**GPU DB mapping:** RCBench is useful even if the first GPU DB deployment is
+single-node. GPU DB already has owner rings, resident snapshots, route
+certificates, and future plans for partition owners and cold tiers. Those
+boundaries should expose a primitive budget just as RCBench exposes an RDMA
+primitive budget: read route metadata, CAS/update a compact state cell, publish
+a generation, invalidate a resident segment, append a WAL record, enqueue a
+GPU batch, copy or pin a buffer, and return a response handle.
+
+This suggests a concrete route-certificate field: `control_ops_budget`.
+Instead of treating a write, retained read, refresh, or fallback as one unit,
+record how many owner-ring messages, atomic metadata updates, visibility
+checks, WAL/publication steps, GPU launches, H2D/D2H transfers, and response
+ring publications it needs. A route with a nominally fast GPU kernel may still
+be bad if it requires too many control-plane operations before the kernel can
+start.
+
+The paper also reinforces keeping metadata compact. RCBench's best paths avoid
+multi-step remote coordination by making common metadata updates fit into one
+CAS or one read. For GPU DB, catalog generations, resident validity, snapshot
+reader counts, hot-key lane state, and route-cache publication should be
+designed as small independently updateable cells where possible. Large
+metadata rewrites belong on refresh or maintenance paths, not on admission.
+
+Coroutine scheduling maps to GPU DB's future owner workers and IO workers.
+When a route waits on NVMe, GPU events, remote memory, or a saturated owner
+ring, the runtime should be able to park that route state without tying up an
+OS thread or allocating a large continuation. The caution is that such
+coroutines should be bounded state machines for hot paths, not arbitrary
+unbounded per-session stacks if the target is 1M logical sessions.
+
+Finally, RCBench's Calvin result is a useful warning. If the bottleneck is a
+central scheduler, faster transport primitives do not fix it. GPU DB should
+not expect CUDA, RDMA, io_uring, or CXL to save a route that still serializes
+through one owner for avoidable planning, validation, or response work.
+
+**Risks and mismatches:** RCBench is a distributed RDMA testbed, not a GPU
+database. Its remote-memory architecture does not directly solve WAL
+durability, crash recovery, SQL execution, GPU residency, or MVCC snapshot
+publication. The most accessible full text during this review was the project
+technical-report PDF; the Springer page confirmed the final VLDB Journal
+citation but the PDF endpoint returned an HTML access page.
+
+One-sided RDMA assumes registered memory, remote addresses, and NIC resources
+that may not exist or may be too expensive in a local GPU DB hot path. The
+paper's range-query and phantom treatment is index-lock based, while GPU DB's
+prefix and range routes need MVCC visibility certificates and retained
+snapshot validity. The reported speedups depend on an InfiniBand RDMA cluster
+and should not be transferred as absolute expectations for local CPU/GPU/NVMe
+work.
+
+The paper also optimizes for serializable concurrency-control protocols but
+does not design a full SQL engine with DDL, long analytical snapshots,
+resident-cache invalidation, or heterogeneous operator placement. For GPU DB,
+the actionable part is the primitive-budget method, not a prescription to
+replace local owner rings with remote memory operations.
+
+**Benchmark candidates:**
+
+- Add `control_ops_budget` telemetry to route descriptors. Count owner-ring
+  messages, metadata atomics, visibility checks, WAL/publication operations,
+  GPU launches, transfer operations, response publications, and fallback
+  probes per route.
+- Build a microbenchmark that compares three metadata publication layouts for
+  retained route validity: one compact CAS-sized generation cell, a
+  read-plus-CAS cell with derived state, and a larger rewritten metadata
+  record. Measure p50/p99 admission latency and failed publication retries.
+- For hot write routes, compare "single exclusive lane" admission against
+  shared/exclusive read-write lanes under low, moderate, and high contention.
+  Failure condition: the lower primitive-count lane wins uniform workloads but
+  destroys high-contention read concurrency or tail latency.
+- Prototype bounded coroutine/state-machine parking for routes waiting on GPU
+  events, NVMe reads, or residency refresh. Measure parked-state bytes per
+  logical session and scheduler wakeup overhead.
+- Add a route-stage breakdown similar to RCBench's primitive count: parse,
+  plan/route, admission, visibility proof, WAL/commit, resident invalidation,
+  GPU execution, transfer, response encode, response write. Use it to reject
+  any "fast GPU route" whose control-plane setup dominates kernel time.
+- Test whether same-shape retained reads can share metadata reads and route
+  validation inside a micro-batch without weakening per-request snapshot
+  correctness.
+
+### 2026-06-05 - Cross-paper synthesis: route boundaries need primitive budgets
+
+Recent reviews of Epoxy, conflict-history transaction scheduling, and RCBench
+converge on the same design pressure from three directions. Epoxy says a
+route must prove its visibility and commit boundary across derived stores.
+Conflict-history scheduling says a route should carry compact conflict shape
+before it enters a hot queue. RCBench says the route should also expose the
+number and type of control-plane operations needed to make that decision real.
+
+The converging design track is a route certificate with three small proofs:
+visibility proof, conflict proof, and primitive-budget proof. A retained GPU
+read, hot write, refresh, or cold-tier fallback should not be admitted only
+because its data is resident or its predicted cost is low. It should show
+which generation it can read, which conflict lane it belongs to, and how many
+metadata, queue, WAL, transfer, and publication operations it will consume
+before producing a response.
+
+**Category gaps:** The recent batch is now strong on transaction scheduling,
+cross-engine snapshot metadata, and remote concurrency-control costs. The next
+useful gap is multi-tier placement or query execution that is not purely GPU
+OLAP: for example warm-column storage, cold-tier IO ownership, or CPU/GPU
+route compilation and fallback.
+
+**Benchmark priorities:**
+
+- Add route-stage counters before changing scheduling policy.
+- Use compact, CAS-sized route-publication cells where a hot path only needs a
+  generation, validity bit, or lane state.
+- Make conflict lanes prove both abort reduction and tail-latency protection.
+- Treat any derived GPU/cold-tier route as unavailable unless its visibility
+  proof and primitive budget are both within the route's latency class.

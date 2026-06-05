@@ -727,13 +727,16 @@ Append new candidates here as each paper is processed.
   multi-write OCC, epoch validation, deterministic conflict resolution, and
   asynchronous log pushdown; selected after the last synthesis called for more
   transaction/MVCC write-publication work.
-- `queued` — **RCBench: an RDMA-enabled transaction framework for analyzing
+- `reviewed` — **RCBench: an RDMA-enabled transaction framework for analyzing
   concurrency control algorithms**, Zhao et al., VLDB Journal 2023.
   URL: `https://doi.org/10.1007/s00778-023-00821-0`
   PDF: `https://link.springer.com/content/pdf/10.1007/s00778-023-00821-0.pdf`
+  Code/PDF: `https://github.com/dbiir/RCBench`
   Why: CCaaS motivates independently scaled conflict-resolution resources;
   RCBench may provide a modern distributed/RDMA concurrency-control benchmark
   framework for comparing protocol scalability under data-node fan-out.
+  Journal entry exists from 2026-06-05; the GitHub technical-report PDF was
+  used after the Springer PDF endpoint returned an HTML access page.
 - `reviewed` — **Epoxy: ACID Transactions Across Diverse Data Stores**,
   Kraft et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2742-kraft.pdf`
@@ -3323,6 +3326,13 @@ Append new candidates here as each paper is processed.
   phase-specific combinations of RPC and one-sided verbs; DrTM-H is a primary
   transaction-processing baseline for deciding which validation, commit, and
   replication steps can safely bypass server CPU work.
+- `queued` — **RDMA-Enabled Concurrency Control Protocols for Transactions in
+  the Cloud Era**, Wang and Qian, IEEE Transactions on Cloud Computing 2021.
+  URL: `https://doi.org/10.1109/TCC.2021.3110946`
+  arXiv: `https://arxiv.org/abs/2002.12664`
+  Why: RCBench contrasts itself with RCC as an earlier unified RDMA
+  concurrency-control framework; useful for comparing phase-wise hybrid
+  RPC/one-sided designs against RCBench's one-sided-only primitive contract.
 - `queued` — **The End of a Myth: Distributed Transactions Can Scale**,
   Zamanian et al., PVLDB 2017.
   URL: `https://arxiv.org/abs/1607.00655`
