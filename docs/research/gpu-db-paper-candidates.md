@@ -3875,13 +3875,31 @@ Append new candidates here as each paper is processed.
   Why: updateable cardinality estimator with bounded-error claims; useful
   counterpoint to offline query-driven retraining when GPU DB table updates
   and resident snapshots shift faster than route logs can be relabeled.
-- `queued` — **LMSFC: A Novel Multidimensional Index Based on Learned
+- `reviewed` — **LMSFC: A Novel Multidimensional Index Based on Learned
   Monotonic Space Filling Curves**, Gao et al., PVLDB 2023.
   URL: `https://doi.org/10.14778/3603581.3603598`
+  PDF: `https://www.vldb.org/pvldb/vol16/p2605-gao.pdf`
   Why: ICE uses multidimensional index filtering efficiency as the main
   control on estimator variance and cites LMSFC as a learned
   space-filling-curve index; useful for comparing route-cardinality sketches
   against resident multidimensional index layouts.
+- `queued` — **Tsunami: A Learned Multi-dimensional Index for Correlated
+  Data and Skewed Workloads**, Ding, Nathan, Alizadeh, and Kraska,
+  PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p74-ding.pdf`
+  DOI: `https://doi.org/10.14778/3425879.3425880`
+  Why: LMSFC compares against Tsunami as a workload/data-aware learned
+  multidimensional index; useful for testing whether GPU DB resident
+  predicate indexes should adapt by correlated regions before trying a
+  learned global space-filling curve.
+- `queued` — **Learning Multi-Dimensional Indexes**, Nathan et al.,
+  SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3380579`
+  arXiv: `https://arxiv.org/abs/1912.01668`
+  Why: LMSFC and Tsunami both build on Flood's learned multidimensional
+  layout ideas; useful as the baseline for whether route-specific index
+  construction should jointly optimize data layout, grid partitioning, and
+  query workload rather than only adding a secondary resident index.
 - `queued` — **PACE: Poisoning Attacks on Learned Cardinality Estimation**,
   Zhang, Zhang, Li, and Chai, PACMMOD 2024.
   URL: `https://doi.org/10.1145/3639292`

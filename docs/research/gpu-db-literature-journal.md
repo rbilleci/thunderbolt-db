@@ -53948,3 +53948,151 @@ models and carefully chosen shims.
   WAL durability, resolver admission, storage apply, resident refresh,
   invalidation, and retry. It should inject delayed logs, failed
   publications, stale route certificates, and snapshot retirement races.
+
+### 2026-06-05 - LMSFC learns the resident multidimensional order, not just the lookup model
+
+**Citation:** Jian Gao, Xin Cao, Xin Yao, Gong Zhang, and Wei Wang.
+"LMSFC: A Novel Multidimensional Index based on Learned Monotonic
+Space Filling Curves." PVLDB 16(10):2605-2617, 2023.
+doi:10.14778/3603581.3603598. Retrieved 2026-06-05 from the
+PVLDB PDF, `https://www.vldb.org/pvldb/vol16/p2605-gao.pdf`.
+
+**Category:** query optimization / planning; resident indexing;
+multi-tier cache / data placement.
+
+**Relevance tags:** learned multidimensional index; space-filling
+curve; workload-aware layout; resident predicate index; page packing;
+range query splitting; route-cost certificates; GPU/CPU scan fallback.
+
+**Core idea:** LMSFC argues that learned multidimensional indexes
+should not only learn a model on top of a fixed linearization such as
+row-major or Z-order. The mapping from multidimensional points into a
+one-dimensional order is itself a route decision. If that order is
+learned from the dataset and expected window-query workload, then the
+physical layout can reduce dead space, page overlap, and false page
+accesses before a learned one-dimensional index is even consulted.
+
+The paper keeps an important property for database execution: the
+learned space-filling curve is monotonic. That makes range-location
+cheap compared with non-monotonic curves that may require enumerating
+many boundary values. LMSFC then adds two complementary optimizations:
+offline page packing after linearization, and online query splitting
+so a broad window can be decomposed into sub-windows that skip more
+irrelevant pages.
+
+**Concrete mechanisms:**
+
+- LMSFC defines a parameterized family of monotonic space-filling
+  curves. The parameters control how bits from each dimension are
+  interleaved, so the final one-dimensional order can favor the data
+  and query workload rather than using a fixed Z-order or row-major
+  rule.
+- It learns the curve parameters with sequential model-based Bayesian
+  optimization over sampled data and sampled workload queries. The
+  paper explicitly uses sampling because repeatedly sorting the full
+  dataset for every candidate SFC is too expensive.
+- After the curve is chosen, multidimensional points are sorted by
+  their learned SFC value and indexed through a one-dimensional learned
+  index path.
+- LMSFC optimizes physical page packing along the learned order. It
+  formulates page grouping as a density-based cost problem; dynamic
+  programming can find an optimal packing, while a heuristic trades a
+  small loss in query time for much lower construction cost.
+- Each packed page carries a multidimensional minimum bounding
+  rectangle. Query execution uses the learned one-dimensional range to
+  find candidate pages, then filters by page MBR and exact tuple
+  predicates.
+- The online recursive query splitting strategy searches for gaps in
+  the learned SFC range where no relevant page should be touched. A
+  split-depth parameter limits overhead: deeper splits skip more
+  irrelevant pages but issue more index accesses.
+- In the reported evaluation, LMSFC is tested on three real datasets
+  including a 250M-record OpenStreetMap sample. The paper reports up
+  to 38.2x speedup over R*-tree, 7.2x over ZM-index, and 2.0x over
+  Flood across the evaluated settings.
+- The kmaxsplit ablation shows the tradeoff directly: on the reported
+  OSM setup, increasing split depth from 0 to 4 reduced average
+  irrelevant pages from 16,991 to 1,288 and query time from 150 us to
+  109 us, while depth 5 reduced irrelevant pages further but increased
+  time to 113 us because index-access overhead dominated.
+- The paging ablation shows the same route-cost shape. On OSM,
+  LMSFC with fixed-size pages averaged 150 us, heuristic packing
+  averaged 116 us, and dynamic-programming packing averaged 109 us;
+  the paper notes heuristic packing was much faster to build than DP.
+
+**GPU DB mapping:** LMSFC is most useful for P8's resident predicate
+and route-selection layer. A GPU resident column group should not
+only ask "scan or probe?" It can also ask which resident order, page
+or segment grouping, and multidimensional predicate family should be
+published as a route. The transferable primitive is a learned,
+monotonic, generation-tagged ordering for a hot multidimensional
+predicate family.
+
+For GPU execution, the monotonic property is valuable because it
+creates compact candidate ranges that can become GPU worklists:
+page or segment ids, key-vector slices, and MBR metadata can be
+checked before launching a wider scan. Query splitting maps to
+micro-batch shape selection. If a predicate window would touch many
+dead resident pages, split it only until the expected skipped bytes
+exceed extra launch, queue, and result-scatter overhead.
+
+For the multi-tier cache manager, LMSFC suggests that resident
+layout is part of the cache object. A learned SFC index should carry
+schema generation, source WAL frontier, sample/workload generation,
+packing policy, split-depth policy, and measured false-page rate. If
+the workload changes, the old route can remain correct but lose its
+performance certificate and be demoted behind scan or CPU fallback.
+
+For MVCC and snapshots, LMSFC's page packing needs a visibility
+boundary. P8 should learn and publish the layout from an immutable
+retained generation, not from mutable in-place pages. Updates can be
+handled initially by invalidating or rebuilding learned resident
+segments; later work can test delta side structures, but correctness
+must stay with WAL-backed CPU truth and retained read visibility.
+
+**Risks and mismatches:** LMSFC targets read-mostly exact window
+queries over multidimensional point data. It is not an OLTP update
+protocol, does not solve MVCC version chains, and does not address
+GPU kernels, host-device transfer, or write-heavy churn. The paper's
+physical unit is a disk page; GPU DB will need segment, column-group,
+and device-worklist equivalents.
+
+The learning process depends on representative sampled workload
+queries. A tenant workload shift, new predicate mix, changed data
+distribution, or altered residency budget can make the learned order
+stale. Query splitting is also not automatically good for latency:
+the OSM ablation shows that deeper splitting eventually loses to
+extra index accesses. On GPU, that overhead could include additional
+kernels, scattered reads, or response-ring fragments.
+
+Finally, a learned multidimensional layout may fight compression,
+append-friendly ingest, and MVCC garbage collection. P8 should treat
+it as an optional resident route for stable hot tables rather than
+the first canonical storage layout.
+
+**Benchmark candidates:**
+
+- Build a resident multidimensional index simulator for two `int4`
+  predicate columns: fixed Z-order, one learned monotonic bit order,
+  and plain resident scan. Measure candidate segments, false-page
+  rate, GPU bytes touched, and p50/p95 latency.
+- Add a split-depth route benchmark. For each predicate window,
+  vary recursive split depth and charge explicit overhead for index
+  accesses, GPU launches, result scattering, and response-ring
+  fragments. Failure condition: deeper splitting improves bytes read
+  but worsens p95 latency.
+- Compare fixed-size resident segments with density-aware packing on
+  a retained generation. Gate: identical visible result sets and
+  lower false-segment access without increasing refresh time beyond
+  the configured route SLA.
+- Track a "route layout certificate" for learned resident indexes:
+  schema generation, WAL frontier, sample generation, workload epoch,
+  packing policy, and measured false-page rate. Invalidate or demote
+  the route when workload drift breaks the certificate.
+- Stress a mixed workload with append/update/delete invalidations
+  while a learned resident index serves reads. The proof gate is that
+  stale learned layouts never return visible rows from an invalidated
+  generation and never hide rows visible to the retained snapshot.
+- Test whether learned multidimensional ordering improves host/NVMe
+  warm-tier prefetch as well as HBM residency. Measure warm-tier
+  page faults, read amplification, and promotion usefulness.
