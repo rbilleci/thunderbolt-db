@@ -71136,3 +71136,155 @@ after-the-fact runtime events.
 - Planner risk benchmark: compare routes that look cheap by scan cost alone
   against routes that include queue delay, transfer pressure, refresh age, and
   lineage compatibility.
+
+### 2026-06-05 - Serial Safety Net layers serializability over faster MVCC paths
+
+**Citation:** Tianzheng Wang, Ryan Johnson, Alan Fekete, and Ippokratis
+Pandis. "Efficiently Making (Almost) Any Concurrency Control Mechanism
+Serializable." VLDB Journal 26(4), 2017; arXiv:1605.04292v5. Retrieved
+2026-06-05 from `https://arxiv.org/abs/1605.04292` after the DOI page
+was identified from the candidate queue.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** serializability; MVCC certification; dependency tracking;
+snapshot isolation; read committed; safe retry; read-mostly transactions;
+phantom protection; retained reads; heterogeneous OLTP/HTAP.
+
+**Core idea:** Serial Safety Net, or SSN, is a commit-time certifier that can
+sit above a weaker but faster concurrency-control scheme such as snapshot
+isolation or read committed. The underlying scheme still decides which version
+a transaction reads and how writes are scheduled. SSN adds enough dependency
+metadata to reject transactions that might close a serialization cycle.
+
+The transferable point for GPU DB is that serializability does not have to mean
+routing every read and write through a pessimistic global lock path. A retained
+snapshot or fast read route can stay optimistic and parallel, while a compact
+certificate checks whether its direct dependencies create a dangerous exclusion
+window before visibility is published.
+
+**Concrete mechanisms:**
+
+- SSN assumes the underlying concurrency-control scheme at least prevents dirty
+  reads and lost writes. It then tracks the transaction dependency graph using
+  local dependency summaries rather than global graph traversal.
+- Each committing transaction receives a monotonically increasing commit stamp
+  `c(T)`. SSN also maintains a successor low watermark `sstamp` / `pi(T)` and a
+  predecessor high watermark `pstamp` / `eta(T)`.
+- A transaction must abort if `pi(T) <= eta(T)`, meaning a direct predecessor
+  committed inside the transaction's exclusion window and may also be reachable
+  as a successor through back edges.
+- In multi-version systems, reads update the transaction's predecessor watermark
+  from the read version's creation stamp. If the version has already been
+  overwritten, the read also folds in the overwritten version's successor stamp;
+  otherwise the version is kept in the read set for pre-commit validation.
+- Writes install a new version through the underlying CC mechanism and remember
+  the overwritten version. At pre-commit, the writer uses the overwritten
+  version's reader/access stamp to account for read anti-dependencies.
+- The commit protocol has a pre-commit phase that fixes `c(T)`, finalizes
+  `pi(T)` and `eta(T)` from the read and write sets, performs the exclusion
+  test, and then a post-commit phase that stamps created, read, and overwritten
+  versions.
+- The paper gives a latch-free multi-version implementation using atomic
+  8-byte reads/writes and CAS. In-flight transactions can temporarily leave
+  transaction IDs in version stamp fields; commit-time logic resolves those IDs
+  to timestamps when needed.
+- SSN can store two extra per-version stamps, while many systems already keep
+  the creation stamp and previous-version pointer. The paper notes that two
+  8-byte stamps cost under 16 MB for one million versions.
+- For read-only work, SSN supports safe snapshots. The active variant treats a
+  forced safe snapshot like a transaction that has read the database, causing
+  overlapping updaters to abort only when they combine unsafe dependencies.
+- For read-mostly transactions, SSN can avoid tracking stale versions in the
+  full read set. It uses thread-private last-commit stamps and reader bitmaps
+  so updaters conservatively account for skipped read tracking.
+- Phantom protection is not automatic. The paper shows how table, key, and gap
+  pseudo-versions or lock-like modes can feed predicate reads and inserts into
+  the same SSN dependency machinery.
+- ERMIA evaluation on a 60-core, 3 TB machine shows SI+SSN close to SI under
+  TPC-C/TPC-CC, more accurate than SSI under contention, and much better than
+  vanilla SSN for long read-mostly TPC-EH work when the read-mostly
+  optimization is enabled. The reported SI+SSN-R improvement over vanilla SSN
+  is about 136% overall and 97% for Asset-Eval in TPC-EH.
+
+**GPU DB mapping:** SSN fits the owner-domain design as a publication gate,
+not as a GPU kernel feature. Mutation or partition owners can keep fast MVCC
+execution, publish commit generations, and attach predecessor/successor
+watermarks to transaction envelopes. A read snapshot worker or GPU retained
+route should not decide serializability alone; it should return the dependency
+facts needed by the owner to certify before write visibility or serializable
+read completion is acknowledged.
+
+The exclusion-window shape is useful for retained reads. A long GPU scan, a
+batched point-lookup route, or a CPU fallback read can hold a snapshot and still
+avoid stamping every old version if the route can prove that most versions are
+stale with respect to recent overwrites. That maps to route certificates with a
+snapshot generation, a dependency summary, and a read-tracking mode: full,
+stale-skipped, safe-snapshot, or non-serializable-read-committed.
+
+For the 1M logical-session target, SSN argues for bounded dependency metadata
+rather than per-session locks. Idle sessions need no SSN state. Active
+transactions need compact read/write footprints, per-owner generation stamps,
+and a deterministic abort/retry result. Safe retry is especially attractive for
+pgwire clients and internal retry loops because a serialization abort caused by
+SSN should not keep failing for the same dependency shape after an immediate
+retry.
+
+P8's resident snapshots should treat phantom and predicate coverage explicitly.
+A GPU route over an index, key vector, visible-row bitmap, or column segment
+needs a pseudo-version or range certificate for the predicate space it covered.
+Without that, SSN can certify tuple-version dependencies while missing inserts
+that would have changed a retained range scan.
+
+The read-mostly optimization is a direct benchmark candidate for retained GPU
+analytics mixed with writes. Instead of stamping every row read by a large scan,
+GPU DB can classify stable resident segments or older deltas as stale and let
+writers account for them through segment-level reader epochs, last-commit
+proxies, or route-level dependency summaries.
+
+**Risks and mismatches:** SSN still needs the underlying CC scheme to prevent
+dirty reads and lost writes. It is not a replacement for WAL-before-visibility,
+write-write conflict handling, physical index correctness, or recovery.
+
+The paper's implementation assumes main-memory multi-version data structures,
+thread-pinned transaction execution, and atomic timestamp machinery. GPU DB's
+network workers, mutation owners, GPU workers, and async refresh tasks may
+cross thread and device boundaries, so thread-private shortcuts must become
+owner-private or route-private summaries.
+
+Read-mostly optimizations introduce conservative false positives and require a
+threshold for stale versions. In GPU DB, a bad threshold could either stamp too
+much and hurt latency, or skip too much and push unnecessary aborts onto
+writers. The paper also separates phantom protection as an added mechanism;
+GPU-resident range and prefix routes will need their own predicate certificates
+before claiming serializable isolation.
+
+The evaluation logs to `/dev/null`, so the throughput results do not include a
+production durable WAL path. Treat the measured deltas as concurrency-control
+shape evidence, not as a write-throughput target.
+
+**Benchmark candidates:**
+
+- Add an SSN-style certification prototype over the current MVCC tuple store:
+  per-transaction `pstamp`/`sstamp`, per-version creation/access/successor
+  stamps, and an exclusion-window check before serializable commit. Proof gate:
+  generated write-skew and read-skew histories abort under serializable mode
+  while snapshot-compatible histories commit.
+- Compare serializable retained reads implemented three ways: owner-routed
+  pessimistic reads, SI plus SSN certification, and safe-snapshot read-only
+  execution. Measure p50/p99 latency, abort rate, read metadata bytes, and write
+  throughput under mixed point lookup, range scan, and update workloads.
+- Build a retained GPU scan dependency-summary benchmark. Full tracking stamps
+  every visible row; stale-segment tracking records only segment/epoch readers;
+  safe-snapshot tracking records no per-row reads. Failure condition: any mode
+  admits a phantom or write-skew anomaly under generated histories.
+- Add a safe-retry benchmark for pgwire transaction loops: inject SSN aborts,
+  retry immediately, and measure whether the same dependency shape clears
+  without random backoff. Gate: bounded retry count and stable response latency
+  under hot-key contention.
+- Prototype predicate pseudo-versions for resident key-vector and prefix scans:
+  table-level, partition-level, key-range, and gap certificates. Gate: inserts
+  into a covered range create dependency edges visible to certification.
+- Measure metadata placement: per-version 16-byte SSN stamps in CPU memory,
+  compressed segment-level summaries for GPU resident data, and per-owner
+  timestamp blocks. Track cache misses, memory footprint, and commit-time work.

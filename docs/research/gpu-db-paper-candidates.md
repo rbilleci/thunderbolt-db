@@ -3513,13 +3513,26 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up that generalizes hot-record migration across
   buffer-managed access methods; useful for comparing Bf-Tree mini-pages with
   explicit tiered hot/cold structures under skewed GPU DB lookup workloads.
-- `queued` — **Efficiently Making (Almost) Any Concurrency Control Mechanism
+- `reviewed` — **Efficiently Making (Almost) Any Concurrency Control Mechanism
   Serializable**, Wang, Johnson, Fekete, and Pandis, VLDB Journal 2017.
   URL: `https://doi.org/10.1007/s00778-017-0463-8`
   arXiv: `https://arxiv.org/abs/1605.04292`
   Why: ERMIA uses Serial Safety Net as its serializability certifier; useful
   for deciding whether GPU DB can layer bounded dependency validation over
   snapshot-friendly read execution without falling back to pessimistic locks.
+- `queued` — **One-shot Garbage Collection for In-memory OLTP through
+  Temporality-aware Version Storage**, Raza et al., SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3589273`
+  Why: SSN and recent MVCC scan/storage reviews point to version-chain and
+  reader-retention costs as a write-path bottleneck; useful for comparing
+  temporal clustering and one-shot reclamation with GPU DB retained-snapshot
+  retirement and old-delta compaction.
+- `queued` — **RABIT: Efficient Range Queries with Bitmap Indexing**,
+  Wang, Xiao, and Athanassoulis, PACMMOD 2025.
+  URL: `https://cs-people.bu.edu/mathan/publications/pacmmod25-wang.pdf`
+  Why: vWeaver-related range-query work with update-friendly bitmap indexing;
+  useful for comparing native index-only scans and lightweight multi-version
+  index layers against GPU DB resident key vectors and visible-row bitmaps.
 - `queued` — **Don't Shoot Down TLB Shootdowns!**, Amit, Tai, and Wei,
   EuroSys 2020.
   URL: `https://doi.org/10.1145/3342195.3387525`
