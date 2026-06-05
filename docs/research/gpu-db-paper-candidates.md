@@ -724,13 +724,19 @@ Append new candidates here as each paper is processed.
   Why: ASCY follow-up from the same group; useful for optimistic read/validate
   patterns in CPU-side route metadata, hot catalog maps, and lightweight
   retained-snapshot indexes.
-- `queued` — **In the Search for Optimal Concurrency**, Gramoli et al.,
+- `reviewed` — **In the Search for Optimal Concurrency**, Gramoli et al.,
   SIROCCO 2016.
   URL:
   `http://sirocco2016.hiit.fi/preproceedings/In_the_Search_for_Optimal_Concurrency.pdf`
   Why: ASCY-related concurrency-optimality work; useful as a correctness
   counterweight when deciding whether simplified route metadata structures
   sacrifice valid concurrent schedules for speed.
+- `queued` — **A Concurrency-Optimal List-Based Set**, Gramoli, Kuznetsov,
+  Ravi, and Shang, DISC 2015 brief announcement / arXiv 2015.
+  URL: `https://arxiv.org/abs/1502.01633`
+  Why: implementation follow-up cited by the SIROCCO 2016 concurrency
+  optimality paper; useful for seeing how semantic-aware validation plus
+  restartability becomes an actual concurrent index/data-structure design.
 - `reviewed` — **PathCAS: An Efficient Middle Ground for Concurrent Search Data
   Structures**, Brown, Sigouin, and Alistarh, PPoPP 2022.
   URL: `https://doi.org/10.1145/3503221.3508410`

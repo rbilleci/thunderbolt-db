@@ -60576,3 +60576,145 @@ counterexample.
 - A mixed workload that combines hot writes, resident reads, and long GPU
   scans to verify that batching/fusion does not serve stale snapshots or
   violate retained-read latency while chasing bandwidth.
+
+### 2026-06-05 - Optimal concurrency is accepted correct schedules, not just fewer locks
+
+**Citation:** Vincent Gramoli, Petr Kuznetsov, and Srivatsan Ravi. "In the
+Search for Optimal Concurrency." SIROCCO 2016 preproceedings. Retrieved
+2026-06-05 from
+`http://sirocco2016.hiit.fi/preproceedings/In_the_Search_for_Optimal_Concurrency.pdf`.
+
+**Category:** runtime / HFT / session scale, with concurrency-control and
+route-metadata relevance.
+
+**Relevance tags:** concurrency metric; LS-linearizability; linearizability;
+local serializability; search data structures; pessimistic locking; optimistic
+serializable synchronization; accepted schedules; route metadata; CPU indexes;
+snapshot publication.
+
+**Core idea:** The paper asks a more precise question than whether a concurrent
+data structure is "highly concurrent": which correct interleavings of the
+sequential implementation can it accept? It defines concurrency as the set of
+schedules an implementation can process, then defines a concurrency-optimal
+implementation as one that accepts every schedule that satisfies the paper's
+correctness criterion.
+
+The correctness criterion, LS-linearizability, combines ordinary
+linearizability at the high-level object interface with local serializability
+of each operation's internal reads and writes. That matters because
+linearizability alone can hide an operation seeing an impossible transient
+state, while full serializability can reject histories where each operation's
+local view is valid and the exported object behavior is linearizable.
+
+The main result is a useful warning for route metadata and CPU-side indexes:
+conservative pessimistic synchronization and strictly serializable optimistic
+synchronization are incomparable for search data structures such as linked
+lists, skiplists, and search trees. Pessimistic locking can exploit semantic
+knowledge and accept some non-serializable but LS-linearizable schedules.
+Optimistic serializable techniques can restart or abort operations and accept
+some schedules that irrevocable pessimistic techniques must reject. Neither
+class is concurrency-optimal on its own.
+
+**Concrete mechanisms:**
+
+- The paper models a concurrent implementation as a transformed sequential
+  implementation: high-level operations execute reads and writes over the data
+  structure state, possibly aborting and restarting in optimistic variants.
+- A schedule is the order of high-level operation events plus internal read and
+  write invocation/response events, with actual read and high-level responses
+  abstracted out. An implementation accepts a schedule when it can produce a
+  complete history matching that order.
+- LS-linearizability requires two properties: every operation's local internal
+  history must match some sequential execution of the original implementation,
+  and the exported high-level history must be linearizable for the object type.
+- The search-structure class is represented as a rooted directed acyclic graph
+  with insert, delete, and find operations. Traversals are read-only, then
+  update phases modify outgoing edges of key-relevant nodes.
+- The paper's hand-over-hand find example serializes updates by a root lock,
+  while find operations use shared locks along the currently traversed node and
+  outgoing edges. Finds can be linearized at a point where they hold the
+  key-relevant set, while each local traversal still observes a sequentially
+  valid view.
+- Pessimistic implementations are shown suboptimal because there are schedules
+  where two insert traversals are indistinguishable until a final conflict; an
+  optimistic serializable implementation can accept the safe case and abort or
+  reject the unsafe case, while an irrevocable pessimistic implementation must
+  be over-conservative.
+- Strictly serializable optimism is shown suboptimal because a hand-over-hand
+  pessimistic structure can accept some locally serializable, linearizable
+  search schedules that are not strictly serializable.
+- The conclusion explicitly does not claim the accepted-schedule metric is a
+  full performance metric; cache behavior, validation cost, and coherence still
+  matter.
+
+**GPU DB mapping:** For GPU DB, the strongest transfer is the definition of
+"more concurrency" as a correctness-bounded acceptance set. Route metadata,
+catalog handles, resident snapshot maps, CPU fallback indexes, and partition
+ownership structures should not be judged only by lock count, abort count, or
+throughput under one benchmark. They should be judged by which interleavings
+they can safely admit under WAL-before-visibility, snapshot visibility, DDL
+invalidation, and route-publication rules.
+
+The paper argues against a universal synchronization style. For route metadata
+publication, a tiny pessimistic publication lock or owner-domain queue may be
+right when it encodes semantics cheaply: publish a whole route generation, then
+let readers hold immutable handles. For hot mutable CPU indexes or per-route
+admission maps, optimistic validation and restart may be better when conflicts
+are rare but possible. For mixed cases, the paper points toward hybrid designs:
+semantic-aware fast paths plus abort/retry when an operation's local view cannot
+be proven safe.
+
+LS-linearizability maps cleanly to retained read snapshots. A read worker can
+execute from an older immutable resident snapshot as long as its local view is
+consistent with a valid snapshot boundary and the final result is linearizable
+with the SQL-visible read boundary. But this is only useful if the route
+certificate records the boundary, generation, invalidation relation, and any
+fallback/retry decision. Full internal serializability of every metadata read
+may be unnecessary, but impossible local views must remain impossible.
+
+For CPU-side search structures, the paper is a reminder that "lock-free",
+"transactional", and "hand-over-hand" are not absolute wins. A resident key
+vector, CPU B-tree/hash fallback, or route map may need different concurrency
+policies by operation class: read-only traversal, single-key publication,
+range update, DDL invalidation, refresh retirement, or eviction. The benchmark
+should include acceptance/correctness cases, not only throughput.
+
+**Risks and mismatches:** This is a formal concurrency paper, not a database
+system evaluation. It does not implement a DBMS, GPU execution, WAL, MVCC,
+network admission, NVMe tiering, SQL planning, or session multiplexing. It
+also does not provide throughput graphs for GPU DB to copy; its value is the
+correctness and concurrency framing.
+
+LS-linearizability is defined for search data structures with internal
+read/write histories. Mapping it to SQL transactions or multi-object MVCC
+requires care because SQL isolation includes transaction boundaries,
+predicate/range effects, constraints, catalog state, and recovery ordering.
+The paper also notes that schedule acceptance does not account for cache
+coherence, validation cost, or memory hierarchy effects, all of which are
+central for GPU DB.
+
+**Benchmark candidates:**
+
+- Add a route-metadata acceptance test suite with generated interleavings for
+  publish, read, invalidate, retire, and refresh operations. Gate: every served
+  route handle has a locally valid generation and SQL-visible read boundary.
+- Compare three route-map synchronization designs: owner-serialized
+  publication with immutable handles, optimistic read/validate/retry, and a
+  hybrid semantic fast path. Measure accepted safe interleavings, retry count,
+  p99 metadata lookup latency, allocation count, and stale-route rejection.
+- Build CPU index concurrency tests for retained lookup fallback: read-only
+  traversal concurrent with insert/delete/update, DDL invalidation, and
+  resident snapshot publication. Failure condition: a lookup observes a local
+  structure state that could not occur in any sequential index state.
+- Extend route certificates with an "acceptance reason" for fast-path reads:
+  immutable snapshot, validated optimistic read, owner-serialized mutation, or
+  fallback. Required metric: route throughput by reason plus retry/reject rate
+  under hot-key and DDL churn.
+- Add a semantic-versus-serializable metadata benchmark. Expected result:
+  semantic-aware publication admits more correct read schedules than forcing
+  every internal metadata access into one global serial order, without serving
+  stale or impossible generations.
+- For any future lock-free or HTM route-map implementation, require a local
+  view proof for readers in addition to linearizable publication. Gate: stress
+  histories can be checked against generated witnesses for publication and
+  retirement order.
