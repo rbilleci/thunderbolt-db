@@ -651,12 +651,12 @@ Append new candidates here as each paper is processed.
   Why: hardware-sensitive scan variants cite modern SIMD selection work; useful
   for calibrating CPU fallback, predicate-vector width, mask extraction, and
   Bloom-filter-style prefilter routes against GPU resident scans.
-- `queued` — **Everything You Always Wanted to Know About Compiled and
+- `reviewed` — **Everything You Always Wanted to Know About Compiled and
   Vectorized Queries But Were Afraid to Ask**, Kersten et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf`
   Why: follow-up on compiled versus vectorized CPU query execution; useful for
   deciding when GPU DB should rely on generated CPU fallback, vectorized warm
-  scans, or fused retained GPU routes.
+  scans, or fused retained GPU routes. Journal entry added 2026-06-05.
 - `reviewed` — **High Performance Transactions via Early Write Visibility**,
   Faleiro, Abadi, and Hellerstein, PVLDB 2017.
   URL: `https://doi.org/10.14778/3055540.3055553`
@@ -1994,13 +1994,14 @@ Append new candidates here as each paper is processed.
   Why: RankPQO cites hybrid plan selection work; relevant to keeping GPU DB
   deterministic cost rules as guardrails while adding measured route-ranking
   hints for CPU/GPU/tier choices.
-- `queued` — **Everything You Always Wanted to Know About Compiled and
+- `reviewed` — **Everything You Always Wanted to Know About Compiled and
   Vectorized Queries But Were Afraid to Ask**, Kersten et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf`
   DOI: `https://doi.org/10.14778/3275366.3275370`
   Why: HetExchange motivates JIT integration against vectorized execution;
   this paper is a focused CPU execution-model baseline for deciding when GPU
   DB route fragments should be compiled, vectorized, interpreted, or staged.
+  Stale duplicate marked reviewed on 2026-06-05.
 - `queued` — **Voodoo - A Vector Algebra for Portable Database Performance on
   Modern Hardware**, Pirk et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p1707-pirk.pdf`
@@ -2008,6 +2009,19 @@ Append new candidates here as each paper is processed.
   Why: HetExchange cites Voodoo as a portable hardware-conscious algebra;
   useful for comparing route descriptors and device providers with a
   declarative intermediate representation for CPU/GPU portability.
+- `queued` — **How to Architect a Query Compiler, Revisited**, Tahboub,
+  Essertel, and Rompf, SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3196893`
+  Why: Kersten et al. cite query-compiler architecture as a major source of
+  maintainability complexity; useful for deciding whether GPU DB route
+  fragments should use staged compilation, a compact IR, or handwritten
+  kernels with deterministic planner guardrails.
+- `queued` — **A Common Runtime for High Performance Data Analysis**, Palkar
+  et al., CIDR 2017.
+  URL: `https://www.cidrdb.org/cidr2017/papers/p51-palkar-cidr17.pdf`
+  Why: Kersten et al. discuss hybrid execution and language integration;
+  useful for comparing a shared fragment runtime against separate CPU, GPU,
+  and fallback execution stacks.
 - `reviewed` — **Query Performance Prediction for Concurrent Queries using
   Graph Embedding**, Zhou et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p1416-zhou.pdf`

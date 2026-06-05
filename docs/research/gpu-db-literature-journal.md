@@ -69455,3 +69455,197 @@ stateful database domains.
   delivery policy for the same logical workload before adopting kernel bypass.
   Expected outcome: identify whether kernel event delivery or SQL owner queues
   dominate the first tail-latency frontier.
+
+### 2026-06-05 - Execution routes should choose fusion by data behavior
+
+**Citation:** Timo Kersten, Viktor Leis, Alfons Kemper, Thomas Neumann, Andrew
+Pavlo, and Peter Boncz. "Everything You Always Wanted to Know About Compiled
+and Vectorized Queries But Were Afraid to Ask." PVLDB 11(13), 2018, pp.
+2209-2222. Retrieved 2026-06-05 from VLDB,
+`https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf`; DOI:
+`https://doi.org/10.14778/3275366.3275370`.
+
+**Category:** query optimization / planning; CPU execution baselines; runtime
+and route-shape selection.
+
+**Relevance tags:** vectorized execution; data-centric compilation; operator
+fusion; materialization boundaries; SIMD limits; morsel-driven parallelism;
+CPU fallback; route compiler; adaptive execution; profiling; OLTP stored
+procedures.
+
+**Core idea:** The paper builds two execution engines in one test system:
+Tectorwise, a vectorized engine, and Typer, a data-centric compiled engine.
+Both use the same query plans, algorithms, data structures, and parallelization
+framework, so the comparison isolates execution model rather than whole-DBMS
+differences. The result is not a simple winner. Data-centric compilation tends
+to execute fewer instructions and is strong when work is computation-heavy and
+cache resident. Vectorized execution materializes more intermediate vectors,
+but its simpler primitive loops can generate more outstanding memory loads and
+hide cache-miss latency better in hash joins and other memory-bound work.
+
+For GPU DB, the transferable point is that CPU route shape is a first-class
+planner decision. A retained GPU route is not the only optimized path. Short
+stored-procedure-like OLTP paths, cache-resident CPU fallback, warm-tier scans,
+and over-resident staging paths may need different degrees of fusion,
+vectorization, and materialization. Route choice should be driven by expected
+data behavior: compute-heavy, cache-resident, memory-miss-heavy, transfer-heavy,
+or latency-sensitive.
+
+**Concrete mechanisms:**
+
+- Vectorized execution splits work into type-specialized primitives that
+  process vectors of tuples. The paper uses a default vector size of roughly
+  1,000 tuples; very small vectors behave like expensive Volcano iteration,
+  while very large vectors overflow caches and hurt performance.
+- Data-centric compilation fuses adjacent non-blocking operators into one
+  generated loop using a push-style produce/consume interface. This can keep
+  intermediates in registers and avoid the load/store traffic that vectorized
+  primitives incur between steps.
+- For fixed-point arithmetic and cheap in-cache aggregation, Typer's fewer
+  instructions and register-resident intermediates dominate. In the selected
+  TPC-H experiments, the compiled engine is substantially faster on some
+  computation-heavy queries.
+- For hash joins and larger hash tables, Tectorwise can be faster despite
+  executing more instructions, because simple primitive loops help the CPU's
+  out-of-order engine issue many independent hash-table loads and hide memory
+  stalls.
+- The paper warns against reading instructions-per-cycle as a throughput proxy:
+  the vectorized engine can have higher IPC while still being slower because it
+  performs more total instructions and materialization work.
+- SIMD helps sharply in microbenchmarks, but its end-to-end benefits are modest
+  in realistic TPC-H joins and selection cascades once sparse gathers, selection
+  vectors, cache misses, and memory latency dominate. This limits the argument
+  that CPU vectorization alone should decide the execution model.
+- Both engines scale well with morsel-driven parallelism when they share the
+  same parallel framework. Parallelization style is mostly orthogonal to
+  vectorized-versus-compiled execution.
+- Out-of-memory experiments with SSD-backed table data make the two engines'
+  differences somewhat smaller, but do not erase the same compute-versus-memory
+  shape distinction.
+- Compilation has practical advantages for OLTP and HTAP stored procedures
+  because many short operations can be compiled into one fast fragment.
+  Vectorization has practical advantages for compile time, profiling by
+  primitive, and adaptivity because primitives are precompiled and can be
+  swapped or reordered at runtime.
+- Hybrid execution is a major design space: compressed scans can stay
+  vectorized while higher-level operators are compiled, or compiled pipelines
+  can deliberately introduce materialization boundaries to improve prefetching,
+  SIMD, and out-of-order execution.
+
+**GPU DB mapping:** P8's current resident route language should not collapse
+all non-GPU execution into "CPU fallback." This paper suggests at least four CPU
+route classes: compiled stored-procedure fragments for short OLTP work,
+vectorized warm-tier scans over host or NVMe-backed column groups, hybrid
+compiled-plus-vectorized routes for compressed resident or warm segments, and
+simple interpreted/debug routes for rare plans where compile time would dominate.
+
+The micro-batching runtime can also borrow the vector-size lesson. A batch of
+1 is protocol-friendly but execution-hostile; an unbounded batch is
+cache-hostile and latency-hostile. For retained reads and CPU fallback scans,
+the route certificate should name both a target batch size and a latency ceiling,
+then record whether the actual batch stayed in-cache or spilled into a
+memory-bound regime.
+
+The hash-join result maps to GPU/CPU split routes. A fused compiled CPU loop is
+not always best if the route is dominated by pointer-chasing or random metadata
+lookups. For CPU-side visibility maps, resident-index misses, warm dictionary
+lookups, or cold-page hash probes, a staged vectorized loop may create more
+memory-level parallelism. GPU DB should test both route shapes before assuming
+operator fusion is always beneficial.
+
+The SIMD section is a useful warning for GPU claims. Microbenchmarks can show
+large lane-level speedups while whole queries remain memory-bound. GPU DB's
+benchmark gates should therefore measure end-to-end route time, transfer bytes,
+queue wait, memory stalls where available, and CPU fallback quality, not only
+kernel or primitive throughput.
+
+For OLTP, the stored-procedure advantage lines up with the Looking Glass and
+WeBridge findings: once protocol round trips and communication dominate,
+compiled or preplanned multi-step fragments can be more valuable than a generic
+operator pipeline. GPU DB can expose prepared route fragments for common write
+and point-read workflows while retaining vectorized/adaptive execution for
+analytical and warm-tier paths.
+
+**Risks and mismatches:** The paper is a CPU OLAP execution-model study, not a
+GPU database paper. Its benchmark engines are prototypes, and the experiments
+ignore some production costs such as overflow checking and broad SQL feature
+coverage. The SIMD conclusions are AVX-512-era CPU conclusions and do not map
+directly to CUDA warps, GPU memory coalescing, or HBM bandwidth. The workload is
+mostly TPC-H/SSB analytics, so OLTP conclusions are qualitative rather than
+measured in this paper. Finally, the paper studies execution code shape, not
+MVCC visibility, WAL ordering, resident snapshot validity, or session
+admission.
+
+**Benchmark candidates:**
+
+- Add a CPU route-shape benchmark for the same retained query family: interpreted
+  scalar, vectorized primitive loop, compiled fused loop, and hybrid staged
+  loop. Measure p50/p99 latency, instructions if available, cache misses,
+  allocated bytes, and route compile/setup time.
+- For point lookup batches, sweep batch sizes from 1 through cache-resident and
+  cache-spilling sizes. Gate: route telemetry reports whether the chosen batch
+  size improved throughput without violating the latency ceiling.
+- Build a warm-tier hash/dictionary lookup benchmark that compares fused CPU
+  loops with staged vectorized loops. Expected win: staged loops should help
+  when random memory misses dominate; failure condition: materialization
+  overhead erases the latency-hiding benefit.
+- Add an end-to-end SIMD/GPU sanity gate: if a primitive or kernel speedup is
+  reported, also report whole-query latency, transfer bytes, queue wait, and
+  fallback-route cost for the same workload.
+- Prototype prepared multi-step route fragments for one stored-procedure-like
+  workflow: parse once, bind parameters, execute CPU/GPU route decisions, and
+  return per-request results. Compare against separate pgwire round trips and
+  owner-queue submissions.
+- Add route profiling that attributes time to primitives or fragments even when
+  a compiled or fused route is used. Failure condition: the fastest route shape
+  becomes opaque enough that regressions cannot be assigned to scan, filter,
+  visibility, lookup, transfer, or response encoding.
+- Test adaptive materialization boundaries for CPU fallback: always-fused,
+  always-vectorized, and route-selected boundaries for scans, filters, hash
+  probes, and aggregates. Minimum proof gate: the planner can explain why it
+  inserted or removed a boundary for the current data size and route class.
+
+### 2026-06-05 - Cross-paper synthesis: route policies need execution-shape proof
+
+The last three reviewed papers sharpen a common frontier. HANA NSE makes
+placement a byte- or API-compatible load-unit policy; SKQ makes event delivery
+a schedulable resource; Kersten et al. make execution model a route-shape
+choice rather than a one-time engine identity. Together they argue that a GPU DB
+route certificate should prove not only semantic validity, but also placement,
+delivery, and execution-shape assumptions.
+
+Converging design tracks:
+
+- **Subcomponent placement certificates:** segment routes should name where
+  values, dictionaries, visibility maps, helper indexes, text payloads, and
+  staging buffers live, plus whether each is dense, compressed, paged, or cold.
+- **Schedulable event delivery:** socket readiness, decoded commands, retained
+  reads, GPU completions, mutation results, cancellations, and overload
+  responses need explicit affinity, balancing, pinning, and priority policies.
+- **Execution-shape selection:** CPU and GPU fallback routes should declare
+  whether they are fused, vectorized, staged, interpreted, compiled, or hybrid,
+  and why that shape matches current data behavior.
+- **Latency-bounded batching:** all three papers warn against unbounded hidden
+  work. Prefetch, event batches, vector batches, and GPU micro-batches need
+  caps that protect short retained reads and correctness-critical paths.
+
+Category gaps remain around production route compilation, observable CPU
+fallback quality, and index/update maintenance under mixed writes. The next
+high-value reviews should keep pulling from query-compiler, learned route
+selection, runtime scheduling, resident index maintenance, or MVCC visibility
+work rather than returning immediately to pure GPU OLAP kernels.
+
+Benchmark priorities:
+
+- Add route certificates that include placement, event-delivery policy,
+  execution shape, target batch size, and latency ceiling.
+- Compare fused versus staged CPU fallback for warm-tier lookup and hash-probe
+  paths before asserting GPU speedups.
+- Add priority response-ring tests where short retained reads and cancellations
+  remain bounded while cold scans, refreshes, and prefetch continue making
+  progress.
+- Tie placement advisors to execution-shape telemetry: a warm compressed
+  segment may prefer vectorized CPU primitives, while a dense resident fragment
+  may prefer compiled CPU fallback or GPU kernels.
+- Require every accelerated benchmark to report the baseline route shape and
+  setup/compile/materialization costs, not just accelerated operator runtime.
