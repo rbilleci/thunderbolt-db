@@ -1370,12 +1370,13 @@ Append new candidates here as each paper is processed.
   over existing transactional stores; useful follow-up to PolarDB-IMCI for
   contrasting redo-replay replicas with service-layer freshness and route
   integration. Journal entry added 2026-06-05.
-- `queued` — **TiDB: A Raft-based HTAP Database**, Huang et al., PVLDB 2020.
+- `reviewed` — **TiDB: A Raft-based HTAP Database**, Huang et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3072-huang.pdf`
   DOI: `https://doi.org/10.14778/3415478.3415535`
   Why: Raft learner based row-to-column HTAP replication; useful follow-up to
   PolarDB-IMCI for comparing physical REDO reuse with consensus-log columnar
-  replicas, freshness, consistency, and workload isolation.
+  replicas, freshness, consistency, and workload isolation. Journal entry
+  added 2026-06-05.
 - `reviewed` — **Hints for Robust Query Performance Tuning**, Xiu et al.,
   PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p5327-xiu.pdf`
@@ -1516,6 +1517,21 @@ Append new candidates here as each paper is processed.
   Why: F1 Lightning contrasts its loosely coupled CDC service with SAP HANA's
   tighter log-replay replica architecture; useful for comparing freshness,
   source-engine modification cost, and row-to-column replication paths.
+- `queued` — **BatchDB: Efficient Isolated Execution of Hybrid OLTP+OLAP
+  Workloads for Interactive Applications**, Makreshanski et al., SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3035959`
+  PDF: `https://www.doc.ic.ac.uk/~jgiceva/papers/SIGMOD_batchdb.pdf`
+  Why: TiDB contrasts BatchDB's primary-secondary HTAP replication without
+  high-availability consensus; useful for comparing replica isolation,
+  freshness, and performance predictability with GPU DB retained snapshot
+  refresh.
+- `queued` — **L-Store: A Real-time OLTP and OLAP System**, Sadoghi et al.,
+  EDBT 2018.
+  URL: `https://research.ibm.com/publications/l-store-a-real-time-oltp-and-olap-system`
+  arXiv: `https://arxiv.org/abs/1601.04084`
+  Why: TiDB contrasts L-Store's lineage-based single-engine HTAP design;
+  useful for comparing contention-free staging, base/tail lineage, and
+  historical query support with P8 stable-plus-delta resident generations.
 - `queued` — **Updatable Learned Index with Precise Positions**, Wu et al.,
   PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p1276-wu.pdf`

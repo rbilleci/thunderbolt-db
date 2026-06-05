@@ -67595,3 +67595,158 @@ kernel, WAL fsync, NVMe, or pgwire measurements.
   generation order versus precise dependency frontiers per owner. Expected win:
   less cross-partition head-of-line blocking for sparse multi-partition writes;
   failure condition: retained reads can observe incompatible owner frontiers.
+
+### 2026-06-05 - TiDB turns consensus replication into an HTAP freshness path
+
+**Citation:** Dongxu Huang, Qi Liu, Qiu Cui, Zhuhe Fang, Xiaoyu Ma, Fei
+Xu, Li Shen, Liu Tang, Yuxing Zhou, Menglong Huang, Wan Wei, Cong Liu,
+Jian Zhang, Jianjun Li, Xuelian Wu, Lingyu Song, Ruoxi Sun, Shuaipeng
+Yu, Lei Zhao, Nicholas Cameron, Liquan Pei, and Xin Tang. "TiDB: A
+Raft-based HTAP Database." PVLDB 13(12), 2020, pp. 3072-3084.
+doi:10.14778/3415478.3415535. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol13/p3072-huang.pdf`.
+
+**Category:** hybrid HTAP; MVCC / snapshot / visibility; multi-tier
+data placement.
+
+**Relevance tags:** Raft learners; columnar replicas; row-to-column
+log replay; freshness windows; snapshot reads; Percolator-style 2PC;
+timestamp oracle; workload isolation; route choice; delta/main merge.
+
+**Core idea:** TiDB extends a Raft-backed NewSQL storage layer with
+non-voting columnar learners. Transactional writes go through row-format
+TiKV Raft leaders and followers, while TiFlash learners asynchronously
+consume the same Raft logs, transform row tuples into columnar data, and
+serve analytical reads from separate resources. The paper's key
+transferable idea is that HTAP freshness and isolation can be derived
+from the replication protocol already needed for availability, rather
+than from an external ETL pipeline or a shared in-memory execution path.
+
+Consistency is enforced at read time. TiFlash can serve a snapshot at a
+requested timestamp only after it has obtained the relevant read index
+from TiKV leaders and replayed enough logs to cover that timestamp. The
+query optimizer can choose TiKV row scans, TiKV indexes, TiFlash column
+scans, or mixed plans. In CH-benCHmark experiments, adding analytical
+clients reduced TiDB transaction throughput by at most about 10%, and
+transaction clients reduced analytical throughput by at most about 5%.
+The paper reports TiKV-to-TiFlash visibility delay mostly below one
+second for the tested 100-warehouse workload, with lower delay for the
+smaller 10-warehouse setting.
+
+**Concrete mechanisms:**
+
+- Data is range-partitioned into Regions. Each Region is managed by a
+  Raft group with row-format TiKV replicas; leaders of different Regions
+  asynchronously replicate committed logs to TiFlash learner replicas.
+- Learners are not election candidates and do not count in the write
+  quorum, so adding analytical replicas does not directly increase the
+  leader's quorum-ack latency.
+- TiKV optimizes Raft write throughput by appending logs locally and
+  sending logs to followers in parallel, batching follower replication,
+  allowing leaders to continue receiving requests while replication is in
+  flight, and applying committed logs asynchronously.
+- Read paths include read-index reads, lease reads, and follower reads.
+  Follower reads ask the leader for the newest read index and can serve
+  the request once the local applied index is high enough.
+- PD manages Region placement, balancing, split/merge, and timestamp
+  allocation. Its timestamps include physical and logical parts, and the
+  paper reports roughly one million timestamp allocations per second in
+  practice, with clients batching timestamp requests.
+- TiDB transactions use MVCC with Percolator-style two-phase commit. The
+  SQL engine coordinates transactions, TiKV stores locks and versions,
+  and PD supplies start, for-update, and commit timestamps.
+- TiFlash log replay compacts raw prewrite/commit/rollback log records,
+  decodes committed row tuples, and transforms them into columnar batches
+  carrying operation type, commit timestamp, key, and column values.
+- TiFlash maintains a schema cache. A periodic sync path reduces ordinary
+  schema fetch traffic, while a compulsive sync path refreshes schema
+  immediately after detecting mismatched column counts or overflow.
+- DeltaTree separates stable columnar chunks from appended delta updates.
+  Deltas are cached in memory and persisted, periodically compacted, and
+  eventually merged into stable chunks that atomically replace old files.
+- A B+ tree over delta items ordered by key and timestamp makes point and
+  range lookup against recent deltas cheaper and makes delta/stable merge
+  more efficient. The paper's TiFlash microbenchmark reports about 2x
+  faster reads from DeltaTree than an LSM-tree design under concurrent
+  update replay.
+- TiFlash snapshot reads issue a read-index request to the relevant
+  leaders, replay logs until the learner covers the requested timestamp,
+  and then read from DeltaTree.
+- The optimizer evaluates row-format scans, row indexes, column scans,
+  pushed-down storage computation, and mixed TiKV/TiFlash plans. Several
+  CH-benCHmark analytical queries were fastest only when the plan could
+  combine both stores.
+
+**GPU DB mapping:** TiDB is a strong template for turning P8 resident
+GPU snapshots into protocol-backed freshness services. GPU DB does not
+need Raft for a single-node first slice, but it does need the same
+contract: a retained GPU generation is routeable only after it can prove
+the CPU/WAL truth frontier it covers, the schema/catalog generation it
+uses, and the visibility timestamp it can serve.
+
+TiFlash learners map to asynchronous residency builders. The mutation
+owner remains the correctness path for WAL, MVCC, locks, and commit
+timestamps. A residency owner or GPU refresh owner consumes committed
+mutation batches, decodes row/MVCC changes, and builds column-group
+generations without participating in the mutation owner's commit quorum.
+At read time, the route selector asks whether the resident generation
+covers the requested timestamp; if not, the route waits within a latency
+budget, falls back to CPU truth, or returns an explicit freshness reason.
+
+DeltaTree's stable-plus-delta structure is directly relevant to P8. A
+GPU resident table can keep immutable base column buffers plus a bounded
+CPU or GPU-visible delta layer keyed by row id and commit timestamp.
+Small fresh writes do not have to trigger full GPU rebuilds immediately;
+reads either merge a bounded delta or wait for a refreshed generation.
+The important benchmark question is where the delta merge belongs: CPU
+warm tier, GPU staging kernel, or full generation rebuild.
+
+The schema-cache path is also useful for route metadata. GPU DB should
+treat catalog generation as part of every resident route certificate.
+Ordinary catalog sync can be lazy, but a decoding or route mismatch must
+force a catalog refresh and route invalidation rather than silently
+serving an incorrectly decoded resident segment.
+
+Finally, TiDB's optimizer result warns against one-store ideology. A
+mixed plan that scans a wide table from GPU/columnar residency and
+performs selective lookups through CPU indexes may beat a pure GPU or
+pure CPU plan. P8 route costing should therefore include mixed
+fragment plans, not only whole-query CPU versus GPU routing.
+
+**Risks and mismatches:** TiDB is a distributed CPU HTAP database, not a
+GPU database. Its learner replication lag, DeltaTree write
+amplification, and CH-benCHmark numbers are tied to TiKV, TiFlash, 10
+Gbps networking, RocksDB, and CPU columnar execution. The system provides
+snapshot isolation / repeatable read semantics rather than full
+serializability. Learners are eventually caught up and can wait for a
+read index, which is acceptable for analytical freshness but may be too
+slow for low-latency retained point reads unless GPU DB has strict wait
+budgets and fallback. DeltaTree uses disk files and B+ trees, so the
+physical structure should not be copied directly into GPU memory.
+
+**Benchmark candidates:**
+
+- Add a retained-route freshness gate: each GPU generation publishes
+  `source_wal_txn`, `min_visible_ts`, `max_visible_ts`, schema generation,
+  and invalidation generation. Gate: no retained GPU read serves outside
+  its published timestamp and schema frontier.
+- Prototype a stable-plus-delta resident table path: immutable base
+  column group plus committed insert/update/delete delta ordered by row id
+  and commit timestamp. Measure full rebuild, CPU delta merge, and GPU
+  delta merge under mixed writes and retained reads.
+- Build a "wait for freshness" benchmark: retained reads request a
+  timestamp just beyond the current GPU frontier and either wait for a
+  bounded refresh, fall back to CPU, or reject with `snapshot_too_new`.
+  Required metrics: p50/p99 latency, fallback rate, refresh bytes, and
+  mutation-owner queue impact.
+- Add catalog-generation mismatch tests for resident decode. Failure
+  condition: a resident route decodes or serves data under a stale schema
+  after DDL or a column-layout change.
+- Extend route costing to allow mixed plans: GPU/columnar scan for the
+  large side, CPU index lookup for the selective side, and CPU truth for
+  unsupported predicates. Gate: mixed plans are result-equivalent to a
+  CPU-only snapshot at the same timestamp.
+- Measure refresh isolation: run COPY/INSERT/UPDATE against CPU truth
+  while background residency builders consume committed batches. Failure
+  condition: background refresh causes unbounded mutation-owner queue
+  growth or silently serves stale GPU data.
