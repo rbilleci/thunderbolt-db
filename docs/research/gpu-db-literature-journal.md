@@ -64254,3 +64254,176 @@ Benchmark priorities:
   while consuming spare capacity with scans, joins, and refresh work.
 - Add planner telemetry that records why a route used resident GPU, CPU
   fallback, owner serialization, or overload rejection.
+
+### 2026-06-05 - HetExchange turns CPU/GPU routing into optimizer-visible operators
+
+**Citation:** Periklis Chrysogelos, Manos Karpathiotakis, Raja
+Appuswamy, and Anastasia Ailamaki. "HetExchange: Encapsulating
+Heterogeneous CPU-GPU Parallelism in JIT Compiled Engines." PVLDB 12(5),
+2019. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol12/p544-chrysogelos.pdf`.
+DOI: `https://doi.org/10.14778/3303753.3303760`.
+
+**Category:** query optimization / planning; GPU execution / analytics.
+
+**Relevance tags:** heterogeneous query execution; CPU/GPU route
+choice; optimizer traits; JIT pipelines; device crossing; data
+movement operators; memory affinity; block handles; pipeline breakers;
+CPU fallback; over-resident execution.
+
+**Core idea:** HetExchange generalizes Volcano's Exchange idea for
+heterogeneous CPU/GPU servers, but adapts it for compiled query
+pipelines instead of interpreted tuple-at-a-time execution. The paper
+argues that CPU-only JIT parallelism relies on homogeneous cores,
+cache-coherent memory, and shared atomic state, while GPU database
+execution has different parallelism, explicit device memories, PCIe
+costs, and no universal cache-coherent shared-memory substrate. The
+solution is to make heterogeneity explicit in the physical plan through
+operators that separately handle control movement, data movement,
+parallelism, packing, and device-local code generation.
+
+The transferable idea for GPU DB is the separation of route concerns.
+A planner should not make one opaque "run on GPU" decision. It should
+produce a route graph whose edges say where control moves, where data
+is already local, where blocks must be copied, where tuples are packed
+or unpacked, and which device-specific provider compiles or executes
+each stage. That maps directly to the current need for route
+certificates that combine visibility frontiers, tier placement, GPU
+resource class, and fallback reason.
+
+**Concrete mechanisms:**
+
+- HetExchange splits heterogeneous control flow into device-crossing
+  operators and router operators. `cpu2gpu` launches GPU kernels from
+  CPU-side execution; `gpu2cpu` uses a GPU-side enqueue plus CPU-side
+  task consumer because commodity GPU frameworks do not launch CPU
+  tasks in the middle of GPU execution.
+- Routers pass block handles rather than tuple payloads. This avoids
+  forcing the routing decision itself to copy or inspect inaccessible
+  memory. When routing needs tuple-derived policy information, the
+  policy is pushed into a data-flow operator that can compute a target
+  id on the device where the tuple is local.
+- Data movement is handled by separate `mem-move` operators. They
+  ensure that a block is accessible from the consumer's target memory
+  node, schedule asynchronous DMA when needed, and pass both the local
+  destination handle and the transfer dependency to the next pipeline.
+- Pack/unpack operators bridge block-granular transfers with
+  tuple-at-a-time compiled pipelines. They amortize CPU/GPU movement
+  over blocks while still allowing fused generated code to keep tuple
+  fields in registers inside a device-local pipeline.
+- The optimizer sees four physical traits: target device, degree of
+  parallelism, data locality, and data packing. HetExchange operators
+  are converters over these traits, so a cost model can price device
+  crossings, routing, interconnect transfers, packing, and
+  device-specific relational operators separately.
+- Code generation uses device providers. A single provider-agnostic
+  operator blueprint can be instantiated for CPU or GPU; provider
+  methods supply allocation, state loading, atomics, thread ids,
+  worker sizes, optimization, compilation, and machine-code loading.
+  The evaluated Proteus prototype uses LLVM for CPU code and LLVM
+  NVPTX plus the CUDA driver API for GPU code.
+- Routers control degree of parallelism and affinity. They generate
+  one parameterized pipeline template per device type, then instantiate
+  multiple pinned pipeline instances. Affinity is propagated across
+  device crossings so downstream stages stay tied to the intended CPU
+  core or GPU.
+- Runtime memory distinguishes operator state from transfer staging.
+  State memory is served by memory managers; block staging is served by
+  per-memory-node block managers with preallocated arenas. Remote block
+  acquisition is routed through local devices and accelerated by cached
+  remote blocks plus batched acquire/release requests.
+- Evaluation integrates HetExchange into Proteus and compares
+  CPU-only, GPU-only, and hybrid modes against commercial CPU and GPU
+  analytical DBMSs on Star Schema Benchmark workloads. The paper
+  reports that Proteus Hybrid achieves 1.5x-5.1x speedup over the
+  CPU DBMS and 3.4x-11.4x over the GPU DBMS for SF1000 data that does
+  not fit in GPU memory, and about 88.5% of the sum of Proteus CPU and
+  GPU throughputs on average. Microbenchmarks show router/setup
+  overhead matters for small inputs, but is largely amortized for
+  inputs above roughly 512 MB.
+
+**GPU DB mapping:** GPU DB should expose CPU/GPU/tier routing as
+explicit plan traits rather than burying it inside a fallback branch.
+For the first P8/runtime slice, a retained route descriptor can carry:
+target device, resident generation, memory locality, transfer bytes,
+packing/layout state, route stage sequence, scratch/pinned-buffer
+needs, resource class, and fallback edges. The planner can then price a
+resident GPU scan, CPU tuple/index path, CPU columnar path, GPU cold
+transfer path, or split CPU/GPU route with the same vocabulary.
+
+The block-handle model is especially relevant for over-resident data.
+A route should pass handles to CPU segments, pinned host chunks, GPU
+resident buffers, or NVMe-backed cold blocks, while separate movement
+operators make the data accessible to the next consumer. That keeps
+route planning honest about transfer cost and avoids hidden copies in
+the execution owner.
+
+The device-provider idea also maps to code ownership. GPU DB does not
+need to commit immediately to a universal compiler, but execution
+fragments should be written against a compact provider interface:
+thread identity, allocation/scratch ownership, atomics/reductions,
+state loading, kernel launch, and fallback implementation. The same
+logical fragment can then have CPU, CUDA, and future device
+implementations without letting route logic fork into unrelated
+systems.
+
+For session concurrency, HetExchange reinforces the need to make
+affinity and queues visible. Network IO workers can submit a request
+into a route graph, but the route graph should name the owner rings,
+GPU execution rings, movement queues, and response rings it will touch.
+That creates measurable bottlenecks and reason-coded fallback instead
+of one global GPU queue.
+
+**Risks and mismatches:** HetExchange is an analytical-query paper.
+It does not address OLTP write admission, MVCC visibility, WAL
+ordering, snapshot retention, pgwire protocol behavior, small
+point-query latency, or 1M logical sessions. Its best numbers come
+from Star Schema Benchmark scans/joins, not transaction workloads.
+
+The prototype uses heuristic insertion of HetExchange operators after
+logical/physical planning; optimizer-driven heterogeneous plan search
+is explicitly future work. GPU DB should borrow the trait/operator
+interface, not assume the paper solves robust route selection under
+visibility, freshness, and queue-delay uncertainty.
+
+The reported benefits depend on large analytical inputs where setup
+and routing overhead amortize. The paper itself shows overhead can be
+visible for small inputs because router initialization and thread
+pinning cost around milliseconds in the prototype. Retained lookup and
+short transaction routes need a much lighter fast path, or they should
+skip heterogeneous operators entirely when the route is already local.
+
+HetExchange also assumes a JIT engine and device code generation stack.
+GPU DB may initially use hand-written kernels and Rust/CUDA host code.
+The useful design invariant is still valid: make device, locality,
+packing, and movement explicit, even if the first implementation uses
+static route fragments.
+
+**Benchmark candidates:**
+
+- Add route-trait accounting to retained-read planning: target device,
+  locality, packing/layout, transfer bytes, resident generation,
+  queue class, and fallback edge. Proof gate: every GPU route decision
+  can explain whether it was resident, cold-transfer, CPU fallback, or
+  overload rejection.
+- Prototype a block-handle transfer harness with CPU segment handles,
+  pinned host handles, and GPU resident handles. Compare hidden-copy
+  execution against explicit `mem-move`-style stages on scan and
+  lookup batches. Measure transfer bytes, queue wait, pin pressure,
+  and result latency.
+- Compare four route shapes for the same query template: CPU-only,
+  GPU-resident, GPU cold transfer, and split CPU-filter/GPU-aggregate
+  or CPU-prefilter/GPU-join. Failure condition: the planner selects a
+  split route without accounting for movement and staging cost.
+- Add a small-input negative control. Run 1, 8, 64, 512, and 4096 row
+  retained lookup or aggregate requests through a heavy route graph and
+  through a direct resident fast path. Expected result: route-operator
+  overhead must be bypassed or cached for point queries.
+- Introduce a provider-like interface for one narrow fragment family:
+  filter plus count/sum over `int4` resident segments. Implement CPU
+  and CUDA providers or static equivalents, then compare correctness,
+  telemetry coverage, and code duplication.
+- Extend planner telemetry to log device crossing, data movement,
+  packing/unpacking, and affinity choices separately. Minimum proof
+  gate: p99 latency regressions can be attributed to one trait rather
+  than a generic "GPU slow" label.

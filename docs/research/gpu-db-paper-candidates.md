@@ -1510,9 +1510,10 @@ Append new candidates here as each paper is processed.
   Why: PIFO cites NUMFabric as a flexible bandwidth-allocation use case; useful
   for comparing utility-driven admission and weighted fair queueing when GPU DB
   request classes compete for network, owner-ring, and accelerator capacity.
-- `queued` — **HetExchange: Encapsulating Heterogeneous CPU-GPU Parallelism in
-  JIT Compiled Engines**, Bress et al., CIDR 2019.
-  URL: `https://www.cidrdb.org/cidr2019/papers/p59-bress-cidr19.pdf`
+- `reviewed` — **HetExchange: Encapsulating Heterogeneous CPU-GPU Parallelism in
+  JIT Compiled Engines**, Chrysogelos et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p544-chrysogelos.pdf`
+  DOI: `https://doi.org/10.14778/3303753.3303760`
   Why: Fluid Co-processing contrasts fragment-level GPU assistance with
   exchange-style whole-pipeline routing; useful for comparing planner-time
   CPU/GPU placement with runtime split-route fallback.
@@ -1838,6 +1839,20 @@ Append new candidates here as each paper is processed.
   Why: RankPQO cites hybrid plan selection work; relevant to keeping GPU DB
   deterministic cost rules as guardrails while adding measured route-ranking
   hints for CPU/GPU/tier choices.
+- `queued` — **Everything You Always Wanted to Know About Compiled and
+  Vectorized Queries But Were Afraid to Ask**, Kersten et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf`
+  DOI: `https://doi.org/10.14778/3275366.3275370`
+  Why: HetExchange motivates JIT integration against vectorized execution;
+  this paper is a focused CPU execution-model baseline for deciding when GPU
+  DB route fragments should be compiled, vectorized, interpreted, or staged.
+- `queued` — **Voodoo - A Vector Algebra for Portable Database Performance on
+  Modern Hardware**, Pirk et al., PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p1707-pirk.pdf`
+  DOI: `https://doi.org/10.14778/3007328.3007336`
+  Why: HetExchange cites Voodoo as a portable hardware-conscious algebra;
+  useful for comparing route descriptors and device providers with a
+  declarative intermediate representation for CPU/GPU portability.
 - `reviewed` — **Query Performance Prediction for Concurrent Queries using
   Graph Embedding**, Zhou et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p1416-zhou.pdf`
