@@ -2593,7 +2593,7 @@ Append new candidates here as each paper is processed.
   Why: JOB is the workload foundation used by Hint-QPT/PARQO to expose
   selectivity-estimation failures; useful as a 2015-present baseline for
   testing CPU/GPU route-choice fragility under join and selectivity errors.
-- `queued` — **Zero-Shot Cost Models for Out-of-the-box Learned Cost
+- `reviewed` — **Zero-Shot Cost Models for Out-of-the-box Learned Cost
   Prediction**, Hilprecht and Binnig, PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p2361-hilprecht.pdf`
   Why: ParamTree compares against zero-shot transfer; useful for deciding
@@ -3999,6 +3999,13 @@ Append new candidates here as each paper is processed.
   Why: direct sketch-based query-optimization baseline for online filtered
   cardinality estimation; useful for deciding which predicates should be
   handled at sketch-ingest time versus route-evaluation time.
+- `queued` — **Query Performance Prediction for Concurrent Queries using Graph
+  Embedding**, Zhou, Sun, Li, and Feng, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p1416-zhou.pdf`
+  DOI: `https://doi.org/10.14778/3397230.3397238`
+  Why: Zero-shot cost models cite this concurrent-query prediction work;
+  useful for extending single-route CPU/GPU latency prediction with queue
+  depth, co-running kernels, response-ring pressure, and tier-stall features.
 - `queued` — **Pessimistic Cardinality Estimation: Tighter Upper Bounds for
   Intermediate Join Cardinalities**, Cai, Balazinska, and Suciu, SIGMOD 2019.
   URL: `https://doi.org/10.1145/3299869.3319894`

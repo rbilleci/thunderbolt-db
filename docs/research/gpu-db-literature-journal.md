@@ -58815,3 +58815,172 @@ benchmark-shape evidence, not as production promises.
   eligible for GPU write batching; dynamic predicates and unknown access sets
   use CPU/owner fallback. Required measurement: GPU throughput gain without
   hidden SQL correctness or cancellation gaps.
+
+### 2026-06-05 - Zero-shot cost models separate route shape from database state
+
+**Citation:** Benjamin Hilprecht and Carsten Binnig. "Zero-Shot Cost Models for
+Out-of-the-box Learned Cost Prediction." PVLDB 15(11):2361-2374, 2022.
+Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol15/p2361-hilprecht.pdf`.
+Artifact: `https://github.com/DataManagementLab/zero-shot-cost-estimation`.
+DOI: `https://doi.org/10.14778/3551793.3551799`.
+
+**Category:** Query optimization / planning.
+
+**Relevance tags:** learned cost model; zero-shot transfer; few-shot
+fine-tuning; query graph encoding; transferable features; cardinality
+estimation; workload drift; CPU/GPU route choice; planner telemetry.
+
+**Core idea:** The paper attacks a deployment problem with learned cost
+models: workload-driven models often need thousands of executed training
+queries for every new database, so the training cost repeats whenever the
+database or workload changes. A zero-shot cost model is trained once across
+many databases and then predicts runtimes on an unseen database without first
+executing a new workload there.
+
+The transferable idea is the separation of route shape from database state.
+The model learns database-agnostic operator behavior, but receives
+database-specific characteristics as input: table size, tuple width, operator
+cardinality, predicate structure, data type, null fraction, distinct count, and
+similar features. That split is a useful contrast to learned models that bake
+table names, column identities, or literal values into the model and therefore
+do not transfer cleanly.
+
+**Concrete mechanisms:**
+
+- Query plans are encoded as graphs containing physical operators, predicates,
+  tables, input columns, and output columns. The encoding avoids one-hot table
+  or column identities and uses transferable features instead.
+- Predicate nodes encode structure, such as comparison operator and data types,
+  rather than literal values. Selectivity is represented by input/output
+  cardinality features instead of expecting the model to memorize data values.
+- Operator features include operator name, estimated output cardinality, tuple
+  width, product of child cardinalities, and worker count. Table and column
+  features include rows, pages, width, correlation, data type, null fraction,
+  distinct count, and aggregation type.
+- Each node type has its own MLP to create a hidden state. A bottom-up message
+  passing pass combines child states through the query tree, and the root state
+  feeds a final estimation MLP that predicts runtime.
+- Training uses `(plan, runtime)` pairs from many databases and optimizes a
+  Q-error loss. The model can then run zero-shot on unseen databases or be
+  fine-tuned in few-shot mode with a small number of local training queries.
+- Intermediate cardinalities can come from data-driven cardinality estimators
+  such as DeepDB, from exact measurements for an upper-bound experiment, or
+  from the DBMS optimizer's conventional estimates when learned cardinality
+  models are unavailable.
+- The robustness method estimates generalization error by leaving out whole
+  databases during training, analogous to cross-validation. If adding more
+  training databases no longer improves the estimated error, the training set
+  may be broad enough for the target workload family.
+- The drift policy is operational: monitor error on the target database, and
+  when workload drift pushes error beyond a threshold, fine-tune with observed
+  local query executions.
+- The evaluation creates a 20-database benchmark with generated SPAJ,
+  complex, and index workloads, plus existing workloads such as JOB, SSB, and
+  TPC-H. It reports that zero-shot models with learned cardinalities keep
+  median Q-error below 1.54 across the tested unseen databases and outperform
+  scaled PostgreSQL optimizer costs on almost all datasets.
+
+**GPU DB mapping:** The direct mapping is CPU/GPU/tier route choice. The GPU
+DB planner should not train a learned route model that memorizes table names
+or a single benchmark database. It should describe each candidate route with
+transferable features: physical operator family, resident snapshot state, row
+count, tuple or column-group width, expected cardinality, selectivity source,
+GPU HBM bytes, host DRAM bytes, NVMe bytes, H2D/D2H bytes, launch count,
+kernel family, queue depth, snapshot generation age, and fallback family.
+
+The paper's separation of concerns fits P8. Resident metadata and cardinality
+estimates remain explicit database-state inputs; the learned layer estimates
+latency from route shape and measured hardware behavior. That keeps the native
+planner inspectable and allows deterministic guardrails: if the route says the
+resident generation is stale, the GPU queue is saturated, or the estimated HBM
+footprint exceeds budget, the learned model cannot override correctness or
+capacity checks.
+
+For 1M logical sessions, zero-shot and few-shot route models are most useful as
+admission and ranking aids, not as authorities. A learned estimate can rank
+CPU index lookup, CPU scan, retained GPU scan, GPU batched lookup, and
+over-resident cold-tier route. The admission layer should still publish the
+reason: model confidence, required bytes, expected queue wait, and fallback
+cost. Few-shot updates are especially attractive after hardware changes,
+schema changes, or a new workload shape, but they must be promoted only after
+shadow evaluation against observed latencies.
+
+The graph-encoding mechanism also suggests a clean feature contract for the
+engine. Each route candidate can be exported as a small typed graph with
+operator nodes, table/column nodes, snapshot/tier nodes, queue nodes, and
+device nodes. That is richer than a flat cost vector and can represent
+interactions such as a GPU scan feeding a CPU filter, an NVMe cold segment
+feeding pinned staging, or many same-shape lookups sharing one snapshot and
+kernel launch.
+
+**Risks and mismatches:** The paper focuses on single-node PostgreSQL cost
+prediction on fixed hardware, not GPU execution, MVCC freshness, cold-tier
+misses, pgwire session fan-out, or concurrent GPU kernel interference. Its
+strongest results depend on having reasonably accurate cardinality inputs; if
+GPU DB underestimates a join, scan, or result size, a learned route model could
+choose a path that overflows HBM, pinned buffers, or response rings.
+
+The benchmark excludes queries longer than 30 seconds and the current model
+does not handle every PostgreSQL operator. The paper explicitly leaves
+cross-DBMS and cross-hardware transfer as future work, which matters because
+GPU DB's target hardware will change and CPU/GPU/NVMe route costs are
+hardware-shaped. Learned estimates therefore need drift detection,
+confidence/reporting, and conservative fallback.
+
+**Benchmark candidates:**
+
+- Define a route-feature graph for retained queries: CPU operator nodes,
+  resident GPU operator nodes, snapshot/tier nodes, queue nodes, and transfer
+  nodes. Gate: every planner choice can be logged as a typed feature graph
+  without running the learned model.
+- Train a route-latency estimator on synthetic and replayed workloads across
+  multiple table shapes. Compare formula-only cost, workload-driven learned
+  model, zero-shot pretraining across tables, and few-shot fine-tuning after a
+  new table arrives.
+- Include tier and pressure features: HBM resident bytes, host-resident bytes,
+  NVMe read bytes, pinned-buffer availability, GPU queue depth, response-ring
+  depth, and invalidation generation. Failure condition: lower median latency
+  but worse p99 because queue/tier pressure was invisible.
+- Shadow-mode the learned route model. Let it predict CPU/GPU/fallback latency
+  while the deterministic planner still chooses the route; promote only if
+  observed Q-error and bad-route rate stay under configured thresholds.
+- Stress workload drift: new predicates, larger joins, different result sizes,
+  stale cardinality estimates, and hardware changes. Expected result:
+  confidence drops or few-shot retraining is triggered before the planner
+  starts choosing risky GPU routes.
+- Add guardrails for underestimated cardinality: pessimistic upper bounds for
+  result bytes and HBM/pinned-buffer usage must veto a learned GPU route even
+  when predicted latency is best.
+
+### 2026-06-05 - Cross-paper synthesis: frontiers, fallback lanes, and learned route confidence
+
+The last four reviews, deferred runtime pipelining, anti-caching for
+memory-constrained OLTP, GPU OLTP concurrency-control analysis, and zero-shot
+cost models, converge on one design track: GPU DB routes need explicit
+contracts before they need more clever execution. A route contract should name
+its visibility frontier, conflict class, tier placement, launch shape, queue
+pressure, expected bytes, and fallback lane.
+
+The transaction papers point toward ordered intention and conflict telemetry.
+Hot writes should not be admitted to a GPU or CPU owner merely because they are
+available; they need conflict class, abort/wait history, and a clear rule for
+when deterministic ordering, OCC validation, or owner serialization wins. The
+tiering paper adds that cold data should not be a hidden stall. A cold miss is
+a route event with a tier, byte count, and policy: synchronous stall, CPU
+fallback, async prefetch, or promotion.
+
+The GPU concurrency paper adds that accelerator routes are launch-shape
+sensitive. Warp density, block size, metadata layout, and conflict-resolution
+cost can dominate the nominal protocol choice. The zero-shot cost-model paper
+adds a practical planner path: learn latency from transferable route features,
+but keep correctness, capacity, freshness, and confidence checks outside the
+model.
+
+The benchmark priority is therefore a route-certificate harness. For every
+retained read, hot write, GPU micro-batch, and cold-tier miss, record the
+snapshot generation, conflict class, selected route, bytes by tier, queue wait,
+launch shape, fallback reason, estimated latency, observed latency, and
+correctness proof gate. The useful milestone is not just higher throughput; it
+is proving that route choices remain explainable when contention, tier
+pressure, and workload drift change at the same time.
