@@ -63870,3 +63870,202 @@ trusted.
 - Track range-certificate telemetry in future benchmarks: range ids touched,
   IX postings examined, delta rows merged, resident batches used,
   validation/retry reason, and owner fallback count.
+
+### 2026-06-05 - Deuteronomy turns the recovery log into a version cache and delivery queue
+
+**Citation:** Justin Levandoski, David Lomet, Sudipta Sengupta,
+Ryan Stutsman, and Rui Wang. "High Performance Transactions in
+Deuteronomy." CIDR 2015. Retrieved 2026-06-05 from
+`https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper15.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; multi-tier cache / data placement.
+
+**Relevance tags:** TC/DC separation; timestamp-order MVCC; latch-free
+MVCC hash table; redo-only logging; log-buffer version cache; read cache;
+fast commit; durable outcome queue; blind writes; background DC posting;
+epoch reclamation; NUMA-aware ownership; stack-first continuations.
+
+**Core idea:** Deuteronomy shows that a transaction component can stay
+logically separate from storage while still matching main-memory OLTP
+performance. The TC owns concurrency control, recovery, and cached
+versions; the DC owns physical storage and access methods. The central
+move is to make the recovery log do triple duty: durable redo record,
+MVCC version payload store, and durable commit-message queue. Committed
+updates are applied to the DC later by a proxy, so user-facing commit
+latency depends on log durability and MVCC acceptance, not on storage-page
+mutation.
+
+The transferable lesson for GPU DB is that resident acceleration state
+does not need to sit on the write critical path. A mutation owner can log
+redo, publish visibility only after durable commit, keep recent versions in
+owner-local log/read buffers for snapshots, and let storage/residency
+owners apply or rebuild physical layouts behind a precise progress
+frontier. That maps cleanly to CPU truth first, GPU resident generations
+second.
+
+**Concrete mechanisms:**
+
+- The system separates a transaction component from a data component. The
+  TC knows logical keys, MVCC, recovery, and commit state; the DC is a
+  key-value store with access methods, cache, and stable storage.
+- Timestamp-order MVCC assigns a start timestamp to each transaction.
+  Reads see versions visible at that timestamp; writes abort if they would
+  violate timestamp order against a later reader or active writer. The
+  system focuses on serializable CRUD operations; transactional range
+  operations were explicitly future work in this CIDR paper.
+- The MVCC table is a latch-free hash table. Record entries hold a fixed
+  hash, full-key pointer, youngest-reader timestamp, and a version list.
+  Version entries contain the creating transaction id, an offset into the
+  version manager, and an aborted bit. List insertion uses CAS prepend;
+  removal marks next pointers and later traversals help unlink entries.
+- The version manager stores update payloads immediately in redo log
+  buffers. MVCC version entries point to offsets in those buffers, so the
+  log is also a recent-version cache.
+- Because the log is redo-only and contains no undo preimages, updates are
+  not applied to the DC until the creating transaction is known committed.
+  Aborted transactions leave redo bytes in the log but their operations are
+  never posted to the DC.
+- Read-only and older hot versions are cached in a latch-free,
+  log-structured read cache. A lossy latch-free hash index maps opaque
+  64-bit identifiers to offsets; misses and overwritten hints are safe
+  cache misses rather than correctness failures.
+- Fast commit treats a transaction as committed after its commit record is
+  placed in a recovery-log buffer, but the user is notified only after that
+  buffer is stable. Read-only transactions avoid commit records when every
+  version they read is already durably committed; otherwise they log a
+  commit record to avoid returning a result that recovery could later
+  invalidate.
+- Commit records in stable log buffers are the queue of durable outcome
+  messages. Once a buffer reaches stable storage, the TC scans linked
+  commit records and sends the stored responses.
+- The TC Proxy receives stable log buffers and applies committed operations
+  to the DC in the background. For remote DCs it first scans commit records
+  to update transaction outcome state, then applies known-committed
+  operations; unknown outcomes are moved to a side buffer.
+- DC application uses blind upserts. With the Bw-tree DC, the proxy can
+  prepend delta updates even to page stubs without reading full pages; later
+  idempotence checks or consolidation discard superseded versions.
+- The proxy reports progress with two frontiers, `T-LSN` for transaction
+  outcome scan progress and `O-LSN` for applied operation progress. An MVCC
+  version can be reclaimed only when both its operation and commit record
+  are covered, avoiding long-running transactions holding back a single
+  monolithic applied-LSN.
+- Hot latch-free buffers reserve space with atomic-add instead of CAS.
+  The same word tracks allocation offset and active users; one thread seals
+  a full buffer and schedules its write.
+- Epoch reclamation uses a global epoch plus cache-line-separated
+  thread-local epochs. Operation entry/exit writes only thread-local state
+  on the fast path, while global-epoch advances and minimum scans are
+  amortized over many retired objects.
+- The implementation pins and limits threads by socket topology. At full
+  load, TC work and TC Proxy/DC work are placed on different sockets when
+  useful, with the DC thread pool adapting to apply logged work fast enough.
+- The asynchronous programming path keeps continuation state on the stack
+  in the common synchronous-cache-hit case and copies it to the heap only
+  when an operation actually goes asynchronous.
+- Evaluation on a four-socket, 32-core/64-hardware-thread machine with a
+  50M-record, 100-byte-value YCSB-like workload reports more than
+  1.5 million four-operation transactions per second and about 6 million
+  operations per second at 84% reads, with durable logging and a stable
+  storage DC. TC reads hit the combined log/read cache about 92% of the
+  time in the reported workload. MVCC garbage collection consumed about
+  4% of transaction-thread CPU in steady state and reduced throughput from
+  roughly 1.6M to 1.3M transactions/s under the shown settings. Checkpoint
+  overhead was usually negligible and reduced 100% write throughput by
+  about 8% in their setup.
+
+**GPU DB mapping:** GPU DB can copy the TC/DC idea almost directly into
+owner domains. The mutation owner should own WAL admission, commit records,
+visibility, and a compact MVCC/version cache. Storage owners should own CPU
+canonical pages or segments. Residency owners and GPU execution owners
+should consume stable boundaries and build/publish resident generations
+only after the mutation owner can prove the commit and source frontier.
+
+The redo-log-as-version-cache shape is attractive for retained reads and
+incremental refresh. Recent updates can stay in a CPU log/read cache, while
+GPU resident columns remain immutable and possibly slightly behind. A route
+certificate can then say: resident generation covers through `resident_lsn`,
+CPU log/read delta covers `(resident_lsn, read_lsn]`, and DC/storage apply
+frontiers are at `O-LSN/T-LSN`-equivalent values. That is more precise than
+a single "valid/invalid" resident flag.
+
+The durable outcome queue maps to response rings. A commit response should
+not be emitted merely because the mutation owner accepted the work; it
+should be associated with a durable commit record or equivalent recovery
+fact. For read-only transactions, the Deuteronomy optimization suggests a
+cheap test: if every version read came from already durable generations, no
+extra durable read-only marker is needed. If a read observes freshly
+committed but not-yet-durable state, GPU DB should either wait for the
+frontier or log a small read dependency before returning a result that must
+survive recovery semantics.
+
+Blind writes are useful for resident maintenance. GPU DB should not read a
+whole CPU page or resident segment just to stage a committed delta. It can
+append delta records or segment-stub updates, then consolidate or rebuild
+resident structures later. The condition is strict: the delta must be
+idempotent under replay and tied to a durable LSN plus transaction outcome.
+
+The two-frontier proxy progress report is a good replacement for scalar
+refresh progress. GPU DB needs separate frontiers for "transaction outcomes
+known," "CPU storage applied," "resident generation built," "resident
+generation published," and "old generations safe to retire." Long readers,
+unknown transaction outcomes, and slow GPU refresh should not collapse into
+one global stall point.
+
+**Risks and mismatches:** The paper evaluates key-value CRUD operations,
+not SQL joins, arbitrary predicates, DDL, GPU kernels, pgwire, or
+transactional range operations. Its own limitation section says range
+operations were not yet supported by this TC design; the Deuteronomy range
+MVCC paper reviewed immediately before this entry is the companion source
+for retained prefix/range correctness.
+
+Timestamp-order MVCC can abort transactions that commit-time validation or
+repair might save. The paper expects future augmentation for high-contention
+cases. GPU DB should therefore avoid adopting strict timestamp order as the
+only write path until hot-key, range, and GPU-batch contention tests compare
+it with priority/OCC/repair/deterministic-batch alternatives.
+
+The TC cache consumes substantial DRAM, uses 1 GB super-pages in the
+evaluation, and depends on careful NUMA placement. On a GPU database, the
+same memory competes with pinned buffers, CPU canonical state, resident
+build staging, and future CXL/far-memory tiers. The log-as-cache idea must
+be budgeted, not treated as free.
+
+The reported throughput comes from a Microsoft prototype running on 2015-era
+hardware with a single SSD and a Bw-tree/LLAMA DC. Absolute numbers should
+not be projected onto CUDA execution or modern NVMe. The mechanisms are the
+useful part.
+
+**Benchmark candidates:**
+
+- Build a CPU-only mutation-owner harness with redo-log version cache,
+  separate read cache, and immutable resident-generation stubs. Measure read
+  latency, commit latency, write throughput, log-buffer pressure, and delta
+  merge cost against the current scalar owner path.
+- Replace a single resident-valid flag in a prototype route certificate with
+  explicit frontiers: durable commit LSN, transaction-outcome scan frontier,
+  CPU-applied frontier, resident-build frontier, resident-publish frontier,
+  and retire-safe frontier. Proof gate: injected crashes or refresh stalls
+  never expose a resident generation that recovery cannot justify.
+- Test read-only commit elision. Route reads over only durable snapshots
+  without logging a read marker; force reads to wait or log a dependency when
+  they observe not-yet-durable committed versions. Failure condition:
+  recovery can remove a version that was already returned to a client.
+- Compare three delta-application paths for GPU-resident maintenance:
+  immediate full rebuild, blind append-plus-later-consolidation, and
+  per-segment upsert stubs. Measure write critical-path cost, refresh lag,
+  idempotent replay behavior, GPU resident query fallback rate, and memory
+  amplification.
+- Add MVCC/version-cache pressure benchmarks with separate budgets for log
+  buffers, read cache, pinned host staging, and resident build buffers.
+  Expected result: a two-frontier or multi-frontier GC policy avoids both
+  unbounded memory growth and false resident invalidation.
+- Prototype stack-first continuation state for hot read routes that usually
+  hit resident or CPU caches, falling back to heap-owned async state only for
+  NVMe/GPU wait paths. Measure allocation count and p99 latency at high
+  session counts.
+- Negative control: collapse `T-LSN`, `O-LSN`, and resident-publish progress
+  into one scalar frontier, then run long transactions, slow DC apply, and
+  slow GPU refresh. Expected failure: either GC stalls too much work or a
+  route frees/serves state before the right downstream owner has caught up.

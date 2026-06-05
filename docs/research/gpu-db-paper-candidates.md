@@ -5054,7 +5054,7 @@ Append new candidates here as each paper is processed.
   this is a 2015-present primary source for range-level MVCC concurrency that
   may inform prefix scans, resident key-range certificates, and lock-free
   retained reads.
-- `queued` — **High Performance Transactions in Deuteronomy**, Levandoski,
+- `reviewed` — **High Performance Transactions in Deuteronomy**, Levandoski,
   Lomet, Sengupta, Stutsman, and Wang, CIDR 2015.
   URL: `https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper15.pdf`
   Project page:
@@ -5063,6 +5063,13 @@ Append new candidates here as each paper is processed.
   MVCC table, redo-log version cache, epoch management, and fast commit path;
   useful if GPU DB adopts logical transaction ownership over separate storage
   and resident-index components.
+- `queued` — **Deuteronomy 2.0: Record Caching and Latch Freedom**,
+  Lomet, arXiv 2025.
+  URL: `https://arxiv.org/abs/2504.14435`
+  Why: modern follow-up from a Deuteronomy author that revisits
+  record-granular caching, delta updating, and latch-free state publication;
+  useful for refining GPU DB's CPU log/read cache, resident-delta policy, and
+  route-metadata update path.
 - `queued` — **VLL: A Lock Manager Redesign for Main Memory Database
   Systems**, Ren, Thomson, and Abadi, VLDB Journal 2015.
   URL: `https://www.cs.yale.edu/homes/dna/papers/vldbj-vll.pdf`
