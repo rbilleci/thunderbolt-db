@@ -559,9 +559,10 @@ Append new candidates here as each paper is processed.
   fallback after LTPG full-text retrieval was blocked; useful for warp/block
   launch tuning, GPU OCC/MVCC tradeoffs, latch-free metadata design, and
   conflict-resolution benchmark design.
-- `queued` — **PLOR: General Transactions with Predictable, Low Tail Latency**,
+- `reviewed` — **PLOR: General Transactions with Predictable, Low Tail Latency**,
   Chen et al., SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3517878`
+  URL: `https://doi.org/10.1145/3514221.3517879`
+  PDF: `https://storage.cs.tsinghua.edu.cn/papers/sigmod22plor.pdf`
   Why: cited by the GPU OLTP CC study as a hybrid pessimistic/optimistic
   concurrency-control direction; useful for tail-latency-aware retained reads
   and hot-write fallback lanes.
@@ -4753,3 +4754,16 @@ Append new candidates here as each paper is processed.
   whether GPU DB route metadata, resident indexes, and queued intentions should
   expose data-structure-specific transaction hooks instead of generic tuple
   read/write validation only.
+- `queued` — **Improving Optimistic Concurrency Control through Transaction
+  Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
+  URL: `https://doi.org/10.14778/3282495.3282502`
+  Why: PLOR contrasts batching/reordering as a tail-latency-aware OCC
+  direction; useful for deciding whether GPU DB hot-write admission should
+  reorder compatible operations inside bounded latency ceilings instead of
+  relying only on timestamp priority.
+- `queued` — **High-Performance ACID via Modular Concurrency Control**, Xie
+  et al., SOSP 2015.
+  URL: `https://doi.org/10.1145/2815400.2815430`
+  Why: PLOR cites Callas-style modular concurrency control as a mixed-protocol
+  alternative; useful for comparing per-route concurrency-control modules with
+  GPU DB owner domains, retained reads, and hot-write fallback lanes.

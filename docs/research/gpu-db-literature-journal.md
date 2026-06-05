@@ -59262,3 +59262,180 @@ NVMe-fed decompression, result materialization, or pgwire response effects.
   gates pass: compare fixed max clocks with conservative DVFS or power caps
   for always-on retained-read workloads. Failure condition: energy savings
   come from hidden p99 regressions or delayed refresh/invalidation work.
+
+### 2026-06-05 - PLOR gives aborted hot transactions timestamp priority
+
+**Citation:** Youmin Chen, Xiangyao Yu, Paraschos Koutris,
+Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau, and Jiwu Shu.
+"Plor: General Transactions with Predictable, Low Tail Latency."
+SIGMOD 2022. DOI `10.1145/3514221.3517879`. Retrieved 2026-06-05
+from `https://storage.cs.tsinghua.edu.cn/papers/sigmod22plor.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** hybrid concurrency control; tail latency; high
+contention; pessimistic locking; optimistic reading; wound-wait priority;
+latch-free lock metadata; interactive transactions; redo/undo logging;
+hot-write fallback lanes.
+
+**Core idea:** PLOR starts from a simple observation: optimistic concurrency
+control gives high throughput, but under hot conflicts its tail transactions
+often abort repeatedly; two-phase locking variants such as WOUND_WAIT can give
+old transactions priority and reduce tail latency, but they block too much
+work during the read phase. PLOR combines the two: transactions pessimistically
+record their read/write intent in lock metadata before access, but they
+optimistically ignore many conflicts while reading. Conflict detection is
+delayed to commit, where older timestamps win.
+
+The design target is single-node in-memory OLTP, including stored-procedure
+and interactive transaction modes. The transferable point for GPU DB is not
+the exact lock implementation; it is the tail-latency policy. A transaction
+that already paid retry cost should not repeatedly lose to younger requests
+on a hot key merely because the younger requests reached validation first.
+
+**Concrete mechanisms:**
+
+- Each worker has a compact transaction context containing worker id,
+  timestamp, and status. Conflicting transactions can mark a younger worker
+  aborted by changing that status.
+- Each record has lock metadata for a current writer, timestamp-ordered
+  waiting writers, and readers. Transactions acquire read or write locks
+  before accessing records, but read/write conflicts are usually ignored
+  during the read phase.
+- Writes are buffered privately during the read phase, so readers that ignore
+  a writer do not see incomplete or uncommitted data.
+- At commit, the transaction upgrades write-set locks to exclusive mode,
+  scans readers and writers in the lock metadata, aborts younger conflicting
+  transactions, and waits for older conflicting transactions. This enforces
+  timestamp-priority conflict resolution.
+- Aborted transactions retain their original timestamp when retried, so after
+  enough conflicts they become old relative to competitors and eventually
+  commit. This is the key tail-latency mechanism.
+- Read-only transactions use an adaptive path: start with OCC-style
+  validation and only acquire read locks after repeated aborts. This avoids
+  paying visible-read overhead for every read-only request.
+- Delayed write-lock acquisition is optional. Blind writes can acquire write
+  locks at commit; read-modify-write records can begin with read locks and
+  upgrade later. The paper finds this helps interactive mode but can be too
+  optimistic in stored-procedure mode.
+- The lock manager can be implemented with latch-free structures. For systems
+  with up to 63 workers, the paper describes an 8-byte reader bitset plus a
+  reserved exclusive-mode bit; larger worker counts can use lock-free queues.
+- Evaluation in DBx1000 compares PLOR with NO_WAIT, WAIT_DIE, WOUND_WAIT,
+  Silo, MOCC, and TicToc on YCSB and TPC-C. Reported stored-procedure results
+  include YCSB-A 99.9th percentile latency 8.8x to 14.5x lower than TicToc
+  and Silo at comparable throughput; interactive YCSB-A improves throughput
+  by up to 2x when delayed write-lock acquisition is enabled.
+- The persistent-logging experiments use Optane DCPMM redo/undo logging.
+  Logging overhead is limited in their setup, but 2PL-style long lock holding
+  interacts poorly with redo logging because logging extends the lock period.
+
+**GPU DB mapping:** GPU DB needs a policy for hot-key and hot-partition
+transactions that protects tail work without sending every transaction through
+a global deterministic scheduler. PLOR suggests a middle path for owner-domain
+write lanes: record intent early enough to expose conflicts and age, allow
+non-conflicting or safely buffered reads to continue, then enforce a priority
+rule at a bounded publication point.
+
+For retained reads, the adaptive read-only path is a useful template. Exact
+snapshot reads should normally stay invisible and avoid owner metadata writes.
+Only reads that repeatedly collide with invalidations, hot writes, or freshness
+barriers should enter a heavier conflict-visible path. That keeps the common
+retained route cheap while still giving tail reads an escape from starvation.
+
+For write throughput, PLOR's delayed write-lock acquisition maps to declared
+write templates and CAS/precondition routes. Blind appends or known-set writes
+can run optimistic CPU/GPU-side preparation and acquire owner-domain commit
+rights near the visibility boundary. Read-modify-write or interactive SQL
+should be admitted more conservatively unless the route certificate proves the
+read and write sets remain compatible.
+
+The lock metadata is also a route-certificate hint. GPU DB does not want
+per-row GPU locks on the hot path, but it can keep CPU owner metadata that
+tracks request age, read/write intent, partition, key range, retry count, and
+whether a request is allowed to wound younger work. That metadata can feed
+bounded rings, hot-write fallback lanes, and overload decisions without
+weakening WAL-before-visibility.
+
+**Risks and mismatches:** PLOR is a CPU in-memory OLTP protocol, not a GPU
+transaction engine, MVCC retained-snapshot design, or distributed SQL protocol.
+It assumes a bounded number of worker threads and uses busy waits in places;
+that does not directly scale to 1M logical sessions. GPU DB would need to map
+the policy to a much smaller active-worker set behind multiplexed sessions.
+
+The paper optimizes conflict-driven tail latency, not head-of-line blocking
+from uneven request sizes. Its own limitations section leaves variable-size
+request scheduling to other work. GPU DB must combine PLOR-style conflict
+priority with Shinjuku/LithOS-style size and resource admission.
+
+PLOR may raise median/non-tail latency because younger transactions can lose
+to older retried work. That is acceptable only if the route has an explicit
+SLO policy. It also does not replace MVCC read snapshots: visible read locks
+for every retained read would likely destroy the point of immutable GPU
+snapshots.
+
+**Benchmark candidates:**
+
+- Add a hot-key write benchmark with retry age preservation. Compare Silo-like
+  retry, timestamp-priority retry, and owner-serialized hot-key fallback.
+  Measure throughput, abort count, retry count, p50/p99/p99.9, and fairness.
+- Add adaptive retained-read conflict visibility: invisible snapshot reads by
+  default, heavier owner-visible admission after repeated invalidation or
+  freshness conflicts. Gate: identical SQL results and no stale resident reads.
+- Prototype a CPU owner-domain PLOR-inspired metadata table for hot routes:
+  request id, key/partition, read/write intent, timestamp/age, retry count,
+  and allowed conflict action. Measure cache-line pressure before considering
+  row-level metadata.
+- Compare delayed commit-right acquisition for blind writes, declared write
+  sets, and read-modify-write templates. Failure condition: higher throughput
+  from hidden stale reads, lost preconditions, or WAL visibility published
+  before durable admission.
+- Combine conflict priority with request-size admission. Run small hot writes,
+  large fan-out transactions, and retained reads together; verify that old
+  transactions stop starving without allowing large old transactions to occupy
+  all rings.
+- Test logging interaction explicitly: measure whether WAL append/flush inside
+  a hot-key critical section extends lock/owner hold time enough to require
+  separate durable-order and visibility-publication stages.
+
+### 2026-06-05 - Cross-paper synthesis: tail contracts need age, fan-out, and accelerator budget
+
+The last three reviewed papers sharpen the same route-contract problem from
+different sides. TAOBench says session pressure is not just connection count:
+one logical request can fan out into many correlated reads and writes, and
+read-hot data can be different from write-hot data. LithOS says accelerator
+work needs explicit resource and priority contracts before it reaches the GPU,
+because over-submitting long work destroys tail latency. PLOR says conflicts
+need an age-aware policy so a hot transaction that already retried does not
+keep losing to younger work.
+
+Converging design tracks:
+
+- Route certificates should include semantic pressure and resource pressure:
+  fan-out, tenant/partition, read/write intent, snapshot generation, expected
+  GPU work, output bytes, retry age, and whether the route may wound, wait,
+  fallback, or reject.
+- Retained reads should remain invisible on the common path, but repeated
+  freshness or invalidation conflicts should promote them into an owner-visible
+  lane with explicit priority.
+- Long GPU work, refresh jobs, and decompression should be chunked so short
+  retained reads and urgent invalidations can enter within a measured bound.
+- Hot-write lanes should preserve retry age across aborts and separate
+  conflict priority from raw arrival order.
+- Cache placement should distinguish read-hot fan-out data from write-hot
+  mutation metadata; promoting every write-hot key to HBM is likely wrong.
+
+Category gaps: the queue still has direct GPU transaction-processing work
+queued but partly access-blocked (`LTPG`). It also needs continued MVCC scan
+and cold-tier work so the loop does not become only runtime/admission design.
+Optimizer coverage is healthier after recent learned-cost reviews but still
+needs plans that combine conflict risk with CPU/GPU/tier route cost.
+
+Benchmark priorities:
+
+- A mixed workload with TAOBench-like correlated fan-out, PLOR-like hot-key
+  retries, and LithOS-like short/long GPU work classes.
+- A route-certificate trace format that records fan-out, retry age, queue wait,
+  GPU chunk wait, visibility boundary, and fallback reason for every request.
+- A tail gate: a policy only passes if it improves p99.9 without stale reads,
+  hidden WAL-order violations, or unbounded queue growth.
