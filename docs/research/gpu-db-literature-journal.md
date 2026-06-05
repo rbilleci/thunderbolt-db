@@ -67750,3 +67750,179 @@ physical structure should not be copied directly into GPU memory.
   while background residency builders consume committed batches. Failure
   condition: background refresh causes unbounded mutation-owner queue
   growth or silently serves stale GPU data.
+
+### 2026-06-05 - LADM makes GPU locality a schedulable data certificate
+
+**Citation:** Mahmoud Khairy, Vadim Nikiforov, David Nellans, and
+Timothy G. Rogers. "Locality-Centric Data and Threadblock Management
+for Massive GPUs." MICRO 2020, pp. 1022-1037.
+doi:10.1109/MICRO50266.2020.00086. Retrieved 2026-06-05 from the
+NVIDIA Research author manuscript,
+`https://d1qx31qr3h6wln.cloudfront.net/publications/MICRO_2020_Threadblock_Management.pdf`.
+
+**Category:** GPU execution / analytics; multi-tier cache / data
+placement; runtime scheduling.
+
+**Relevance tags:** GPU NUMA; chiplet GPUs; multi-GPU placement;
+threadblock scheduling; datablock locality; static index analysis;
+remote cache insertion; topology-aware routing; resident partition
+placement; GPU route certificates.
+
+**Core idea:** LADM argues that future large GPUs will look less like
+one uniform device and more like a hierarchy of locality domains:
+chiplets, local HBM stacks, packages, and potentially multiple discrete
+GPUs presented as one logical GPU. If the runtime treats that hardware
+as uniform, threadblocks frequently chase remote memory and waste
+inter-chip bandwidth. LADM therefore promotes locality from an implicit
+hardware concern to an explicit compiler/runtime contract.
+
+The transferable idea for GPU DB is not the exact compiler pass, but
+the certificate shape. A GPU route should know which data blocks a
+kernel fragment is expected to touch, which locality domain owns those
+blocks, whether the fragment can be scheduled near them, and whether
+remote requests should pollute local caches. LADM combines static index
+analysis with runtime topology information to place data, schedule
+threadblocks, prefetch when sizes are known at launch time, and choose
+cache insertion policies. On its simulated hierarchical multi-GPU
+system, the paper reports 4x lower inter-chip memory traffic and 1.8x
+average speedup over H-CODA, while capturing about 82% of monolithic
+GPU performance.
+
+**Concrete mechanisms:**
+
+- LADM introduces a GPU "datablock" abstraction: a predicted chunk of
+  data accessed by one threadblock. Static index analysis maps CUDA
+  threadblock and grid indices to accessed address ranges where the
+  pattern is analyzable.
+- The compiler transforms GPU parallel dimensions into loop-like index
+  variables, then uses locality analysis to classify how threadblocks
+  access arrays and to estimate datablock widths.
+- The runtime combines compiler-provided datablock metadata with
+  topology information for hierarchical GPUs. It co-places
+  threadblocks and datablocks within locality domains instead of using
+  a hierarchy-oblivious schedule.
+- For kernels whose data-structure size is known only at launch time,
+  LADM can adjust the threadblock schedule dynamically while still
+  using precomputed access-shape information.
+- LADM orchestrates prefetching and data placement to avoid relying
+  solely on demand paging or page-fault-driven first touch.
+- Its cache policy distinguishes local requests served by local DRAM,
+  local requests that miss to remote DRAM, and remote requests served
+  by the local node. This lets the system decide whether remote-origin
+  traffic should be inserted into the local L2 cache.
+- The paper studies policies such as inserting remote-origin lines only
+  when reuse is likely. A case study shows remote-origin traffic can
+  consume a large fraction of L2 traffic with poor hit rate; bypassing
+  it gives cache space back to local and local-to-remote accesses.
+- LADM's benefits depend on analyzable locality. The paper explicitly
+  calls out complex indices, irregular data-dependent graph accesses,
+  and kernel-boundary cache invalidation as remaining reasons it falls
+  short of an ideal monolithic GPU.
+- Evaluation is simulation-based. The target hardware is a future
+  massive logical GPU composed of multiple devices and chiplets, not a
+  shipping database GPU platform.
+
+**GPU DB mapping:** P8 should treat resident GPU data placement as more
+than "table is on GPU." A retained route certificate can include segment
+or partition locality: resident buffer id, GPU device, chiplet or MIG
+slice when visible, stream owner, expected column vectors, expected key
+or row-id ranges, and whether the route's kernel accesses them with
+contiguous, strided, gathered, or irregular patterns.
+
+For point lookup batches, the LADM-style datablock is a key-vector
+range plus the resident index/search structure it will touch. For
+scans, it is a column segment and predicate vector. For joins or grouped
+aggregates, it is the build/probe partition or group-state shard. The
+scheduler should prefer to launch work on the GPU execution owner that
+already owns the relevant segment and scratch buffers. If a route would
+touch remote GPU memory, the certificate should expose that fact so the
+planner can choose between migrating/rebuilding the segment, scheduling
+near the data, using CPU fallback, or rejecting under tight latency.
+
+The cache-insertion lesson maps to GPU DB's future multi-tier cache
+policy. Remote or one-off reads should not automatically contaminate the
+cache slice used by hot retained reads. A resident execution owner can
+tag route fragments as local-reuse, remote-reuse, or streaming/no-reuse,
+then choose whether results, decoded deltas, or intermediate hash/filter
+state are admitted to GPU memory, pinned host buffers, or only transient
+scratch.
+
+LADM also strengthens the case for route-specific GPU kernels instead
+of one generic resident executor. A kernel with predictable segment
+locality deserves a different scheduling and admission policy than an
+irregular pointer-chasing metadata walk. When access shape is unknown,
+GPU DB should route through conservative CPU truth, a specialized
+gather kernel with bounded queue budget, or a learned/observed route
+class rather than pretending locality was proven.
+
+**Risks and mismatches:** LADM is a computer-architecture paper, not a
+DBMS execution engine. It relies on static CUDA index analysis, while
+SQL route shapes are produced by a planner and may include predicates,
+joins, MVCC filters, and deltas whose access pattern depends on data.
+Its hardware is simulated and future-looking, and the paper assumes a
+single logical GPU abstraction that may not expose the same locality
+controls through CUDA today. It does not handle database correctness,
+WAL, snapshot visibility, DDL invalidation, or concurrent transactional
+updates. Complex and irregular access patterns are exactly where many
+MVCC/index workloads can land, so GPU DB needs a fallback path whenever
+the locality certificate is weak.
+
+**Benchmark candidates:**
+
+- Extend GPU route certificates with access-shape fields:
+  resident segment ids, key/row-id ranges, expected column vectors,
+  locality domain, reuse class, and remote-touch risk. Gate: every GPU
+  retained route records why locality was proven or why it fell back.
+- Build a resident lookup benchmark with locality-aware batching:
+  partition key vectors by resident segment/device before launch versus
+  FIFO batching. Measure p50/p99 latency, kernel count, queue wait,
+  HBM bytes, remote/device-to-device bytes when available, and fallback
+  rate.
+- Add a cache-admission experiment for route fragments: hot retained
+  local reads, remote/cold reads, and streaming scans use different
+  admission policies for decoded deltas, filters, and scratch buffers.
+  Failure condition: one-off scans evict hot lookup state without an
+  explicit policy decision.
+- Prototype a "schedule near data or rebuild near worker" decision for
+  future multi-GPU P8: either run the kernel on the owner of the
+  resident segment or rebuild/migrate a segment copy near a saturated
+  worker. Required metrics: rebuild bytes, remote bytes, queue delay,
+  and correctness against the same snapshot frontier.
+- Add an irregular-access guardrail benchmark using MVCC visibility or
+  secondary-index gathers. Gate: unknown locality cannot enter the
+  fast GPU route without a bounded gather budget and CPU-truth replay
+  verifier.
+
+### 2026-06-05 - Cross-paper synthesis: serviceable snapshots also need locality proof
+
+The last three reviews converge on a sharper route-certificate model.
+Snapper says a fast write lane needs declared owner touches and a proof
+of where dynamic fallback transactions fit between ordered batches.
+TiDB says a retained analytical route is serviceable only when it can
+prove its timestamp, schema, and replay frontier. LADM adds the hardware
+side: a GPU route also needs a locality proof that says where the data
+lives, where the work will run, and whether intermediate state deserves
+cache residency.
+
+That yields three converging design tracks:
+
+- **Frontier-certified execution:** reads and writes must carry visible
+  frontier fields: WAL/commit boundary, MVCC timestamp, catalog
+  generation, resident generation, and partition-local predecessor.
+- **Declared owner and locality routing:** prepared writes, retained
+  reads, refreshes, and GPU fragments should declare touched owners,
+  resident segments, access ranges, and locality domains before entering
+  fast lanes.
+- **Fallback as a first-class plan:** dynamic SQL, irregular gathers,
+  stale resident data, or remote GPU touches are not exceptional cases.
+  They need explicit wait, retry, CPU-truth, rebuild, migration, or
+  rejection policies with telemetry.
+
+Current category gaps remain runtime/network admission at 1M logical
+sessions and deeper MVCC garbage-collection under long retained
+snapshots. Benchmark priority should therefore be a route-certificate
+trace that follows one request across admission, owner scheduling,
+snapshot proof, locality proof, GPU execution, fallback, and response
+publication. Without that trace, isolated GPU speedups can look good
+while hiding stale snapshots, remote-memory traffic, or unbounded queue
+delay.

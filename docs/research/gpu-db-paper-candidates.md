@@ -1319,13 +1319,15 @@ Append new candidates here as each paper is processed.
   Why: NUBA contrasts page migration with LAB/MDR placement; useful for
   evaluating when GPU DB should migrate, replicate, or rebuild resident
   segment pages across future multi-GPU and partitioned-memory hardware.
-- `queued` — **Locality-Centric Data and Threadblock Management for Massive
+- `reviewed` — **Locality-Centric Data and Threadblock Management for Massive
   GPUs**, Khairy et al., MICRO 2020.
-  URL: `https://doi.org/10.1109/MICRO50266.2020.00087`
+  URL: `https://doi.org/10.1109/MICRO50266.2020.00086`
+  PDF:
+  `https://d1qx31qr3h6wln.cloudfront.net/publications/MICRO_2020_Threadblock_Management.pdf`
   Why: NUBA cites locality-centric data/threadblock management for massive GPU
   locality; useful for mapping query fragments, CTAs, and resident segment
   placement to hardware-local partitions instead of relying only on generic
-  GPU scheduling.
+  GPU scheduling. Journal entry added 2026-06-05.
 - `reviewed` — **Concurrency Control as a Service**, Zhou et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p2761-zhou.pdf`
   DOI: `https://doi.org/10.14778/3746405.3746406`
@@ -1461,6 +1463,22 @@ Append new candidates here as each paper is processed.
   Why: Steam-style MVCC version garbage collection cited by the Umbra MVCC
   paper; relevant to bounded version retention, long retained snapshots, and
   per-owner GC without global contention.
+- `queued` — **Beyond the Socket: NUMA-Aware GPUs**, Milic et al.,
+  MICRO 2017.
+  URL: `https://doi.org/10.1145/3123939.3124534`
+  PDF:
+  `https://research.nvidia.com/sites/default/files/pubs/2017-10_Beyond-the-socket%3A/milic_micro17.pdf`
+  Why: direct predecessor to LADM on multi-socket NUMA GPU interconnect,
+  cache, and phase-aware policy; useful for comparing hardware-visible
+  locality controls with route-level resident segment placement.
+- `queued` — **MCM-GPU: Multi-Chip-Module GPUs for Continued Performance
+  Scalability**, Arunkumar et al., ISCA 2017.
+  URL: `https://doi.org/10.1145/3079856.3080231`
+  PDF:
+  `https://research.nvidia.com/sites/default/files/publications/ISCA_2017_MCMGPU.pdf`
+  Why: source architecture for chiplet-style GPU NUMA locality and inter-GPM
+  traffic reduction; useful for future multi-GPU/chiplet residency placement
+  and deciding when GPU DB should migrate, replicate, or schedule near data.
 - `reviewed` — **BTrim - Hybrid In-Memory Database Architecture for Extreme
   Transaction Processing in VLDBs**, Gurajada et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p1889-gurajada.pdf`
