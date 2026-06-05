@@ -68614,3 +68614,160 @@ Benchmark priorities:
 - Treat route admission as receiver-credit flow control: a GPU or
   response owner grants work based on destination capacity, not only
   on the caller's desire to submit work.
+
+### 2026-06-05 - Adaptive compression should be a tier policy, not a column default
+
+**Citation:** Leon Windheuser, Christoph Anneser, Huanchen Zhang,
+Thomas Neumann, and Alfons Kemper. "Adaptive Compression For
+Databases." EDBT 2024, pp. 143-149. doi:10.48786/EDBT.2024.13.
+Retrieved 2026-06-05 from OpenProceedings,
+`https://openproceedings.org/2024/conf/edbt/paper-43.pdf`.
+
+**Category:** multi-tier cache / data placement; query execution; physical
+storage layout.
+
+**Relevance tags:** adaptive compression; hot/cold segmentation; lightweight
+integer packing; column groups; memory footprint; cache residency; warm-tier
+policy; access sampling; background adaptation.
+
+**Core idea:** AdaCom argues that in-memory compression should be selective.
+Compressing every in-memory column segment saves memory but adds per-access
+CPU work, while leaving everything uncompressed wastes scarce memory and may
+force expensive out-of-memory behavior. The paper therefore tracks segment
+accesses at runtime, keeps hot segments in the performance-optimized
+uncompressed representation, and compresses cold segments with lightweight
+succinct encodings.
+
+The DuckDB prototype applies this idea to column segments, using sampled
+access statistics and a background adaptive compression manager. Its headline
+result is that cold-segment compression can reduce DuckDB memory footprint by
+up to about 40% while retaining roughly 95% of uncompressed performance. In an
+out-of-memory scan, using succinct column segments avoids buffer overflow and
+improves execution time by up to 7x versus DuckDB's default representation in
+the tested setup. The useful GPU DB lesson is not the DuckDB number itself; it
+is that resident, warm, and cold layouts should be chosen from measured access
+temperature and route cost rather than from one fixed encoding per column.
+
+**Concrete mechanisms:**
+
+- The system splits each column into independently adaptable segments. DuckDB
+  already uses up-to-256 KiB column segments indexed by a segment tree, which
+  gives AdaCom a natural compression/adaptation unit.
+- Lightweight compression uses succinct integer vectors. Bit packing stores
+  each integer using the bit width required by the segment maximum; frame of
+  reference stores values as deltas from the segment minimum before bit
+  packing.
+- Succinct vectors provide O(1) random element access, but they need extra
+  shifts and alignment work. The paper's microbenchmarks show that this hurts
+  when both compressed and uncompressed vectors fit in cache, while larger
+  vectors can recover the overhead through better cache locality.
+- The paper also evaluates byte packing, which pads widths to byte boundaries.
+  In the reported experiments, byte packing and bit packing remain in the same
+  rough performance and memory range, with only modest differences.
+- AdaCom samples a subset of column-segment accesses into a hash table rather
+  than counting every access. The paper does not present a complex sampling
+  estimator; the mechanism is intentionally lightweight access tracking.
+- A compaction threshold `alpha` chooses how aggressively to compress. For
+  example, `alpha = 0.9` means the 90% least-accessed segments are candidates
+  for compact encoding.
+- An adaptation period controls how often the adaptive compression manager
+  wakes up. On each cycle it sorts segments by sampled accesses, compresses
+  cold segments, decompresses hot segments, resets statistics, and sleeps.
+- Segment conversion is background work. Query processing can continue while a
+  new compacted or uncompacted segment is built, at the cost of temporary
+  memory amplification for the old and new segment copies.
+- Inserts and updates can force re-encoding when a new value exceeds the
+  current bit width. To avoid oscillation, the prototype tracks insert history
+  and prevents recently decompressed segments from being immediately
+  compacted again.
+- Primary key and enum-like columns are called out as good fits: primary keys
+  are usually monotonic and not updated, and enum domains are small and stable.
+- The DuckDB integration has a query-engine limitation: compressed segment
+  values are copied into DuckDB's normal vector format because the query engine
+  does not natively consume `sdsl::vector`.
+- Evaluation uses an Intel i9-7900X server, 125 GB DRAM, DuckDB with its
+  buffer size set to available physical memory, microbenchmarks, a 5B-integer
+  sequential scan, Zipf point lookups, and a generated RocksDB-like workload
+  based on Meta access patterns.
+
+**GPU DB mapping:** P8 should treat compression as part of the route and tier
+certificate. A column group should not be classified only as resident or not
+resident; it should also record its physical encoding, hotness class, minimum
+and maximum values, bit width, compression age, conversion debt, and whether
+the current CPU/GPU kernels can consume the encoding without materialization.
+
+The hot/cold segment idea maps naturally to GPU DB's resident, warm, and cold
+tiers. Hot retained lookup columns may deserve dense GPU-resident buffers with
+no decode on the p50 path. Warm host-memory segments can use lightweight
+integer packing if better cache residency offsets decode cost. Cold NVMe or
+future GPUDirect paths may use stronger compression or lazy decompression if
+the reduced bytes moved outweigh the kernel and CPU decode work.
+
+AdaCom also strengthens the case for route-shaped rather than table-shaped
+placement. One table may need an uncompressed GPU-resident key vector for hot
+point lookups, a compressed host-memory measure column for occasional
+aggregates, and a cold packed text-offset or dictionary side structure for
+rare scans. The planner and runtime should be able to admit those choices
+independently instead of forcing a whole table into one representation.
+
+The compaction threshold and adaptation period are directly analogous to P8
+cache policy knobs. GPU DB can make them resource-driven rather than fixed:
+tight HBM budget raises cold-segment compression or demotion pressure; high
+latency pressure keeps hot routes uncompressed; refresh debt or mutation churn
+extends the adaptation period to avoid conversion thrash.
+
+For GPU execution, the DuckDB copy limitation is a warning. If a GPU route must
+decompress packed values into a dense staging buffer before every query, the
+encoding may merely move cost from memory to launch-time materialization.
+Packed resident formats become attractive only when kernels can consume them
+directly, when decompression can be fused with scan/filter work, or when the
+route is cold enough that transfer-byte reduction dominates latency.
+
+The update mechanism matters for MVCC. A compact segment tied to a visibility
+frontier should not be rewritten in place after a new insert/update changes
+bit width. Instead, compacted GPU or host segments should be immutable
+generation objects; new writes land in a delta or newer generation, and
+background adaptation publishes a replacement only after WAL and MVCC
+frontiers make it safe.
+
+**Risks and mismatches:** AdaCom is a short EDBT paper and a DuckDB prototype,
+not a GPU database or transactional storage engine. DuckDB is columnar and
+OLAP-oriented, while GPU DB must preserve WAL-before-visibility, MVCC
+frontiers, pgwire ordering, and update/delete behavior. The prototype focuses
+on integer columns and does not solve string compression, indexes, joins, SQL
+expression coverage, CUDA kernels, or GPU memory management. Its adaptation
+thread introduces temporary memory amplification and CPU work; on a GPU DB
+that same work may compete with refresh, WAL replay, and response encoding.
+The reported out-of-memory win depends on a memory budget where compressed
+data fits and uncompressed data spills; that threshold must be remeasured for
+HBM, DRAM, NVMe, and future tiers.
+
+**Benchmark candidates:**
+
+- Add an encoding field to resident segment metadata: dense, bit-packed,
+  byte-packed, frame-of-reference packed, dictionary/text-offset, or unknown.
+  Gate: every route report names the encoding and whether it was consumed
+  directly or materialized.
+- Build a P8 integer-column benchmark with identical logical data in dense
+  GPU, packed GPU, packed host, and cold transfer formats. Measure p50/p99
+  latency, bytes moved, decode instructions, kernel time, and result
+  correctness.
+- Prototype access-temperature sampling per resident segment and route shape.
+  Compare no compression, fixed compression, and AdaCom-style hot/cold
+  compression under Zipf point lookups plus periodic scans.
+- Measure conversion debt: background compression/decompression cycles should
+  report temporary bytes, owner pause time, refresh lag, and query latency
+  impact. Failure condition: adaptation silently steals enough memory or CPU
+  to cause route rejection or tail spikes.
+- Add an update-churn test for packed segments. Insert or update values that
+  exceed current bit width while retained snapshots are active; prove old
+  generation visibility remains correct and new generation publication does
+  not rewrite data under active readers.
+- Test fused decode versus staging decode for packed GPU scans. Expected win:
+  packed representation helps only when lower bytes moved or better cache/HBM
+  locality beats decode overhead. Failure condition: every query materializes
+  the full segment before filtering.
+- Add a resource-driven threshold experiment: vary HBM and DRAM budgets while
+  keeping workload constant, and let policy change compression pressure.
+  Required metrics: resident bytes, fallback rate, refresh debt, CPU/GPU queue
+  wait, and query p99.

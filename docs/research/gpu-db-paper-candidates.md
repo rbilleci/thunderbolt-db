@@ -3826,13 +3826,33 @@ Append new candidates here as each paper is processed.
   prediction, placement granularity, and code-management choices; useful for
   turning HetCache-style access-path hints into a broader route-placement
   contract. Journal entry exists from 2026-06-05.
-- `queued` — **Adaptive Compression for Databases**, Windheuser et al.,
+- `reviewed` — **Adaptive Compression for Databases**, Windheuser et al.,
   EDBT 2024.
   URL: `https://doi.org/10.48786/EDBT.2024.13`
+  PDF: `https://openproceedings.org/2024/conf/edbt/paper-43.pdf`
   Why: GOLAP cites adaptive compression of cold column sections; useful for
   deciding whether GPU DB cold/warm segments should choose compression
   parameters from access statistics instead of a single fixed resident/cold
-  format.
+  format. Journal entry exists from 2026-06-05.
+- `queued` — **High-Throughput BitPacking Compression**, Lisa, Nguyen,
+  Habich, Kumar, and Lehner, DSD 2019.
+  URL: `https://doi.org/10.1109/DSD.2019.00101`
+  Why: AdaCom uses bit packing as its compact segment format; useful for
+  comparing CPU/GPU-friendly integer packing throughput, alignment choices,
+  and decompression overhead for resident and warm column groups.
+- `queued` — **Evaluating Lightweight Integer Compression Algorithms in
+  Column-Oriented In-Memory DBMS**, Heinzl et al., ADMS@VLDB 2021.
+  URL:
+  `https://hpi.de/fileadmin/user_upload/fachgebiete/rabl/publications/2021/ADMS_2021_Integer_Compression.pdf`
+  Why: AdaCom cites this integer-compression evaluation; useful for choosing
+  first P8 integer segment encodings before testing GPU resident, CPU warm,
+  and NVMe cold formats.
+- `queued` — **Waiting to Decompress: Lazy Loading of Compressed Data in
+  Main-Memory Database Systems**, Kipf et al., CIDR 2026.
+  URL: `https://vldb.org/cidrdb/papers/2026/p34-kipf.pdf`
+  Why: modern compression/lazy-loading follow-up that cites AdaCom; useful for
+  deciding whether GPU DB warm and cold column groups should defer
+  decompression until route admission proves the bytes are needed.
 - `queued` — **The Art of Balance: A RateupDB Experience of Building a
   CPU/GPU Hybrid Database Product**, Lee et al., PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p2999-lee.pdf`
