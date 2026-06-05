@@ -66703,3 +66703,130 @@ rule. The value is the decision framework and benchmark shape.
 - Include grouped aggregation as a negative-control benchmark for predicated
   SIMD and GPU scatter-heavy routes. The route should fall back or choose a
   grouped-friendly implementation when scatter dominates.
+
+### 2026-06-05 - HeMem makes tier policy asynchronous and application-visible
+
+**Citation:** Amanda Raybuck, Tim Stamler, Wei Zhang, Mattan Erez, and Simon
+Peter. "HeMem: Scalable Tiered Memory Management for Big Data Applications and
+Real NVM." SOSP 2021, pp. 392-407. DOI:
+`https://doi.org/10.1145/3477132.3483550`. Retrieved 2026-06-05 from the
+author-hosted PDF,
+`https://www.cs.utexas.edu/~witchel/380L/papers/raybuck21sosp.pdf`.
+
+**Category:** multi-tier cache / data placement, with runtime admission and
+write-path relevance.
+
+**Relevance tags:** tiered memory; hot/cold placement; hardware-event
+sampling; asynchronous migration; write-heavy page priority; NVM wear;
+performance isolation; user-space policy; future CXL/far-memory tiers.
+
+**Core idea:** HeMem argues that real DRAM+Optane-NVM tiering needs
+application-visible policy without putting heavy tracking and migration work
+on the request path. Hardware memory mode is fast but blind to application
+structure, while prior OS/software page-table tracking can pay high scanning
+and TLB-synchronization costs. HeMem instead keeps policy in a user-level
+library, samples memory access with CPU events, batches tracking and migration
+work asynchronously, and treats write-heavy data as more urgent for DRAM than
+read-heavy data because the slow tier has asymmetric read/write bandwidth.
+
+The paper's key transfer for GPU DB is not "let the OS migrate pages." It is
+the split between a cheap hot-path access model and a background placement
+control loop. Fast memory should be reserved for small, ephemeral, or
+write-heavy structures; cold or large structures can live in the slow tier as
+long as promotion/demotion is explicit, rate-limited, and visible to the
+runtime.
+
+**Concrete mechanisms:**
+
+- HeMem samples virtual memory accesses using PEBS-style CPU events instead of
+  periodically scanning page-table access/dirty bits. Samples are processed in
+  batches so tracking cost is amortized.
+- Managed memory is allocated from per-process DRAM and NVM DAX-backed files.
+  The library intercepts allocation and mapping calls, tracks virtual-address
+  to backing-file offsets, and focuses management on large, long-lived ranges.
+- Small allocations and small or ephemeral structures stay in DRAM. When DRAM
+  free space falls below a threshold, the policy thread demotes cold pages or
+  falls back to random demotion if no cold DRAM page is available.
+- A periodic policy thread, reported as a 10 ms loop in the paper, scans hot
+  NVM and cold DRAM lists and migrates pages asynchronously. A maximum
+  migration rate, 10 GB/s in the evaluated setup, limits interference.
+- Migration uses userfaultfd write protection: reads can continue while a page
+  is migrating, but writes wait until migration completes. The paper reports
+  write pauses as exceedingly rare in its write-heavy benchmark.
+- If available, HeMem offloads copies to an I/OAT DMA engine and batches copy
+  requests. Without DMA, it can use extra copy threads.
+- Write-heavy pages get priority for DRAM placement and a second chance before
+  cooling because Optane NVM writes are especially expensive and affect device
+  wear.
+- Evaluation uses GUPS, Silo/TPC-C, FlexKVS, and GAP graph workloads on a
+  single socket with 192 GB DRAM and 768 GB Optane NVM. The paper reports up
+  to 13% higher Silo/TPC-C throughput versus Intel memory mode, better FlexKVS
+  throughput and latency when the hot set fits in DRAM, and much lower NVM
+  write volume on graph workloads.
+
+**GPU DB mapping:** P8 already treats GPU memory as an explicit cache and CPU
+state/WAL as correctness owners. HeMem reinforces that future tiering should
+be a policy loop with telemetry, not a hidden page-fault surprise. For GPU DB,
+the analogous "pages" are resident column chunks, retained snapshot
+generations, CPU derived indexes, WAL replay buffers, text dictionaries,
+visibility summaries, and pinned transfer buffers.
+
+The most useful mapping is a two-plane tier manager. The foreground route
+selector decides whether a query may use a resident GPU snapshot, warm CPU
+column segment, CPU tuple/index path, cold transfer, or rejection. A background
+placement loop samples route hits, bytes transferred, write invalidations,
+snapshot hold times, queue wait, and tier pressure; then it promotes,
+demotes, refreshes, or evicts chunks under explicit rate caps. That keeps the
+request path deterministic while still adapting to hot sets.
+
+HeMem's write-heavy priority maps directly to MVCC and WAL design. Hot
+mutation metadata, current visibility counters, owner queues, conflict
+summaries, and short-lived response buffers should stay in the fastest CPU
+memory available even if larger read-mostly segments move to GPU HBM, host
+DRAM, CXL, or NVMe. Old retained snapshots can be demoted only if their
+holders are classified and the route selector knows that resurrecting them has
+a latency cost.
+
+The paper also supports separate policy for small and large objects. GPU DB
+should avoid demoting tiny control structures merely because they are cold in a
+sampling window. Control-plane state may be small but latency-critical, while
+large column groups or old snapshot side structures are better candidates for
+background migration.
+
+**Risks and mismatches:** HeMem is not a database storage engine and does not
+reason about WAL-before-visibility, SQL correctness, MVCC garbage collection,
+GPU HBM, CUDA streams, or NVMe-resident persisted state. Its unit of placement
+is an OS page, which may be too coarse for column chunks, text dictionaries,
+or version-chain fragments. It assumes a hot set exists; uniform access beyond
+fast-tier capacity gets little benefit.
+
+The implementation depends on Linux 5.1-era userfaultfd patches, DAX files,
+PEBS events, and optionally I/OAT DMA, so its exact machinery should not be
+copied into the GPU DB runtime. The transferable idea is asynchronous
+measurement-driven tier policy with interference caps and write-sensitive
+placement, not the specific kernel interface.
+
+**Benchmark candidates:**
+
+- Add a simulated tier-policy benchmark for P8 resident chunks: hot/cold
+  accesses with a fixed HBM or DRAM budget, background promotion/demotion
+  every configurable interval, and a migration bandwidth cap. Gate: route p95
+  must not regress when migration is active at the cap.
+- Track write-heavy versus read-heavy structures in tier telemetry: WAL
+  buffers, visibility summaries, CPU indexes, resident column chunks, pinned
+  buffers, and retained snapshots. Require the policy to keep write-heavy
+  metadata in the fastest CPU tier before promoting read-mostly bulk data.
+- Build a retained-snapshot demotion test: hold one old analytical snapshot,
+  continue fresh OLTP reads/writes, and demote only old generation chunks.
+  Failure condition: fresh route latency or WAL visibility publication waits
+  behind old-snapshot migration.
+- Add a small-object negative-control test where tiny control-plane structures
+  remain in fast memory even when sampled as cold. Measure admission latency,
+  route lookup latency, and cache-policy overhead.
+- Compare foreground synchronous refresh against asynchronous rate-limited
+  refresh for invalidated GPU resident chunks. Minimum proof gate: identical
+  visible rows and explicit fallback while refresh is pending.
+- If future CXL or far-memory hardware is available, reproduce the HeMem-style
+  hot-set experiment with GPU DB chunks: hot set fits in fast tier, hot set
+  exceeds fast tier, and uniform access. The policy should report when no hot
+  set exists instead of thrashing.

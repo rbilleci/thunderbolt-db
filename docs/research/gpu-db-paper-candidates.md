@@ -4849,7 +4849,7 @@ Append new candidates here as each paper is processed.
   offloading policy; TMO is a production datacenter memory-offload baseline
   for deciding which GPU DB objects can be transparently demoted and which
   require explicit route-owned placement.
-- `queued` — **HeMem: Scalable Tiered Memory Management for Big Data
+- `reviewed` — **HeMem: Scalable Tiered Memory Management for Big Data
   Applications and Real NVM**, Raybuck et al., SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483550`
   PDF: `https://www.cs.utexas.edu/~witchel/380L/papers/raybuck21sosp.pdf`
@@ -4857,6 +4857,13 @@ Append new candidates here as each paper is processed.
   useful for comparing hardware-event sampling and user-level tier policy
   against DB-owned placement of hot metadata, cold segments, and old
   snapshots.
+- `queued` — **MaxMem: Colocation and Performance for Big Data Applications
+  on Tiered Main Memory Servers**, Raybuck et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2312.00647`
+  Why: HeMem follow-up that extends user-space tiered-memory management to
+  multi-application colocation and QoS; useful for comparing per-process heat
+  gradients and fast-tier miss ratios with GPU DB admission when multiple
+  tenants, retained snapshots, and warm segments contend for future tiers.
 - `queued` — **Nimble Page Management for Tiered Memory Systems**, Yan et al.,
   ASPLOS 2019.
   URL: `https://doi.org/10.1145/3297858.3304024`
