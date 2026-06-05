@@ -1517,7 +1517,7 @@ Append new candidates here as each paper is processed.
   Why: Fluid Co-processing contrasts fragment-level GPU assistance with
   exchange-style whole-pipeline routing; useful for comparing planner-time
   CPU/GPU placement with runtime split-route fallback.
-- `queued` — **Performance-Optimal Filtering: Bloom Overtakes Cuckoo at High
+- `reviewed` — **Performance-Optimal Filtering: Bloom Overtakes Cuckoo at High
   Throughput**, Lang et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p502-lang.pdf`
   Why: Fluid Co-processing uses performance-optimal Bloom filter modeling as
@@ -4481,6 +4481,22 @@ Append new candidates here as each paper is processed.
   Why: BinDex uses Column Sketches as a main robust-scan baseline; useful for
   comparing lossy compressed host/GPU predicate filters with binned bitmap
   refinement under tight memory budgets.
+- `queued` — **Morton Filters: Faster, Space-Efficient Cuckoo Filters via
+  Biasing, Compression, and Decoupled Logical Sparsity**, Breslow and Jayasena,
+  PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p1041-breslow.pdf`
+  Why: Performance-Optimal Filtering compares against Morton filters as a
+  SIMD-friendly Cuckoo-filter variant; useful for resident set summaries where
+  delete support or lower false positives may justify more CPU/GPU lookup
+  work.
+- `queued` — **Monkey: Optimal Navigable Key-Value Store**, Dayan,
+  Athanassoulis, and Idreos, SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3064054`
+  PDF:
+  `https://stratos.seas.harvard.edu/files/stratos/files/monkeykeyvaluestore.pdf`
+  Why: Performance-Optimal Filtering cites Monkey for level-specific Bloom
+  filter tuning in LSM-style storage; useful if GPU DB adopts log-structured
+  cold or warm segments with tier-specific false-positive budgets.
 - `queued` — **Access Path Selection in Main-Memory Optimized Data Systems:
   Should I Scan or Should I Probe?**, Kester, Athanassoulis, and Idreos,
   SIGMOD 2017.

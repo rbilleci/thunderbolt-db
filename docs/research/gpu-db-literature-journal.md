@@ -64427,3 +64427,144 @@ static route fragments.
   packing/unpacking, and affinity choices separately. Minimum proof
   gate: p99 latency regressions can be attributed to one trait rather
   than a generic "GPU slow" label.
+
+### 2026-06-05 - Performance-optimal filters need route-specific false-positive budgets
+
+**Citation:** Harald Lang, Thomas Neumann, Alfons Kemper, and Peter
+Boncz. "Performance-Optimal Filtering: Bloom Overtakes Cuckoo at High
+Throughput." PVLDB 12(5):502-515, 2019. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol12/p502-lang.pdf`.
+DOI: `https://doi.org/10.14778/3303753.3303757`.
+
+**Category:** query optimization / planning; multi-tier cache / data
+placement.
+
+**Relevance tags:** Bloom filters; Cuckoo filters; false-positive
+budgets; SIMD lookup cost; join pushdown; resident summaries; LSM
+filters; route costing; cache-sectorized Bloom filters; register-blocked
+Bloom filters; CPU/GPU fallback.
+
+**Core idea:** The paper argues that filter choice should be optimized
+for end-to-end performance, not for the smallest filter or lowest
+false-positive rate in isolation. A filter is useful only when its
+lookup cost is lower than the work it avoids often enough. The decision
+depends on filter lookup time, saved work per negative lookup, and the
+true negative fraction in the workload.
+
+The practical result is that high-throughput database uses often prefer
+blocked Bloom-filter variants even when Cuckoo filters are more
+space/precision efficient. If a false positive merely causes a CPU cache
+miss, hash-table probe, or small local continuation, the cheaper Bloom
+lookup can dominate. If a false positive triggers expensive disk, remote,
+or object-store access, then a more precise Cuckoo-style filter can win.
+For GPU DB, that turns resident filters into route-specific cost objects:
+one filter policy is not right for GPU-resident scans, CPU index probes,
+NVMe cold-partition probes, and remote or future-tier fetches.
+
+**Concrete mechanisms:**
+
+- The paper defines performance-optimal filtering around three runtime
+  terms: filter lookup cost, saved work per avoided lookup, and the real
+  negative-lookup fraction. A stricter false-positive rate pays only when
+  the additional work saved exceeds the extra lookup cost.
+- It separates classic space/precision-optimal Bloom sizing from
+  performance-optimal sizing. Fast implementations may choose larger or
+  differently aligned filters when that lowers lookup cost or improves
+  SIMD/cache behavior.
+- It introduces cache-sectorized Bloom filters, which divide a cache-line
+  block into sectors so lookups can test fewer bits per sector with better
+  cache locality and SIMD-friendly access.
+- It introduces register-blocked Bloom filters, where the lookup mask fits
+  in SIMD registers and avoids multiple random memory accesses for a single
+  key. This trades false-positive precision for very cheap membership
+  tests.
+- The implementation uses SIMD lookup paths, including AVX2/AVX-512
+  gather-style operations, and magic modulo to avoid expensive modulus
+  operations while supporting more practical filter sizes than only powers
+  of two.
+- It evaluates Bloom and Cuckoo variants over different problem sizes,
+  false-positive targets, and hardware platforms. The reported conclusion
+  is that SIMD optimizations can produce up to roughly 10x speedups, and
+  that blocked Bloom filters tend to beat Cuckoo filters in high-throughput
+  workloads where the avoided work is low or moderate.
+- The paper explicitly connects filters to database join pushdown,
+  distributed semijoins, LSM run filters, cold-storage filters, and
+  column-store skipping, but it does not evaluate GPU kernels directly.
+
+**GPU DB mapping:** GPU DB should treat resident predicate filters and
+join summaries as planner-visible route artifacts with measured lookup
+cost and false-positive budget. A retained GPU route may use a cheap
+Bloom-style summary when false positives only waste a few GPU lanes or a
+CPU cache probe. A cold NVMe or remote-tier route may need a more precise
+filter because every false positive can trigger DMA, page pinning, NVMe
+IO, or GPU queue occupancy.
+
+This maps cleanly to the P8 cache manager. Resident segment metadata can
+carry summary type, bytes, build generation, supported predicate family,
+estimated negative fraction, measured lookup cost, and false-positive
+rate. Planner routes can then price "filter then GPU scan", "filter then
+CPU index probe", "filter then NVMe fetch", and "no filter" separately.
+The filter policy should be tied to the route certificate, not hidden in
+the scan kernel.
+
+For high session concurrency, cheap filters can also protect owner and
+GPU rings. Before admitting a request to an expensive route, an IO or read
+snapshot worker could test a compact immutable summary and immediately
+fall back or reject impossible keys. The design must preserve SQL
+correctness: a negative approximate filter may only skip work if it has
+no false negatives for the covered generation, and any stale or invalid
+filter must fail closed to CPU/owner execution.
+
+For GPU execution, the direct mechanism is not "copy AVX-512 code to
+CUDA." The transferable mechanism is the cost equation. GPU versions
+need their own measurements for warp divergence, coalesced loads,
+shared-memory/register pressure, false-positive continuation cost, and
+host/device transfer overhead. A CPU-side Bloom guard may still be better
+for small retained lookups, while a GPU-side bitset/filter can be better
+for large resident batches.
+
+**Risks and mismatches:** The paper is CPU/SIMD focused and largely
+analytical. It does not address MVCC, WAL ordering, snapshot retention,
+writer invalidation, transaction isolation, GPU memory capacity, CUDA
+kernel behavior, or session admission under 1M logical sessions.
+
+Its conclusions depend on hardware-specific SIMD behavior. The paper
+reports different behavior across Intel, KNL, and AMD platforms, so GPU
+DB should not hard-code "Bloom beats Cuckoo" as an architecture rule.
+The correct rule is to measure lookup cost and saved work per route.
+
+Deletes and duplicate keys matter. Cuckoo/counting-style structures may
+be necessary for mutable summaries or bags, while immutable resident
+snapshot summaries can use simpler Bloom-style filters and rebuild on
+generation change. That division must be explicit in the cache manager.
+
+False positives can be harmless or disastrous depending on tier. A policy
+that is optimal for GPU-resident hash probes may be wrong for NVMe or
+remote tiers. The planner must keep filter choice coupled to route and
+tier, not table alone.
+
+**Benchmark candidates:**
+
+- Add a route-filter cost model with terms for lookup cost, saved work,
+  negative fraction, false-positive rate, build cost, and summary bytes.
+  Proof gate: telemetry can explain why a route used no filter, Bloom,
+  precise set, or Cuckoo/counting-style summary.
+- Build immutable per-generation Bloom summaries for one resident `int4`
+  key column. Compare CPU prefilter, GPU prefilter, and no filter across
+  point lookups, lookup batches, and selective joins. Measure p50/p99
+  latency, GPU queue admissions, false positives, and skipped work.
+- Run tier-sensitive false-positive tests: resident GPU continuation,
+  CPU index probe, pinned-host transfer, and simulated NVMe cold fetch.
+  Expected result: the optimal false-positive budget gets stricter as
+  continuation cost rises.
+- Add a stale-generation correctness stressor. Mutate keys after a filter
+  is published, invalidate the resident generation, and verify negative
+  filter answers cannot suppress visible rows from a newer snapshot.
+- Compare exact small-set filters against Bloom summaries for small hot
+  dimensions or parameter lists. Failure condition: an approximate filter
+  is used where a compact exact set is faster and eliminates false
+  positives entirely.
+- Measure filter build and refresh costs under COPY/INSERT batches.
+  Minimum proof gate: filter refresh either publishes with the resident
+  snapshot generation or logs a reason-coded fallback until the summary is
+  current.
