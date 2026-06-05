@@ -4036,7 +4036,7 @@ Append new candidates here as each paper is processed.
   Why: Auto-WLM cites database-agnostic workload management as related
   production-oriented scheduling work; useful for comparing external workload
   control with an engine-integrated GPU route/admission controller.
-- `queued` — **IsoDiff: Debugging Anomalies Caused by Weak Isolation**, Gan,
+- `reviewed` — **IsoDiff: Debugging Anomalies Caused by Weak Isolation**, Gan,
   Ren, Ripberger, Blanas, and Wang, PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p2773-gan.pdf`
   DOI: `https://doi.org/10.14778/3407790.3407860`
@@ -4044,6 +4044,14 @@ Append new candidates here as each paper is processed.
   trace-based anomaly debugging; useful for a GPU DB isolation-template
   validation harness that compares static route certification with observed
   weak-isolation anomaly traces.
+- `queued` — **Elle: Inferring Isolation Anomalies from Experimental
+  Observations**, Kingsbury and Alvaro, PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p268-alvaro.pdf`
+  arXiv: `https://arxiv.org/abs/2003.10554`
+  Why: IsoDiff focuses on static trace-derived application anomaly debugging;
+  Elle is the complementary experiment-driven isolation checker for database
+  implementations, useful for validating GPU DB isolation claims with generated
+  workloads and concise anomaly witnesses.
 - `queued` — **DynaMast: Adaptive Dynamic Mastering for Replicated Systems**,
   Abebe, Glasbergen, and Daudjee, ICDE 2020.
   URL: `https://doi.org/10.1109/ICDE48307.2020.00123`

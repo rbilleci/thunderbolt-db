@@ -54255,3 +54255,237 @@ pgwire response rings, or multi-tier cold reads.
   same-shape update batch and compare CPU-only validation against
   GPU-prepared metadata plus owner prefix commit. Failure condition:
   transfer and launch overhead exceed saved owner time.
+
+### 2026-06-05 - IsoDiff turns weak-isolation safety into a traceable route-debugging problem
+
+**Citation:** Yifan Gan, Xueyuan Ren, Drew Ripberger, Spyros
+Blanas, and Yang Wang. "IsoDiff: Debugging Anomalies Caused by
+Weak Isolation." PVLDB 13(11):2773-2786, 2020.
+doi:10.14778/3407790.3407860. Retrieved 2026-06-05 from the
+VLDB PDF, `https://www.vldb.org/pvldb/vol13/p2773-gan.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction
+processing / write path; SQL isolation validation.
+
+**Relevance tags:** weak isolation; Read Committed; Snapshot
+Isolation; dependency serialization graph; anomaly cycles;
+transaction traces; false-positive pruning; route certification;
+serializable fallback; isolation-template validation.
+
+**Core idea:** IsoDiff is not a concurrency-control protocol. It is
+a debugging and analysis tool for finding application-level
+anomalies that are allowed by weak isolation levels but forbidden
+by serializable execution. The paper targets Read Committed and
+Snapshot Isolation, where subtle cycles in dependency graphs can
+produce lost updates, write skew, unserializable range reads, or
+application-specific inconsistencies.
+
+The key transfer to GPU DB is that isolation route safety should be
+auditable from SQL traces and operation-level dependency evidence,
+not only from protocol labels. A fast retained GPU route might be
+declared safe for RC, SI, RSS, or serializable read-only execution,
+but that declaration needs a workload-shaped certificate: which
+transaction classes, columns, dependency edges, timing constraints,
+and tolerated anomalies make the route safe. IsoDiff supplies a
+practical shape for that certificate.
+
+IsoDiff also reframes "upgrade to serializable" as a targeted
+repair problem. Rather than making the entire workload pay for a
+stronger isolation path, it identifies representative dangerous
+cycles and suggests target columns or dependencies where stronger
+protection, commutativity, application locking, or `SELECT FOR
+UPDATE`-style behavior would break many anomalies at once.
+
+**Concrete mechanisms:**
+
+- IsoDiff parses SQL traces into transaction classes. A class is an
+  operation sequence, not necessarily an application function, so
+  different branches or loops become distinct transaction classes
+  when their observed SQL operation sequences differ.
+- It builds two static dependency graphs: a transaction dependency
+  graph over transaction classes and an operation dependency graph
+  over reads, writes, and intra-transaction operation order.
+  Dependencies include write-write, write-read, and read-write
+  anti-dependencies whenever operations may touch the same table
+  and column.
+- The anomaly target is a cycle allowed by the configured weak
+  isolation level but not by serializable execution. For Read
+  Committed, IsoDiff searches cycles containing at least one
+  read-write edge. For Snapshot Isolation, it searches cycles with
+  two consecutive vulnerable read-write edges.
+- Because the number of cycles can be non-polynomial, IsoDiff looks
+  for a representative subset. It enumerates dangerous paths, uses
+  a k-shortest-path search to find short cycles around them, and
+  samples operation-level mappings to balance coverage against
+  runtime.
+- It reduces false positives with timing checks. A transaction-level
+  cycle may map to an operation-level graph that contains an
+  impossible happened-before cycle; such a candidate is invalidated.
+- It detects dependency correlations from traces, such as operations
+  that always access the same row or same key across tables. These
+  correlations can prove that an apparent dangerous edge is paired
+  with another dependency that makes the reported weak-isolation
+  cycle impossible.
+- It accepts developer feedback as graph properties: remove a
+  transaction class, remove an edge, mark dependencies as
+  correlated, or mark dependencies as mutually exclusive. The paper
+  argues this is practical because many false positives share a
+  small number of root causes.
+- It formulates repair advice as an approximate set-cover problem
+  over target columns: choose a small set of columns or dependencies
+  whose stronger protection would cover the representative anomaly
+  cycles.
+- The implementation uses `pglast` to parse SQL traces into ASTs and
+  about 2K lines of C++ for graph construction, correlation, cycle
+  search, and set cover. Cycle search is parallelized across worker
+  threads.
+- The evaluation covers TPC-C and seven open-source applications
+  under Read Committed and Snapshot Isolation. The paper reports
+  many more target columns under RC than SI, true anomalies such as
+  select-followed-by-update and write skew, and false positives
+  caused by application tolerance, nonconcurrent transactions,
+  commutative updates, and imprecise row/range modeling.
+- In the reported experiments, timing checks invalidate up to 85% of
+  found cycles, correlation checks invalidate up to 55%, and up to
+  94% of read-write edges are non-vulnerable under SI. The slowest
+  reported configuration on WooCommerce SI finds roughly 20K valid
+  cycles and 19K invalid cycles in about 46 minutes on one machine.
+
+**GPU DB mapping:** The first mapping is an isolation-route auditor
+for retained read paths. When the planner admits a query or
+transaction class to an RC/SI/RSS/GPU snapshot route, the engine
+should be able to record the transaction class, touched columns,
+read/write/anti-dependency edges, snapshot generation, and fallback
+requirements. An offline IsoDiff-like pass over pgwire traces can
+then identify whether the route templates admit weak-isolation
+cycles that would not be serializable.
+
+For MVCC design, IsoDiff suggests that route metadata should expose
+operation-level dependencies, not only transaction ids. A retained
+snapshot certificate should include which columns and predicates are
+read, which mutation classes write them, and which dependency edges
+are intentionally broken by immutable snapshot reads, write-owner
+serialization, prefix publication, or serializable fallback.
+
+For the write path, the set-cover repair idea maps to selective
+route strengthening. If a hot anomaly cycle depends on
+`stock.quantity` or `account.balance`, GPU DB should not globally
+disable fast RC/SI reads. It can instead route specific columns,
+transaction classes, or predicate ranges through stronger owner
+lanes, key locks, deterministic batches, commutative update
+operators, or `FOR UPDATE` equivalents.
+
+For 1M logical sessions, the correlation and timing checks are a
+guard against over-admitting "maybe safe" weak-isolation templates.
+Many sessions may share a few SQL shapes; validating those shapes
+offline can prevent the runtime from spending hot-path cycles on
+unnecessary serializable fences while still identifying the small
+set of shapes that must be fenced.
+
+For query planning, IsoDiff's output is useful route telemetry. A
+planner can learn that a route shape is fast but anomaly-prone for
+particular columns, while another route is safe because dependencies
+are correlated, mutually exclusive, or commutative. That evidence is
+more actionable than a single isolation-level label.
+
+**Risks and mismatches:** IsoDiff is a trace-based debugging tool,
+so its completeness is limited by the observed SQL traces. Rare
+transaction branches, tenant-specific predicates, DDL paths, and
+data-dependent stored-procedure behavior can be missed. A GPU DB
+route validator should combine trace evidence with static route
+metadata and targeted workload generation before treating a route as
+production-safe.
+
+The paper's dependency model is conservative at table/column level
+and has known false positives around range reads, single-row selects
+against future inserts, commutative updates, tolerated anomalies,
+and application-level nonconcurrency. GPU DB must not blindly turn
+every reported cycle into a global fence; doing so would erase the
+throughput benefit of weak isolation and retained snapshots.
+
+IsoDiff also does not prove the database implementation itself
+meets an isolation level. It assumes a weak isolation level and
+finds application anomalies allowed by that level. A GPU DB needs
+both this application-shape analysis and implementation-level
+history checking, which is why Elle was added as a follow-up
+candidate.
+
+Finally, the tool runs offline and can take tens of minutes for the
+larger reported configurations. It is appropriate for route
+certification, CI workload checks, and release gates, not for
+per-query admission on the hot path.
+
+**Benchmark candidates:**
+
+- Build a trace-to-route analyzer for the pgwire benchmark suite:
+  parse observed SQL into operation classes, touched columns, route
+  family, snapshot generation, and fallback path. Gate: the analyzer
+  can reconstruct the same route class for repeated same-shape
+  statements without adding runtime overhead to query execution.
+- Add an isolation-template stress test with three lanes: ordinary
+  RC route, SI retained-snapshot route, and serializable/owner route.
+  Generate lost-update and write-skew patterns, then verify the
+  analyzer flags the weak routes and leaves the serializable route
+  clean.
+- Implement target-column repair simulation. Given an anomaly cycle,
+  mark one column or predicate family as requiring owner
+  serialization or `FOR UPDATE` behavior and measure throughput loss
+  versus anomaly elimination.
+- Compare global route strengthening against selective strengthening
+  on a mixed TPC-C-like workload. Metrics: committed TPS, p50/p99
+  latency, retained-read hit rate, and number of unsafe cycles
+  remaining in trace analysis.
+- Record dependency-correlation facts for deterministic stored
+  procedures: same key, same partition, mutually exclusive route,
+  commutative update, or tolerated stale read. Proof gate: these
+  facts only remove analyzer false positives when the runtime has a
+  matching route certificate.
+- Add a CI artifact that stores representative dangerous cycles as
+  minimized SQL traces. Failure condition: a future route change
+  makes a previously safe retained route admit one of the stored
+  anomaly witnesses.
+
+### 2026-06-05 - Cross-paper synthesis: route certificates need isolation evidence, not just performance evidence
+
+FoundationDB, LMSFC, Dodo, and IsoDiff converge on the same
+pressure point from different directions: a fast route is not just a
+piece of code. It is a certificate that ties a workload shape to
+resource ownership, data layout, retry policy, visibility, and
+proof obligations.
+
+The route-certificate track now has four concrete parts. First,
+FoundationDB argues for separating transaction, log, and storage
+roles while exposing versions as the coordination currency. Second,
+LMSFC shows that a resident layout needs its own workload and
+packing certificate, because learned physical order can be correct
+but stale as a performance route. Third, Dodo shows that hot
+write-conflict routes need explicit batch order, staged retries, and
+prefix publication rather than invisible abort churn. Fourth,
+IsoDiff adds that weak-isolation routes need operation-level
+dependency evidence and anomaly witnesses, not just an isolation
+level name.
+
+For GPU DB this points to one benchmarkable design track: every
+nontrivial fast path should publish a compact route certificate with
+at least schema generation, WAL or transaction frontier, snapshot
+boundary, route shape, touched column families, resource class,
+layout/version policy, conflict/admission policy, and isolation
+evidence. Some fields are runtime data; others are offline
+certification artifacts. The hot path should check compact ids and
+frontiers, while CI and offline analysis validate the expensive
+dependency and anomaly claims.
+
+The current category gap is implementation-level isolation testing.
+IsoDiff can tell us whether an application route template is
+dangerous under a weak isolation model, but it does not prove GPU DB
+actually implements RC, SI, RSS, or serializable semantics. The next
+high-value follow-up is an experimental checker such as Elle, plus a
+small GPU DB history format that can emit enough read/write/version
+events for checker-driven validation.
+
+Benchmark priority should therefore move from "does the fast route
+win" to "does the fast route still win after carrying its proof":
+measure retained GPU reads, deterministic write batches, and
+selective serializable fallback with route-certificate creation,
+trace capture, offline anomaly analysis, and replayable minimized
+witnesses included in the cost model.
