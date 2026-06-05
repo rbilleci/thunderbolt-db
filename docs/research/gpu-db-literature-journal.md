@@ -54853,3 +54853,182 @@ GPU execution. Those require DB-specific benchmark gates.
   resident metadata. Compare 4KB pages, huge pages, and DB-owned segment
   packing for hot metadata plus cold payload mixes. Gate: improved TLB
   reach must not pin cold data on the hot path.
+
+### 2026-06-05 - HDCC mixes deterministic batches and optimistic transactions with explicit proof points
+
+**Citation:** Yinhao Hong, Hongyao Zhao, Wei Lu, Xiaoyong Du,
+Yuxing Chen, Anqun Pan, and Lixiong Zheng. "A Hybrid Approach to
+Integrating Deterministic and Non-deterministic Concurrency Control
+in Database Systems." PVLDB 18(5):1376-1389, 2025.
+doi:10.14778/3718057.3718066. Retrieved 2026-06-05 from the VLDB
+PDF, `https://www.vldb.org/pvldb/vol18/p1376-lu.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility.
+
+**Relevance tags:** hybrid concurrency control; deterministic
+execution; Calvin; OCC; serializability; global validation; logging;
+recovery; hot-key contention; distributed transactions; phantom
+avoidance; route assignment.
+
+**Core idea:** HDCC argues that deterministic and non-deterministic
+concurrency control should coexist inside one database system, but
+not as independent fast paths that merely hope their local schedules
+compose. Deterministic execution, represented by Calvin, is strong
+for high contention and distributed transactions with predeclared
+read/write sets. OCC is strong for local, low-to-medium contention,
+interactive, or undeclared transactions. HDCC routes each transaction
+exclusively to one of the two algorithms, then adds explicit
+cross-algorithm mechanisms so the combined history remains
+serializable and recoverable.
+
+The useful framing for GPU DB is "mixed routes need shared proof
+points." A hot-key write batch can go through a deterministic owner
+lane, while ordinary writes or reads go through optimistic lanes, but
+the route boundary must expose ordering evidence, validation rules,
+and log replay order. Without those, locally correct lanes can still
+form a nonserializable global schedule or an unrecoverable log order.
+
+**Concrete mechanisms:**
+
+- The system has an Analyzer that receives transactions, assigns a
+  monotonically increasing transaction id, and routes each transaction
+  to either OCC workers or a Calvin sequencer. Calvin transactions
+  later receive a batch id; OCC transactions keep a null batch id.
+- The rule-based assignment sends distributed transactions with
+  predeclared read/write sets to Calvin, local hot-item transactions
+  with predeclared read/write sets to Calvin, and local low-contention
+  or undeclared transactions to OCC. The exact thresholds are workload
+  policy, not a learned model.
+- Calvin transactions are batched, logged before execution, split into
+  node-local subtransactions, and locked by schedulers in transaction-id
+  order. HDCC does not abort Calvin transactions.
+- OCC transactions use Silo-style execution, prepare, validation, and
+  commit. Distributed OCC transactions coordinate participant workers,
+  lock write sets, validate read sets, log before commit, and may abort.
+- Lock-sharing makes local OCC validation aware of conflicting Calvin
+  transactions. When an OCC transaction validates, each node checks
+  which Calvin transactions conflict with it and are ordered before it.
+- Global validation handles distributed OCC transactions whose local
+  order against Calvin transactions might disagree across nodes. The
+  coordinator checks whether the OCC transaction and the conflicting
+  Calvin transactions would form a cross-node cycle; if so, the OCC
+  transaction aborts.
+- HDCC extends B+-tree index handling so inserts/deletes and range
+  queries participate in the same conflict tracking, avoiding phantom
+  anomalies rather than validating only point reads and writes.
+- The recovery problem is explicit: Calvin logs batched logical
+  transactions before execution, while OCC logs individual transactions
+  later in its lifecycle. Replaying two independent logs would not
+  reconstruct the serializable interleaving between Calvin and OCC.
+- Two-log interleaving records, in the OCC log, the committed Calvin
+  transactions ordered before an OCC transaction. During recovery, the
+  system interleaves Calvin-log and OCC-log replay according to that
+  recorded order.
+- Checkpointing is derived from Calvin's Zigzag-style approach. Data is
+  flushed at checkpoints, and transactions beyond the checkpoint
+  frontier are replayed from logs.
+- The paper evaluates HDCC in Deneva against OCC, Calvin, Aria, and
+  Snapper on YCSB and TPC-C. Reported results include up to 3.1x
+  higher throughput than Snapper when transactions predeclare their
+  read/write sets, up to 2.3x on TPC-C in the undeclared-rate
+  experiment, and about 6.8x higher throughput than OCC and Aria when
+  the distributed transaction rate approaches 100%.
+- The evaluation shows a route-shift pattern: under low contention,
+  OCC-like lanes dominate; under high contention or distributed
+  pressure, most HDCC transactions move toward Calvin and throughput
+  approaches Calvin's behavior.
+
+**GPU DB mapping:** HDCC is directly relevant to the planned owner
+domains and route certificates. GPU DB should not pick one universal
+write path for all workloads. Low-contention writes can stay in an
+optimistic mutation-owner lane, while hot-key batches, predeclared
+stored procedures, COPY chunks, or multi-partition writes can move to
+a deterministic owner or partition schedule. The important lesson is
+that the switch needs validation and recovery metadata, not just an
+admission rule.
+
+For the write path, the Analyzer maps to GPU DB's admission/router
+layer. A route descriptor should classify each transaction by
+declared read/write set, key locality, contention telemetry, route
+duration, required isolation, and whether the transaction can be
+batched deterministically. When a transaction is routed to the
+deterministic lane, it should carry an explicit ordered batch id or
+generation. When it stays optimistic, validation must see conflicts
+against already-ordered deterministic work.
+
+Lock-sharing maps to cross-lane visibility summaries. If a retained
+read or optimistic write conflicts with a deterministic batch, the
+runtime needs a compact way to know whether that batch is before or
+after the transaction's snapshot and validation point. This should be
+attached to partition owners or mutation owners, not transient IO
+workers.
+
+Global validation maps to multi-owner and multi-partition transactions.
+If a transaction touches two owner domains, local validation at each
+owner is insufficient when deterministic batches and optimistic lanes
+interleave differently. GPU DB needs a small cycle or ordering check
+for cross-owner route certificates before such transactions commit.
+
+Two-log interleaving reinforces WAL-before-visibility. A fast
+deterministic batch log and an optimistic transaction log cannot be
+replayed independently if SQL-visible order depends on both. GPU DB's
+future WAL design should record enough interleaving evidence to replay
+mixed owner lanes, deterministic batches, retained-snapshot
+publication, and fallback commits into the same visible order observed
+before failure.
+
+**Risks and mismatches:** HDCC targets a shared-nothing distributed
+in-memory database, not a GPU-resident storage engine. It does not
+solve GPU kernel scheduling, resident snapshot refresh, CUDA buffer
+ownership, or over-resident data placement.
+
+Calvin-style routing assumes predeclared read/write sets for the
+transactions it handles. GPU DB will only have that for prepared
+stored procedures, COPY chunks, simple key-shape updates, or routes
+whose planner can certify touched keys/ranges. Interactive SQL with
+data-dependent branches remains a poor fit for deterministic batching.
+
+The evaluation is built on Deneva and synthetic/benchmark workloads.
+The reported speedups are useful evidence for route switching, but
+the absolute throughput does not transfer to GPU DB. The unknowns are
+how much validation metadata costs under PostgreSQL protocol sessions,
+how often real workloads predeclare enough information, and whether
+route switching can stay stable under mixed read/write invalidation.
+
+HDCC's rule-based assignment is intentionally simple. GPU DB may need
+telemetry-driven thresholds for queue depth, hot-key frequency, abort
+rate, WAL pressure, GPU batchability, and snapshot invalidation cost.
+The rule should still remain explainable; a learned policy without
+serializability and replay evidence would be dangerous.
+
+**Benchmark candidates:**
+
+- Prototype a two-lane write-path model: optimistic mutation-owner
+  validation for low-contention transactions and deterministic ordered
+  batches for predeclared hot-key transactions. Gate: identical final
+  SQL-visible state and WAL replay under generated conflict histories.
+- Add cross-lane validation metadata. An optimistic transaction should
+  record which deterministic batch generations it conflicts with and
+  whether they are ordered before or after its validation point.
+  Failure condition: two owner domains can commit a mixed Calvin/OCC
+  cycle that an Elle-style checker detects.
+- Build a hot-key route-switch benchmark. Vary skew, declared
+  read/write-set availability, and transaction locality; measure abort
+  rate, committed TPS, p50/p99 latency, deterministic batch size, and
+  owner queue wait. Expected behavior: optimistic wins at low skew;
+  deterministic owner batches win under high contention.
+- Add WAL replay tests for mixed lanes. Interleave deterministic batch
+  log records, optimistic transaction records, retained-snapshot
+  publication records, and fallback commits. Proof gate: replay
+  reconstructs the same visible order and snapshot frontiers as the
+  live run.
+- Extend route certificates with `cc_lane`, `declared_rw_set`,
+  `deterministic_batch_id`, `optimistic_validation_frontier`,
+  `cross_lane_conflicts`, and `replay_interleaving_evidence`. A route
+  cannot be considered certified unless these fields are either filled
+  or explicitly marked inapplicable.
+- Test range/prefix predicates separately from point updates. Insert
+  and delete rows while retained GPU prefix scans and deterministic
+  write batches run. Failure condition: a phantom anomaly appears
+  because cross-lane validation only tracked point keys.

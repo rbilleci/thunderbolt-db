@@ -2341,13 +2341,21 @@ Append new candidates here as each paper is processed.
   Why: Mako contrasts against integrated replication and concurrency-control
   protocols; useful for comparing visibility-control metadata against GPU DB
   snapshot publication and route certificates.
-- `queued` — **A Hybrid Approach to Integrating Deterministic and
+- `reviewed` — **A Hybrid Approach to Integrating Deterministic and
   Non-Deterministic Concurrency Control in Database Systems**, Hong et al.,
   PVLDB 2025.
-  URL: `https://dblp.org/rec/journals/pvldb/HongZLDCPZ25`
+  URL: `https://www.vldb.org/pvldb/vol18/p1376-lu.pdf`
+  DOI: `https://doi.org/10.14778/3718057.3718066`
+  Code: `https://github.com/dbiir/HDCC`
   Why: Minerva relates this HDCC line to Aria-style OCC plus deterministic
   rescheduling; useful for deciding when GPU DB should switch from optimistic
   validation to deterministic owner execution under high contention.
+- `queued` — **TDSQL: Tencent Distributed Database System**, Chen et al.,
+  PVLDB 2024.
+  URL: `https://doi.org/10.14778/3685800.3685844`
+  Why: HDCC cites TDSQL as a production distributed DBMS context for hybrid
+  concurrency-control mechanisms; useful for comparing research-grade Calvin/OCC
+  integration with deployed MVCC, logging, failover, and transaction routing.
 - `queued` — **Epoch-Based Commit and Replication in Distributed OLTP
   Databases**, Lu et al., PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p743-lu.pdf`
