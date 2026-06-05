@@ -5619,13 +5619,20 @@ Append new candidates here as each paper is processed.
   useful for comparing byte-compatible hot/warm structures against persistent
   memory placement, restart, and tier-specific durability behavior before GPU
   DB adds future CXL/NVM tiers.
-- `queued` — **Characterizing, Modeling, and Benchmarking RocksDB Key-Value
+- `reviewed` — **Characterizing, Modeling, and Benchmarking RocksDB Key-Value
   Workloads at Facebook**, Cao et al., FAST 2020.
   URL: `https://www.usenix.org/conference/fast20/presentation/cao-zhichao`
   Why: SKQ's RocksDB evaluation uses the ZippyDB workload model from this
   paper; useful for constructing realistic GET/SEEK/PUT service-time mixes,
   skewed tail-latency probes, and storage-adjacent runtime benchmarks before
   testing GPU DB pgwire/event-loop admission against only synthetic clients.
+- `queued` — **Optimizing Space Amplification in RocksDB**, Dong et al.,
+  CIDR 2017.
+  URL: `https://www.cidrdb.org/cidr2017/papers/p82-dong-cidr17.pdf`
+  Why: the FAST 2020 RocksDB workload paper depends on RocksDB's LSM and
+  compaction behavior; this primary RocksDB design paper is useful for
+  comparing space amplification, compaction, and cold-tier write pressure
+  before GPU DB designs realistic LSM-like benchmark traces.
 - `queued` — **FPTree: A Hybrid SCM-DRAM Persistent and Concurrent B-Tree for
   Storage Class Memory**, Oukid et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2915251`

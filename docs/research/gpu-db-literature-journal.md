@@ -71776,3 +71776,156 @@ explicit and SQL-safe.
   scan, refresh, and response write should expose separate saturation counters.
   Gate: saturation in one route class cannot stop unrelated route classes that
   do not share the scarce resource.
+
+### 2026-06-05 - RocksDB production traces show locality is a benchmark input, not noise
+
+**Citation:** Zhichao Cao, Siying Dong, Sagar Vemuri, and David H.C. Du.
+"Characterizing, Modeling, and Benchmarking RocksDB Key-Value Workloads at
+Facebook." FAST 2020, pp. 209-223. Retrieved 2026-06-05 from the official
+USENIX page and PDF:
+`https://www.usenix.org/conference/fast20/presentation/cao-zhichao` and
+`https://www.usenix.org/system/files/fast20-cao_zhichao.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** workload modeling; key-space locality; storage I/O
+amplification; trace replay; cache hit rate; benchmark realism; hot ranges;
+GET/PUT/Iterator/Merge mixes; tail-latency probes; cold-tier placement.
+
+**Core idea:** The paper characterizes production RocksDB workloads at Facebook
+from three use cases: UDB as the MySQL/MyRocks storage layer for social graph
+data, ZippyDB as a distributed key-value store, and UP2X as persistent storage
+for AI/ML profile data. Its central warning is that query-level statistics are
+not enough for storage benchmarks. YCSB-style workloads can match operation
+ratios, value sizes, and key popularity while still producing unrealistic block
+reads, cache hits, and write amplification because they ignore where hot keys
+sit in sorted storage.
+
+The authors find strong key-space locality: hot keys are concentrated in
+particular ranges, often tied to application structure such as MySQL table
+prefixes, object metadata ranges, or AI/ML counter windows. They propose a
+key-range based workload generator that models range hotness and then places
+hot keys close together inside ranges. In their ZippyDB comparison, YCSB causes
+at least 7.7x as many block reads and about 6.2x as many read bytes as trace
+replay, with only about 17% of replay's block-cache hits. Their Prefix_dist
+benchmark cuts the mismatch substantially: read bytes are about 40%-43% above
+replay and cache hits are about 77% of replay.
+
+**Concrete mechanisms:**
+
+- The RocksDB trace tooling records each public API call with column family id,
+  operation type, key, query-specific data, and timestamp. For Put and Merge,
+  it stores value information; for Iterator seek calls, it stores scan length.
+- Trace replay runs against RocksDB snapshots taken at trace start so storage
+  I/O statistics can be compared against production-like state rather than only
+  synthetic load.
+- UDB, ZippyDB, and UP2X show different operation mixes. UDB and ZippyDB are
+  read-dominated, while UP2X is dominated by RocksDB Merge operations for
+  read-modify-write counters and structured updates.
+- Key sizes are typically small and narrowly distributed, but value sizes vary
+  strongly by use case. The reported average key/value sizes are about 27.1 B
+  and 126.7 B for UDB, 47.9 B and 42.9 B for ZippyDB, and 10.45 B and 46.8 B
+  for UP2X.
+- Iterator behavior matters. In the evaluated UDB column families, more than
+  60% of Iterators scan only one item, while about 20% of Assoc Iterators scan
+  more than 100 consecutive items.
+- Heat maps over sorted key order show that hot KV pairs are not randomly
+  distributed. Some MySQL-table key ranges are extremely hot, new social-graph
+  associations skew toward the end of a table range, and ZippyDB hot GET keys
+  cluster in a small number of ranges.
+- Temporal locality is workload-specific. UDB GET/PUT and UP2X Merge traffic
+  show diurnal patterns tied to user behavior; delete and internal service
+  scans can instead be spiky or range-bursty.
+- The key-range model partitions the whole sorted key space into ranges, uses
+  range hotness as a first-level distribution, and chooses keys inside the
+  selected range according to KV-pair access-count distributions.
+- The paper chooses a range size near the average number of KV pairs per SST
+  file so the benchmark preserves locality at both block-cache and SST levels.
+- Prefix_dist also models query type ratios, key and value size distributions,
+  QPS variation, and Iterator scan lengths, then generates db_bench workloads
+  whose trace statistics can be compared back to collected workloads.
+- The YCSB mismatch changes both read and write conclusions: randomizing hot
+  keys across the full key space makes too many blocks hot, reduces block-cache
+  effectiveness, overstates read pressure, and can understate production write
+  amplification from compaction.
+
+**GPU DB mapping:** This is a benchmark-design paper for P8 and the
+high-throughput runtime. GPU DB should not validate read throughput, cache
+placement, or session admission using only uniform or plain Zipfian keys.
+Resident GPU segments, pinned host staging buffers, CPU indexes, and NVMe cold
+tiers will all look artificially bad or artificially good if hot keys are
+scattered in ways real sorted/table-partitioned workloads would not scatter
+them.
+
+The key-range model maps directly to resident segment admission. A table can be
+hot in one key range and cold elsewhere; an admitted GPU route should score
+range, column family, predicate family, and scan length separately. This
+reinforces the UniMem entry's useful-byte-density rule: HBM promotion should be
+driven by hot route fragments, not whole-table popularity.
+
+The Iterator findings matter for prefix and range routes. A benchmark suite
+should include many one-row seeks, some medium prefix scans, and a smaller
+number of long scans. A GPU kernel optimized only for broad scans may miss the
+actual service-time mix, while a CPU index path optimized only for point reads
+may miss the long-tail scan pressure that drives cache residency and response
+buffer use.
+
+For session scale, the paper gives a practical workload shape for BFC-style
+active-session admission. A million logical sessions should be tested against
+hot-range bursts, diurnal ramps, short Iterator seeks, and Merge-like
+read-modify-write waves, not only independent same-shape point lookups. The
+right admission policy may batch or promote by key range because range-local
+heat keeps CPU/GPU cache lines, SST blocks, resident key vectors, and response
+metadata reusable.
+
+For write throughput, the UP2X Merge pattern is a useful proxy for hot counter
+or profile updates. GPU DB's mutation owner should be tested with repeated
+updates to moving hot ranges, compaction or checkpoint pressure, and retained
+read snapshots pinned over those ranges. The goal is to expose whether
+tombstones, old versions, or cold-tier cleanup create write amplification that
+synthetic random-key tests hide.
+
+**Risks and mismatches:** The paper studies RocksDB key-value APIs, not SQL
+execution, WAL/MVCC correctness, GPU kernels, or PostgreSQL protocol handling.
+It uses Facebook production workloads from specific services, and the raw
+traces are not public. GPU DB should borrow the modeling method, not assume the
+same key/value sizes or operation ratios.
+
+The benchmark excludes deletions from the modeling section and only performs
+the detailed YCSB storage-I/O comparison on ZippyDB because UDB and UP2X have
+special plugin requirements. That leaves delete bursts, range deletes, SQL
+transaction boundaries, and MVCC version-chain behavior as GPU DB-specific
+extensions to model.
+
+RocksDB's LSM/SST block-cache behavior differs from a GPU-resident column-group
+cache. The transferable claim is that locality changes tier behavior; the
+exact read-byte and cache-hit ratios will not carry over to HBM, pinned memory,
+or NVMe-backed resident snapshots without new measurements.
+
+**Benchmark candidates:**
+
+- Add a key-range workload generator for the GPU DB benchmark endpoint. Inputs:
+  range count, range hotness distribution, key popularity inside range, scan
+  length distribution, value width, operation mix, and QPS time curve. Gate:
+  generated traces reproduce target range heat maps and operation ratios.
+- Compare uniform, Zipfian, whole-keyspace hotspot, and key-range hotspot
+  workloads for retained lookups. Measure CPU index hits, GPU resident hits,
+  H2D/D2H bytes, response-buffer reuse, queue wait, and p50/p99 latency.
+- Build a short-Iterator versus long-prefix benchmark: more than half the range
+  reads should return one row, with a controlled tail of 100+ row scans. Gate:
+  planner route choice does not send one-row seeks through broad GPU scan
+  kernels when CPU or resident key-vector lookup is cheaper.
+- Add a moving-hot-range Merge/update benchmark inspired by UP2X. Repeatedly
+  update one half-hour-style key window, then advance to a neighboring range.
+  Measure mutation-owner throughput, WAL bytes, version cleanup, resident
+  invalidation, and refresh lag.
+- Add diurnal ramp and burst profiles to active-session admission. The runtime
+  should keep idle-session memory flat while active-lane, pinned-buffer, and
+  response-ring pressure scale with admitted work, not total logical sessions.
+- Evaluate placement with useful-byte density: whole table, hot range, key
+  vector only, selected payload columns, and prefix/text metadata. Failure
+  condition: HBM promotion wins under random Zipfian load but loses under
+  range-local production-shaped load.
+- Extend the generator with deletion and range-delete bursts before using it as
+  a write-path proof. Gate: old-version and tombstone growth under retained
+  snapshots is visible in latency and cleanup telemetry.
