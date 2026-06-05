@@ -56461,3 +56461,153 @@ arbitrary SQL updates.
 - Stress unsupported SQL shapes, including state-dependent subqueries,
   triggers, unique constraints, and foreign keys. Required result: explicit
   fallback to strict validation, not silent auto-merge admission.
+
+### 2026-06-05 - HybridTier tracks both long-term heat and short-term momentum for CXL tiering
+
+**Citation:** Sihang Liu, Zixuan Wang, Jishen Zhao, Kevin Song,
+Jiacheng Yang, and Gennady Pekhimenko. "HybridTier: an Adaptive and
+Lightweight CXL-Memory Tiering System." ASPLOS 2025. doi:
+10.1145/3676642.3736119. Retrieved 2026-06-05 from arXiv,
+`https://arxiv.org/abs/2312.04789`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** CXL memory; tiered memory; hot/cold placement;
+probabilistic metadata; page migration; access frequency; access momentum;
+promotion/demotion; future memory tiers; CPU host-tier policy.
+
+**Core idea:** HybridTier argues that practical CXL memory tiering has to solve
+two problems at once: place the true hot set in local DRAM and adapt quickly
+when the hot set moves, without spending so much metadata memory or cache
+bandwidth that tiering eats the benefit. Pure frequency policies capture the
+overall hot set but react slowly because cooled counters are lagging
+indicators. Pure recency policies react quickly but can promote transiently
+touched cold pages.
+
+The paper's mechanism is to maintain two independent page-hotness signals.
+Long-term frequency captures stable heat over minutes to hours; short-term
+momentum captures access bursts over seconds. HybridTier then makes placement
+decisions from the pair: promote high-frequency or high-momentum pages, demote
+pages that are low on both, and give high-frequency but low-momentum pages a
+second chance before demotion. To keep the metadata path cheap, both signals
+are stored in blocked counting Bloom filters with small saturating counters,
+trading a little count inaccuracy for much lower memory and cache overhead.
+
+In the evaluation, HybridTier uses remote NUMA memory to emulate CXL memory and
+compares against AutoNUMA, TPP, Memtis, ARC, and TwoQ across CacheLib, GAP,
+SPEC CPU, Silo, and XGBoost workloads. The paper reports up to 91% speedup and
+19% geomean speedup over prior systems, with 2.0-7.8x less metadata memory
+overhead and 1.7-3.5x fewer cache misses from tiering activity. It also reports
+that HybridTier adapts 3.2x faster than Memtis in the dynamic CacheLib
+experiments.
+
+**Concrete mechanisms:**
+
+- HybridTier runs as a userspace runtime thread injected with `LD_PRELOAD`; it
+  does not require application recompilation or kernel changes.
+- It samples memory accesses with Intel PEBS and records the virtual page
+  address from each sample.
+- Every sampled page increments two trackers: a frequency tracker with a long
+  cooling period and a momentum tracker with a short cooling period.
+- The frequency threshold is adjusted from the observed hotness distribution
+  and available fast-tier capacity, following the shape of Memtis. The momentum
+  threshold is empirical; the evaluated default is 3.
+- Promotion happens when frequency or momentum is above threshold. The runtime
+  batches 100,000 samples and promotes all hot pages in one system call to
+  reduce migration overhead.
+- Demotion starts when free fast-tier memory drops below a promotion watermark
+  and continues until a demotion watermark is reached.
+- Cold candidates are found by scanning the process address space with
+  `/proc/PID/maps` and `/proc/PID/pagemaps`.
+- Pages with low frequency and low momentum are demoted immediately. Pages with
+  high frequency but low momentum are marked for a second chance, revisited
+  after roughly one minute, and demoted only if their frequency did not advance.
+- Both trackers use counting Bloom filters rather than exact per-page hash
+  tables. A lookup returns the minimum of the counters selected by the hash
+  functions; an increment raises the minimum counters.
+- HybridTier uses 4-bit saturating counters for normal pages, treating counts
+  of 15 or more as equivalent hot pages. Huge-page mode uses wider counters and
+  has much lower metadata count because one 2MB page replaces 512 4KB pages.
+- The frequency CBF is sized from the fast-tier page count and target tracking
+  error; the momentum CBF is 128x smaller because frequent cooling leaves far
+  fewer active entries.
+- Blocked CBF placement keeps all counters for one page inside one 64-byte
+  cache line, so a lookup has exactly one cache-line access and at most one
+  cache miss.
+- Page migration relies on existing OS mechanisms. The paper evaluates CXL via
+  remote NUMA emulation with application threads pinned to the local socket.
+
+**GPU DB mapping:** HybridTier is not a database paper, but it sharpens the
+future-tier policy for P8. A GPU DB should not rely on one heat signal such as
+"recently queried" or "historically popular" when deciding which resident
+segments, host-side indexes, old snapshot structures, or CXL/far-memory pages
+deserve fast-tier space. Stable hot tables and bursty route families need
+different promotion behavior, and stable-but-temporarily-quiet metadata should
+not be evicted on the first cold interval.
+
+The frequency/momentum split maps naturally to route and object telemetry. For
+each table segment, resident key vector, CPU index page family, route metadata
+object, old-version side structure, or response/template buffer family, the
+engine can maintain a stable heat score and a short-window momentum score.
+Promotion to GPU memory, local DRAM, or pinned host buffers can admit objects
+that are either proven hot or suddenly surging. Demotion from scarce tiers
+should require both low stable heat and low recent momentum, with second
+chance for historically important objects.
+
+The blocked CBF idea is useful even before CXL. Per-object placement metadata
+can become a hidden hot path under 1M logical sessions if every request updates
+exact counters, hash maps, or per-session LRU nodes. Approximate, cache-line-
+local counters are a good fit for advisory placement decisions where exactness
+is not part of SQL correctness. The durable authority remains WAL/MVCC and
+catalog state; probabilistic heat should influence only admission, promotion,
+demotion, prefetch, and benchmark routing.
+
+For retained GPU snapshots, the most direct design candidate is a two-signal
+cache manager: keep GPU-resident objects for stable high-frequency routes,
+fast-promote CPU/host-memory structures for high-momentum bursts, and demote
+old snapshots only after both signals are cold and no reader pins them. For
+future CXL or far-memory tiers, HybridTier suggests a default benchmark shape:
+compare transparent page-tiering against DB-owned object-family placement with
+frequency/momentum telemetry.
+
+**Risks and mismatches:** HybridTier is application-transparent page tiering,
+not DBMS-owned object placement. It samples virtual memory pages and migrates
+them through OS page mechanisms, so it cannot directly express SQL object
+identity, WAL generation, snapshot visibility, route support, or GPU residency
+validity.
+
+The evaluation uses remote NUMA as a CXL emulator, not the exact future GPU DB
+hardware stack. It also focuses on CPU workloads, including Silo/YCSB-C, not
+GPU kernels, pinned host buffers, GPUDirect storage, CUDA unified memory, or
+NVMe cold-tier routes. The paper's default momentum threshold and one-minute
+second-chance interval are empirical and should not be hard-coded into GPU DB.
+
+Approximate counters are safe only for performance policy. They must not drive
+semantic decisions such as whether a snapshot is visible, whether a resident
+route is valid, whether a mutation was replayed, or whether a row version can
+be garbage-collected. One-time scans can also pollute fast tiers unless the
+momentum threshold or scan classification resists transient access bursts.
+
+**Benchmark candidates:**
+
+- Add a placement-policy simulator for table segments, route metadata, and old
+  snapshot side structures with three policies: frequency-only,
+  recency/momentum-only, and HybridTier-style frequency plus momentum. Measure
+  hit rate, promotion churn, demotion mistakes, and p95 route latency.
+- Prototype approximate heat counters for advisory cache placement using
+  blocked counting Bloom filters or cache-line-local saturating counters. Gate:
+  identical SQL results and route-validity decisions with telemetry disabled.
+- Add route-certificate placement fields: `stable_heat`, `recent_momentum`,
+  `placement_policy`, `promotion_reason`, `demotion_reason`,
+  `second_chance_until`, and `placement_counter_confidence`.
+- Run a bursty retained-read workload where a cold table suddenly becomes hot.
+  Expected result: momentum promotion beats frequency-only policy in time to
+  useful residency without excessive pollution from one-shot scans.
+- Run a stable-hot-but-quiet workload where a historically hot resident segment
+  goes idle briefly during write pressure. Failure condition: immediate
+  eviction causes avoidable rebuild or transfer when traffic returns.
+- For future CXL/far-memory experiments, compare OS-transparent page migration
+  with DB-owned object-family placement for CPU indexes, old versions,
+  catalog/route metadata, and compressed host segments. Required metrics:
+  p50/p99 lookup latency, cache misses in placement metadata, migration bytes,
+  and wrong-tier accesses.

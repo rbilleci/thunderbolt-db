@@ -4272,12 +4272,38 @@ Append new candidates here as each paper is processed.
   Why: NeoMem compares against Memtis as a distribution-aware software tiering
   baseline; useful for separating hardware-side access telemetry from
   application-visible page-size and hot-set classification policy.
-- `queued` — **Lightweight Frequency-Based Tiering for CXL Memory Systems**,
-  Liu et al., arXiv 2023.
+- `reviewed` — **HybridTier: an Adaptive and Lightweight CXL-Memory Tiering
+  System**, Liu et al., ASPLOS 2025 / arXiv 2023.
   URL: `https://arxiv.org/abs/2312.04789`
+  DOI: `https://doi.org/10.1145/3676642.3736119`
+  Code: `https://github.com/kevins981/hybridtier-asplos25-artifact`
   Why: NeoMem frames frequency-sensitive page promotion as the central CXL
   tiering challenge; useful for comparing software frequency estimation with
   device-side hot-page telemetry before relying on OS-transparent placement.
+- `queued` — **MTM: Rethinking Memory Profiling and Migration for Multi-Tiered
+  Large Memory**, Ren et al., EuroSys 2024.
+  URL: `https://doi.org/10.1145/3627703.3650074`
+  Why: HybridTier omits end-to-end comparison because source was unavailable at
+  submission; MTM is a modern multi-tier profiling/migration baseline for
+  comparing DB-owned placement against application-transparent page movement.
+- `queued` — **FlexMem: Adaptive Page Profiling and Migration for Tiered
+  Memory**, Xu et al., USENIX ATC 2024.
+  URL: `https://www.usenix.org/conference/atc24/presentation/xu-dong`
+  Why: HybridTier cites FlexMem as a contemporary frequency-based tiering
+  system; useful for comparing adaptive profiling overhead with GPU DB's
+  route-object heat telemetry.
+- `queued` — **Tiered Memory Management: Access Latency is the Key!**,
+  Vuppalapati and Agarwal, SOSP 2024.
+  URL: `https://doi.org/10.1145/3694715.3695964`
+  Why: HybridTier notes Colloid as complementary latency-balanced tiering;
+  useful for comparing hotness-only placement with latency-balancing policy
+  when CXL/far-memory paths have heterogeneous access costs.
+- `queued` — **Managing Memory Tiers with CXL in Virtualized Environments**,
+  Zhong et al., OSDI 2024.
+  URL: `https://www.usenix.org/conference/osdi24/presentation/zhong-yuhong`
+  Why: HybridTier references Memstrata as a CXL tier manager for virtualized
+  environments; useful for multi-tenant placement, isolation, and whether GPU
+  DB can trust host/VM tiering for route-critical memory.
 - `reviewed` — **Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its
   Reliability on High Latency Memory**, Mahling, Weisgut, and Rabl, DaMoN 2025.
   URL: `https://doi.org/10.1145/3736227.3736231`
