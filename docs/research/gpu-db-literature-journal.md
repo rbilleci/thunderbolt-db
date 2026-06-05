@@ -63404,3 +63404,146 @@ the explicit frontier machinery, not the consistency contract itself.
   instead of per-owner fronts. Expected failure: either stale reads are possible
   under partial refresh lag, or the scalar frontier over-waits and suppresses
   otherwise safe fresh-owner routes.
+
+### 2026-06-05 - Cornus turns shared storage into commit-state arbitration
+
+**Citation:** Zhihan Guo, Xinyu Zeng, Kan Wu, Wuh-Chwen Hwang, Ziwei Ren,
+Xiangyao Yu, Mahesh Balakrishnan, and Philip A. Bernstein. "Cornus: Atomic
+Commit for a Cloud DBMS with Storage Disaggregation." PVLDB 16(2), 2022,
+pp. 379-392. doi:10.14778/3565816.3565837. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol16/p379-guo.pdf`.
+
+**Category:** transaction processing / write path; recovery and commit
+protocols; storage disaggregation.
+
+**Relevance tags:** atomic commit; two-phase commit; WAL critical path;
+disaggregated storage; compare-and-swap; coordinator failure; participant
+state; commit latency; durable transaction-state store.
+
+**Core idea:** Cornus observes that conventional two-phase commit was designed
+for shared-nothing databases where each compute node owns its own durable log.
+In a cloud-native storage-disaggregated database, all compute nodes can reach a
+highly available storage service, so a transaction's final state does not need
+to depend only on the coordinator's private log. Cornus keeps the familiar 2PC
+shape but replaces the second eager log-write phase with a storage-backed
+commit-state object that is written exactly once with atomic compare-and-swap.
+
+The useful design lesson for GPU DB is not "use cloud object storage"; it is
+that commit state and data/log state can have different durability authorities
+as long as the publication rule is explicit. A GPU DB with mutation owners,
+partition owners, residency owners, and future remote tiers should not smear
+"committed", "visible", "resident", and "recovered" into one flag. The commit
+decision needs a small, durable, uniquely-writable state that other owners can
+consult or complete after a coordinator stalls.
+
+The paper reports up to 1.9x lower distributed transaction latency than
+conventional 2PC in its evaluated storage-disaggregated setting. The benefit
+comes from eliminating the commit phase on the normal read-write path; under
+high contention, the relative gain shrinks because abort and execution time
+dominate. Cornus also bounds failure termination when storage remains
+available: in the reported experiment, termination completed within a few
+milliseconds on Redis and tens of milliseconds on Azure Blob, whereas ordinary
+2PC can block indefinitely waiting for a failed coordinator.
+
+**Concrete mechanisms:**
+
+- The system assumes a storage-disaggregation architecture: compute nodes
+  execute transactions, while log/state records are stored in a separate,
+  highly available storage layer that all compute nodes can access.
+- Cornus introduces a durable transaction-state record separate from ordinary
+  transaction data/log records. The key storage primitive is an atomic
+  conditional write: write the final state only if the state record does not
+  already exist.
+- Participants still prepare and log enough local information to ensure that
+  they can commit or abort consistently after failures.
+- The coordinator decides commit after receiving participant votes, then uses
+  the storage-layer conditional write to publish the transaction's final
+  decision exactly once.
+- A helper or recovering compute node can later read participant logs and the
+  transaction-state record to complete the outcome instead of waiting for the
+  original coordinator to recover.
+- If concurrent recovery helpers race, the conditional write makes only one
+  final decision durable. Other helpers observe the existing state and follow
+  it.
+- Read-only transactions can skip prepare and commit work, so Cornus mainly
+  improves read-write distributed transactions.
+- The evaluation implements Cornus on a modified distributed DBMS testbed with
+  Redis and Azure Blob-style storage services. It uses YCSB and TPC-C
+  workloads and measures distributed transaction latency, latency breakdown,
+  contention sensitivity, and failure termination time.
+- Cornus is not a free lunch: the prepare phase can be slightly more expensive
+  than 2PC because the conditional write abstraction and state metadata have
+  their own cost. Separate access control for transaction data and transaction
+  state in Azure Blob materially increased the state-write latency in the
+  paper's setup.
+- The paper contrasts Cornus with centralized logging, early prepare,
+  speculative pre-commit, 3PC, EasyCommit-style message redundancy, and
+  stronger co-designs between commit and storage replication.
+
+**GPU DB mapping:** The current GPU DB architecture already treats WAL as the
+durable source of truth and GPU resident state as rebuildable acceleration
+state. Cornus sharpens the write-path split for future multi-owner execution:
+the mutation owner can append durable WAL for data, while a small durable
+commit-state record or generation-frontier record can arbitrate the final
+decision among partition, catalog, and residency owners.
+
+This matters once the engine has more than one mutation authority. A
+multi-partition write, DDL-plus-data transaction, or future replicated
+resident-refresh transaction should not require every owner to block behind a
+failed coordinator thread. If the final decision is recorded in a compact
+state object with exactly-once creation semantics, another owner can finish
+publication, rollback, invalidation, or recovery repair without violating
+WAL-before-visibility.
+
+Cornus also maps to retained snapshot publication. A resident GPU generation
+should not become visible merely because its buffers were built; it should be
+published only after the transaction/refresh state record reaches a durable
+decision and the required owner frontiers cover that decision. This is the
+same conceptual boundary as Cornus's transaction-state record, but applied to
+visibility and route safety.
+
+For 1M logical sessions, the latency lesson is practical: do not put two
+remote durable round trips on every distributed write or refresh if one
+uniquely-writable decision record plus replayable participant logs can provide
+the same safety. The admission system should expose commit-state wait, WAL
+flush wait, owner queue wait, and resident-publication wait separately so
+transaction latency does not get blamed on GPU execution.
+
+**Risks and mismatches:** Cornus targets distributed cloud DBMSs with
+storage-disaggregated logs and a storage service that provides conditional
+writes. A single-node GPU DB with local WAL does not need this protocol yet.
+The paper does not address SQL planning, GPU memory residency, MVCC garbage
+collection, CUDA streams, or pgwire session multiplexing. Its failure progress
+depends on storage availability; if the shared storage layer is unavailable,
+Cornus cannot magically publish a decision. The security and access-control
+tradeoff is also real: if every compute node can modify every transaction-state
+object, the system needs careful fencing, identity, and authorization rules.
+Finally, this is a commit optimization, not a contention-control scheme; under
+hot-key abort pressure the paper's own results show that abort cost can
+dominate.
+
+**Benchmark candidates:**
+
+- Add a no-GPU commit-latency model for future partitioned writes: conventional
+  2PC-style two durable phases versus one durable WAL phase plus an exactly-once
+  decision record. Measure p50/p99 commit latency, number of durable writes,
+  and failure-recovery work.
+- Prototype a durable generation-state table for resident refresh publication:
+  `building`, `committed`, `aborted`, `visible`, `retired`, each transition
+  guarded by owner identity and monotonic generation checks. Gate: no resident
+  snapshot can be routed before the committed/visible frontier is durable.
+- Add a recovery stress test where the coordinator owner stalls after
+  participants prepare but before publication. Proof gate: a recovery owner can
+  complete or abort deterministically from WAL plus the decision record without
+  exposing stale GPU state.
+- Track latency breakdown for write paths: execution/validation, WAL flush,
+  decision-state write, invalidation, resident publication, and response
+  encoding. Failure condition: these are collapsed into one opaque "commit"
+  timer.
+- Compare owner-local-only commit state with a small shared decision object for
+  multi-owner catalog plus data changes. Expected improvement: shorter
+  coordinator-failure stalls and clearer replay boundaries. Failure condition:
+  the decision object becomes a global bottleneck for single-partition writes.
+- Add a negative-control test that publishes a resident generation after buffer
+  build but before durable decision state. Expected failure: recovery can no
+  longer prove whether readers saw a generation that should have aborted.

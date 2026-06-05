@@ -5030,14 +5030,22 @@ Append new candidates here as each paper is processed.
   snapshot-read protocol; useful for a deeper single-datacenter version of
   epoch publication, fast 2PC, and on-disk MVCC visibility without geo
   publisher latency.
-- `queued` — **Cornus: Atomic Commit for a Cloud DBMS with Storage
+- `reviewed` — **Cornus: Atomic Commit for a Cloud DBMS with Storage
   Disaggregation**, Guo et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol16/p379-guo.pdf`
-  DOI: `https://doi.org/10.14778/3565816.3565821`
+  DOI: `https://doi.org/10.14778/3565816.3565837`
   Why: Chardonnay's transaction-state-store path cites Cornus-style atomic
   commit work; useful for comparing fast commit-state durability and
   coordinator failure handling when GPU DB separates WAL, owner ordering, and
   resident publication state.
+- `queued` — **EasyCommit: A Non-blocking Two-phase Commit Protocol**,
+  Gupta and Sadoghi, EDBT 2018.
+  URL: `https://expolab.org/papers/easy-commit.pdf`
+  DOI: `https://doi.org/10.5441/002/edbt.2018.15`
+  Why: Cornus contrasts with non-blocking 2PC variants that add message
+  redundancy rather than storage-layer CAS; useful for comparing failure
+  progress, participant autonomy, and extra message cost in owner-domain
+  commit protocols.
 - `queued` — **Multi-version Range Concurrency Control in Deuteronomy**,
   Levandoski et al., PVLDB 2015.
   URL: `https://www.vldb.org/pvldb/vol8/p2146-levandoski.pdf`
