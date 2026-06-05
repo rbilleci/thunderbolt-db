@@ -4432,3 +4432,29 @@ Append new candidates here as each paper is processed.
   low-latency in-memory key-value migration; useful for comparing early
   ownership transfer, workload-skew-aware movement, and adaptive background
   migration against GPU DB resident segment and owner-domain movement.
+- `reviewed` — **When Database Meets New Storage Devices: Understanding and
+  Exposing Performance Mismatches via Configurations**, He et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p1712-he.pdf`
+  DOI: `https://doi.org/10.14778/3587136.3587145`
+  Artifact: `https://github.com/TimHe95/S3M`
+  Why: selected after recent synthesis called for storage-device scheduling
+  work; exposes concrete IO-size, IO-parallelism, and sequentiality mismatches
+  when DBMS storage routes assume faster media automatically helps.
+- `queued` — **Rearchitecting Linux Storage Stack for microsecond Latency and
+  High Throughput**, Hwang, Vuppalapati, Peter, and Agarwal, OSDI 2021.
+  URL: `https://www.usenix.org/conference/osdi21/presentation/hwang`
+  Why: cited by the PVLDB 2023 storage-device mismatch paper as a
+  device-sensitive layer direction; useful for comparing DB-owned cold-tier IO
+  owners with OS-level request switching and NVMe queue dispatch.
+- `queued` — **Write Dependency Disentanglement with Horae**, Liao, Lu, Xu,
+  and Shu, OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/liao`
+  Why: cited by the PVLDB 2023 storage-device mismatch paper as ordered async
+  IO work; useful for deciding how WAL-before-visibility can coexist with more
+  parallel durable writes.
+- `queued` — **Crash Consistent Non-Volatile Memory Express**, Liao, Lu, Yang,
+  and Shu, SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483555`
+  Why: storage-device mismatch work points to crash-consistent NVMe paths;
+  useful for separating durable ordering constraints from unnecessary
+  synchronous queue-depth-1 IO in future WAL/checkpoint routes.

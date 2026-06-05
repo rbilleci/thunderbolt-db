@@ -55364,3 +55364,148 @@ throughput prediction.
   telemetry against simpler fixed-window bounded inflight admission. The
   question is whether HPCC-style precision is needed, or whether GPU DB's
   internal owner-ring telemetry already captures enough pressure.
+
+### 2026-06-05 - New storage devices need route-visible IO shape contracts
+
+**Citation:** Haochen He, Erci Xu, Shanshan Li, Zhouyang Jia, Si
+Zheng, Yue Yu, Jun Ma, and Xiangke Liao. "When Database Meets New
+Storage Devices: Understanding and Exposing Performance Mismatches
+via Configurations." PVLDB 16(7):1712-1725, 2023.
+doi:10.14778/3587136.3587145. Retrieved 2026-06-05 from the
+official VLDB PDF, `https://www.vldb.org/pvldb/vol16/p1712-he.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** NVMe; storage-device mismatch; IO size; IO
+parallelism; IO sequentiality; fsync; io_uring; queue-depth telemetry;
+cold-tier admission; WAL and checkpoint IO; route certificates.
+
+**Core idea:** The paper shows that simply replacing older storage
+with NVMe SSDs can make an existing DBMS slower or much less improved
+than expected because the DBMS continues to issue IO in shapes tuned
+for older devices. Across MySQL, PostgreSQL, SQLite, MariaDB, MongoDB,
+and Redis, the authors use configuration-controlled experiments to
+expose performance mismatches, then diagnose them with block-layer
+tracing, kernel tracing, eBPF, and fio.
+
+The transferable idea for GPU DB is that a tier route is incomplete if
+it only says "read from NVMe" or "spill to cold storage." It also needs
+an explicit IO shape contract: request size and alignment, fsync or
+durability cadence, queue depth, number of independent queues, whether
+random-to-sequential conversion is actually profitable, and which owner
+is allowed to merge, reorder, or pace requests.
+
+**Concrete mechanisms:**
+
+- The authors identify IO-related DBMS configuration knobs by tracing
+  data-flow and control-flow from configuration variables to Linux
+  syscalls that can affect IO size, IO parallelism, IO synchronization,
+  memory mapping, or thread/process creation.
+- They generate controlled tests by changing one IO-related knob at a
+  time, comparing the performance effect across HDD, SATA SSD, and NVMe
+  SSD tiers. A counterintuitive larger penalty on a faster device is
+  treated as a potential mismatch, then manually diagnosed.
+- Runtime diagnosis combines DBMS profiling, blktrace, kernel event
+  tracing, eBPF, fio, and control-variable experiments to separate DBMS
+  behavior from storage-device behavior.
+- The main root-cause classes are write-size mismatch, IO parallelism
+  mismatch, and sequentiality mismatch.
+- Write-size mismatches arise when DBMS flushes produce small writes,
+  often page-sized or log-header-sized, that interact badly with SSD
+  cache-line or internal write behavior. The paper shows frequent fsync
+  can hurt NVMe SSDs much more than slower devices in selected TPC-C
+  tests.
+- Parallelism mismatches arise because many DBMS IO paths still issue
+  largely synchronous IO, or drive only one queue at very low depth,
+  while NVMe devices expose much larger internal queue parallelism.
+- Sequentiality mismatches arise when a DBMS spends CPU and memory
+  converting random IO into sequential IO even though the random versus
+  sequential gap is much smaller on NVMe than on HDD.
+- The paper reports 123 potential performance mismatch cases, grouped
+  into 17 developer issue reports; 15 were confirmed by developers.
+- The authors propose root-cause-based detection signals: unaligned
+  writes near the block layer for size mismatch, multi-queue utilization
+  and depth distribution for parallelism mismatch, and CPU plus
+  sequentiality changes for over-sequentialization.
+- Suggested remedies include a device-sensitive layer that dispatches
+  requests across idle NVMe queues and reorganizes small writes, moving
+  DBMS IO subsystems away from legacy synchronous interfaces, using
+  newer async interfaces such as io_uring, and making silent IO
+  optimizations configurable enough to test and disable.
+
+**GPU DB mapping:** P8 already treats GPU memory as an explicit
+performance tier and CPU/WAL state as the correctness tier. This paper
+adds a missing cold-tier contract: every storage route should expose the
+IO shape it will send to durable storage. A checkpoint, WAL append,
+cold segment read, resident refresh, and spill scan should record
+intended block size, alignment, queue target, durability boundary, and
+whether requests can be merged or reordered before hitting NVMe.
+
+For WAL-before-visibility, the important point is not to weaken fsync
+or durability. It is to batch and align durable writes at explicit
+generation boundaries so the storage layer is not forced into many
+small synchronous writes. COPY, refresh, checkpoint, and mutation-owner
+batching should report both logical commit latency and physical write
+shape: small flush count, average write size, aligned bytes, write
+amplification proxy, and queue-depth distribution.
+
+The runtime document's bounded rings and HPCC-like in-flight telemetry
+can extend downward into storage-device scheduling. A cold-tier IO owner
+should maintain route-local credits not only for bytes but for NVMe
+queue slots and flush epochs. If a request route would drive only queue
+depth 1 while leaving the device idle, the route certificate should make
+that visible before planner cost says "NVMe is fast."
+
+The sequentiality result is a useful warning for GPU-resident refresh.
+GPU DB should not automatically compact, sort, or convert cold random
+reads into sequential streams unless the measured device and route shape
+benefit from that conversion after CPU cost, queue delay, and GPU
+transfer scheduling are included. For retained snapshots, a resident
+segment build may still want sorted or columnar output, but that is a
+GPU execution contract, not proof that the NVMe input path should be
+sequentialized at all costs.
+
+**Risks and mismatches:** The paper studies existing CPU DBMSs on
+consumer NVMe SSDs, SATA SSDs, and HDDs. It does not evaluate
+enterprise NVMe, ZNS, SPDK, GPUDirect Storage, CXL-attached devices, or
+GPU-initiated IO. The exact penalties should not be transferred to GPU
+DB without hardware-specific measurements.
+
+The detection framework depends on configuration knobs and source-code
+taint analysis. GPU DB can design explicit storage-route telemetry from
+the start, so it should not need to infer every behavior through knobs.
+
+The paper is not a concurrency-control or MVCC design. It informs
+physical IO scheduling and tier placement, while WAL ordering,
+visibility publication, and snapshot validity still need database-level
+proofs.
+
+**Benchmark candidates:**
+
+- Add a cold-tier IO shape probe to P8 benchmarks. For WAL append,
+  checkpoint, resident refresh, and cold scan routes, record request
+  size distribution, aligned versus unaligned bytes, flush count,
+  queue-depth distribution, and device throughput. Gate: route telemetry
+  explains why a storage route is underusing NVMe before planner cost
+  relies on advertised bandwidth.
+- Compare queue-depth-1 synchronous cold reads against batched io_uring
+  or async pread routes for one cold partition. Required metrics: p50/p99
+  query latency, active queue depth, CPU overhead, bytes read, fallback
+  count, and retained-snapshot freshness delay.
+- Test WAL/COPY chunk sizing. Vary chunk and flush boundaries while
+  preserving WAL-before-visibility. Expected result: larger aligned
+  physical writes improve device utilization, but a proof gate should
+  cap commit latency and recovery replay ambiguity.
+- Benchmark random versus sequential cold-partition reads on the actual
+  target NVMe. Include CPU cost of sorting, compaction, or readahead.
+  Failure condition: the engine spends CPU sequentializing a path whose
+  end-to-end p99 or throughput does not improve.
+- Add route-certificate fields for storage routes: `io_size_class`,
+  `alignment_class`, `flush_epoch`, `target_queue_depth`,
+  `observed_queue_depth`, `merge_policy`, `sequentialization_policy`,
+  and `device_profile_id`.
+- Build a mismatch-regression harness using fio plus engine telemetry:
+  replay representative WAL, checkpoint, refresh, and cold-read IO
+  shapes on HDD/SATA/NVMe-like profiles and assert that the route
+  chooses device-sensitive batching, fallback, or warning states rather
+  than assuming faster media automatically helps.
