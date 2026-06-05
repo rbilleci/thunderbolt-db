@@ -536,7 +536,7 @@ Append new candidates here as each paper is processed.
   Why: OLTPim cites PIM-Tree as the skew-resistant alternative to its simpler
   hash/range partitioned PIM indexes; useful for GPU DB skew-aware resident
   key-vector and metadata placement.
-- `queued` — **GaccO: A GPU-Accelerated OLTP DBMS**, Boeschen and Binnig,
+- `reviewed` — **GaccO: A GPU-Accelerated OLTP DBMS**, Boeschen and Binnig,
   SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3517876`
   Why: OLTPim contrasts prior GPU OLTP systems; useful follow-up for
@@ -4642,3 +4642,15 @@ Append new candidates here as each paper is processed.
   Why: MOT names memory capacity and tiering as future work; HANA NSE is a
   primary-source warm-tier design for comparing in-memory OLTP acceleration
   with disk-backed warm data placement.
+- `queued` — **GalOP: Towards a GPU-Accelerated OLTP DBMS**, Boeschen and
+  Binnig, DaMoN/SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3465998.3466007`
+  Metadata: `https://www.dfki.de/en/web/research/projects-and-publications/publication/14419`
+  Why: precursor to GaccO; useful for separating the early GPU OLTP execution
+  argument from the later CPU/GPU co-execution and update-propagation design.
+- `queued` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
+  Control Schemes**, arXiv 2024.
+  URL: `https://arxiv.org/abs/2406.10158`
+  Why: modern GPU OLTP concurrency-control comparison discovered while
+  reviewing GaccO; useful for comparing GPU-friendly locking/OCC/MVCC choices
+  before adopting large homogeneous transaction batches.

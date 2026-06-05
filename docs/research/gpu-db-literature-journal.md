@@ -57487,3 +57487,148 @@ padding background work behind urgent reads.
   refresh or statistics kernel mid-flight, replaying CPU truth, and
   rebuilding resident metadata. Proof gate: no recovered route trusts
   pre-crash partial GPU state.
+
+### 2026-06-05 - GaccO batches same-shape OLTP transactions on GPU while CPU handles the rest
+
+**Citation:** Nils Boeschen and Carsten Binnig. "GaccO - A
+GPU-accelerated OLTP DBMS." SIGMOD 2022, pp. 1003-1016.
+doi:10.1145/3514221.3517876. Retrieved 2026-06-05 from the ACM DOI,
+DFKI publication page, and a rendered copy of the paper at
+`https://www.modb.pro/doc/75685`.
+
+**Category:** transaction processing / write path; GPU execution /
+analytics.
+
+**Relevance tags:** GPU OLTP; transaction batching; stored
+procedures; deterministic concurrency control; CPU/GPU co-execution;
+resident secondary copy; update propagation; larger-than-GPU-memory
+databases; route choice.
+
+**Core idea:** GaccO argues that OLTP is not hopeless for GPUs if the
+system stops treating each short transaction as an independent GPU job.
+Its execution model routes frequent stored-procedure transaction types
+to per-type queues, batches only transactions of the same type, and
+executes those homogeneous batches on the GPU. Less frequent or
+non-batched transaction types continue to execute individually on the
+CPU.
+
+The second half of the idea is co-execution, not GPU-only OLTP. GaccO
+keeps the primary table copy in CPU memory and a secondary copy or
+subset in GPU memory. That lets the system avoid shipping full tables
+for every batch, support databases larger than device memory, and
+propagate only updates across the CPU/GPU boundary. The paper reports
+TPC-C throughput speedups up to 6x over a CPU-only OLTP execution, with
+batched GPU latency in the millisecond range. The accessible source did
+not expose all evaluation tables in this run, so exact per-workload
+numbers beyond the reported headline are not recorded here.
+
+**Concrete mechanisms:**
+
+- Incoming transactions are classified by transaction type. Dominating
+  types are eligible for GPU batching; non-dominating types run on CPU.
+- GaccO's current routing scheme is static and assumes transactions are
+  available as stored procedures. The paper explicitly names dynamic
+  routing and ad-hoc transaction support as future extensions.
+- GPU-batched work uses one queue per batched transaction type, for
+  example separate TPC-C `NewOrder` and `Payment` queues.
+- Batches contain only transactions of the same type. This reduces
+  control-flow divergence and makes memory access patterns less random
+  than a mixed transaction batch.
+- GPU execution is described as a sequence of preprocessing, transaction
+  kernel execution, and postprocessing.
+- The GPU-side deterministic concurrency-control step orders
+  transactions in a batch based on conflicts so the batch can execute
+  abort-free. The first two rendered pages show this at the mechanism
+  level, but the detailed conflict-ordering algorithm was not fully
+  accessible through primary PDF retrieval during this run.
+- CPU tables are multi-versioned primary state. GPU tables are shown as
+  single-versioned secondary state for the GPU-executed subset.
+- CPU and GPU execute concurrently, so isolation requires coordination
+  between CPU-side transactions and GPU batches plus update propagation
+  between primary CPU tables and secondary GPU tables.
+- The storage scheme allows only a subset of data to be resident on GPU,
+  which is the lever for databases larger than GPU memory.
+- The paper evaluates TPC-C and highlights the mix of `NewOrder` and
+  `Payment` transactions as a motivating example for same-type batching.
+
+**GPU DB mapping:** GaccO is the closest reviewed source so far to the
+engine's target of GPU-assisted transaction processing rather than only
+GPU-assisted scans. The direct transferable idea is a route contract for
+stored-procedure-like write paths: if a transaction shape is frequent,
+has predictable parameters, and can be grouped under a clear conflict
+rule, the runtime can admit it to a same-shape GPU batch instead of
+forcing every transaction through scalar owner execution.
+
+This maps naturally to the command-ring design in
+`11-high-throughput-query-runtime.md`. Mutation owners could keep
+per-shape bounded queues for admitted transaction templates, drain them
+under a latency ceiling, and publish one WAL/MVCC visibility boundary
+per accepted batch. Non-dominating, ad-hoc, DDL-sensitive, or
+high-conflict transactions should remain on CPU/owner routes until they
+earn a batch certificate.
+
+The CPU-primary/GPU-secondary storage model also fits P8. GPU resident
+state should stay acceleration state, while CPU/WAL truth owns
+correctness. The useful design extension is to treat GPU transaction
+batches as consumers and producers of resident deltas, not only read
+queries. A GPU batch should run against a named resident generation,
+write private outputs or deltas, and publish them only after the CPU
+truth, WAL boundary, and invalidation state agree.
+
+GaccO also warns against generic "GPU OLTP" routing. The system wins
+because batches are homogeneous and because the route is selected by
+transaction type. For GPU DB, that suggests starting with one or two
+templates such as append-only insert batches, fixed-key balance updates,
+or inventory-like decrement/check transactions rather than arbitrary
+SQL transactions.
+
+**Risks and mismatches:** GaccO assumes stored procedures and static
+route choice. The current GPU DB serves SQL/pgwire, so arbitrary
+interactive statements, prepared statements, portals, and DDL require a
+much stronger planner and invalidation contract before they can follow
+this route. Millisecond batch latency may be acceptable for throughput
+lanes but not for latency-critical point reads or short interactive
+transactions unless admission has strict latency ceilings.
+
+The paper's visible design uses single-versioned GPU tables while CPU
+tables are multi-versioned. GPU DB cannot expose stale or wrong
+snapshot results just because the resident copy is convenient; every
+GPU write batch needs WAL-before-visibility, MVCC snapshot boundaries,
+and recovery behavior. The exact deterministic conflict-ordering
+algorithm was not available from the accessible primary pages in this
+run, so the benchmark mapping should validate the concept rather than
+copying the protocol blindly.
+
+Finally, GaccO's TPC-C result is for a research prototype with
+workload-specific batching. The transferable claim is not that all OLTP
+should run on GPU, but that carefully selected, homogeneous,
+high-volume transaction shapes can justify GPU execution when the CPU
+keeps correctness ownership and the GPU route has explicit admission
+rules.
+
+**Benchmark candidates:**
+
+- Add a transaction-template batching harness with one same-shape write
+  route, for example fixed-key inventory decrement or append-only
+  insert. Compare CPU owner scalar execution, CPU micro-batch, and GPU
+  homogeneous batch. Gate: identical WAL replay and MVCC-visible
+  results.
+- Create per-shape mutation queues with count and microsecond drain
+  thresholds. Metrics: queue wait, batch size, WAL bytes, commit
+  generation count, p50/p99 latency, abort/reject count, and CPU/GPU
+  fallback reason.
+- Prototype a GPU write batch that produces private deltas and publishes
+  only after CPU truth accepts the batch and the WAL boundary is durable.
+  Failure condition: partial GPU output can become visible after crash,
+  abort, or invalidation.
+- Build a same-type versus mixed-type batch experiment for retained
+  lookups or fixed updates. Expected result: same-shape batching should
+  reduce divergence and response scatter overhead; failure condition:
+  mixed batches win because route classification overhead dominates.
+- Add an update-propagation benchmark for CPU-primary/GPU-secondary
+  state: measure whether propagating row deltas beats rebuilding
+  resident segments under low, medium, and high update rates.
+- Test a larger-than-GPU-memory table with only a hot subset admitted to
+  the GPU write/read route. Proof gate: cold rows remain correct through
+  CPU fallback, and hot resident subsets invalidate before stale reads
+  or writes can use them.
