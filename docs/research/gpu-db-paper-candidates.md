@@ -4457,7 +4457,7 @@ Append new candidates here as each paper is processed.
   Why: cited by the PVLDB 2023 storage-device mismatch paper as a
   device-sensitive layer direction; useful for comparing DB-owned cold-tier IO
   owners with OS-level request switching and NVMe queue dispatch.
-- `queued` — **Write Dependency Disentanglement with Horae**, Liao, Lu, Xu,
+- `reviewed` — **Write Dependency Disentanglement with Horae**, Liao, Lu, Xu,
   and Shu, OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/liao`
   Why: cited by the PVLDB 2023 storage-device mismatch paper as ordered async
@@ -4469,3 +4469,10 @@ Append new candidates here as each paper is processed.
   Why: storage-device mismatch work points to crash-consistent NVMe paths;
   useful for separating durable ordering constraints from unnecessary
   synchronous queue-depth-1 IO in future WAL/checkpoint routes.
+- `queued` — **Barrier-Enabled IO Stack for Flash Storage**, Won et al.,
+  FAST 2018.
+  URL: `https://www.usenix.org/conference/fast18/presentation/won`
+  PDF: `https://www.usenix.org/system/files/conference/fast18/fast18-won.pdf`
+  Why: Horae contrasts its multi-queue/multi-device control/data split with
+  BarrierFS; useful for comparing fbarrier-style ordering without durability
+  against GPU DB WAL, checkpoint, and cold-tier publication boundaries.

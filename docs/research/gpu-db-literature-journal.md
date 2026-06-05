@@ -55830,3 +55830,150 @@ need saturation and latency signals as well.
 - Measure refresh pollution from non-public versions. If deterministic batches
   create versions that no retained snapshot can see, GPU refresh should skip
   them and GC should reclaim them before they reach resident segment encoding.
+
+### 2026-06-05 - Horae separates durable order control from parallel data writes
+
+**Citation:** Xiaojian Liao, Youyou Lu, Erci Xu, and Jiwu Shu.
+"Write Dependency Disentanglement with Horae." OSDI 2020, pages
+549-565. Retrieved 2026-06-05 from the USENIX publication page and
+PDF, `https://www.usenix.org/conference/osdi20/presentation/liao`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** ordered writes; NVMe; WAL-before-visibility; queue
+parallelism; storage control path; crash recovery; flush batching;
+cold-tier IO owners; route certificates.
+
+**Core idea:** Horae targets a specific failure mode in fast storage:
+systems need write ordering for atomicity and consistency, but enforcing
+that ordering through synchronous one-IO-at-a-time transfer turns many
+NVMe queues and multiple independent devices into one logical serial
+queue. The paper's answer is barrier translation: keep most data writes
+orderless and parallel, while moving dependency tracking into compact
+ordering metadata on a separate control path.
+
+The important transfer to GPU DB is that "WAL-before-visibility" does
+not imply "all durable IO must run at queue depth 1." The engine can
+preserve the durable publication order while still allowing independent
+WAL, checkpoint, cold-segment, and metadata writes to use the parallelism
+of NVMe or future tiers, as long as the ordering metadata, flush epochs,
+and recovery acceptance rules are explicit.
+
+**Concrete mechanisms:**
+
+- The paper distinguishes exclusive IO processing from orderless data
+  writes. Traditional ordered writes wait for preceding IO to travel
+  through PCIe, device processing, and completion before later dependent
+  IO is submitted.
+- The authors show ordered 4 KB random writes underutilize multi-queue
+  NVMe and multi-device setups; in their motivation experiment, the
+  dependency overhead reaches up to 87% as queues and devices scale.
+- Barrier translation converts ordered write dependencies into orderless
+  data blocks plus ordering metadata that records the dependency relation.
+- Horae splits the IO stack into an ordered control path and an orderless
+  data path. The data path reuses the ordinary block layer and device
+  driver, so data blocks can be dispatched asynchronously to one device
+  and pipelined across multiple devices.
+- The control path persists compact ordering metadata directly into NVMe
+  controller memory buffer using MMIO. The paper discusses persistent
+  memory and capacitor-backed DRAM as possible alternatives; writing the
+  tiny metadata through a normal SSD block interface is much slower
+  because it expands to a 4 KB synchronous transfer.
+- Horae uses joint flush to issue parallel FLUSH commands to dependent
+  devices rather than serializing flushes across the full dependency
+  chain.
+- Horae uses write redirection to break dependency loops and parallelize
+  in-place updates while preserving a strong consistency guarantee.
+- On crash recovery, Horae reloads ordering metadata and commits only
+  data blocks whose dependencies are valid, discarding data blocks that
+  arrived out of order relative to the persisted dependency metadata.
+- The implementation includes HoraeFS for POSIX-style workloads and
+  HoraeStore for a user-space object-store path. The paper reports up to
+  1.8x performance gain for MySQL and up to 2.1x for BlueStore, with the
+  larger BlueStore gain appearing when multiple devices otherwise make
+  dependency serialization more expensive.
+
+**GPU DB mapping:** P8 should treat durable storage as a set of owned
+routes with separate control and data facts. A mutation batch, resident
+refresh, checkpoint, or cold-partition write can have a durable ordering
+token that says which visibility generation, WAL epoch, checkpoint
+record, or segment manifest must precede it. The data bytes can still be
+submitted through async NVMe queues when the route certificate proves
+recovery will reject out-of-order or incomplete data.
+
+This fits the owner-domain runtime. A storage IO owner can own data
+submission queues, while a durability/control owner publishes compact
+ordering metadata, flush epochs, and recovery-validity frontiers. The
+mutation owner should wait for the visibility frontier, not for every
+individual data write to complete serially unless the route truly depends
+on that exact serial completion.
+
+For WAL-before-visibility, the safe design is to separate three orders:
+logical transaction order, durable control metadata order, and physical
+data completion order. A transaction becomes visible only after the WAL
+and control frontier prove it is recoverable. Checkpoint or resident
+segment data may complete earlier or later, but recovery must be able to
+classify the bytes as committed, pending, or discardable using the
+ordering metadata.
+
+Horae also strengthens the route-certificate idea from the recent
+synthesis. Storage routes should declare `dependency_epoch`,
+`control_record_bytes`, `data_write_bytes`, `flush_group`, `device_set`,
+`target_queue_depth`, `recovery_accept_rule`, and whether in-place writes
+require redirection. Without those fields, planner and admission logic
+cannot distinguish safe durable parallelism from unsafe reordering.
+
+For GPU-resident refresh, the mapping is especially useful. A refresh can
+write a new cold/warm segment or manifest in parallel with other data
+movement, but it should not publish a resident snapshot until its control
+record and recovery boundary are durable. If a crash sees the segment
+bytes without the control metadata, the segment is just discardable
+acceleration state.
+
+**Risks and mismatches:** Horae is a Linux IO-stack and storage-system
+paper, not a database concurrency-control protocol. It does not prove
+SQL isolation, MVCC visibility, WAL replay, or GPU cache invalidation.
+Those invariants remain database responsibilities.
+
+The design relies on hardware support for a fast persistent control path,
+especially NVMe controller memory buffer in the main implementation.
+GPU DB should not assume that target hardware exposes the same capability.
+Persistent memory, battery-backed DRAM, or ordinary WAL records may be
+more realistic control-path substrates, but each has different latency and
+failure semantics.
+
+The paper's fbarrier-related lineage separates ordering from durability.
+GPU DB must be careful not to turn that into weaker commits. For SQL
+commit visibility, ordering without durability is insufficient unless the
+transaction is explicitly allowed to return before durable commit, which
+is outside the current architecture goal.
+
+The reported MySQL and BlueStore gains depend on kernel changes, device
+topology, workload shape, and storage stack behavior. The transferable
+claim is the control/data separation and recovery filtering pattern, not
+the absolute speedup.
+
+**Benchmark candidates:**
+
+- Build a WAL/checkpoint IO-shape simulator with three policies:
+  queue-depth-1 ordered writes, async data writes plus serial durable
+  control records, and unsafe orderless writes as a negative control.
+  Gate: recovered committed state matches the strict ordered baseline.
+- Add storage route-certificate fields for `dependency_epoch`,
+  `control_record_bytes`, `data_write_bytes`, `flush_group`,
+  `device_set`, `target_queue_depth`, `observed_queue_depth`,
+  `recovery_accept_rule`, and `redirected_write_count`.
+- Prototype a refresh-manifest publication test: write segment bytes
+  before, during, and after the manifest/control record, inject crashes,
+  and verify recovery only trusts segments whose control frontier is
+  durable.
+- Compare serial flushes with grouped flush epochs for WAL, checkpoint,
+  and cold-segment writes. Required metrics: commit latency, p99 flush
+  wait, queue depth, throughput, and replay ambiguity.
+- Test in-place cold-tier update versus redirected write for one
+  Bf-Tree/TreeLine-like page route. Failure condition: recovery can
+  observe a partially updated page as visible after a crash.
+- Measure whether ordered metadata is small enough to keep on the hot
+  CPU path. If the control record forces a 4 KB synchronous write per
+  transaction, GPU DB should batch the frontier or choose a different
+  substrate before relying on NVMe parallelism.
