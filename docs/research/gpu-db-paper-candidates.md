@@ -2460,7 +2460,7 @@ Append new candidates here as each paper is processed.
   Why: lightweight learned transaction-to-thread assignment cited by TSkd;
   relevant to admission-time prediction before choosing an owner, CPU route,
   or deferred execution path.
-- `queued` — **Intelligent Transaction Scheduling via Conflict Prediction in
+- `reviewed` — **Intelligent Transaction Scheduling via Conflict Prediction in
   OLTP DBMS**, Zhang, Tomasic, and Pavlo, arXiv 2024.
   URL: `https://arxiv.org/abs/2409.01675`
   Why: longer modern follow-up to abort-prediction scheduling that studies
@@ -2476,6 +2476,13 @@ Append new candidates here as each paper is processed.
   concurrency-control cores; useful for deciding whether GPU DB mutation
   owners, read-snapshot workers, and conflict/admission workers should be
   separated under hot-key contention.
+- `queued` — **Self-Driving Database Management Systems**, Pavlo et al.,
+  CIDR 2017.
+  URL: `https://www.cidrdb.org/cidr2017/papers/p42-pavlo-cidr17.pdf`
+  Why: TSkd's evaluation uses Peloton, whose self-driving DBMS direction is
+  relevant to collecting workload evidence, adapting scheduling state, and
+  deciding how much conflict-history telemetry should feed GPU DB route
+  admission before introducing heavier learned control loops.
 - `reviewed` — **Polyjuice: High-Performance Transactions via Learned
   Concurrency Control**, Wang et al., OSDI 2021.
   URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`

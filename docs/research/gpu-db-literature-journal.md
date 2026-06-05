@@ -66226,3 +66226,171 @@ work, including separate snapshot classes and old-version side structures.
 - For future external tiering, test the exclusive-access assumption explicitly:
   inject an out-of-band cold-tier or resident metadata write and require route
   certification to reject the tier until it is reconciled.
+
+### 2026-06-05 - Conflict history can route hot transactions before validation
+
+**Citation:** Tieying Zhang, Anthony Tomasic, and Andrew Pavlo. "Intelligent
+Transaction Scheduling via Conflict Prediction in OLTP DBMS." arXiv 2409.01675,
+2024. Retrieved 2026-06-05 from `https://arxiv.org/abs/2409.01675` and
+`https://arxiv.org/pdf/2409.01675`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale.
+
+**Relevance tags:** transaction scheduling; conflict prediction; OCC; 2PL;
+hot-key admission; owner queues; abort reduction; workload history; adaptive
+scheduling; queue stealing; route telemetry.
+
+**Core idea:** The paper argues that an unpartitioned main-memory OLTP engine
+can recover some of the benefits of partitioned execution by routing
+transactions that are likely to conflict into the same worker queue. If two
+transactions are likely to abort when run concurrently, serializing them in a
+FIFO queue can reduce aborts without requiring a hard data partitioning scheme
+or a deterministic read/write-set analysis.
+
+The design deliberately stays lightweight. It does not attempt to model full
+read/write sets, estimate conflicts from histograms, or solve a global
+scheduling optimization problem. Instead, it records which SQL references
+appeared in transactions that committed or aborted, keeps a live map of which
+references are already queued where, and routes each new transaction to the
+queue with the highest predicted conflict score. In the paper's TPC-C
+experiments on a 20-core Peloton setup, the best Count/Max/Canonical/Single
+policy reduces OCC abort rate sharply and reports about 30-40% throughput
+improvement versus random scheduling in high-contention cases. The result is
+best read as evidence for simple conflict-history routing, not as a finished
+production scheduler.
+
+**Concrete mechanisms:**
+
+- The system inserts a scheduling layer between incoming transaction requests
+  and the DBMS worker queues. Its API needs only transaction capture,
+  enqueue-to-specific-worker, and commit/abort logging with SQL text.
+- The History component is a hash table keyed by extracted transaction
+  references. Each value stores abort and commit counters. Counters increase
+  on transaction outcomes and are not decremented during a history epoch.
+- A reference is an attribute/operator/value fragment, or a boolean
+  combination of such fragments, extracted from SELECT, UPDATE, INSERT, and
+  DELETE statements after parameter binding.
+- The State component is a hash table from reference to an array of per-queue
+  counts. It tracks how many queued transactions contain each reference, plus
+  auxiliary rate/volume fields used for cleanup.
+- The Schedule component extracts references for an incoming transaction,
+  looks up their historical abort evidence, combines that evidence with
+  State's per-queue counts, and enqueues the transaction into the queue with
+  the highest likely-conflict score.
+- Count policy scores references by total historical abort count. Fraction
+  policy scores by aborts divided by aborts plus commits. The paper finds
+  Count is more robust because it captures total lost work rather than only
+  local abort probability.
+- Sum policy combines all references in a transaction. Max policy keeps only
+  the strongest conflict reference, acting more like a soft partitioning key.
+- Literal policy uses exact SQL references. Canonical policy maps references
+  onto a shared underlying domain such as warehouse id or customer id, which
+  requires schema or workload knowledge but can mimic good partitioning.
+- Single policy splits conjunctive conditions into separate references. All
+  policy keeps a full condition as one reference. The best TPC-C policy in the
+  paper is Count/Max/Canonical/Single.
+- Idle DBMS workers may still steal work from other queues. This preserves
+  utilization but can reintroduce conflict when a stolen transaction runs
+  concurrently with transactions from its intended conflict queue.
+- Aborted transactions are immediately retried by the worker that already
+  holds them, which is intentionally unfavorable to the scheduler because the
+  abort itself is strong evidence that the retry should perhaps be delayed or
+  rerouted.
+- History initialization is separated from measured execution. The paper first
+  runs random scheduling for a short phase to collect abort/commit evidence,
+  then runs the intelligent scheduler with read-only History and live State.
+- Continuous execution needs State cleanup and History regeneration. The paper
+  removes low-rate, low-volume references, biased by queue occupancy, and shows
+  that deleting entries too eagerly can collapse scheduling quality.
+- The implementation uses concurrent hash tables but accepts slightly stale
+  scheduling information rather than globally synchronizing History, State,
+  and queue decisions.
+
+**GPU DB mapping:** This is a practical candidate for GPU DB admission before
+the engine invests in heavier learned schedulers. The current runtime target
+already has bounded mutation command rings, read snapshot rings, partition
+owners, and route descriptors. A TSkd-style layer could add a compact
+`conflict_signature` to write and mixed transaction routes, then steer hot
+transactions into the same mutation owner lane or hot-key queue when history
+suggests that concurrent execution would waste validation, WAL, index, or
+resident-invalidation work.
+
+The useful part is the low-cost evidence model. GPU DB does not need a full
+learned policy to start: it can count aborts, waits, validation failures,
+lock/latch conflicts, resident invalidation collisions, and hot-key retries by
+canonical route reference. Examples include table id plus primary key, account
+id, inventory id, tenant id, partition id, prefix/range bucket, or catalog
+object id. These references can become route-certificate fields that explain
+why a request was sent to the fast lane, conflict lane, deferred lane, or CPU
+fallback.
+
+The Canonical policy is the most important warning. Literal SQL text is too
+sparse and too brittle for GPU DB route admission. The runtime should canonicalize
+conflict evidence around stable catalog and key-domain identities: table OID,
+index OID, key column, hash/range bucket, tenant/session class, and route
+shape. That also aligns with the P8 need to avoid treating GPU resident
+segments as anonymous cached bytes.
+
+Queue stealing maps to GPU DB's work-conserving pressure. Stealing or fallback
+is good for utilization, but it can break the scheduler's conflict-avoidance
+intent. The engine should measure when work stealing, CPU fallback, or
+cross-owner rescue execution causes extra aborts, invalidations, or p99
+latency. A "stealable unless hot-conflict" bit may be worth testing for
+mutation lanes, while read-only retained routes can remain more freely
+work-conserving.
+
+For 1M logical sessions, the paper reinforces that idle sessions should not
+create scheduling complexity. The evidence tables should be keyed by route
+shape and data domain, not by session id. Session admission can attach current
+priority and latency budget, but conflict grouping should remain compact
+enough to run before enqueue without allocation-heavy analysis.
+
+**Risks and mismatches:** The paper is an arXiv preprint and its experiment is
+preliminary. Some figures and text have draft-quality issues, and the reported
+system is Peloton on a 20-core CPU, not a GPU database or a production SQL
+server. The Canonical policy is manually encoded for the benchmarks; a real
+engine must derive canonical references from catalog, constraints, prepared
+statement parameters, and planner metadata.
+
+The scheduler reduces conflicts by serializing likely-conflicting work, so it
+can hurt latency or fairness if a hot reference maps too much work to one
+queue. Fraction policy also shows workload distortion in the paper's generator
+setup when short and long transactions are sorted into different queues. GPU DB
+must therefore measure per-route service time and queue delay, not only abort
+rate.
+
+The design targets transaction aborts under OCC and 2PL. It does not solve
+MVCC visibility, serializable predicate conflicts, WAL durability, GPU
+resident refresh correctness, DDL invalidation, or long read-only snapshot
+pinning. It also handles equality-like OLTP references best; range predicates,
+prefix scans, and analytical reads are called out as future work.
+
+**Benchmark candidates:**
+
+- Add conflict-signature telemetry for mutation routes: table id, key/range
+  bucket, route shape, transaction class, validation failure reason, retry
+  count, and resident-invalidation target. Gate: no behavior change until the
+  scheduler consumes the telemetry.
+- Prototype a Count/Max/Canonical/Single admission lane for hot-key writes.
+  Compare random owner assignment, hash-by-key assignment, and history-based
+  conflict queues under TPC-C-like and SmallBank-like skew. Measure throughput,
+  abort rate, p50/p99 latency, queue wait, and fairness.
+- Add a "stealable hot transaction" experiment. Let idle workers steal normal
+  mutation work but not queued hot-conflict work, then compare utilization
+  versus abort/retry reduction.
+- Test canonicalization quality. Compare literal SQL text, normalized
+  prepared-statement parameters, table/key-domain references, and range-bucket
+  references. Failure condition: the scheduler improves one benchmark only by
+  hand-coded domain knowledge that cannot be extracted from catalog/planner
+  state.
+- Add route-level workload-shift tests: uniform to Zipfian hot keys and back.
+  Required proof: the conflict-history table adapts without unbounded memory
+  growth and without routing all traffic into one queue after stale evidence.
+- For retained GPU snapshots, test mixed read/write sessions where hot writes
+  invalidate the same resident segment. Compare scheduling by row key, segment
+  generation, and resident-invalidation target to see which reduces refresh
+  churn without starving fresh writes.
+- Add a failure guard for latency: if conflict grouping reduces aborts but
+  increases p99 beyond the route's budget, the scheduler must switch to a
+  fallback policy, split the hot bucket, or reject/defer lower-priority work.
