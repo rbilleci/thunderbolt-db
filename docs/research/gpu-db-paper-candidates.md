@@ -763,13 +763,22 @@ Append new candidates here as each paper is processed.
   comparing cross-store MVCC metadata, global snapshots, and atomic commit
   without forcing all stores to implement a 2PC participant protocol.
   Journal entry exists from 2026-06-05.
-- `queued` — **Scalable Distributed Transactions across Heterogeneous
+- `reviewed` — **Scalable Distributed Transactions across Heterogeneous
   Stores**, Dey, Fekete, and Rohm, ICDE 2015.
   URL: `https://doi.org/10.1109/ICDE.2015.7113278`
   Why: Epoxy compares against Cherry Garcia's key-value-oriented
   heterogeneous-store transaction protocol; useful for contrasting
   client-coordinated commit and minimal-store assumptions with Epoxy-style
   coordinator-owned global snapshots.
+  Journal entry added 2026-06-05.
+- `queued` — **ScalarDB: Universal Transaction Manager for Polystores**,
+  Yamada et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p3768-yamada.pdf`
+  DOI: `https://doi.org/10.14778/3611540.3611560`
+  Why: modern production-oriented follow-up for Cherry Garcia and Epoxy-style
+  transactions across heterogeneous stores; useful for comparing coordinator
+  metadata, snapshot/serializable guarantees, and adapter requirements when GPU
+  DB spans CPU truth, GPU resident state, and cold-tier services.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for Microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`

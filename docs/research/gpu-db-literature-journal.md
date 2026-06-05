@@ -71288,3 +71288,139 @@ shape evidence, not as a write-throughput target.
 - Measure metadata placement: per-version 16-byte SSN stamps in CPU memory,
   compressed segment-level summaries for GPU resident data, and per-owner
   timestamp blocks. Track cache misses, memory footprint, and commit-time work.
+
+### 2026-06-05 - Cherry Garcia commits heterogeneous-store writes through recoverable metadata
+
+**Citation:** Akon Dey, Alan D. Fekete, and Uwe Rohm. "Scalable
+Distributed Transactions across Heterogeneous Stores." ICDE 2015, pp. 125-136,
+doi:10.1109/ICDE.2015.7113278. Retrieved 2026-06-05 from the DOI/DBLP record,
+with full text read from the author-uploaded ResearchGate copy after the IEEE
+paper endpoint was not directly accessible.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** heterogeneous stores; snapshot isolation; client
+coordination; transaction status records; conditional writes; prepared
+versions; recovery metadata; bounded coordinator assumptions; cross-tier
+transactions.
+
+**Core idea:** Cherry Garcia shows how to layer multi-item snapshot-isolation
+transactions over heterogeneous key-value stores that expose only a small common
+surface: consistent single-item access, conditional writes, and extra metadata
+on stored values. Instead of requiring every store to participate in a central
+2PC implementation, each written record carries enough transaction metadata to
+let any later client decide whether a prepared version should roll forward or
+roll back.
+
+The most transferable idea is that correctness can be encoded into versioned
+data records plus a compact transaction status record, as long as the commit
+point and recovery rules are explicit. For GPU DB, this is a useful contrast to
+Epoxy: a resident GPU tier should not become a full transaction participant if
+record- or segment-level metadata can let CPU truth, cold tiers, and
+accelerator caches converge after failure.
+
+**Concrete mechanisms:**
+
+- The Java library exposes transaction APIs above datastore-specific adapters
+  for Windows Azure Storage, Google Cloud Storage, and Tora. Each adapter hides
+  store-specific conditional-write and metadata operations.
+- A transaction reads from a client-side transaction cache and writes dirty
+  records to the cache first. Physical datastore updates happen at commit time.
+- Each stored record contains metadata for a valid-start time, valid-end time,
+  lease time, transaction identifier, transaction state, last-update time,
+  store-generated version tag, and previous version.
+- Timestamps are taken from an abstract TrueTime-like API that returns a time
+  plus uncertainty interval. The implementation used local clocks with a 1 ms
+  uncertainty bound; the paper says equivalent bounded-time services can be
+  substituted.
+- During prepare, dirty records are ordered by hash of key, marked with the
+  transaction status record URI, commit time, and PREPARED state, then written
+  by conditional update. If a newer version has appeared since the transaction
+  read the item, prepare fails.
+- The commit point is creation of the Transaction Status Record, or TSR, in a
+  Coordinating Data Store by conditional write. After this point, prepared
+  record versions should be recovered by rolling forward.
+- After TSR creation, write-set records are marked COMMITTED in their
+  respective stores, and the TSR can later be lazily deleted once records have
+  been finalized.
+- Readers encountering PREPARED records inspect the referenced TSR and lease
+  metadata. They can use the previous version, roll forward, or roll back
+  depending on transaction state and lease expiry.
+- The protocol does not require a central lock manager or timestamp oracle, but
+  it does rely on globally reachable transaction-status metadata and bounded
+  timestamp uncertainty.
+- The evaluation uses YCSB+T's Closed Economy Workload. It reports zero simple
+  anomaly score for transactional heterogeneous-store runs, while
+  non-transactional runs develop inconsistencies. Heterogeneous-store
+  throughput scaled to 16 client threads but was constrained by WAS/GCS rate
+  limits; Tora-only scale-out reached about 23,288 transactions/s across eight
+  client hosts and four Tora nodes in the reported 90:10 workload.
+
+**GPU DB mapping:** The protocol maps best to cross-tier metadata and recovery,
+not to GPU execution itself. GPU DB already treats WAL/checkpoint/archive and
+CPU MVCC state as the durable truth. Cherry Garcia reinforces that GPU resident
+segments, CPU derived indexes, cold-tier blobs, and future external tiers should
+not all need equivalent transaction engines. Instead, published artifacts can
+carry enough transaction or generation metadata to let recovery and readers
+decide whether an artifact is committed, prepared-but-incomplete, stale, or
+safe to discard.
+
+For P8, the record metadata shape translates into resident segment metadata:
+source WAL boundary, visibility boundary, generation, lease or build deadline,
+publication state, previous generation pointer, and recovery action. A refresh
+that has encoded GPU buffers but not yet published its route certificate is like
+a PREPARED record: readers may not trust it as committed, but recovery can
+either finish publication from CPU truth or delete the acceleration artifact.
+
+The TSR idea maps to a small route-publication record owned by the mutation,
+catalog, or residency owner. A multi-step refresh across CPU indexes, pinned
+host buffers, GPU buffers, and cold-tier manifests can make the route
+publication record the commit point rather than requiring every buffer update
+to be independently durable. That keeps WAL-before-visibility intact while
+allowing asynchronous cleanup.
+
+For session scale, the client-coordinated design is a warning and an
+opportunity. GPU DB should avoid per-session heavy transaction managers at 1M
+logical sessions, but request envelopes can still carry transaction identifiers
+and route-certificate URIs so any worker can recover or reject in-flight work
+without consulting a thread-local coordinator.
+
+**Risks and mismatches:** The paper targets key-value stores and
+application-level transaction libraries, not an in-process SQL engine with GPU
+resident execution. Its timestamp assumption depends on bounded clock
+uncertainty; GPU DB can often use owner-issued logical generations instead.
+
+Cherry Garcia provides snapshot isolation and says serializability is adaptable,
+but the reviewed paper does not implement a full serializable SQL engine. It
+also relies on storing previous versions inside records, which may be too large
+for GPU resident column buffers or wide text values. The public cloud
+experiments were limited by service rate limiting and use a 2015 stack, so the
+absolute throughput numbers should not drive GPU DB capacity targets.
+
+The commit point is not a durable WAL record in the GPU DB sense. If GPU DB
+borrows TSR-like route publication, the publication record must still be
+ordered after WAL durability and before SQL-visible route validity.
+
+**Benchmark candidates:**
+
+- Add a route-publication-state test for resident refresh: `Preparing`,
+  `Published`, `Retiring`, and `Aborted`. Proof gate: crash/replay or simulated
+  restart never serves a `Preparing` generation as valid.
+- Prototype TSR-like publication records for multi-artifact refresh. Build CPU
+  derived index metadata, pinned host buffers, and GPU buffers, then atomically
+  publish one route record. Measure refresh latency, cleanup work, and
+  correctness under injected failures between each step.
+- Add a prepared-artifact recovery benchmark: create interrupted refreshes at
+  each state, restart from WAL/CPU truth, and verify that recovery either
+  completes publication from a valid source boundary or deletes acceleration
+  artifacts.
+- Compare logical owner-issued generations versus wall-clock timestamps for
+  snapshot and route publication. Failure condition: clock uncertainty or
+  worker migration can produce ambiguous visibility ordering.
+- Test previous-generation fallback for retained reads. A refresh is prepared
+  but unpublished while readers continue on the last published generation; gate
+  p99 read latency and exact snapshot correctness under concurrent mutation.
+- Measure metadata size tradeoffs: per-row previous-version metadata, per-page
+  previous pointers, and per-segment previous-generation records. Gate:
+  retained reads and recovery get enough information without bloating GPU
+  resident buffers.
