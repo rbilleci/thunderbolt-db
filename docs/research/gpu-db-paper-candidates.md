@@ -552,6 +552,19 @@ Append new candidates here as each paper is processed.
   GPU batches without predefined read/write sets. The author-manuscript PDF
   was behind a Cloudflare challenge during the 2026-06-05 cron run, so use
   IEEE, author, or institutional access if available.
+- `reviewed` — **GPU-Accelerated OLTP: An In-Depth Analysis of Concurrency
+  Control Schemes**, Sun et al., arXiv 2024/2026.
+  URL: `https://arxiv.org/abs/2406.10158`
+  Why: accessible modern GPU OLTP concurrency-control evaluation selected as a
+  fallback after LTPG full-text retrieval was blocked; useful for warp/block
+  launch tuning, GPU OCC/MVCC tradeoffs, latch-free metadata design, and
+  conflict-resolution benchmark design.
+- `queued` — **PLOR: General Transactions with Predictable, Low Tail Latency**,
+  Chen et al., SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517878`
+  Why: cited by the GPU OLTP CC study as a hybrid pessimistic/optimistic
+  concurrency-control direction; useful for tail-latency-aware retained reads
+  and hot-write fallback lanes.
 - `queued` — **A Study of the Fundamental Performance Characteristics of GPUs
   and CPUs for Database Analytics**, Shanbhag, Yu, and Madden, SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3380595`

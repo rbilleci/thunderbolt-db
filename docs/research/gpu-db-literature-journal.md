@@ -58654,3 +58654,164 @@ of GPU-derived state, or GPU memory pressure.
   NVMe, mmap, io_uring/SPDK-style reads, pinned staging buffers, and any
   future CXL/far-memory tier. The useful result is policy shape, not raw
   throughput copied from the 2016 devices.
+
+### 2026-06-05 - GPU OLTP concurrency is launch-shape and conflict-resolution bound
+
+**Citation:** Zihan Sun, Yuyu Luo, Yong Zhang, Chao Li, and Chunxiao Xing.
+"GPU-Accelerated OLTP: An In-Depth Analysis of Concurrency Control
+Schemes." arXiv:2406.10158v2, 2026. Retrieved 2026-06-05 from
+`https://arxiv.org/abs/2406.10158` and
+`https://arxiv.org/pdf/2406.10158`.
+
+**Category:** Transaction processing / write path and GPU execution.
+
+**Relevance tags:** GPU OLTP; concurrency control; OCC; MVCC; TicToc;
+Silo; GaccO; GPUTx; warp density; block size; latch-free metadata;
+conflict resolution; YCSB; TPC-C.
+
+**Core idea:** The paper builds gCCTB, a GPU testbed for concurrency-control
+schemes, and evaluates eight schemes on YCSB and TPC-C: two 2PL variants,
+basic timestamp ordering, MVCC, Silo, TicToc, GPUTx, and GaccO. The main
+message is that "GPU-oriented" is not automatically better for OLTP. Under
+read-heavy or medium-contention workloads, CPU-origin optimistic schemes can
+match or beat graph-ordering GPU schemes because graph preprocessing costs
+more than the conflicts it avoids. Under high write intensity and high
+contention, GaccO's GPU-oriented ordering wins.
+
+The study also shows that GPU launch shape is part of the concurrency-control
+design. More active threads per warp do not always help. Higher warp density
+raises uncoalesced access, intra-warp conflict, waiting, and abort overhead.
+For high-conflict cases, lower warp density can be much faster, while larger
+block sizes often help keep SM resources used. The paper's most transferable
+finding is that conflict-resolution overhead dominates GPU OLTP: waiting,
+aborting, rollback work, timestamp/version-chain traversal, and lock acquisition
+cost usually matter more than raw timestamp allocation or the nominal isolation
+family.
+
+**Concrete mechanisms:**
+
+- gCCTB uses a batch execution model: the CPU constructs fixed transaction
+  batches, initializes GPU-resident tables and indexes, chooses a CC scheme,
+  JIT-compiles CUDA transaction code through NVRTC, and launches kernels where
+  each GPU worker thread executes one transaction.
+- The experiments keep table and index data resident in GPU memory, leave
+  transaction updates and results in GPU memory, and exclude inserts/deletes to
+  isolate GPU-side CC behavior from PCIe transfer and dynamic memory/index
+  maintenance.
+- Transaction templates call an abstract CC interface such as transaction start,
+  transaction end, finalize, reads, and writes. CC schemes implement the
+  interface, so the same benchmark logic can be combined with different
+  concurrency protocols.
+- The testbed records GPU-side read, write, and commit events with atomic event
+  ids. A CPU verifier reconstructs a conflict graph from the event stream and
+  reports cycles, allowing correctness checks without paying debug overhead in
+  normal performance runs.
+- GPU tables are simple row-store arrays with constant size during execution.
+  GPU indexes are sorted arrays with primary keys, so lookups use binary search.
+  The paper also compares a B+ tree variant and finds only modest improvement
+  in its tested YCSB cases.
+- For locks and metadata updates, the implementation relies on CUDA atomics and
+  spin locks. Spin-lock correctness depends on independent thread scheduling;
+  without care, one thread in a warp can spin while the holder cannot reach the
+  release path.
+- The preferred metadata update pattern packs lock bits, timestamps, counters,
+  or deltas into 64-bit words and uses atomicCAS loops plus memory fences. This
+  avoids separate latch memory accesses for common critical sections.
+- The implemented TO layout packs commit, read timestamp, and write timestamp
+  into 64 bits. Silo packs a lock bit and timestamp. TicToc packs a lock bit,
+  write timestamp, and delta. MVCC needs a second 64-bit version pointer, which
+  hurts locality compared with dense TO metadata.
+- MVCC preallocates history-version arrays because the batch's write count is
+  known. Worker threads write old versions into local space and update version
+  pointers at commit time; rollback restores the previous version from local
+  space.
+- Silo and TicToc lock write-set items in primary-key order and use no-wait
+  behavior during the write phase. TicToc's separate read/write timestamp
+  metadata often reduces aborts compared with Silo.
+- GPUTx and GaccO build access tables during preprocessing. They collect
+  transaction id and primary-key pairs, sort and prefix-sum them with Thrust,
+  and derive conflict/order metadata before execution.
+- GPUTx assigns conflict-graph ranks so transactions in the same rank set run
+  together. GaccO builds a lock table and orders all accesses to the same item,
+  treating reads and writes alike as conflicts.
+- Warp density `wd` controls how many active worker threads are used per warp,
+  while block size `bs` controls warps per block. The paper evaluates both as
+  first-class parameters instead of treating the CUDA launch shape as fixed.
+
+**GPU DB mapping:** This paper is a useful guardrail for any GPU transaction
+path in this engine. A GPU write route should not simply enqueue all OLTP work
+onto the device. The route contract needs to name workload shape, known access
+set, write ratio, contention estimate, launch parameters, metadata layout, and
+fallback rule. CPU-origin OCC ideas like TicToc-style validation may be better
+for read-heavy or medium-contention batches, while GaccO-like ordering may be
+reserved for clearly hot write batches where preprocessing cost is amortized.
+
+The warp-density result maps directly to the runtime document's GPU execution
+owners. A GPU owner should not tune only for maximum active threads. For
+same-shape retained writes or lookups, the scheduler should expose `wd`, block
+size, abort count, wait time, memory coalescing, and conflict class as route
+telemetry. The best launch shape under read-only retained lookups may be wrong
+for hot writes, MVCC scans, or mixed read/write micro-batches.
+
+For MVCC and snapshot design, the locality result is especially relevant. The
+paper's straightforward MVCC suffers from version-pointer locality and chain
+scan costs even when it reduces some aborts. GPU DB should avoid shipping
+pointer-heavy CPU-style version chains into the device hot path. A retained
+snapshot route should prefer dense visibility frontiers, compact per-row or
+per-segment validity ranges, or prefiltered snapshot-compatible column groups.
+If the engine needs GPU-side write visibility, the metadata must remain densely
+packed enough for atomic and coalesced access.
+
+The event-verification mechanism is a good benchmark pattern. Before any GPU
+transaction prototype is trusted, it should emit a low-overhead optional trace
+of reads, writes, commits, aborts, and visibility publication. A CPU verifier
+can then check serializability/MVCC visibility and WAL-before-visibility
+ordering for small stress cases before the benchmark switches tracing off.
+
+The paper also clarifies the boundary between batch testbed and production
+runtime. gCCTB assumes predetermined access operations, GPU-resident data,
+fixed table size, no inserts/deletes, and eventual commit of all transactions.
+GPU DB can use that shape for a first proof, but production SQL must have
+owner-lane fallbacks for arbitrary predicates, dynamic access sets, index
+maintenance, DDL, recovery, session cancellation, and bounded overload.
+
+**Risks and mismatches:** The paper is an arXiv study and testbed paper, not a
+full production DBMS. It intentionally excludes inserts, deletes, PCIe transfer
+cost, dynamic index maintenance, variable-length SQL types, NULL semantics,
+DDL, WAL/recovery, pgwire sessions, and long retained snapshots. Its GPU table
+is a fixed row-store array, whereas P8's first slice targets generated GPU
+column-group snapshots.
+
+The experiments use an RTX 4090 and CUDA 12.4; launch-shape conclusions should
+be retested on the newer target GPU. The MVCC implementation is deliberately
+straightforward and does not represent optimized Hekaton/Cicada-style MVCC.
+The benchmark assumes all read/write operations are known before execution,
+which favors GPU batching and graph-ordering schemes more than arbitrary SQL
+would. The reported throughput and abort rates should therefore be treated as
+benchmark-shape evidence, not as production promises.
+
+**Benchmark candidates:**
+
+- Build a GPU transaction micro-batch testbed for known-key updates over
+  resident `int4` tables. Compare owner-serialized CPU writes, GPU TicToc-style
+  OCC, simple GPU MVCC metadata, and GaccO-style ordered conflict batches.
+  Gate: identical committed rows, abort outcomes, visibility frontiers, and
+  WAL replay.
+- Add route telemetry for conflict-resolution time: wait, abort, rollback,
+  validation, metadata atomic retries, useful work, and index lookup. Failure
+  condition: throughput improves while p99 latency is dominated by unnamed
+  conflict-resolution work.
+- Sweep CUDA launch shape for retained transaction batches: warp density
+  `0..5`, warps per block `1..32`, read/write mix, and Zipf contention.
+  Expected result: route-specific launch policies rather than one static GPU
+  kernel configuration.
+- Compare dense packed visibility metadata with pointer-heavy version metadata
+  for GPU snapshot reads. Minimum gate: same visible row set as the CPU MVCC
+  store under update/delete stress and long retained snapshots.
+- Add optional GPU transaction event tracing and a CPU conflict/visibility
+  verifier. Use it on small randomized workloads before running untraced
+  throughput tests.
+- Test known-access-set admission: only transactions with declared key sets are
+  eligible for GPU write batching; dynamic predicates and unknown access sets
+  use CPU/owner fallback. Required measurement: GPU throughput gain without
+  hidden SQL correctness or cancellation gaps.
