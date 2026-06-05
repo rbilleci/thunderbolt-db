@@ -703,7 +703,7 @@ Append new candidates here as each paper is processed.
   reclamation overhead; useful for bounded per-worker command descriptors,
   route-publication descriptors, and lock-free helper metadata under high
   session counts.
-- `queued` — **A Template for Implementing Fast Lock-free Trees Using HTM**,
+- `reviewed` — **A Template for Implementing Fast Lock-free Trees Using HTM**,
   Brown, PODC 2017.
   URL: `https://arxiv.org/abs/1708.04838`
   PDF: `https://mc.uwaterloo.ca/pubs/3path/paper.podc17.pdf`
@@ -711,6 +711,13 @@ Append new candidates here as each paper is processed.
   fast paths but still needs an efficient lock-free fallback; useful for
   evaluating whether route metadata updates should use HTM as an optional fast
   path while keeping descriptor-reuse fallback progress.
+- `queued` — **To Lock, Swap, or Elide: On the Interplay of Hardware
+  Transactional Memory and Lock-Free Indexing**, Makreshanski, Levandoski, and
+  Stutsman, PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol8/p1298-makreshanski.pdf`
+  Why: Brown cites this database-index HTM/k-CAS work; useful for comparing
+  HTM elision, lock-free Bw-tree-style indexing, and multi-word CAS as
+  production route-metadata and CPU-index update options.
 - `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`

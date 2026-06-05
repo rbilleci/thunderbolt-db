@@ -57996,3 +57996,164 @@ resident refresh, or response encoding.
   partial checkpoints plus merge. Metrics: steady-state write throughput,
   checkpoint IO bytes, recovery time, and background merge interference
   with resident GPU reads.
+
+### 2026-06-05 - Three-path HTM keeps the common index route uninstrumented
+
+**Citation:** Trevor Brown. "A Template for Implementing Fast Lock-free
+Trees Using HTM." PODC 2017 / arXiv 2017. Retrieved 2026-06-05 from the
+arXiv and author PDFs, `https://arxiv.org/abs/1708.04838` and
+`https://mc.uwaterloo.ca/pubs/3path/paper.podc17.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** lock-free indexes; hardware transactional memory;
+fallback paths; route metadata; descriptor overhead; index update
+latency; bounded progress; concurrent search structures.
+
+**Core idea:** Brown studies a practical problem with HTM-backed
+concurrent data structures: best-effort hardware transactions are fast
+only when their fallback path does not impose instrumentation on the
+common route, but a non-concurrent fallback path can make all fast-path
+transactions wait or stampede into slow software execution. The paper's
+answer is a three-path design: an uninstrumented HTM fast path, an
+instrumented HTM middle path, and a lock-free software fallback path.
+The middle path can run concurrently with either of the other two, while
+the fast path and fallback path do not run together.
+
+The mechanism is applied to Brown et al.'s LLX/SCX tree update template,
+then used to build an unbalanced BST and a relaxed `(a,b)`-tree. In the
+reported 72-thread experiments, the accelerated relaxed `(a,b)`-tree
+performs about 4.0x to 4.2x as many operations per second as the
+original non-HTM tree-template implementation. The result is most useful
+for GPU DB as a route-design pattern: keep the p50 metadata/index path
+as simple as possible, but give aborted or long operations a concurrent
+middle lane instead of forcing them straight into the fully general slow
+path.
+
+**Concrete mechanisms:**
+
+- Every operation starts on the HTM fast path. It executes sequential
+  index code inside a hardware transaction and checks a global fallback
+  indicator before proceeding, so it does not overlap with the software
+  fallback path.
+- After a bounded number of fast-path aborts, an operation moves to the
+  HTM middle path. The middle path uses the same synchronization
+  metadata as the software fallback, so it can safely run concurrently
+  with fallback operations.
+- After a bounded number of middle-path aborts, an operation moves to
+  the original lock-free software fallback path. The fallback preserves
+  progress when HTM transactions repeatedly abort due to conflicts,
+  capacity limits, interrupts, page faults, or other best-effort HTM
+  failures.
+- The fallback indicator is a global fetch-and-increment object in the
+  paper's template. Fast-path transactions read it and abort when it is
+  nonzero. A scalable nonzero indicator can replace it if the global
+  counter becomes a bottleneck.
+- The fast path avoids descriptor and helper metadata. For LLX/SCX, the
+  HTM path replaces SCX-record allocation with tagged per-process
+  sequence numbers stored in node `info` fields, and modified LLX treats
+  tagged sequence numbers as unlocked.
+- The fast path can directly modify fields that the fallback path treats
+  as immutable, because fast and fallback executions never overlap. This
+  avoids copy-on-update work in common cases such as replacing a value in
+  an existing leaf or deleting a node without copying its sibling.
+- The middle path cannot use all fast-path simplifications because it
+  overlaps with fallback operations. It still benefits from HTM around
+  LLX/SCX-style updates, but it respects the fallback path's metadata and
+  structural assumptions.
+- The paper separates read-only search from update transactions as an
+  optional optimization. A nontransactional search can run first; once
+  the update transaction begins, it checks marked bits on touched nodes
+  and aborts if it has reached a deleted subtree.
+- Memory reclamation remains conservative in the evaluated code through
+  DEBRA epoch reclamation. The paper notes that when all fast/middle
+  accesses occur inside transactions on Intel HTM, immediate freeing on
+  the fast path can be safe because stale accesses abort rather than
+  crash; this does not transfer to all HTM implementations.
+- Evaluation uses update-heavy workloads plus a heavy workload with one
+  range-query thread that causes more capacity aborts. Most operations
+  still complete on the fast path, but the middle path prevents rare
+  fallback range queries from serializing the whole system as TLE does.
+
+**GPU DB mapping:** The direct target is CPU-side route metadata and
+resident-index maintenance, not GPU kernels themselves. GPU DB already
+needs hot maps for catalog generations, resident table entries, route
+certificates, snapshot handles, partition metadata, and perhaps CPU
+equality/range indexes that feed GPU execution. Brown's lesson is that
+the common path should not pay descriptor allocation, helper records,
+or full validation machinery just because a rare path needs them.
+
+A GPU DB analog would classify metadata updates into three lanes. The
+fast lane handles tiny, bounded publication updates, such as swapping a
+resident generation pointer, updating a route heat class, or publishing a
+new immutable snapshot handle. The middle lane handles operations that
+can still execute concurrently with slow maintenance if they subscribe
+to enough metadata: partial refresh publication, route invalidation, or
+small index rewrites. The fallback lane is the lock-free or owner-domain
+software route for large DDL, GC, rebuild, or high-contention metadata
+changes. This fits the runtime document's owner-domain rule if HTM is
+treated as an optional CPU-side fast path, never as the authority for
+WAL-before-visibility.
+
+The three-path design also maps to admission. A request should not jump
+from "fast retained route" directly to "global owner queue" just because
+one fast attempt failed. A middle lane can preserve concurrency with
+bounded extra metadata checks, while the slow owner path remains the
+progress guarantee and the correctness backstop. This is similar in
+spirit to GPU scheduling lanes: urgent routes should have a cheap common
+case, an instrumented but concurrent fallback, and finally a conservative
+owner path.
+
+For P8, the strongest benchmark hook is resident metadata publication.
+Refreshing or evicting a segment may require atomically changing several
+small fields: state, generation, pointer, byte budget, checksum, and
+route support. The paper suggests testing whether an HTM fast path can
+commit these small publications with no descriptor churn, while a
+descriptor-reuse or lock-free fallback preserves progress under capacity
+abort or unsupported hardware.
+
+**Risks and mismatches:** HTM is CPU-specific and best-effort; it is not
+a portability assumption for GPU DB and cannot replace the owner-domain
+correctness model. Intel TSX availability, errata, virtualization, and
+deployment policy may make HTM unavailable or disabled. The paper's
+microbenchmarks are ordered dictionaries, not SQL indexes with MVCC,
+WAL, variable-length values, prepared statements, DDL invalidation, or
+GPU resident buffers.
+
+The global fallback indicator is simple but may be too blunt for a
+1M-logical-session service if many unrelated metadata domains share it.
+Per-domain indicators or owner-local lanes would likely be needed. The
+memory-reclamation optimization is especially risky: GPU DB must not
+free CPU metadata, pinned buffers, or CUDA handles merely because one CPU
+HTM implementation would abort stale transactional accesses. Finally,
+HTM transactions have capacity limits, so this route is only plausible
+for small metadata publications or compact CPU indexes, not broad scans
+or large resident segment rewrites.
+
+**Benchmark candidates:**
+
+- Prototype a route-metadata publication microbenchmark with three
+  variants: lock-free descriptor update, HTM fast path plus lock-free
+  fallback, and Brown-style fast/middle/fallback lanes. Gate: identical
+  generation publication and reader-visible metadata under concurrent
+  invalidation.
+- Add abort/fallback telemetry for CPU-side metadata updates: HTM commit,
+  conflict abort, capacity abort, explicit fallback-indicator abort,
+  middle-lane commit, and software fallback count. Failure condition:
+  p99 route publication hides behind generic CPU time.
+- Test resident-cache generation swaps where each publication touches a
+  small fixed set of fields. Expected win: lower descriptor allocation
+  and lower p50 publication latency under light contention. Failure
+  condition: capacity or conflict aborts push most operations to fallback.
+- Compare immediate fast-path metadata reuse with existing epoch or
+  reference-count retirement. Proof gate: no retained snapshot, GPU
+  worker, response ring, or planner route can observe freed metadata.
+- Stress one long metadata maintenance operation, such as eviction or
+  rebuild publication, while many small retained-route publications run.
+  The pass condition is that small updates use a concurrent middle lane
+  rather than waiting behind slow maintenance or stampeding into the
+  software fallback.
+- Use the result as a route-design benchmark even if HTM is disabled:
+  implement the same three-lane admission shape with ordinary owner
+  queues and compare direct fallback-to-owner against fast/middle/owner
+  escalation.
