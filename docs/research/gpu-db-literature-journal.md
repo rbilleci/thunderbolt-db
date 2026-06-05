@@ -51802,3 +51802,137 @@ node shape without local measurement and fallback.
 - Treat huge pages as a measured policy, not a default. Compare 4 KiB and huge
   page allocation for route metadata and host indexes, including allocation
   overhead, memory waste, TLB behavior, and invalidation/refresh interaction.
+
+### 2026-06-05 - Asynchronized Concurrency: The Secret to Scaling Concurrent Search Data Structures
+
+**Citation:** Tudor David, Rachid Guerraoui, and Vasileios Trigonakis.
+"Asynchronized Concurrency: The Secret to Scaling Concurrent Search Data
+Structures." ASPLOS 2015, pp. 631-644. doi:10.1145/2694344.2694359. Retrieved
+2026-06-05 from the EPFL Infoscience record,
+`https://infoscience.epfl.ch/entities/publication/f0a2d789-2b13-421d-ab2d-d6302f631e78/files`.
+
+**Category:** runtime / HFT / session scale; transaction processing /
+concurrency control.
+
+**Relevance tags:** concurrent search data structures; latch avoidance; cache
+coherence; CPU metadata indexes; route metadata; read-mostly maps; update
+publication; latency distribution.
+
+**Core idea:** ASCY treats scalable concurrent search data structures as a
+memory-access-shape problem. The best concurrent lists, hash tables, skip
+lists, and binary search trees are the ones whose searches and update parse
+phases look as close as possible to an unsafe sequential/asynchronized
+implementation: few shared stores, little waiting, no retry-heavy traversal, and
+successful updates that write only the small memory region the sequential
+algorithm would have changed.
+
+The paper evaluates many concurrent search data structures across six hardware
+platforms and uses an asynchronized version as an upper-bound reference rather
+than as a correct implementation. Its main empirical claim is not that one data
+structure always wins, but that low shared-store count and sequential-like
+access patterns predict portable scalability. The paper reports up to 30%
+throughput improvement after re-engineering existing algorithms with ASCY
+patterns, and its cache-line hash table outperforms the strongest existing hash
+table alternative by about 23% on average in the reported experiments.
+
+**Concrete mechanisms:**
+
+- Operations are split into `search(k)` and `update(k)`, where updates have a
+  parse phase followed by a modify phase. ASCY tries to keep the parse phase as
+  close to a read-only sequential traversal as possible.
+- Pattern 1: searches should avoid stores, waiting, and retries. A read-only
+  route must not dirty shared cache lines just to prove it observed a stable
+  value.
+- Pattern 2: an update parse phase should avoid stores except cleanup stores,
+  and should not wait or retry while discovering where the update will apply.
+- Pattern 3: an update whose parse phase fails should not perform shared stores
+  other than cleanup. Failed speculative work should be cheap for other cores.
+- Pattern 4: a successful update should write a number and region of memory
+  close to the sequential implementation's write footprint.
+- The paper connects poor scalability to cache-coherence traffic: stores to
+  shared data invalidate cache lines and cause later misses on other cores.
+- ASCYLIB evaluates linked lists, hash tables, skip lists, and binary search
+  trees, including lock-based and lock-free variants, across read-only and
+  read/write workloads.
+- The cache-line hash table places a small number of key/value pairs plus
+  concurrency metadata in one cache-line-sized bucket, so most operations touch
+  at most one coherence unit before following an overflow pointer.
+- CLHT updates synchronize at bucket granularity and modify key/value slots in
+  place; reads validate an atomic bucket snapshot instead of taking locks on
+  the ordinary read path.
+- The paper notes that lock-free algorithms are not automatically faster than
+  lock-based ones; the decisive factor is often the amount and placement of
+  shared memory traffic.
+
+**GPU DB mapping:** ASCY is a useful design rule for CPU structures that feed
+the GPU runtime: route metadata maps, catalog-generation lookups, resident
+segment tables, MVCC visibility-summary maps, CPU fallback indexes, prepared
+statement caches, and session-admission maps. Those structures sit on the hot
+path before work reaches CUDA, so their searches should not mutate shared state
+or bounce cache lines across network workers, mutation owners, and read
+snapshot workers.
+
+The direct runtime rule is: retained reads must be read-only all the way through
+admission whenever possible. Looking up a snapshot generation, resident
+partition handle, route certificate, or encoded response shape should not
+increment shared counters, refresh LRU state, acquire global locks, or publish
+cleanup markers on the common path. Telemetry and aging can be sampled,
+sharded, or deferred to owner queues.
+
+For writes, ASCY supports a two-phase route. A mutation or refresh request can
+first parse its target table, partition, keys, and resident metadata with
+read-mostly traversal, then enter the mutation/residency owner only for the
+minimal publication region: WAL slot, visibility boundary, invalidation bit,
+route-generation pointer, or bucket-local index update. Failed admission,
+stale-route detection, and unsupported-query fallback should leave almost no
+shared-memory footprint.
+
+CLHT's cache-line bucket shape is especially relevant to small CPU-side maps:
+session credit maps, relation-OID to resident-generation maps, and hot equality
+lookup dictionaries. A first GPU DB prototype does not need to adopt CLHT
+verbatim, but it should measure whether cache-line-sized buckets with versioned
+read validation beat generic maps under many IO/read workers.
+
+**Risks and mismatches:** ASCY is about concurrent in-memory search data
+structures, not SQL transaction isolation. It does not solve WAL ordering,
+MVCC visibility, recovery, DDL invalidation, GPU residency, or query planning.
+Its asynchronized baseline is intentionally incorrect and must never be
+confused with an implementation choice.
+
+The paper's platforms are 2015-era multicore systems, so absolute scalability
+numbers and cache-line economics may shift on the eventual GPU host. The design
+patterns are still relevant, but they need local measurement with current CPU,
+NUMA, SMT, and memory-controller behavior. CLHT-style in-place updates also
+need careful memory reclamation and snapshot interaction before they can back a
+route map visible to retained readers.
+
+Finally, minimizing shared stores can conflict with observability and cache
+policy. A DBMS needs metrics, admission counters, eviction state, and audit
+trails. The production rule should be deferred or sharded accounting, not
+missing accounting.
+
+**Benchmark candidates:**
+
+- Build a CPU route-metadata microbenchmark comparing a generic concurrent map,
+  an owner-serialized map, and a cache-line-bucket/versioned-read map for
+  `relation_oid -> resident_generation` lookups. Gate: equal route correctness
+  and lower p95/p99 under many read workers.
+- Add a retained-read admission probe that forbids shared stores on the common
+  lookup path. Measure whether moving LRU/telemetry updates to sampled or owner
+  lanes reduces cache misses and queue wait without losing operational
+  visibility.
+- Stress failed route admission: many unsupported or stale read requests should
+  parse and reject without dirtying shared route structures. Failure condition:
+  failed requests reduce successful retained-read throughput through coherence
+  traffic.
+- Compare bucket-local version validation against global lock or global
+  generation checks for session credit and resident snapshot maps. Required
+  metrics: read throughput, update latency, cache misses, retries, and memory
+  reclamation stalls.
+- For write-path metadata, split parse and modify phases in a benchmarked
+  invalidation route. Parse target tables and keys read-only, then publish only
+  the minimal owner-owned generation change. Gate: identical invalidation and
+  WAL replay behavior with less CPU contention at high reader counts.
+- Add telemetry to catch accidental shared stores in hot read paths, such as
+  global hit counters, LRU touches, or debug fields. Proof gate: retained-read
+  execution remains low-store under perf/counter inspection.

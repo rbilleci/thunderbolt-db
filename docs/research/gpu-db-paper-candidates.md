@@ -629,7 +629,7 @@ Append new candidates here as each paper is processed.
   comparison for pointer-stall hiding; useful for deciding whether selected
   GPU DB metadata paths deserve explicit state-machine optimization instead
   of general coroutine machinery.
-- `queued` — **Asynchronized Concurrency: The Secret to Scaling Concurrent
+- `reviewed` — **Asynchronized Concurrency: The Secret to Scaling Concurrent
   Search Data Structures**, David, Guerraoui, and Trigonakis, ASPLOS 2015.
   URL: `https://doi.org/10.1145/2694344.2694359`
   Project: `https://dcl.epfl.ch/site/ascylib`
@@ -642,6 +642,19 @@ Append new candidates here as each paper is processed.
   Why: AMAC cites many-core hash-join tuning as related hardware-conscious
   database work; useful for separating CPU many-core memory-level parallelism
   from GPU/accelerator route choices when joins or grouped lookups spill to CPU.
+- `queued` — **Optimistic Concurrency with OPTIK**, David et al., PPoPP 2016.
+  URL: `https://doi.org/10.1145/2851141.2851146`
+  PDF: `https://infoscience.epfl.ch/record/217219/files/PPoPP16_OPTIK.pdf`
+  Why: ASCY follow-up from the same group; useful for optimistic read/validate
+  patterns in CPU-side route metadata, hot catalog maps, and lightweight
+  retained-snapshot indexes.
+- `queued` — **In the Search for Optimal Concurrency**, Gramoli et al.,
+  SIROCCO 2016.
+  URL:
+  `http://sirocco2016.hiit.fi/preproceedings/In_the_Search_for_Optimal_Concurrency.pdf`
+  Why: ASCY-related concurrency-optimality work; useful as a correctness
+  counterweight when deciding whether simplified route metadata structures
+  sacrifice valid concurrent schedules for speed.
 - `reviewed` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
   Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
   URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`
