@@ -1524,13 +1524,25 @@ Append new candidates here as each paper is processed.
   Why: Hermes evaluates real-time analytics against HATtrick; useful for
   shaping GPU DB mixed transactional/analytical workload gates beyond separate
   OLTP and OLAP clients.
-- `queued` — **FlexPushdownDB: Hybrid Pushdown and Caching in a Cloud DBMS**,
+- `reviewed` — **FlexPushdownDB: Hybrid Pushdown and Caching in a Cloud DBMS**,
   Yang et al., PVLDB 2021.
   URL: `https://vldb.org/pvldb/vol14/p2101-yang.pdf`
   DOI: `https://doi.org/10.14778/3476249.3476265`
   Why: Hermes uses FlexPushdownDB as an AP engine; relevant to deciding which
   filtering, aggregation, and cache work should happen near storage, host
   memory, or GPU execution workers.
+- `queued` — **PushdownDB: Accelerating a DBMS using S3 Computation**,
+  Yu et al., ICDE 2020.
+  URL: `https://doi.org/10.1109/ICDE48307.2020.00166`
+  Why: direct predecessor to FlexPushdownDB's pushdown-only baseline; useful
+  for isolating S3 Select-style filtering/aggregation pushdown economics
+  before GPU DB adopts hybrid CPU/GPU/NVMe segment routes.
+- `queued` — **AQUOMAN: An Analytic-Query Offloading Machine**,
+  Xu et al., MICRO 2020.
+  URL: `https://doi.org/10.1109/MICRO50266.2020.00042`
+  Why: FlexPushdownDB cites analytic query offloading as a near-storage
+  pushdown direction; useful for comparing hardware-assisted pushdown and
+  multiway SQL offload against GPU DB's explicit owner and tier boundaries.
 - `queued` — **L-Store: A Real-time OLTP and OLAP System**, Sadoghi et al.,
   EDBT 2018.
   URL: `https://arxiv.org/abs/1601.04084`

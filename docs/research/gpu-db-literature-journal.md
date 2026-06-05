@@ -59912,3 +59912,162 @@ Benchmark priorities:
 - A pressure-aware placement benchmark that decides wait/promote/fallback from
   measured stalls and verifies that p99 improves without hidden queue growth
   or stale reads.
+
+### 2026-06-05 - FlexPushdownDB: Hybrid Pushdown and Caching in a Cloud DBMS
+
+**Citation:** Yifei Yang, Matt Youill, Matthew Woicik, Yizhou Liu,
+Xiangyao Yu, Marco Serafini, Ashraf Aboulnaga, and Michael Stonebraker.
+"FlexPushdownDB: Hybrid Pushdown and Caching in a Cloud DBMS." PVLDB
+14(11), 2021, pp. 2101-2113. doi:10.14778/3476249.3476265. Retrieved
+2026-06-05 from `https://vldb.org/pvldb/vol14/p2101-yang.pdf`.
+
+**Category:** Hybrid HTAP / multi-tier cache and data placement.
+
+**Relevance tags:** storage disaggregation; computation pushdown; local
+cache; fine-grained placement; separable operators; cloud storage; S3 Select;
+network bottlenecks; cache replacement; route choice.
+
+**Core idea:** FlexPushdownDB argues that caching and near-storage pushdown
+should not be independent table-level modes. In a disaggregated cloud DBMS,
+some hot segments should execute locally from the compute-node cache while
+uncached or pushdown-friendly segments should be filtered or aggregated near
+storage, then merged into one query result. The key architectural point is
+fine-grained hybrid execution: the route is chosen per partition/column
+segment and per separable operator, not once for the whole table.
+
+The second idea is that cache value changes when pushdown exists. A cache miss
+is no longer a uniform "load the block" event; it may be cheap if storage-side
+filtering greatly reduces transfer, or expensive if the segment cannot benefit
+from pushdown. FPDB's Weighted-LFU therefore weights access frequency by
+estimated pushdown work. On Star Schema Benchmark experiments, the paper
+reports that hybrid execution outperforms both caching-only and pushdown-only
+by up to 2.2x at the crossover point, and that Weighted-LFU improves over LFU
+by 37% in the hybrid architecture. Under the default workload, hybrid execution
+also reduces measured network traffic to 7.9 GB versus 37.1 GB for
+pushdown-only and 112.6 GB for caching-only.
+
+**Concrete mechanisms:**
+
+- FPDB stores table data in cloud storage and keeps a compute-node cache. The
+  cache unit is a segment: one column within one horizontal table partition,
+  identified by table, partition, and column.
+- The hybrid executor transforms an optimizer-provided logical plan into a
+  separable plan based on the current cache contents.
+- A separable operator can split work across cached segments and storage-side
+  pushdown, then combine the outputs. The paper treats projection, filtering
+  scans, and base-table aggregation as separable in common cases.
+- Filtering scans become conditional on which predicate and output columns are
+  cached. If all needed columns for a partition are cached, FPDB executes
+  locally; if predicate columns are missing, it pushes down; if predicate
+  columns are cached but some projected columns are missing, it can filter
+  locally and fetch or push down the missing columns.
+- Base-table aggregates are separated by partition: cached partitions
+  aggregate locally, uncached partitions aggregate near storage, and merge
+  logic combines partial sums/counts for functions such as average.
+- Hash join is only partially separable. The build side must be loaded at the
+  compute node, but the probe-side scan can use a Bloom filter as an extra
+  pushed-down predicate for uncached outer segments.
+- Merge operators combine local and remote results. FPDB implements merging
+  across parallel workers, with local merging required only when a worker owns
+  a mixture of cached and remote segments.
+- Plan selection is heuristic: prefer local cached processing when the needed
+  data is cached, otherwise push down as much as possible, otherwise pull data
+  up. The paper explicitly leaves cost-based pushdown-aware optimization as
+  future work.
+- The cache manager updates segment metadata for every query and decides
+  admission/eviction. On a miss selected for admission, FPDB waits for the load
+  to reduce network traffic rather than also pushing down the current query.
+- The benefit-based caching framework orders missing segments by benefit and
+  evicts cached segments with lower benefit until the new segment fits.
+- Weighted-LFU increments a segment's benefit by estimated pushdown work per
+  byte, modeled as network-transfer time plus scan time plus compute time
+  divided by segment size. Network time uses selectivity, segment size, and
+  network bandwidth; scan and compute terms use tuple count, tuple size,
+  predicate count, and calibrated bandwidths.
+- FPDB is implemented in C++ on AWS S3/S3 Select, uses Apache Arrow inside the
+  engine/cache, Gandiva for expression evaluation, and the C++ Actor Framework
+  for operator actors and message-passing parallel execution.
+
+**GPU DB mapping:** The direct mapping is not "use S3 Select"; it is that GPU
+DB route choice should be segment-local and operator-local. For P8, a table
+partition can have a mix of GPU-resident columns, warm CPU column groups, cold
+NVMe chunks, and unsupported columns. A retained route should be able to
+execute the resident portion on GPU, run missing or unsupported portions on CPU
+or cold-tier scan/pushdown, and merge results only when the operator is proven
+separable under the same visibility boundary.
+
+The segment cache unit maps well to P8 resident column-group snapshots. GPU DB
+already tracks valid resident entries by table/source boundary; this paper
+pushes that toward column/partition segment descriptors that record placement,
+predicate support, visibility generation, and route compatibility. A route
+certificate should say not just "resident table valid" but which segment set
+is resident, which segment set is remote/warm/cold, and which operators can
+combine them without changing SQL semantics.
+
+Weighted-LFU is a useful template for pressure-aware placement. GPU DB's
+benefit should include avoided H2D transfer, avoided NVMe read, GPU queue wait,
+cold scan selectivity, CPU fallback cost, refresh cost, and decompression cost.
+Segments whose cold route is already cheap should not displace segments whose
+miss path forces full transfer or blocks a hot retained route. This complements
+the TMO pressure entry: placement should optimize avoided stall, not access
+count alone.
+
+The separable-operator boundary is also a correctness guard. Counts, simple
+projections, filters, and some aggregates can split across tiers if every side
+uses the same snapshot/visibility certificate and if merge functions are
+deterministic. Joins, distincts, ordered projections, text predicates, and
+updates need narrower proofs before hybrid routing. For GPU DB, this means
+route selection should expose "separable under snapshot X" as a planner fact
+rather than treating CPU/GPU fallback as a black-box runtime decision.
+
+Finally, FPDB's heuristic limitation is a warning. Always prefer resident GPU,
+then pushdown/cold route, then pullup/CPU is plausible for early benchmarks,
+but it can be wrong when GPU queues are saturated, storage parallelism is
+high, selectivity is extreme, or merge cost dominates. The planner should start
+with deterministic guards and then graduate to measured route costs, not
+hard-code a universal tier order.
+
+**Risks and mismatches:** FPDB is an OLAP prototype, not an OLTP or HTAP
+transaction engine. It does not solve WAL-before-visibility, MVCC, snapshot
+retirement, catalog invalidation, or write-path refresh. Its cache is table
+data, not intermediate results, and its evaluation executes batches of SSB
+queries sequentially after warmup rather than high-concurrency transactional
+sessions.
+
+The separable-operator set is intentionally limited. General joins, sorting,
+updates, serializable reads, and mutable indexes are outside the proven hybrid
+model. The implementation also uses S3 Select and a single compute node, so
+its absolute performance numbers do not transfer to GPU HBM, CPU DRAM, NVMe,
+or CUDA kernels. The transferable claim is the structure of hybrid placement
+and benefit-aware caching.
+
+Waiting for a cache load on admission minimizes network traffic in FPDB, but
+GPU DB may need a latency-aware choice among wait, execute cold, execute CPU,
+or reject. Under 1M logical sessions, waiting for loads without bounded
+credits could create hidden queue growth.
+
+**Benchmark candidates:**
+
+- Add a segment-local route decision prototype for one P8 table: resident GPU
+  segment, warm CPU segment, cold generated chunk, or CPU fallback. Gate:
+  every accepted hybrid route carries one visibility/source boundary and
+  produces identical PostgreSQL-comparator results.
+- Build a separable `COUNT`/filtered projection benchmark where some column
+  segments are GPU resident and others are cold. Measure merge cost, H2D/D2H
+  bytes, NVMe bytes, queue wait, and p95/p99 latency against all-resident,
+  all-cold, and CPU-only routes.
+- Implement a Weighted-LFU-style placement simulator using avoided transfer,
+  selectivity, refresh cost, cold-tier wait, GPU queue wait, and segment size.
+  Compare against LFU/LRU/bytes-only eviction. Failure condition: hit rate
+  improves while p99 or cold-tier bytes get worse.
+- Add planner facts for "operator separable under snapshot generation":
+  projection, filter, count, sum/count average, and Bloom-filter probe-side
+  join as separate proof gates. Reject or fall back for unsupported merge
+  semantics rather than executing a partial GPU route.
+- Test admission choices on a cache miss: wait for promotion, run cold route,
+  CPU fallback, or reject. Gate: no unbounded wait queue and no stale reads
+  after mutation, refresh, or eviction.
+- Track segment benefit telemetry per route certificate: resident hit, remote
+  selectivity, avoided H2D, avoided NVMe, merge rows/bytes, and fallback
+  reason. Expected improvement: placement decisions explain observed latency
+  better than raw resident byte count.
