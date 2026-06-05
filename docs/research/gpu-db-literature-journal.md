@@ -52396,3 +52396,193 @@ DBMS placement model, not replace it with hidden page migration.
   buffers. Required metrics: CXL access latency, bandwidth utilization,
   migration count, perf-counter misses, p99 route latency, and write-path
   interference.
+
+### 2026-06-05 - ICE makes dynamic cardinality estimates an updateable index problem
+
+**Citation:** Yingze Li, Xianglong Liu, Hongzhi Wang, Kaixin Zhang,
+and Zixuan Wang. "Updateable Data-Driven Cardinality Estimator with
+Bounded Q-error." arXiv:2408.17209v1, 2024. Retrieved 2026-06-05
+from `https://arxiv.org/abs/2408.17209`.
+
+**Category:** query optimization / planning; route cardinality
+estimation; update-aware metadata.
+
+**Relevance tags:** cardinality estimation; dynamic workloads;
+multidimensional index; rank-space sampling; bounded Q-error; route
+costing; updateable statistics; resident snapshot drift.
+
+**Core idea:** ICE argues that dynamic cardinality estimation should
+not rely only on neural models that require expensive relabeling,
+fine-tuning, or stale statistics after data changes. Instead, it turns
+a multidimensional index into the estimator itself. The index remains
+synchronized with tuple-level inserts, deletes, and modifications, and
+its rank/key mapping lets the estimator sample compact rank intervals
+instead of sparse multidimensional key space.
+
+The paper is scoped to single-table multidimensional cardinality
+estimation. Within that scope, the reported results are strong: ICE
+keeps update cost at tuple-level index-update scale, improves accuracy
+by multiple orders of magnitude over several real-time learned
+baselines on dynamic workloads, and adds a hybrid exact-index fallback
+when sampling is likely to violate a user-specified Q-error bound.
+
+**Concrete mechanisms:**
+
+- ICE uses a B+-tree-like multidimensional index over Z-order encoded
+  tuple keys rather than a neural network as the primary data-driven
+  model.
+- Leaf entries maintain tuple-frequency counters `o(t)`, allowing the
+  index to expose exact local PDF-like frequency information for
+  duplicated tuples.
+- Each node maintains a cover counter `CNum`, the number of tuples
+  covered by that subtree, so the structure can map from key to rank
+  and from rank back to key in `O(log N)` time.
+- Bulk loading sorts tuples by Z-order, builds leaf and non-leaf levels
+  bottom-up, and aggregates counters while constructing the index.
+- Inserts, deletes, and modifications update only the affected search
+  path and local counters, keeping the estimator synchronized with the
+  current table version instead of requiring model retraining.
+- Query predicates are represented as multidimensional query boxes.
+  ICE recursively filters those boxes with space-filling-curve gap
+  skipping, producing subregions that should contain all qualifying
+  tuples while excluding irrelevant key-space areas.
+- Filtered key-space subregions are converted to compact rank-space
+  intervals through `Key2Rank`; samples are drawn from those intervals,
+  decoded through `Rank2Key`, checked against the query box, and scaled
+  by the filtered rank-space size.
+- The authors prove the rank-space sampling estimator is unbiased and
+  tie variance to sampling budget and index filtering efficiency.
+- For low-cardinality queries that sampling may miss, ICE estimates the
+  probability of exceeding a configured Q-error bound and falls back to
+  an exact index range query when that probability is too high.
+- Experiments use Power, DMV, OSM, and DataDist-style workloads with
+  static, insert-heavy, update-heavy, data-drift, and query-drift cases.
+  The paper reports ICE's dynamic-workload max Q-errors in the low
+  tens on the shown real datasets, while several stale or retrained
+  baselines reach hundreds to tens of thousands.
+- The main admitted costs are memory footprint and single-table scope;
+  future work calls out workload-shaped index efficiency and index
+  compression.
+
+**GPU DB mapping:** ICE is a good fit for GPU DB's route-certificate
+direction because it treats cardinality facts as updateable database
+metadata, not as an opaque model artifact. A retained GPU route should
+know whether its row-count estimate came from current CPU truth,
+resident snapshot metadata, a learned/log-derived model, or an index
+that can be advanced at the same generation boundary as MVCC
+visibility. ICE suggests a concrete path for the last option: maintain
+small route-estimator indexes for admitted hot tables or resident
+segments, and publish them alongside snapshot generations.
+
+The rank-space mechanism maps naturally to GPU DB's existing
+same-shape route planning. For point/range/prefix predicates over
+admitted `int4` and encoded `text` columns, a route estimator could
+translate predicate boxes into rank intervals and sample bounded
+candidate rows before deciding between CPU index lookup, GPU resident
+scan, GPU resident lookup, or fallback. Because ICE can fall back to
+exact index counting for risky low-cardinality cases, it provides a
+planner guardrail: do not send a query to a GPU batch lane based on a
+sampled estimate when the uncertainty could overflow response buffers
+or choose the wrong route family.
+
+For writes, the transferable idea is generation-aligned updateability.
+When a mutation batch becomes visible, the estimator's counters and
+route-cardinality metadata must advance with the same source boundary
+used by the resident snapshot. Stale cardinality models can be worse
+than no model if they route an updated hot segment into the wrong HBM,
+CPU, or NVMe lane. ICE argues for estimator structures that either
+update in the write path at bounded `O(log N)` cost or explicitly carry
+a stale-generation marker that disqualifies them from fast-route
+certification.
+
+For 1M logical sessions, ICE also reinforces that per-query planning
+should be bounded. Rank-space sampling has an explicit sample budget,
+and exact fallback is triggered only when the risk of large Q-error is
+too high. GPU DB can turn that into admission policy: planner
+estimation has its own time and memory budget, and uncertain plans must
+choose a safer CPU route, exact count probe, smaller GPU batch, or
+explicit overload/fallback reason rather than consuming unbounded
+planning work.
+
+**Risks and mismatches:** ICE is an arXiv paper with placeholder ACM
+venue fields in the PDF, and the reviewed version is not a complete
+published systems paper. Its core experiments are single-table
+cardinality estimation, not joins, SQL execution, GPU kernels, MVCC
+visibility, recovery, or concurrent planner integration. The authors
+state that multi-table adaptation can follow CardIndex-style full
+outer join sampling, but the paper does not evaluate that as a full
+optimizer path.
+
+The memory tradeoff is also real. ICE keeps index state precise enough
+to preserve data distribution, so it can be too large for every table,
+tenant, column combination, or resident generation. GPU DB should not
+copy this wholesale into HBM. The likely first use is a CPU-resident or
+host-tier estimator for a few admitted hot tables, with compressed or
+sampled summaries published to route workers.
+
+Finally, Z-order query boxes fit numeric multidimensional predicates
+better than arbitrary SQL predicates. Text prefix, null semantics,
+collations, expression predicates, joins, and correlated updates need
+careful encoding before an ICE-like estimator can be trusted. The
+bounded-Q-error fallback protects low-cardinality estimates, but only
+if the exact range query itself is cheap enough and snapshot-compatible.
+
+**Benchmark candidates:**
+
+- Build an updateable route-cardinality prototype for one admitted
+  `int4` table: maintain tuple counters and subtree counts at the same
+  generation boundary as MVCC visibility. Gate: estimate metadata is
+  never newer or older than the route certificate it supports.
+- Compare fixed statistics, stale learned/log estimates, and ICE-like
+  updateable index estimates under insert-heavy and update-heavy
+  retained lookup workloads. Required metrics: Q-error, update cost,
+  planner latency, selected route, fallback rate, and p99 query latency.
+- Add a bounded-risk route decision: if sampled cardinality may exceed
+  an HBM, pinned-buffer, or response-ring budget by more than a
+  configured probability, force an exact CPU/index probe or safer route.
+  Failure condition: underestimated cardinality admits a GPU batch that
+  spills or stalls response rings.
+- Test rank-space sampling versus resident column sampling for prefix
+  and range predicates. Proof gate: rank-space sampling gives better
+  route choices than uniform row sampling when data is skewed or
+  clustered.
+- Measure estimator memory footprint per table, per indexed column
+  family, and per resident generation. Keep ICE-like structures only if
+  route-latency and misroute reductions justify the host-memory cost.
+- Simulate generation-stale estimator behavior: run the planner with
+  estimates from generation `G` after writes have published generation
+  `G+1`. The route certificate must reject or downgrade stale estimates
+  unless explicitly allowed by a bounded staleness policy.
+
+### 2026-06-05 - Cross-paper synthesis: route certificates need estimate freshness and tier freshness
+
+The last three reviews converge on a single control-plane problem:
+route certificates now need compact, explicit freshness facts across
+ordering, placement, and estimates. SSS separates internal commit from
+external visibility and shows that retained readers may force delayed
+write responses or propagated dependencies. NeoMem shows that tier
+placement is only useful when the runtime can observe what is hot,
+what is ping-ponging, and what migration costs. ICE adds that
+cardinality estimates must have their own generation and update path;
+otherwise the planner may confidently route from stale statistics.
+
+The promising design track is a route certificate with four independent
+frontiers: SQL visibility boundary, resident data generation, placement
+telemetry generation, and estimator generation. A retained GPU route is
+admissible only when all four frontiers are compatible with the query's
+snapshot and latency budget. If one frontier is stale, the route should
+fall back, refresh, run an exact probe, or return an explicit overload
+reason instead of silently trusting cached state.
+
+Category gap: the journal now has strong evidence for MVCC
+publication, future-tier telemetry, and route-cardinality freshness.
+The next useful candidates should lean toward query scheduling,
+network/session admission, or live partition movement so the runtime
+can decide how to spend these certificates under many simultaneous
+sessions.
+
+Benchmark priority: build a small certificate simulator that combines
+one long retained read, one write batch, one moving hot/cold segment,
+and one stale cardinality estimate. Measure how often each frontier
+causes fallback or delay, and require the simulator to explain every
+route decision in terms of visibility, placement, or estimate freshness.

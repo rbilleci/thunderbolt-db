@@ -3817,12 +3817,25 @@ Append new candidates here as each paper is processed.
   retained route family already includes aggregates and distinct projections;
   this is a targeted follow-up for group-cardinality estimates in route
   selection.
-- `queued` — **Updateable Data-Driven Cardinality Estimator with Bounded
+- `reviewed` — **Updateable Data-Driven Cardinality Estimator with Bounded
   Q-error**, Li et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2408.17209`
   Why: updateable cardinality estimator with bounded-error claims; useful
   counterpoint to offline query-driven retraining when GPU DB table updates
   and resident snapshots shift faster than route logs can be relabeled.
+- `queued` — **LMSFC: A Novel Multidimensional Index Based on Learned
+  Monotonic Space Filling Curves**, Gao et al., PVLDB 2023.
+  URL: `https://doi.org/10.14778/3603581.3603598`
+  Why: ICE uses multidimensional index filtering efficiency as the main
+  control on estimator variance and cites LMSFC as a learned
+  space-filling-curve index; useful for comparing route-cardinality sketches
+  against resident multidimensional index layouts.
+- `queued` — **PACE: Poisoning Attacks on Learned Cardinality Estimation**,
+  Zhang, Zhang, Li, and Chai, PACMMOD 2024.
+  URL: `https://doi.org/10.1145/3639292`
+  Why: ICE treats estimator freshness and updateability as planner inputs, but
+  route models also need robustness against bad or adversarial training/query
+  feedback; useful for designing guarded learned route telemetry.
 - `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
   Learning**, Zhang et al., AIDB@VLDB 2020.
   URL:
