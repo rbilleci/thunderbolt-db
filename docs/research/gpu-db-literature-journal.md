@@ -71610,3 +71610,169 @@ UniMem-style probation/active placement into one synthetic workload. The gate
 is that no read observes an unpublished or uncertified generation, while
 one-hit sessions stop polluting HBM and hot repeated route shapes promote
 predictably.
+
+### 2026-06-05 - Backpressure Flow Control makes admission local, selective, and bounded
+
+**Citation:** Prateesh Goyal, Preey Shah, Kevin Zhao, Georgios Nikolaidis,
+Mohammad Alizadeh, and Thomas E. Anderson. "Backpressure Flow Control." NSDI
+2022, pp. 779-805. Retrieved 2026-06-05 from the official USENIX page and PDF:
+`https://www.usenix.org/conference/nsdi22/presentation/goyal` and
+`https://www.usenix.org/system/files/nsdi22-paper-goyal.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** backpressure; bounded queues; active-flow admission;
+head-of-line blocking; per-hop flow control; tail latency; response rings;
+session multiplexing; gateway networking.
+
+**Core idea:** BFC argues that end-to-end congestion-control feedback is too
+slow for very fast datacenter links, short flows, bursty arrivals, and switch
+buffers that do not scale with link speed. Instead of asking senders to infer
+the correct rate after an end-to-end RTT, BFC applies selective per-hop,
+per-flow backpressure at the congested switch. The trick is making per-flow
+control practical without keeping state for every live connection: only flows
+with queued packets at a switch are "active," and fair scheduling keeps that
+active set much smaller than the total connection population in typical
+workloads.
+
+The transferable design lesson for GPU DB is not a network protocol detail.
+It is the separation between enormous logical population and small active
+pressure set. A runtime targeting 1M logical sessions should not allocate
+queue, pinned-buffer, response-buffer, GPU-stream, or owner-service rights to
+every session. It should dynamically bind only active requests to scarce queue
+slots, apply pressure at the nearest saturated boundary, and avoid pausing
+unrelated work.
+
+**Concrete mechanisms:**
+
+- BFC defines an active flow as one with one or more packets queued at a
+  switch. Its active-flow argument uses fair-queueing intuition: short flows
+  finish quickly, so the number of queued active flows can stay modest even
+  while the total number of possible flows is large.
+- Each switch maps packets to an egress port and a physical FIFO queue. Modern
+  Tofino2 hardware has a limited number of independently pausable queues per
+  port rather than one queue per flow.
+- A strawman hash-to-queue design causes collisions: short flows can sit
+  behind unrelated long flows, and pausing a shared queue creates
+  head-of-line blocking.
+- BFC dynamically assigns a newly active flow to an empty queue when one is
+  available. If all queues are occupied, it falls back to sharing a random
+  queue, accepting head-of-line risk only when the active set exceeds hardware
+  capacity.
+- Flow assignment state is stored in a bounded flow table indexed by egress
+  port and a hash of the flow identifier. The paper's Tofino2 design sizes the
+  table proportional to queue count, not total connection count.
+- The switch tracks each table entry's physical queue assignment and number of
+  queued packets. When the last packet drains, the queue can become available
+  for another active flow.
+- Backpressure is triggered when the assigned queue occupancy exceeds a small
+  threshold. The threshold is based on one-hop bandwidth-delay product at the
+  queue's fair-share drain rate, so pressure reacts at one-hop latency rather
+  than end-to-end latency.
+- Instead of signaling "pause flow X" and requiring an upstream lookup, packets
+  carry the upstream queue id. A downstream switch directly asks the upstream
+  device to pause or resume that queue.
+- Pause counters make the state idempotent. A queue remains paused while its
+  downstream pause counter is nonzero, and pause/resume packets are sent only
+  on counter transitions, with periodic bitmap repair for packet loss.
+- BFC uses deficit round-robin or other switch scheduling among unpaused
+  queues. The flow-control mechanism is separate from the scheduling policy.
+- The paper implements BFC in the Tofino2 dataplane with constant-time
+  per-packet operations and reports the implementation uses less than 10% of
+  dedicated stateful memory. In loopback tests, BFC limits queue length near
+  the pause threshold while maintaining high utilization.
+- Large-scale ns-3 evaluation uses a 128-server, 8-ToR, 8-spine Clos topology
+  with 100 Gbps links, 8 microsecond maximum base RTT, 2 microsecond one-hop
+  RTT, and bursty Google/Facebook-like flow distributions. Compared with
+  end-to-end schemes, the paper reports 2.3x-60x lower tail latency for short
+  flows and 1.6x-5x better average completion time for long flows.
+- BFC does not guarantee losslessness. Under extreme incast, an upstream queue
+  can still send for one hop RTT after congestion is detected; the paper
+  reports drops only under a 2000-to-1 incast in its evaluated settings.
+- BFC is vulnerable to head-of-line blocking once active flows exceed physical
+  queues. More queues or hybrid end-to-end controls reduce this risk.
+- Backpressure mechanisms can deadlock if cyclic buffer dependencies exist.
+  The paper avoids this by eliding pause/resume for disallowed ingress/egress
+  pairs according to precomputed topology rules.
+
+**GPU DB mapping:** BFC maps directly to `11-high-throughput-query-runtime.md`.
+GPU DB should treat sessions like possible flows, and admitted requests like
+active flows. Idle pgwire sessions should occupy compact protocol state, not a
+reserved mutation-ring slot, response buffer, pinned staging buffer, CUDA
+stream, or snapshot-worker lane. Scarce rights should be dynamically assigned
+to active requests and released when the request drains.
+
+The dynamic queue assignment maps to response rings and owner ingress rings.
+When a request becomes active, the network IO worker can bind it to an empty
+per-worker or per-route queue lane if one exists. If lanes are exhausted, the
+runtime should either share a lane within a compatible class, fall back to a
+slower path, or reject with an explicit overload reason. It should not let one
+long COPY, over-resident scan, or blocked socket pause unrelated retained reads
+that happen to share a coarse queue.
+
+BFC's one-hop threshold is a good model for local pressure telemetry. GPU DB
+should not wait for end-to-end client latency or global saturation before
+acting. Each boundary can compute its own pressure from queue depth, service
+rate, and handoff latency: network ingress to parse queue, parse queue to
+mutation owner, read-snapshot queue to GPU worker, GPU worker to response
+encoder, and response ring to socket writer.
+
+The upstream queue id is analogous to carrying return-lane and ownership ids in
+GPU DB request envelopes. A worker that detects saturation should be able to
+pause or reduce credits for the exact upstream lane that feeds it, not for an
+entire network worker or session shard. This is especially important for 1M
+logical sessions, where coarse pause domains would create artificial
+head-of-line blocking.
+
+The deadlock discussion is a warning for owner-domain graphs. If mutation
+owners, residency owners, GPU workers, response encoders, and IO workers can
+all apply backpressure to each other, the runtime needs an acyclic pressure
+graph or explicit deadlock-breaking rules. The "bounded queues are correctness"
+rule from the architecture doc should include a wait-for graph test, not only
+capacity counters.
+
+**Risks and mismatches:** BFC is a datacenter network paper, not a SQL runtime
+or database concurrency-control design. It does not solve MVCC, WAL ordering,
+snapshot publication, query planning, GPU residency, or SQL error semantics.
+Its strongest mechanism depends on programmable switch queues and pause/resume
+signals; GPU DB's in-process rings and TCP sockets have different primitives.
+
+The active-flow assumption can fail under synchronized bursts, large incast, or
+a million sessions that all become active together. In GPU DB, the analogous
+failure is a thundering herd of retained reads, prepared statements, COPY
+chunks, or response writes exceeding queue lanes and pinned-buffer budgets.
+BFC's fallback to queue sharing is acceptable for packets but may be wrong for
+SQL routes with different latency classes or visibility requirements.
+
+Selective pressure also needs fairness. If hot sessions continually reacquire
+active lanes, quiet sessions can starve unless admission includes per-class or
+per-session fairness. Finally, a database cannot drop or reorder request
+semantics the way a network can retransmit packets; overload behavior must be
+explicit and SQL-safe.
+
+**Benchmark candidates:**
+
+- Build an active-session admission benchmark: allocate compact idle session
+  state for a large logical population, but bind only active requests to a
+  limited set of read lanes, mutation lanes, response lanes, and buffer
+  credits. Gate: bytes per idle session stay bounded and active-lane memory is
+  independent of total logical session count.
+- Add dynamic response-lane assignment for retained reads. Compare
+  hash-to-worker, sticky session lanes, and empty-lane-first assignment under
+  mixes of tiny retained reads and long response writes. Failure condition:
+  short read p99 grows because it shares a lane with an unrelated long result.
+- Implement local one-hop pressure thresholds for at least one ring boundary:
+  pause or reduce upstream credits from queue depth, measured service rate, and
+  handoff latency. Compare against global overload decisions based only on
+  request latency.
+- Add a runtime wait-for graph test for backpressure domains. Model IO workers,
+  mutation owner, residency owner, GPU workers, response encoders, and sockets;
+  fail the test if capacity and pause edges can form a cycle with no draining
+  owner.
+- Stress thundering-herd admission with many sessions issuing same-shape
+  retained reads simultaneously. Compare lane count, batch size, p50/p99
+  latency, rejection/fallback count, and buffer reuse correctness.
+- Add per-route pause domains: COPY admission, retained lookup, over-resident
+  scan, refresh, and response write should expose separate saturation counters.
+  Gate: saturation in one route class cannot stop unrelated route classes that
+  do not share the scarce resource.

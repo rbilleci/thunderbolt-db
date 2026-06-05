@@ -5568,12 +5568,12 @@ Append new candidates here as each paper is processed.
   useful for understanding real RDMA service mixes, CPU offload, and
   storage/network tail-latency interactions before GPU DB considers
   RDMA-connected storage or gateway paths.
-- `queued` — **Backpressure Flow Control**, Goyal et al., NSDI 2022.
+- `reviewed` — **Backpressure Flow Control**, Goyal et al., NSDI 2022.
   URL: `https://www.usenix.org/conference/nsdi22/presentation/goyal`
   Why: ConWeave discusses switch resource exhaustion and cites backpressure
   as related switch-flow-control work; useful for comparing explicit
   transport backpressure with GPU DB response-ring, reorder-buffer, and
-  active-session admission limits.
+  active-session admission limits. Reviewed on 2026-06-05.
 - `queued` — **Data Center Ethernet and Remote Direct Memory Access:
   Issues at Hyperscale**, Hoefler et al., IEEE Computer 2023.
   URL: `https://doi.org/10.1109/MC.2023.3261184`
@@ -5639,3 +5639,15 @@ Append new candidates here as each paper is processed.
   Why: SAP HANA NVM flags persistent-memory testing as a separate challenge;
   useful for designing crash/restart fault-injection gates before any future
   GPU DB CXL/NVM tier stores durable or semi-durable route metadata.
+- `queued` — **Deadlocks in Datacenter Networks: Why Do They Form, and How to
+  Avoid Them**, Hu et al., HotNets 2016.
+  URL: `https://doi.org/10.1145/3005745.3005778`
+  Why: Backpressure Flow Control relies on avoiding cyclic buffer dependencies;
+  useful for translating network backpressure deadlock rules into GPU DB
+  owner-ring, response-ring, and gateway admission graphs.
+- `queued` — **Tagger: Practical PFC Deadlock Prevention in Data Center
+  Networks**, Hu et al., CoNEXT 2017.
+  URL: `https://doi.org/10.1145/3143361.3143368`
+  Why: BFC cites Tagger-style deadlock prevention for pause/resume paths;
+  useful follow-up for ensuring selective backpressure and bounded queues
+  cannot create distributed wait cycles across GPU DB runtime domains.
