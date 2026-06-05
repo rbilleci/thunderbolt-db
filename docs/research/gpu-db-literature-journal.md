@@ -72068,3 +72068,217 @@ small deterministic tests that can force every pause edge and failure path.
   time, service-rate estimates, and owner-lane credit ownership. Gate: a
   deadlock or near-deadlock is diagnosable from telemetry without guessing from
   average throughput alone.
+
+### 2026-06-05 - ScalarDB makes transaction authority an adapter-visible metadata layer
+
+**Citation:** Hiroyuki Yamada, Toshihiro Suzuki, Yuji Ito, and Jun Nemoto.
+"ScalarDB: Universal Transaction Manager for Polystores." PVLDB 16(12):
+3768-3780, 2023. doi:10.14778/3611540.3611563. Retrieved 2026-06-05 from
+the PVLDB PDF:
+`https://www.vldb.org/pvldb/vol16/p3768-yamada.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** strict serializability; polystore transactions;
+coordinator metadata; disaggregated WAL; lazy recovery; two-phase commit;
+single-record linearizability; adapter abstraction; context routing; backup
+quiescing.
+
+**Core idea:** ScalarDB is a production-oriented universal transaction manager
+for transactions that span heterogeneous databases. Instead of requiring every
+store to implement XA or expose the same transaction protocol, it uses a
+database abstraction that requires only linearizable single-record reads and
+conditional mutations, durability, and room for extra metadata inside each
+record. A ScalarDB transaction manager then runs global transactions above the
+stores, using per-record transaction metadata and a coordinator table as the
+authority for final transaction state.
+
+The transferable idea for GPU DB is that correctness boundaries can be made
+explicit and adapter-visible without making every tier a full transaction
+participant. GPU memory, CPU MVCC truth, cold-tier services, and future
+metadata stores do not need identical execution engines, but they do need a
+small common contract: conditional publication, durable or rebuildable state
+classification, version metadata, recovery authority, and a clear coordinator
+for final visibility.
+
+**Concrete mechanisms:**
+
+- ScalarDB chooses a single-level transaction-management design. The
+  coordinator owns global concurrency control instead of relying on underlying
+  database transaction managers, which improves database agnosticism but makes
+  global performance optimization and local fast paths harder.
+- The database abstraction models data as records with partition keys,
+  clustering keys, and columns. Current shims include major relational stores
+  and NoSQL stores; each store must provide linearizable single-record reads,
+  conditional write/delete, durability, and storage for ScalarDB metadata.
+- The basic commit protocol treats each record as a small database and runs
+  two-phase commit over records. The prepare phase writes PREPARED record
+  states with conditional mutations; commit is decided by a COMMITTED state in
+  the coordinator table; record commit can then be completed asynchronously.
+- ScalarDB adds transaction metadata to application records: transaction id,
+  record version, record state, timestamps, and a before image. The paper calls
+  this disaggregated WAL because recovery information is stored per record
+  rather than only in a central sequential log.
+- The coordinator table is the source of truth for transaction state. It can be
+  replicated through an underlying database's replication/consensus mechanism,
+  which makes the protocol resemble Paxos Commit for safety/liveness rather
+  than a single in-memory coordinator.
+- Lazy recovery repairs uncommitted records when they are read. If a PREPARED
+  record's transaction is committed, it is rolled forward; if the transaction is
+  expired or aborted, it is rolled back. The default expiration is 15 seconds.
+- Without a reliable clock, ScalarDB uses single-version OCC and offers a
+  weaker read-committed snapshot isolation mode. For strict serializability it
+  offers extra-write and extra-read strategies that avoid anti-dependencies
+  without implementing a full SSI/SSN-style lock table in records.
+- Extra-write converts reads into writes by updating read records' transaction
+  metadata, including writing a deleted placeholder for missing records. This
+  can help read-heavy workloads but increases write traffic.
+- Extra-read is the default strict-serializable strategy. It re-reads the read
+  and scan sets after prepare and before coordinator commit; if any record
+  changed, the transaction aborts. The paper frames this as similar to taking
+  read locks after write locks using linearizable operations.
+- Predicate scans remain special. ScalarDB's text says scan sets are re-read
+  for validation, but it also notes limitations around scans with other
+  operations and suggests partition locks for fuller handling.
+- Correctness is empirically checked with Elle/Jepsen-style tests for
+  cursor-stability and strict-serializable models, plus in-house predicate
+  tests because existing tools do not fully cover predicate anomalies.
+- Performance optimizations include one-phase commit for single-record updates,
+  parallel record commit, parallel prepare and validation, and commit
+  spin-waiting on recently prepared records to avoid aborting work that is
+  likely to become committed soon.
+- Productization mechanisms include quiescing ScalarDB servers for
+  transactionally consistent backups, optimistic rechecking of Kubernetes
+  server membership after backup windows, and context-aware request forwarding
+  via consistent hashing from transaction ids to stateful ScalarDB servers.
+- ScalarDB Analytics exposes a read-committed analytical view by reading
+  committed before/after images through PostgreSQL FDWs or Spark connectors;
+  this is useful, but it is not the same as a full serializable analytical
+  snapshot.
+- Evaluation uses YCSB and TPC-C over MariaDB, PostgreSQL, Cassandra, and mixed
+  deployments. Reported results include near-Atomikos performance in many XA
+  comparisons, strict-serializable overhead of at most 15% throughput and 17%
+  latency in the shown TPC-C MariaDB case, parallel commit gains up to 87% on
+  MariaDB and 48% on PostgreSQL in the shown setup, and 92% scale efficiency
+  from 3 to 15 Cassandra nodes.
+
+**GPU DB mapping:** ScalarDB is not a GPU paper, but it sharpens the boundary
+between correctness authority and tier implementation. GPU DB already treats
+WAL/CPU MVCC state as correctness authority and GPU resident buffers as
+rebuildable acceleration state. ScalarDB suggests making that split more
+adapter-like: every tier or service that can affect visible state should expose
+a minimal transaction/publish contract, while rebuildable tiers expose enough
+metadata for validation, invalidation, and recovery without pretending to be
+durable.
+
+For P8, disaggregated per-record metadata maps to per-segment and per-route
+publication metadata: source WAL boundary, visibility boundary, validity state,
+before/after generation identity, and recovery action. GPU resident state should
+not carry a full WAL, but it should carry enough "DWAL-like" provenance for a
+reader, refresh worker, or recovery path to decide whether to use, roll
+forward, invalidate, or discard it.
+
+For the write path, the coordinator-table idea maps to a visibility frontier
+owned by the mutation owner. GPU refresh, cold-tier staging, route-cache
+publication, and catalog generation changes should not each invent their own
+commit truth. They can publish prepared or pending artifacts, but one authority
+should decide when those artifacts become visible to new reads.
+
+For strict snapshots, extra-read is a useful baseline for expensive
+cross-domain validation. A retained GPU read route can be admitted optimistically
+after checking a snapshot generation, but before final response publication it
+may need to re-check route-relevant generations if mutation, DDL, or residency
+owners can invalidate the route concurrently. The cost should be benchmarked
+against stronger reservation or extra-write-style metadata touching.
+
+For 1M logical sessions, context-aware request forwarding is a direct warning:
+interactive transactions have stateful read/write sets. If GPU DB supports
+multi-step transactions over IO workers, stored procedures, or future
+microservices, transaction ids need stable routing to the worker or owner that
+holds their context, without forcing every logical session to pin a thread.
+
+For backups and PITR, ScalarDB's quiescing mechanism highlights a gap between
+distributed record metadata and globally replayable order. GPU DB should keep
+its central WAL-before-visibility log for durable CPU truth, but if future
+cold-tier or resident-route metadata becomes distributed, backup tests need to
+prove that a quiesced or frontier-bounded restore cannot produce a mixed
+generation state.
+
+**Risks and mismatches:** ScalarDB is a polystore transaction manager, not an
+in-process GPU database engine. It optimizes CRUD-style record transactions
+and has limited SQL support in the evaluated core path; joins, aggregation, GPU
+kernels, MVCC version chains, and PostgreSQL wire protocol are outside its main
+design.
+
+The SingleTM abstraction intentionally hides underlying layout and locality,
+which conflicts with GPU DB's need to exploit table layout, residency, device
+placement, and transfer cost. GPU DB should borrow the metadata and authority
+contracts, not hide route cost facts behind a lowest-common-denominator data
+model.
+
+Lazy recovery is attractive for scalability but risky for append-only or
+blind-write paths because unrecovered prepared records may never be read. GPU
+DB's COPY, WAL replay, and resident-refresh paths should not depend only on
+read-time repair for cleanup; owner ticks or recovery scans are still needed.
+
+The paper reports production lessons and benchmark results, but many details
+of ScalarDB Enterprise/Cluster are commercial, and the analytical layer's
+read-committed view is weaker than the strict snapshot semantics GPU DB wants
+for retained reads.
+
+**Benchmark candidates:**
+
+- Add a route-publication state machine mirroring PREPARED/COMMITTED/ABORTED
+  for resident snapshots, catalog route metadata, and cold-tier artifacts.
+  Gate: only the mutation/catalog/residency authority can move an artifact into
+  visible-to-new-read state.
+- Compare extra-read route validation with reservation-style publication for
+  retained GPU reads. Measure generation re-check cost, abort/fallback rate,
+  p50/p99 latency, and false-positive invalidations under concurrent writes,
+  DDL, and refresh.
+- Build a lazy-recovery stress test for prepared resident artifacts and
+  prepared cold-tier chunks. Failure condition: blind append or refresh traffic
+  can leave unrecovered artifacts indefinitely without an owner-visible cleanup
+  path.
+- Add a transaction-context routing benchmark with many logical sessions and a
+  smaller active set. Measure transaction-id-to-owner routing, IO-worker
+  migration, context memory, and abort behavior when a multi-step transaction
+  changes workers between statements.
+- Add a quiesced-backup/frontier snapshot test spanning WAL, CPU MVCC state,
+  catalog route metadata, and resident cache metadata. Gate: restore never
+  observes a resident generation or route cache entry newer than the durable
+  visibility frontier.
+- Use ScalarDB-style mixed-store experiments as a future-tier proxy: CPU truth,
+  GPU resident cache metadata, and a simulated cold-tier service each expose
+  different latency and conditional-update costs. Measure when centralizing
+  the coordinator is cheaper than making every tier participate in richer
+  commit logic.
+
+### 2026-06-05 - Cross-paper synthesis: publication proof needs metadata authority
+
+Recent entries keep circling the same design track from different angles.
+Backpressure Flow Control and the HotNets deadlock paper argue that runtime
+progress depends on local, bounded pressure signals and escape paths, not only
+on average throughput or static topology. The RocksDB trace study argues that
+benchmark locality must preserve key-range and operation-shape structure, or
+tier decisions will be optimized for the wrong workload. ScalarDB adds the
+transactional counterpart: every visible state transition needs a small,
+explicit authority and enough metadata for recovery, validation, and backup.
+
+For GPU DB, this converges into a "metadata authority" track. Resident GPU
+routes, route caches, cold-tier chunks, response lanes, and transaction
+contexts should all publish through typed metadata records with owner, state,
+generation, visibility frontier, lease/deadline, and cleanup responsibility.
+The metadata should be rich enough for narrow backpressure, route validation,
+and restore checks, but not so abstract that the planner loses placement,
+locality, and transfer facts.
+
+The main category gap is now less about finding one more GPU kernel paper and
+more about proving publication semantics under mixed workloads: long retained
+reads, hot writes, cold-tier refresh, slow responses, and backup/frontier
+events. The next benchmark priority should combine a production-shaped
+key-range workload with deliberate publication pressure: hot-range updates,
+resident refresh, slow-client response backpressure, and a quiesced snapshot
+gate. Success means the engine can explain exactly which authority blocked or
+published each route, why unrelated work kept moving, and which durable
+frontier a restored system would trust.

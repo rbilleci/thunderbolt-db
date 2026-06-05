@@ -771,14 +771,28 @@ Append new candidates here as each paper is processed.
   client-coordinated commit and minimal-store assumptions with Epoxy-style
   coordinator-owned global snapshots.
   Journal entry added 2026-06-05.
-- `queued` — **ScalarDB: Universal Transaction Manager for Polystores**,
+- `reviewed` — **ScalarDB: Universal Transaction Manager for Polystores**,
   Yamada et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p3768-yamada.pdf`
-  DOI: `https://doi.org/10.14778/3611540.3611560`
+  DOI: `https://doi.org/10.14778/3611540.3611563`
   Why: modern production-oriented follow-up for Cherry Garcia and Epoxy-style
   transactions across heterogeneous stores; useful for comparing coordinator
   metadata, snapshot/serializable guarantees, and adapter requirements when GPU
   DB spans CPU truth, GPU resident state, and cold-tier services.
+  Journal entry added 2026-06-05.
+- `queued` — **Apache ShardingSphere: A Holistic and Pluggable Platform for
+  Data Sharding**, Li et al., ICDE 2022.
+  URL: `https://doi.org/10.1109/ICDE53745.2022.00231`
+  Why: ScalarDB compares against XA-style middleware and references
+  ShardingSphere's transaction-management ecosystem; useful for contrasting
+  pluggable sharding/routing middleware with GPU DB's owner-domain route
+  metadata and transaction context routing.
+- `queued` — **The BigDAWG Polystore System**, Duggan et al., SIGMOD Record
+  2015.
+  URL: `https://doi.org/10.1145/2814710.2814713`
+  Why: ScalarDB frames modern polystores as a successor to earlier federated
+  systems; BigDAWG is useful background for comparing islands, shims, and
+  cross-engine routing when GPU DB grows CPU/GPU/cold-tier execution surfaces.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for Microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
