@@ -68944,3 +68944,184 @@ write-heavy transactional mixes need separate measurement.
   generation with on-demand reconstruction from checkpoint plus WAL
   deltas. Required metrics: startup time, first-query latency, recovery
   read amplification, and resident warmup debt.
+
+### 2026-06-05 - TDSL makes conflict detection a data-structure contract
+
+**Citation:** Alexander Spiegelman, Guy Golan-Gueta, and Idit Keidar.
+"Transactional Data Structure Libraries." PLDI 2016, pp. 682-696.
+doi:10.1145/2908080.2908112. Retrieved 2026-06-05 from the author PDF,
+`https://people.csail.mit.edu/idish/ftp/TransactionalLibrariesPLDI16.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT / session
+scale; concurrency control.
+
+**Relevance tags:** semantic conflict detection; transactional data
+structures; route metadata; index update atomicity; singleton fast paths;
+read-set reduction; mixed optimistic/pessimistic concurrency; composable
+owner domains; abort reduction.
+
+**Core idea:** TDSL adds transactions to concurrent data-structure libraries
+without treating every memory access as a generic STM read or write. The key
+move is to constrain the transactional alphabet to known operations such as
+map insert/remove/contains and queue enqueue/dequeue. Once the library owns the
+operation semantics, it can validate only the state that can change the
+operation's meaning, choose a different concurrency protocol per data
+structure, and keep ordinary stand-alone operations almost as cheap as the
+underlying concurrent data structure.
+
+For GPU DB, the transferable lesson is that the runtime should not force every
+route, resident-index update, queue admission, and metadata change through one
+generic tuple-level conflict protocol. Some structures need optimistic
+validation with small semantic read sets; others need early pessimistic
+ownership because conflicts are inherent. A route or index component should
+publish the conflict predicate it needs, then participate in a common commit or
+publication protocol.
+
+**Concrete mechanisms:**
+
+- The library exposes `TX-begin` and `TX-commit`; operations between them are
+  one transaction. Atomicity covers only the library's data-structure
+  operations, not arbitrary memory accesses outside the library.
+- Stand-alone operations are modeled as singleton transactions but cannot abort,
+  preserving legacy concurrent-data-structure behavior and avoiding generic
+  transaction-management overhead on non-transactional fast paths.
+- The skiplist starts from TL2-style optimistic validation with a global version
+  clock, per-node versions, a transaction read set, and a write set applied at
+  commit after locking and validation.
+- Read-set reduction exploits skiplist semantics. For `contains(k)`, `insert(k)`,
+  and `remove(k)`, the transaction generally needs to validate the predecessor
+  that proves whether key `k` could appear, rather than every node traversed on
+  the search path. `remove(k)` also tracks the removed successor.
+- A non-transactional skiplist index provides shortcuts. It is updated lazily
+  after commit and is not part of the transaction, so stale index entries may
+  slow traversal but cannot cause aborts or violate correctness.
+- Deleted nodes remain reachable until epoch-based reclamation. If the lazy
+  index returns a removed node, the operation backs up through the index and
+  traverses from a safe predecessor.
+- Multiple objects in one library share a global version clock. Each object has
+  its own read set, write set, and optional lazy index work. Commit locks all
+  write sets, validates all read sets, increments the version clock, applies
+  object updates, releases locks, and then performs lazy index updates.
+- Queues use a different protocol from skiplists. Because queue head and tail
+  are natural contention points, dequeue is pessimistic and locks the queue on
+  first access in the transaction; enqueue is buffered in an ordered local queue
+  and appended at commit.
+- Singleton updates do not increment the global version clock. Instead, updated
+  nodes or queues carry a singleton bit; transactional validation checks this
+  bit to detect conflicts with singleton operations.
+- The paper splits composable commit into lock, verify, finalize, and abort
+  phases so separately implemented transactional libraries can participate in a
+  combined transaction with an atomicity window and an opacity window.
+- Evaluation uses C/C++ implementations on a 32-thread machine. The authors
+  report singleton skiplist operations running on par with baseline concurrent
+  skiplists, transactional skiplist workloads up to an order of magnitude
+  faster than a TL2 baseline for update-only workloads, and a STAMP Intruder
+  application running up to 17x faster than TL2 when larger flows exercise
+  maps, sets, queues, and singletons.
+
+**GPU DB mapping:** The current owner-domain design already says mutable state
+has one owner and readers should use immutable snapshots. TDSL adds a sharper
+rule for the structures inside those domains: each route-critical structure
+should define its own semantic conflict surface. A resident key index, route
+metadata table, response ring, hot-key admission queue, and snapshot-generation
+map should not all validate the same generic tuple fields.
+
+For resident indexes, the skiplist pattern maps to route certificates. A point
+lookup certificate may need to prove only that the predecessor/key-range or
+resident hash bucket generation did not change, not that every touched metadata
+node stayed untouched. Prefix scans and range routes need stronger range
+certificates. This suggests a benchmarkable split between route-shape conflict
+predicates: point lookup, range/prefix lookup, aggregate over immutable segment,
+refresh publication, and invalidation.
+
+The lazy non-transactional index is also useful. GPU DB can keep correctness in
+CPU MVCC/WAL state and use resident indexes, route caches, and shortcut maps as
+lazy acceleration. A stale shortcut should cost a fallback, retry, or longer
+proof path, but it must not force aborts or become the authority for visibility.
+This matches the P8 rule that GPU resident state is rebuildable acceleration
+state.
+
+The queue result maps directly to session admission and response rings. Queues
+are not good candidates for optimistic read/write-set validation under heavy
+head/tail contention. Hot write queues, COPY admission queues, and response
+rings should use explicit ownership, credits, or bounded pessimistic admission,
+while route metadata and resident indexes can use optimistic validation where
+commutativity is real.
+
+Singleton fast paths are a warning for the runtime. Not every one-statement
+lookup, metadata read, or response enqueue should pay the full multi-object
+transaction cost. The system needs a cheap singleton route that is still
+serialized against mutations by a compact generation or singleton/conflict bit,
+with promotion to the heavier transaction path only when a statement spans
+multiple mutable structures.
+
+**Risks and mismatches:** TDSL is a shared-memory programming paper, not a
+DBMS storage engine. Its transactions are over library data structures and do
+not provide SQL isolation, WAL durability, crash recovery, catalog safety, or
+GPU memory correctness. The example structures are skiplists, maps, sets, and
+queues, not B-trees, column groups, MVCC version chains, or CUDA buffers. The
+single global version clock would need replacement or partitioning in a 1M
+logical-session database runtime. Lazy index correctness depends on epoch-based
+memory reclamation; GPU resident generations and pinned host buffers need a
+stronger retire protocol that spans CPU readers, GPU streams, and network
+responses. Finally, the reported speedups compare against STM baselines, not
+against production database concurrency-control schemes.
+
+**Benchmark candidates:**
+
+- Add route-shape conflict predicates for retained reads: point lookup, prefix
+  range, aggregate over immutable segment, refresh publication, and invalidation.
+  Gate: each accepted route can name the smallest generation/range/bucket proof
+  it validated.
+- Prototype a lazy resident-index shortcut over CPU truth. Stale shortcut hits
+  must retry or fall back without aborting unrelated routes. Failure condition:
+  shortcut metadata becomes required for correctness or stale reads.
+- Compare generic tuple-level validation with semantic index validation for a
+  retained point-lookup workload under concurrent inserts/deletes. Required
+  metrics: abort/retry rate, route-proof time, p99 latency, and correctness.
+- Treat hot admission queues separately from route metadata: compare optimistic
+  queue validation against bounded owner/credit admission for COPY chunks and
+  response-ring slots. Expected win: fewer aborts and clearer overload reasons
+  under head/tail contention.
+- Add a singleton retained-read path with a compact generation conflict bit and
+  no multi-object transaction allocation. Gate: identical visibility results
+  and lower per-request allocation/latency for one-statement reads.
+- Measure lazy-index maintenance debt after commits and refreshes: pending index
+  updates, obsolete shortcut hits, retries, and retire lag. Failure condition:
+  lazy maintenance steals enough owner time to hurt mutation p99.
+
+### 2026-06-05 - Cross-paper synthesis: frontiers need semantic proof surfaces
+
+AdaCom, OrpheusDB, and TDSL converge on one design track: a GPU DB route should
+carry not just a timestamp, but a compact proof surface chosen for the structure
+and tier it touches. AdaCom says the physical encoding and placement are part
+of that surface. OrpheusDB says retained generations need explicit
+storage/recreation boundaries and membership maps. TDSL says conflict detection
+should be stated in the vocabulary of the data structure, not in generic memory
+or tuple accesses.
+
+The benchmark direction is therefore semantic route certificates. A point
+lookup should validate a different certificate from a range scan, a resident
+aggregate, a queue admission, or a background refresh. The certificate should
+name visibility frontier, segment membership, physical encoding, shortcut/index
+generation, and bounded resource ownership. If a proof is stale, the engine
+should retry, fall back, or reject explicitly; it should not silently widen
+conflict detection until everything contends on one global owner.
+
+Category gaps remain around production-grade resident index maintenance,
+range-proof certificates, and warm-tier HTAP placement. The next papers should
+keep mixing OLTP/concurrency with tiering and optimizer work; strong candidates
+are Native Store Extension for SAP HANA, Harmony, Bwe-tree if a primary full
+text can be obtained, STO/type-aware transactions, and VLL.
+
+Benchmark priorities:
+
+- Build a certificate matrix by route shape: point, range, aggregate, queue,
+  refresh, invalidation, and recovery rebuild.
+- Measure generic MVCC validation against semantic route validation under
+  writes, deletes, retained readers, and lazy resident-index maintenance.
+- Track encoding and placement as first-class proof fields so compressed or
+  reconstructed segments cannot be routed as if they were dense resident GPU
+  buffers.
+- Add retire/debt telemetry for every lazy shortcut, compressed segment,
+  membership map, and resident generation held by active snapshots.

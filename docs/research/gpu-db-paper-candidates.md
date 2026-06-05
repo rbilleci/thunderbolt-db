@@ -5235,9 +5235,9 @@ Append new candidates here as each paper is processed.
   Why: modern GPU OLTP concurrency-control comparison discovered while
   reviewing GaccO; useful for comparing GPU-friendly locking/OCC/MVCC choices
   before adopting large homogeneous transaction batches.
-- `queued` — **Transactional Data Structure Libraries**, Spiegelman et al.,
+- `reviewed` — **Transactional Data Structure Libraries**, Spiegelman et al.,
   PLDI 2016.
-  URL: `https://doi.org/10.1145/2908080.2908111`
+  URL: `https://doi.org/10.1145/2908080.2908112`
   Author PDF:
   `https://people.csail.mit.edu/idish/ftp/TransactionalLibrariesPLDI16.pdf`
   Why: DRP builds on STO-style transactional objects; useful for deciding
@@ -5319,13 +5319,15 @@ Append new candidates here as each paper is processed.
   Why: Index Checkpoints relies on tuple snapshot consistency while accepting
   non-transaction-consistent index checkpoints; useful for choosing CPU truth
   checkpoint algorithms before deciding which derived indexes are persisted.
-- `queued` — **Low-Overhead Asynchronous Checkpointing in Main-Memory
+- `reviewed` — **Low-Overhead Asynchronous Checkpointing in Main-Memory
   Database Systems**, Ren, Diamond, Abadi, and Thomson, SIGMOD 2016.
-  URL: `https://doi.org/10.1145/2882903.2915226`
+  URL: `https://www.cs.yale.edu/homes/dna/papers/fast-checkpoint-sigmod16.pdf`
+  DOI: `https://doi.org/10.1145/2882903.2915966`
   Why: Li et al. use CALC as the virtual-snapshot baseline; useful for
   comparing deferred consistent snapshots that avoid blocking active
   transactions with GPU DB retained snapshot publication and checkpoint
-  boundaries.
+  boundaries. Duplicate queue entry corrected after the 2026-06-05 journal
+  review already covered CALC.
 - `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using
   both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2882925`
@@ -5474,3 +5476,11 @@ Append new candidates here as each paper is processed.
   Why: OrpheusDB builds on the recreation/storage tradeoff for versioned
   datasets; useful for turning GPU DB snapshot-retention, checkpoint, and
   cold-version reconstruction policy into an explicit cost frontier.
+- `queued` — **Type-Aware Transactions for Faster Concurrent Code**,
+  Herman, Inala, Huang, Tsai, Kohler, Liskov, and Shrira, EuroSys 2016.
+  URL: `https://doi.org/10.1145/2901318.2901348`
+  Author PDF: `https://read.seas.harvard.edu/~kohler/pubs/herman16type-aware.pdf`
+  Why: TDSL cites STO as independently developed semantic transactional
+  object work; useful for comparing route-specific conflict predicates,
+  datatype-owned commit hooks, and reduced read/write-set bookkeeping
+  against generic tuple-level validation.
