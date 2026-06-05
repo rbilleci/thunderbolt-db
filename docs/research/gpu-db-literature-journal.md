@@ -73357,3 +73357,192 @@ would erase much of the benefit.
   snapshots, and GPU-residency candidates. Reject any policy that
   improves scan throughput while starving hot point lookups or refresh
   work.
+
+### 2026-06-06 - ShardingSphere makes route metadata a first-class execution boundary
+
+**Citation:** Ruiyuan Li, Liang Zhang, Juan Pan, Junwen Liu, Peng Wang,
+Nianjun Sun, Shanmin Wang, Chao Chen, Fuqiang Gu, and Songtao Guo.
+"Apache ShardingSphere: A Holistic and Pluggable Platform for Data
+Sharding." ICDE 2022, pp. 2468-2480. doi:10.1109/ICDE53745.2022.00231.
+Retrieved 2026-06-06 from
+`https://download.sphere-ex.com/paper/a-holistic-and-pluggable-platform-for-data-sharding.pdf`.
+
+**Category:** query optimization / planning and hybrid transaction routing.
+
+**Relevance tags:** sharded SQL routing; route metadata; transaction context;
+XA/local/BASE transactions; SQL rewrite; stream merger; memory merger;
+connection admission; pluggable execution features; governance metadata;
+route-aware result merge.
+
+**Core idea:** ShardingSphere is a sharding middleware that lets applications
+use multiple relational databases as one logical database. Its main design
+choice is to make the route boundary explicit: parse logical SQL, infer the
+data nodes touched, rewrite SQL for physical tables, execute against selected
+data sources, and merge results back into one logical result. It also exposes
+distributed transaction modes and configuration through the same database-like
+surface instead of forcing sharding logic into application code.
+
+The strongest transferable idea is not the middleware form itself, but the
+typed route artifact that sits between SQL parsing and physical execution. A
+query is not just "sent to storage"; it becomes a set of execution units with
+known data nodes, table rewrites, connection needs, merge requirements, and
+transaction mode. That is the same boundary GPU DB needs between logical SQL
+and CPU/GPU/NVMe tiers: every route should know which owner, snapshot,
+resident generation, buffers, and fallback merger it needs before admission.
+
+The paper reports Sysbench and TPC-C experiments comparing ShardingSphere
+against several systems in its settings, including MySQL/PostgreSQL baselines,
+Vitess, Citus, TiDB, CockroachDB, and Aurora variants. The absolute numbers
+are system- and benchmark-specific, but the useful claim is architectural:
+JDBC-in-process routing is often faster than proxy routing because it avoids an
+extra forwarding hop, while proxy routing gives language neutrality and pooled
+connections. GPU DB has an analogous choice between embedded fast paths,
+protocol-edge fast paths, and owner-mediated execution.
+
+**Concrete mechanisms:**
+
+- ShardingSphere has data-source, feature, governor, SQL-engine, and adaptor
+  components. Features such as sharding, distributed transaction,
+  read/write-splitting, encryption, shadow database, scaling, circuit breaking,
+  and throttling are pluggable around the SQL engine.
+- The SQL engine is a staged pipeline: parse SQL into an AST, route logical
+  SQL to data nodes, rewrite logical SQL into physical SQL, execute rewritten
+  units against underlying data sources, then merge partial results.
+- The router distinguishes broadcast routes from sharding routes. Statements
+  without sharding keys may fan out to all data nodes; statements with
+  sharding keys can route to one or more precise nodes.
+- Standard route handles one logical table or binding tables. Equality on the
+  sharding key can route to one data node, while `IN` or `BETWEEN` may route
+  to multiple nodes. Binding-table joins avoid Cartesian fanout when joined
+  tables share data sources, sharding keys, and algorithms.
+- Cartesian route is the correctness fallback for joins across non-binding
+  tables. It can preserve correctness but expands the number of rewritten SQL
+  statements and should be avoided by schema/rule design.
+- SQL rewrite has correctness and optimization phases. Correctness rewrite
+  changes logical table names to actual table names, derives hidden columns
+  needed by result merging, revises pagination, and splits batched inserts.
+  Optimization rewrite skips unnecessary derived columns on single-node routes
+  and can add `ORDER BY` to make grouped results stream-mergeable.
+- The executor groups route/rewrite results by physical data source and chooses
+  connection behavior per data source using the number of SQL statements and a
+  configured maximum connection count. If one connection would need to execute
+  multiple SQL statements, the executor chooses connection-strict mode and
+  memory merger; otherwise it can choose memory-strict mode and stream merger.
+- To avoid connection deadlocks, the executor obtains all required connections
+  for a query atomically when needed, but avoids locking when the query shape
+  cannot deadlock or when connection-strict memory merger releases connections
+  after loading results.
+- Result merger supports iteration, order-by, group-by, aggregation, and
+  pagination. Ordered results can use multiway stream merge. Group-by can use
+  stream merge when the grouping and ordering align; otherwise it falls back to
+  memory merge. `AVG` is rewritten into `SUM` and `COUNT` for correct merging.
+- ShardingSphere supports XA, local, and BASE transaction modes. XA wraps a
+  two-phase commit transaction manager inside the middleware. Local transaction
+  degrades to one-phase commit and may ignore partial commit failures. BASE
+  mode integrates Seata-style global transaction IDs, branch registration,
+  redo/undo logs, and eventual compensation.
+- DistSQL exposes resource/rule definition, query, and administration through
+  SQL-like commands. AutoTable lets users specify data sources and shard count
+  while the system creates physical tables and binds logical-to-actual tables.
+- Governor stores configuration and runtime state in ZooKeeper and performs
+  health checks over proxy instances and underlying databases.
+- The paper's future work notes that BASE transactions are still synchronously
+  returned for protocol compatibility, and suggests asynchronous result return
+  where applications submit SQL and ShardingSphere guarantees the BASE
+  transaction after submission.
+
+**GPU DB mapping:** The direct GPU DB mapping is a typed `RoutePlan` or
+`ExecutionUnit` boundary. Logical SQL should lower into one or more units that
+declare relation generation, partition/residency owner, snapshot boundary,
+required columns, predicate family, expected merge shape, transaction mode,
+connection or queue budget, GPU buffer budget, and fallback path. That route
+artifact becomes the admission input for the high-throughput runtime instead
+of letting each owner rediscover the same facts.
+
+Binding tables map to co-resident or co-partitioned GPU routes. If two tables
+are partitioned by the same key and resident on the same device/partition
+generation, a join or paired lookup can stay local. If they are not binding,
+the route should explicitly expose Cartesian fanout or choose CPU fallback,
+predicate transfer, repartition, or rejection. The key is making fanout visible
+before queue admission, because fanout multiplies owner work, response buffers,
+and GPU staging memory.
+
+The executor's connection-mode logic maps to GPU and tier admission. GPU DB's
+equivalent of `MaxCon` is a per-boundary budget: command-ring slots, mutation
+owner credits, read snapshot credits, CUDA stream slots, pinned buffers,
+resident segment handles, and response buffers. A route that needs more slots
+than the boundary can safely hold should either stream, split, memory-merge,
+fall back to CPU, or reject with an overload reason. It should not enqueue a
+large fanout and discover the pressure after buffers are already pinned.
+
+The result-merger rules are useful for CPU/GPU split execution. Ordered and
+grouped fragments can stream merge if the route preserves compatible order;
+otherwise the engine must budget for memory merge or pick a different plan.
+For resident aggregates, `AVG` should remain a decomposed `SUM`/`COUNT`
+contract across partitions or devices. Pagination across shards or resident
+segments should be treated as a route-specific merge cost, not as a final
+protocol formatting detail.
+
+The transaction-mode split is a warning for GPU DB. XA/local/BASE are not
+drop-in policies, but they show that route metadata must carry consistency
+intent. A short mutation spanning multiple partition owners may need a strict
+commit protocol. A background refresh, warm-tier transcode, or cold-tier
+placement update may be asynchronous and compensatable. A read-only retained
+route may require only a stable snapshot boundary. The runtime should not
+force all of these through one global owner path, but it must make the chosen
+mode explicit and observable.
+
+The JDBC-versus-proxy result maps to protocol-edge design. Embedded fast paths
+can avoid extra hops for benchmarks and in-process clients, but pgwire proxy
+compatibility and 1M logical sessions need pooled, multiplexed IO workers.
+The production design should allow a protocol-edge route cache or in-process
+route path only when the route certificate proves the snapshot and residency
+generation are still valid.
+
+**Risks and mismatches:** ShardingSphere is middleware over existing
+databases, not a storage engine. It does not own WAL replay, MVCC tuple
+versions, GPU residency, CUDA streams, NVMe placement, or physical page/cache
+formats. Its transaction modes depend on the semantics and limitations of
+underlying databases and Seata-style compensation; GPU DB cannot copy those
+without defining its own WAL-before-visibility and recovery rules.
+
+The paper's routing model is mostly key-sharding middleware. GPU DB's route
+space is wider: CPU tuple/index path, warm encoded pushdown, GPU resident
+scan/index, over-resident transfer, NVMe cold segment, and mutation-owner
+fallback. The useful part is the route artifact and merger discipline, not the
+specific sharding algorithms. The evaluation is also framed around
+application-level sharding on cloud VMs; it should not be treated as evidence
+that a GPU route or proxy path will have the same performance.
+
+The AutoTable and DistSQL ideas may be too administrative for the first engine
+slice. They become relevant later for declaring residency, partitioning, and
+tier rules, but the immediate benchmark target should be internal route
+metadata rather than a user-facing DDL surface.
+
+**Benchmark candidates:**
+
+- Add an internal route-artifact benchmark for retained reads: parse/lower once
+  into execution units carrying snapshot generation, resident table identity,
+  predicate family, merge mode, and fallback reason. Gate: route validation is
+  cheaper than owner-thread execution for hot repeated reads and never returns
+  stale generations after mutation invalidation.
+- Build a binding-partition join probe: two tables co-partitioned by key versus
+  non-binding partitions. Measure fanout count, queue slots, pinned-buffer
+  bytes, merge cost, and p95 latency. Failure condition: non-binding fanout is
+  admitted without an explicit budget or fallback reason.
+- Add a merger-mode microbenchmark for partitioned results: stream merge
+  ordered fragments, memory merge unordered fragments, and aggregate merge
+  with `AVG` decomposed into `SUM`/`COUNT`. Gate: identical SQL results across
+  CPU and GPU/partition split routes.
+- Prototype per-route resource admission analogous to connection mode:
+  command slots, response buffers, CUDA stream capacity, pinned bytes, and
+  resident handles. Compare immediate rejection, split execution, stream
+  merge, and CPU fallback under high logical-session counts.
+- Add transaction-mode telemetry to mutation and refresh routes: strict
+  WAL-backed mutation, snapshot read, asynchronous refresh/transcode, and
+  compensatable maintenance. Failure condition: a maintenance route can publish
+  visibility before WAL or snapshot compatibility is proven.
+- Compare protocol-edge retained route caching with owner-mediated execution.
+  Gate: the fast path must check relation identity, schema generation,
+  visibility boundary, and residency invalidation generation before bypassing
+  the owner.

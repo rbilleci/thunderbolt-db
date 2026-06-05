@@ -782,13 +782,15 @@ Append new candidates here as each paper is processed.
   metadata, snapshot/serializable guarantees, and adapter requirements when GPU
   DB spans CPU truth, GPU resident state, and cold-tier services.
   Journal entry added 2026-06-05.
-- `queued` — **Apache ShardingSphere: A Holistic and Pluggable Platform for
+- `reviewed` — **Apache ShardingSphere: A Holistic and Pluggable Platform for
   Data Sharding**, Li et al., ICDE 2022.
   URL: `https://doi.org/10.1109/ICDE53745.2022.00231`
   Why: ScalarDB compares against XA-style middleware and references
   ShardingSphere's transaction-management ecosystem; useful for contrasting
   pluggable sharding/routing middleware with GPU DB's owner-domain route
-  metadata and transaction context routing.
+  metadata and transaction context routing. Journal entry added 2026-06-06
+  using the accessible SphereEx PDF:
+  `https://download.sphere-ex.com/paper/a-holistic-and-pluggable-platform-for-data-sharding.pdf`.
 - `queued` — **The BigDAWG Polystore System**, Duggan et al., SIGMOD Record
   2015.
   URL: `https://doi.org/10.1145/2814710.2814713`
@@ -1118,6 +1120,13 @@ Append new candidates here as each paper is processed.
   Why: extends vmcache-style virtual-memory-assisted buffer management to
   multiple memory tiers such as DRAM, remote memory/CXL-like tiers, and disk;
   directly relevant to future GPU DB host-tier and cold-partition placement.
+- `queued` — **Citus: Distributed PostgreSQL for Data-Intensive Applications**,
+  Cubukcu et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457551`
+  Why: ShardingSphere compares against Citus as a PostgreSQL sharding
+  middleware; useful follow-up for contrasting extension-level distributed
+  planning, colocated joins, shard routing, and coordinator/worker execution
+  with GPU DB route metadata and CPU/GPU/cold-tier ownership.
 - `reviewed` — **PARQO: Penalty-Aware Robust Plan Selection in Query
   Optimization**, Xiu et al., PVLDB 2024.
   URL: `https://doi.org/10.14778/3704965.3704971`
