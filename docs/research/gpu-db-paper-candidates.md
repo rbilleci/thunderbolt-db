@@ -2349,13 +2349,25 @@ Append new candidates here as each paper is processed.
   Why: FNCC contrasts against credit-based congestion avoidance; useful for
   evaluating whether GPU DB response rings should use receiver-issued credits
   rather than only reactive queue-delay backpressure.
-- `queued` — **Taurus Database: How to be Fast, Available, and Frugal in the
+- `reviewed` — **Taurus Database: How to be Fast, Available, and Frugal in the
   Cloud**, Depoutovitch et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3386129`
   arXiv: `https://arxiv.org/abs/2412.02792`
   Why: cloud database storage architecture with append-only storage,
   replication, recovery, and constant-time snapshots; relevant to future
   cloud/disaggregated durability and snapshot tiers.
+- `queued` — **Near Data Processing in Taurus Database**, Depoutovitch et al.,
+  arXiv 2025.
+  URL: `https://arxiv.org/abs/2506.20010`
+  Why: direct Taurus follow-up that pushes selection, projection, and
+  aggregation into the storage layer; useful for comparing GPU DB cold-tier
+  pushdown with GPU-resident and CPU fallback routes.
+- `queued` — **Taurus MM: bringing multi-master to the cloud**, Depoutovitch
+  et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p3488-depoutovitch.pdf`
+  Why: direct Taurus follow-up on multi-master cloud database design; useful
+  for comparing cross-owner write ordering, conflict handling, and snapshot
+  publication in a disaggregated architecture.
 - `reviewed` — **Hybrid Garbage Collection for Multi-Version Concurrency Control
   in SAP HANA**, Lee et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2903734`

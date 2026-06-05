@@ -66830,3 +66830,176 @@ placement, not the specific kernel interface.
   hot-set experiment with GPU DB chunks: hot set fits in fast tier, hot set
   exceeds fast tier, and uniform access. The policy should report when no hot
   set exists instead of thrashing.
+
+### 2026-06-05 - Taurus separates durable log truth from eventually current page service
+
+**Citation:** Alex Depoutovitch, Chong Chen, Jin Chen, Paul Larson, Shu Lin,
+Jack Ng, Wenlin Cui, Qiang Liu, Wei Huang, Yong Xiao, and Yongjun He.
+"Taurus Database: How to be Fast, Available, and Frugal in the Cloud."
+SIGMOD 2020. DOI: `https://doi.org/10.1145/3318464.3386129`.
+Retrieved 2026-06-05 from the arXiv PDF,
+`https://arxiv.org/abs/2412.02792`.
+
+**Category:** multi-tier cache / data placement; transaction processing /
+write path; MVCC / snapshot / visibility.
+
+**Relevance tags:** disaggregated storage; append-only storage; WAL
+publication; page reconstruction; read replicas; visible LSNs; recovery;
+constant-time snapshots; cold-tier page service; log truncation.
+
+**Core idea:** Taurus is a cloud-native relational database that splits
+compute from storage and then splits storage into two different services:
+strongly replicated Log Stores for durability and eventually current Page
+Stores for page reads. The key move is that the durable log is the source of
+truth, while page service is allowed to be repaired from that log. This lets
+the write path acknowledge after durable log replication and after at least
+one relevant Page Store has accepted the slice fragment needed for forward
+progress, instead of waiting for a quorum of page replicas.
+
+For GPU DB, the transferable idea is a frontier-based contract: publish a
+small, named boundary that says which durable writes are safe, which derived
+tiers can serve data up to that boundary, and which old versions must remain
+available. GPU resident snapshots, CPU warm segments, and NVMe/cold pages can
+then be treated as repairable service tiers rather than correctness owners.
+
+**Concrete mechanisms:**
+
+- The compute layer uses a modified MySQL front end. A Storage Abstraction
+  Layer (SAL) hides remote storage, database slicing, recovery, read-replica
+  synchronization, and page reads/writes from the SQL engine.
+- Log Stores persist PLogs, limited-size append-only log objects. Each PLog is
+  synchronously replicated to three Log Stores; if one chosen store is slow or
+  unavailable, Taurus stops writing that PLog and creates another PLog on a
+  different set of Log Stores.
+- Page Stores own fixed-size database slices, 10GB in the paper, and each
+  slice is replicated to three Page Stores. Page Stores receive only log
+  records for pages in their slices and reconstruct requested page versions.
+- SAL batches redo records into database log buffers, writes them to Log
+  Stores first for durability, then distributes records into per-slice buffers
+  for Page Stores. Per-slice buffers flush when full or after a timeout.
+- Taurus maintains a cluster visible LSN (CV-LSN), a database-wide frontier
+  at a physically consistent group boundary. SAL advances CV-LSN only after
+  the database log buffer is durable in Log Stores and matching per-slice
+  buffers have reached at least one Page Store for every affected slice.
+- Page Stores expose `WriteLogs`, `ReadPage`, `SetRecycleLSN`, and
+  `GetPersistentLSN`. `ReadPage` requests include the required page version
+  and the LSN up to which the Page Store must have records; an unready Page
+  Store returns an error and SAL tries another replica.
+- Log truncation is LSN-based. Each Page Store tracks a slice persistent LSN;
+  SAL tracks persistent LSNs per slice replica and deletes PLogs only after
+  records are known to have reached all relevant slice replicas and read
+  replicas no longer need them.
+- Page Store recovery combines replica gossip with SAL repair from Log Stores.
+  If all Page Store replicas miss a log fragment, SAL detects stagnant or
+  reduced persistent LSNs, rereads missing records from Log Stores, and resends
+  them to the Page Stores.
+- Read replicas get log locations and slice metadata from the master, but read
+  redo records directly from Log Stores. This avoids making the master stream
+  the same redo bytes to every read replica.
+- Read replicas maintain a replica visible LSN at log group boundaries for
+  physical consistency. Each read transaction records a transaction visible
+  LSN (TV-LSN); the minimum active TV-LSN feeds the recycle LSN so Page Stores
+  know which old page versions must remain serviceable.
+- Page Stores use append-only slice logs. Their Log Directory, implemented as
+  a lock-free hash table keyed by page ID, tracks log-record and page-version
+  locations needed to reconstruct pages.
+- Consolidation is log-cache-centric rather than longest-chain-first. Taurus
+  consolidates records that are already in the log cache to avoid small reads
+  from disk, even if this lowers buffer-pool hit rate.
+- The paper reports Taurus beating published Aurora numbers across the
+  evaluated SysBench/TPC-C comparisons, up to 160% in TPC-C, and keeping read
+  replica lag below 11ms at 200,000 writes per second. These are system- and
+  hardware-specific claims, not direct GPU DB predictions.
+
+**GPU DB mapping:** Taurus supports the P8 rule that WAL/checkpoint/archive
+state remains the authority while GPU, host-columnar, and cold-page structures
+are derived tiers. The useful abstraction is not a page server clone; it is
+the separation between durable publication and serviceable derived state.
+
+The CV-LSN maps to a route frontier. For GPU DB, a retained route should know:
+the durable WAL boundary, the CPU MVCC visibility boundary, the resident
+snapshot generation, and the oldest active read frontier. A route is eligible
+only if these frontiers prove that its tier can serve the requested snapshot.
+If the GPU tier is stale but the CPU or NVMe tier can serve the frontier, the
+route should fall back explicitly rather than weakening visibility.
+
+Taurus's Page Stores are eventually current, but recoverable from Log Stores.
+That is close to how GPU resident segments should behave: they may lag behind
+the mutation owner, may be invalidated or missing, and may be rebuilt from CPU
+truth plus WAL, but they must never be the only holder of a committed version.
+The same pattern also applies to future NVMe cold segments and old-snapshot
+side structures.
+
+The read-replica TV-LSN design is a practical model for retained GPU reads.
+Each active read can hold a small visible-frontier token, while the tier
+manager tracks the minimum active frontier before deleting old versions,
+evicting old resident generations, or truncating cold-tier redo. Long GPU scans
+should pin only the versions they need, not every fresh write-path structure.
+
+The log-cache-centric consolidation lesson maps to refresh policy. A GPU DB
+refresh loop should prefer work whose deltas are still hot in memory or pinned
+buffers, rather than choosing only the table with the longest invalidation
+chain and then faulting many cold redo fragments back from disk.
+
+**Risks and mismatches:** Taurus is a cloud MySQL storage architecture, not an
+in-process GPU storage engine. It operates at page granularity, while P8 uses
+MVCC tuple versions, column groups, text buffers, resident key vectors, and
+GPU kernels. Its availability model assumes large pools of storage nodes and
+uncorrelated failures; a single-node GPU DB will not get the same probability
+shape. The paper does not solve GPU memory pressure, CUDA synchronization,
+predicate pushdown, or session admission. It also allows Page Stores to be
+eventually current only because Log Stores remain strongly durable and SAL can
+repair missing fragments, so copying only the "eventual" part would be unsafe.
+
+**Benchmark candidates:**
+
+- Add route-frontier telemetry for every retained read: WAL boundary, CPU
+  visibility boundary, resident generation, oldest active read frontier,
+  selected tier, and fallback reason. Gate: no route executes from a tier
+  whose frontier is behind the requested snapshot.
+- Prototype an LSN-like resident refresh frontier for one P8 table. Mutations
+  invalidate the GPU generation, a background refresh advances the frontier,
+  and reads fall back until the frontier catches up. Failure condition:
+  stale GPU rows are ever returned after mutation visibility.
+- Build a log-cache-centric refresh microbenchmark: compare refreshing the
+  longest invalidation chain first against refreshing deltas that are still in
+  hot/pinned buffers. Measure refresh latency, cold redo reads, and foreground
+  route p95 under concurrent writes.
+- Add a retained-read recycle-frontier test with one long GPU scan, many short
+  retained lookups, and continuous writes. Old generations may remain
+  serviceable, but fresh write admission and short reads must not wait on
+  old-generation cleanup.
+- Model Page Store repair as a derived-tier rebuild test: corrupt or evict a
+  resident segment, rebuild from CPU truth and WAL/checkpoint state, and prove
+  identical visible rows and explicit unavailability while rebuild is pending.
+- For future NVMe/cold-tier work, compare append-only segment writes plus
+  consolidation against in-place cold-page updates. Minimum proof gate:
+  lower write amplification without increasing read fallback tail latency.
+
+### 2026-06-05 - Cross-paper synthesis: fallback, tiering, and recovery all need route frontiers
+
+The last three papers converge on one design track: every route needs a small
+frontier contract before it can be optimized. CPU scan variants need a
+code-shape frontier: selectivity, predicate count, aggregate work, and whether
+branchy, predicated, SIMD, GPU, or warm-tier execution is currently justified.
+HeMem adds a placement frontier: hot/cold evidence, write-heavy priority,
+migration rate, and whether promotion/demotion is background-safe. Taurus adds
+a recovery frontier: durable WAL boundary, serviceable page or segment
+boundary, oldest active read boundary, and repair source.
+
+The category gap is now not "find another faster scan." It is proving that the
+GPU DB route selector can reject stale or over-budget routes early, then fall
+back to CPU or cold-tier work with an explicit reason. Transaction/MVCC papers
+are still needed, but the next useful experiments should make route
+certificates concrete enough that transaction papers can plug into them.
+
+**Benchmark priorities:**
+
+- Add a route-certificate log for retained reads and CPU fallback: visibility
+  frontier, tier frontier, code-shape choice, and fallback reason.
+- Calibrate CPU scan variants before any GPU resident route claims victory for
+  selective filters or simple aggregates.
+- Make background refresh/tier migration prove it does not block WAL
+  publication, short retained reads, or old-snapshot retirement.
+- Treat rebuildable derived tiers like Taurus Page Stores: unavailable while
+  stale, repairable from durable truth, and never authoritative by themselves.
