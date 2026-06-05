@@ -38,6 +38,173 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Decibel: The Relational Dataset Branching System
+
+**Citation:** Michael Maddox, David Goehring, Aaron J. Elmore,
+Samuel Madden, Aditya Parameswaran, and Amol Deshpande. "Decibel:
+The Relational Dataset Branching System." PVLDB 9(9), 2016,
+pp. 624-635. doi:10.14778/2947618.2947619. Retrieved 2026-06-06
+from `https://www.vldb.org/pvldb/vol9/p624-maddox.pdf`.
+
+**Category:** MVCC / snapshot / visibility, with multi-tier
+storage and dataset-versioning relevance.
+
+**Relevance tags:** branched versions; retained snapshots; version
+graphs; tuple-first storage; version-first storage; segment-local
+bitmaps; diff and merge; checkout; branch-aware scans; storage
+amplification; benchmark design.
+
+**Core idea:** Decibel treats relational datasets like a versioned
+repository rather than a single linear history. Users can commit,
+checkout, branch, diff, and merge relational versions while still
+using database features such as SQL, sessions, transactions, WAL,
+and recovery. The paper's main storage question is how to avoid
+copying whole datasets for every branch while still supporting
+efficient single-version scans, multi-version comparisons, diffs,
+and merges.
+
+The paper evaluates three physical layouts. Tuple-first storage keeps
+all tuple versions in one shared heap and uses bitmaps to record
+which branches contain each tuple. Version-first storage keeps each
+branch's changes in segment files chained through ancestry. Hybrid
+storage combines segmented files with segment-local bitmaps plus a
+global branch-segment bitmap. The hybrid design keeps much of the
+lineage locality of version-first while recovering bitmap-friendly
+multi-version operations from tuple-first.
+
+**Concrete mechanisms:**
+
+- Decibel stores a version graph for commits and branches. A branch
+  is the lineage from a leaf/head version back to the root, and a
+  commit is an immutable logical snapshot of one or more relations.
+- A session points at a checked-out commit or branch. Different users
+  can read older versions concurrently, while concurrent transactions
+  on the same version are isolated by two-phase locking in the
+  prototype.
+- Primary keys are the cross-version identity for records. Primary-key
+  changes logically create new records; the prototype assumes keys are
+  not reused for different semantic records.
+- Commits are explicit logical checkpoints. Updates made before a
+  commit are part of a single transaction and become atomically visible
+  at commit time; commits to non-head versions are disallowed, but a
+  new branch can be created from any commit.
+- Merge is record/field aware rather than line based. Non-overlapping
+  field updates can auto-merge; conflicting field updates are resolved
+  by a user-specified policy, with branch precedence used in the
+  evaluation.
+- Tuple-first storage uses branch-oriented or tuple-oriented bitmaps.
+  Branch-oriented bitmaps make single-branch membership checks cheaper;
+  tuple-oriented bitmaps can help multi-branch membership scans.
+- Tuple-first commits store compressed branch bitmap deltas using XOR
+  plus run-length encoding, with a higher composite-delta layer to
+  reduce long checkout chains.
+- Version-first storage appends inserts and updates to branch segment
+  files. Deletes become tombstone records because historical versions
+  may still need to see older tuples.
+- Version-first branch scans traverse segment ancestry in reverse,
+  using an in-memory emitted-key set so child updates or tombstones
+  hide older ancestor records. Merges require parent scan order and may
+  force more complex multi-pass scans.
+- Hybrid storage freezes head segments into internal segments when
+  branching, creates new head segments for parent and child branches,
+  and uses a branch-segment bitmap to skip segments with no live rows
+  for a requested branch/version expression.
+- Hybrid merge first uses segment bitmaps and the lowest common
+  ancestor to locate potentially conflicting records, then scans common
+  ancestor records for field-level three-way comparison.
+- The benchmark stresses deep, flat, science, and curation branching
+  patterns with single-version scans, diffs, joins between versions,
+  and all-head-version scans.
+- In the evaluation, hybrid generally matches or beats the best of
+  tuple-first and version-first. Bitmap commit metadata remains under
+  1% of total storage in the reported experiments, and commit/checkout
+  times are under one second.
+- Compared with git-backed storage, Decibel's hybrid approach reports
+  up to three orders of magnitude lower commit and checkout latency on
+  the tested datasets, trading against full-record-copy overhead on
+  updates.
+
+**GPU DB mapping:** Decibel is not an OLTP MVCC engine, but it is a
+good physical-design warning for retained GPU snapshots: timestamps
+alone do not define a cheap historical read path. The engine needs a
+version graph or generation graph for resident snapshots, refresh
+boundaries, branch-like what-if route states, checkpoint generations,
+and long analytical snapshots, plus physical structures that make
+single-generation reads and cross-generation comparisons cheap.
+
+The hybrid segment-plus-bitmap layout maps directly to P8 resident
+segments. A GPU DB retained snapshot could publish immutable column
+segments plus local visibility bitmaps, while a compact global
+generation/segment bitmap states which segments contain rows live for
+which snapshot or refresh generation. Fresh point/range reads get
+segment locality; diff, invalidation, refresh, and old-snapshot repair
+get bitmap operations instead of scanning every retained generation.
+
+The branch-segment bitmap is also a candidate cache-admission and
+eviction primitive. Instead of caching whole query results, the
+residency owner could expose which table/partition segments are valid
+for which visibility boundary, schema generation, and route family.
+That lets the planner skip cold or invalid segments deterministically
+and gives the cache manager an explicit accounting surface for
+snapshot pinning.
+
+Decibel's merge and diff operators suggest benchmarkable admin and
+maintenance paths. GPU DB will need to compare resident generations
+after refresh, repair a segment from deltas, compute invalidated row
+sets after COPY/UPDATE/DELETE, and reconcile checkpoint/replay
+frontiers. Segment-local bitmaps make those operations closer to
+set algebra than ad hoc scans over tuple chains.
+
+For MVCC, the important mismatch is scope. SQL-visible transactional
+versions are much denser and shorter-lived than Decibel's human-level
+branches. GPU DB should not create a Decibel-style branch for every
+transaction. The transferable idea is to use coarser retained
+generations and segment-local membership summaries where many reads
+share a boundary.
+
+**Risks and mismatches:** Decibel targets collaborative dataset
+versioning, not high-rate OLTP. It is implemented over SimpleDB, uses
+two-phase locking in the prototype, and does not evaluate modern
+multicore contention, GPU execution, CUDA memory ownership, NVMe
+tiering, or pgwire session scale. The paper's full-record-copy update
+approach can amplify storage badly under table-wide updates; the
+authors call compression/materialization a future direction.
+
+The benchmark uses a single-threaded client and synthetic integer
+records, so its latency results should not be copied as production
+expectations. Hybrid bitmaps may become expensive if every transaction
+or row-level MVCC timestamp becomes a separate bitmap dimension. GPU
+DB needs generation coalescing, compression, and GC rules before using
+this for hot paths.
+
+**Benchmark candidates:**
+
+- Prototype a P8 `generation_segment_bitmap` for resident table
+  snapshots: rows are grouped into immutable segments, each segment has
+  local live/deleted membership summaries, and a global map lists which
+  segments are relevant to a snapshot generation. Gate: identical
+  visible row sets versus the MVCC tuple-store oracle.
+- Add a retained-generation diff benchmark after COPY/UPDATE/DELETE:
+  compute invalidated row ids by segment-local bitmap algebra versus
+  scanning tuple-version chains. Measure latency, bytes touched,
+  allocation, and correctness under deletes and updates.
+- Compare three snapshot-retention layouts for read-heavy mixed
+  workloads: tuple-chain only, version-first delta segments, and hybrid
+  segment plus bitmap summaries. Required metrics: point lookup p99,
+  range scan p99, write throughput, retained bytes, and GC cost.
+- Add a segment-skip planner proof: for a query route, expose the
+  table OID, schema generation, visibility boundary, route family, and
+  segment bitmap used. Failure condition: the planner silently scans an
+  invalid or irrelevant resident segment.
+- Build a table-wide update amplification test against resident
+  snapshots. Failure condition: one broad update forces full resident
+  duplication without an explicit demotion, rebuild, or compressed-delta
+  policy.
+- Add a generation checkout/rebuild probe for recovery: replay WAL to
+  CPU truth, rebuild a prior retained generation from segment deltas or
+  snapshots, and verify checksum/row-set equality before publishing it
+  for reads.
+
 ### 2026-06-02 - Scalable and Robust Snapshot Isolation for High-Performance Storage Engines
 
 **Citation:** Adnan Alhomssi and Viktor Leis. "Scalable and Robust

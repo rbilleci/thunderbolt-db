@@ -5684,14 +5684,14 @@ Append new candidates here as each paper is processed.
   Why: Ultra Ethernet motivates its design as an answer to RoCE/RDMA
   deployment pain; useful background for avoiding fragile lossless-network
   assumptions in GPU DB's future gateway and accelerator-fabric design.
-- `queued` — **Decibel: The Relational Dataset Branching System**,
+- `reviewed` — **Decibel: The Relational Dataset Branching System**,
   Maddox et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p624-maddox.pdf`
   DOI: `https://doi.org/10.14778/2947618.2947619`
   Why: OrpheusDB contrasts its bolt-on relational approach with Decibel's
   native versioned storage engine; useful for comparing branch-aware storage
   primitives against GPU DB's MVCC lineage, retained snapshots, and
-  old-version reconstruction cost.
+  old-version reconstruction cost. Journal entry added 2026-06-06.
 - `queued` — **Principles of Dataset Versioning: Exploring the
   Recreation/Storage Tradeoff**, Bhattacherjee et al., PVLDB 2015.
   URL: `https://www.vldb.org/pvldb/vol8/p1346-bhattacherjee.pdf`
@@ -5699,6 +5699,18 @@ Append new candidates here as each paper is processed.
   Why: OrpheusDB builds on the recreation/storage tradeoff for versioned
   datasets; useful for turning GPU DB snapshot-retention, checkpoint, and
   cold-version reconstruction policy into an explicit cost frontier.
+- `queued` — **DataHub: Collaborative Data Science & Dataset Version
+  Management at Scale**, Bhardwaj et al., CIDR 2015.
+  URL: `https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper18.pdf`
+  Why: Decibel is a DataHub component; useful for understanding the broader
+  collaborative-data workload, access-control, provenance, and version-query
+  surface that motivated branch-aware relational storage.
+- `queued` — **Towards a Unified Query Language for Provenance and
+  Versioning**, Chavan et al., TaPP 2015.
+  URL: `https://www.usenix.org/conference/tapp15/workshop-program/presentation/chavan`
+  Why: Decibel's VQuel support builds on this work; useful for deciding how
+  much version/provenance query surface GPU DB should expose for retained
+  generations, diffs, replay frontiers, and debugging.
 - `reviewed` — **Type-Aware Transactions for Faster Concurrent Code**,
   Herman, Inala, Huang, Tsai, Kohler, Liskov, and Shrira, EuroSys 2016.
   URL: `https://doi.org/10.1145/2901318.2901348`
