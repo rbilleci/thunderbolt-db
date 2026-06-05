@@ -4491,3 +4491,31 @@ Append new candidates here as each paper is processed.
   Why: Horae contrasts its multi-queue/multi-device control/data split with
   BarrierFS; useful for comparing fbarrier-style ordering without durability
   against GPU DB WAL, checkpoint, and cold-tier publication boundaries.
+- `reviewed` — **Generic Version Control: Configurable Versioning for
+  Application-Specific Requirements**, Yilmaz and Dittrich, CIDR 2025.
+  URL:
+  `https://mail.vldb.org/cidrdb/2025/generic-version-control-configurable-versioning-for-application-specific-requirements.html`
+  PDF: `https://mail.vldb.org/cidrdb/papers/2025/p24-yilmaz.pdf`
+  Why: selected after the recent synthesis called for more MVCC/visibility
+  and transaction-route proof work; proposes explicit validation-time
+  conflict detection and reconciliation functions that may reduce false
+  aborts without moving semantic repair back to application round trips.
+- `queued` — **TARDiS: A Branch-and-Merge Approach To Weak Consistency**,
+  Crooks et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915213`
+  Why: GenericVC cites TARDiS as branch/merge related work; useful for
+  contrasting database-layer reconciliation with application-visible
+  branch-and-merge semantics under weaker consistency.
+- `queued` — **OrpheusDB: Bolt-on Versioning for Relational Databases**,
+  Huang et al., PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p1130-huang.pdf`
+  DOI: `https://doi.org/10.14778/3115404.3115417`
+  Why: GenericVC contrasts bolt-on relational versioning with a unified
+  transaction/version layer; useful for deciding whether GPU DB old-version
+  lineage should be a first-class MVCC structure or an external branch table.
+- `queued` — **MindPalace: Version Reconciliation for Collaborative
+  Databases**, Ranjan, Shang, Krishnan, and Elmore, SoCC 2021.
+  URL: `https://doi.org/10.1145/3472883.3486994`
+  Why: GenericVC cites MindPalace's auto-mergeability as related
+  reconciliation work; useful for comparing semantic merge rules against
+  strict SQL validation and retained-snapshot correctness.

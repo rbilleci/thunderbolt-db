@@ -56151,3 +56151,181 @@ snapshot checks, CUDA work, WAL flushing, or response encoding.
 - Add a "fast path closed" route certificate field for protocol-edge
   decisions: `edge_classified`, `edge_rejected`, `edge_overflow`,
   `edge_generation_mismatch`, and `edge_forwarded_to_user_space`.
+
+### 2026-06-05 - GenericVC turns MVCC conflicts into configurable validation work
+
+**Citation:** Gunce Su Yilmaz and Jens Dittrich. "Generic Version
+Control: Configurable Versioning for Application-Specific Requirements."
+CIDR 2025. Retrieved 2026-06-05 from the CIDR publication page and
+PDF, `https://mail.vldb.org/cidrdb/papers/2025/p24-yilmaz.pdf`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** MVCC; conflict validation; reconciliation; nested
+transactions; version graphs; application-specific conflict rules;
+semantic repair; abort reduction; route certificates.
+
+**Core idea:** GenericVC is a vision paper that compares MVCC and Git as
+two specialized forms of version control, then proposes a unified versioned
+system where transactions, branches, nested transactions, conflict
+detection, and reconciliation are configurable. The useful database idea is
+not that SQL should behave like Git by default. It is that conflict
+definition and conflict repair can be explicit commit-validation functions
+instead of a fixed abort rule baked into the concurrency-control algorithm.
+
+The paper proposes two user-definable functions, `detect_conflicts` and
+`reconcile`, that run during transaction validation. `detect_conflicts`
+decides which versions actually conflict at tuple, attribute, relation,
+transaction, or database granularity. `reconcile` can create replacement
+versions, invalidate losing versions, or return failures that force abort or
+manual handling. The claimed benefits are qualitative: fewer unnecessary
+aborts and fewer application round trips for conflict repair. The authors
+state that performance and scalability experiments are future work, so this
+entry treats GenericVC as a design source rather than an evaluated throughput
+claim.
+
+**Concrete mechanisms:**
+
+- GenericVC models Git commit graphs as nested transactions. A feature branch
+  maps to a private transaction space, and committing or merging maps to
+  publishing versions into a parent transaction.
+- MVCC-style visibility uses timestamped tuple versions and hidden begin/end
+  metadata, while Git-style versioning uses content-addressed objects and a
+  commit graph. GenericVC tries to expose the common concepts behind both.
+- The validation phase calls `detect_conflicts(T_read_write_set,
+  T_parent_write_set)` over versions read and written by the committing
+  transaction and versions committed to the parent since the transaction
+  began.
+- The example `detect_conflicts` implementation uses a tuple identifier
+  composed of table id and row id, intersects the transaction read/write set
+  with the parent write set, and returns conflicting version pairs.
+- The paper explicitly allows custom conflict granularity. A use case can
+  compare attribute ids instead of tuple ids so independent column updates do
+  not become false conflicts.
+- `reconcile` runs inside validation, not as an ordinary deferred trigger.
+  Reconciliation may create new tuple versions in a nested transaction and
+  invalidate conflicting versions that should no longer become visible.
+- After reconciliation creates versions, GenericVC recursively runs conflict
+  detection again. If reconciliation introduced new conflicts, the process
+  repeats until there are no conflicts or reconciliation fails.
+- A Git-style reconciliation example performs a three-way merge using the
+  transaction version, the parent version, and a base version as of the
+  transaction begin timestamp.
+- A hybrid inventory example disables first-writer prevention for the
+  inventory tuple, lets concurrent checkout transactions update it, and then
+  reconciles the later transaction by moving an out-of-stock item to a
+  wishlist while preserving other checkout effects.
+- The paper argues reconciliation must run in the commit-validation phase
+  because ordinary deferred triggers run before validation; another
+  transaction could commit between trigger execution and validation, making
+  the repair stale.
+- Physical storage discussion contrasts MVCC append-only, time-travel, and
+  delta version storage with Git loose and packed objects. It highlights that
+  packed reverse deltas resemble MVCC delta storage, while MVCC GC removes
+  versions no active transaction can see.
+
+**GPU DB mapping:** GenericVC suggests a cautious extension to the current
+WAL/MVCC design: not all conflicts need the same policy. GPU DB can keep
+strict default MVCC and serializable validation, but route certificates for
+prepared transaction shapes could declare a conflict policy such as
+tuple-strict, attribute-disjoint, commutative-counter, inventory-repair, or
+no-repair. That gives the mutation owner a way to reduce false aborts without
+making semantic exceptions invisible.
+
+The commit-validation placement is the key transfer. Any reconciliation must
+happen after the system knows the concurrent versions that actually committed,
+but before WAL publish and visibility. For GPU DB that means reconciliation
+belongs in the mutation owner or a validation owner with exclusive authority
+over the affected write set. It should not run in network IO workers, GPU
+execution workers, protocol-edge filters, or application retry paths if the
+goal is to remove extra round trips.
+
+The nested-transaction framing also maps to route repair. A transaction can
+have an original write set, a repair write set, and a final published write
+set. WAL records should make those phases explicit enough that crash replay
+reconstructs only the final visible outcome, while diagnostics can still
+explain which route was reconciled. GPU refresh should consume only the final
+public versions, not private or superseded repair versions.
+
+The version-graph comparison is useful for retained snapshots. Long retained
+read snapshots do not need Git-style branching, but the engine may eventually
+need snapshot families: user transactions, retained GPU reads, refresh
+snapshots, repair/nested validation snapshots, and recovery snapshots. Naming
+the parent-child relationship between these handles can prevent ambiguous
+visibility rules as route repair and resident refresh become more complex.
+
+For multi-tier placement, the Git packed-object analogy is a reminder that old
+versions need not stay in the same shape as hot current versions. Current
+versions can remain GPU-friendly dense segments, while old or repair-only
+versions can be encoded as CPU-side deltas, graveyard entries, or cold
+lineage records until GC proves no snapshot can see them.
+
+**Risks and mismatches:** GenericVC is a vision paper, not a measured DBMS.
+It has no throughput, latency, abort-rate, or recovery evaluation, and it does
+not provide a production implementation of arbitrary SQL constraints,
+predicate reads, secondary indexes, or serializable validation. The paper's
+strongest claims are conceptual.
+
+Application-specific reconciliation can also weaken correctness if treated as
+a casual optimization. A merge rule that is valid for a shopping-cart example
+may be invalid for money movement, inventory reservations, unique indexes,
+foreign keys, triggers, or regulatory audit trails. GPU DB should require
+explicit route support, proof tests, and conservative fallback before any
+custom conflict rule can run.
+
+The paper deliberately questions fixed MVCC conflict handling, but GPU DB must
+not weaken WAL-before-visibility, crash replay, snapshot correctness, or
+client-visible SQL semantics. Reconciliation must be deterministic under
+replay, must identify every version it reads and writes, and must leave enough
+metadata for debugging and benchmark comparison.
+
+**Benchmark candidates:**
+
+- Build a validation-only simulator with three policies: strict tuple-level
+  first-writer-wins, attribute-disjoint conflict detection, and one
+  commutative or inventory-style reconciliation policy. Gate: serializable
+  outcomes match a reference rule for supported transaction templates.
+- Add route-certificate fields for `conflict_policy`,
+  `conflict_granularity`, `reconciliation_policy`,
+  `reconciliation_attempted`, `reconciliation_succeeded`,
+  `repair_version_count`, `repair_read_set`, and `repair_write_set`.
+- Add a crash/replay test where reconciliation creates replacement versions
+  before visibility. Failure condition: replay exposes a private,
+  superseded, or failed repair version.
+- Compare application retry versus validation-time reconciliation for one
+  prepared checkout or counter workload. Metrics: abort count, round trips,
+  WAL bytes, p50/p99 commit latency, and refresh invalidations.
+- Test retained read snapshots while reconciliation is active. Required
+  result: readers see either the pre-commit snapshot or the final committed
+  repaired version, never an intermediate repair transaction.
+- Measure old-version shape after repair. If repair creates versions no public
+  snapshot can see, they should be pruned before GPU refresh or kept as
+  CPU-side lineage rather than polluting resident segments.
+
+### 2026-06-05 - Cross-paper synthesis: route certificates need semantic conflict shape, not only resource shape
+
+The last four reviews extend the route-certificate track in two directions.
+Gria makes deterministic batches adaptive and multi-versioned; Horae separates
+durable control order from parallel data writes; Electrode keeps tiny protocol
+fast paths near the kernel while leaving semantic authority in user space; and
+GenericVC argues that conflict detection and reconciliation should be explicit
+validation work.
+
+The convergence is that every high-throughput shortcut needs a small,
+auditable contract. A request should say which resource budgets it consumes,
+which durable frontier makes it recoverable, which protocol-edge decisions
+were made, and which conflict policy is allowed. Queue depth alone cannot
+explain whether delaying, batching, repairing, falling back, or rejecting a
+request is correct.
+
+The main gap is still evaluated implementation for MVCC route repair under
+ordinary SQL constraints. The next papers should lean toward serializability
+certification, false-abort reduction, and recovery-safe version cleanup rather
+than more GPU analytics. Storage-tier and runtime sources are now strong
+enough to start turning certificates into benchmark fields.
+
+Benchmark priority: build one active-window harness that includes conflict
+policy, WAL/control frontier, fixed-capacity completion cells, and retained
+snapshot visibility. The proof gate is not just higher throughput. It is
+higher p99 stability with identical committed results, deterministic replay,
+and no exposure of private repair or non-public batch versions.
