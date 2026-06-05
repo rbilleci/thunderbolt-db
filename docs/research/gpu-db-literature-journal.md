@@ -60718,3 +60718,166 @@ central for GPU DB.
   view proof for readers in addition to linearizable publication. Gate: stress
   histories can be checked against generated witnesses for publication and
   retirement order.
+
+### 2026-06-05 - Index checkpoints move recovery risk from rebuild time to derived-state correctness
+
+**Citation:** Leon Lee, Siphrey Xie, Yunus Ma, and Shimin Chen. "Index
+Checkpoints for Instant Recovery in In-Memory Database Systems." PVLDB 15(8),
+2022, pp. 1671-1683. doi:10.14778/3529337.3529350. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol15/p1671-lee.pdf`.
+
+**Category:** multi-tier cache / data placement, with recovery, MVCC, and
+write-path relevance.
+
+**Relevance tags:** instant recovery; index checkpoints; derived indexes;
+MVCC snapshots; deferred deletion; on-demand cleanup; indirection arrays;
+copy-on-write; mmap-friendly checkpoint files; ART; CPU truth rebuild;
+resident-index acceleration state.
+
+**Core idea:** The paper observes that once in-memory databases optimize data
+checkpoint loading and log replay, recovery can become dominated by rebuilding
+indexes that were treated as volatile derived state. The proposed response is
+to persist index checkpoints as well, but without pretending they are fully
+transaction-consistent snapshots. Instead, the system preserves correctness by
+making checkpointed indexes conservative: they must not miss entries that
+belong to the transaction-consistent data snapshot, and any extra dangling
+entries are cleaned lazily after restart.
+
+The most transferable design is IACoW, an indirection-array based copy-on-write
+ART. Tree nodes use logical node IDs through an indirection array instead of
+direct child pointers, so modifying a node during a checkpoint copies only that
+node version rather than copying the whole root-to-leaf path. Checkpoints can
+then scan the indirection array in parallel, serialize the selected node
+versions into mmap-friendly files, and recover by loading the latest full index
+checkpoint plus later incremental checkpoints.
+
+The evaluation in Huawei's HiEngine reports recovery near the paper's roughly
+10 second target with IACoW and only about 5%-11% transaction-throughput loss
+relative to a baseline that does not checkpoint indexes. ChainIndex and
+MirrorIndex show the tradeoff space: freezing incremental trees can be
+wait-free but causes read amplification, while a mirror tree removes read
+amplification but adds write and memory overhead plus slower checkpointing.
+
+**Concrete mechanisms:**
+
+- HiEngine stores tuple IDs in indexes and resolves them through an indirection
+  array that can point either to in-memory tuple addresses or on-storage log
+  offsets, allowing tuple contents to be restored lazily after recovery.
+- Data checkpoints are "dataless": the transaction-consistent tuple snapshot
+  stores log offsets rather than dumping full tuple payloads, which makes data
+  checkpoint loading fast.
+- Indexes are ART trees with optimistic lock coupling and do not contain MVCC
+  version timestamps, so the paper treats a fully transaction-consistent index
+  checkpoint as infeasible for the target design.
+- A checkpoint timestamp is chosen from persisted transaction progress. Tuple
+  data is checkpointed at that transaction-consistent boundary, while the
+  index snapshot may include operations that do not match that exact boundary.
+- To avoid missing entries after recovery, physical index-entry deletion is
+  deferred until the corresponding tuple version is garbage-collectable. During
+  checkpointing, the GC timestamp is bounded by the persisted checkpoint
+  timestamp so deletes cannot remove entries that the checkpointed tuple
+  snapshot still needs.
+- To handle extra entries, post-restart lookup performs on-demand cleanup. If
+  an index entry points to an empty indirection slot or to a tuple whose key no
+  longer matches the ART key, the entry is treated as dangling and removed.
+- ChainIndex atomically installs a new head tree when a checkpoint starts,
+  freezes the old head after active modifiers drain, serializes frozen trees,
+  and later merges frozen trees to control read amplification and garbage.
+- MirrorIndex adds a full mirror tree for reads, while still freezing
+  incremental trees for checkpointing; this trades lower read amplification
+  for extra write work, memory, and mirror recovery work.
+- IACoW assigns each ART node a logical node ID. Child pointers store node IDs,
+  and the indirection array maps IDs to the current node version.
+- IACoW uses a global tree epoch, per-thread operation epoch, and per-node
+  epoch. At checkpoint start, the checkpoint epoch is captured and the global
+  epoch advances; operations that started before the checkpoint finish in the
+  old epoch, while later mutations copy only nodes that need a new epoch
+  version.
+- Each logical node has at most one version per epoch. Obsolete node versions
+  are retained until the checkpoint is done, then released.
+- IACoW can write incremental checkpoints by serializing nodes whose epoch
+  equals the checkpoint epoch, and periodically write full checkpoints by
+  serializing nodes whose epoch is at or before the checkpoint epoch.
+- Recovery mmaps the latest full index checkpoint and subsequent incremental
+  checkpoints, restores the indirection array, sets the next epoch, and then
+  allows normal index operations while tuple payloads may still be loaded on
+  demand.
+
+**GPU DB mapping:** GPU DB currently treats CPU indexes, route metadata, and
+resident GPU structures as rebuildable acceleration state behind WAL and CPU
+truth. This paper says that is correct for safety, but incomplete for recovery
+SLOs. If a large CPU index, resident key vector, route map, or GPU-resident
+segment catalog takes minutes to rebuild after WAL replay, it may become the
+new recovery bottleneck even though correctness is preserved.
+
+The right transfer is not "checkpoint every cache." It is a policy boundary:
+derived state that is expensive to rebuild and required for service readiness
+should have an explicit checkpoint format; derived state that is cheap to
+rebuild can remain volatile. For P8, that suggests separating CPU canonical
+tuple truth, CPU derived indexes, route metadata, resident snapshot manifests,
+and actual GPU buffers. CPU indexes and resident manifests are plausible
+checkpoint candidates; GPU buffers themselves probably remain rebuildable
+because device memory is not durable and route validity depends on fresh
+publication after restart.
+
+The conservative-index correctness rule maps well to resident route metadata.
+A recovered derived index or resident manifest may safely contain extra stale
+entries only if every lookup validates the tuple/version/generation boundary
+before serving a result and can clean the stale entry. It must not miss entries
+needed by the visible data snapshot. This is the same shape as retained GPU
+reads: route certificates can be conservative, but final visibility and
+generation checks must happen before a query claims a resident answer.
+
+IACoW's logical-pointer design is also useful for CPU-side route maps and
+resident index manifests. Logical IDs decouple stable parent references from
+physical node versions, reducing cascading copies during checkpoint or
+publication windows. For GPU DB, a similar indirection table could map logical
+segment, index-node, or route IDs to CPU memory offsets, mmap checkpoint
+offsets, or rebuilt GPU handles after warmup.
+
+**Risks and mismatches:** The paper is about CPU in-memory indexes, not GPU
+resident buffers, CUDA resources, NVMe tiering, SQL planning, or session
+admission. Its index correctness assumes the index maps to tuple IDs and that
+post-restart lookup can validate a tuple's key through an indirection array.
+GPU columnar snapshots and resident hash/key vectors may need different
+validation hooks.
+
+The checkpointed index is deliberately not transaction consistent. That is
+acceptable only because missing entries are prevented by deferred deletion and
+extra entries are validated lazily. A GPU DB implementation must prove the same
+two-sided property before checkpointing any derived route state. IACoW also
+adds pointer chasing through the indirection array and transient memory growth
+during checkpoints; those costs may hurt read-heavy CPU fallback paths or
+metadata lookups if used too broadly.
+
+The evaluation uses HiEngine and TPC-C/Microbench on CPU. The reported
+5%-11% overhead and near-10-second recovery are useful directional claims, not
+portable constants for this engine.
+
+**Benchmark candidates:**
+
+- Add a recovery-time breakdown benchmark: WAL replay, CPU tuple restore,
+  CPU index rebuild/load, route metadata rebuild/load, resident manifest
+  rebuild/load, and GPU warmup. Gate: derived-state rebuild time is visible
+  separately from correctness recovery.
+- Prototype checkpointing a rebuildable CPU equality index or route manifest
+  with a conservative validation rule. Minimum proof: after crash/restart,
+  PostgreSQL-comparator queries match WAL replay even when the checkpointed
+  derived state contains stale entries.
+- Add a "missing versus dangling" fault-injection test for derived indexes.
+  Missing visible entries must fail the proof gate; dangling entries are
+  allowed only when lookup validates and removes or ignores them before
+  returning rows.
+- Compare three recovery policies for CPU indexes: rebuild from WAL/tuple
+  truth, load a full checkpoint, and load full plus incremental checkpoints.
+  Required metrics: recovery seconds, service-readiness point, steady-state
+  insert/update/delete overhead, memory growth during checkpoint, and p99
+  lookup latency.
+- Evaluate an indirection-array route map for resident segment metadata:
+  logical segment IDs point to CPU manifest offsets before GPU warmup and to
+  GPU handles after publication. Gate: no route can be served until its
+  WAL/read boundary and resident generation validate.
+- Decide an explicit readiness contract: after restart, CPU-correct service
+  may begin before GPU residency warmup, but any route that relies on a
+  checkpointed manifest must expose whether it is loaded, validated, warmed,
+  stale, or rebuilding.

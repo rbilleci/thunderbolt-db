@@ -4782,7 +4782,7 @@ Append new candidates here as each paper is processed.
   Why: MOT reuses this checkpointing line; useful for designing asynchronous
   CPU truth checkpoints that do not stop GPU resident snapshot refresh,
   invalidation, or WAL replay.
-- `queued` — **Index Checkpoints for Instant Recovery in In-Memory Database
+- `reviewed` — **Index Checkpoints for Instant Recovery in In-Memory Database
   Systems**, Lee, Xie, Ma, and Chen, PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1671-lee.pdf`
   DOI: `https://doi.org/10.14778/3529337.3529350`
@@ -4844,3 +4844,21 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up for transaction admission before full execution;
   useful for comparing engine-owned hot-key batching with earlier network or
   gateway triage of likely-conflicting requests.
+- `queued` — **Indexed Log File: Towards Main Memory Database Instant
+  Recovery**, Magalhaes, Brayner, Monteiro, and Moraes, EDBT 2021.
+  URL: `https://openproceedings.org/2021/conf/edbt/p172.pdf`
+  Why: Index Checkpoints builds on indexed-log recovery; useful for comparing
+  log-offset indexes, on-demand tuple restore, and whether GPU DB should make
+  cold CPU tuple reconstruction lazy while keeping route metadata eager.
+- `queued` — **Fast Failure Recovery for Main-Memory DBMSs on Multicores**,
+  Wu, Guo, Chan, and Tan, SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3064011`
+  Why: Index Checkpoints uses PACMAN-style parallel recovery as a baseline;
+  useful for separating parallel log replay, index rebuild, and GPU resident
+  acceleration rebuild in recovery benchmarks.
+- `queued` — **A Comparative Study of Consistent Snapshot Algorithms for
+  Main-Memory Database Systems**, Li et al., IEEE TKDE 2021.
+  URL: `https://doi.org/10.1109/TKDE.2019.2925876`
+  Why: Index Checkpoints relies on tuple snapshot consistency while accepting
+  non-transaction-consistent index checkpoints; useful for choosing CPU truth
+  checkpoint algorithms before deciding which derived indexes are persisted.
