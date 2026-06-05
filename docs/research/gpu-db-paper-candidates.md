@@ -2619,9 +2619,9 @@ Append new candidates here as each paper is processed.
   Why: Dodo compares against DOCC as the predecessor that commits in
   predetermined order but blocks under multicore pressure; useful for
   isolating lazy determinism versus Dodo-style staged re-execution.
-- `queued` — **Gria: an efficient deterministic concurrency control protocol**,
+- `reviewed` — **Gria: an efficient deterministic concurrency control protocol**,
   Wang et al., Frontiers of Computer Science 2024.
-  URL: `https://doi.org/10.1007/s11704-023-2648-8`
+  URL: `https://doi.org/10.1007/s11704-023-2605-z`
   Metadata: `https://academic.hep.com.cn/fcs/CN/Y2024/V18/I4/184204`
   Why: Dodo's author line includes Gria as an Aria follow-up with auto-scaling
   batches, multi-version write-after-write avoidance, reordering, and

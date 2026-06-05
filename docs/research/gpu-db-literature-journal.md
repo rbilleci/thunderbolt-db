@@ -55702,3 +55702,131 @@ against certificates that include in-flight bytes, flush epochs, and
 dependency tokens. A route passes only if p99 improves without
 weakening WAL-before-visibility, snapshot correctness, or abort
 propagation.
+
+### 2026-06-05 - Gria makes deterministic batches adaptive and multi-versioned
+
+**Citation:** Xinyuan Wang, Yun Peng, and Hejiao Huang. "Gria: an
+efficient deterministic concurrency control protocol." Frontiers of
+Computer Science 18(4):184204, 2024. doi:10.1007/s11704-023-2605-z.
+Retrieved 2026-06-05 from the Springer/Frontiers of Computer Science
+article page and supplementary PDF,
+`https://link.springer.com/article/10.1007/s11704-023-2605-z`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** deterministic concurrency control; adaptive batching;
+multi-version writes; write-after-write conflict reduction; reordering;
+rechecking; batch-size admission; retained snapshot publication; conflict
+fallback.
+
+**Core idea:** Gria is a follow-up to Aria-style deterministic OLTP that tries
+to keep the replication benefit of deterministic batches without forcing a
+fixed batch size or a single-version write layout. The paper argues that Aria
+has three practical problems when the read/write set is not known ahead of
+time: users must tune batch size, low-concurrency runs can suffer the same
+conflict pattern as high-concurrency runs, and single-version in-place updates
+create write-after-write conflicts.
+
+Gria's answer is to make the batch size auto-scale from the previous batch's
+committed transaction count, group execution so a transaction reads versions
+from the same worker/group context, and use a multi-version structure so
+write-after-write conflicts do not force the same abort behavior as
+single-version execution. The article page and supplement report reordering in
+the commit phase and a rechecking strategy in an extended phase; the evaluated
+claim is up to 13x over Aria on the authors' benchmarks. Full algorithmic
+pseudocode was not available through the accessible article body in this run,
+so low-level proof details remain to be checked before implementation.
+
+**Concrete mechanisms:**
+
+- Gria keeps deterministic transaction processing: replicas can execute the
+  same ordered workload without per-transaction coordination once the batch
+  order and conflict rules are fixed.
+- A sequencer assigns transaction ordering metadata, and an epoch is processed
+  as multiple batches rather than one fixed-size batch.
+- Batch size is auto-scaling. The supplement says the next batch size is based
+  on the number of committed transactions in the previous batch, using observed
+  commit progress as the feedback signal instead of a static tuning knob.
+- The protocol groups execution so each transaction reads versions written by
+  transactions running in the same thread/group context. The article captions
+  describe this as reducing conflict probability in low-concurrency scenarios.
+- Gria uses a multi-version record structure in which transactions and their
+  written versions point to each other. Only versions of the same group are
+  readable during execution, according to the article figure captions.
+- The multi-version structure removes write-after-write conflicts that arise
+  from concurrent in-place updates to a single version in Aria.
+- A deterministic reordering mechanism runs in the commit phase to reduce
+  conflicts after execution has revealed more dependency information.
+- A rechecking strategy runs in an extended phase to avoid false-positive
+  conflicts that would otherwise abort transactions.
+- The accessible table compares complexity across rebalance, execution,
+  commit, reordering, and GC. It names Gria conflict classes including
+  read-after-write, intra-group write dependencies, and reads of conflicted
+  transactions.
+- The accessible evaluation material shows read- and write-intensive YCSB
+  experiments with varying skew and reports Gria variants against Aria. Exact
+  benchmark configuration details beyond the article page and supplement were
+  not available in this run.
+
+**GPU DB mapping:** Gria is relevant because GPU DB already wants
+micro-batches, owner rings, and deterministic publication boundaries, but it
+should not require a hand-tuned batch size for every hot write workload. A
+mutation or conflict owner could use previous-batch commit count, abort count,
+queue wait, and WAL flush time to resize the next write batch under a latency
+ceiling. That turns "batch for throughput" into a closed-loop admission policy.
+
+The multi-version part maps to P8 and retained snapshots more directly than
+single-version deterministic execution. Hot writes can publish committed
+versions at generation boundaries while preserving older versions for retained
+read snapshots. If a deterministic write batch generates intermediate versions
+that no public snapshot can see, Gria and its Cheetah follow-up suggest those
+versions should be candidates for early pruning rather than GPU refresh.
+
+The grouping idea fits owner domains. GPU DB should compare one global mutation
+batch against per-partition or per-hot-key group batches where each group has
+its own version lane and commit feedback. Low-concurrency groups should not pay
+the same conflict/abort cost as a saturated group, and unrelated retained reads
+should not be delayed behind a globally oversized batch.
+
+Reordering and rechecking are also useful route-certificate concepts. A write
+route can record whether it committed in the original order, was deterministically
+reordered, was rechecked after a false-positive conflict, or fell back to
+owner-serialized execution. That telemetry would let the runtime distinguish
+real contention from overly conservative validation.
+
+**Risks and mismatches:** The most important risk is source depth. The
+accessible Springer page, metadata page, and supplementary PDF expose the core
+ideas, figures, and high-level results, but not enough full pseudocode to treat
+Gria as implementation-ready. Any code work should first obtain the full paper
+or reproduce the protocol from a primary full-text source.
+
+Gria is deterministic OLTP, not MVCC snapshot isolation for arbitrary SQL. Its
+group-local readability rule may not map cleanly to SQL predicate reads,
+secondary indexes, foreign keys, DDL, or retained GPU snapshots. Reordering may
+also complicate WAL-before-visibility if the WAL order, conflict order, and
+response order are not explicitly separated. Finally, auto-scaling by previous
+commit count can lag when workload skew changes abruptly; GPU DB would likely
+need saturation and latency signals as well.
+
+**Benchmark candidates:**
+
+- Add an adaptive write-batch simulator with fixed-size Aria-style batches
+  versus Gria-style previous-commit-count sizing. Metrics: throughput, aborts,
+  p50/p99 commit latency, WAL flush grouping, and queue wait. Failure
+  condition: adaptive sizing oscillates or violates latency ceilings.
+- Prototype per-owner version lanes for a hot-key batch. Compare single-version
+  placeholder updates, ordinary MVCC chains, and group-local multi-version
+  writes. Gate: committed visibility equals the serialized baseline and retained
+  reads never see group-private versions.
+- Add route-certificate fields for `batch_epoch`, `batch_group`,
+  `batch_size_policy`, `prior_committed_count`, `reordered`, `rechecked`,
+  `false_conflict_count`, and `group_private_version_count`.
+- Test deterministic reordering only after WAL order is defined. Required
+  proof: crash/replay produces the same committed version order that readers
+  observe, even when response order differs from deterministic commit order.
+- Build a skew-shift benchmark where a hot key appears and disappears across
+  batches. Expected result: adaptive batch sizing reacts faster than manual
+  fixed sizes without starving unrelated partition groups.
+- Measure refresh pollution from non-public versions. If deterministic batches
+  create versions that no retained snapshot can see, GPU refresh should skip
+  them and GC should reclaim them before they reach resident segment encoding.
