@@ -2506,18 +2506,25 @@ Append new candidates here as each paper is processed.
   Why: cloud database storage architecture with append-only storage,
   replication, recovery, and constant-time snapshots; relevant to future
   cloud/disaggregated durability and snapshot tiers.
-- `queued` — **Near Data Processing in Taurus Database**, Depoutovitch et al.,
+- `reviewed` — **Near Data Processing in Taurus Database**, Lin et al.,
   arXiv 2025.
   URL: `https://arxiv.org/abs/2506.20010`
   Why: direct Taurus follow-up that pushes selection, projection, and
   aggregation into the storage layer; useful for comparing GPU DB cold-tier
-  pushdown with GPU-resident and CPU fallback routes.
+  pushdown with GPU-resident and CPU fallback routes. Journal entry added
+  2026-06-05.
 - `queued` — **Taurus MM: bringing multi-master to the cloud**, Depoutovitch
   et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p3488-depoutovitch.pdf`
   Why: direct Taurus follow-up on multi-master cloud database design; useful
   for comparing cross-owner write ordering, conflict handling, and snapshot
   publication in a disaggregated architecture.
+- `queued` — **Near-Data Processing in Database Systems on Native
+  Computational Storage under HTAP Workloads**, Vincon et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p1991-petrov.pdf`
+  Why: Taurus NDP related work points to update-aware NDP; useful for
+  comparing shared-state snapshot propagation and transactional guarantees
+  when pushing cold-tier scans or aggregates into storage devices.
 - `reviewed` — **Hybrid Garbage Collection for Multi-Version Concurrency Control
   in SAP HANA**, Lee et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2903734`

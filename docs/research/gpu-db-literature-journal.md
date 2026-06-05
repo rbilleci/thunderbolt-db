@@ -72867,3 +72867,149 @@ queries but may not be acceptable for long over-resident scans.
   failed generation, retry on newer generation, or suspend/resume if enough
   epoch metadata exists. Measure tail latency and correctness after simulated
   owner or residency failure.
+
+### 2026-06-05 - Taurus NDP makes cold-tier pushdown best-effort and MVCC-safe
+
+**Citation:** Shu Lin, Arunprasad P. Marathe, Per-Ake Larson, Chong Chen,
+Calvin Sun, Paul Lee, Weidong Yu, Jianwei Li, Juncai Meng, Roulin Lin,
+Xiaoyang Chen, and Qingping Zhu. "Near Data Processing in Taurus Database."
+arXiv:2506.20010, 2025. Retrieved 2026-06-05 from
+`https://arxiv.org/abs/2506.20010` and `https://arxiv.org/pdf/2506.20010`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** near-data processing; cold-tier pushdown; storage-node
+selection; projection pushdown; aggregation pushdown; MVCC read view;
+best-effort fallback; batch reads; descriptor caching; parallel storage reads;
+query optimizer post-processing; disaggregated storage.
+
+**Core idea:** Taurus extends its cloud-native compute/storage split by
+pushing selection, projection, and aggregation into Page Stores, while keeping
+the SQL executor mostly unaware of the new path. The implementation is
+deliberately conservative: the optimizer first produces a normal plan, then
+marks eligible index scans as NDP scans; InnoDB wraps pushdown state in an NDP
+descriptor; Page Stores turn ordinary InnoDB pages into query-private NDP
+pages; and any page, row, or predicate that cannot be safely processed near
+storage falls back to InnoDB on the compute node.
+
+The useful lesson for GPU DB is not merely "push filters down." It is that a
+cold-tier acceleration path can be optional, page-scoped, and still
+semantically invisible to higher layers if the fallback boundary is precise.
+Taurus preserves index order, handles MVCC ambiguity by returning full records
+to InnoDB, and lets overloaded Page Stores skip NDP instead of blocking
+ordinary page service. On 100 GB TPC-H, the paper reports that 18 of 22 queries
+benefited, network traffic fell by 63%, SQL-node CPU time fell by 50%, and Q15
+reduced data shipped by 98%, CPU time by 91%, and runtime by 80%.
+
+**Concrete mechanisms:**
+
+- NDP is a plan post-processing step, not a full optimizer alternative. The
+  final plan is inspected for eligible table accesses; projection and
+  predicate pushdown may apply to each access, while aggregation pushdown is
+  considered for the last table access in a query block.
+- An NDP descriptor carries projected columns, LLVM IR for eligible
+  table-local predicates, aggregation functions and grouping columns, type and
+  index metadata, and an MVCC read-view low watermark.
+- Page Stores compile predicate IR into native functions and apply predicates,
+  projection, and partial aggregation to visible rows. Descriptor decoding and
+  JIT setup are cached by a descriptor hash, cutting average descriptor
+  handling to under 5 microseconds in the authors' report.
+- Page Stores can only prove visibility by comparing a row transaction id with
+  the descriptor's low watermark. Rows that may require undo-chain traversal
+  are ambiguous and are returned unchanged so InnoDB can reconstruct the right
+  version and finish NDP work.
+- NDP pages resemble regular InnoDB pages, retain index-key order, and are
+  tagged with new NDP projection or aggregate record types. They live in the
+  buffer pool but are query-private and kept out of normal hash/LRU/flush
+  lists.
+- NDP scans use large batch reads, often around a thousand pages. A scan locks
+  the B-tree path down to a level-1 page, records an LSN for the subtree,
+  releases locks, and asks Page Stores for page versions matching that LSN.
+- Page Stores process batch-read pages concurrently and the storage abstraction
+  layer splits batches across slices and stores, yielding parallelism at the
+  SQL node, across Page Stores, and within each Page Store.
+- Resource control is page-scoped. Page Stores use a dedicated NDP thread pool
+  and queue, treat NDP as best effort, and may return raw pages when NDP would
+  wait too long. The compute node then completes the omitted work.
+- Aggregation pushdown is restricted. Page Stores can do scalar cross-page
+  aggregation within one batch; grouped aggregation stays per page unless page
+  adjacency is known. Residual predicates, unsupported types/functions, UDFs,
+  and small point-lookups remain outside the NDP path.
+- The evaluation also shows a cache side effect: NDP can avoid warming the
+  regular buffer pool, causing a later non-NDP query to miss more often. The
+  authors observed one TPC-H query's runtime increase despite modest data
+  reduction because prior NDP scans had not loaded ordinary pages.
+
+**GPU DB mapping:** Taurus NDP maps cleanly to P8's cold and warm tiers. GPU DB
+should treat NVMe, CPU compressed segments, remote storage, and future CXL or
+storage-compute layers as optional route stages with a proof/fallback contract:
+if a stage can prove predicate support, MVCC visibility, layout compatibility,
+and pressure budget, it may reduce data before the next tier; otherwise it must
+return enough raw state for the normal CPU/MVCC path to finish.
+
+The page-scoped best-effort model is especially important for 1M-session
+admission. Cold-tier pushdown should not hold the mutation owner, read snapshot
+workers, or storage service hostage while waiting for accelerator resources.
+Each page, segment, or batch can carry a route outcome: pushed, skipped due to
+pressure, ambiguous due to visibility, unsupported expression, or completed on
+CPU. Response latency and correctness then depend on named fallbacks instead
+of hidden blocking.
+
+The MVCC low-watermark rule is a useful minimum visibility certificate for
+resident/cold-tier filtering. GPU DB can push down filters over rows whose
+begin/end visibility is provably inside the read boundary, but rows requiring
+version-chain reconstruction, undo, or catalog-generation checks must remain
+full-fidelity candidates. That suggests a two-stream design for cold-tier
+scans: compact visible/proven rows early, and return ambiguous row ids or full
+records to the CPU visibility resolver.
+
+The descriptor cache maps to route-shape caching. Repeated same-shape scans
+and lookup micro-batches should cache decoded route descriptors, predicate
+kernels, projection layouts, aggregate state layout, and supported-type proof.
+The cache key should include snapshot generation, relation/schema generation,
+predicate/operator family, projected columns, and device or CPU feature gates.
+
+Batch reads and LSN-matched page versions map to P8 segment reads. A resident
+or cold-tier scan should read segment batches tied to a stable WAL or snapshot
+boundary, then let storage, CPU warm-tier, and GPU workers process independent
+sub-batches. The planner should account for three kinds of parallelism:
+front-end scan workers, tier/storage fan-out, and per-device worker fan-out.
+
+**Risks and mismatches:** Taurus NDP targets analytical scans in a
+disaggregated MySQL/InnoDB system, not GPU-resident OLTP. It does not solve
+write admission, high-contention transaction scheduling, GPU kernel
+concurrency, or retained snapshot refresh. Its post-processing optimizer
+choice is intentionally low-risk but can miss better global plans, especially
+join plans that would become attractive after pushdown.
+
+The Page Store visibility test is weaker than a complete MVCC read-view check.
+That is acceptable only because ambiguous rows are returned unchanged and
+InnoDB finishes the work. GPU DB must preserve the same full-fidelity fallback
+for rows whose visibility, schema, or row version cannot be proven at the
+lower tier. The buffer-pool side effect is also a warning: a pushdown path that
+reduces transfer may starve other route caches of warming evidence unless
+placement telemetry records what was not loaded.
+
+**Benchmark candidates:**
+
+- Add a cold-tier pushdown benchmark for selection/projection/aggregation over
+  generated `order_line`-style segments: raw CPU scan, CPU compressed
+  prefilter, storage/NVMe pushdown simulation, and GPU resident route. Measure
+  transferred bytes, CPU time, p50/p99 latency, and fallback reasons.
+- Prototype a two-stream MVCC scan: proven-visible rows are compacted and
+  filtered in the lower tier; ambiguous rows return full records or row ids to
+  CPU visibility reconstruction. Gate: identical results under concurrent
+  insert/update/delete and retained read snapshots.
+- Add page/segment-scoped best-effort pushdown admission. Saturate the lower
+  tier and verify that skipped pages fall back without blocking mutation,
+  residency refresh, or ordinary reads. Record pushed/skipped/ambiguous counts.
+- Cache route descriptors for repeated same-shape scans and lookup batches.
+  Measure descriptor decode/JIT/kernelization overhead with and without cache,
+  and invalidate the cache on schema, snapshot, feature, or device changes.
+- Add a cache-side-effect benchmark: run NDP/pushdown scans before point
+  lookups and compare buffer/resident cache warmth against a baseline that
+  reads ordinary pages. Failure condition: pushdown improves one scan while
+  silently worsening later retained or CPU fallback routes.
+- Test batch size for segment reads under latency ceilings: small batches for
+  p50, large batches for throughput, and dual-trigger batching. Record tier
+  fan-out, queue wait, skipped pushdown work, and bytes saved per batch.
