@@ -5202,13 +5202,19 @@ Append new candidates here as each paper is processed.
   MVCC table, redo-log version cache, epoch management, and fast commit path;
   useful if GPU DB adopts logical transaction ownership over separate storage
   and resident-index components.
-- `queued` — **Deuteronomy 2.0: Record Caching and Latch Freedom**,
+- `reviewed` — **Deuteronomy 2.0: Record Caching and Latch Freedom**,
   Lomet, arXiv 2025.
   URL: `https://arxiv.org/abs/2504.14435`
   Why: modern follow-up from a Deuteronomy author that revisits
   record-granular caching, delta updating, and latch-free state publication;
   useful for refining GPU DB's CPU log/read cache, resident-delta policy, and
   route-metadata update path.
+- `queued` — **Bwe-tree: An Evolution of Bw-tree on Fast Storage**, Wang
+  et al., ICDE 2024.
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00405`
+  Why: Deuteronomy 2.0 cites this modern Bw-tree evolution on fast storage;
+  useful for comparing notice/delta publication with newer fast-storage index
+  behavior before adopting latch-free resident-index rebuilds.
 - `queued` — **VLL: A Lock Manager Redesign for Main Memory Database
   Systems**, Ren, Thomson, and Abadi, VLDB Journal 2015.
   URL: `https://www.cs.yale.edu/homes/dna/papers/vldbj-vll.pdf`

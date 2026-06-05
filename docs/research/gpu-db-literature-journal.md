@@ -65712,3 +65712,162 @@ winner rule observable and workload-driven.
 - Add serializable-read guardrail tests showing that SI-style epoch validation
   is insufficient for dependency cycles. Use the result to keep SERIALIZABLE
   route work separate from the faster SI/OCC batch path.
+
+### 2026-06-05 - Deuteronomy 2.0 turns cache granularity into a hot-path contract
+
+**Citation:** David Lomet. "Deuteronomy 2.0: Record Caching and Latch
+Freedom." arXiv:2504.14435, 2025. Retrieved 2026-06-05 from
+`https://arxiv.org/abs/2504.14435` and
+`https://arxiv.org/pdf/2504.14435`.
+
+**Category:** multi-tier cache / data placement; MVCC / snapshot /
+visibility; runtime / HFT / session scale.
+
+**Relevance tags:** record caching; delta updates; latch-free indexes;
+Bw-tree; TC/DC split; MVCC log records; cost-performance; hot-record cache;
+epoch reclamation; structural modification; CPU truth cache; tier placement.
+
+**Core idea:** Deuteronomy 2.0 revisits two design choices enabled by
+Deuteronomy's transaction-component/data-component split: caching individual
+records rather than full storage pages, and making latch-free structural
+changes cheaper by installing small "notice" deltas before doing expensive
+state reconstruction. The paper argues that delta updates are the common
+enabler. They let the transaction component keep recently updated or fetched
+records in a hash-addressed record cache without retaining their home pages,
+and they let the data component update Bw-tree-like nodes by prepending small
+state records instead of rewriting in place.
+
+The most transferable idea is that hot-path cache granularity should be an
+economic and concurrency contract, not just a storage format accident. A 4 KB
+page cache may evict useful records because cold neighbors consume the same
+DRAM budget. A record cache can keep hot keys resident longer for the same
+memory cost and can be accessed by hashing instead of a full tree traversal.
+For structural changes, notices avoid the common latch-free waste where many
+threads build the same consolidated or split state and all but one lose the
+CAS. Losers should lose only the cheap notice race, then continue useful delta
+work above the notice while the winner finishes the expensive rebuild.
+
+**Concrete mechanisms:**
+
+- Deuteronomy separates transaction functionality in the TC from storage and
+  indexing in the DC. The TC uses update log records for MVCC and as cached
+  record material; misses fetch records from the DC's Bw-tree.
+- Cached records live in a record-centric hash table rather than in page-sized
+  buffers. The paper describes a lossy hash index from opaque 64-bit
+  identifiers to offsets in a large log-structured buffer.
+- Record caching is motivated with a cost/performance model: when the cached
+  unit is smaller than a page, the access interval at which DRAM caching
+  remains cost-effective grows in inverse proportion to the unit size.
+- The cache can hold both recently updated records from the transaction log
+  and records read from the DC. Log structuring can move records, so an
+  indirection layer insulates users of the cache from physical movement.
+- List pointers used by hash buckets or other linked structures can be stored
+  adjacent to their records. The paper argues this reduces separate
+  allocation, pointer traversal, cache misses, and garbage-collection work.
+- Deuteronomy uses epoch-based reclamation for pointer safety in latch-free
+  structures.
+- Bw-tree updates prepend delta records to a node through a mapping-table CAS.
+  The delta points to the old state, making the logical update immediately
+  visible while sharing most old state.
+- Long delta chains are eventually consolidated into a read-optimized base
+  state. Instead of having every contending thread build a consolidated state,
+  contenders race to install a cheap consolidation notice (`cNOTICE`).
+- The `cNOTICE` winner performs the expensive consolidation over the protected
+  old state. Losing threads can keep adding new delta updates above the notice
+  rather than blocking or duplicating consolidation work.
+- Structural modification operations use the same notice pattern. Split
+  notices (`sNOTICE`) protect shared old state while the winner instantiates
+  old and new node contents; merge/delete/extra notices protect all access
+  paths needed to combine nodes safely.
+- The paper emphasizes that notices must be installed on every path to the
+  state being transformed and in a correct order, analogous to latch-ordering
+  discipline.
+- Notices can include an epoch or timeout so another thread can complete the
+  transformation if the original winner dies before finishing.
+- The work is a design/explanation paper, not a new full system evaluation.
+  It relies on prior Deuteronomy cost/performance and Bw-tree work for
+  supporting measurements.
+
+**GPU DB mapping:** For GPU DB, record caching is a useful CPU-side truth-cache
+shape between full MVCC tuple chains and GPU resident column groups. Hot
+point-lookups, updates, and conflict checks should not require loading or
+retaining an entire cold CPU/NVMe page just because one row is active. A
+record-granular CPU cache keyed by stable tuple identity, commit generation,
+and schema generation could feed mutation validation, retained lookup
+fallback, and resident delta refresh while leaving cold page or segment state
+on cheaper tiers.
+
+The TC/DC split also maps well to the existing owner-domain plan. The mutation
+or conflict owner should own WAL/MVCC publication and hot record metadata,
+while the storage/residency owner owns physical segment refresh, GPU
+residency, and cold-tier placement. Deuteronomy's lesson is that the boundary
+can be efficient if the TC keeps enough record-level material to avoid
+round-tripping through the DC for hot updates.
+
+Delta updates and notices suggest a publication pattern for resident indexes
+and CPU route metadata. Small committed deltas can be appended above an
+immutable base generation and made visible after WAL publication. When the
+delta chain grows too long, one worker should win a cheap "rebuild notice" and
+construct the new base state while other workers keep adding newer deltas
+above the notice. That is a cleaner benchmark target than either locking the
+resident index during refresh or letting multiple refresh workers rebuild the
+same range.
+
+For GPU-resident P8 structures, the notice idea becomes a generation-state
+contract. A segment split, resegmentation, compaction, or FITing-style index
+rebuild can publish a notice that says "base below this generation is being
+rewritten; new deltas land above it; readers use either the old base plus
+compatible deltas or the newly published base once complete." The notice is
+not the visibility authority: WAL and CPU MVCC still are. It is a latch-free
+coordination record for derived state.
+
+The adjacent-pointer/list formatting idea matters for 1M-session and hot-key
+runtime work too. Queue nodes, response handles, hot-key waiters, and
+per-record delta metadata should avoid separate allocations for list links
+when the lifetime matches the record or command object. That fits the existing
+bounded-ring and preallocated-buffer goals.
+
+**Risks and mismatches:** The paper is short and partly retrospective. It
+does not provide a fresh end-to-end benchmark for Deuteronomy 2.0, and some
+claims are argued from prior Deuteronomy/Bw-tree work rather than newly
+measured in this paper. Deuteronomy is a key-value store architecture, not a
+SQL GPU database, and the paper does not cover CUDA execution, HBM budgets,
+SQL planning, pgwire sessions, DDL/catalog visibility, or columnar analytical
+scans.
+
+Record caching is also not a replacement for resident column groups. It helps
+hot records and updates; it may hurt scans if it fragments memory or bypasses
+columnar layout. Notices require subtle correctness: every path to protected
+state must see the notice, old state must be retained until readers drain, and
+crash recovery must be able to replay or discard partially completed derived
+state. GPU DB should start by using notices for rebuildable CPU/resident
+metadata, not durable truth.
+
+**Benchmark candidates:**
+
+- Prototype a CPU hot-record cache keyed by tuple id and visibility generation
+  for point reads and update validation. Compare record-cache hit, CPU index
+  lookup, and full MVCC tuple-chain paths under Zipfian read/write mixes.
+- Add a cache-granularity sweep: full page/segment, record, and record-plus-
+  delta bundle. Measure memory footprint, p50/p99 point latency, mutation
+  validation time, cold-tier reads, and scan regression.
+- Build a resident-index delta-chain benchmark. New committed keys append as
+  deltas above an immutable base; lookups search base plus deltas; a rebuild
+  notice consolidates when chain length crosses a threshold. Gate: no lookup
+  sees uncommitted deltas or misses committed deltas across the publication
+  boundary.
+- Compare rebuild coordination strategies for a hot resident index range:
+  exclusive lock, duplicate optimistic rebuild with CAS winner, and notice
+  winner with loser continuation. Required metrics: wasted rebuild work,
+  writer stall time, reader latency, and memory retained by old generations.
+- Add a stale-reader reclamation test using epoch/hazard-style accounting:
+  hold retained snapshots while consolidating deltas and verify old base
+  buffers are retired only after the last compatible reader drains.
+- Test adjacent-link allocation for hot-key wait queues or response handles:
+  separate node allocation versus embedded links in command/record objects.
+  Measure allocation count, cache misses if available, queue latency, and
+  tail latency under 10K to 1M logical sessions with bounded active work.
+- For P8, add a route-certificate field for derived-state rebuild status:
+  no rebuild, notice active, base generation, delta generation, and fallback
+  reason. Failure condition: a strong read waits indefinitely or silently uses
+  a stale derived base when the CPU truth has advanced.
