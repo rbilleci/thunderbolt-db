@@ -61535,3 +61535,179 @@ queries even more strongly than CPU OLAP plans do.
   metrics: planning CPU time, model-training time, GPU training overlap, queue
   wait added to mutation/read/GPU owners, and number of route hints abandoned
   because execution finished first.
+
+### 2026-06-05 - blk-switch treats storage IO as switch-scheduled work
+
+**Citation:** Jaehyun Hwang, Midhul Vuppalapati, Simon Peter, and Rachit
+Agarwal. "Rearchitecting Linux Storage Stack for microsecond Latency and High
+Throughput." OSDI 2021. Retrieved 2026-06-05 from the USENIX paper page and
+PDF, `https://www.usenix.org/conference/osdi21/presentation/hwang` and
+`https://www.usenix.org/system/files/osdi21-hwang.pdf`.
+
+**Category:** multi-tier cache / data placement, with runtime / HFT /
+session-scale relevance.
+
+**Relevance tags:** Linux storage stack; NVMe; remote storage; request
+steering; application steering; priority queues; tail latency; throughput
+isolation; cold-tier IO owners; queue telemetry; multi-tenant interference.
+
+**Core idea:** blk-switch argues that Linux's per-core block queues plus
+multi-queue storage and network hardware make the storage stack look like a
+network switch. Instead of treating the application submission core as the only
+place a request can be processed, blk-switch decouples ingress queues from
+device-side egress queues. That lets it prioritize latency-sensitive requests
+locally while steering throughput-oriented requests to less loaded cores.
+
+The transferable point is not "use Linux block layer internals" for GPU DB. It
+is that storage and remote-tier IO need the same first-class scheduling shape
+as network and GPU execution work: explicit classes, per-owner egress queues,
+request-level steering for transient imbalance, coarser application or worker
+steering for persistent imbalance, and telemetry on the bytes and requests
+queued behind each egress path.
+
+**Concrete mechanisms:**
+
+- blk-switch creates per-core egress queues per application class and maps each
+  egress queue to a unique device-driver queue, for local storage or remote
+  storage access.
+- It uses Linux `ionice` classes to distinguish latency-sensitive applications
+  from throughput-bound applications without changing the application API.
+- Latency-sensitive requests are mapped to the local egress queue and processed
+  before throughput-bound requests, reducing head-of-line blocking from large
+  read/write streams.
+- Request steering handles transient overload. If a local throughput egress
+  queue exceeds a load threshold, blk-switch picks candidate cores with egress
+  queues to the same destination and uses a power-of-two choices style decision
+  to steer the request to a lower-load core.
+- The paper's default load signal for throughput IO is the instantaneous sum of
+  outstanding bytes in the egress queue. It notes this is imperfect because it
+  ignores request type, queueing delay, and compute/IO ratio.
+- Application steering handles persistent overload. At a coarse 10 ms default
+  timescale, blk-switch changes thread affinity to reduce sustained contention
+  between latency-sensitive and throughput-bound work.
+- In-flight request completion remains correct because Linux block request tags
+  and `kioctx` metadata let completions find the original application context
+  even after request or application steering.
+- The implementation keeps the default Linux CFS scheduler, TCP/IP stack, and
+  application APIs. The change is inside the kernel storage stack.
+- Evaluation uses two directly connected servers with 100 Gbps links, Ubuntu
+  20.04, kernel 5.4.43, Intel Xeon Gold 6234 CPUs, RAM-backed block devices
+  for most storage-stack stress tests, NVMe SSD tests, and a RocksDB
+  ReadRandom workload.
+- Across evaluated scenarios except noted sensitivity cases, blk-switch reports
+  microsecond-scale average, p99, and p99.9 latency while retaining near device
+  throughput. The paper reports up to 130x average-latency and 24x p99
+  improvement versus Linux while keeping 84-100% of Linux throughput, and up to
+  12x average and 18x p99 improvement versus SPDK when applications share
+  cores.
+- With 16 latency-sensitive and 16 throughput-bound applications over 16 cores
+  and 200 Gbps of network bandwidth, blk-switch reports 10 us average, 143 us
+  p99, and 296 us p99.9 latency while coming within 1% of Linux throughput.
+- In RocksDB experiments over remote SSD and XFS with direct IO, blk-switch
+  keeps the same qualitative benefit: over an order-of-magnitude latency
+  reduction versus Linux while sacrificing at most 10% throughput.
+
+**GPU DB mapping:** The P8 cold-tier path should not be a side effect of a
+generic filesystem or OS queue if it becomes hot enough to affect query
+latency. It should be modeled like the runtime's network, mutation, read, and
+GPU rings: one or more cold-tier IO owners with per-class egress queues,
+bounded depth, outstanding-byte telemetry, and explicit priority classes for
+latency-critical reads, refresh/prefetch, checkpoint, compaction, and bulk scan
+work.
+
+For retained GPU reads, blk-switch reinforces that cold-tier misses and
+resident refreshes need separate classes. A point lookup that misses HBM but is
+still on a latency budget should not sit behind a long sequential refresh,
+checkpoint, or analytical prefetch. Conversely, throughput work should be
+allowed to consume idle cores, queues, and NVMe bandwidth when latency-sensitive
+queues are empty. Request steering maps to moving cold-tier scan chunks or
+prefetch requests across IO owners when an owner is transiently overloaded.
+Application steering maps to coarser reassignment of refresh workers,
+partition owners, or session classes when one owner is persistently colliding
+with latency-sensitive work.
+
+The outstanding-byte load signal is a useful first metric for GPU DB, but it is
+not enough. Route certificates should also record request class, estimated
+rows, expected transfer bytes, response bytes, visibility boundary, device
+queue depth, pinned-buffer pressure, and whether the work is on the critical
+path of a user query or background residency maintenance. The switch analogy
+also suggests that completion routing matters: cold-tier IO completions should
+return to the query, refresh, or recovery owner that issued the request without
+requiring global-owner arbitration.
+
+For 1M logical sessions, blk-switch is another argument against per-session
+storage handling. Sessions should submit route-classified work into bounded
+owner queues; the owners decide whether to process locally, steer, defer,
+fallback, or reject based on class and load. That preserves a small number of
+hot IO workers while keeping cold-tier throughput available to scans,
+refreshes, and checkpoint tasks.
+
+**Risks and mismatches:** blk-switch is a Linux kernel storage-stack paper, not
+a DBMS storage engine. Its latency-sensitive and throughput-bound classes are
+coarser than SQL route classes with MVCC, WAL, refresh, and recovery
+dependencies. Most evaluation pushes bottlenecks into the storage stack with
+RAM block devices; NVMe latency can hide some scheduling gains, and GPU DB will
+also have CUDA, pinned-memory, decompression, and response-encoding costs. The
+paper's default outstanding-byte threshold is workload-specific, so GPU DB
+should treat it as a telemetry seed, not a policy constant. Finally,
+prioritization can starve throughput work unless request steering and
+coarser-grained worker steering are both present.
+
+**Benchmark candidates:**
+
+- Add cold-tier IO owner telemetry before changing policy: per-class queue
+  depth, outstanding bytes, request age, device queue wait, completion owner,
+  and rejection/fallback reason. Gate: every NVMe or disk-backed route can
+  explain which queue delayed it.
+- Compare one shared cold-tier queue with class-separated egress queues for
+  latency-sensitive point misses, resident refresh, checkpoint, compaction, and
+  bulk scans. Success condition: p99 point-miss latency improves without
+  reducing aggregate cold-tier throughput by more than a measured budget.
+- Prototype request steering for throughput-class cold-tier chunks across IO
+  owners using power-of-two choices over outstanding bytes plus request age.
+  Failure condition: steering improves mean throughput while increasing p99
+  user-query latency or completion-routing overhead.
+- Add a persistent-imbalance experiment where one hot partition's refresh work
+  collides with retained reads. Compare local-only ownership, request steering,
+  and coarser refresh-worker reassignment at 1 ms, 10 ms, and 100 ms windows.
+- Test strict priority alone against priority plus steering. Expected result:
+  strict priority protects p50/p99 reads but starves refresh/checkpoint work;
+  priority plus steering should keep refresh throughput progressing.
+- Run a RocksDB-like cold-tier benchmark for GPU DB: small point reads mixed
+  with large scans or refreshes, with CPU-only, GPU-resident, and cold-transfer
+  routes. Required measurements: p50/p99 query latency, total throughput,
+  owner queue wait, NVMe queue depth, pinned-buffer pressure, and fallback
+  count.
+
+### 2026-06-05 - Cross-paper synthesis: route schedulers need class, proof, and completion locality
+
+The latest route-control papers converge on a sharper scheduler contract.
+GPU locality showed that resident routes need locality and bandwidth metadata,
+Bao showed that learned route hints should choose only among bounded
+certificate-checked arms, and blk-switch shows that even storage IO needs
+switch-like request classes, egress queues, and completion routing.
+
+The design track is now a route certificate plus route scheduler rather than a
+single planner decision. A certificate proves semantic safety: snapshot
+boundary, schema generation, resident segment validity, visibility frontier,
+and fallback semantics. The scheduler then chooses how to run a safe route
+under pressure: local owner, steered owner, deferred route, cold-tier transfer,
+CPU fallback, or explicit overload. Learned hints can rank these choices, but
+they should not create new correctness paths.
+
+Category gaps after this batch are strongest around integrated HTAP freshness
+and warm-tier DBMS designs: Oracle Database In-Memory, SQL Server real-time
+analytics, Harmony, and HANA Native Store Extension remain useful next steps.
+The queue also has storage-stack follow-ups from blk-switch, especially i10 and
+sRoute, for separating remote-storage efficiency from class-based scheduling.
+
+Benchmark priorities:
+
+- Build a route-certificate trace that logs semantic proof fields and resource
+  scheduling fields separately.
+- Add cold-tier class-separated queues before relying on OS or filesystem
+  fairness.
+- Measure completion locality: whether cold-tier, GPU, and CPU fallback
+  completions return directly to the owning query/session response ring.
+- Keep learned route hints in advisor mode until deterministic routes expose
+  enough telemetry for p99 regression gates.

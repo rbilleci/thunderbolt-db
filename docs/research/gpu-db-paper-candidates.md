@@ -4739,12 +4739,24 @@ Append new candidates here as each paper is processed.
   Why: selected after recent synthesis called for storage-device scheduling
   work; exposes concrete IO-size, IO-parallelism, and sequentiality mismatches
   when DBMS storage routes assume faster media automatically helps.
-- `queued` — **Rearchitecting Linux Storage Stack for microsecond Latency and
+- `reviewed` — **Rearchitecting Linux Storage Stack for microsecond Latency and
   High Throughput**, Hwang, Vuppalapati, Peter, and Agarwal, OSDI 2021.
   URL: `https://www.usenix.org/conference/osdi21/presentation/hwang`
   Why: cited by the PVLDB 2023 storage-device mismatch paper as a
   device-sensitive layer direction; useful for comparing DB-owned cold-tier IO
   owners with OS-level request switching and NVMe queue dispatch.
+- `queued` — **TCP ≈ RDMA: CPU-efficient Remote Storage Access with i10**,
+  Hwang, Cai, Tang, and Agarwal, NSDI 2020.
+  URL: `https://www.usenix.org/conference/nsdi20/presentation/hwang`
+  Why: blk-switch uses i10 as the Linux remote-storage baseline; useful for
+  separating CPU-efficient NVMe-over-network access from the later
+  latency/throughput isolation mechanisms in blk-switch.
+- `queued` — **sRoute: Treating the Storage Stack Like a Network**, Thereska
+  et al., FAST 2016.
+  URL: `https://www.usenix.org/conference/fast16/technical-sessions/presentation/thereska`
+  Why: blk-switch's related work names sRoute as a policy-based storage-stack
+  design; useful for comparing network-like storage routing policy with
+  GPU DB's explicit cold-tier IO owners and response-ring scheduling.
 - `reviewed` — **Write Dependency Disentanglement with Horae**, Liao, Lu, Xu,
   and Shu, OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/liao`
