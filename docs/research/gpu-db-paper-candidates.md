@@ -1544,7 +1544,7 @@ Append new candidates here as each paper is processed.
   Why: Socrates and Aurora leave open how elastic compute interacts with a
   disaggregated storage layer; PolarDB Serverless is a modern follow-up for
   elastic buffer ownership, cold-page access, and storage/compute separation.
-- `queued` — **FoundationDB: A Distributed Unbundled Transactional Key Value
+- `reviewed` — **FoundationDB: A Distributed Unbundled Transactional Key Value
   Store**, Zhou et al., SIGMOD 2021.
   URL: `https://doi.org/10.1145/3448016.3457559`
   Why: Socrates uses separate services for log, page serving, and durable
@@ -1638,6 +1638,13 @@ Append new candidates here as each paper is processed.
   Why: modern MVCC/concurrency-control work that discusses Plor and adapts to
   changing workload conditions; useful for deciding when GPU DB should switch
   conflict policy by route, contention, or transaction size.
+- `queued` — **FoundationDB Record Layer: A Multi-Tenant Structured Datastore**,
+  Kornacker et al., arXiv 2019.
+  URL: `https://arxiv.org/abs/1901.04452`
+  Why: FoundationDB points to the Record Layer as a production structured
+  layer over a transactional key-value core; useful for comparing SQL/catalog,
+  secondary-index, and aggregate-index layering against GPU DB route metadata
+  and lower-half storage boundaries.
 - `reviewed` — **Robust External Hash Aggregation in the Solid State Age**,
   Kuiper, Boncz, and Muhleisen, ICDE 2024.
   URL: `https://doi.org/10.1109/ICDE60146.2024.00288`

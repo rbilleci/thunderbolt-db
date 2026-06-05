@@ -53747,3 +53747,204 @@ frontier or warmup gap.
 - Sparse-HBM/dense-warm-tier benchmark: measure lookup, scan, refresh,
   and fallback costs when hot segments fit in HBM but full partitions
   live in host/NVMe.
+
+### 2026-06-05 - FoundationDB unbundles transaction processing, logging, and storage reads
+
+**Citation:** Jingyu Zhou, Meng Xu, Alexander Shraer,
+Bala Namasivayam, Alex Miller, Evan Tschannen, Steve Atherton,
+Andrew J. Beamon, Rusty Sears, John Leach, Dave Rosenthal,
+Xin Dong, Will Wilson, Ben Collins, David Scherer, Alec Grieser,
+Young Liu, Alvin Moore, Bhaskar Muppana, Xiaoge Su, and
+Vishesh Yadav. "FoundationDB: A Distributed Unbundled
+Transactional Key Value Store." SIGMOD 2021, pp. 2653-2666.
+doi:10.1145/3448016.3457559. Retrieved 2026-06-05 from
+FoundationDB, `https://www.foundationdb.org/files/fdb-paper.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; multi-tier cache / data placement.
+
+**Relevance tags:** unbundled transaction system; strict
+serializability; OCC; MVCC; read/write separation; range-partitioned
+conflict detection; log servers; storage servers; recovery epochs;
+transaction batching; atomic operations; deterministic simulation.
+
+**Core idea:** FoundationDB shows a production "lower half" database
+that deliberately separates transaction management, durable logging,
+and storage reads. The transaction system assigns versions, accepts
+commits, detects conflicts, and writes logs. Storage servers serve
+MVCC reads directly from sharded key ranges and asynchronously pull
+mutation logs. The log system provides durable replicated queues
+between those two sides.
+
+The strongest transferable idea is that read scalability, write
+admission, conflict detection, and durable propagation should be
+separate scale units with explicit version frontiers. FoundationDB's
+clients read from a versioned storage snapshot, buffer writes locally,
+then send read/write conflict ranges to proxies at commit. Proxies
+obtain a commit version, ask range-partitioned resolvers to validate
+read-write conflicts, and only then persist committed mutations to
+log servers. Storage servers later apply committed logs while still
+serving reads at requested versions.
+
+This is a useful contrast to Socrates. Socrates emphasizes page
+availability behind a SQL Server compute node; FoundationDB exposes a
+more aggressive split where read-serving storage is not on the
+commit path, resolvers are stateless conflict services, and failure
+of transaction/log roles causes a new epoch rather than bespoke
+repair in each role.
+
+**Concrete mechanisms:**
+
+- The data plane is split into a transaction system, log system, and
+  storage system. The transaction system includes a sequencer,
+  proxies, and range-partitioned resolvers; the log system contains
+  log servers; the storage system contains sharded storage servers.
+- A transaction obtains a read version from a proxy/sequencer and
+  reads directly from storage servers at that version. Writes are
+  buffered client-side until commit, with read-your-writes handled by
+  combining storage lookups with local uncommitted writes.
+- At commit, a proxy obtains a commit version greater than existing
+  read and commit versions. The commit version is also the log
+  sequence number. The sequencer returns the previous commit version
+  so resolvers, log servers, and storage servers can process without
+  gaps in LSN order.
+- Resolvers implement lock-free OCC over recently modified key
+  ranges. For each read conflict range, they intersect it with
+  modified ranges whose commit versions are newer than the
+  transaction read version. If any such range exists, the transaction
+  aborts; otherwise write ranges are recorded with the commit version.
+- The key space is partitioned across resolvers, so conflict checking
+  runs in parallel. A transaction commits only if every relevant
+  resolver admits it. Partial admits can create temporary false
+  positives, but they expire with the short MVCC window.
+- The paper reports one single-threaded resolver can handle about
+  280K TPS in a random range-read/range-write microbenchmark, and
+  production conflict rates under the measured CloudKit workload
+  averaged 0.73%.
+- Committed mutations are tagged for the storage servers responsible
+  for affected key ranges and written to preferred log servers plus
+  enough replicas to satisfy the durability policy. A proxy replies
+  committed only after designated log servers make the log durable.
+- Storage servers continuously pull logs from log servers and apply
+  committed updates. Log shipping is outside the commit path; storage
+  lag in a production cluster had a reported 99.9 percentile average
+  delay of 3.96 ms and maximum delay of 208.6 ms over the measured
+  window.
+- Recovery is epoch-based. If transaction or log roles fail, the
+  sequencer terminates and a new transaction system is recruited.
+  Proxies and resolvers are stateless; recovery determines the end of
+  the previous epoch's committed log and starts a new epoch while
+  storage servers continue normal log pulling.
+- Storage servers keep an unversioned SQLite B-tree plus in-memory
+  multi-version redo state. Only mutations leaving the MVCC window
+  are written to SQLite, so rollback after recovery can discard
+  in-memory versions beyond the recovery version.
+- Proxies dynamically batch commits: one sequencer version request and
+  one resolver/log pass can cover many client transactions. Batch size
+  shrinks under light load for latency and grows under pressure for
+  throughput.
+- Atomic operations such as add, bitwise operations, compare-and-clear,
+  and set-versionstamp avoid read-before-write round trips and reduce
+  conflicts for hot counters or aggregate indexes.
+- The evaluation reports a 27-machine scalability test where 90/10
+  read-write traffic rose from 593K to 2.779M operations per second as
+  the cluster scaled from 4 to 24 machines. Below 100K ops/s on the
+  24-machine setup, mean latencies were about 0.35 ms for a key read,
+  1 ms to get a read version, and 2 ms to commit; at saturation,
+  batching preserved throughput but commit latency rose sharply.
+- Deterministic simulation is treated as core infrastructure. The
+  real database runs inside a deterministic discrete-event simulator
+  with randomized workloads, network/disk/process faults,
+  "buggification" points, and conditional coverage checks.
+
+**GPU DB mapping:** FoundationDB supports a sharper decomposition of
+the GPU DB runtime than a single mutation owner plus resident cache.
+The first useful mapping is: sequencer equals visibility/frontier
+publisher; proxies equal admission and commit-batch coordinators;
+resolvers equal range/key conflict services; log servers equal
+durable WAL frontiers; storage servers equal CPU/NVMe segment owners
+that serve versioned reads and feed GPU refresh.
+
+For the current WAL-before-visibility rule, the log-server boundary
+is directly applicable. A GPU resident generation should be route
+visible only after its source WAL boundary is durable, but CPU/NVMe
+segment owners can pull and pre-apply logs asynchronously to reduce
+refresh lag. This creates three different timestamps to expose in
+telemetry: durable WAL frontier, storage-applied frontier, and
+resident-published frontier.
+
+The resolver design suggests a path for scaling writes without
+putting every conflict check through one owner thread. GPU DB can
+start with one mutation owner for correctness, then benchmark
+range-partitioned conflict services for declared read/write sets or
+prepared write routes. For retained read snapshots, the read version
+handle can be a compact scalar plus route metadata rather than a
+copied transaction table.
+
+FoundationDB's local read-only commit is also relevant. A read-only
+retained GPU transaction that has a route-valid snapshot should not
+round trip through the mutation owner merely to "commit." It should
+release its snapshot handle and response buffers locally unless it
+asked for a stronger freshness or locking contract.
+
+Atomic operations map to hot-key update lanes. For counters,
+inventory deltas, or aggregate-index maintenance, the engine should
+test whether commutative operations can bypass full read-conflict
+tracking and enter an ordered WAL batch with deterministic GPU/CPU
+apply semantics. This is not general MVCC, but it may be a high-value
+write-throughput fast path.
+
+The deterministic simulation lesson is unusually important for the
+GPU DB. Route certificates, invalidation, WAL durability, resident
+generation publication, cold-tier fallback, and snapshot retirement
+have many rare interleavings. A small deterministic model or
+single-process simulator for owner queues, frontier publication, and
+failure/retry paths may find bugs that ordinary benchmarks will miss.
+
+**Risks and mismatches:** FoundationDB targets ordered key-value
+OLTP, not SQL query execution or GPU-resident column groups. It has
+no joins, schemas, query optimizer, or device memory tier. Its
+transaction size limits and low-contention assumptions may not hold
+for bulk ingest, wide analytical scans, or high-contention SQL
+updates.
+
+The paper's OCC shape works well because production conflict rates
+are low. A GPU DB trying to absorb many hot write sessions may need
+deterministic lanes, priority-aware OCC, or commutative operation
+classes rather than FDB-style restart alone. Range conflict metadata
+also has to align with SQL predicates, indexes, and physical row
+versions; a false-positive window that is acceptable for a KV store
+may be too expensive for long GPU refresh or analytical transactions.
+
+FoundationDB's storage servers keep a short in-memory MVCC window and
+persist older state into SQLite. GPU DB retained snapshots and long
+analytical reads may require longer version retention, graveyard
+structures, or retained column-generation bundles. Finally, FDB's
+simulation approach was enabled by writing the system around a
+deterministic async runtime; retrofitting equivalent coverage into
+Rust, CUDA, sockets, and filesystem code will require narrower
+models and carefully chosen shims.
+
+**Benchmark candidates:**
+
+- Prototype a three-frontier metric for P8: durable WAL frontier,
+  CPU/NVMe segment-applied frontier, and GPU resident-published
+  frontier. Gate: route-visible generations never exceed durable WAL.
+- Build a range-partitioned conflict-check microbenchmark for prepared
+  write routes. Compare one mutation owner, sharded resolvers, and
+  deterministic hot-key lanes under low, medium, and high conflict
+  rates.
+- Add a read-only retained transaction fast path that releases snapshot
+  handles locally. Failure condition: read-only completion still waits
+  behind mutation-owner commits when no freshness upgrade is requested.
+- Test dynamic commit batching for COPY/INSERT admission: shrink batch
+  windows under low load and grow under saturation. Required metrics:
+  WAL fsync count, commit latency, abort/retry rate, and owner queue
+  depth.
+- Implement a commutative atomic-update lane for one counter-like
+  workload. Proof gate: WAL replay, retained reads, and aggregate/index
+  metadata produce the same visible values as ordinary transactions.
+- Create a deterministic frontier simulator for queue ownership,
+  WAL durability, resolver admission, storage apply, resident refresh,
+  invalidation, and retry. It should inject delayed logs, failed
+  publications, stale route certificates, and snapshot retirement races.
