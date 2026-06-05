@@ -54489,3 +54489,180 @@ measure retained GPU reads, deterministic write batches, and
 selective serializable fallback with route-certificate creation,
 trace capture, offline anomaly analysis, and replayable minimized
 witnesses included in the cost model.
+
+### 2026-06-05 - Elle turns isolation claims into generated history witnesses
+
+**Citation:** Kyle Kingsbury and Peter Alvaro. "Elle: Inferring
+Isolation Anomalies from Experimental Observations." PVLDB
+14(3):268-280, 2021. doi:10.14778/3430915.3430918. Retrieved
+2026-06-05 from the VLDB PDF,
+`https://www.vldb.org/pvldb/vol14/p268-alvaro.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction
+processing / write path; isolation validation.
+
+**Relevance tags:** experimental isolation checking; Jepsen;
+Adya dependency graph; traceable histories; recoverable histories;
+list append; direct serialization graph; G0; G1; G2; G-single;
+internal consistency; anomaly witnesses; route certification.
+
+**Core idea:** Elle is an implementation-level isolation checker
+for black-box databases. Instead of trying to solve for a complete
+serial transaction order, it generates histories whose operations
+expose enough version-order information to infer Adya-style
+dependencies between observed transactions. Cycles in that inferred
+direct serialization graph become concise anomaly witnesses.
+
+The paper is the missing counterpart to IsoDiff for GPU DB route
+certification. IsoDiff asks whether an application workload would
+be anomaly-prone under weak isolation. Elle asks whether the
+database implementation actually delivered its claimed isolation
+contract under generated concurrent transactions, faults, and
+observed client responses.
+
+The transferable design lesson is that visibility correctness needs
+test payloads shaped for inference. A generic SQL workload may show
+that results look plausible, but it may not expose the version order
+needed to prove a retained snapshot, prefix-published write batch,
+or serializable fallback route was wrong. Elle's traceable datatype
+approach gives GPU DB a way to build small, high-signal isolation
+benchmarks whose failures come with minimized, explainable witness
+transactions.
+
+**Concrete mechanisms:**
+
+- Elle models observed client transactions and infers dependencies
+  from their reads, writes, commit outcomes, process order, and
+  real-time order where applicable. It reasons about possible Adya
+  histories compatible with those observations rather than assuming
+  access to the database's internal version order.
+- The checker targets write-write, write-read, and read-write
+  dependencies and reports cycles in a direct serialization graph.
+  It distinguishes anomaly classes such as G0, G1c, G2, and
+  G-single instead of returning only a yes/no serializability result.
+- Recoverability means each observed version can be mapped to the
+  transaction that wrote it. For simple registers, this usually
+  requires unique values; otherwise different transactions may have
+  produced the same observed state.
+- Traceability means the observed value exposes the sequence of
+  prior versions. Elle's strongest example is an append-only list:
+  reading `[1, 2, 3]` reveals the prefix sequence and therefore the
+  version order up to that point.
+- Combining traceability and recoverability lets Elle reconstruct
+  dependency edges from external observations. Some suffix writes
+  may remain unobserved, but periodic reads make the unknown part
+  of the version order small in long histories.
+- Elle generalizes beyond lists with weaker inference for registers,
+  counters, and sets, but list append is the most precise test
+  substrate. For SQL systems, the paper notes that text
+  concatenation or JSON collection types can encode list workloads.
+- The implementation in Jepsen reports anomalies as data structures,
+  visualizations, and human-checkable explanations. It also detects
+  non-Adya phenomena observed in real systems, including garbage
+  reads, duplicate writes, and internal inconsistency where a
+  transaction fails to observe its own earlier read or write.
+- The case study applied Elle to four distributed systems spanning
+  SQL, document, and graph databases and found anomalies in every
+  tested system. Reported anomaly types included G2, G-single,
+  G1a, lost updates, cyclic version dependencies, and internal
+  inconsistencies.
+- The performance comparison shows the intended scale difference:
+  Knossos-style linearizability checking becomes intractable as
+  concurrency grows, while Elle's indexing, dependency graph
+  construction, consistency checks, and cycle detection are
+  linear-time passes over the generated histories.
+- Elle deliberately omits predicate anomalies from its main
+  guarantee. That matters for SQL range predicates and retained GPU
+  scans; predicate/range witnesses need additional instrumentation
+  or a complementary checker.
+
+**GPU DB mapping:** The immediate mapping is a generated isolation
+history format for GPU DB routes. Each benchmark transaction should
+record client id, route family, transaction id, snapshot or WAL
+frontier, read/write set, returned version payload, commit outcome,
+fallback reason, and real-time boundaries. The history should be
+small enough to persist as a CI artifact and rich enough for an
+Elle-style checker to infer dependency edges.
+
+For retained GPU reads, encode traceable list-like payloads inside
+ordinary SQL rows or JSON/text columns and execute them through the
+same planner routes used by real queries. A retained snapshot route
+that skips an invalidation, observes a non-prefix batch, or mixes
+two visibility frontiers should produce a direct witness rather than
+only a mismatch counter.
+
+For the write path, use Elle-style histories around deterministic
+micro-batches, prefix publication, staged retry, and serial owner
+fallback. The key question is whether a read can observe a suffix
+write, miss a prefix write, or fail to observe its own write after a
+route transition. These are exactly the kinds of visible-version
+facts that traceable append tests can expose.
+
+For 1M logical sessions, Elle suggests validating shared route
+templates rather than every session separately. Many sessions can
+generate high concurrency against a small set of traceable keys and
+transaction shapes. The checker then validates the route's isolation
+frontier under stress while the runtime measures queue wait,
+admission rejection, GPU batch size, and fallback pressure.
+
+For route certificates, Elle contributes the implementation-level
+evidence field: a route is not certified only because the planner
+believes it uses SI or RSS. It should have generated-history
+witness tests proving that its observable behavior does not produce
+forbidden cycles for the claimed isolation level.
+
+**Risks and mismatches:** Elle's strongest inference depends on
+traceable and recoverable datatypes. Production SQL workloads do
+not naturally look like append-only lists, so GPU DB needs dedicated
+test tables and generated workloads rather than assuming ordinary
+TPC-style traces are enough.
+
+The paper omits predicate anomalies, which are important for range
+scans, prefix filters, secondary indexes, and GPU-resident columnar
+routes. Elle can still test many visibility and object-level
+violations, but predicate/range correctness needs supplemental
+tests, possibly combining Elle with IsoDiff-style template analysis
+or explicit predicate witness rows.
+
+Elle proves violations from observed histories; it does not prove
+the absence of all bugs. Rare scheduler interleavings, DDL
+boundaries, memory-pressure eviction, GPU refresh races, and crash
+recovery windows must be targeted by workload generation and fault
+injection.
+
+Finally, list-append tests may stress a different physical path from
+hot scalar lookups if implemented naively. GPU DB should keep the
+payload encoding close to ordinary tuple, MVCC, WAL, and retained
+snapshot mechanics so the checker validates the same visibility
+route used by real queries.
+
+**Benchmark candidates:**
+
+- Add an `isolation_history` test mode that emits Elle-compatible
+  transaction events for retained GPU reads, CPU reads, mutation
+  owner writes, fallback writes, commit outcomes, route family,
+  snapshot generation, and WAL frontier. Proof gate: recording can
+  be enabled in tests without changing SQL-visible results.
+- Build a traceable SQL workload with append-only text or JSON
+  payloads, unique transaction markers, and periodic full reads.
+  Run it through three routes: CPU owner only, retained GPU read
+  snapshot, and mixed retained-read plus write-owner invalidation.
+  Failure condition: any forbidden dependency cycle appears under
+  the claimed isolation level.
+- Test prefix-publication safety with generated list appends in a
+  deterministic write batch. Gate: readers may observe only durable
+  published prefixes, never suffix writes or reordered prefixes.
+- Add an internal-consistency probe for route transitions: a
+  transaction writes a marker, switches through fallback or retained
+  read logic, and reads the same object. Failure condition: the
+  transaction misses its own visible write or observes incompatible
+  route generations.
+- Combine Elle-style generated histories with queue pressure:
+  increase logical clients and bounded-ring saturation while
+  measuring committed TPS, p50/p99 latency, rejection/fallback
+  counts, retained-read hit rate, and anomaly witnesses.
+- Extend the route certificate schema with `history_checker`,
+  `checked_isolation`, `workload_shape`, `max_concurrency`,
+  `faults_enabled`, and `witness_artifact` fields. Gate: a fast
+  route cannot be marked certified unless at least one generated
+  history artifact covers its isolation claim.

@@ -4044,7 +4044,7 @@ Append new candidates here as each paper is processed.
   trace-based anomaly debugging; useful for a GPU DB isolation-template
   validation harness that compares static route certification with observed
   weak-isolation anomaly traces.
-- `queued` — **Elle: Inferring Isolation Anomalies from Experimental
+- `reviewed` — **Elle: Inferring Isolation Anomalies from Experimental
   Observations**, Kingsbury and Alvaro, PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p268-alvaro.pdf`
   arXiv: `https://arxiv.org/abs/2003.10554`
@@ -4052,6 +4052,14 @@ Append new candidates here as each paper is processed.
   Elle is the complementary experiment-driven isolation checker for database
   implementations, useful for validating GPU DB isolation claims with generated
   workloads and concise anomaly witnesses.
+- `queued` — **Cobra: Making Transactional Key-Value Stores Verifiably
+  Serializable**, Tan, Zhao, Mu, and Walfish, OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/tan`
+  PDF: `https://www.usenix.org/system/files/osdi20-tan.pdf`
+  Why: Elle checks generated histories with traceable datatypes; Cobra is a
+  continuous black-box serializability verifier for transactional key-value
+  workloads, useful for comparing route-history checking against solver-backed
+  verification and transaction segmentation.
 - `queued` — **DynaMast: Adaptive Dynamic Mastering for Replicated Systems**,
   Abebe, Glasbergen, and Daudjee, ICDE 2020.
   URL: `https://doi.org/10.1109/ICDE48307.2020.00123`
