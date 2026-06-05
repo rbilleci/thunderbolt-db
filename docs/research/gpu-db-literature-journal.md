@@ -63715,3 +63715,158 @@ while comparing scalar latest-generation routing against explicit
 decision-plus-frontier routing. The pass gate is identical committed results
 and recoverable resident-publication state with lower p99 than a global
 owner-serialized baseline.
+
+### 2026-06-05 - Deuteronomy makes range MVCC a logical route certificate
+
+**Citation:** Justin Levandoski, David Lomet, Sudipta Sengupta,
+Ryan Stutsman, and Rui Wang. "Multi-Version Range Concurrency
+Control in Deuteronomy." PVLDB 8(13):2146-2157, 2015.
+doi:10.14778/2831360.2831367. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol8/p2146-levandoski.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing;
+range concurrency control.
+
+**Relevance tags:** serializable MVCC; phantom prevention; logical
+ranges; timestamp ordering; latch-free metadata; TC/DC separation;
+retained range reads; prefix scans; route certificates; resident index
+visibility.
+
+**Core idea:** Deuteronomy extends timestamp-order MVCC from single
+records to key ranges without making the transaction component depend
+on physical page or B-tree structure. The data component still owns
+storage and scans; the transaction component owns logical concurrency
+state. Range protection is represented as logical range resources with
+last-read timestamps and intent-to-update postings, so serializable
+range scans can avoid commit-time re-reading and phantom validation.
+
+The transferable idea is that a range read can be certified at access
+time by a small logical object rather than by rescanning the physical
+index at commit. That is a strong fit for GPU DB retained reads: a
+resident prefix/range route should not merely say "this buffer is
+valid." It should carry the logical key-range partition, read frontier,
+writer intents considered, and storage/residency generation used to
+assemble the visible result.
+
+**Concrete mechanisms:**
+
+- Deuteronomy separates a transaction component from a data component.
+  The transaction component performs logical MVCC and recovery; the data
+  component manages key-ordered storage, in the paper using the Bw-tree.
+- For single-record timestamp-order MVCC, a transaction receives a
+  timestamp at start. Reads select the newest committed version earlier
+  than that timestamp and advance a per-record last-read time. Writes
+  abort if they would overwrite a record whose last-read time is later
+  than the writer timestamp, or if another active writer already owns an
+  uncommitted version.
+- Range MVCC adds a separate latch-free hash table for logical range
+  objects. Each range object maintains a last-read time and a list of IX
+  update postings naming transactions that may update records in that
+  range.
+- The data component supplies a key-space partitioning during
+  initialization, ideally using key distribution rather than equal-width
+  guesses. The transaction component maps scanned keys to these disjoint
+  logical range ids; it does not know physical pages or tree splits.
+- A record update first posts an IX access to the containing logical
+  range, then posts the record update in the record MVCC table. Multiple
+  IX postings are compatible with one another; record-level conflicts
+  are still resolved at the record MVCC entry.
+- A range read checks all relevant IX postings and advances the range
+  last-read timestamp if safe. The scheme also supports an SIX-like
+  read-while-updating mode where a transaction can scan a range and later
+  update records in that same range.
+- Range results are assembled incrementally. For each logical range
+  partition, the transaction component gathers committed relevant
+  versions from transactions named by IX postings, scans the data
+  component for the physical range, and merges the two sorted streams.
+  It materializes only batches of records, not the whole range object.
+- The paper identifies a subtle late-insert problem: a record inserted
+  after the transaction's read timestamp can appear from the data
+  component even if it was not in the transaction component's version
+  set. Their fix is to make data-component records carry timestamps, or
+  page-level timestamp upper bounds, so the merge can discard versions
+  newer than the reader.
+- Evaluation uses a YCSB-E-like workload with 95% scans and 5% updates
+  over 50 million 100-byte values on a four-socket, 32-core/64-thread
+  machine. Reported results include 2.25 million scan transactions per
+  second, roughly 112 million scanned records per second for the main
+  workload, and long-scan rates near 250 million records per second
+  under serializable isolation. Range support increased update latency
+  by about 80% on the fast path but only reduced a four-operation OLTP
+  workload from 1.28M tps to 1.25M tps in their setup. Their IX range
+  method was up to 43% faster than re-reading ranges for validation.
+
+**GPU DB mapping:** GPU DB's P8 design already treats GPU resident state
+as an immutable acceleration tier rebuilt from CPU/WAL truth. Deuteronomy
+adds the missing range-level visibility shape: a retained snapshot for
+`key = ?`, `key BETWEEN ? AND ?`, or `text LIKE 'prefix%'` should publish
+not only a table generation but also logical range partitions with
+last-read/read-frontier state and writer-intent evidence.
+
+For resident prefix scans, a range route certificate could include:
+`table_oid`, schema generation, resident generation, logical range ids,
+key bounds, source WAL boundary, read timestamp, range last-read frontier,
+active writer-intent frontier, and whether any late insert/update must be
+merged from CPU delta state. That would let read workers execute against a
+GPU column group or resident key vector without routing every prefix read
+through the mutation owner, while still proving that no phantom is hidden
+behind an old resident buffer.
+
+The TC/DC split also matches the architecture's owner-domain direction.
+Mutation owners and MVCC metadata owners can stay logical; storage,
+resident index, and GPU execution owners can manage physical layouts. The
+price is that logical range partitions must be stable enough for routing
+and cheap enough to check on every write. They should probably be derived
+from observed key distribution and hot ranges, then published as metadata
+versions just like route-relevant catalog state.
+
+The late-insert lesson is especially important for GPU residency. If the
+GPU resident range is built from a previous CPU snapshot and the CPU truth
+accepts a newer insert in the same key range, a GPU range scan needs an
+upper-bound timestamp or generation on each resident batch/page plus a
+mergeable delta source. Otherwise it can accidentally return a row whose
+physical placement is new but whose logical visibility is too young, or
+miss a phantom that should be visible.
+
+**Risks and mismatches:** This is a 2015 Deuteronomy design, not a GPU
+paper. It assumes ordered key-value operations and a transaction component
+that can maintain extra latch-free hash-table state. GPU DB's current
+prototype is much simpler and may not need range MVCC until resident range
+indexes or prefix scans become hot. The reported performance depends on a
+carefully tuned Bw-tree/LLAMA stack and a specific NUMA machine; the
+absolute rates should not be projected onto CUDA kernels or pgwire paths.
+
+Range partition choice is a real risk. Too few partitions make IX lists hot
+and over-conservative; too many increase partition-crossing overhead and
+metadata footprint. The paper also does not solve SQL predicate locking for
+arbitrary expressions, secondary-index maintenance, DDL/catalog versioning,
+GPU memory eviction, or WAL durability ordering for resident generations.
+The timestamp/page-timestamp fix for late inserts must be reconciled with
+GPU DB's WAL-before-visibility invariant and recovery replay before it is
+trusted.
+
+**Benchmark candidates:**
+
+- Add a CPU-only retained range-certificate simulator: logical range
+  partitions, per-range last-read timestamps, IX writer postings, and
+  record-level MVCC validation. Measure aborts, per-write metadata cost,
+  range-read latency, and phantom correctness under skewed inserts.
+- Compare three prefix-scan correctness strategies: owner-serialized scan,
+  commit-time range revalidation, and Deuteronomy-style access-time range
+  certificate plus delta merge. Proof gate: identical serializable results
+  on generated histories with late inserts, deletes, updates, and long
+  readers.
+- Prototype resident range route metadata for one admitted table: key-range
+  partition map, resident batch timestamp upper bounds, source WAL boundary,
+  and merge-required delta frontier. Failure condition: any GPU resident
+  range route can execute without proving the CPU delta interval it covers.
+- Stress partition granularity for retained prefix reads: 256, 4K, 64K, and
+  adaptive logical ranges under Zipfian hot keys. Measure IX-list length,
+  write admission overhead, scan batch count, and p99 read latency.
+- Add a late-insert negative control where a row is inserted after a
+  resident batch is scanned physically but before the range result is
+  returned. Expected failure without timestamp/generation checks: the scan
+  either exposes a too-new row or misses a required phantom boundary.
+- Track range-certificate telemetry in future benchmarks: range ids touched,
+  IX postings examined, delta rows merged, resident batches used,
+  validation/retry reason, and owner fallback count.

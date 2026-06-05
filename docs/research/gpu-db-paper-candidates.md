@@ -5046,7 +5046,7 @@ Append new candidates here as each paper is processed.
   redundancy rather than storage-layer CAS; useful for comparing failure
   progress, participant autonomy, and extra message cost in owner-domain
   commit protocols.
-- `queued` — **Multi-version Range Concurrency Control in Deuteronomy**,
+- `reviewed` — **Multi-version Range Concurrency Control in Deuteronomy**,
   Levandoski et al., PVLDB 2015.
   URL: `https://www.vldb.org/pvldb/vol8/p2146-levandoski.pdf`
   DOI: `https://doi.org/10.14778/2831360.2831367`
@@ -5054,6 +5054,22 @@ Append new candidates here as each paper is processed.
   this is a 2015-present primary source for range-level MVCC concurrency that
   may inform prefix scans, resident key-range certificates, and lock-free
   retained reads.
+- `queued` — **High Performance Transactions in Deuteronomy**, Levandoski,
+  Lomet, Sengupta, Stutsman, and Wang, CIDR 2015.
+  URL: `https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper15.pdf`
+  Project page:
+  `https://www.microsoft.com/en-us/research/publication/high-performance-transactions-in-deuteronomy/`
+  Why: direct source for Deuteronomy's high-throughput TC/DC split, latch-free
+  MVCC table, redo-log version cache, epoch management, and fast commit path;
+  useful if GPU DB adopts logical transaction ownership over separate storage
+  and resident-index components.
+- `queued` — **VLL: A Lock Manager Redesign for Main Memory Database
+  Systems**, Ren, Thomson, and Abadi, VLDB Journal 2015.
+  URL: `https://www.cs.yale.edu/homes/dna/papers/vldbj-vll.pdf`
+  DOI: `https://doi.org/10.1007/s00778-014-0377-7`
+  Why: Deuteronomy contrasts VLL's logical range locking with MV timestamp
+  ranges; useful for comparing lightweight pessimistic range protection
+  against MVCC range certificates for retained prefix scans.
 - `skipped` — **Releasing Locks as Early as You Can: Reducing Contention of
   Hotspots by Violating Two-Phase Locking**, Guo, Wu, Yan, and Yu,
   SIGMOD 2021.
