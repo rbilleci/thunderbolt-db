@@ -583,10 +583,10 @@ Append new candidates here as each paper is processed.
   warm-tier DBMS designs; relevant to byte-compatible hot/warm column formats,
   load-unit placement, buffer-cache prefetch, page-level eviction, and
   advisor-driven tiering.
-- `queued` — **Real-time Analytical Processing with SQL Server**, Larson et al.,
+- `reviewed` — **Real-time Analytical Processing with SQL Server**, Larson et al.,
   PVLDB 2015.
-  URL: `https://www.vldb.org/pvldb/vol8/p1740-larson.pdf`
-  DOI: `https://doi.org/10.14778/2824032.2824091`
+  URL: `https://www.vldb.org/pvldb/vol8/p1740-Larson.pdf`
+  DOI: `https://doi.org/10.14778/2824032.2824071`
   Why: HANA NSE contrasts SQL Server's columnstore-on-OLTP approach; useful for
   comparing dual-store maintenance, operational analytics freshness, and write
   overhead against GPU DB resident snapshots.
@@ -978,6 +978,13 @@ Append new candidates here as each paper is processed.
   Why: source design for the GPU-PGM paper; useful for understanding update,
   error-bound, and space guarantees before adapting a learned index to MVCC
   resident snapshots.
+- `queued` — **Freely Moving Between the OLTP and OLAP Worlds**, Gubner et al.,
+  PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p5113-gubner.pdf`
+  Why: modern SQL Server/Azure SQL HTAP follow-up cited by the search path for
+  SQL Server real-time analytics; useful for comparing newer hot/cold
+  movement, analytical freshness, and operational workload isolation against
+  the 2015 columnstore-on-OLTP design.
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
@@ -4733,9 +4740,10 @@ Append new candidates here as each paper is processed.
   Why: TiDB contrasts dual-format in-memory replicas with Raft learners;
   useful for comparing transaction-owned row truth plus queryable column
   acceleration when the analytical copy is updated inside the primary DBMS.
-- `queued` — **Real-Time Analytical Processing with SQL Server**, Larson et
+- `reviewed` — **Real-Time Analytical Processing with SQL Server**, Larson et
   al., PVLDB 2015.
-  URL: `https://www.vldb.org/pvldb/vol8/p1740-larson.pdf`
+  URL: `https://www.vldb.org/pvldb/vol8/p1740-Larson.pdf`
+  DOI: `https://doi.org/10.14778/2824032.2824071`
   Why: TiDB cites SQL Server's integrated Hekaton/Apollo HTAP path; useful for
   comparing migration from hot transactional rows into compressed columnar
   structures against GPU DB's resident refresh and safe-generation policy.

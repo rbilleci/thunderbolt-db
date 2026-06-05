@@ -61862,3 +61862,176 @@ lookups, write invalidation churn, queue pressure, and pinned-buffer scarcity.
   append to CPU/WAL deltas, retained reads combine a resident main segment with
   a bounded delta overlay or force refresh. Measure write throughput,
   freshness lag, read latency, and refresh frequency.
+
+### 2026-06-05 - SQL Server real-time analytics overlays columnar reads onto OLTP storage
+
+**Citation:** Per-Ake Larson, Adrian Birka, Eric N. Hanson, Weiyun
+Huang, Michal Nowakiewicz, and Vassilis Papadimos. "Real-Time
+Analytical Processing with SQL Server." PVLDB 8(12), 2015, pp.
+1740-1751. doi:10.14778/2824032.2824071. Retrieved 2026-06-05
+from `https://www.vldb.org/pvldb/vol8/p1740-Larson.pdf`.
+
+**Category:** hybrid HTAP and MVCC / snapshot / visibility.
+
+**Relevance tags:** real-time analytics; HTAP; columnstore indexes;
+in-memory OLTP; MVCC; tail rows; delete buffers; delta stores;
+compressed row groups; B-tree overlays; batch mode; SIMD; predicate
+pushdown; operational freshness.
+
+**Core idea:** SQL Server 2016 improved HTAP by making columnstore
+analytics a first-class overlay on both disk-based OLTP tables and
+Hekaton in-memory OLTP tables, rather than treating analytics as a
+separate replica with stale data. The paper describes four mechanisms:
+columnstore indexes on in-memory tables, updatable secondary
+columnstore indexes on disk-based tables, B-tree indexes over primary
+columnstores, and faster columnstore scans.
+
+The transferable idea is the separation of mutable OLTP truth from
+compressed analytical fragments, with explicit bridging structures for
+freshness. New and recently updated rows remain in row-oriented
+structures that preserve OLTP behavior; background tasks migrate cooler
+rows into compressed row groups; scans combine compressed groups,
+tail/delta rows, and delete metadata under snapshot semantics. SQL
+Server gets real-time analytical visibility without requiring every
+transaction to immediately rewrite the analytical layout.
+
+**Concrete mechanisms:**
+
+- SQL Server keeps a common frontend and backend across the classical
+  row engine, Apollo columnstore engine, and Hekaton in-memory OLTP
+  engine. They share logging and high-availability infrastructure while
+  specializing execution/storage paths.
+- Hekaton tables use latch-free memory-resident indexes and MVCC. Row
+  versions have begin/end timestamps, and read-only transactions read
+  older versions without blocking writers.
+- A Hekaton table with a secondary columnstore index stores all rows in
+  the in-memory table and most rows in compressed columnstore form. A
+  hidden RID column records the compressed row-group/position location
+  when a row has migrated.
+- Rows not yet migrated are kept in a hidden Tail Index. Analytical
+  scans read compressed columnstore row groups and append visible tail
+  rows, avoiding duplicates through RID state and versioned metadata.
+- A hidden Deleted Rows Table stores RIDs or RID ranges for compressed
+  rows that have been logically deleted, so scans can skip old
+  compressed versions while the OLTP row store handles updates normally.
+- The migration task chooses "cool" rows based on time since last
+  modification, compresses them into new row groups, initially hides
+  them through Deleted Rows Table entries, then uses short transactions
+  to update Hekaton RIDs and make the compressed rows visible.
+- RID-column updates are not logged directly. Recovery reconstructs RID
+  values by scanning compressed row groups, extracting primary keys,
+  looking up rows in Hekaton, and restoring the mapping.
+- Background migration is made subordinate to user transactions:
+  short transactions reduce conflict windows, and user transactions win
+  when they conflict with background RID-only maintenance.
+- For disk-based tables with updatable secondary columnstores, hot
+  inserted/modified rows live in B-tree delta stores keyed by base-table
+  locators; colder rows live in compressed row groups.
+- Deletes from compressed row groups first enter a B-tree delete buffer
+  rather than forcing an immediate scan to find row positions. Scans
+  anti-join compressed rows against the delete buffer, using Bloom
+  filters and segment min/max metadata to reduce overhead.
+- Delete-buffer entries carry a generation number, so a deleted key
+  only hides rows in immutable row groups whose generation is at or
+  before the delete.
+- Primary columnstores can have secondary B-tree indexes. Their locators
+  are row-group ID plus row position, with a Mapping Index recording
+  moved row ranges so tuple movement does not require rewriting every
+  secondary index entry.
+- The improved scan operator splits decompression, decoding, filtering,
+  compaction, and aggregation into smaller sequential passes, enabling
+  SIMD implementations and more operation pushdown.
+- Filters and some scalar aggregates can be evaluated on encoded or
+  compressed values before full decoding. Dictionary predicates can
+  become bitmap filters over dictionary IDs, and fast paths can fall
+  back to ordinary execution for unsupported cases or overflow risk.
+- Reported micro-benchmarks include a 55.4x scan speedup for a simple
+  aggregation over Hekaton lineitem data using a columnstore index
+  versus row-store scan, while inserts/updates/deletes paid visible but
+  bounded extra maintenance cost. Secondary columnstore scans over a
+  180M-row disk-based table were much faster than page-compressed
+  B-tree scans, but delete buffers and delta stores degraded scans until
+  background cleanup caught up.
+
+**GPU DB mapping:** This paper sharpens the P8 resident-snapshot plan:
+GPU analytical/read-optimized state should be an overlay on WAL/MVCC
+truth, not the place where every transaction does physical analytical
+maintenance. For GPU DB, the analog is a CPU/WAL-owned mutable delta
+plus immutable GPU/host column groups. New writes remain cheap in the
+mutation owner; retained reads merge a valid resident main segment with
+a bounded visible delta or trigger refresh/fallback when the delta has
+grown too expensive.
+
+The Tail Index and Deleted Rows Table map directly to snapshot
+freshness structures. A retained GPU route should know which rows are
+in a resident compressed/main segment, which fresh rows still live in a
+CPU delta, and which resident row ordinals are hidden by delete/update
+metadata for the read boundary. That can be represented as route
+certificate fields: resident source boundary, delta boundary,
+delete-buffer generation, visibility frontier, and merge policy.
+
+The "cool row" migration policy is a useful guardrail for refresh. P8
+should avoid eagerly refreshing GPU segments for rows that are likely to
+change again. A first policy can require minimum row count, minimum
+age since update, invalidation age, and bounded delta size before
+building a new resident generation. User writes must win over
+background refresh when both touch the same metadata.
+
+Delete buffers and generation tags are especially relevant to MVCC
+visibility. Rather than invalidating or rebuilding a whole resident
+segment on every delete, GPU DB could benchmark a compact per-segment
+delete/key buffer that resident scans anti-join against. Fresh point
+lookups may prefer CPU fallback until the delete buffer is flushed,
+while broad scans may still win on GPU if the delete-buffer overhead is
+bounded and visible.
+
+The B-tree-over-columnstore mapping index reinforces a route-metadata
+principle: physical movement of compressed chunks should not force
+global rewrites of every lookup structure. GPU DB resident key vectors,
+CPU indexes, and route caches should retain stable original locators or
+row IDs plus a small movement/remapping table for chunk refresh and
+compaction.
+
+The scan improvements carry over to kernels and CPU fallbacks. Resident
+segments should preserve encoded forms that allow predicate pushdown,
+dictionary/bitmap filtering, aggregate pushdown, and vectorized or GPU
+SIMT compaction before materializing rows. Unsupported encodings should
+fall back by route certificate, not silently take a slow or incorrect
+resident path.
+
+**Risks and mismatches:** The paper is SQL Server 2016-era CPU
+columnstore work, not a GPU execution design. Its scan speedups depend
+on SQL Server batch mode, AVX2, compression choices, and parallel CPU
+scans. It does not describe GPUDirect, CUDA pinned buffers, GPU
+resident indexes, or million-session admission. Some maintenance
+details are proprietary or summarized at a high level, and the
+micro-benchmarks used early builds. The Hekaton columnstore design also
+duplicates data between row store and columnstore; GPU DB must measure
+whether duplicate GPU/host column groups are acceptable under HBM
+pressure. Delete-buffer anti-joins can hurt scans if cleanup lags, so
+the technique needs explicit failure gates.
+
+**Benchmark candidates:**
+
+- Prototype a mutable-delta plus immutable-resident-main read path for
+  one P8 table: retained scans merge GPU-resident main rows with a CPU
+  or staged delta overlay. Gate: identical SQL results before/after
+  insert/update/delete under retained snapshots.
+- Add a per-resident-segment delete buffer with generation tags and
+  compare three policies: invalidate-on-delete, GPU anti-join against
+  delete buffer, and CPU fallback until refresh. Measure write latency,
+  retained scan latency, delete-buffer size, and p99 under mixed writes.
+- Add a "cool row" refresh policy using row age, update frequency,
+  delta cardinality, and invalidation age. Success condition: fewer
+  wasted refreshes without stale reads or unbounded delta merge cost.
+- Benchmark stable original locators plus movement/remapping metadata
+  for resident chunk refresh. Failure condition: refresh requires
+  rewriting all resident key-vector or route-cache entries.
+- Compare encoded predicate pushdown versus decode-then-filter for
+  resident `int4` and dictionary/text-prefix segments on CPU and GPU.
+  Required measurements: H2D/D2H bytes, kernel time, output rows,
+  compaction cost, and fallback reason.
+- Build a cleanup-lag stress test: repeated updates/deletes against a
+  hot subset while a long retained scan remains open. Failure
+  condition: delete-buffer or tail/delta overhead grows without
+  telemetry-driven refresh, cleanup, or fallback.
