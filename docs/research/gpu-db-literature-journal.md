@@ -70773,3 +70773,158 @@ could improve mean latency while harming tail latency and memory pressure.
   strict session order, transaction-local order, unordered background
   notification, or idempotent telemetry. The scheduler should refuse to
   reroute strict-order work unless a bounded reorder path is available.
+
+### 2026-06-05 - Orion co-schedules GPU kernels by resource complementarity
+
+**Citation:** Foteini Strati, Xianzhe Ma, and Ana Klimovic.
+"Orion: Interference-aware, Fine-grained GPU Sharing for ML
+Applications." EuroSys 2024. doi:10.1145/3627703.3629578.
+Retrieved 2026-06-05 from the author-hosted PDF,
+`https://fotstrt.github.io/files/2024-orion.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** GPU scheduling; operator-level admission; CUDA streams;
+tail latency; resource profiles; compute-bound kernels; memory-bound kernels;
+foreground/background colocation; retained reads; refresh throttling.
+
+**Core idea:** Orion treats a GPU as a schedulable mix of compute and memory
+bandwidth rather than a single busy/idle device. It intercepts GPU work from
+multiple clients, queues operations in software, and launches kernels at the
+granularity of individual operators. Best-effort work is allowed to run beside
+a high-priority job only when its kernel is small enough and has a complementary
+resource profile, such as memory-bound work beside compute-bound work.
+
+The strongest transferable idea is that GPU DB should not decide colocation
+from queue depth or SM occupancy alone. A retained read, decompression pass,
+refresh chunk, index probe, and scan fragment can interfere differently. The
+runtime needs per-route resource shape, expected duration, and priority before
+it lets background work share the device with latency-sensitive reads.
+
+**Concrete mechanisms:**
+
+- Orion is implemented as a dynamically linked CUDA/C++ library integrated
+  with PyTorch. It intercepts kernel launches and memory operations, buffers
+  operations in per-client software queues, and submits them to GPU streams
+  according to its scheduler.
+- The scheduler always launches high-priority kernels on a dedicated
+  high-priority stream. For best-effort kernels, it checks whether a
+  high-priority task is active, whether the best-effort kernel needs fewer SMs
+  than a threshold, and whether the high-priority and best-effort kernels have
+  different compute-versus-memory profiles.
+- Orion throttles non-preemptible best-effort work with a duration budget. It
+  tracks already submitted best-effort kernels through CUDA events and refuses
+  to add more if their expected outstanding duration exceeds a tunable
+  percentage of the high-priority request latency or training iteration time.
+  The default used in the paper is 2.5%.
+- Offline profiling supplies each kernel's compute or memory intensity,
+  expected execution time, and SM requirement. Orion uses NVIDIA Nsight Compute
+  and Nsight Systems, classifies kernels with roofline analysis when available,
+  and otherwise treats kernels above 60% compute throughput or memory bandwidth
+  utilization as compute-bound or memory-bound.
+- Kernels with unknown profiles are allowed optimistically because the paper
+  found them mostly short-running in its workloads. This is a policy choice,
+  not a correctness requirement.
+- Orion uses CUDA stream priorities to influence the closed GPU hardware
+  scheduler, but it does not rely on true kernel preemption. It records CUDA
+  events and uses non-blocking event queries to observe completion of
+  best-effort streams.
+- Memory allocation and copy operations are submitted directly in the current
+  design. Blocking memory operations block the client until completion;
+  operations that synchronize the device, such as allocation and free, force
+  synchronization across clients to avoid invalid memory access.
+- The evaluation reports bursty DNN operator behavior where compute throughput
+  and memory bandwidth utilization are both often low on average. On a V100,
+  profiled workloads used 18%-72% compute throughput, 21%-49% memory bandwidth,
+  and 7%-53% memory capacity on average.
+- A toy experiment showed why resource complementarity matters: co-running two
+  compute-heavy Conv2d kernels gave no benefit, co-running two memory-heavy
+  BN2d kernels gave only a small benefit, while Conv2d plus BN2d reduced
+  aggregate latency by 1.41x compared with sequential execution.
+- In the main experiments, Orion maintains high-priority p99 inference latency
+  close to ideal while adding best-effort work. The paper reports up to 7.3x
+  aggregate inference throughput versus dedicating the GPU to the
+  high-priority job alone, p99 latency within 15% on average for
+  inference-inference Poisson arrivals, and high-priority p99 within 9% of
+  ideal with five inference clients on an A100.
+
+**GPU DB mapping:** GPU DB's runtime should define a "GPU route profile" for
+each retained execution family. The minimum fields are kernel family, expected
+duration, launch count, estimated SM footprint, compute-bound versus
+memory-bound classification, HBM bytes touched, D2H output bytes, priority,
+chunkability, and whether the route can be retried, cancelled, or preempted at
+the next chunk boundary.
+
+This maps directly to foreground retained reads versus background refresh.
+Short point lookups, count routes, and prefix filters should be treated as
+high-priority lanes when serving interactive sessions. Long scans, resident
+snapshot refresh, decompression, reindexing, and warmup should be best-effort
+unless an admin or benchmark explicitly promotes them. Background chunks should
+launch only if their profile is complementary to the foreground route or if no
+foreground route is active.
+
+Orion's duration threshold is a good practical substitute for unavailable GPU
+preemption. GPU DB can track already submitted refresh or scan chunks and
+refuse to enqueue additional best-effort GPU work when the outstanding
+non-preemptible duration approaches a retained-read p99 budget. This fits the
+runtime document's bounded rings: the admission failure should be explicit,
+for example `gpu_background_duration_budget_exceeded`, not hidden as random
+queueing delay.
+
+The offline profiler maps to route calibration rather than model profiling.
+GPU DB can benchmark representative kernels for each route family after startup
+or during controlled calibration: resident key-vector lookup, dense column
+scan, decompression, prefix text filter, grouped aggregate, hash join build,
+hash join probe, refresh encode, and D2H result scatter. The planner can then
+use those measurements to decide which routes may share a stream window.
+
+The paper's memory-operation caveat is important for P8. H2D/D2H copies,
+resident segment builds, allocation, and frees may synchronize the device or
+consume PCIe/NVLink bandwidth. GPU DB should include transfer and allocation
+events in the same route budget as kernels. Otherwise a "small" background
+kernel may still hurt foreground latency by issuing a large copy or
+synchronizing allocator call.
+
+**Risks and mismatches:** Orion targets DNN frameworks, not database kernels.
+DNN operators have stable offline profiles and strong data-dependency order
+inside a model. Database routes may have data-dependent output sizes, skewed
+hash-table behavior, variable predicate selectivity, MVCC visibility checks,
+and cancellation semantics that make profiles less stable.
+
+The design assumes collocated jobs fit in GPU memory and are in the same trust
+domain. That does not solve GPU DB multi-tenant isolation, hostile UDFs, memory
+budgeting, or resident snapshot eviction. Orion also does not manage PCIe
+bandwidth in the evaluated implementation; it explicitly lists that as future
+work. For GPU DB, transfer pressure is often first-order, especially for
+over-resident or cold-tier routes.
+
+Unknown-profile kernels are allowed optimistically in Orion because they were
+short in the evaluated DNN workloads. GPU DB should be stricter. Unknown route
+profiles should start in a conservative class and earn colocation only after
+telemetry shows bounded duration and interference.
+
+**Benchmark candidates:**
+
+- Add a GPU route-profile table for retained execution families: expected
+  duration, SM footprint, compute/memory class, HBM bytes, transfer bytes,
+  output bytes, priority, and chunkability. Proof gate: every GPU admission
+  decision can report the profile fields it used.
+- Build a foreground/background colocation benchmark: retained point lookups
+  or counts versus refresh chunks, decompression, and scans. Compare FIFO,
+  stream-priority-only, SM-threshold-only, compute/memory-complementary, and
+  complementary-plus-duration-budget policies.
+- Add a duration-budget admission gate for non-preemptible background GPU work.
+  Failure condition: p99 retained-read latency exceeds target because already
+  submitted background kernels occupy the device after foreground work arrives.
+- Measure memory-operation interference separately: large H2D/D2H transfers,
+  allocation/free, refresh encoding, and result scattering beside short
+  retained reads. The gate is that transfer and allocation pressure appear in
+  route profiles, not only CUDA kernel time.
+- Treat unknown GPU route profiles conservatively. Benchmark a learning phase
+  where a new kernel family starts isolated, records telemetry, and is admitted
+  to colocation only after duration and interference variance stay below a
+  configured threshold.
+- Test whether complementary colocation can improve background refresh
+  throughput without hurting foreground reads: run compute-heavy retained
+  filters beside memory-heavy refresh or decompression chunks, then reverse
+  the pairing and record when HBM contention makes colocation unsafe.

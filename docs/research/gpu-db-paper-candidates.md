@@ -1640,19 +1640,32 @@ Append new candidates here as each paper is processed.
   comparing software-visible GPU partition control against LithOS-style
   transparent atomization before GPU DB relies on hardware-specific scheduling
   hooks. Journal entry added 2026-06-05.
-- `queued` — **Orion: Interference-aware, Fine-grained GPU Sharing for ML
+- `reviewed` — **Orion: Interference-aware, Fine-grained GPU Sharing for ML
   Applications**, Strati, Ma, and Klimovic, EuroSys 2024.
-  URL: `https://doi.org/10.1145/3627703.3650078`
+  URL: `https://doi.org/10.1145/3627703.3629578`
+  PDF: `https://fotstrt.github.io/files/2024-orion.pdf`
   Why: SGDRC compares against Orion's interference-aware colocation policy;
   useful for deciding when GPU DB should use profiling-based compatible
   co-runners instead of explicit partitioning for retained reads, scans, and
-  refresh work.
+  refresh work. Journal entry added 2026-06-05.
 - `queued` — **Transparent GPU Sharing in Container Clouds for Deep Learning
   Workloads**, Wu et al., NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/wu`
   Why: SGDRC contrasts TGS temporal multiplexing and CUDA-container switching
   overhead; useful for evaluating whether GPU DB request classes should ever
   use exclusive time slices instead of spatial sharing or chunked preemption.
+- `queued` — **Paella: Low-Latency Model Serving with Software-Defined GPU
+  Scheduling**, Ng, Demoulin, and Liu, SOSP 2023.
+  URL: `https://doi.org/10.1145/3600006.3613163`
+  Why: Orion contrasts Paella as a low-latency GPU serving scheduler that is
+  not compute/memory-profile aware; useful for comparing model-serving
+  scheduling policies against GPU DB route-class and chunking policies.
+- `queued` — **Zico: Efficient GPU Memory Sharing for Concurrent DNN
+  Training**, Lim et al., USENIX ATC 2021.
+  URL: `https://www.usenix.org/conference/atc21/presentation/lim`
+  Why: Orion contrasts Zico's training-oriented GPU memory sharing and
+  forward/backward scheduling with operator-profile-aware colocation; useful
+  for GPU DB refresh and scan jobs that have large resident memory footprints.
 - `queued` — **StreamBox: A Lightweight GPU Sandbox for Serverless Inference
   Workflow**, Wu et al., USENIX ATC 2024.
   URL: `https://www.usenix.org/conference/atc24/presentation/wu-hao`
