@@ -4916,9 +4916,11 @@ Append new candidates here as each paper is processed.
   direction; useful for deciding whether GPU DB hot-write admission should
   reorder compatible operations inside bounded latency ceilings instead of
   relying only on timestamp priority.
-- `queued` — **High-Performance ACID via Modular Concurrency Control**, Xie
+- `reviewed` — **High-Performance ACID via Modular Concurrency Control**, Xie
   et al., SOSP 2015.
   URL: `https://doi.org/10.1145/2815400.2815430`
+  PDF:
+  `https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/263-xie-online.pdf`
   Why: PLOR cites Callas-style modular concurrency control as a mixed-protocol
   alternative; useful for comparing per-route concurrency-control modules with
   GPU DB owner domains, retained reads, and hot-write fallback lanes.
@@ -4964,3 +4966,11 @@ Append new candidates here as each paper is processed.
   Why: Index Checkpoints relies on tuple snapshot consistency while accepting
   non-transaction-consistent index checkpoints; useful for choosing CPU truth
   checkpoint algorithms before deciding which derived indexes are persisted.
+- `queued` — **Chablis: Fast and General Transactions in Geo-Distributed
+  Systems**, Lu et al., CIDR 2024.
+  URL:
+  `https://mail.vldb.org/cidrdb/2024/chablis-fast-and-general-transactions-in-geo-distributed-systems.html`
+  Why: discovered while reviewing Callas and modern transaction-routing
+  follow-ups; useful for comparing multi-versioned transactional routing,
+  fast local read-write transactions, and lock-free snapshot reads against GPU
+  DB route certificates and owner-local hot paths.

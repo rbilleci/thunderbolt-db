@@ -62035,3 +62035,197 @@ the technique needs explicit failure gates.
   hot subset while a long retained scan remains open. Failure
   condition: delete-buffer or tail/delta overhead grows without
   telemetry-driven refresh, cleanup, or fallback.
+
+### 2026-06-05 - Callas modular concurrency control separates ACID from one-size-fits-all locking
+
+**Citation:** Chao Xie, Chunzhi Su, Cody Littley, Lorenzo Alvisi,
+Manos Kapritsos, and Yang Wang. "High-Performance ACID via Modular
+Concurrency Control." SOSP 2015, pp. 279-294.
+doi:10.1145/2815400.2815430. Retrieved 2026-06-05 from
+`https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/263-xie-online.pdf`.
+
+**Category:** transaction processing / write path and concurrency control.
+
+**Relevance tags:** modular concurrency control; ACID; transaction
+grouping; hot-key contention; transaction chopping; runtime pipelining;
+lock release ordering; rollback containment; per-route concurrency modules;
+owner domains.
+
+**Core idea:** Callas argues that ACID should remain a uniform application
+abstraction, but the mechanism enforcing isolation need not be uniform. Its
+Modular Concurrency Control (MCC) partitions transactions into groups. Each
+group can use a specialized concurrency-control mechanism, while an
+inter-group mechanism preserves the target isolation property across groups.
+The point is not weaker semantics: Callas tries to get BASE/NoSQL-style
+throughput gains while leaving applications written as ordinary ACID
+transactions.
+
+The paper's most transferable idea for GPU DB is a two-layer contract. First,
+prove that each route class or owner group preserves the required isolation
+property internally. Second, use a small global mechanism to regulate only
+cross-group conflicts. That is close to the current owner-domain direction:
+retained reads, mutation-owner writes, hot-key ordered lanes, CPU fallbacks,
+and future GPU OLTP batches do not all need the same internal protocol, but
+they do need a common visibility and conflict boundary.
+
+**Concrete mechanisms:**
+
+- MCC defines correctness in two parts using Adya-style isolation
+  phenomena. Within each group, the chosen mechanism must prevent aborted
+  reads, intermediate reads, and the relevant circularity conditions. Across
+  groups, a separate mechanism must prevent those same phenomena when
+  transactions from different groups interact.
+- Callas implements the inter-group layer with nexus locks. Every row access
+  acquires a nexus lock, but the lock behaves restrictively only across
+  different groups. Transactions in the same group may acquire the same nexus
+  lock concurrently, leaving their in-group mechanism free to exploit more
+  concurrency.
+- Nexus locks prevent aborted and intermediate reads across groups by making
+  conflicting cross-group row accesses wait. To prevent dependency cycles,
+  Callas enforces a Nexus Lock Release Order: if transaction `T2` depends on
+  same-group transaction `T1`, `T2` cannot release its nexus locks before
+  `T1` releases its nexus locks.
+- Commit and nexus-lock release are decoupled. A transaction may release the
+  resources used by its in-group protocol when it commits, while retaining
+  nexus locks only long enough to satisfy cross-group ordering.
+- The main in-group mechanism is Runtime Pipelining. Static analysis ranks
+  read-write tables or columns, chops transactions into pieces that access
+  compatible ranks, and then uses runtime checks to order only actual
+  conflicting pieces instead of rejecting all static SC-cycle possibilities.
+- Runtime Pipelining declares dependencies only when two transaction
+  instances touch the same row at runtime. If `Ti` becomes dependent on
+  uncommitted `Tj`, `Ti` cannot commit before `Tj`, and later pieces of `Ti`
+  wait until `Tj` has reached a sufficient rank or committed.
+- The chopping tool uses column-level analysis, removes commutative conflict
+  edges, and detects runtime uniqueness through monotonic objects such as
+  counters used to allocate unique keys.
+- To avoid forcing rollback statements into the first piece, Runtime
+  Pipelining optimistically permits uncommitted reads inside a group but makes
+  dependent transactions wait for the source transaction to commit. If the
+  source rolls back, dependents roll back too.
+- Cascading rollback risk is contained inside the group. When rollback rate
+  crosses a threshold, Runtime Pipelining temporarily reverts to a more
+  conservative rollback-safe chopping mode, and later probes whether it can
+  return to aggressive mode.
+- The grouping tool profiles workloads under increasing load, looks for
+  operations whose latency grows disproportionately, and explores groupings
+  for the transaction types responsible for contention. Less critical
+  transactions remain in a conservative group.
+- The prototype modifies MySQL Cluster, uses read committed because that is
+  what MySQL Cluster supports, and evaluates TPC-C, Fusion Ticket, Front
+  Accounting, and microbenchmarks.
+- Reported results include an 8.2x TPC-C throughput improvement over MySQL
+  Cluster, 5.7x on Fusion Ticket, and 6.7x on Front Accounting. Nexus-lock
+  overhead alone is reported as about 19% in a no-contention microbenchmark
+  and about 13.6% under high contention when Callas' optimization benefits
+  are intentionally disabled.
+
+**GPU DB mapping:** GPU DB should think of route families as concurrency
+modules, not just execution targets. A retained GPU snapshot read, a CPU
+point lookup, a hot-key mutation lane, a COPY admission batch, and an
+over-resident scan have different conflict shapes and latency budgets. Callas
+suggests allowing different internal protocols for each route family while
+requiring them all to publish into one visibility and WAL order.
+
+The nexus-lock idea maps to a lightweight cross-route conflict boundary. GPU
+DB should not let every route acquire heavyweight locks on every tuple, but
+it may need compact per-key, per-segment, or per-partition conflict metadata
+that gates only cross-module conflicts: for example, a retained read can run
+freely inside an immutable snapshot module, but a mutation touching the same
+resident segment must publish invalidation and visibility ordering before
+new retained readers use that segment.
+
+Runtime Pipelining maps to bounded hot-write lanes. When a batch of similar
+transactions touches the same ranked resources in the same order, the engine
+can pipeline pieces through owner domains instead of serializing whole
+transactions at the mutation owner. A GPU-friendly version would need
+declared route steps such as key reservation, WAL append, CPU index update,
+resident invalidation, delta publish, and response completion, with runtime
+dependencies declared only when the actual key/segment conflicts.
+
+Column-level and runtime-uniqueness optimizations are useful for P8. A route
+certificate can say that two transactions update different columns or allocate
+different row IDs from a monotonic allocator, allowing the write path to avoid
+false conflicts while still enforcing WAL-before-visibility. This should be
+measured before adopting a generic "one writer per table" bottleneck.
+
+The rollback containment lesson is important for adaptive admission. If a
+route family uses an optimistic or learned policy, failures should be
+contained to that module and should trigger a local fallback to a conservative
+lane. A bad hot-key policy must not propagate cascading retries into retained
+read snapshots, residency refresh, or unrelated sessions.
+
+**Risks and mismatches:** Callas is a 2015 MySQL Cluster prototype, not a GPU
+database and not an MVCC-rich engine. Its implementation targets read
+committed because of the substrate, while GPU DB needs explicit snapshot and
+future serializable semantics. Nexus locks are row-oriented and ubiquitous;
+copying them literally could add too much CPU, memory, and queue overhead.
+Runtime Pipelining assumes useful static knowledge of transaction tables or
+columns, which fits stored procedures and prepared routes better than fully
+interactive SQL. The evaluation uses 1 Gb Ethernet, SATA disks, and ten
+warehouses for TPC-C, so the absolute numbers are historical. The paper also
+does not solve GPU residency, CUDA scheduling, pgwire session multiplexing,
+or WAL/checkpoint recovery for mixed protocols.
+
+**Benchmark candidates:**
+
+- Add a route-family conflict trace: classify each request as retained read,
+  CPU read, hot-key write, ordinary mutation, COPY chunk, refresh, or
+  over-resident scan, and log whether conflicts are intra-family or
+  cross-family. Gate: no route can bypass WAL-before-visibility or snapshot
+  proof fields.
+- Prototype a conservative cross-route conflict table for one key/index:
+  retained reads run from immutable snapshots, hot writes run in a specialized
+  owner lane, and only cross-route publication/invalidation uses the shared
+  boundary. Measure write throughput, retained-read p99, conflict waits, and
+  invalidation correctness.
+- Build a transaction-piece pipeline for a narrow stored procedure or batched
+  insert path: key allocation, WAL append, CPU index publish, resident
+  invalidation, and response completion. Compare whole-transaction
+  serialization against pipelined pieces under a fixed latency ceiling.
+- Add a column-conflict experiment for updates to different columns of the
+  same row. Success condition: false conflicts fall without allowing a read
+  snapshot to observe a mixed invalid generation.
+- Test runtime uniqueness for append-heavy inserts using a monotonic ID
+  allocator. Failure condition: the optimization breaks under retry, rollback,
+  replay, or partition-owner migration.
+- Add adaptive safe-mode telemetry for optimistic hot-write lanes: when aborts
+  or cascading retries cross a threshold, route that family to a conservative
+  ordered lane and report the transition.
+
+### 2026-06-05 - Cross-paper synthesis: HTAP freshness and modular transaction lanes are converging
+
+**Papers covered:** SAP HANA Native Store Extension, SQL Server real-time
+analytics, and Callas modular concurrency control.
+
+These three papers point to a single design track: keep the user-facing
+database abstraction uniform, but make the physical execution and placement
+modules explicit. NSE says hot, warm, and paged column structures need stable
+load-unit metadata. SQL Server says mutable OLTP truth and compressed
+analytical structures can coexist if tail rows, delete buffers, and migration
+tasks are part of the design. Callas says transaction classes can use
+different concurrency mechanisms as long as a cross-module boundary preserves
+the global isolation contract.
+
+For GPU DB, the converging shape is a route certificate with both resource
+placement and concurrency proof fields. A route should know which data units
+are GPU-resident, host-warm, cold, delta-only, or absent; it should also know
+which concurrency module owns the request and what cross-module boundary is
+needed before visibility is published or a retained snapshot is used.
+
+Category gaps after this batch are now less about HTAP/tiering and more about
+modern transaction routing, snapshot algorithms, and runtime admission under
+very high session counts. Good next papers are Chablis for lock-free snapshot
+reads and fast local transactions, SLOG for strict-serializable locality-aware
+routing, and Orthrus or GalOP for separating transaction logic from
+concurrency/GPU execution resources.
+
+Benchmark priorities:
+
+- Make route certificates log both placement state and isolation proof state.
+- Measure mutable-delta plus immutable-resident-main reads before optimizing
+  full refresh.
+- Add cross-route conflict telemetry so retained reads, hot writes, refresh,
+  and CPU fallback do not hide conflicts behind one owner queue.
+- Test adaptive fallback from optimistic hot-write lanes into ordered lanes
+  under abort or retry spikes.
