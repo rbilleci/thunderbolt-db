@@ -5691,12 +5691,21 @@ Append new candidates here as each paper is processed.
   control as useful for reducing PFC generation but too delayed to eliminate it;
   useful for comparing end-to-end delay/rate feedback with GPU DB's local
   ring-pressure and credit signals.
-- `queued` — **Selection Pushdown in Column Stores using Bit Manipulation
-  Instructions**, Raghavan et al., SIGMOD 2023.
+- `reviewed` — **Selection Pushdown in Column Stores using Bit Manipulation
+  Instructions**, Li, Lu, and Chandramouli, SIGMOD/PACMMOD 2023.
   URL:
   `https://www.microsoft.com/en-us/research/publication/selection-pushdown-in-column-stores-using-bit-manipulation-instructions/`
-  DOI: `https://doi.org/10.1145/3588913`
+  PDF: `https://badrish.net/papers/bmi-sigmod2023.pdf`
+  DOI: `https://doi.org/10.1145/3589323`
   Why: modern compressed-column scan work using bit-manipulation and
   SIMD-style mechanisms; useful follow-up after Rethinking SIMD for deciding
   whether CPU warm-tier compressed scans can beat GPU transfer or resident
-  refresh on selective predicates.
+  refresh on selective predicates. Author spelling, DOI, and PDF were
+  corrected during review on 2026-06-05.
+- `queued` — **Crystal: A Unified Cache Storage System for Analytical
+  Databases**, Durner, Chandramouli, and Li, PVLDB 2021.
+  URL: `https://vldb.org/pvldb/vol14/p2432-durner.pdf`
+  DOI: `https://doi.org/10.14778/3476249.3476292`
+  Why: Selection Pushdown and Microsoft data-lake work point to a
+  query-aware cache layer with push-down predicates and region caching; useful
+  for GPU DB's warm/cold tier placement and cache-admission contract.

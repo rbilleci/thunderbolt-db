@@ -72574,3 +72574,153 @@ text-heavy SQL payloads, or write invalidation.
   uniqueness, hash load factor, partition fanout, and resident generation.
   Minimum proof: route choice changes under synthetic workloads in the same
   direction as measured operator latencies.
+
+### 2026-06-05 - Selection Pushdown in Column Stores using Bit Manipulation Instructions
+
+**Citation:** Yinan Li, Jianan Lu, and Badrish Chandramouli. "Selection
+Pushdown in Column Stores using Bit Manipulation Instructions." PACMMOD 1(2),
+Article 178, 2023. doi:10.1145/3589323. Retrieved 2026-06-05 from the author
+PDF: `https://badrish.net/papers/bmi-sigmod2023.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** compressed columns; predicate pushdown; selection
+pushdown; bit-packed values; Parquet; CPU warm-tier scans; projected-byte
+avoidance; route-cost model; GPU transfer avoidance; nested/repeated data.
+
+**Core idea:** The paper attacks a specific but important waste in compressed
+column stores: decoding values that later filters have already made
+irrelevant. Traditional predicate pushdown can avoid decoding only when the
+encoding is order-preserving and the predicate can be converted into the
+encoded domain. Parquet's dictionary encoding is not generally order-preserving,
+and real queries include strings, UDFs, cross-table predicates, nulls, and
+nested structures.
+
+Selection pushdown keeps predicate semantics unchanged. It still decodes and
+evaluates selected values with the original predicate, but it first uses the
+select bitmap from earlier filters to extract only the needed encoded values.
+The key engineering trick is a bit-parallel select operator built around x86
+BMI `PEXT` and `PDEP`, so bit-packed encoded values can be compacted before
+decode without scanning value by value. In Parquet-Select, this reduces both
+decode work and downstream engine handoff for selective scans.
+
+**Concrete mechanisms:**
+
+- A select operator takes `n` bit-packed `k`-bit values plus an `n`-bit select
+  bitmap and emits only selected encoded values contiguously, as if unselected
+  encoded values had been removed before decoding.
+- For power-of-two bit widths, the algorithm expands each select bit into a
+  `k`-bit mask using two `PDEP` operations and one subtraction, then uses
+  `PEXT(values, extended_mask)` to compact all selected bits in a processor
+  word.
+- For arbitrary bit widths, values may span word boundaries. The implementation
+  precomputes `k` layout masks per group and keeps the same constant-instruction
+  per-word shape without adding per-value branching.
+- Filter and project operators take the current select bitmap, select encoded
+  values first, unpack only selected values, and for filters evaluate the
+  predicate on that smaller decoded stream.
+- After a filter evaluates only selected values, the result bitmap must be
+  transformed back into the original record positions. The paper uses BMI-based
+  bitmap transforms to make this alignment cheap enough for the framework.
+- Parquet support handles bit-packed and RLE runs, dictionary-coded values,
+  definition levels for nulls, repetition levels for repeated fields, and
+  bitmap transformations needed when nested columns are not row-aligned.
+- Filter ordering matters. On TPC-H Q6, the best tested order is reported as
+  up to 30% faster than other orders because the most selective and widest
+  encoded column should be evaluated early enough to reduce later decode work.
+- Evaluation is against Apache Parquet and Spark over Parquet. Reported results
+  include up to more than one order of magnitude speedup for individual scan
+  queries, about 3x on non-null TPC-H Q6 with preloaded data, 13.7x on a
+  nullable Q6 variant, around 20x on a repeated-column Q6 variant, and 1.1x to
+  5.5x on selected end-to-end Spark TPC-H queries.
+- The paper notes portability limits: `PEXT`/`PDEP` are widely available on
+  x86, but ARM server processors such as Graviton and Nvidia Grace did not
+  provide equivalent instructions at the time of writing.
+
+**GPU DB mapping:** This is a planning and warm-tier paper, not a GPU kernel
+paper, but it is directly useful for P8. GPU DB should not decide "CPU versus
+GPU" only after decoding full warm/cold columns. A CPU warm-tier route can
+first compact encoded values, row ids, validity bits, and projected payloads,
+then either finish on CPU or transfer a much smaller stream to GPU.
+
+For resident GPU scans, selection pushdown suggests a route shape with staged
+filters: run the cheapest or most selective encoded/metadata filters first,
+carry a bitmap or compacted ordinal vector, and delay text payload, wide
+projection columns, MVCC side metadata, and host-to-device transfer until after
+the row set has shrunk. This aligns with P8's "move compact row ids before
+full tuples" direction.
+
+For retained lookup and scan micro-batches, the paper reinforces that filter
+order is a runtime cost variable. Route descriptors should record encoded bit
+width, null/repetition overhead, expected selectivity, projected bytes, decode
+cost, transfer bytes, and whether a CPU BMI path exists. The planner can then
+choose CPU compressed scan, CPU prefilter plus GPU transfer, resident GPU scan,
+or fallback based on measured thresholds instead of a static "GPU is faster"
+rule.
+
+For multi-tier cache placement, Parquet-Select is a useful analogue for cold or
+warm compressed segments. If GPU DB stores cold partitions as compressed
+column groups, cache admission should consider whether a selective compressed
+CPU route is cheaper than refreshing a GPU resident segment. A small
+CPU-side bitmap/ordinal cache for hot predicates may be more valuable than
+pinning full decoded columns in GPU memory.
+
+**Risks and mismatches:** The work targets analytical scans over Parquet, not
+OLTP writes, MVCC validation, WAL-before-visibility, point updates, or
+PostgreSQL protocol latency. It assumes compressed column chunks and focuses
+on reducing decode and engine-handoff cost, so it does not answer how to keep
+resident GPU snapshots fresh under mutations.
+
+The core fast path depends on x86 BMI `PEXT`/`PDEP`. GPU DB cannot assume the
+same instruction exists on all CPU hosts, and it cannot mechanically transfer
+the algorithm to CUDA without measuring warp-level compaction, divergence,
+memory coalescing, and occupancy. There is also an extra planning burden:
+selection pushdown wins most under selective predicates and narrow bit-packed
+values; for broad scans or already resident decoded columns, the added bitmap
+work may not be worthwhile.
+
+**Benchmark candidates:**
+
+- Add a CPU compressed-column prefilter benchmark with dictionary-coded or
+  bit-packed `int4`/text-code columns: decode-all baseline versus
+  bitmap-select-before-decode. Measure p50/p99 scan latency, decoded bytes,
+  projected bytes, and transfer bytes.
+- Compare three selective scan routes: CPU compressed prefilter only, CPU
+  compressed prefilter plus GPU transfer of compacted ordinals/payloads, and
+  direct resident GPU scan. Failure condition: GPU route wins only because CPU
+  fallback is decode-all and untuned.
+- Add filter-order experiments to route planning. Vary per-column selectivity,
+  encoded bit width, null density, and projected payload width; gate route
+  choice on measured order sensitivity instead of fixed predicate order.
+- Prototype an MVCC-aware bitmap stage: first compact candidate tuple ordinals
+  with cheap predicates, then apply visibility metadata and payload fetch only
+  to selected rows. Gate: visible result sets match the current MVCC path under
+  insert/update/delete and retained snapshots.
+- Add a CPU feature gate for BMI paths. Measure x86 BMI, scalar fallback, and
+  any SIMD/AVX alternative separately so route selection remains portable to
+  hosts without fast `PEXT`/`PDEP`.
+- For cold-tier P8, test whether caching compressed predicate/ordinal side
+  products beats caching decoded columns or refreshing a full GPU segment under
+  selective repeated queries.
+
+### 2026-06-05 - Cross-paper synthesis: route choice needs staged proof
+
+REPS, Rethinking SIMD, and Selection Pushdown all argue against one-shot route
+decisions. REPS keeps tiny recycled endpoint state and updates path choice from
+clean or marked completions. Rethinking SIMD shows that CPU operator shape and
+partitioning can change the winning algorithm. Selection Pushdown shows that
+even within one scan, the order of filters and the choice to compact encoded
+values before decode can dominate the cost.
+
+The converging design track is staged route proof. GPU DB should treat a route
+as a sequence of measurable stages: admission, cheap metadata/predicate filter,
+visibility check, decode or payload fetch, transfer, GPU execution, response
+encoding, and completion feedback. Each stage should publish enough telemetry
+for the next route choice to improve without breaking correctness metadata.
+
+The current gap is a benchmark that mixes staged execution with database
+invariants. The next priority should be a selective warm-tier workload with
+concurrent writes and retained reads: compact candidate row ids first, validate
+MVCC visibility second, move only selected payloads or ordinals across the
+CPU/GPU boundary, and reject the route if invalidation or feature gates make
+the staged proof stale.
