@@ -626,10 +626,12 @@ Append new candidates here as each paper is processed.
   PDF: `https://dl.gi.de/bitstreams/6553ed86-57b6-4dad-a5ab-f8d25c646f2e/download`
   Why: ROF cites this as related work on compiled scan variants; useful for
   tuning CPU fallback and warm-tier scan routes before routing work to GPU.
-- `queued` — **One Loop Does Not Fit All**, Pantela and Idreos, SIGMOD 2015.
-  URL: `https://doi.org/10.1145/2723372.2737796`
+- `reviewed` — **One Loop Does Not Fit All**, Pantela and Idreos, SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2764944`
+  PDF: `https://scholar.harvard.edu/files/stratos/files/oneloopdoesnotfitall.pdf`
   Why: ROF contrasts one-size-fits-all compiled loops with staged route shapes;
-  useful for route-specific code generation and planner decisions.
+  useful for route-specific code generation and planner decisions. The previous
+  queued DOI was corrected during the 2026-06-06 review.
 - `reviewed` — **Hardware-Conscious Hash-Joins on GPUs**, Sioulas et al.,
   ICDE 2019.
   URL: `https://doi.org/10.1109/ICDE.2019.00068`
@@ -645,6 +647,14 @@ Append new candidates here as each paper is processed.
   Why: immediate predecessor to Fast Equi-Join that measures how older GPU
   join algorithms age across hardware generations; useful for separating
   hardware-refresh effects from algorithmic redesign in GPU DB benchmarks.
+- `queued` — **Push vs. Pull-Based Loop Fusion in Query Engines**, Shaikhha,
+  Dashti, and Koch, arXiv 2016 / Journal of Functional Programming 2018.
+  arXiv: `https://arxiv.org/abs/1610.09166`
+  DOI: `https://doi.org/10.1017/S0956796818000102`
+  Why: direct follow-up for the One Loop and ROF route-shape thread; compares
+  push and pull pipelining under fair query-compilation conditions and may help
+  decide whether GPU DB's CPU fallback and retained routes should use push,
+  pull, or stream-fusion-like generated pipelines.
 - `reviewed` — **Rethinking SIMD Vectorization for In-Memory Databases**,
   Polychroniou and Ross, SIGMOD 2015.
   URL: `https://doi.org/10.1145/2723372.2747645`

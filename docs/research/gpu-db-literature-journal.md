@@ -74109,3 +74109,191 @@ failure semantics.
 - Track a `busy_until` or saturation horizon per owner domain, inspired
   by EQDS busy time. Use it to decide whether new reads should wait,
   fallback to CPU, be micro-batched, or return overload.
+
+### 2026-06-06 - One Loop Does Not Fit All makes execution shape selectivity-dependent
+
+**Citation:** Styliani Pantela and Stratos Idreos. "One Loop Does Not
+Fit All." SIGMOD 2015, pp. 2073-2074. doi:10.1145/2723372.2764944.
+Retrieved 2026-06-06 from the author/project publication page and PDF,
+`https://stratos.seas.harvard.edu/publications/one-loop-does-not-fit-all`
+and `https://scholar.harvard.edu/files/stratos/files/oneloopdoesnotfitall.pdf`.
+The original queued DOI pointed at `10.1145/2723372.2737796`, but the
+paper text and DOI metadata identify `10.1145/2723372.2764944`.
+
+**Category:** query optimization / planning, with CPU fallback and
+route-shape relevance.
+
+**Relevance tags:** query compilation; vectorized execution; loop
+fusion; branchless predicates; selectivity-sensitive route choice; CPU
+fallback; predicate ordering; route certificates; micro-batch code shape.
+
+**Core idea:** The paper studies a narrow but useful execution-choice
+problem in in-memory column stores: whether a conjunctive predicate
+pipeline should run as several tight vectorized loops, one predicate
+at a time, or as a single fused loop that evaluates all predicates
+together. The answer is not static. It depends on predicate selectivity
+and branch behavior.
+
+The transferable idea is that code shape is a route decision, not an
+implementation afterthought. For branchless selection, low selectivity
+favors multiple loops because early filters shrink the tuple-id stream
+and later columns read fewer cache lines. Higher selectivity favors one
+fused loop because the cost of intermediate result materialization and
+function/operator overhead dominates. With branching enabled in the
+paper's experiment, the one-loop strategy wins across the tested
+selectivity range, while branchless execution is more predictable and
+crosses over by selectivity.
+
+The evaluated setup is intentionally small: a main-memory column-store
+prototype, one billion 8-byte tuples per column, a four-predicate
+conjunctive selection, uniform random data, equal per-column
+selectivities, eight active cores on a 4-way Intel Xeon E7-4820 machine,
+and GCC 4.7.2. The paper is a two-page SIGMOD contribution, so it gives
+a clear design signal but not a complete optimizer or production
+implementation.
+
+**Concrete mechanisms:**
+
+- The test query selects `R.d` from a relation with predicates on
+  `R.a`, `R.b`, `R.c`, and `R.d`, all expressed as threshold filters.
+- The multi-loop strategy evaluates one predicate per tight loop. After
+  the first selection, later loops use a combined `select_fetch` style
+  operator so projection and filtering operate over the current
+  intermediate tuple-id/vector state.
+- The one-loop strategy evaluates all predicates in one tight loop and
+  writes qualifying results directly, avoiding intermediate
+  materialization between predicates.
+- Both strategies are tested with branched and branchless select
+  implementations. The branchless vectorized version is loop-unrolled.
+- Predicate order is held unimportant in the experiment because the
+  generated data is uniform and every predicate has the same
+  per-column selectivity; this is not a claim that order is irrelevant
+  for real correlated data.
+- The paper's explanation for the low-selectivity branchless result is
+  memory traffic: a fused loop reads every predicate column for every
+  row even when most rows will be rejected, while staged loops can avoid
+  reading later-column cache lines for rows filtered out early.
+- The explanation for the high-selectivity result is intermediate work:
+  when most rows survive, staged vectorized loops create and scan large
+  intermediate results, while the fused loop keeps the work in one pass.
+- The authors explicitly leave deeper hardware-counter analysis,
+  SIMD-specific comparisons, disjunctive predicates, data distributions,
+  and inter-column correlations as future work.
+
+**GPU DB mapping:** This is most useful as a CPU/GPU route-shape rule.
+The runtime and P8 storage design already treat route choice as a
+certificate over snapshot generation, resident validity, supported
+predicates, transfer bytes, and fallback reason. Pantela/Idreos adds
+one more certificate field: execution shape. A route should say whether
+it is using a fused scan kernel, staged predicate masks, bitmap/predicate
+index prefiltering, CPU vectorized fallback, or CPU compiled fallback,
+and why that shape was selected.
+
+For resident GPU scans, the paper argues against always fusing every
+predicate into one kernel. If early predicates are highly selective and
+later columns are expensive, variable-length, cold, compressed, or not
+resident, a staged mask route can save memory movement even if it adds
+an intermediate mask. If predicates are broad and all needed columns are
+already resident, a fused kernel may be better because it avoids extra
+passes and mask materialization.
+
+For warm CPU fallback, the same rule helps prevent false GPU wins. A
+branchless CPU staged-filter route may beat a GPU transfer/fused route
+when a cheap early predicate eliminates most rows before later columns
+or text payloads are touched. Conversely, a high-selectivity retained
+scan should not pay for CPU intermediate tuple-id lists if a fused GPU
+or CPU loop can stream through resident columns.
+
+For micro-batching, compatible same-shape requests should include
+execution shape and selectivity class in their grouping key. A batch of
+low-selectivity tenant/status filters may use staged masks; a batch of
+high-selectivity analytical counts may use a fused scan; a mixed batch
+should split instead of forcing one code shape that is suboptimal for
+half the requests.
+
+**Risks and mismatches:** The paper is CPU-focused and old relative to
+current GPU hardware. It does not evaluate GPUs, SIMD variants,
+compressed columns, MVCC visibility checks, variable-length text,
+indexes, joins, skew, correlated predicates, adaptive runtime switching,
+or mixed OLTP/OLAP pressure.
+
+The branch behavior result should not be copied blindly. GPU warp
+divergence, memory coalescing, mask compaction, HBM bandwidth, PCIe or
+NVLink transfer, and kernel-launch overhead change the tradeoff. The
+safe takeaway is the decision boundary: code shape should be selected
+from measured predicate selectivity and data-movement cost, not fixed
+by engine ideology.
+
+The experiment assumes equal per-column selectivity and random data, so
+it cannot answer which predicate should run first in real workloads.
+GPU DB needs route telemetry for cardinality, correlation, cache
+residency, column width, and compression before adopting a staged route
+as the default.
+
+**Benchmark candidates:**
+
+- Add an execution-shape microbenchmark for four-predicate filters:
+  fused resident GPU scan, staged GPU mask route, CPU branchless staged
+  vector route, and CPU fused route. Sweep per-predicate selectivity
+  from 0.1% to 100%. Gate: the route selector predicts the fastest shape
+  within a bounded error band for each selectivity bucket.
+- Extend route certificates with `execution_shape`, `selectivity_class`,
+  `estimated_mask_bytes`, and `columns_touched_before_filter`. Failure
+  condition: a route chooses GPU fused execution while a cheap early CPU
+  or GPU mask avoids most later-column movement.
+- Benchmark staged predicate masks for text-prefix filters: first apply
+  an `int4` tenant/status filter, then touch text offsets/bytes only for
+  survivors. Measure HBM/DRAM bytes, CPU cache misses, p50/p99 latency,
+  and result correctness against CPU MVCC.
+- Test micro-batch grouping by execution shape. Compare grouping only by
+  SQL shape versus grouping by SQL shape plus selectivity bucket and
+  resident-column set. Gate: splitting mixed-selectivity batches reduces
+  p99 without losing too much launch amortization.
+- Add a fallback calibration benchmark before claiming GPU benefit:
+  generated CPU branchless staged loops, CPU fused loops, and retained
+  GPU kernels should be compared on identical snapshot boundaries and
+  output shapes.
+- Track route misprediction telemetry: selected shape, actual rows
+  after each predicate, bytes touched per column, mask materialization
+  bytes, kernel launches, and fallback reason. Gate: repeated
+  mispredictions create planner feedback instead of silently persisting.
+
+### 2026-06-06 - Cross-paper synthesis: fast routes need private formats, receiver credits, and execution-shape proof
+
+The last three papers sharpen one design track from different layers.
+CUBIT says mutable acceleration structures should publish compact,
+snapshot-scoped deltas instead of rewriting shared compressed state.
+EQDS says overloaded resources should be receiver-clocked, with queueing
+kept at explicit edges rather than hidden inside shared cores. One Loop
+Does Not Fit All says execution shape itself is a route decision that
+depends on selectivity and data movement.
+
+The converging GPU DB track is a typed route certificate. A retained
+read should carry not only snapshot and resident-generation proof, but
+also private-format proof, credit proof, and execution-shape proof:
+which base/delta interval is safe, which owner granted buffer/stream or
+response capacity, and why the selected fused, staged, bitmap, CPU, or
+GPU route is expected to win for the current selectivity and placement.
+
+The biggest category gap after this batch is still not "more GPU
+operators"; it is tying optimizer estimates to runtime pressure without
+making either one authoritative alone. The queue should keep mixing
+optimizer/code-shape papers with transaction/MVCC and admission papers
+so route certificates include cost, conflict, visibility, and pressure
+evidence.
+
+Benchmark priorities:
+
+- Build one retained filter route that can choose fused scan, staged
+  mask, or bitmap-delta path from the same snapshot and emit the route
+  certificate fields that justified the choice.
+- Add receiver-credit admission for GPU execution and response rings,
+  then measure whether staged masks and bitmap deltas still help when
+  output buffers, not kernel time, are the bottleneck.
+- Record actual per-predicate survivor counts and bytes touched so
+  selectivity mistakes become feedback into planner calibration rather
+  than permanent route bias.
+- Treat base-plus-delta bitmap refresh and staged-mask execution as
+  separately budgeted maintenance paths. Failure condition: either path
+  improves mean latency by creating unbounded p99 merge, mask, or
+  response work.
