@@ -70283,3 +70283,160 @@ snapshot retention, cancellation, and replay. The next benchmark
 priority should be a small semantic-conflict harness that can run both
 the generic path and one route-specific path over the same generated
 history, then compare results with an isolation checker and WAL replay.
+
+### 2026-06-05 - SAP HANA NVM keeps hot mutability out of the persistent tier
+
+**Citation:** Mihnea Andrei, Christian Lemke, Gunter Radestock,
+Robert Schulze, Carsten Thiel, Rolando Blanco, Daniel Booss, Thomas
+Peh, Ivan Schreter, Werner Thesing, Mehul Wagle, Akanksha Meghlan,
+Muhammad Sharique, Sebastian Seifert, Surendra Vishnoi, and Thomas
+Willhalm. "SAP HANA Adoption of Non-Volatile Memory." PVLDB 10(12),
+2017. Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol10/p1754-andrei.pdf`; DOI:
+`https://doi.org/10.14778/3137765.3137780`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** persistent memory; DRAM/NVM placement; restart
+latency; checkpoint-driven lifecycle; columnar main/delta layout;
+MVCC metadata placement; pointer-free persistent blocks; tier-aware
+testing.
+
+**Core idea:** The paper describes an early production-oriented NVM
+adoption path for SAP HANA that avoids redesigning the whole database.
+HANA keeps its disk persistence, redo logging, checkpoint, backup, and
+HA machinery, but maps large read-mostly Main column-fragment backing
+arrays directly from byte-addressable NVRAM. Smaller metadata,
+intermediate query state, Delta fragments, and MVCC structures remain in
+DRAM because they are latency-sensitive or write-heavy.
+
+The most transferable lesson is placement discipline. NVRAM is not
+treated as generic cheaper DRAM and not as a faster SSD. It is a third
+tier with its own lifecycle: good for large immutable or infrequently
+rewritten arrays that benefit from direct mapping and fast restart, bad
+for hot mutable metadata that would need frequent persistence fences or
+would expose higher random-access latency. In the reported simulated
+experiments, insert performance was unaffected because inserts land in
+DRAM Delta structures, OLAP throughput had only marginal sensitivity to
+added NVRAM latency, and table preload after restart became nearly flat
+with table size compared with size-linear DRAM reload from SSD.
+
+**Concrete mechanisms:**
+
+- HANA keeps the Main/Delta split. Main column fragments are
+  reader-friendly, compressed, mostly stable, and created by Delta merge;
+  Delta fragments are writer-friendly and stay in DRAM.
+- Snapshot isolation is implemented outside the column data in dedicated
+  MVCC structures. The paper explicitly keeps MVCC structures in DRAM,
+  along with Delta data and intermediate query results.
+- The NVRAM placement unit is the Main Column Fragment, not a disk page.
+  Each Main Column Fragment has an associated NVRAM block containing
+  large content arrays such as column vectors and dictionary backing
+  arrays.
+- Only large content data moves to NVRAM. Descriptive metadata and
+  pointers remain in DRAM; on load, transient objects point into the
+  mapped NVRAM block.
+- Persistent blocks do not contain absolute pointers. Variable-sized
+  dictionary helper indexes are changed to store offsets rather than
+  virtual addresses so remapping after restart is safe.
+- During Delta merge, data is first built in DRAM. At the end of the
+  merge, a dry-run serialization computes the exact NVRAM block size,
+  then the Main fragment is written once into an aligned block and
+  accessed directly from the mapping afterwards.
+- The existing disk persistence format remains the recovery source of
+  truth in this early adoption. NVRAM is added beside it so existing
+  backup, replication, and disaster-recovery paths remain available.
+- Main-fragment/NVRAM block lifecycle is tied to Delta merge, DDL,
+  undo/redo, cleanup, and checkpoint. Creation of a block, its
+  NVRAM-commit, and the persistent descriptor update occur inside a
+  HANA consistent change that blocks checkpoint.
+- NVRAM blocks are committed at most once and then treated as immutable.
+  Reorganization or better compression creates a new block and retires
+  the old one rather than updating the old block in place.
+- Physical deletion is delayed. Blocks requested for removal are kept
+  until cleanup/checkpoint can prove no old reader or rollback path still
+  needs them.
+- The NVRAM Block Provider classifies blocks as committed data blocks,
+  tombstone blocks for deferred deletion, or temporary uncommitted
+  blocks. Startup traverses the NVRAM root, rebuilds maps, installs a
+  checkpoint version, removes temporary blocks, and prunes or preserves
+  blocks according to checkpoint order.
+- The implementation uses memory-mapped files and expects DAX on real
+  persistent memory. The paper notes filesystem hole allocation can break
+  assumptions about user-space cache-line flushes unless filesystem
+  metadata is also made durable.
+
+**GPU DB mapping:** P8 can use this as a template for future CXL/NVM or
+persistent-memory tiers: put large stable read snapshots and compressed
+column-group backing arrays in the slower persistent tier, but keep
+mutation deltas, MVCC visibility metadata, route certificates, queue
+state, pinned buffers, and intermediate results in DRAM/HBM unless a
+benchmark proves otherwise. A future tier should not silently become the
+place where every cache object goes.
+
+The pointer-free block rule maps directly to GPU DB resident and
+over-resident segment design. Any host persistent or cold-tier segment
+that might be remapped after restart should store offsets, ids,
+generation numbers, and checksums, not process pointers or CUDA handles.
+After recovery, transient descriptors can rebuild pointers, device
+handles, and route metadata from durable identifiers.
+
+The checkpoint-driven lifecycle is the strongest storage lesson. GPU DB
+already treats WAL/checkpoint/archive replay as authority and GPU state
+as acceleration. If a future NVM tier stores CPU column groups or route
+metadata, block creation, publication, logical deletion, and physical
+reclamation need the same fences as resident snapshot publication:
+create privately, publish only after WAL/checkpoint-safe metadata,
+preserve old blocks for old readers, and delete only after snapshot and
+rollback horizons pass.
+
+HANA's selective placement also suggests a benchmarkable warm/cold split
+for GPU DB. Cold or warm column groups can live in a byte-addressable
+host tier and be mapped quickly after restart, while hot retained
+subsets are promoted to HBM. Reads that scan predictable compressed
+arrays may tolerate the slower tier; point lookups, MVCC checks, and
+hot-key writes probably need DRAM/HBM-resident indexes or deltas.
+
+**Risks and mismatches:** This is an early adoption paper based on
+simulated NVRAM latency and mmap-backed shared memory for some
+experiments, not final persistent-memory hardware. The design targets
+SAP HANA's compressed column store, Main/Delta merge architecture, and
+read-heavy enterprise workload; GPU DB's first P8 slice has a simpler
+MVCC tuple source and GPU-resident acceleration path. The paper keeps
+disk persistence as the authoritative recovery path, so it does not
+answer how to make NVRAM the only durable source. It also does not
+evaluate GPU kernels, CUDA transfer paths, GPUDirect storage, CXL
+devices, or pgwire/session admission. Its worst-case single-select
+experiment is a reminder that random row reconstruction from a slower
+memory tier can hurt badly even when scans look fine.
+
+**Benchmark candidates:**
+
+- Add a tier-placement benchmark with three host layouts for one admitted
+  table: all DRAM column groups, mmap-backed cold column groups plus DRAM
+  descriptors, and full reload from disk/checkpoint. Measure restart
+  availability time, DRAM bytes, scan latency, point lookup latency, and
+  promotion cost into HBM.
+- Add a pointer-free segment encoding gate for any persisted warm-tier
+  segment: offsets and ids only, no process pointers or device handles.
+  Proof gate: restart remaps at different virtual addresses and produces
+  identical checksums and query results.
+- Prototype immutable warm-tier column-group blocks that are committed
+  once and replaced on refresh rather than updated in place. Measure
+  write admission, refresh latency, old-snapshot retention bytes, and
+  cleanup delay.
+- Build a "slow warm memory" simulator by adding latency or bandwidth
+  throttling to mapped host segments. Compare sequential scans, prefix
+  scans, point lookups, and row reconstruction so tier admission is not
+  justified only by scan-friendly workloads.
+- Extend cache metadata with block lifecycle states: creating,
+  published, logically deleted, checkpoint-retained, reclaimable, and
+  pruned. Failure condition: a block can be physically removed while a
+  retained snapshot, rollback path, or recovery replay still names it.
+- Add a restart benchmark where WAL/checkpoint replay restores CPU truth,
+  warm-tier blocks are mapped immediately, and GPU HBM residency is
+  rebuilt lazily. Minimum proof gate: traffic can start with explicit
+  fallback before GPU warmup without stale resident reads.
+- Track DRAM/HBM versus warm-tier bytes separately in status output.
+  Expected improvement: lower DRAM pressure and faster post-restart
+  availability without hiding random-access latency or refresh debt.

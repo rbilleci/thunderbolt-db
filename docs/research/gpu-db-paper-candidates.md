@@ -5529,7 +5529,7 @@ Append new candidates here as each paper is processed.
   Why: Type-Aware Transactions contrasts STO with automatic semantic locking;
   useful for comparing rollback-free pessimistic semantic locks against
   datatype-owned optimistic predicates and route-specific conflict contracts.
-- `queued` — **SAP HANA Adoption of Non-Volatile Memory**, Andrei et al.,
+- `reviewed` — **SAP HANA Adoption of Non-Volatile Memory**, Andrei et al.,
   PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p1754-andrei.pdf`
   DOI: `https://doi.org/10.14778/3137765.3137780`
@@ -5544,3 +5544,16 @@ Append new candidates here as each paper is processed.
   paper; useful for constructing realistic GET/SEEK/PUT service-time mixes,
   skewed tail-latency probes, and storage-adjacent runtime benchmarks before
   testing GPU DB pgwire/event-loop admission against only synthetic clients.
+- `queued` — **FPTree: A Hybrid SCM-DRAM Persistent and Concurrent B-Tree for
+  Storage Class Memory**, Oukid et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915251`
+  Why: SAP HANA NVM cites FPTree as a persistent-memory index direction;
+  useful for comparing DRAM-resident volatile inner nodes plus persistent
+  leaves against GPU DB's CPU warm indexes, resident key vectors, and rebuild
+  policy after restart.
+- `queued` — **On Testing Persistent-Memory-Based Software**, Oukid et al.,
+  DaMoN 2016.
+  URL: `https://doi.org/10.1145/2933349.2933355`
+  Why: SAP HANA NVM flags persistent-memory testing as a separate challenge;
+  useful for designing crash/restart fault-injection gates before any future
+  GPU DB CXL/NVM tier stores durable or semi-durable route metadata.
