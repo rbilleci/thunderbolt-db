@@ -1084,13 +1084,26 @@ Append new candidates here as each paper is processed.
   contrasting range-partitioned metadata, relational/distributed-system
   integration, and data-lake scale metadata routing with Tectonic's
   hash-partitioned design.
-- `queued` — **FITing-Tree: A Data-aware Index Structure**, Galakatos et al.,
+- `reviewed` — **FITing-Tree: A Data-aware Index Structure**, Galakatos et al.,
   SIGMOD 2019.
   URL: `https://doi.org/10.1145/3299869.3319860`
   arXiv: `https://arxiv.org/abs/1801.10207`
   Why: bounded-error piecewise-linear learned-index predecessor to PGM; useful
   for comparing B-tree-indexed segments with fully learned recursive routing
-  and for understanding update/retraining costs.
+  and for understanding update/retraining costs. Journal entry added
+  2026-06-05.
+- `queued` — **Design Tradeoffs of Data Access Methods**, Athanassoulis and
+  Idreos, SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2912577`
+  Why: FITing-Tree frames its error knob around the broader access-method
+  tuning problem; useful for turning GPU DB resident index choices into
+  explicit memory/latency/update tradeoff policies.
+- `queued` — **UpBit: Scalable In-Memory Updatable Bitmap Indexing**,
+  Athanassoulis et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2903734`
+  Why: FITing-Tree discusses bitmap-index compression as related work; useful
+  for comparing delete/update-friendly bitmap summaries against learned
+  key-position models for GPU resident predicate filters.
 - `queued` — **Pangea: Monolithic Distributed Storage for Data Analytics**,
   Ghosh et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p681-ghosh.pdf`

@@ -65351,3 +65351,198 @@ window design rather than the absolute latency.
 - Add a freshness benchmark modeled on the paper's freshness-time metric:
   time from WAL-visible mutation to read visibility in strong resident mode
   across append, update, delete, and compaction-heavy workloads.
+
+### 2026-06-05 - FITing-Tree makes resident index memory a tunable error budget
+
+**Citation:** Alex Galakatos, Michael Markovitch, Carsten Binnig, Rodrigo
+Fonseca, and Tim Kraska. "FITing-Tree: A Data-aware Index Structure." SIGMOD
+2019, pp. 1189-1206. Retrieved 2026-06-05 from
+`https://arxiv.org/abs/1801.10207` and the ACM DOI page
+`https://doi.org/10.1145/3299869.3319860`.
+
+**Category:** query optimization / planning; multi-tier cache / data placement.
+
+**Relevance tags:** learned indexes; bounded-error indexes; resident point
+lookups; range scans; memory budgets; update buffers; segment metadata;
+planner cost knobs; GPU resident indexes; CPU fallback.
+
+**Core idea:** FITing-Tree compresses an index by replacing dense leaf keys
+with piecewise-linear segments that map sorted keys to approximate positions.
+Each segment has a configured maximum error, so a point lookup first finds the
+segment in an upper-level tree, predicts the key position from the segment
+slope, and then searches only the bounded local window. The error parameter is
+not just an implementation constant; it is the knob that trades index memory
+against lookup latency and insert maintenance cost.
+
+The paper positions FITing-Tree as a learned-index variant with two practical
+guardrails that matter for a database engine: worst-case lookup work is bounded
+by construction, and inserts are supported through in-place or per-segment
+delta-buffer strategies. On real datasets, the authors report lookup
+performance comparable to full or fixed-page indexes with orders-of-magnitude
+smaller memory footprint; one highlighted Maps experiment says a FITing-Tree
+matched full-index performance with 609 MB while the full index used more than
+30 GB. The exact numbers are CPU/in-memory and dataset-specific, but the
+transferable mechanism is the bounded memory/latency contract.
+
+**Concrete mechanisms:**
+
+- FITing-Tree models an index as a monotonic key-to-position function over a
+  sorted array or indirection layer. Instead of storing every leaf key, it
+  stores each segment's start key, slope, and pointer.
+- A segment is valid when every key in that segment is within the configured
+  maximum position error of the segment's linear interpolation.
+- The upper structure is a normal B+ tree over segment start keys. The paper
+  notes the segment directory could use another structure, such as FAST for
+  read-mostly workloads.
+- The ShrinkingCone segmentation algorithm scans keys once, maintains a
+  feasible high/low slope cone from the segment origin, and starts a new
+  segment when the next key would violate the error bound.
+- ShrinkingCone is not optimal in segment count and can be arbitrarily worse
+  than optimal on adversarial input, but the paper proves a maximal segment
+  covers at least `error + 1` locations, so the resulting structure is bounded
+  relative to fixed-page sparse indexing.
+- Point lookup cost is tree search over the number of segments plus binary,
+  linear, or exponential search inside `[predicted - error, predicted + error]`.
+- Range queries use a point lookup to find the start position and then scan
+  sequentially through the clustered data or through a sorted secondary-index
+  indirection layer.
+- Non-clustered indexes add a key-sorted indirection layer of pointers to
+  unsorted table rows; operations search the segment model over that layer.
+- In-place inserts reserve movement budget around each segment so shifting
+  keys does not violate the total error bound, but can be expensive for large
+  segments.
+- Delta inserts attach a sorted fixed-size buffer to each segment. When the
+  buffer fills, the segment data and buffer are merged, resegmented, inserted
+  into the upper tree, and the old segment is removed.
+- Delta buffering reduces insert movement cost but must be counted against the
+  user-visible error budget: the paper describes segmenting with
+  `error - buffer_size` so lookups still search within the promised bound.
+- The cost model estimates lookup latency from tree depth, segment-local
+  search over the error window, buffer search, and an approximate random-cache
+  miss penalty. A second model estimates index size from segment count and
+  upper-tree metadata.
+- The error parameter can be chosen to satisfy either a lookup-latency target
+  or a storage budget. The evaluation says the model is pessimistic enough to
+  bound observed lookup latency on their tested hardware.
+- The evaluation uses CPU in-memory indexes and real datasets including
+  Weblogs, IoT, Maps, and NYC Taxi-derived fields; it does not evaluate GPUs,
+  MVCC visibility, persistence, or concurrent database transactions.
+
+**GPU DB mapping:** FITing-Tree is a useful shape for GPU DB's first resident
+lookup indexes because it turns "should this key column get a GPU index?" into
+a bounded resource decision. A resident segment could carry a compact
+piecewise-linear key-to-row-id model, while the planner certificate names the
+error bound, last-mile search width, resident generation, and memory footprint.
+That is much more inspectable than a black-box learned index.
+
+For P8, FITing-Tree suggests a middle ground between dense GPU key vectors and
+full CPU fallback. A hot `int4` key column can keep compact segment metadata
+in CPU DRAM or GPU memory, predict a small row-id window, and then refine
+against a resident key vector, delete bitmap, or CPU canonical index. The
+segment directory itself could live on CPU for admission/planning while the
+last-mile search window is launched on GPU for batched lookups.
+
+The error knob should become a planner and cache-manager budget rather than a
+static DDL choice. For a table with tight HBM pressure, GPU DB might choose a
+larger error and accept wider refinement. For a latency-sensitive retained
+lookup route, it might spend more resident bytes to reduce the last-mile
+window. The route cost must include not only the predicted search width but
+also delete bitmap density, delta-window size, output scattering, and GPU queue
+wait.
+
+Delta inserts map directly to the recent HTAP freshness-window entries.
+Resident base segments can stay compact while new keys and updates accumulate
+in per-segment delta buffers tied to WAL generations. On refresh, the engine
+merges and resegments only affected ranges, then publishes a new immutable
+resident generation. Reads either include compatible deltas in the refinement
+window or fall back when the requested snapshot is outside the delta window.
+
+The non-clustered indirection-layer design is also relevant to row-id locators.
+GPU DB should probably not require the CPU canonical table to be physically
+sorted by every indexed predicate. Instead, resident segment models can map
+secondary keys to row ids or stable row ordinals, then apply MVCC/delete
+visibility and fetch projected columns from resident column groups.
+
+**Risks and mismatches:** FITing-Tree assumes ordered keys and a monotonic
+key-to-position mapping. Text prefix predicates, composite keys, heavy churn,
+and skewed duplicate keys need more design than the paper gives. It is not an
+MVCC index: the paper does not address begin/end timestamps, long snapshot
+retention, version-chain visibility, or DDL/catalog generation changes.
+
+The insert strategy is single-index maintenance, not WAL-before-visibility
+transactional publication. GPU DB must not expose a resegmented resident index
+until the CPU/WAL authority and visibility boundary are already safe. Segment
+delta buffers must be generation-scoped, replayable, and discardable after
+abort or recovery.
+
+The evaluation is CPU-only and in-memory. GPU last-mile refinement may be
+slower than CPU for a single point lookup unless requests are batched, the
+key vector is already resident, and response scattering is cheap. The
+ShrinkingCone worst case also means adversarial data can erase much of the
+space advantage, so the cache manager needs telemetry on segment count,
+error-window width, and actual false refinement work.
+
+**Benchmark candidates:**
+
+- Prototype a resident `int4` equality index with FITing-style segment
+  metadata over a sorted row-id/key vector. Compare dense key-vector binary
+  search, CPU B+ tree fallback, and bounded-error segment prediction at
+  micro-batch sizes `1, 4, 16, 64, 256`.
+- Add route certificates for resident lookup indexes: error bound, segment
+  count, predicted window width, delete bitmap density, delta generation, and
+  resident bytes. Gate: every GPU lookup route can explain why it was admitted
+  over CPU fallback.
+- Sweep the error parameter under fixed HBM budgets. Measure p50/p95/p99
+  lookup latency, resident memory, GPU kernel time, CPU planning/refinement
+  time, and fallback rate.
+- Add an adversarial-key benchmark where ShrinkingCone produces many small
+  segments. Failure condition: the planner keeps choosing the learned resident
+  index when a dense key vector or CPU index is cheaper.
+- Prototype per-segment delta buffers tied to WAL generations. New writes stay
+  invisible until the commit boundary, then participate in lookup refinement
+  until the segment is remerged and republished. Gate: no staged key is visible
+  before WAL-before-visibility publication.
+- Test range predicates with FITing-style start lookup plus sequential resident
+  scan. Compare count-only range routes, projected range scans, and prefix-like
+  text fallback. Required metric: crossover selectivity where scanning beats
+  repeated point refinement.
+- Compare CPU-resident versus GPU-resident segment directories. Measure
+  whether moving the directory to HBM helps batched lookups enough to justify
+  HBM consumption.
+- Add stale-generation retirement pressure: hold an old retained read snapshot
+  while resegmenting updated ranges, then measure memory retained by old
+  segment directories, delta buffers, and key vectors.
+
+### 2026-06-05 - Cross-paper synthesis: freshness windows need compact proof indexes
+
+The last four entries converged on a route-design problem rather than a single
+storage structure. Hardware-conscious GPU joins argued that partitioning,
+placement, and skew must be explicit route traits. PolarDB-IMCI and ByteHTAP
+made freshness a replay/window contract with row-id locators, delete maps, and
+visible LSN boundaries. FITing-Tree adds the missing index-memory knob: a
+route can spend bytes to shrink proof/refinement work, or accept wider
+last-mile search when memory is the bottleneck.
+
+The strongest design track is now a "resident proof index" layer attached to
+each immutable resident generation. It should expose compact segment
+statistics, key-to-row-id models, delete/delta summaries, freshness
+boundaries, and expected refinement width. CPU/GPU route choice can then be
+based on a certificate rather than a Boolean resident-cache hit.
+
+The category gap after this sequence is transaction/MVCC write publication
+under high contention. The queue has plenty of indexing, storage, and GPU
+execution material; the next high-value pick should bias toward transaction
+processing, MVCC commit/visibility, or runtime admission unless a specific
+GPU-index benchmark is being designed.
+
+Benchmark priorities:
+
+- Build one resident lookup route that reports both freshness and index proof
+  fields: source boundary, applied boundary, delta window, segment count,
+  error width, delete density, and fallback reason.
+- Measure delete/delta-aware lookup refinement under skew before adding more
+  GPU index families.
+- Add a planner guardrail that rejects resident index routes when estimated
+  refinement work plus queue wait exceeds CPU fallback.
+- Keep HTAP freshness benchmarks paired with write-path contention tests so
+  compaction, resegmentation, and resident refresh do not hide commit latency.
