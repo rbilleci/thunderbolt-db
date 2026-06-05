@@ -5205,12 +5205,21 @@ Append new candidates here as each paper is processed.
   Why: Transaction Triaging cites Harmonia as in-network conflict detection for
   replicated storage; useful for separating cheap conflict hints from
   authoritative WAL/MVCC visibility decisions.
-- `queued` — **Indexed Log File: Towards Main Memory Database Instant
+- `reviewed` — **Indexed Log File: Towards Main Memory Database Instant
   Recovery**, Magalhaes, Brayner, Monteiro, and Moraes, EDBT 2021.
-  URL: `https://openproceedings.org/2021/conf/edbt/p172.pdf`
+  URL: `https://openproceedings.org/2021/conf/edbt/p110.pdf`
+  DOI: `https://doi.org/10.5441/002/edbt.2021.34`
   Why: Index Checkpoints builds on indexed-log recovery; useful for comparing
   log-offset indexes, on-demand tuple restore, and whether GPU DB should make
   cold CPU tuple reconstruction lazy while keeping route metadata eager.
+- `queued` — **FineLine: Log-structured Transactional Storage and
+  Recovery**, Sauer, Graefe, and Harder, PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p2249-sauer.pdf`
+  DOI: `https://doi.org/10.14778/3275366.3275373`
+  Why: Indexed Log File contrasts with FineLine's indexed single-storage log;
+  useful for deciding whether GPU DB cold CPU truth should remain WAL plus
+  materialized state or move selected partitions toward log-structured,
+  tuple-addressable recovery storage.
 - `queued` — **Fast Failure Recovery for Main-Memory DBMSs on Multicores**,
   Wu, Guo, Chan, and Tan, SIGMOD 2017.
   URL: `https://doi.org/10.1145/3035918.3064011`

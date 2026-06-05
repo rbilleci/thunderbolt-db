@@ -67003,3 +67003,130 @@ certificates concrete enough that transaction papers can plug into them.
   publication, short retained reads, or old-snapshot retirement.
 - Treat rebuildable derived tiers like Taurus Page Stores: unavailable while
   stale, repairable from durable truth, and never authoritative by themselves.
+
+### 2026-06-05 - Indexed Log File makes crash recovery tuple-addressable
+
+**Citation:** Arlino Magalhaes, Angelo Brayner, Jose Maria Monteiro, and
+Gustavo Moraes. "Indexed Log File: Towards Main Memory Database Instant
+Recovery." EDBT 2021, pp. 355-360. doi:10.5441/002/edbt.2021.34.
+Retrieved 2026-06-05 from OpenProceedings,
+`https://openproceedings.org/2021/conf/edbt/p110.pdf`.
+
+**Category:** transaction processing / write path and recovery.
+
+**Relevance tags:** instant recovery; indexed redo log; on-demand restore;
+main-memory database recovery; WAL replay; checkpoint boundaries; cold CPU
+truth; session availability during recovery.
+
+**Core idea:** The paper targets a specific recovery bottleneck in main-memory
+databases: after a crash, a sequential redo log is efficient to write but poor
+for restoring one requested tuple, so the system often stays offline until it
+has loaded a checkpoint and replayed the whole log. Indexed Log File keeps the
+commit path sequential, then asynchronously builds a B-tree keyed by tuple id
+over redo records. Recovery can then restore tuples incrementally and
+on-demand, allowing transactions to run once their required tuples have been
+restored instead of waiting for full database recovery.
+
+For GPU DB, the transferable idea is a recovery service frontier for CPU truth:
+the engine can remain unavailable or fall back only for keys, partitions, or
+resident generations whose CPU tuple state has not yet been restored. That is
+more useful than treating recovery as a single global "not ready" state.
+
+**Concrete mechanisms:**
+
+- The foreground logger appends redo records to a sequential log. Transaction
+  records are accumulated thread-locally and appended atomically at commit, so
+  commits wait only for the sequential durable log, not the indexed structure.
+- An asynchronous indexer periodically copies records from the sequential log
+  into an indexed log. The indexed log is a B-tree where each key is a tuple id
+  and the value contains the update records needed to restore that tuple.
+- The sequential log remains available as the recovery authority if the
+  indexed log is missing or corrupt. Before indexed recovery starts, any
+  sequential records not yet indexed at the time of crash must be indexed.
+- The restorer can recover by traversing the B-tree incrementally, restoring
+  tuple after tuple until the database is fully rebuilt.
+- A scheduler handles foreground transactions during recovery. If a requested
+  tuple is not yet in memory, it pauses incremental traversal, asks the
+  restorer to fetch that tuple's indexed redo records, marks the tuple
+  restored, then lets the transaction proceed.
+- The evaluation prototype uses Redis 5.0.7 with append-only-file logging and
+  Berkeley DB 4.8 for the indexed log. Snapshotting and AOF rewrite were
+  disabled in the prototype.
+- Experiments compare sequential log recovery, asynchronous indexed-log
+  instant recovery, and synchronous indexed-log instant recovery using
+  Memtier workloads. The paper reports that asynchronous indexing preserves
+  throughput close to sequential logging, while synchronous indexing hurts
+  foreground throughput.
+- In the scalability experiment, sequential log recovery finishes full recovery
+  faster than indexed-log recovery, but indexed-log recovery can serve work
+  during recovery. With larger workloads, total workload execution can become
+  slightly longer for the asynchronous indexed approach because its foreground
+  throughput is a little lower than pure sequential logging.
+
+**GPU DB mapping:** The current architecture already keeps WAL/checkpoint/
+archive replay as the durable source of truth and treats GPU resident data as
+rebuildable acceleration state. Indexed Log File suggests adding a tuple- or
+segment-addressable recovery index as optional derived recovery metadata, not
+as a replacement for WAL. A cold partition, retained snapshot generation, or
+CPU derived index could expose a `restored_up_to` frontier and an on-demand
+restore path for the exact keys or segments required by a query.
+
+This pairs well with the route-frontier synthesis. A retained read route
+should know whether CPU truth for its requested key range is restored, whether
+resident GPU state is valid, and whether the request can trigger a bounded
+restore before execution. If not, the runtime should return an explicit
+recovery-unavailable or fallback reason rather than blocking unrelated
+sessions behind whole-database replay.
+
+For 1M logical sessions, the scheduler lesson is important: recovery work
+should be demand shaped. A storm of sessions after restart must not each cause
+unbounded restore work. The restorer needs per-partition queues, duplicate
+suppression for the same tuple or segment, active restore credits, and
+response-ring backpressure so on-demand recovery does not become a second
+admission-control bypass.
+
+For P8, the indexed unit probably should not be a single tuple everywhere.
+Column-group segments, key ranges, text dictionaries, and version bundles may
+be better restore units for GPU resident or warm CPU paths. The mechanism to
+test is the same: write sequential WAL first, maintain rebuildable
+addressable recovery metadata asynchronously, and expose restore-frontier
+telemetry to planning and admission.
+
+**Risks and mismatches:** This is a short paper with a Redis key-value
+prototype, not a full SQL MVCC engine. It does not cover secondary indexes,
+range predicates, DDL, serializable isolation, long retained snapshots, WAL
+archiving, GPU memory, or multi-tier placement. The prototype disables Redis
+snapshotting and AOF rewrite, so the log sizes and maintenance costs are not
+production-complete.
+
+The indexed log can increase recovery maintenance cost and can recover the
+whole database more slowly than sequential replay. It is only attractive if
+the product values partial availability, bounded route restore, or lazy cold
+tuple reconstruction. The paper also assumes unfinished indexing can be
+completed before recovery opens; GPU DB would need a clear startup phase for
+catching up derived recovery indexes from WAL before allowing on-demand
+restores to claim correctness.
+
+**Benchmark candidates:**
+
+- Add a recovery-frontier simulation for one table: sequential WAL plus an
+  asynchronously maintained key-to-redo index. After simulated crash, allow
+  reads only for keys marked restored or restored on demand. Gate: identical
+  visible rows versus full WAL replay.
+- Compare full sequential replay against on-demand key restore under restart
+  storms: many sessions request a hot key set, a cold uniform key set, and a
+  mixed hot/cold distribution. Measure p95 admission latency, duplicate
+  restore suppression, and total time to full recovery.
+- Track restore credits as a runtime resource beside session, response-buffer,
+  mutation, and GPU work credits. Failure condition: on-demand recovery work
+  starves WAL replay, network IO, or short already-restored reads.
+- Prototype segment-addressable recovery metadata for P8 instead of per-tuple
+  only: table id, partition id, key range, source WAL range, and touched
+  columns. Compare restore bytes and route latency against tuple-level
+  indexing.
+- Add a stale-index startup test: crash with sequential WAL records not yet in
+  the recovery index. The engine must catch up the index or fall back to
+  sequential replay before serving any on-demand restore from that range.
+- Treat GPU resident snapshots as invalid after crash, then measure whether a
+  restored CPU key range can serve CPU fallback immediately while GPU warmup
+  happens in the background.
