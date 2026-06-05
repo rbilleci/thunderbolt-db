@@ -70440,3 +70440,203 @@ memory tier can hurt badly even when scans look fine.
 - Track DRAM/HBM versus warm-tier bytes separately in status output.
   Expected improvement: lower DRAM pressure and faster post-restart
   availability without hiding random-access latency or refresh debt.
+
+### 2026-06-05 - SGDRC splits GPU service quality into SM and VRAM-channel budgets
+
+**Citation:** Yongkang Zhang, Haoxuan Yu, Chenxia Han, Cheng Wang,
+Baotong Lu, Yunzhe Li, Zhifeng Jiang, Yang Li, Xiaowen Chu, and Huaicheng
+Li. "SGDRC: Software-Defined Dynamic Resource Control for Concurrent DNN
+Inference on NVIDIA GPUs." PPoPP 2025. doi:10.1145/3710848.3710863.
+Retrieved 2026-06-05 from the author-hosted PDF,
+`https://people.cs.vt.edu/~huaicheng/p/ppopp25-sgdrc.pdf`.
+
+**Category:** GPU execution / runtime scheduling and admission.
+
+**Relevance tags:** GPU resource partitioning; VRAM bandwidth isolation;
+SM allocation; cache coloring; latency-sensitive work; best-effort work;
+GPU admission; route resource certificates; tail latency; hardware
+reverse engineering.
+
+**Core idea:** SGDRC argues that GPU sharing needs two independently
+managed resources: compute units and VRAM bandwidth. Existing choices
+such as time slicing, MPS-style spatial sharing, interference-aware
+co-scheduling, and coarse MIG partitions either waste capacity, hurt
+latency-sensitive work, or lack dynamic bandwidth control. SGDRC uses
+software-defined partitioning to isolate both intra-SM contention and
+inter-SM VRAM-channel contention, then reallocates resources as
+latency-sensitive and best-effort work arrives.
+
+The paper targets DNN inference, not databases, but the mechanism is
+highly relevant to GPU DB's retained-read versus scan/refresh problem.
+Short high-priority kernels should not be forced behind long best-effort
+GPU work, and memory-bound background work should not silently steal the
+VRAM channels or L2/MSHR capacity needed for low-latency retained reads.
+In the reported evaluation on Tesla P40 and RTX A2000 GPUs, SGDRC
+achieves 99.0% average SLO attainment and improves overall throughput by
+up to 1.47x and best-effort throughput by up to 2.36x versus compared
+sharing systems.
+
+**Concrete mechanisms:**
+
+- SGDRC separates intra-SM conflicts from inter-SM conflicts. Intra-SM
+  conflicts come from kernels sharing SM-local compute, L1/shared memory,
+  instruction cache, and scheduling state; inter-SM conflicts come from
+  kernels on different SMs contending for shared VRAM channels, L2 cache
+  capacity, MSHRs, and DRAM banks.
+- The system operates in offline and online phases. Offline, it compiles
+  and transforms kernels, profiles each kernel's VRAM bandwidth
+  consumption and minimum SM requirement, and prepares metadata for
+  online allocation. Online, it chooses SM and VRAM-channel allocation
+  for latency-sensitive and best-effort queues.
+- It reverse-engineers NVIDIA VRAM-channel mappings without assuming a
+  simple XOR hash. It labels addresses by inducing DRAM-bank or L2
+  conflicts, observes 1 KiB channel partitions, and trains a DNN to
+  predict channel ids for physical addresses. The paper reports more
+  than 99.9% channel-label accuracy on its test set.
+- Shadow page tables implement fine-grained software cache coloring.
+  SGDRC reserves colored chunks in `nvidia-uvm`, maps 1 KiB or 2 KiB
+  sectors to chosen channel sets, and rewrites kernel array indexing so
+  selected tensors access selected VRAM channels.
+- VRAM isolation is applied primarily to memory-bound tensors discovered
+  by profiling. A kernel is considered memory-bound when colocated L2
+  population degrades its runtime.
+- Bimodal tensors give best-effort memory-bound tensors two copies: one
+  mapped to all VRAM channels for monopolization, and one mapped to a
+  restricted channel subset for colocation. Intermediate tensor reuse is
+  used to limit the memory footprint.
+- Tidal SM masking uses a little-known NVIDIA task metadata interface via
+  `libsmctrl` to limit which TPCs a kernel may use. Latency-sensitive
+  kernels can preempt best-effort kernels through an eviction flag, after
+  which best-effort work restarts with fewer compute resources.
+- SGDRC reserves for the next latency-sensitive kernel the maximum SM
+  requirement observed across a sliding window of pending
+  latency-sensitive kernels, rather than a fixed static partition.
+- Kernels with many thread blocks can be transformed into
+  persistent-thread style to reduce hardware-scheduler conflicts.
+- The implementation is about 12K lines of C++ across reverse
+  engineering, `nvidia-uvm` cache coloring, kernel transformation, and an
+  inference server/client.
+- In the paper's isolation microbenchmarks, VRAM-channel isolation
+  reduces latency-sensitive kernel p99 runtime by 28.7% on average on
+  Tesla P40 and 47.5% on RTX A2000 versus non-isolated coexecution,
+  while shadow-page-table overhead averages 2.9% at kernel level and
+  about 0.5% for end-to-end DNN inference after applying it only to
+  memory-bound kernels.
+
+**GPU DB mapping:** This paper makes GPU DB's route-resource certificate
+more concrete. A retained read, grouped lookup batch, decompression pass,
+refresh job, and long scan should declare not only "uses GPU," but also
+whether it is compute-bound, VRAM-bandwidth-bound, launch-bound, or
+output-bound. The admission layer should then protect short retained
+reads from best-effort refresh or scan work by reserving GPU execution
+budget and memory-bandwidth budget separately.
+
+The immediate implementation should not depend on SGDRC's driver-level
+cache coloring. The transferable first step is observability and policy:
+per-route kernel family, bytes touched, measured DRAM throughput, SM
+scaling curve, queue priority, allowed co-runners, and preemption or
+chunking boundary. On current hardware, GPU DB can approximate the policy
+with separate CUDA streams, bounded GPU execution rings, chunked scans and
+refreshes, and admission that refuses to launch background work when a
+latency-sensitive lane lacks budget.
+
+SGDRC's memory-bound tensor profiling maps to P8 resident segments.
+Resident column scans, decompression, hash joins, and old-snapshot merge
+work may stress HBM/VRAM bandwidth differently from point lookup kernels.
+GPU DB should measure these route classes separately before deciding that
+two kernels are compatible merely because their SM occupancy looks low.
+
+The bimodal tensor idea maps to dual placement of resident data. A hot
+segment could have a full-bandwidth HBM layout for monopolized scans and a
+restricted or chunked background layout for refresh, validation, or
+best-effort work. More conservatively, the engine can maintain route
+variants: latency-sensitive retained reads use small HBM-resident indexes
+or key vectors, while background scans and refreshes use chunked
+column-group passes that yield at deterministic boundaries.
+
+The sliding-window SM reservation suggests a useful queue policy. Instead
+of reserving a fixed GPU fraction for all foreground work, the GPU owner
+can reserve enough capacity for the worst near-term retained-read route in
+the foreground queue, then donate idle capacity to refresh or
+over-resident scans. That is a good fit for the runtime document's
+bounded rings and explicit overload reasons.
+
+**Risks and mismatches:** SGDRC is specialized to DNN inference and
+assumes kernel generation/transformation through TVM-like compilation.
+Database kernels may use hand-written CUDA, libraries, dynamic plans,
+global reductions, hash-table updates, and ordered result materialization
+that are not safe to rewrite with simple tensor index translation.
+
+The design touches NVIDIA-specific internals, `nvidia-uvm`, physical
+address mappings, and task metadata. Those dependencies may be too
+fragile for a database product and may not work under managed cloud
+drivers, MIG, future GPU architectures, or non-NVIDIA accelerators. The
+paper also notes that A100/H100 L2 behavior is more NUMA-like, requiring
+adaptation. GPU DB should treat cache coloring as a research benchmark,
+not a near-term production dependency.
+
+SGDRC aggregates workloads into one CUDA context and does not provide
+strong fault isolation between colocated tasks. That is risky if GPU DB
+ever colocates external UDFs or third-party kernels. The paper's workload
+is ML serving with SLO and best-effort jobs, not MVCC snapshots, WAL
+ordering, SQL cancellation, pgwire responses, or CPU/GPU fallback.
+
+**Benchmark candidates:**
+
+- Add GPU route profiling fields for each retained kernel: DRAM/HBM
+  throughput, kernel duration, launch count, estimated SM scaling,
+  output bytes, route priority, and whether the route is chunkable. Gate:
+  route selection and admission can explain why two GPU jobs were or were
+  not colocated.
+- Build a foreground/background GPU scheduling benchmark: short retained
+  point lookups or counts versus long refresh, decompression, or scan
+  chunks. Compare FIFO, fixed foreground reservation, sliding-window
+  foreground reservation, and chunk-yield policies. Required metrics:
+  retained-read p50/p99, background throughput, queue wait, and fallback
+  count.
+- Add a memory-bandwidth interference probe where a background column scan
+  or decompression kernel runs beside a point-lookup kernel. Failure
+  condition: planner marks the routes compatible from SM occupancy alone
+  while p99 retained-read latency collapses under HBM contention.
+- Prototype chunked refresh/scan work with deterministic continuation
+  metadata and yield points. Proof gate: cancellation, invalidation, and
+  retained snapshot retirement remain correct if a foreground read runs
+  between chunks.
+- Add "resource-donation" admission: when no latency-sensitive GPU work is
+  queued, background refresh can consume the whole device; when foreground
+  work arrives, new background chunks are limited or delayed. Failure
+  condition: already-submitted background work can monopolize the GPU long
+  enough to violate retained-read latency budgets.
+- For future hardware experiments only, test whether CUDA/MPS/MIG,
+  stream priorities, or available profiling counters can approximate
+  separate compute and memory-bandwidth budgets without driver patching.
+  Treat any driver-internal cache-coloring result as non-portable until
+  reproduced across at least two GPU generations.
+
+### 2026-06-05 - Cross-paper synthesis: admission must budget fan-out, tiers, and accelerator interference
+
+TAOBench, LithOS, SAP HANA NVM, and SGDRC converge on a broader runtime
+track: admission is no longer just "is there a worker thread free?" It must
+budget correlated request fan-out, storage-tier placement, and accelerator
+interference before work is admitted. TAOBench shows that one logical request
+can expand into many correlated reads and writes. HANA NVM shows that stable
+read arrays and hot mutable metadata belong in different tiers. LithOS and
+SGDRC show that GPU compute capacity and GPU memory-bandwidth interference
+need visible scheduling contracts, not best-effort FIFO submission.
+
+For GPU DB, the converging design is a route certificate with three
+resource axes: logical fan-out and response bytes, tier bytes and refresh
+debt, and GPU compute/memory-bandwidth shape. A retained read route should
+state which snapshot generation it will use, how many internal lookups it may
+spawn, which resident or warm-tier bytes it may touch, and whether its GPU
+kernel can safely run beside scans, refreshes, or decompression work. A route
+that cannot make those claims should fall back to the generic owner/CPU path
+or reserve conservative capacity.
+
+The category gap is now an end-to-end admission benchmark. The journal has
+many strong individual mechanisms, but fewer tests that combine session
+fan-out, tier pressure, and GPU interference at once. The next benchmark
+priority should be a mixed retained-read workload where correlated point/range
+requests compete with refresh, cold-tier scans, and write invalidation, while
+the runtime reports per-route queue wait, bytes by tier, GPU kernel class,
+fallback reason, and p99 latency.

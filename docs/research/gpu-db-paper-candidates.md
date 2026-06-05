@@ -1632,13 +1632,33 @@ Append new candidates here as each paper is processed.
   Why: LithOS cites CoFRIS as a GPU frequency/resource scaling predecessor;
   useful for separating route latency budgets, energy-aware DVFS, and
   capacity-right-sizing policies for always-on retained read services.
-- `queued` — **SGDRC: Software-Defined Dynamic Resource Control for
+- `reviewed` — **SGDRC: Software-Defined Dynamic Resource Control for
   Concurrent DNN Inference on NVIDIA GPUs**, Zhang et al., PPoPP 2025.
   URL: `https://doi.org/10.1145/3710848.3710863`
+  PDF: `https://people.cs.vt.edu/~huaicheng/p/ppopp25-sgdrc.pdf`
   Why: recent GPU resource-control follow-up cited by LithOS; useful for
   comparing software-visible GPU partition control against LithOS-style
   transparent atomization before GPU DB relies on hardware-specific scheduling
-  hooks.
+  hooks. Journal entry added 2026-06-05.
+- `queued` — **Orion: Interference-aware, Fine-grained GPU Sharing for ML
+  Applications**, Strati, Ma, and Klimovic, EuroSys 2024.
+  URL: `https://doi.org/10.1145/3627703.3650078`
+  Why: SGDRC compares against Orion's interference-aware colocation policy;
+  useful for deciding when GPU DB should use profiling-based compatible
+  co-runners instead of explicit partitioning for retained reads, scans, and
+  refresh work.
+- `queued` — **Transparent GPU Sharing in Container Clouds for Deep Learning
+  Workloads**, Wu et al., NSDI 2023.
+  URL: `https://www.usenix.org/conference/nsdi23/presentation/wu`
+  Why: SGDRC contrasts TGS temporal multiplexing and CUDA-container switching
+  overhead; useful for evaluating whether GPU DB request classes should ever
+  use exclusive time slices instead of spatial sharing or chunked preemption.
+- `queued` — **StreamBox: A Lightweight GPU Sandbox for Serverless Inference
+  Workflow**, Wu et al., USENIX ATC 2024.
+  URL: `https://www.usenix.org/conference/atc24/presentation/wu-hao`
+  Why: SGDRC names StreamBox as a transparent colocation/sandbox direction;
+  useful for comparing GPU runtime fault isolation and queue boundaries before
+  colocating database kernels with externally generated GPU tasks.
 - `reviewed` — **Microsecond-scale Preemption for Concurrent GPU-accelerated DNN
   Inferences**, Han et al., OSDI 2022.
   URL: `https://www.usenix.org/conference/osdi22/presentation/han`
