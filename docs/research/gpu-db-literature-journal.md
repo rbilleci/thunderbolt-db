@@ -69649,3 +69649,158 @@ Benchmark priorities:
   may prefer compiled CPU fallback or GPU kernels.
 - Require every accelerated benchmark to report the baseline route shape and
   setup/compile/materialization costs, not just accelerated operator runtime.
+
+### 2026-06-05 - Flowcut keeps adaptive network routing in-order by draining active flows
+
+**Citation:** Tommaso Bonato, Daniele De Sensi, Salvatore Di Girolamo,
+Abdulla Bataineh, David Hewson, Duncan Roweth, and Torsten Hoefler. "Flowcut
+Switching: High-Performance Adaptive Routing with In-Order Delivery
+Guarantees." arXiv:2506.21406v2, 2025. Retrieved 2026-06-05 from arXiv,
+`https://arxiv.org/abs/2506.21406` and
+`https://arxiv.org/pdf/2506.21406`.
+
+**Category:** runtime / HFT / session scale; high-concurrency networking and
+transport admission.
+
+**Relevance tags:** adaptive routing; in-order delivery; RDMA/RoCE;
+flow-control; congestion detection; NIC/switch co-design; response-ring
+ordering; session admission; fabric load balancing; tail latency.
+
+**Core idea:** Flowcut addresses a tension in datacenter and supercomputer
+networks: per-packet adaptive routing can reduce queueing, but protocols such
+as RoCE, TCP, and QUIC can pay heavily when packets arrive out of order.
+Flowlet-style routing reduces reordering only when traffic is bursty enough to
+create idle gaps, which is often not true for paced RDMA flows. Flowcut instead
+routes a consecutive run of packets, a "flowcut," on one path until the network
+knows there are no in-flight packets for that flow. Only then can the next
+flowcut choose a different path.
+
+The transferable idea for GPU DB is not that SQL should implement Flowcut.
+It is that adaptive routing can be made correctness-friendly by treating
+ordering as an explicit resource frontier. A future gateway, RDMA transport, or
+multi-node accelerator fabric should not spray SQL responses, WAL records,
+COPY chunks, or GPU completion messages across paths unless it can prove the
+receiver will observe the required order or has bounded reorder repair.
+
+**Concrete mechanisms:**
+
+- A flowcut is a sequence of consecutive packets from one flow sent on the same
+  output path. Switches or NICs keep per-active-flow state only while packets
+  remain in flight.
+- The state stores the chosen output path, enough reverse-path information when
+  needed, an in-flight byte counter, and RTT/congestion summaries. The paper's
+  resource accounting estimates roughly 10-11 bytes of extra state per active
+  flow for Flowcut variants, depending on whether full switch or ingress/NIC
+  deployment is used.
+- The egress side sends ACK packets carrying the flow key, data-packet size,
+  timestamp, and hop count. As ACKs return, the source-side counter decreases.
+  When the counter reaches zero, the flowcut entry is removed and a later
+  packet may choose a new route.
+- Initial packets sent before any ACK returns must all follow the same path,
+  for example ECMP, because changing paths before the first in-flight window
+  drains would break the in-order guarantee.
+- If the ingress switch or NIC observes congestion while a flow still has
+  in-flight packets, it can pause the source for that flow, wait until all
+  ACKs return, delete the old flowcut, and resume transmission so the next
+  flowcut can select a less congested route.
+- Congestion detection uses packet timestamps and hop counts to compute a
+  normalized RTT relative to a minimum observed RTT for that hop count. Per-flow
+  exponential moving averages of normalized RTT and RTT slope trigger draining
+  when queueing grows beyond configured thresholds.
+- ACK traffic can be prioritized, and the paper argues reverse-path ACK
+  congestion is usually negligible when ACKs get higher priority.
+- Flowcut has three deployment variants: full switch state at every switch,
+  ingress-switch-only state, and NIC-only state. Full switch reacts most
+  precisely; NIC-only requires no fabric changes and stores state at endpoints
+  but can only force a different ECMP hash or source-chosen path.
+- The bandwidth overhead is a per-packet ACK/header cost. For 1 KiB packets,
+  the paper reports less than 2% per-packet bandwidth overhead.
+- The memory model bounds active flow state by bandwidth-delay product rather
+  than total possible flow count. Once each flow has less than one packet in
+  flight on average, adding more logical flows does not increase simultaneously
+  active flowcut entries.
+- Simulations use RDMA-like credit-based flow control on 1024-node fat-tree and
+  Dragonfly networks, with web-search, enterprise, Alibaba, random, permutation,
+  and all-to-all workloads. The paper also reports measurements from a 2048-node
+  Slingshot Dragonfly system running ordered and unordered routing modes.
+- Evaluation claims include up to 50% lower flow completion time than ECMP,
+  up to 40% lower than conservative Flowlet settings, zero out-of-order packets
+  by construction, and roughly 5x improvement over ECMP in a simulated link
+  failure scenario. The Slingshot ordered mode reportedly comes close to the
+  unordered mode but with about a 24% completion-time difference in the shown
+  all-to-all experiment.
+- Draining is not free. The paper reports average draining time as about 5-11%
+  of runtime in selected fat-tree experiments and suggests adding remaining
+  packet counts or bounded out-of-order degree as possible optimizations.
+
+**GPU DB mapping:** For the current single-process pgwire endpoint, Flowcut is
+mostly a design warning: preserving per-session and per-request order should be
+an explicit runtime contract, not an accident of FIFO sockets and one owner
+queue. As the engine moves toward network IO workers, response rings, GPU
+execution workers, and possibly multiple gateways, a response route needs a
+declared ordering class: strict in-order, independently reorderable, bounded
+reorder with sequence repair, or unordered best effort.
+
+The flowcut frontier maps cleanly to response-ring and COPY/WAL chunk routing.
+A session can have many queued chunks, but the runtime should know which chunks
+are still in flight before switching the session to a different response writer,
+transport path, GPU completion lane, or gateway. If a path is congested, the
+safe move is a drain-and-switch: stop admitting new chunks for that ordered
+stream, wait for acknowledged completion, then publish a new route/path id.
+
+The BDP-based active-state argument is useful for the 1M logical-session target.
+The engine should budget active in-flight request or response state by actual
+bytes and outstanding chunks, not by total authenticated sessions. A million
+idle sessions do not need a million pinned buffers, GPU slots, or reorder
+windows; only sessions with in-flight work do.
+
+Flowcut's RTT and slope triggers resemble queue-wait telemetry at runtime
+boundaries. Network workers, response rings, GPU rings, and cold-tier IO owners
+can maintain moving averages of queue wait plus service time. When the slope
+spikes, the engine can pause or drain a route class before switching to CPU
+fallback, another GPU worker, or another gateway. The important detail is that
+rerouting waits for the old ordered frontier to clear.
+
+The NIC-only variant is especially relevant to future deployment. It suggests a
+path where GPU DB can keep the database ordering contract in endpoint software
+or smart NIC logic without requiring a fully custom fabric. The tradeoff is
+less precise congestion knowledge and random ECMP rehashing unless the fabric
+exports better congestion signals.
+
+**Risks and mismatches:** Flowcut is a networking paper, not a database runtime
+paper. It does not address SQL transactions, WAL-before-visibility, MVCC
+snapshots, pgwire ordering, CUDA completion semantics, or durable recovery.
+The evaluation is mostly simulation, and the empirical Slingshot result uses
+hardware whose behavior is not equivalent to commodity Ethernet/TCP. The
+algorithm assumes lossless or near-lossless behavior; lost ACKs require timeout
+recovery and can temporarily resume on the old path. Per-packet ACK/header
+overhead may be acceptable for MTU-sized data but less attractive for tiny SQL
+responses. Finally, draining protects order but adds latency, so it must be
+used only for ordered streams whose remaining work justifies switching paths.
+
+**Benchmark candidates:**
+
+- Add a response-route ordering simulator with strict FIFO, unordered spray,
+  bounded reorder, and drain-and-switch policies. Measure response p50/p99,
+  reorder buffer bytes, cancellation latency, and incorrect-order detections.
+- Track active in-flight bytes per logical session, response writer, GPU
+  worker, and gateway. Gate: idle sessions consume no pinned or reorder buffers
+  beyond compact session metadata.
+- Build a drain-and-switch test for pgwire response rings: route a session's
+  responses through one worker, inject congestion, pause new chunks, wait for
+  acknowledgments, then move the session to another worker without reordering
+  row descriptions, data rows, command-complete, or error frames.
+- Add per-route queue RTT analogs: enqueue timestamp, service start, completion
+  acknowledgment, moving average, and slope. Failure condition: the system
+  switches ordered routes before all earlier chunks are acknowledged.
+- Compare per-session FIFO affinity with adaptive response-worker routing under
+  mixed tiny responses, large retained scans, COPY output, and cancellation.
+  Expected win: adaptive routing lowers tail latency without visible protocol
+  reordering.
+- For future multi-gateway or RDMA work, benchmark path switching by flowcut
+  frontier rather than packet spraying. Required measurements: bytes in flight,
+  route switch time, reordered packets/messages, CPU reorder overhead, and
+  throughput under link or worker degradation.
+- Add an "ordered stream budget" to route certificates. Any route that requires
+  order should declare max in-flight chunks, max drain time, and whether bounded
+  out-of-order repair is allowed.

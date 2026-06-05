@@ -5463,12 +5463,18 @@ Append new candidates here as each paper is processed.
   Why: Ultra Ethernet names REPS as a path-aware entropy recycling strategy;
   useful for comparing self-clocking packet/path selection with GPU DB
   response-ring and multi-gateway load balancing.
-- `queued` — **Flowcut Switching: High-Performance Adaptive Routing with
+- `reviewed` — **Flowcut Switching: High-Performance Adaptive Routing with
   In-Order Delivery Guarantees**, Bonato et al., arXiv 2025.
   URL: `https://arxiv.org/abs/2506.21406`
   Why: Ultra Ethernet cites Flowcut as a newer routing direction; useful for
   deciding whether future GPU DB transport paths need packet spraying,
   flowlet switching, or in-order route classes for SQL responses.
+- `queued` — **Network Load Balancing with In-network Reordering Support
+  for RDMA**, Song et al., SIGCOMM 2023.
+  URL: `https://www.comp.nus.edu.sg/~lijl/papers/conweave-sigcomm23.pdf`
+  Why: Flowcut contrasts with ConWeave's switch-side in-network reordering;
+  useful for comparing endpoint/NIC pause-and-reroute against fabric-buffered
+  reordering when future GPU DB gateways need in-order high-throughput flows.
 - `queued` — **Data Center Ethernet and Remote Direct Memory Access:
   Issues at Hyperscale**, Hoefler et al., IEEE Computer 2023.
   URL: `https://doi.org/10.1109/MC.2023.3261184`
