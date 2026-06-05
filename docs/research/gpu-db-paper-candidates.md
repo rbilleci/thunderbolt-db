@@ -2572,13 +2572,26 @@ Append new candidates here as each paper is processed.
   contended rows with bitmaps and dynamic local version arrays; useful for
   deciding whether GPU DB write batches should keep per-owner local version
   arrays before publishing a merged visibility front.
-- `queued` — **Dodo: A scalable optimistic deterministic concurrency control
+- `reviewed` — **Dodo: A scalable optimistic deterministic concurrency control
   protocol**, Li et al., Future Generation Computer Systems 2024.
   URL: `https://doi.org/10.1016/j.future.2024.05.004`
   Why: modern deterministic concurrency control design that removes some
   state-of-the-art scalability bottlenecks; useful as a follow-up after
   Serval/Caracal for comparing deterministic batch ordering when full
   read/write sets are not always known.
+- `queued` — **Optimistic Transaction Processing in Deterministic Database**,
+  Dong, Tang, Wang, and Zang, Journal of Computer Science and Technology 2020.
+  URL: `https://jcst.ict.ac.cn/cn/article/id/2622`
+  Why: Dodo compares against DOCC as the predecessor that commits in
+  predetermined order but blocks under multicore pressure; useful for
+  isolating lazy determinism versus Dodo-style staged re-execution.
+- `queued` — **Gria: an efficient deterministic concurrency control protocol**,
+  Wang et al., Frontiers of Computer Science 2024.
+  URL: `https://doi.org/10.1007/s11704-023-2648-8`
+  Metadata: `https://academic.hep.com.cn/fcs/CN/Y2024/V18/I4/184204`
+  Why: Dodo's author line includes Gria as an Aria follow-up with auto-scaling
+  batches, multi-version write-after-write avoidance, reordering, and
+  rechecking; useful for GPU DB batch-size and deterministic rerun policy.
 - `queued` — **Cheetah: An Efficient Deterministic Concurrency Control Scheme
   with Non-Visible Write Elimination and Re-Designed Garbage Collection**, Li,
   Onishi, and Kawashima, IEEE CLUSTER Workshops 2024.

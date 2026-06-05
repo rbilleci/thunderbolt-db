@@ -54096,3 +54096,162 @@ the first canonical storage layout.
 - Test whether learned multidimensional ordering improves host/NVMe
   warm-tier prefetch as well as HBM residency. Measure warm-tier
   page faults, read amplification, and promotion usefulness.
+
+### 2026-06-05 - Dodo makes deterministic batch order scale by staging retries
+
+**Citation:** Xinyuan Wang, Yun Peng, Hejiao Huang, and Xingchen Li.
+"Dodo: A scalable optimistic deterministic concurrency control
+protocol." Future Generation Computer Systems 159:15-26, 2024.
+doi:10.1016/j.future.2024.05.004. Retrieved 2026-06-05 from the
+ScienceDirect article page, `https://www.sciencedirect.com/science/article/abs/pii/S0167739X24002139`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; runtime / batch scheduling.
+
+**Relevance tags:** deterministic concurrency control; optimistic
+validation; MVCC version chains; batch execution; staged retries;
+early write visibility; lazy commit/abort decision; write-set reuse;
+hot-key contention.
+
+**Core idea:** Dodo targets the gap between Aria-style deterministic
+OLTP and predetermined-order commit. Aria avoids predeclared
+read/write sets by executing a batch first and deterministically
+choosing commits later, but its commit order can diverge from the
+transaction id order and hurt multi-node scalability. DOCC preserves
+predetermined order, but the ScienceDirect summary reports that
+blocking rises sharply as threads increase because later transactions
+must wait for earlier decisions.
+
+Dodo keeps deterministic transaction-id order while trying to recover
+multicore throughput. It divides work into batches and splits each
+batch into execution, validation, and commit phases. Transactions run
+optimistically without prior read/write-set knowledge; conflicts are
+validated after execution; only the continuous unconflicted prefix of
+the batch commits. Aborted transactions move to the next batch, but
+their previous write sets become useful metadata so dependent
+transactions in the next batch can wait for the staged writer instead
+of repeating the same abort pattern.
+
+The transferable idea is staged deterministic retry. A GPU DB mutation
+runtime does not need to choose only between one serial owner and
+abort-heavy free-for-all OCC. For prepared or same-shape write routes,
+the engine can execute a deterministic batch, publish only a safe
+prefix after WAL durability, and carry conflict/write-set evidence into
+the next batch so repeated hot-key conflicts become ordered waits or
+special lanes rather than blind retries.
+
+**Concrete mechanisms:**
+
+- Dodo uses a sequencer that assigns transaction ids and splits stored
+  procedures into partition-local pieces. The reviewed page does not
+  expose all sequencing implementation details, but it states that the
+  commit order follows the predetermined ids.
+- Each record keeps a multi-version chain ordered by the writing
+  transaction id. This removes write-write conflicts as a direct abort
+  source and lets conflict handling focus on read-write dependencies
+  and visibility.
+- A batch has three barrier-separated phases. In the execution phase,
+  transactions read committed versions or staged versions whose writers
+  have finished execution but have not committed yet.
+- In the validation phase, Dodo checks transactions for read-write
+  conflicts. In the commit phase, only the continuous unconflicted
+  transactions at the head of the batch commit; later transactions that
+  are individually clean still cannot leap ahead of an earlier conflict.
+- Aborted transactions are re-executed in the next batch. Their
+  previous write sets are exposed to other transactions so a transaction
+  with a dependency on a re-executed writer can wait for that writer's
+  execution before reading, reducing repeat aborts.
+- Lazy decision delays some commit/abort choices into the next batch.
+  If all dependent transactions of an unconflicted transaction commit,
+  Dodo can avoid aborting that transaction and validate it in the
+  subsequent batch.
+- Early-write visibility assumes that an aborted transaction's write
+  count to the same record is unchanged in the next execution. When the
+  re-executing transaction performs the final write to that record, the
+  version can become visible to dependent transactions before the full
+  transaction completes.
+- The article page reports evaluation on YCSB and TPC-C. It reports
+  Dodo outperforming Aria and DOCC by up to 16.5x and 8.0x,
+  respectively, in a single-node multicore setting; lazy decision and
+  early-write visibility contribute up to 1.4x and 2.8x, respectively;
+  and Dodo scales better than Aria in an eight-node setting.
+
+**GPU DB mapping:** The immediate mapping is a deterministic write-batch
+lane for hot or prepared routes. A mutation owner can still preserve
+WAL-before-visibility, but instead of admitting each conflicting command
+independently, it can form a bounded batch with transaction ids, execute
+or prepare fragments against a stable read frontier, validate, then
+publish only a durable unconflicted prefix. Conflicted suffix work would
+carry write-set and dependency evidence into the next batch.
+
+For MVCC, Dodo reinforces a version-chain shape that is useful for GPU
+DB visibility summaries: versions ordered by a deterministic batch id
+or transaction id make retry, validation, and prefix publication easier
+to reason about than arbitrary worker-local commit order. That does not
+replace snapshot timestamps, but it gives write-heavy lanes a compact
+ordering certificate that can feed retained-snapshot invalidation and
+refresh planning.
+
+For GPU execution, Dodo's staged retry suggests a narrow experiment for
+same-shape update or upsert batches. A GPU or CPU parallel pass can
+prepare candidate writes and conflict metadata, while the mutation owner
+serializes the final prefix publication and WAL boundary. The GPU should
+not publish writes, but it may help prepare validation vectors, hot-key
+histograms, or partition-local dependency masks for deterministic
+owners.
+
+For session concurrency, the design converts repeated abort churn into
+explicit waiting and carried metadata. That is a better fit for 1M
+logical sessions than letting many active sessions repeatedly enqueue
+the same doomed hot-key work. Admission can expose "staged behind
+transaction id X" as a bounded state with queue time and retry count.
+
+**Risks and mismatches:** Dodo is a deterministic transaction protocol,
+not a PostgreSQL-compatible GPU storage engine. The source page exposes
+high-level mechanisms and results but not every data structure,
+pseudocode detail, or recovery path, so exact latch, memory-ordering,
+and logging costs are unknown from this review.
+
+The early-write visibility mechanism is risky for GPU DB unless tied to
+a strict recoverability rule. The paper's assumption that a re-executed
+transaction's write count to a record is unchanged may not hold for
+general SQL, triggers, constraints, DDL, or data-dependent stored
+procedures. GPU DB should first treat it as an experiment for
+deterministic stored procedures or commutative update classes, never as
+a default visibility rule.
+
+Dodo also pays batch barriers. That can improve throughput under
+contention while hurting p50 latency for single short commands or
+imbalanced transactions. A GPU DB needs latency ceilings and fallback
+lanes, otherwise deterministic batches can become another head-of-line
+blocking point. Finally, Dodo's distributed claims are about transaction
+order and partitioned servers, not GPU HBM residency, CUDA streams,
+pgwire response rings, or multi-tier cold reads.
+
+**Benchmark candidates:**
+
+- Build a deterministic hot-key write-batch simulator with three lanes:
+  serial mutation owner, Aria-style execute-then-validate batch, and
+  Dodo-style prefix commit plus staged retry. Metrics: committed
+  transactions per second, aborts, waits, p50/p99 latency, and WAL
+  publication gaps.
+- Add write-set carryover telemetry for aborted mutation batches:
+  touched keys, touched columns, repeated conflict keys, dependent
+  queued requests, and whether the next attempt avoided a repeat abort.
+  Proof gate: no SQL-visible behavior change.
+- Prototype prefix publication for a stored-procedure-only benchmark.
+  The owner may publish only the continuous validated prefix after WAL
+  durability; suffix work must retry or stage with explicit reasons.
+  Failure condition: a retained read can observe a non-prefix or
+  non-durable write.
+- Test early-write visibility only for one commutative or fixed-write
+  procedure, such as inventory decrement with known key count. Gate:
+  replay, retained snapshots, and CPU fallback produce the same final
+  state as ordinary serial execution.
+- Measure batch-barrier harm under mixed short and long transactions.
+  Required output: throughput gain under hot-key contention versus p50
+  and p99 latency loss for unrelated short reads and writes.
+- For GPU assist, generate validation vectors or dependency masks for a
+  same-shape update batch and compare CPU-only validation against
+  GPU-prepared metadata plus owner prefix commit. Failure condition:
+  transfer and launch overhead exceed saved owner time.
