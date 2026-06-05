@@ -1008,7 +1008,7 @@ Append new candidates here as each paper is processed.
   SQL Server real-time analytics; useful for comparing newer hot/cold
   movement, analytical freshness, and operational workload isolation against
   the 2015 columnstore-on-OLTP design.
-- `queued` — **PolarDB-IMCI: A Cloud-Native HTAP Database System at Alibaba**,
+- `reviewed` — **PolarDB-IMCI: A Cloud-Native HTAP Database System at Alibaba**,
   Wang et al., SIGMOD 2023.
   URL: `https://arxiv.org/abs/2305.08468`
   PDF: `https://haozesong.github.io/data/sigmod23-polar.pdf`
@@ -1298,6 +1298,19 @@ Append new candidates here as each paper is processed.
   reusable task/device layers; useful for deciding whether GPU DB route
   descriptors should expose device-specific kernels, portable fragments, or a
   layered execution abstraction.
+- `queued` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p3313-yang.pdf`
+  DOI: `https://doi.org/10.14778/3415478.3415553`
+  Why: loosely coupled production HTAP system with transparent query federation
+  over existing transactional stores; useful follow-up to PolarDB-IMCI for
+  contrasting redo-replay replicas with service-layer freshness and route
+  integration.
+- `queued` — **TiDB: A Raft-based HTAP Database**, Huang et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p3072-huang.pdf`
+  DOI: `https://doi.org/10.14778/3415478.3415535`
+  Why: Raft learner based row-to-column HTAP replication; useful follow-up to
+  PolarDB-IMCI for comparing physical REDO reuse with consensus-log columnar
+  replicas, freshness, consistency, and workload isolation.
 - `reviewed` — **Hints for Robust Query Performance Tuning**, Xiu et al.,
   PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p5327-xiu.pdf`

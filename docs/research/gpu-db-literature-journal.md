@@ -64951,3 +64951,201 @@ operator throughput.
   target hardware. Expected result is not assumed; the pass condition is that
   the planner has measured movement telemetry instead of a hidden placement
   policy.
+
+### 2026-06-05 - PolarDB-IMCI makes freshness a replay pipeline, not a side channel
+
+**Citation:** Jianying Wang, Tongliang Li, Haoze Song, Xinjun Yang,
+Wenchao Zhou, Feifei Li, Baoyue Yan, Qianqian Wu, Yukun Liang, Chengjun
+Ying, Yujie Wang, Baokai Chen, Chang Cai, Yubin Ruan, Xiaoyi Weng,
+Shibin Chen, Liang Yin, Chengzhong Yang, Xin Cai, Hongyan Xing, Nanlong
+Yu, Xiaofei Chen, Dapeng Huang, and Jianling Sun. "PolarDB-IMCI: A
+Cloud-Native HTAP Database System at Alibaba." PACMMOD/SIGMOD 2023.
+Retrieved 2026-06-05 from
+`https://haozesong.github.io/data/sigmod23-polar.pdf`. DOI:
+`https://doi.org/10.1145/3589785`.
+
+**Category:** hybrid HTAP; MVCC / snapshot / visibility; multi-tier cache
+/ data placement; query optimization / planning.
+
+**Relevance tags:** HTAP freshness; read-only replicas; physical REDO
+reuse; append-only column index; version maps; row-id locator; transparent
+routing; consistency routing; checkpointed scale-out; resource isolation.
+
+**Core idea:** PolarDB-IMCI adds an analytical columnar path to a
+cloud-native transactional database without putting analytical update work
+on the primary transaction commit path. A single read/write node remains
+the OLTP authority; read-only nodes maintain both a row-store buffer pool
+and in-memory column indexes, then serve analytical or read-only traffic
+through transparent proxy routing. The important design choice is that
+freshness is implemented as a high-throughput asynchronous REDO replay
+pipeline rather than a second logical-log stream.
+
+The paper frames the system around five production HTAP goals:
+transparent SQL routing, competitive OLAP performance, minimal OLTP
+perturbation, high data freshness, and elastic read-only scale-out. The
+reported results include up to 149x speedup over row-based PolarDB on
+TPC-H 100 GB scan-heavy queries, less than 5% OLTP perturbation from the
+REDO-based propagation path in the evaluated write workloads, visibility
+delay below 5 ms on typical workloads and below 30 ms under heavy
+workloads, and read-only node scale-out in tens of seconds.
+
+**Concrete mechanisms:**
+
+- The architecture has shared storage, one read/write node, multiple
+  read-only nodes, and stateless proxies. Large analytical queries route to
+  read-only nodes for resource isolation; the paper says a single writer
+  was enough for most PolarDB customers in their environment.
+- Read-only nodes are dual-format: they keep the ordinary row-store buffer
+  pool plus complementary in-memory column indexes. This lets them parse
+  physical REDO into logical updates while still supporting row-oriented
+  point queries and fallback paths.
+- Column indexes are built as append-only row groups. A table can include a
+  selected subset of columns in the column index; each row group has one
+  compressed data Pack per indexed column plus metadata such as min, max,
+  sums, counts, null counts, distinct counts, and histograms.
+- Rows in the column index are ordered by insertion rather than primary key.
+  Primary-key lookup and delete therefore use a Row-ID locator, implemented
+  as a two-layer LSM tree from primary key to row id.
+- Snapshot visibility in the column index uses per-row-group insert and
+  delete Version Id maps. A read sees a version when its snapshot timestamp
+  is within the insert/delete VID range.
+- Inserts allocate a row id, update the locator, append column values into
+  partial Packs, and set insert VID. Deletes find the row id via the
+  locator, set delete VID, and remove the locator entry. Updates are delete
+  plus append of the new version.
+- Full Packs are immutable and compressed with numeric
+  frame-of-reference/delta/bit-packing or string dictionary compression.
+  Partial Packs remain uncompressed while actively appended. Insert VID
+  maps can be removed after all active transactions are newer than those
+  insert versions.
+- Background compaction detects sparse Packs and re-appends valid rows
+  through ordinary update operations. Old Packs are removed only after no
+  active transaction can still access them.
+- Commit-Ahead Log Shipping ships REDO entries to read-only nodes after the
+  primary writes each log entry to shared storage, before the transaction's
+  commit record arrives. DML REDO entries are parsed into per-transaction
+  buffers; commit records can apply already-parsed work, while abort records
+  discard the buffer.
+- 2P-COFFER replays physical REDO in two conflict-free phases. Phase 1
+  hashes REDO by page id, replays page changes into the read-only row-store
+  buffer pool, filters out storage-internal changes, and reconstructs
+  logical DMLs with table schema and primary-key information. Phase 2 sorts
+  DMLs by LSN/commit order, dispatches row-level DMLs by primary-key hash,
+  and applies them to column indexes in parallel.
+- Large transactions are pre-committed into Partial Packs with invalid VIDs
+  and a temporary RID locator so transaction buffers do not grow without
+  bound. On commit, the temporary locator is merged and VIDs are patched to
+  the commit sequence number; on abort, the temporary locator is discarded
+  and invalid rows are later compacted away.
+- Query routing happens in two levels. The proxy routes read/write traffic
+  between the primary and read-only replicas. Within a read-only node, the
+  optimizer first builds a row-oriented plan and only generates a columnar
+  plan when the row plan cost exceeds a threshold.
+- Columnar plan generation transforms the row plan instead of starting from
+  scratch, preserving MySQL-compatible casts and static error behavior.
+  Runtime errors can fall back to the row executor. Join ordering is then
+  refined for the column engine with DPhyp and sampled statistics.
+- Strong consistency is exposed by proxy LSN checks. A proxy tracks the
+  primary written LSN and each read-only node's applied LSN, and routes a
+  query to a read-only node only when its applied LSN satisfies the required
+  freshness boundary.
+- Read-only scale-out uses column-index checkpoints in shared storage. A
+  leader read-only node writes checkpointed locators and VID maps at a
+  committed sequence number, writes immutable Packs independently, and new
+  read-only nodes lazily load Packs plus replay later REDO to catch up.
+
+**GPU DB mapping:** The strongest transfer is the separation of durable
+truth, freshness replay, and analytical residency. GPU DB should keep WAL
+and CPU MVCC state as the authority, but treat GPU-resident column groups as
+read-only replica state that is refreshed by a measured replay/build
+pipeline. The refresh path should have its own throughput, visibility-delay,
+and memory-budget telemetry rather than hiding behind generic cache
+invalidation.
+
+PolarDB-IMCI's column index maps closely to the first P8 slice: append-only
+column groups, per-row visibility metadata, row-id/key locator, min/max
+statistics, compression, and checkpointable resident structures. For GPU DB,
+the "read-only node" can initially be an owner domain and resident snapshot
+pipeline rather than a separate server, but the same rule applies: analytical
+refresh must not sit inside the write commit path.
+
+CALS is a useful pattern for reducing freshness delay without weakening
+WAL-before-visibility. GPU DB could pre-parse WAL or mutation batches into
+refresh work as soon as log records are durable or known to be durable, but
+resident snapshots should publish only after the commit/visibility boundary
+is known. Aborted or rolled-back work can be discarded before it reaches a
+published generation.
+
+2P-COFFER suggests a concrete way to parallelize refresh: first reconstruct
+or collect row-level logical changes from the CPU authority, then dispatch
+column/resident updates by primary key, row id, segment id, or partition id.
+The GPU DB version should probably avoid parsing physical page logs because
+its own WAL can expose better route metadata, but the two-phase shape is
+still valuable: durable-order parse, then conflict-free resident apply.
+
+The temporary locator and invalid-VID pre-commit path is relevant to COPY
+and bulk ingestion. GPU DB can stage large batches into append-only
+resident-build buffers with invalid visibility, release per-session memory
+early, then patch generation/visibility metadata atomically after WAL commit.
+If the batch aborts, staged rows remain invisible and become compaction
+input.
+
+The proxy-applied-LSN rule maps to route certificates. A retained GPU route
+should carry the source WAL/transaction boundary and refuse strong reads
+when the resident generation is behind the requested boundary. Lower
+freshness modes can be explicit, but the route result must name the
+freshness decision rather than silently serving stale data.
+
+**Risks and mismatches:** PolarDB-IMCI is a production HTAP system, not a
+GPU DBMS. Its analytical executor is CPU vectorized, not CUDA-based, and the
+paper's performance numbers are from Alibaba Cloud instances, RDMA-backed
+shared storage, and PolarDB internals. The single-writer architecture matched
+their customer base but may not be enough for GPU DB's long-range session and
+write-throughput goals without partition owners.
+
+The REDO reuse mechanism depends on maintaining a row-store buffer pool on
+read-only nodes and reconstructing logical DML from physical page logs. GPU
+DB should prefer richer WAL/route metadata if available rather than
+recreating this complexity. The paper gives limited detail on failure modes,
+stale-query policy beyond LSN routing, and exactly how compaction interacts
+with long analytical snapshots under extreme churn.
+
+Column indexes are in-memory and complementary to a row store; they do not
+solve GPU memory pressure, HBM/DRAM/NVMe placement, pinned-buffer budgets,
+or over-resident execution. The reported visibility delays assume a
+cloud-native shared-storage and RDMA environment that may not match a local
+NVMe plus GPU setup. The optimizer's row-cost threshold is also deliberately
+rough; GPU DB needs route costs that include transfer, queue delay, refresh
+age, and output materialization.
+
+**Benchmark candidates:**
+
+- Add a refresh-freshness benchmark: measure time from WAL-visible mutation
+  to resident snapshot publication for append, update, delete, COPY, and
+  refresh-coalesced workloads. Proof gate: every resident route reports
+  source boundary, applied boundary, and freshness lag.
+- Prototype invalid-visibility staged COPY buffers. Append rows into
+  segment-build buffers before commit, publish by patching visibility after
+  WAL safety, and discard on abort. Failure condition: any read sees staged
+  rows before the commit boundary.
+- Compare full resident rebuild versus two-phase logical apply for
+  append-heavy and update-heavy tables. Measure CPU parse cost, GPU transfer
+  bytes, p95 refresh latency, resident invalidation count, and query p99.
+- Add a row-id locator experiment for resident segments: primary-key to
+  row-id mapping in a CPU LSM/hash structure versus a GPU-resident key vector
+  plus CPU fallback. Measure point lookup latency, update/delete cost, and
+  memory footprint.
+- Implement route freshness modes: latest/strong boundary, bounded-stale
+  boundary, and any-resident boundary. Gate: identical results when strong
+  mode is requested; stale modes must expose lag and applied generation.
+- Add pack/segment statistics to resident route pruning: min/max and
+  sampled histograms per GPU column group. Failure condition: route
+  selection cannot explain skipped segments or false-positive continuation
+  cost.
+- Build a read-only scale-out analogue for a second GPU execution owner or
+  second resident partition: load checkpointed resident metadata first, lazy
+  load column buffers, replay later WAL, and measure time to "serve stale"
+  versus "serve strong."
+- Stress long snapshots plus compaction: hold one analytical snapshot while
+  updates punch holes in column groups, then measure scan degradation,
+  compaction backlog, and safe retirement once readers release.
