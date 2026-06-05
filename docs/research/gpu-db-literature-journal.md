@@ -59578,3 +59578,148 @@ published read boundary.
 - Track per-request route fields: requested snapshot, durable watermark,
   resident watermark, wait budget, write-set known/unknown, placeholder id,
   fallback reason, and boundary that released the response.
+
+### 2026-06-05 - TMO makes tiering a pressure-controlled feedback loop
+
+**Citation:** Johannes Weiner, Niket Agarwal, Dan Schatzberg, Leon Yang,
+Hao Wang, Blaise Sanouillet, Bikash Sharma, Tejun Heo, Mayank Jain,
+Chunqiang Tang, and Dimitrios Skarlatos. "TMO: Transparent Memory
+Offloading in Datacenters." ASPLOS 2022. DOI `10.1145/3503222.3507731`.
+Retrieved 2026-06-05 from author PDF
+`https://www.cs.cmu.edu/~dskarlat/publications/tmo_asplos22.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** memory tiering; pressure feedback; PSI; cgroups; cold page
+offload; file cache; anonymous memory; zswap; SSD swap; CXL/future tiers;
+admission; hot/cold placement.
+
+**Core idea:** TMO is Meta's production transparent memory offloading system.
+Its main lesson is not "swap is good"; it is that tiering decisions should be
+driven by measured lost work, not by a raw page-movement counter. TMO adds
+Linux Pressure Stall Information (PSI) to measure time lost to CPU, memory, and
+I/O shortage, then uses a userspace controller, Senpai, to apply mild memory
+pressure and offload colder anonymous and file-backed pages to compressed
+memory or SSD-backed swap.
+
+The paper is especially useful as a counterweight to DB-only placement plans.
+It shows that transparent tiering can save large amounts of memory in
+production, but also that hardware heterogeneity, file-cache refaults, SSD
+endurance, and workload SLO sensitivity determine whether a page should move.
+For GPU DB, that argues for explicit route-aware placement for correctness
+state, plus pressure feedback when deciding which old snapshots, cold segments,
+response buffers, and side metadata can be demoted.
+
+**Concrete mechanisms:**
+
+- PSI measures the proportion of non-idle compute potential lost to resource
+  stalls. The `some` metric captures time when at least one task in a domain is
+  stalled; `full` captures time when all tasks are stalled.
+- Memory PSI includes direct reclaim stalls, refault stalls for recently
+  evicted file-cache pages, and swap-in stalls. I/O PSI tracks block-I/O wait
+  because page offload can harm applications indirectly through shared storage.
+- Senpai periodically computes a reclaim amount from current cgroup memory,
+  a reclaim ratio, observed `PSI_some`, and a target pressure threshold. It
+  reclaims less as pressure approaches the threshold and stops above it.
+- The production configuration described in the paper uses a global mild target
+  of `PSI_threshold=0.1%`, `reclaim_ratio=0.0005`, and a six-second reclaim
+  period, with workload expansion handled immediately and contraction taking
+  minutes.
+- TMO adds a stateless `memory.reclaim` cgroup interface so userspace can ask
+  the kernel to reclaim a calculated amount without lowering a persistent
+  cgroup memory limit that might block a growing workload.
+- The kernel reclaim path keeps active and inactive LRU lists for file-backed
+  and swap-backed pages. TMO changes reclaim to use file cache while there are
+  no refaults, then balance file-cache reclaim and swapping based on file
+  refault rate versus anonymous swap-in rate.
+- Non-resident file-cache tracking stores a shadow entry when a page is evicted
+  and detects refaults by reuse distance. TMO uses this both for memory PSI and
+  for balancing file and anonymous reclaim.
+- Offload backends include zswap compressed memory and SSD-backed swap. Senpai
+  can use the same feedback loop for either backend because PSI reflects actual
+  stall cost, device speed, and workload sensitivity.
+- SSD-backed offload is rate-limited for endurance. The paper reports a
+  production-safe threshold around 1 MB/s for its fleet and shows Senpai
+  modulating swap-out rate to that bound.
+- Evaluation reports 20-32% total memory savings across Meta's fleet after
+  more than a year in production, with 7-19% from application containers and
+  about 13% from datacenter and microservice memory tax.
+- The Web application experiment shows promotion/swap-in rate is not a robust
+  health metric: a host with a faster SSD can swap more and still process more
+  requests. PSI tracks the performance impact better because it captures the
+  stall cost of the actual backend.
+- The paper's future direction is a hierarchy of offload backends: warmer pages
+  in zswap, colder or less-compressible pages on SSD, and future NVM/CXL tiers,
+  with kernel reclaim dynamically balancing across pools.
+
+**GPU DB mapping:** GPU DB should treat multi-tier placement as a feedback
+loop over route-visible pressure, not as a static HBM/DRAM/NVMe ranking. The
+analog of PSI is route stall pressure: queue wait, GPU stream wait, pinned
+buffer wait, resident refresh wait, cold-tier I/O wait, WAL flush wait, and
+response-ring backpressure. A segment should be demoted or promoted based on
+the work it saves or stalls, not merely on access count.
+
+TMO's file-cache versus anonymous-memory balance maps to GPU DB's split between
+query data and correctness metadata. Cold column segments, old retained
+snapshots, response-shape caches, and decoded text buffers may tolerate
+transparent demotion. Current MVCC heads, visibility watermarks, catalog route
+metadata, owner queues, WAL buffers, pinned staging pools, and invalidation
+state probably require explicit ownership and hard budgets. Moving those
+transparently risks adding latency exactly where the runtime needs predictable
+publication.
+
+For P8, TMO suggests making every tier decision expose both a placement action
+and a pressure result: HBM resident hit/miss, DRAM warm hit, zswap or compressed
+host hit, NVMe read, refault after eviction, demotion write rate, and route
+fallback. CPU-visible and GPU-resident watermarks from the Ocean Vista entry
+should gain pressure annotations so the planner can choose "wait for resident,"
+"CPU fallback," "promote," or "reject" from measured stall budgets.
+
+The memory-tax result also matters for 1M logical sessions. Idle sessions,
+sidecar-like protocol state, prepared statement metadata, row descriptions,
+and infrequently used response buffers may be offload candidates, but active
+session credits, socket readiness, and response-ring descriptors need hot-tier
+budgets. Logical session scale should not imply all session memory is equally
+hot.
+
+**Risks and mismatches:** TMO is transparent OS memory management, not a DBMS
+storage engine. It cannot know SQL visibility, WAL ordering, resident snapshot
+generations, or which page contains a route-critical latch, watermark, or GPU
+descriptor. GPU DB should not delegate correctness-tier movement to the OS.
+
+The paper's reaction time intentionally favors fleet stability over
+microsecond response. Senpai's six-second loop and minute-scale contraction are
+not suitable for hot query admission, GPU queue saturation, or WAL visibility
+publication. GPU DB needs a faster internal feedback loop for active routes
+while possibly using OS-tier signals for cold objects.
+
+The fleet numbers are Meta-specific and depend on workload mix,
+compressibility, SSD devices, and SLOs. They prove that pressure-based tiering
+can be production viable, not that GPU DB will save the same percentage. SSD
+offload also introduces endurance and shared-device interference, so demotion
+benchmarks must include write-rate caps and cold-tier contention.
+
+**Benchmark candidates:**
+
+- Add route pressure telemetry inspired by PSI: per-route queue wait, GPU wait,
+  pinned-buffer wait, refresh wait, cold I/O wait, WAL wait, and response-ring
+  wait. Gate: pressure counters explain p99 regressions better than raw
+  resident hit rate alone.
+- Build a tier-demotion simulator for old snapshots and cold resident segments.
+  Compare access-count eviction, bytes-only eviction, and pressure-feedback
+  eviction under mixed retained reads, refresh lag, and hot writes.
+- Split objects into transparent-demotion and explicit-placement classes.
+  Proof gate: no demotion of WAL buffers, visibility watermarks, route
+  metadata, owner queues, active pinned buffers, or current MVCC heads.
+- Add a refault benchmark: evict warm CPU column segments or response metadata,
+  then measure refault rate, fallback latency, and whether promotion restores
+  p99 without HBM/DRAM churn.
+- Test SSD/NVMe demotion with a write-rate cap and shared read pressure.
+  Failure condition: throughput improves only by exceeding the write cap or by
+  inflating cold-tier p99 for unrelated routes.
+- For 1M logical sessions, classify session memory by heat: active credits and
+  response descriptors hot, idle prepared metadata warm, long-idle state cold.
+  Measure memory saved, wakeup latency, and reconnect/statement correctness.
+- Add a planner experiment where "wait for resident," CPU fallback, promote,
+  and reject are chosen from measured route pressure rather than static tier
+  priority. Gate: lower p99 without stale reads or hidden queue growth.

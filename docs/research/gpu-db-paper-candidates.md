@@ -4512,7 +4512,7 @@ Append new candidates here as each paper is processed.
   latency and bandwidth evidence; useful for replacing abstract CXL tier
   assumptions with measured load/store, copy, random-access, and NUMA-like
   behavior.
-- `queued` — **TMO: Transparent Memory Offloading in Datacenters**, Weiner et
+- `reviewed` — **TMO: Transparent Memory Offloading in Datacenters**, Weiner et
   al., ASPLOS 2022.
   URL: `https://doi.org/10.1145/3503222.3507731`
   PDF: `https://www.cs.cmu.edu/~dskarlat/publications/tmo_asplos22.pdf`
@@ -4537,6 +4537,18 @@ Append new candidates here as each paper is processed.
   workloads; Nimble is a primary OS page-migration mechanism for measuring
   migration throughput, migration interference, and whether GPU DB should avoid
   opaque page movement on short read paths.
+- `queued` — **Thermostat: Application-Transparent Page Management for
+  Two-Tiered Main Memory**, Agarwal and Wenisch, ASPLOS 2017.
+  URL: `https://doi.org/10.1145/3037697.3037706`
+  Why: TMO cites Thermostat as an application-transparent hot/cold page
+  management baseline; useful for comparing DB-owned tier policy with
+  transparent page migration when GPU DB adds CXL, NVM, or far-memory tiers.
+- `queued` — **Effectively Prefetching Remote Memory with Leap**, Al Maruf and
+  Chowdhury, USENIX ATC 2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/maruf`
+  Why: TMO cites Leap as a remote-memory prefetching design; useful for
+  evaluating whether future GPU DB cold-tier or far-memory lookups can hide
+  migration latency without polluting hot DRAM/HBM placement.
 - `queued` — **Dremel: A Decade of Interactive SQL Analysis at Web Scale**,
   Melnik et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3461-melnik.pdf`
