@@ -4584,10 +4584,10 @@ Append new candidates here as each paper is processed.
   version and snapshot metadata crosses engines; Skeena is a modern
   cross-engine transaction source for comparing lightweight snapshot tracking
   and atomic commit across CPU, GPU, and cold-tier execution engines.
-- `queued` — **Industrial-Strength OLTP Using Main Memory and Many Cores**,
+- `reviewed` — **Industrial-Strength OLTP Using Main Memory and Many Cores**,
   Avni et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p3099-avni.pdf`
-  DOI: `https://doi.org/10.14778/3415478.3415538`
+  DOI: `https://doi.org/10.14778/3415478.3415537`
   Why: Skeena cites this main-memory engine line as a production fast-engine
   target; useful for comparing cross-engine snapshot coordination with
   many-core OLTP ownership, logging, and memory-resident transaction paths.
@@ -4598,3 +4598,23 @@ Append new candidates here as each paper is processed.
   Why: Skeena cites SAP HANA's heterogeneous-engine direction; useful for
   contrasting cross-engine OLTP correctness with HTAP table placement,
   analytical freshness, and transaction-aware engine routing.
+- `queued` — **Low-Overhead Asynchronous Checkpointing in Main-Memory Database
+  Systems**, Ren, Diamond, Abadi, and Thomson, SIGMOD 2016.
+  URL: `https://www.cs.yale.edu/homes/dna/papers/fast-checkpoint-sigmod16.pdf`
+  DOI: `https://doi.org/10.1145/2882903.2915966`
+  Why: MOT reuses this checkpointing line; useful for designing asynchronous
+  CPU truth checkpoints that do not stop GPU resident snapshot refresh,
+  invalidation, or WAL replay.
+- `queued` — **A Scalable Linearizable Multi-Index Table**, Sheffi,
+  Golan-Gueta, and Petrank, ICDCS 2018.
+  URL: `https://doi.org/10.1109/ICDCS.2018.00029`
+  Why: MOT contrasts its industrial optimistic multi-index insert protocol with
+  this multi-index table work; useful for deciding which index-update
+  atomicity guarantees must be database-transactional versus data-structure
+  local.
+- `queued` — **Native Store Extension for SAP HANA**, Sherkat et al.,
+  PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p2047-sherkat.pdf`
+  Why: MOT names memory capacity and tiering as future work; HANA NSE is a
+  primary-source warm-tier design for comparing in-memory OLTP acceleration
+  with disk-backed warm data placement.

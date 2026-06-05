@@ -56957,3 +56957,182 @@ frontiers.
 - Track route-certificate fields for `operation_affinity`,
   `metadata_placement`, `payload_placement`, `dependent_round_count`,
   `batch_size`, `active_context_bytes`, and `rebuildable_acceleration_state`.
+
+### 2026-06-05 - MOT productionizes many-core OCC inside a full SQL engine
+
+**Citation:** Hillel Avni, Alisher Aliev, Oren Amor, Aharon Avitzur,
+Ilan Bronshtein, Eli Ginot, Shay Goikhman, Eliezer Levy, Idan Levy,
+Fuyang Lu, Liran Mishali, Yeqin Mo, Nir Pachter, Dima Sivov,
+Vinoth Veeraraghavan, Vladi Vexler, Lei Wang, and Peng Wang.
+"Industrial-Strength OLTP Using Main Memory and Many Cores." PVLDB
+13(12), 2020, pp. 3099-3111. doi:10.14778/3415478.3415537.
+Retrieved 2026-06-05 from
+`https://www.vldb.org/pvldb/vol13/p3099-avni.pdf`.
+
+**Category:** transaction processing / write path; runtime / HFT /
+session scale.
+
+**Relevance tags:** OLTP; many-core scale-up; optimistic concurrency
+control; Silo; Masstree; multi-index inserts; WAL; asynchronous
+checkpointing; epoch GC; NUMA pools; prepared-query JIT; mixed storage
+engines; SQL integration.
+
+**Core idea:** The paper describes MOT, Huawei GaussDB/openGauss's
+memory-optimized table engine, as a production conversion of a fast
+research-style in-memory OLTP prototype into an industrial SQL storage
+engine. The performance recipe is not one exotic feature: MOT combines
+cache-friendly Masstree indexes, a Silo-like optimistic concurrency
+control path, careful memory pools and epoch reclamation, reusable
+GaussDB logging/checkpoint/recovery services, and prepared-query JIT for
+short OLTP queries whose engine access is already fast enough that the
+SQL executor becomes visible overhead.
+
+The most transferable claim is that a fast transactional engine must be
+productionized at the awkward boundaries: multiple unique and non-unique
+indexes, read-your-own-writes behavior, DDL/VACUUM/DROP cleanup, WAL and
+checkpoint alignment, HA replication, NUMA allocation, and query-planner
+integration. On full TPC-C, MOT reports more than 2.5x improvement over
+GaussDB's disk-based table path on both x86 and ARM many-core servers.
+The paper also reports that MOT keeps scaling beyond the disk-based path
+as connection count rises, with the caveat that high contention still
+turns optimistic execution into aborted work.
+
+**Concrete mechanisms:**
+
+- MOT uses Masstree for primary and secondary indexes because point
+  lookup, iteration, modification, cache behavior, prefetching, and
+  optimistic navigation were a better all-around fit than the tested
+  alternatives, at the cost of higher per-index memory overhead.
+- It chooses single-version shared-everything OCC based on Silo rather
+  than MVCC, ETL, or 2PL. The stated reasons are simpler performance,
+  invisible readers, avoiding locks held by swapped or slow threads, and
+  avoiding deadlock-detection overhead.
+- Inserts use sentinel objects in indexes. A transaction first inserts
+  absent sentinels, keeps private inserted rows in an access set keyed by
+  sentinel pointer, then links all sentinels to the same row only after
+  commit validation succeeds.
+- Sentinel reference counts let concurrent failed inserts and abort
+  cleanup decide whether an absent index entry can be removed without
+  racing another uncommitted insert.
+- Non-unique indexes append a symmetry-breaking suffix, the row pointer,
+  to the logical key because the underlying Masstree maps one object per
+  key.
+- One ordered access set tracks read, write, insert, and delete states.
+  This solves read-after-write and self-insert visibility without scanning
+  separate write sets on every read.
+- The commit path extracts update/delete rows, inserted rows, and, above
+  read committed, read-set rows from the ordered access set. It locks rows
+  and sentinels in pointer order, validates rows and absent sentinels,
+  writes updates, links inserted rows, then releases locks and publishes
+  versions.
+- In the real implementation, WAL flush happens after locking and before
+  releasing commit locks; the pseudocode omits logging and abort cleanup
+  for readability.
+- MOT integrates into a PostgreSQL-derived system through an extended FDW
+  path even though the foreign-data-wrapper API was not originally meant
+  for embedded, locally managed storage engines.
+- The engine reuses GaussDB XLOG, replication, checkpoint, and recovery
+  services. MOT checkpoints keep an LSN aligned with GaussDB recovery,
+  and recovery restores the MOT checkpoint before replaying newer MOT WAL
+  records.
+- MOT's checkpoint is asynchronous. During checkpoint collection, updated
+  rows keep the original version until collection completes, which avoids
+  stopping concurrent transactions.
+- Checkpoint recovery is parallelized by having multiple threads read
+  different data segments.
+- Memory allocation is per table and per index, using 2MB pool chunks.
+  Shared data pools default to round-robin NUMA allocation, while
+  thread-private memory is local to the worker's NUMA node.
+- Epoch GC waits until transactions live at row deletion have finished
+  before reclaiming row, sentinel, and index-node memory. DROP and index
+  pool deletion additionally recycle pending GC buffers from the deleted
+  pool before freeing the pool.
+- MOT JIT compiles whole prepared OLTP queries for selected point and
+  simple range-query classes, bypassing the interpreted operator tree.
+  Compilation happens at `PREPARE`, not per execution, because OLTP
+  executions are too short to amortize compile cost.
+- Aggregate queries with materialization such as `GROUP BY` or
+  `COUNT DISTINCT` are not supported by the MOT JIT path.
+- Evaluation uses full TPC-C and basic SQL operations with data and
+  indexes fitting in memory for both MOT and the disk-based baseline.
+  The paper attributes MOT's scale-up to lock-free indexes, OCC, and
+  invisible readers, while noting logging wait on x86 above roughly 250
+  connections and better behavior on the ARM server with higher SSD
+  bandwidth.
+
+**GPU DB mapping:** MOT is a strong reminder that the first GPU DB
+transaction/runtime win should preserve a boring, explicit correctness
+envelope. If retained GPU routes are a second storage/execution engine
+inside a PostgreSQL-compatible database, they need planner visibility,
+WAL/replay alignment, checkpoint generation alignment, DDL cleanup,
+snapshot retirement, and mixed CPU/GPU route behavior before raw kernel
+speed matters.
+
+The sentinel pattern maps well to GPU DB's resident index and route
+metadata. A write path can publish placeholders or invalidation markers
+early, keep private row/version payloads on the mutation-owner side, and
+link rebuilt GPU-resident key vectors or visibility summaries only after
+WAL and validation succeed. The benchmark should distinguish "index entry
+reserved" from "resident route visible" just as MOT separates absent
+sentinels from committed row links.
+
+MOT's ordered access set suggests a route-local transaction record for
+GPU DB writes: track every row/key/sentinel touched by a transaction in
+one ordered structure with states such as read, write, insert, delete,
+resident-invalidated, and resident-link-pending. That structure can feed
+deadlock-free publication locks, WAL record construction, invalidation
+messages, and read-your-own-write behavior.
+
+The JIT result also matters for retained reads. Once the GPU or resident
+index path makes data access cheap, the SQL executor, protocol framing,
+and route dispatch can become the bottleneck. Prepared same-shape routes
+should therefore have cached route plans, reusable row descriptions, and
+possibly generated CPU/GPU dispatch stubs, but only for narrow query
+families where the route choice is stable.
+
+**Risks and mismatches:** MOT is CPU main-memory OLTP, not GPU execution,
+MVCC retained snapshots, over-resident analytics, or NVMe/CXL/GPU memory
+tiering. Its single-version OCC choice avoids MVCC GC but does not
+directly solve long retained analytical snapshots, snapshot isolation
+across resident generations, or serializable read-only transactions.
+
+The paper reports strong TPC-C results but does not claim official TPC-C
+compliance with scaling rules, and the standalone microbenchmark removes
+networking and durability. Its default read-committed behavior also means
+GPU DB cannot copy the design wholesale for repeatable-read or
+serializable retained routes.
+
+High contention remains a known OCC problem: MOT keeps a speedup at high
+TPC-C contention, but aborted work grows. GPU DB's admission layer should
+not send hot write conflicts through large GPU or retained-route batches
+without a priority, reservation, or fallback policy.
+
+**Benchmark candidates:**
+
+- Prototype a route transaction access set with ordered entries for CPU
+  row versions, resident key/vector placeholders, invalidation markers,
+  and pending GPU metadata links. Gate: read-your-own-writes and duplicate
+  insert detection work across primary and secondary route keys.
+- Test sentinel-style resident index publication: reserve route metadata
+  during mutation, WAL flush before linking resident summaries, then
+  publish a new resident generation. Failure condition: any reader can
+  observe a reserved-but-uncommitted resident route.
+- Compare separate read/write/insert sets with a unified ordered access
+  set for write publication. Metrics: commit p50/p99, lock wait,
+  allocation count, abort cleanup cost, and invalidation latency.
+- Add an OCC hot-key admission benchmark using TPC-C-like contention.
+  Measure abort rate, useful work per commit, GPU queue pollution, and
+  fallback behavior as concurrent writers per hot key rises.
+- Build a prepared same-shape retained-read dispatch benchmark: generic
+  SQL executor path versus cached route plan plus reusable response
+  metadata. Gate: identical pgwire-visible results and invalidation on DDL
+  or schema generation changes.
+- Add asynchronous checkpoint alignment tests where CPU truth,
+  WAL/checkpoint LSN, resident snapshot generation, and rebuildable GPU
+  metadata are advanced independently. Proof gate: recovery replays CPU
+  truth and rebuilds resident metadata without trusting pre-crash GPU
+  state.
+- Stress DROP/TRUNCATE/VACUUM-like lifecycle events while readers hold
+  old retained snapshots and invalidation buffers await reclamation. Win
+  condition: no use-after-free of resident buffers, sentinel metadata, or
+  pending response buffers.
