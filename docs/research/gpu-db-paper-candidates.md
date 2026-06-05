@@ -2325,12 +2325,26 @@ Append new candidates here as each paper is processed.
   Why: Linux CXL transparent page placement baseline compared by NOMAD;
   useful for deciding where OS-managed promotion/demotion is enough and where
   GPU DB needs explicit DBMS placement handles.
-- `queued` — **TAOBench: An End-to-End Benchmark for Social Network
+- `reviewed` — **TAOBench: An End-to-End Benchmark for Social Network
   Workloads**, Cheng et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1965-cheng.pdf`
   Why: DeToX's most important real-world workload source; useful for a
   session-heavy transactional cache/residency benchmark with correlated
   point reads, read transactions, writes, skew, and contaminated hot keys.
+- `queued` — **FlightTracker: Consistency across Read-Optimized Online Stores
+  at Facebook**, Shi et al., OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/shi`
+  PDF: `https://www.usenix.org/system/files/osdi20-shi.pdf`
+  Why: TAOBench's TAO context depends on read-optimized caches and consistency
+  tokens; useful for comparing retained GPU snapshot freshness, read-your-writes
+  guarantees, and route-local consistency tickets under high fan-out reads.
+- `queued` — **RAMP-TAO: Layering Atomic Transactions on Facebook's Online TAO
+  Data Store**, Cheng et al., PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p3014-cheng.pdf`
+  Why: TAOBench discusses TAO's read-only and write-only transactional needs;
+  RAMP-TAO is the natural follow-up for cache-friendly read transactions,
+  fractured-read avoidance, and opt-in transactional metadata for read-dominant
+  social graph workloads.
 - `queued` — **ChronoCache: Predictive and Adaptive Mid-Tier Query Result
   Caching**, Glasbergen et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3380593`

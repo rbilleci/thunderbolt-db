@@ -58984,3 +58984,139 @@ launch shape, fallback reason, estimated latency, observed latency, and
 correctness proof gate. The useful milestone is not just higher throughput; it
 is proving that route choices remain explainable when contention, tier
 pressure, and workload drift change at the same time.
+
+### 2026-06-05 - TAOBench turns session scale into correlated request pressure
+
+**Citation:** Audrey Cheng, Xiao Shi, Aaron Kabcenell, Shilpa Lawande,
+Hamza Qadeer, Jason Chan, Harrison Tin, Ryan Zhao, Peter Bailis, Mahesh
+Balakrishnan, Nathan Bronson, Natacha Crooks, and Ion Stoica. "TAOBench:
+An End-to-End Benchmark for Social Network Workloads." PVLDB 15(9):
+1965-1977, 2022. doi:10.14778/3538598.3538616. Retrieved 2026-06-05
+from `https://www.vldb.org/pvldb/vol15/p1965-cheng.pdf`.
+Artifact: `https://github.com/audreyccheng/taobench`.
+
+**Category:** Runtime / HFT / session scale and benchmark design.
+
+**Relevance tags:** social graph workloads; high fan-out requests; skew;
+correlated reads; read-heavy transactions; write-only transactions; shard
+colocation; multi-tenant shared data; cache pressure; contention; benchmark
+generation.
+
+**Core idea:** TAOBench is not a new database mechanism; it is a benchmark
+designed to preserve the workload properties that make large social graph
+stores difficult. The paper argues that common OLTP and graph benchmarks miss
+important production behavior: extreme read dominance, skew, high correlation
+between keys requested together, explicit shard colocation preferences,
+transactional write/read APIs, and multi-tenant behavior over shared data.
+
+The source workload is Meta's TAO graph store, which the paper describes as
+serving more than ten billion reads and tens of millions of writes per second
+over many petabytes. TAOBench captures enough of that shape to downscale it:
+operation mix, transaction size, key-to-shard mapping, access distributions,
+hotspot and colocation patterns, and product-group tenancy. One important
+observation for GPU DB is that read and write heat are often not the same:
+the paper reports that more than 99% of frequently written items are read
+less than once per day on average, while high-frequency read requests are
+strongly clustered and can still contaminate shared caches and shards.
+
+**Concrete mechanisms:**
+
+- TAO exposes a simple graph data model: objects are nodes, associations are
+  edges keyed by `(id1, type, id2)`, and the API includes point gets, ranges,
+  counts, inserts, updates, deletes, and failure-atomic multi-put writes.
+- The production TAO stack is tiered: a client-side cache, graph-aware TAO
+  cache layer, and statically sharded MySQL storage layer. Applications can
+  express colocation preferences, so shard placement is part of workload
+  semantics rather than only a physical afterthought.
+- TAO supports read-your-writes consistency, one-shot write-only transactions
+  with failure atomicity, and prototype read-only transactions. Write
+  transactions use two-phase locking and two-phase commit; write preconditions
+  provide compare-and-swap-style semantics.
+- The benchmark classifies operations into reads, writes, and write
+  transactions. Reads include point, range, and count requests; writes include
+  single-key mutations; write transactions cover multi-key mutation groups.
+- Trace sampling is by object id or association key so all requests to sampled
+  items are captured. This is specifically meant to preserve conflicts and
+  correlations instead of sampling isolated requests independently.
+- TAOBench models workloads with distributions rather than a small fixed menu
+  of query templates. Parameters include operation frequencies, transaction
+  sizes, read/write set characteristics, key-to-shard mapping, tenant/product
+  group, and colocation constraints.
+- The paper defines multiple workloads, including an application workload with
+  heavier write transactions and an overall read-heavy workload. It also uses
+  benchmark variants to stress new transaction use cases, longer lock hold
+  times, new APIs, and high fan-out transactions.
+- High fan-out transactions are explicitly called out as a tail-latency and
+  contention risk: increasing transaction fan-out raises latency, tail latency,
+  and contention errors.
+- The evaluation runs TAOBench against Cloud Spanner, CockroachDB, PlanetScale,
+  TiDB, and YugabyteDB to demonstrate that the benchmark exposes different
+  tradeoffs rather than to crown one system.
+
+**GPU DB mapping:** TAOBench gives GPU DB a better target than isolated
+TPC-C/YCSB microbenchmarks for the 1M logical session goal. A useful retained
+read benchmark should not be "many clients repeatedly issue the same point
+lookup." It should generate correlated bursts where a web request fans out
+into many graph-shaped point/range/count reads, several tenants touch shared
+hot data, and a small number of write transactions or CAS-style preconditions
+invalidate only some resident generations.
+
+The key transfer is workload shape. GPU DB's session runtime should measure
+logical sessions, active requests, per-request fan-out, response-ring bytes,
+owner-ring pressure, retained snapshot hits, and cache contamination
+separately. One user-visible request may become hundreds of internal retained
+reads; the admission system must budget the fan-out, not just the connection.
+That maps directly to the runtime document's network IO workers, bounded
+command rings, response rings, and micro-batched same-shape lookups.
+
+TAOBench also challenges simple hot-data placement. If write-hot keys are
+mostly not read-hot, then a GPU resident cache should not promote or keep data
+resident merely because it receives writes. Write-heavy objects may belong in
+CPU owner lanes with compact visibility metadata, while read-hot association
+ranges or count summaries deserve GPU/HBM residency. Colocation hints should
+feed partition owner and resident segment placement so correlated fan-out reads
+hit the same snapshot generation and can be batched.
+
+The transactional API shape maps to conservative route templates. Failure-
+atomic write-only transactions and CAS-style preconditions are plausible early
+templates for GPU DB owner admission: known write sets, no arbitrary
+interactive SQL between reads and writes, explicit precondition checks, and a
+deterministic visibility boundary. Read-only transactions over many correlated
+keys are plausible retained snapshot templates, but they need freshness and
+read-your-writes certificates before they bypass the mutation owner.
+
+**Risks and mismatches:** TAOBench models a graph/key-value API, not SQL. TAO's
+transactional support is narrower than general interactive SQL transactions,
+and its consistency model is not a drop-in replacement for PostgreSQL-style
+MVCC isolation. The benchmark is designed for distributed databases and
+application graph workloads, not GPU kernels, P8 column groups, WAL replay, or
+SQL operator coverage.
+
+The paper's production scale numbers describe TAO, not the benchmark harness
+or this engine. Its published evaluation emphasizes distributed SQL systems,
+so direct latency/throughput comparisons do not transfer to a single-node GPU
+DB. The useful part is the request generator and workload shape: correlation,
+fan-out, shard colocation, tenancy, transaction mix, and cache pressure.
+
+**Benchmark candidates:**
+
+- Build a TAOBench-inspired pgwire workload mode where one logical request
+  expands into many point/range/count reads over association-like tables.
+  Measure logical sessions, active requests, internal fan-out, response bytes,
+  owner-ring depth, retained snapshot hit rate, and p99 latency.
+- Add correlated-key micro-batching: group same-shape association lookups by
+  snapshot generation, relation/partition, and tenant/product group. Gate:
+  identical SQL-visible results and stable per-request response ordering.
+- Separate read-hot and write-hot placement. Generate keys where write heat and
+  read heat diverge, then compare HBM admission by read frequency, write
+  frequency, combined frequency, and colocation-aware correlated fan-out.
+- Add CAS/write-only transaction templates with declared write sets and
+  preconditions. Compare owner-serialized execution with batched validation
+  under high fan-out and skew. Failure condition: better throughput with
+  hidden stale resident reads or weaker WAL-before-visibility.
+- Stress cache contamination: one tenant issues correlated read bursts over
+  shared data while another tenant writes or scans adjacent keys. Measure
+  resident eviction, invalidation, refresh cost, and tenant-level p99.
+- Use high fan-out transactions as an admission test. The route must either
+  reserve enough owner/GPU/response budget up front or reject/fallback before
+  partial fan-out fills bounded queues.
