@@ -55217,3 +55217,150 @@ under pressure: mixed Calvin/OCC replay, tenant-local learned-route
 poisoning, slow-tier noisy neighbors, and generated isolation histories.
 The proof gates should require explainable fallback or rejection, not
 just higher average throughput.
+
+### 2026-06-05 - HPCC uses precise in-flight telemetry instead of queue-depth guessing
+
+**Citation:** Yuliang Li, Rui Miao, Hongqiang Harry Liu, Yan Zhuang,
+Fei Feng, Lingbo Tang, Zheng Cao, Ming Zhang, Frank Kelly, Mohammad
+Alizadeh, and Minlan Yu. "HPCC: High Precision Congestion Control."
+SIGCOMM 2019, pp. 44-58. doi:10.1145/3341302.3342085. Retrieved
+2026-06-05 from the author PDF,
+`https://liyuliang001.github.io/publications/hpcc.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** high-concurrency networking; admission control;
+in-band telemetry; queue-delay control; bounded in-flight work;
+response-ring pacing; RDMA; programmable switches; million-session
+runtime.
+
+**Core idea:** HPCC argues that high-speed datacenter transports cannot
+simultaneously keep latency low, bandwidth high, and networks stable if
+senders infer congestion only from delayed coarse signals such as ECN or
+RTT. Instead, each packet carries in-network telemetry from switches:
+queue length, transmitted bytes, timestamp, and link capacity. The sender
+uses that per-link information to estimate normalized in-flight bytes and
+adjust its sending window toward a link-load target just below capacity.
+
+The transferable idea for GPU DB is not "use RDMA INT now." It is that
+coarse queue depth is a late and lossy admission signal. A high-session
+runtime should expose precise service telemetry at each bounded boundary
+and pace work by in-flight bytes or budgeted work units, not only by
+whether a queue is currently full.
+
+**Concrete mechanisms:**
+
+- Switches attach INT metadata to packets along the path. The receiver
+  copies the metadata into ACKs so the sender can observe every link on
+  the flow path without switch-side rate computation.
+- A sender estimates each link's in-flight bytes as queue length plus
+  output rate times base RTT. Output rate comes from transmitted-byte and
+  timestamp deltas between telemetry samples.
+- The normalized load signal combines queue occupancy and pipeline
+  occupancy, then the sender reacts to the most congested link on the
+  path.
+- HPCC controls a sending window rather than only a rate. That limits
+  outstanding bytes even when congestion feedback is delayed by queued
+  packets.
+- Packet pacing is derived from the current window and base RTT, reducing
+  burstiness while preserving line-rate starts when the network is idle.
+- The control law separates efficiency from fairness: multiplicative
+  adjustment moves quickly toward the desired load, while a small additive
+  increase term nudges long-flow fairness.
+- To avoid overreacting to several ACKs that describe the same queued
+  packets, HPCC uses a reference window updated on an RTT-like boundary
+  while still processing per-ACK telemetry for fast reaction.
+- The prototype implements the scheme on commodity programmable NIC and
+  switch hardware. The paper reports that the HPCC module is modest in
+  FPGA resource use, but the prototype supports only a limited number of
+  concurrent flows per 25GbE interface; the authors expect higher ASIC
+  flow counts.
+- Evaluation uses a 32-server testbed and 320-server simulations with
+  WebSearch and FB_Hadoop traffic. Reported results include near-zero
+  median queues, much smaller tail queues than DCQCN, up to 95% lower
+  short-flow completion-time slowdown in selected testbed cases, and no
+  PFC pauses in the evaluated incast simulations.
+- HPCC deliberately trades some long-flow throughput headroom for short
+  flow latency and stability. In one simulation discussion, long flows are
+  slower because HPCC targets 95% link utilization and pays INT header
+  overhead.
+
+**GPU DB mapping:** The runtime in
+`11-high-throughput-query-runtime.md` already names bounded command and
+response rings. HPCC suggests the next step: each ring should publish a
+precise "in-flight work" signal, not just depth. For GPU DB that signal
+could be bytes, decoded rows, pinned-buffer bytes, response bytes, WAL
+bytes, GPU scratch bytes, or route-specific service quanta. Admission can
+then cap outstanding work before queues become latency reservoirs.
+
+The in-band telemetry pattern maps to route certificates and response
+metadata. A request entering a network IO worker, mutation owner,
+residency owner, GPU execution owner, and response ring should accumulate
+compact boundary observations: queue wait, service time, bytes admitted,
+bytes retired, budget class, and saturation state. A later scheduler or
+route model should reason over those observations rather than a single
+end-to-end latency sample.
+
+HPCC's combined per-ACK/per-RTT reaction is a useful analogy for
+micro-batching. GPU DB wants fast reaction to urgent saturation, but not
+oscillation from every completion event in the same batch. A practical
+policy could update a reference admission window per route class at
+micro-batch or time-slice boundaries while still reading every completion
+for emergency backpressure.
+
+The tradeoff is also relevant. Leaving headroom can protect p99 retained
+reads, response writes, or mutation-owner latency, but it may reduce bulk
+COPY, scan, or refresh throughput. The engine should make that an explicit
+route policy: low-latency classes get headroom and bounded in-flight
+credits; background refresh and bulk ingest can use leftover capacity.
+
+**Risks and mismatches:** HPCC is a network congestion-control paper, not
+a database runtime paper. It assumes INT-capable switches, RDMA-style
+hardware offload, and a small enough per-NIC flow-scheduling state space;
+ordinary pgwire over kernel TCP will not expose the same telemetry or
+control points.
+
+The paper's flow count discussion is far below a 1M logical-session
+target. GPU DB should not allocate heavy transport-like state per idle
+session. The transferable unit is the active admitted request, response,
+or route class, not every logical connection.
+
+HPCC's base-RTT model has no direct equivalent inside a database engine
+where service times vary by route shape, row count, GPU queue state, WAL
+flush, and tier placement. Any GPU DB adaptation needs route-local
+service-time estimates and conservative fallback when telemetry is stale.
+
+The reported throughput and latency numbers come from network testbeds
+and simulations. They support the control-shape argument, not a direct SQL
+throughput prediction.
+
+**Benchmark candidates:**
+
+- Add a bounded-in-flight admission prototype for one retained-read route:
+  cap outstanding response bytes, GPU staging bytes, and request count.
+  Compare against queue-depth-only admission under many idle sessions and
+  a small active hot set. Gate: lower p99 without correctness or throughput
+  collapse at low load.
+- Instrument each runtime boundary with HPCC-like telemetry:
+  `admitted_work`, `retired_work`, `queue_wait_us`, `service_us`,
+  `budget_bytes`, `inflight_bytes`, and `headroom_policy`. Proof gate:
+  route certificates can explain why a request was admitted, delayed,
+  rejected, or CPU-fallbacked.
+- Test reference-window pacing for micro-batches. Update per-route
+  admission windows at fixed microsecond or batch-drain boundaries while
+  still allowing emergency reductions on hard saturation. Failure
+  condition: per-completion updates oscillate batch size or response
+  latency under bursty point reads.
+- Compare headroom policies by route class: retained point reads,
+  mutations, COPY, refresh, over-resident scans, and response writes.
+  Expected result: latency-sensitive classes benefit from reserved
+  headroom; bulk classes should consume slack without stealing it.
+- Build an active-session versus logical-session test. Keep a large number
+  of logical sessions idle, then admit only a bounded active subset with
+  per-class credits. Required metrics: idle bytes/session, active
+  credits/session, p99 queue wait, response-ring occupancy, and rejection
+  reason counts.
+- For future RDMA or kernel-bypass transport work, compare precise
+  telemetry against simpler fixed-window bounded inflight admission. The
+  question is whether HPCC-style precision is needed, or whether GPU DB's
+  internal owner-ring telemetry already captures enough pressure.

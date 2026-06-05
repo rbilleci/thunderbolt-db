@@ -1697,12 +1697,19 @@ Append new candidates here as each paper is processed.
   Why: PowerTCP contrasts against delay-based congestion control; useful for
   deciding when absolute delay, rather than only delay gradient or queue depth,
   should drive GPU DB IO-worker, response-ring, and route-class pacing.
-- `queued` — **HPCC: High Precision Congestion Control**, Li et al.,
+- `reviewed` — **HPCC: High Precision Congestion Control**, Li et al.,
   SIGCOMM 2019.
   URL: `https://doi.org/10.1145/3341302.3342085`
   Why: PowerTCP builds on HPCC-style in-band network telemetry; relevant to
   whether GPU DB should export precise per-boundary service telemetry to
   schedulers instead of relying on coarse queue depths.
+- `queued` — **Revisiting Network Support for RDMA**, Mittal et al.,
+  SIGCOMM 2018.
+  URL: `https://doi.org/10.1145/3230543.3230557`
+  Why: HPCC evaluates IRN-style loss recovery and fixed-window inflight
+  limiting as an orthogonal flow-control path; useful for comparing precise
+  congestion feedback against simpler bounded-inflight request admission for
+  future high-concurrency GPU DB transports.
 - `queued` — **ghOSt: Fast & Flexible User-Space Delegation of Linux
   Scheduling**, Narayanan et al., SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483542`
