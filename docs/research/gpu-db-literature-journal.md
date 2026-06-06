@@ -38,6 +38,183 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Multiverse versions only when long readers prove they need it
+
+**Citation:** Gaetano Coccimiglio, Trevor Brown, and Srivatsan
+Ravi. "Multiverse: Transactional Memory with Dynamic
+Multiversioning." arXiv:2601.09735v4, 2026. Retrieved
+2026-06-06 from `https://arxiv.org/abs/2601.09735` and PDF
+`https://arxiv.org/pdf/2601.09735`.
+
+**Category:** MVCC / snapshot / visibility, with runtime /
+concurrent metadata and memory-reclamation relevance.
+
+**Relevance tags:** dynamic multiversioning; long read-only
+transactions; opacity; versioned and unversioned modes; per-address
+version lists; bloom-filter version probes; version reclamation;
+epoch-based reclamation; mode switching; retained snapshots; common
+case write overhead.
+
+**Core idea:** Multiverse is a software transactional memory system
+that tries to combine the common-case speed of unversioned optimistic
+transactions with the ability to run long read-only transactions over
+frequently updated addresses. It starts with unversioned execution and
+adds multiversioning dynamically only where abort behavior indicates
+that long readers need it.
+
+The useful GPU DB lesson is that snapshot support does not need to tax
+every hot write or every route metadata access equally. Short
+mutation-owner operations, catalog lookups, and retained-route probes
+can stay on compact unversioned cells until long readers, refresh
+scans, or metadata traversals show enough conflict to justify
+versioned state.
+
+**Concrete mechanisms:**
+
+- Multiverse distinguishes unversioned transactions from versioned
+  read-only transactions. Transactions begin unversioned; read-only
+  transactions may switch to the versioned path after aborts or mode
+  heuristics. Writing transactions remain unversioned, but may create
+  or update version lists depending on the global mode.
+- Versioning is at word/address granularity. The system keeps user data
+  layout unchanged by storing locks, bloom filters, and version-list
+  table buckets in separate parallel tables.
+- Each versioned address has a version list. A version-list-table node
+  records the address, the head of its version list, and the next node
+  in the bucket. Version nodes carry timestamp, data, older-node link,
+  and a to-be-determined marker while an updating transaction has not
+  committed.
+- A bloom-filter table avoids most version-list-table traversals. If an
+  address is not in the corresponding bloom filter, it is treated as
+  unversioned without bucket traversal. False positives cost extra
+  lookup work but do not affect correctness.
+- In Mode Q, versioned read transactions are responsible for
+  versioning addresses they encounter. Unversioned writers are mostly
+  oblivious unless they write an already-versioned address. This favors
+  the common short-write/short-read case.
+- In Mode U, unversioned writing transactions are forced to version
+  addresses they update, while versioned read transactions can behave
+  as if relevant addresses are already versioned. This favors
+  long-running readers under frequent updates.
+- Transient Mode QtoU and Mode UtoQ states prevent unsafe overlap
+  between old local transaction modes and new global invariants. The
+  background thread waits for worker announcements before advancing
+  modes.
+- Versioned reads traverse the version list until they find a version
+  with timestamp no newer than the transaction read clock, waiting on
+  TBD markers when necessary. If no suitable version exists, the
+  transaction aborts.
+- Unversioning happens only in Mode Q. The background thread unversions
+  whole version-list buckets when their newest version is old enough
+  relative to the global clock and observed commit timestamp deltas.
+  Whole-bucket unversioning lets it reset bloom-filter state and bound
+  bucket traversal cost.
+- Memory management uses epoch-based reclamation tied to transaction
+  commit/abort. Retires from aborted update transactions are revoked
+  where needed; versions created by aborted transactions are retired.
+- Correctness target is opacity, not only snapshot isolation. The paper
+  argues all committed and aborted transactions observe consistent
+  state; it guarantees weak progressiveness, not strong
+  progressiveness.
+- Evaluation uses a C++ implementation on a single AMD EPYC 7662 with
+  64 cores and 128 hardware threads, comparing against TL2, DCTL,
+  NOrec, and TinySTM. Main experiments use an `(a,b)` tree with point
+  searches, inserts, deletes, rare range queries, and optional
+  dedicated updater threads.
+- Reported results show Multiverse matching or beating unversioned STM
+  baselines when there are no range queries, while significantly
+  outperforming them when long range queries run concurrently with
+  dedicated updaters. The paper reports several-order-of-magnitude wins
+  in some long-reader/update cases and up to 50x better throughput per
+  joule than the next best STM in one reported range-query workload.
+
+**GPU DB mapping:** GPU DB can use Multiverse as a model for adaptive
+snapshot cost placement. Route metadata, resident index descriptors,
+catalog handles, and visibility summaries should not all carry full
+version chains by default. They can start as compact generationed cells
+with lock/version validation, then promote specific cells, buckets, or
+route families to versioned records when long retained readers or
+refresh scans repeatedly conflict.
+
+Mode Q maps to the default runtime: short writes preserve WAL-before-
+visibility and update compact metadata; long readers that need older
+state create or request versioned metadata lazily. Mode U maps to a
+pressure mode for known long-reader intervals: mutation owners preserve
+old route/catalog/residency metadata proactively until the long-reader
+cohort drains.
+
+Whole-bucket unversioning is a useful analogue for route metadata
+compaction. Instead of reclaiming one descriptor at a time, GPU DB can
+retire versioned metadata buckets, resident index generations, or
+route-cache regions after the oldest active snapshot and durability
+frontier pass them. False-positive probes are acceptable if they only
+cost a slow metadata lookup, never stale visibility.
+
+The to-be-determined marker maps to publication fences. A new metadata
+version, resident snapshot, or index descriptor can exist in a
+construction table but must not be readable as committed until WAL,
+invalidation, and publication checks complete. Readers that encounter
+an in-flight version should wait, retry, or route to fallback rather
+than guessing.
+
+The paper's benchmark design is also transferable: long retained reads
+must be tested with dedicated updaters that continue to mutate the same
+structure. Otherwise a system that cannot really support long snapshots
+can appear healthy once all workers happen to be stuck on read-only
+work.
+
+**Risks and mismatches:** Multiverse is an STM for in-process
+concurrent data structures, not a SQL DBMS. It does not cover WAL,
+crash recovery, indexes with predicate/range semantics, distributed
+replication, DDL, GPU buffers, or cold-tier placement.
+
+The paper targets opacity, while SQL systems often need a specific mix
+of snapshot isolation, serializable reads, read committed, and
+transactional DDL behavior. GPU DB cannot adopt STM mode changes
+without mapping them to SQL-visible isolation contracts.
+
+Versioning at word/address granularity may be wrong for database rows,
+columns, pages, route descriptors, or GPU resident segments. GPU DB
+should benchmark bucket, segment, and route-family granularity before
+copying the address-level design.
+
+Mode U deliberately increases write overhead to protect long reads.
+That is acceptable only when the scheduler can prove long readers are
+active and valuable; otherwise it may reduce write throughput and
+increase memory pressure.
+
+The mode-switching heuristics are workload-tuned STM heuristics. GPU DB
+should start with deterministic telemetry thresholds such as long-reader
+count, abort/retry count, route invalidation rate, retained snapshot age,
+and versioned-bytes budget before considering learned policies.
+
+**Benchmark candidates:**
+
+- Build an adaptive route-metadata versioning benchmark: compact
+  generationed cells versus dynamically versioned metadata buckets under
+  short reads, long catalog scans, DDL churn, and resident refresh.
+  Gate: no long-reader starvation and less common-case write overhead
+  than always-versioned metadata.
+- Add a Mode Q/Mode U analogue for retained snapshots. In lazy mode,
+  long readers create versioned route records on demand; in proactive
+  mode, mutation owners preserve old metadata while a long-reader cohort
+  is active. Measure write throughput, read aborts, p99 latency, and
+  versioned bytes.
+- Stress TBD publication fences for resident snapshots and metadata
+  descriptors. Delay WAL flush, invalidation, or GPU refresh completion
+  after allocating a new version and assert that readers never observe
+  an uncommitted descriptor.
+- Compare reclamation granularity: per-descriptor retire, per-bucket
+  retire, and per-route-family retire. Failure condition: long readers
+  force unbounded metadata growth or reclamation stalls mutation owners.
+- Create a long-reader benchmark with dedicated updaters, mirroring the
+  paper's evaluation concern. A retained snapshot or metadata scan must
+  complete while updates continue, not only after all workers have
+  stopped mutating.
+- Track false-positive metadata probes from bloom-like or generation
+  summary filters. Gate: false positives add bounded lookup work and
+  never permit stale route execution.
+
 ### 2026-06-06 - Poplar relaxes WAL order to the dependencies recovery actually needs
 
 **Citation:** Huan Zhou, Jinwei Guo, Huiqi Hu, Weining Qian,

@@ -1846,13 +1846,27 @@ Append new candidates here as each paper is processed.
   recorded-once indirection constraint and packages versioned pointers as a C++
   library; useful before choosing GPU DB's retained route metadata and
   resident-index publication primitives. Journal entry added 2026-06-06.
-- `queued` — **Multiverse: Transactional Memory with Dynamic
+- `reviewed` — **Multiverse: Transactional Memory with Dynamic
   Multiversioning**, Coccimiglio, Brown, and Ravi, arXiv/PPoPP 2026.
   URL: `https://arxiv.org/abs/2601.09735`
   Why: discovered while reviewing VERLIB; useful for comparing dynamic
   versioned/unversioned transaction modes with GPU DB's need to keep common
   short writes cheap while still supporting long retained reads and
-  snapshot-heavy metadata scans.
+  snapshot-heavy metadata scans. Journal entry added 2026-06-06 from arXiv
+  v4.
+- `queued` — **TLF: Transactional Lock Fusion**, Blelloch, Kent, and Wei,
+  SPAA 2025.
+  DOI: `https://doi.org/10.1145/3694906.3743341`
+  Why: Multiverse cites TLF as the multiversion STM line built on Verlib;
+  useful for comparing fused transactional locking and versioned-pointer
+  metadata before GPU DB chooses publication primitives for retained route
+  metadata.
+- `queued` — **Scaling Up Transactions with Slower Clocks**, Ramalhete and
+  Correia, PPoPP 2024.
+  DOI: `https://doi.org/10.1145/3627535.3638477`
+  Why: Multiverse uses DCTL as its fast unversioned STM baseline; useful for
+  contrasting global-clock reduction, encounter-time locking, and starvation
+  fallback with GPU DB's compact unversioned route metadata cells.
 - `reviewed` — **VBR: Version Based Reclamation**, Sheffi et al., arXiv 2021.
   URL: `https://arxiv.org/abs/2107.13843`
   Why: optimistic memory reclamation scheme related to EBR/hazard-pointer
