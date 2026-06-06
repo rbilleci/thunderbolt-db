@@ -5414,12 +5414,12 @@ Append new candidates here as each paper is processed.
   Why: Robust query-driven cardinality estimation contrasts against retraining
   and drift-adaptation systems; useful for deciding when GPU DB route models
   should retrain, adapt online, or fall back to anchored DBMS statistics.
-- `queued` — **ALECE: An Attention-based Learned Cardinality Estimator for SPJ
+- `reviewed` — **ALECE: An Attention-based Learned Cardinality Estimator for SPJ
   Queries on Dynamic Workloads**, Li et al., PVLDB 2023.
   URL: `https://arxiv.org/abs/2310.05349`
   Why: modern learned cardinality estimator for dynamic workloads; useful for
   comparing data-update-aware route estimates against simpler DBMS-statistics
-  correction and explicit route telemetry.
+  correction and explicit route telemetry. Journal entry added 2026-06-06.
 - `reviewed` — **CardOOD: Robust Query-driven Cardinality Estimation under
   Out-of-Distribution Workloads**, Li, Zhao, Yu, and Wang, arXiv 2024 /
   VLDB Journal 2026.
@@ -5483,6 +5483,21 @@ Append new candidates here as each paper is processed.
   retained route family already includes aggregates and distinct projections;
   this is a targeted follow-up for group-cardinality estimates in route
   selection.
+- `queued` — **Flow-Loss: Learning Cardinality Estimates That Matter**,
+  Negi et al., PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p2019-negi.pdf`
+  DOI: `https://doi.org/10.14778/3476249.3476259`
+  Why: ALECE optimizes q-error and end-to-end query plans, while Flow-Loss
+  trains estimators against plan-impact-sensitive loss; useful for deciding
+  whether GPU DB route estimators should optimize route regret and overload
+  risk instead of raw cardinality error.
+- `queued` — **A Unified Transferable Model for ML-Enhanced DBMS**, Wu et al.,
+  CIDR 2022.
+  URL: `https://www.cidrdb.org/cidr2022/papers/p20-wu.pdf`
+  Why: ALECE is schema/workload trained, while transferable DBMS models ask
+  how learned components move across databases and tasks; useful before GPU DB
+  depends on per-tenant route models that may need cold-start or migration
+  behavior.
 - `reviewed` — **Updateable Data-Driven Cardinality Estimator with Bounded
   Q-error**, Li et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2408.17209`

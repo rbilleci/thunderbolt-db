@@ -88266,3 +88266,197 @@ semantic oracles.
 - Track each regression by violated semantic, not just by SQL text. Required
   metadata: isolation level, route family, snapshot generation, schema
   generation, resident generation, WAL boundary, and expected oracle class.
+
+### 2026-06-06 - ALECE makes dynamic cardinality a query-data attention problem
+
+**Citation:** Pengfei Li, Wenqing Wei, Rong Zhu, Bolin Ding, Jingren Zhou,
+and Hua Lu. "ALECE: An Attention-based Learned Cardinality Estimator for SPJ
+Queries on Dynamic Workloads." PVLDB 17(2):197-210, 2023.
+DOI: `10.14778/3626292.3626302`. Retrieved 2026-06-06 from arXiv
+`https://arxiv.org/abs/2310.05349`; PDF:
+`https://arxiv.org/pdf/2310.05349`.
+
+**Category:** query optimization / planning, with secondary relevance to
+multi-tier route choice, dynamic workload telemetry, and mixed read/write
+admission.
+
+**Relevance tags:** learned cardinality estimation; dynamic workloads;
+attention; SPJ queries; histograms; route costing; PostgreSQL optimizer;
+query-data featurization; plan quality; model maintenance; drift.
+
+**Core idea:** ALECE treats cardinality estimation for changing databases as a
+joint query-and-data representation problem. It keeps updateable per-attribute
+histogram vectors as "DB states", encodes relationships among those states
+with self-attention, and then uses query-to-data cross attention to decide
+which data summaries matter for a given select-project-join query.
+
+For GPU DB, the transferable idea is not "put a neural estimator on every
+route." It is that route costing should consume both static query shape and
+current placement/visibility state. A retained GPU route is only attractive
+when its predicate family, join shape, resident generation, cache pressure,
+and expected output size all line up. ALECE gives a concrete model shape for
+combining query features with live, updateable state summaries, while keeping
+the DBMS optimizer as the authority that chooses a plan.
+
+**Concrete mechanisms:**
+
+- ALECE targets SPJ cardinality estimation over dynamic workloads containing
+  queries plus inserts, deletes, and updates. The paper assumes a static schema;
+  dynamic schema support is explicitly left for future work.
+- Data featurization stores a fixed-size histogram vector for every attribute.
+  Categorical attributes are first mapped to consecutive integers; numerical
+  and converted categorical domains are binned into `dx` histogram slots. In
+  the main experiments, `dx = 40`.
+- The DB-state update path is intentionally simple: an insert/delete/update
+  modifies only the histograms for the affected relation's attributes, with
+  update cost proportional to the number of changed records. Query
+  featurization cost is proportional to the number of join and filter
+  predicates.
+- Query featurization has separate join and filter components. Join predicates
+  are canonicalized through equivalence classes before vectorization so
+  equivalent predicate sets map to the same representation. Filter predicates
+  become hyper-rectangle lower/upper bounds over normalized attribute domains.
+- The data-encoder module applies stacked multi-head self-attention over the
+  DB-state vectors. Its purpose is to learn correlations among attribute
+  summaries, approximating useful joint-distribution information without
+  materializing every joint distribution.
+- The query-analyzer module applies stacked cross-attention: keys and values
+  come from the data-encoder output, while the query comes from the SQL query
+  featurization. The resulting answer vector is fed to a linear regression
+  layer to estimate cardinality.
+- Training samples are triples of query featurization, current DB states, and
+  true cardinality collected from historical queries on a dynamic database.
+  Labels are log cardinalities, and the loss weights larger-cardinality queries
+  more heavily because their plan mistakes often matter more to runtime.
+- The evaluation integrates external estimates into PostgreSQL's optimizer and
+  compares end-to-end query time, q-error, p-error, build time, model size, and
+  inference latency on STATS, Job-light, and TPC-H-derived dynamic workloads.
+- The paper reports that ALECE's models are under 23 MB on the tested datasets,
+  train from scratch in under 12 minutes, and have estimation latency below
+  11 ms. In the dynamic-workload experiments, ALECE's end-to-end query time is
+  close to the optimizer fed with true cardinalities, and the paper reports up
+  to 2.7x improvement over benchmark alternatives.
+- The evaluation workloads include insert-heavy, update-heavy, and
+  distribution-shift cases. Testing queries execute after at least 20% data
+  change relative to the estimator build point.
+
+**GPU DB mapping:** The first mapping is a route estimator that treats
+resident placement as part of the data state. Instead of feeding only table
+statistics to a model, GPU DB can maintain compact route-state vectors:
+resident row counts, per-column min/max or histograms, invalidation age,
+visibility generation, compressed-byte estimates, HBM/DRAM/NVMe placement,
+GPU queue depth, pinned-buffer pressure, and recent fallback outcomes. The
+query vector would encode predicate family, selected columns, join shape,
+aggregate shape, expected result shape, and isolation/read-snapshot needs.
+
+The second mapping is a guardrail: learned estimates should calibrate and rank
+routes, not bypass deterministic route validity. ALECE integrates with
+PostgreSQL by replacing cardinality estimates while leaving the optimizer in
+charge. GPU DB should keep the same contract. A model may estimate that a GPU
+resident scan or key-vector lookup is cheap, but route eligibility still needs
+hard checks for schema generation, resident generation, visibility boundary,
+predicate support, and memory budget.
+
+The updateable histogram design maps to low-cost telemetry maintenance. A
+mutation owner can update small CPU-side summaries at WAL-visibility
+publication time, while the residency owner updates placement summaries at
+refresh/evict/invalidate boundaries. That creates a dynamic route-state stream
+without making the GPU hot path ask the owner for every read.
+
+The attention split is useful for mixed route choices. Self-attention over
+state vectors can learn relationships such as "column A selectivity plus
+column B placement predicts transfer size" or "resident-generation age plus
+mutation rate predicts fallback risk." Cross-attention can then make the
+estimate query-specific instead of treating all cached tables or predicates as
+equally relevant.
+
+ALECE's latency numbers also shape the deployment boundary. A roughly
+millisecond-scale learned estimator is too expensive for every point lookup in
+a hot 1M-session path. It is more plausible for plan compilation, route-family
+calibration, batch admission, or periodic policy refresh. Ultra-hot retained
+lookup routes still need precomputed, deterministic, constant-time guards.
+
+**Risks and mismatches:** ALECE assumes a static schema and leaves dynamic
+schema support for future work. GPU DB route planning must handle catalog
+generation changes, DDL invalidation, and resident-fragment rebuilds, so the
+model cannot be the only source of truth for schema-aware route validity.
+
+The paper focuses on cardinality estimation for SPJ queries, not GPU execution,
+MVCC visibility, WAL ordering, queue saturation, or tier placement. Its
+histogram states do not directly encode snapshot age, resident cache validity,
+device memory pressure, or GPU kernel contention.
+
+The tested inference latency is acceptable for optimizer calls in the paper's
+setting, but not automatically acceptable for per-request routing under tight
+tail-latency goals. GPU DB should benchmark model invocation against cached
+estimate tables, sketch-based estimates, and deterministic heuristics.
+
+The dynamic-workload generator changes data distributions and mixes DML with
+queries, but it is still an estimator benchmark, not a full transactional
+correctness or high-concurrency session benchmark. It should inform route
+costing, not validate MVCC correctness.
+
+**Benchmark candidates:**
+
+- Build a route-state estimator harness with deterministic validity gates plus
+  pluggable learned/cardinality estimates. Required features: query shape,
+  predicate family, resident generation, row-count histogram, HBM bytes, queue
+  depth, invalidation age, and fallback reason counters.
+- Compare three route-costing baselines for retained reads: PostgreSQL-style
+  static stats, updateable histogram/sketch telemetry, and an ALECE-style
+  query-state model. Measure route-regret, latency error, p99 fallback rate,
+  and overload decisions rather than q-error alone.
+- Add a dynamic workload replay where inserts/updates/deletes change both data
+  distribution and resident-cache validity. Gate: estimator updates happen at
+  WAL visibility and residency publication boundaries without adding owner
+  queue contention to read-only routes.
+- Test model invocation placement. Compare per-query inference, plan-cache
+  inference, per-batch inference, and periodic policy refresh. Failure
+  condition: estimator latency dominates p50 retained lookup latency or
+  increases p99 queue wait under high session fan-in.
+- Add a route-validity hard-check audit around any learned route choice.
+  Learned output may rank CPU/GPU/tier alternatives, but a stale schema,
+  stale resident generation, unsupported predicate, or exhausted pinned-buffer
+  budget must force fallback or rejection.
+- Train with plan-impact-sensitive loss, not just cardinality q-error, in a
+  follow-up experiment. Measurement: route regret and HBM/pinned-buffer
+  overflow avoidance under underestimated result sizes.
+
+### 2026-06-06 - Cross-paper synthesis: planning needs live state, but correctness still needs hard gates
+
+The last review batch spans optimizer robustness, queryable metadata,
+version-tree placement, persistent-index logging, transaction bug patterns,
+and dynamic cardinality estimation: SkinnerDB, Big Metadata, CHEX, REWIND,
+TXBug, and ALECE.
+
+The converging track is that GPU DB route decisions should be explainable
+state machines rather than opaque shortcuts. SkinnerDB bounds exploration cost
+when static plan choice is weak. Big Metadata argues that pruning and file
+metadata should be queryable and semantically rich. CHEX and dataset-versioning
+work turn retained versions into a placement/reconstruction frontier. REWIND
+shows that durable metadata/index updates need log-shape and recovery proofs.
+TXBug shows that small transactional schedules catch silent semantic failures.
+ALECE adds that cost estimates should combine query shape with live, changing
+state.
+
+The design implication is a two-layer route contract. The inner layer is a
+hard proof gate: schema generation, visibility boundary, resident generation,
+WAL/checkpoint safety, predicate support, memory budget, and queue capacity.
+No learned model, metadata cache, or retained snapshot reuse can override this
+layer. The outer layer is adaptive ranking: optimizer exploration, metadata
+statistics, version-retention costs, route telemetry, and learned estimates
+choose among eligible routes.
+
+Category gaps after this batch are still runtime/admission and high-concurrency
+networking under 1M logical sessions. The queue has strong follow-ups on RDMA
+transport, proactive receiver-driven scheduling, flow control, and actor-style
+database runtimes; the next non-optimizer paper should preferably come from
+runtime/session admission or network backpressure unless a newer MVCC or WAL
+paper is clearly higher value.
+
+Benchmark priority should move toward route-regret under changing state:
+measure whether a route chooser picks CPU, retained GPU, refresh, fallback, or
+rejection correctly as data distributions, resident generations, queue depth,
+and memory pressure change. Each benchmark should pair latency/throughput with
+semantic oracles from TXBug-style small schedules, because a fast stale route
+is a correctness bug, not a performance win.
