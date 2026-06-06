@@ -1017,13 +1017,13 @@ Append new candidates here as each paper is processed.
   focused follow-up for scheduler-level compaction smoothing and latency-spike
   control in LSM-style cold/warm tiers. Journal entry added 2026-06-06 from
   the USENIX page and PDF.
-- `queued` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
+- `reviewed` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
   Stores**, Conway et al., USENIX ATC 2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/conway`
   Why: DiffKV evaluates commodity SSD LSM tradeoffs; SplinterDB is a modern
   NVMe-oriented KV-store design useful for comparing write-optimized indexing,
   space amplification, and scan/read behavior before GPU DB commits to an
-  LSM-like cold-tier structure.
+  LSM-like cold-tier structure. Journal entry added 2026-06-06.
 - `queued` — **Redesigning LSMs for Nonvolatile Memory with NoveLSM**,
   Kannan, Bhat, Gavrilovska, Arpaci-Dusseau, and Arpaci-Dusseau, USENIX
   ATC 2018.
@@ -1063,6 +1063,18 @@ Append new candidates here as each paper is processed.
   write-amplification technique; WiscKey is a foundational post-2015 primary
   source for deciding when GPU DB should separate keys, medium payloads, and
   large values across NVMe-friendly tiers.
+- `queued` — **Tucana: Design and Implementation of a Fast and Efficient
+  Scale-up Key-value Store**, Papagiannis et al., USENIX ATC 2016.
+  URL: `https://www.usenix.org/conference/atc16/technical-sessions/presentation/papagiannis`
+  Why: SplinterDB identifies Tucana as the closest B-epsilon-tree style SSD
+  key-value-store predecessor; useful for comparing CPU cost, concurrency, and
+  write amplification before adopting branchy cold-tier indexes.
+- `queued` — **PebblesDB: Building Key-Value Stores using Fragmented
+  Log-Structured Merge Trees**, Raju et al., SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132765`
+  Why: SplinterDB adapts and extends fragmentation/size-tiering ideas from
+  PebblesDB; useful for testing fragmented LSM layouts against active-branch
+  cold-tier directories and short-range scan penalties.
 - `reviewed` — **Taurus: Lightweight Parallel Logging for In-Memory Database
   Management Systems**, Xia, Yu, Pavlo, and Devadas, SIGMOD/PACMMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389713`
@@ -3952,13 +3964,14 @@ Append new candidates here as each paper is processed.
   request-granularity costs; ZNS is useful for evaluating whether future GPU
   DB cold-tier segments should expose zone-aware allocation, append, and
   placement contracts instead of relying on conventional block IO.
-- `queued` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
+- `reviewed` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
   Stores**, Conway et al., USENIX ATC 2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/conway`
   Why: Hyperion's argument depends on extracting cheap NVMe bandwidth;
   SplinterDB is a storage-engine follow-up for comparing write-optimized
   indexing, compaction, and bandwidth utilization against GPU DB cold-tier
-  point lookup and segment-directory designs.
+  point lookup and segment-directory designs. Duplicate queue entry corrected
+  to reviewed on 2026-06-06.
 - `queued` — **Elastic Use of Far Memory for In-Memory Database Management
   Systems**, Lee et al., DaMoN 2023.
   URL: `https://doi.org/10.1145/3592980.3595311`
@@ -4819,13 +4832,14 @@ Append new candidates here as each paper is processed.
   scaling limits under high contention, and may inform GPU DB mutation-owner
   admission and partitioned write lanes. Journal entry added 2026-06-06 from
   the SIGMOD 2016 author PDF.
-- `queued` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
+- `reviewed` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
   Stores**, Conway et al., USENIX ATC 2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/conway`
   PDF: `https://www.usenix.org/system/files/atc20-conway.pdf`
   Why: PrismDB cites SplinterDB as an NVMe-specialized KV-store comparison;
   its STB-epsilon-tree, concurrent cache, and reduced write amplification are
-  relevant to CPU/NVMe tier limits before GPU resident refresh.
+  relevant to CPU/NVMe tier limits before GPU resident refresh. Duplicate queue
+  entry corrected to reviewed on 2026-06-06.
 - `queued` — **SpanDB: A Fast, Cost-Effective LSM-tree Based KV Store on
   Hybrid Storage**, Chen et al., FAST 2021.
   URL: `https://www.usenix.org/conference/fast21/presentation/chen-hao`

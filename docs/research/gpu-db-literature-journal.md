@@ -38,6 +38,166 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - SplinterDB turns NVMe storage into a CPU-efficiency problem
+
+**Citation:** Alexander Conway, Abhishek Gupta, Vijay Chidambaram,
+Martin Farach-Colton, Richard Spillane, Amy Tai, and Rob Johnson.
+"SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value Stores."
+USENIX ATC 2020, 49-63. Retrieved 2026-06-06 from the USENIX page and
+PDF: `https://www.usenix.org/conference/atc20/presentation/conway`,
+`https://www.usenix.org/system/files/atc20-conway.pdf`.
+
+**Category:** WAL, logging, and read/write throughput; database
+file-system design, storage, and indexing.
+
+**Relevance tags:** SplinterDB; STB-epsilon-tree; NVMe; key-value
+store; write amplification; size-tiering; B-epsilon-tree; quotient
+filters; flush-then-compact; concurrent memtable; user-level cache;
+small key-value pairs; point reads; scan startup cost.
+
+**Core idea:** SplinterDB argues that modern NVMe SSDs shift the
+storage bottleneck back into the CPU and storage-engine data structure.
+When the device can deliver hundreds of thousands of IOPS and
+multi-GB/s sequential bandwidth, repeated compaction reads, cache
+misses, and thread contention can prevent an LSM-style engine from
+using the device.
+
+The transferable idea for GPU DB is not to adopt a key-value store as
+the main relational layout. It is to treat the CPU/NVMe cold tier as a
+parallel, bandwidth-oriented structure whose metadata, cache, and
+compaction policy must be designed to feed both point reads and
+resident GPU refresh without burning CPU cycles. P8 should not assume
+that "NVMe is cold and slow"; the wrong cold-tier layout can waste a
+fast drive long before the GPU is involved.
+
+**Concrete mechanisms:**
+
+- SplinterDB's STB-epsilon-tree is a tree of trees. A trunk tree stores
+  pivots, metadata, branch pointers, and active-branch ranges; branch
+  trees store the actual key-value pairs. A memtable buffers inserts
+  before becoming a new branch at the root.
+- Branches are ordered from oldest to youngest. Point queries search the
+  memtable first, then walk trunk nodes and check active branches for
+  the relevant child from youngest to oldest. Each branch has a quotient
+  filter, so most misses avoid leaf I/O.
+- The design goal is that normal point queries require at most one
+  storage I/O when filter and branch-index metadata fit in RAM. The
+  paper estimates quotient filters at roughly 1-2 bytes per key and
+  argues that filter plus branch-index overhead remains under about 10%
+  of database size for the common configurations it studies.
+- Insertions are accumulated in a bounded memtable chosen to be large
+  enough for efficient branch scans but not so large that random inserts
+  spill into one random I/O per insert. The prototype uses a 24 MB
+  memtable.
+- When trunk nodes fill, SplinterDB flushes data toward children and
+  compacts active branch portions into a new child branch. The basic
+  STB-epsilon-tree has size-tiered-style write amplification of
+  `O(log_F N)`, while level-tiered LSMs and normal B-epsilon-trees pay a
+  larger `O(F log_F N)` term in the paper's analysis.
+- The flush-then-compact policy first moves logically relevant branch
+  ranges down the trunk and only compacts when needed. This exposes more
+  independent compaction work across the tree and lets localized insert
+  workloads skip some intermediate compaction.
+- Query metadata marks old branches inactive for a child after their
+  contents have been flushed there. Branches that are inactive for all
+  children can be reclaimed.
+- The user-level cache is designed around high concurrency rather than
+  a page-cache-style global bottleneck. The paper describes
+  fine-grained distributed reader-writer locks and a direct-map path for
+  lock-free cache operations; all reads and writes flow through this
+  cache.
+- The evaluation reports that SplinterDB outperforms RocksDB by 6-10x
+  on insertions and 2-2.6x on point queries in the headline comparison,
+  while reducing write amplification by about 2x and matching RocksDB on
+  small range queries.
+- In the insertion-concurrency experiment, SplinterDB scales nearly
+  linearly to 10 threads and reaches 2.0-2.4 million insertions per
+  second, using about 1.9-2.2 GiB/s of bandwidth on a device advertised
+  around 2.2 GiB/s sequential bandwidth.
+- The main acknowledged weakness is scan startup. Size-tiering means
+  short scans must search branches along the root-to-leaf path before
+  iteration becomes cheap. The paper reports that effective scan
+  bandwidth approaches device bandwidth for longer scans, reaching 91%
+  of advertised sequential read bandwidth at 1,000 key-value-pair scan
+  lengths in one experiment.
+
+**GPU DB mapping:** For P8, SplinterDB suggests a cold/warm tier design
+where point lookup metadata and refresh-segment metadata stay compact
+and memory-resident, while value or row payloads can live in large
+NVMe-friendly branches or segments. The GPU-resident cache can then be
+rebuilt from branch-sized sequential reads instead of many scattered
+tuple-chain reads.
+
+The active-branch mechanism maps naturally to MVCC and retained
+snapshot generations: old physical fragments may remain present, but
+route metadata should say exactly which fragments are active for a
+table, key range, visibility boundary, and resident refresh. This is
+similar to P8's "resident state is versioned performance state" rule,
+but extends it down into CPU/NVMe segment directories.
+
+Flush-then-compact gives a useful benchmark axis for GPU DB ingest.
+Instead of compacting every update immediately into a canonical
+columnar form, the mutation path could publish WAL-visible CPU truth,
+append updates into bounded branch/delta segments, and let refresh
+workers compact only the key ranges or snapshot cohorts that are worth
+making GPU-resident. Correctness remains WAL/MVCC-owned; compaction is
+a performance publication step.
+
+The cache design reinforces the runtime document's mechanical-sympathy
+rules. A cold-tier cache cannot be a shared mutex hidden behind the
+query path. It needs bounded ownership, fine-grained locks or sharded
+owners, direct-map fast paths for hot metadata, and explicit telemetry
+for cache misses, branch-filter false positives, and compaction queue
+pressure.
+
+**Risks and mismatches:** SplinterDB is a key-value store, not a SQL
+transactional storage engine. It does not provide relational schema
+semantics, SQL visibility, WAL-before-visibility ordering, secondary
+index maintenance, GPU kernels, or snapshot-safe DDL.
+
+The paper targets small key-value pairs and limited memory. GPU DB also
+needs columnar scans, text encodings, joins, aggregates, retained GPU
+buffers, and mixed OLTP/analytical reads. STB-epsilon-tree branches are
+not automatically a good resident column-group layout.
+
+Size-tiering can increase temporary space usage and makes short-range
+scan startup more expensive. A relational engine with many prefix/range
+queries may need separate range indexes, scan descriptors, or
+resident-column summaries rather than relying only on STB-style branch
+filters.
+
+The evaluation is on a single-node KV workload. It does not answer how
+branch compaction interacts with group commit, crash recovery,
+replication, long-running snapshots, or tenant admission.
+
+**Benchmark candidates:**
+
+- Add a cold-tier point-lookup simulator comparing LSM-style sorted
+  runs, STB-style active branches with quotient filters, and a simple
+  append-segment directory. Measure point p50/p99, filter false
+  positives, metadata memory, read amplification, write amplification,
+  and CPU cycles per lookup.
+- Build a GPU-refresh benchmark where row deltas are stored in
+  branch-sized NVMe segments. Compare full-table rebuild, key-range
+  refresh, and snapshot-cohort refresh. Gate: refresh must use
+  sequential bandwidth without increasing visible write latency.
+- Test memtable/delta sizes from 4 MB to 256 MB for COPY/INSERT
+  ingestion. Measure WAL flush latency, branch scan throughput,
+  compaction backlog, resident refresh delay, and memory pressure.
+- Add a scan-startup benchmark for short and medium range reads over
+  size-tiered cold fragments. Failure condition: a branchy cold-tier
+  layout improves ingest but makes retained lookup or prefix-scan p99
+  worse than a simpler layout.
+- Prototype compact filter metadata per branch or resident segment,
+  using Bloom/quotient-filter-like behavior. Gate: absent-key reads and
+  refresh pruning must avoid most cold I/O without consuming enough RAM
+  to crowd out route descriptors, command rings, or hot snapshots.
+- Compare cache ownership choices for cold-tier metadata: one global
+  cache lock, sharded cache owners, direct-map metadata slots, and
+  partition-local caches. Measure throughput, queue wait, cache-line
+  bouncing if available, and p99 under 1M logical-session admission
+  pressure.
+
 ### 2026-06-06 - Memstrata makes CXL tiering an isolation and outlier-control problem
 
 **Citation:** Yuhong Zhong, Daniel S. Berger, Carl Waldspurger,
