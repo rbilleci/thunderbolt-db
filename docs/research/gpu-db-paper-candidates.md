@@ -5688,12 +5688,27 @@ Append new candidates here as each paper is processed.
   as related switch-flow-control work; useful for comparing explicit
   transport backpressure with GPU DB response-ring, reorder-buffer, and
   active-session admission limits. Reviewed on 2026-06-05.
-- `queued` — **Data Center Ethernet and Remote Direct Memory Access:
+- `reviewed` — **Data Center Ethernet and Remote Direct Memory Access:
   Issues at Hyperscale**, Hoefler et al., IEEE Computer 2023.
   URL: `https://doi.org/10.1109/MC.2023.3261184`
   Why: Ultra Ethernet motivates its design as an answer to RoCE/RDMA
   deployment pain; useful background for avoiding fragile lossless-network
   assumptions in GPU DB's future gateway and accelerator-fabric design.
+  Reviewed on 2026-06-06.
+- `queued` — **SRDMA: Efficient NIC-Based Authentication and Encryption for
+  Remote Direct Memory Access**, Taranov et al., USENIX ATC 2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/taranov`
+  Why: the RDMA hyperscale paper flags multi-tenant authentication and
+  encryption as first-class issues; useful for deciding whether any future GPU
+  DB RDMA/gateway path can preserve tenant isolation without excessive
+  per-connection state or CPU-side crypto overhead.
+- `queued` — **ReDMArk: Bypassing RDMA Security Mechanisms**, Rothenberger
+  et al., USENIX Security 2021.
+  URL:
+  `https://www.usenix.org/conference/usenixsecurity21/presentation/rothenberger`
+  Why: the RDMA hyperscale paper cites RDMA security weaknesses; useful
+  negative case before GPU DB exposes remote memory, accelerator buffers, or
+  tenant-visible gateway fast paths.
 - `reviewed` — **Decibel: The Relational Dataset Branching System**,
   Maddox et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p624-maddox.pdf`

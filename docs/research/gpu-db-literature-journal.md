@@ -38,6 +38,154 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Datacenter Ethernet and RDMA: Issues at Hyperscale
+
+**Citation:** Torsten Hoefler, Duncan Roweth, Keith Underwood,
+Robert Alverson, Mark Griswold, Vahid Tabatabaee, Mohan Kalkunte,
+Surendra Anubolu, Siyuan Shen, Moray McLaren, Abdul Kabbani, and
+Steve Scott. "Data Center Ethernet and Remote Direct Memory Access:
+Issues at Hyperscale." Computer 56(7), 2023, pp. 67-77.
+doi:10.1109/MC.2023.3261184. Retrieved 2026-06-06 from the IEEE DOI
+metadata and the arXiv/author PDF, `https://arxiv.org/abs/2302.03337`
+and `https://htor.inf.ethz.ch/publications/img/hoefler-datacenter-issues-with-roce.pdf`.
+
+**Category:** runtime / HFT / session scale, with future accelerator
+fabric and storage-networking relevance.
+
+**Relevance tags:** RDMA; RoCE; PFC; lossless Ethernet; incast;
+congestion control; head-of-line blocking; queue-pair state; SmartNICs;
+multi-tenancy; low-latency transport; storage networking; response-ring
+backpressure.
+
+**Core idea:** The paper argues that RoCE inherited InfiniBand-era
+assumptions that fit simple, lossless, in-order fabrics better than
+hyperscale Ethernet. At 800G-class links, high message rates, AI/HPC
+collectives, storage traffic, microservice incast, and multi-tenant
+deployment make those assumptions increasingly costly. The authors
+predict a convergence of datacenter and HPC networking around modernized
+Ethernet transports that support better congestion control, selective
+retransmission, flexible lossy/lossless modes, SmartNIC-aware stacks, and
+first-class security.
+
+For GPU DB, the most useful lesson is not "use RDMA." It is that a
+high-throughput database runtime should not assume an ideal lossless
+fabric or hide congestion behind one backpressure mechanism. At 1M
+logical sessions, the database's own command rings, response rings,
+gateway workers, storage paths, and future GPU/NIC paths will reproduce
+the same motifs: incast to hot owners, latency-sensitive short messages,
+bulk transfer phases, and multi-tenant connection state pressure.
+
+**Concrete mechanisms:**
+
+- The paper separates three important traffic motifs: incast from many
+  uncoordinated senders to one receiver, oblivious bulk-synchronous
+  transfers such as collectives, and latency-sensitive message chains.
+  It argues that different motifs need different transport behavior.
+- RoCE's reliance on Priority Flow Control makes link-level lossless
+  transport possible, but reserves headroom buffer roughly tied to
+  bandwidth-delay product and packet size. At higher bandwidths and
+  longer distances, this reserved buffer becomes expensive.
+- PFC pauses a traffic class, not just the congested flow. A blocked
+  downstream flow can create victim flows, head-of-line blocking,
+  congestion trees, PFC storms, and, with cyclic dependencies, deadlock.
+- RoCE's inherited in-order and go-back-N assumptions make packet-level
+  multipathing and out-of-order delivery difficult. A lost packet can
+  force retransmission of later packets even if those packets arrived.
+- The paper contrasts rate-based ECN-style feedback with workload-specific
+  needs. Small messages below the bandwidth-delay product may complete
+  before receiver feedback can throttle senders, making incast a hard
+  case for storage and transaction-like traffic.
+- RoCEv2 carries Ethernet, IP, UDP, InfiniBand BTH, and ICRC headers.
+  For tiny messages, header overhead and NIC packet-processing rate can
+  dominate useful payload throughput.
+- Queue-pair connection state can be large enough to matter at all-to-all
+  or multi-tenant scale. The paper notes implementations may carry up to
+  roughly 1 KiB per connection, making connection-state design part of
+  scalability.
+- SmartNICs and in-network telemetry create chances for application-aware
+  transport decisions, but fixed RoCE hardware semantics limit how much
+  traffic-specific knowledge user stacks can express.
+- The paper flags security and memory-delegation issues for RDMA in
+  multi-tenant environments, including authentication, encryption, and
+  exposed remote-address semantics.
+- Link-level reliability is not free. More complex signaling, FEC, BER,
+  retransmission, and latency interact with congestion control because a
+  larger RTT increases the message size below which feedback arrives too
+  late.
+
+**GPU DB mapping:** GPU DB's near-term serving runtime should model
+traffic classes explicitly before it considers RDMA, GPUDirect, CXL
+memory, or remote storage. Hot-key writes, retained point reads, compatible
+GPU micro-batches, refresh/copy streams, and response emission should not
+share one undifferentiated queue and one overload policy. The paper's
+traffic motifs map to route classes: latency-sensitive point lookups and
+simple commits, incast-prone hot partition writes and response bursts,
+and bulk-synchronous refresh or analytical transfer phases.
+
+The PFC failure modes map directly to internal backpressure design. A
+single full response ring or GPU queue must not pause unrelated route
+classes if those routes could continue independently. GPU DB should prefer
+per-owner, per-route-class credits and narrow overload reasons over a
+coarse global "stop all reads" or "stop all responses" state. Deadlock
+analysis should treat mutation owners, residency owners, GPU workers,
+network IO workers, pinned-buffer pools, and response rings as a wait
+graph just as network designers reason about cyclic buffer dependencies.
+
+Connection-state pressure matters for the 1M logical-session target.
+If NICs can struggle with per-QP state, the database should avoid per
+logical session heavyweight runtime state: use multiplexed IO workers,
+compact session descriptors, shared prepared route metadata, and bounded
+per-active-request buffers. Logical sessions should become active command
+descriptors only when admitted.
+
+For future accelerator/storage fabrics, the paper argues against assuming
+lossless RoCE as a magic low-latency substrate. If GPU DB later uses RDMA,
+remote memory, GPUDirect Storage, or NIC/DPU steering, benchmarks must
+include lossy behavior, congestion, selective retransmission or retry,
+tenant isolation, encryption/authentication cost, and in-order versus
+out-of-order response assembly.
+
+**Risks and mismatches:** This is a networking perspective article, not a
+DBMS paper. It does not evaluate database transaction protocols, MVCC,
+SQL response encoding, GPU kernels, WAL, or cache placement. Some claims
+are forward-looking predictions rather than completed system results. The
+paper also discusses fabrics and hardware capabilities that may not exist
+on the local benchmark host.
+
+The paper's critique of RoCE should not be misread as a reason to ignore
+RDMA entirely. The actionable point is narrower: use explicit admission,
+credits, telemetry, and benchmarked failure modes before depending on a
+specific lossless transport. For local single-node GPU DB work, the same
+ideas first apply inside the process: bounded rings, route classes, buffer
+budgets, and cancellation semantics.
+
+**Benchmark candidates:**
+
+- Add a route-class pressure harness for the high-throughput runtime:
+  separate point reads, writes, refresh/copy work, and response-heavy
+  routes, then force saturation in one class. Gate: unrelated classes
+  continue or fail with a narrow overload reason rather than global
+  collapse.
+- Build an internal incast benchmark: many logical sessions submit small
+  commands to one mutation owner or response owner. Measure queue depth,
+  p99 latency, rejected/admitted counts, and bytes of reserved command and
+  response buffer state.
+- Add a wait-graph/deadlock audit for bounded queues and buffer pools.
+  Nodes should include network IO workers, mutation owner, residency
+  owner, GPU workers, pinned buffers, response rings, and snapshot refs.
+  Failure condition: a cycle can hold all progress while every component
+  waits for another bounded resource.
+- Track per-logical-session versus per-active-request memory. Gate: 1M
+  idle logical sessions do not allocate per-session command buffers,
+  response buffers, CUDA state, or heavyweight route metadata.
+- If future RDMA or remote-storage experiments are added, benchmark TCP,
+  RDMA/RoCE, and any kernel-bypass path under incast, packet loss or
+  retry, mixed short/large messages, and encryption/authentication where
+  available. Do not report only uncongested throughput.
+- Extend response-ring telemetry with payload size classes and blocked
+  writer/reader attribution so head-of-line blocking can be diagnosed at
+  the database layer before relying on network fabric counters.
+
 ### 2026-06-06 - ROME: Robust Query Optimization via Parallel Multi-Plan Execution
 
 **Citation:** Ziyun Wei and Immanuel Trummer. "ROME: Robust Query
