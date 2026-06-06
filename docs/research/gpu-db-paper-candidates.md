@@ -87,13 +87,14 @@ read/write throughput, recovery, compaction, or tail-latency mechanisms.
   Why: cited by GPU-Accelerated OLTP as a contention-oriented CPU-side
   concurrency-control baseline; useful for comparing lightweight optimistic
   fallback against GPU conflict ordering under hot keys.
-- `queued` — **Improving Optimistic Concurrency Control through Transaction
+- `reviewed` — **Improving Optimistic Concurrency Control through Transaction
   Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
   DOI: `https://doi.org/10.14778/3282495.3282502`
   Why: PLOR contrasts batching/reordering as a throughput and tail-latency
   direction for OCC; useful for comparing route-level reordering against
   GPU DB's owner rings, priority retry budgets, and hot-key write admission.
+  Journal entry added 2026-06-06.
 - `reviewed` — **Polyjuice: High-Performance Transactions via Learned
   Concurrency Control**, Wang et al., OSDI 2021.
   URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`
@@ -619,6 +620,15 @@ Append new candidates here as each paper is processed.
   strong 2023-present full paper in transaction scheduling; directly relevant
   to hot-key admission, abort/fallback reduction, and route ordering under
   contention.
+- `queued` — **Intelligent Transaction Scheduling to Enhance Concurrency in
+  High-Contention Workloads**, Chen and Wu, Applied Sciences 2025.
+  URL: `https://www.mdpi.com/2076-3417/15/11/6341`
+  DOI: `https://doi.org/10.3390/app15116341`
+  Why: discovered while reviewing OCC batching/reordering; useful as a modern
+  dependency-aware scheduling follow-up that combines hot-data partitioning,
+  fine-grained operation scheduling, and learned scheduling under high
+  contention. Lower priority than SIGMOD/VLDB/OSDI transaction papers, but
+  relevant if the queue needs more recent contention-scheduling contrasts.
 - `reviewed` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
   Cao et al., PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3603164`

@@ -81207,3 +81207,183 @@ tiering benchmarks prove otherwise.
 - Add system-action logging for resident metadata changes: allocation,
   segment split, route invalidation, and eviction. Gate: recovery can
   rebuild metadata fences without relying on GPU cache contents.
+
+### 2026-06-06 - OCC batching turns contention into a reorderable route batch
+
+**Citation:** Bailu Ding, Lucja Kot, and Johannes Gehrke. "Improving
+Optimistic Concurrency Control Through Transaction Batching and
+Operation Reordering." PVLDB 12(2), pp. 169-182, 2018. DOI:
+`https://doi.org/10.14778/3282495.3282502`. Retrieved 2026-06-06
+from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol12/p169-ding.pdf`.
+
+**Category:** transaction processing / write path, with runtime
+admission and tail-latency scheduling relevance.
+
+**Relevance tags:** optimistic concurrency control; semantic batching;
+storage reordering; validator reordering; dependency graph; feedback
+vertex set; tail-latency priority; thread-aware scheduling; hot-key
+contention; write-before-read batching; pre-validation; parallel
+validator; batch-size sweet spot.
+
+**Core idea:** The paper treats batching as a semantic transaction
+mechanism rather than only a low-level amortization trick. In an OCC
+system, the final serialization order is chosen late, so transactions
+that would abort under arrival order can sometimes commit if the system
+collects them into a batch and chooses a better order.
+
+For GPU DB, the transferable idea is that high-contention write
+admission should not be only FIFO plus retry. When a mutation owner or
+hot-key route already has a queue, that queue can become a small,
+bounded dependency-solving window. The system can preserve
+WAL-before-visibility while reordering viable work inside the window,
+aborting or deferring the minimum useful subset, and giving priority to
+older retries or latency-sensitive sessions.
+
+**Concrete mechanisms:**
+
+- The target architecture has processors, storage, and one or more OCC
+  validators. Transactions execute reads, validate against committed
+  writes, then install writes if validation succeeds.
+- Storage batching buffers read and write requests together. For each
+  object in a batch, it applies the highest-version pending committed
+  write before serving reads for that object, and discards lower-version
+  writes that would be superseded in the versioned store.
+- This storage rule is meant to avoid guaranteed stale reads: in OCC,
+  reads are from not-yet-validated transactions, while writes come from
+  transactions that passed validation and are about to commit.
+- Validator batching collects validation requests and chooses a
+  serialization order for the batch instead of committing in arrival
+  order.
+- The paper defines intra-batch validator reordering as finding a subset
+  of transactions to abort plus an order for the rest such that the
+  remaining transactions validate successfully.
+- It builds a directed dependency graph with one node per transaction
+  and edges for read-write dependencies. If the graph is acyclic, a
+  topological order gives a safe validation order.
+- If the graph has cycles, the transactions to abort correspond to a
+  feedback vertex set. The minimum feedback vertex set problem is hard,
+  so the paper uses practical greedy approximations.
+- The SCC-based greedy algorithm repeatedly partitions the graph into
+  strongly connected components and removes a policy-selected vertex
+  from cyclic components.
+- The faster sort-based greedy algorithm ranks vertices, removes the top
+  `k` candidates, trims acyclic leftovers, and iterates. In the
+  evaluation, the sort-based approach trades a little solution quality
+  for much lower reorder overhead.
+- Policies can minimize aborts using degree heuristics, reduce tail
+  latency by protecting transactions that have already restarted, or
+  prefer business/application value.
+- For decentralized OCC systems without a central validator, the paper
+  proposes thread-aware reordering: batch transactions before execution,
+  place mutually conflicting transactions onto the same worker thread so
+  they execute serially there, and reduce inter-thread conflicts.
+- The validator can be pipelined into batch preparation, reordering, and
+  final validation. The reordering stage can run multiple workers over
+  independent batches, while final validation preserves batch order.
+- A pre-validation stage removes transactions that already conflict with
+  committed state before running the reorder algorithm, reducing the
+  graph size and reorder bottleneck.
+- The prototype uses default storage and validator batch sizes around
+  40; the paper notes a batch-size sweet spot because larger batches
+  give more reorder freedom but add latency.
+- On synthetic high-contention workloads, storage plus validator
+  reordering improves throughput by up to 2.7x and reduces average and
+  tail latency by up to 67% and 82% versus the no-batching baseline.
+- On Cicada with write-intensive skewed YCSB, thread-aware reordering
+  improves throughput by up to 2.2x and reduces 99th percentile latency
+  by up to 71% versus state-of-the-art OLTP baselines in the reported
+  setting.
+- On the commercial DBMS-X SmallBank setup, middle-tier batching plus
+  reordering raises peak throughput and lowers abort rate and latency;
+  the paper reports up to 3.1x throughput improvement for some loaded
+  points and up to 66% latency reduction.
+
+**GPU DB mapping:** GPU DB's mutation owner, route queues, and future
+GPU OLTP batch paths already form natural bounded reorder windows. A
+route batch could collect hot-key writes, COPY chunks, stored-procedure
+transactions, or same-shape single-row mutations, build a compact
+dependency graph from declared/read write sets, and publish the chosen
+order as the WAL/visibility order.
+
+Storage batching maps to the P8 resident-invalidation path. Before
+serving reads from a hot CPU or GPU snapshot, pending validated writes
+for the same key/segment should either be applied, fenced, or make the
+read choose a newer snapshot/fallback. The important rule is not "writes
+always jump reads"; it is that reads must not be knowingly served from a
+version that is already invalidated by a committed-but-not-applied write
+in the same admission window.
+
+Validator batching maps to a CPU-side pre-GPU admission stage for GPU
+OLTP. Instead of launching a GPU transaction batch in arrival order, the
+owner can reorder viable transactions by dependency graph, mark the
+discarded feedback-vertex subset as retry/defer, then send a
+conflict-reduced ordered batch to GPU kernels. The WAL order remains the
+ordered batch; GPU execution is acceleration under that order, not a
+separate source of truth.
+
+The tail-latency policy is especially useful for 1M logical sessions.
+Retry count, deadline, tenant priority, and route class can be vertex
+weights. A session that already lost several retry rounds should become
+harder to put in the abort/defer set, preventing hot-key throughput from
+hiding starvation.
+
+Thread-aware reordering also fits owner-domain design. If GPU DB splits
+mutation owners by partition, table, or key range, admission can place
+conflicting work onto the same owner where it serializes cheaply and
+place non-conflicting work across owners. That is a route-placement
+problem, not just a validator problem.
+
+**Risks and mismatches:** The paper assumes useful read and write sets
+are available to validation. Interactive SQL, ad hoc predicates, and
+stored procedures with data-dependent accesses may not expose complete
+sets early enough for safe pre-execution reordering.
+
+Batching creates latency budget pressure. The paper's sweet spot is
+workload-dependent, and GPU DB must bound queue wait in microseconds or
+small milliseconds by route class. Larger batches can improve commit
+rate while violating p50/p99 session goals.
+
+The storage write-before-read rule is safe in the paper's versioned OCC
+model, but GPU DB has MVCC snapshots, retained resident buffers, WAL
+flush ordering, and DDL invalidation. A pending write can only affect a
+read after the right durable and visibility fences exist.
+
+Feedback-vertex heuristics are attractive, but graph construction and
+policy scoring are still CPU work. For large batches or dense hot-key
+cycles, reorder overhead can dominate. The paper itself observes that
+validator reordering is less useful under extreme contention and that
+storage-only reordering may win there.
+
+The evaluation is CPU OLTP, not GPU execution. It does not measure CUDA
+kernel launch overhead, device memory placement, resident snapshot
+refresh, pgwire backpressure, or recovery.
+
+**Benchmark candidates:**
+
+- Add a hot-key OCC admission simulator with FIFO, storage reordering,
+  validator graph reordering, and tail-priority graph reordering. Gate:
+  throughput, abort/defer rate, retry count distribution, p50/p99, and
+  reorder CPU time are reported together.
+- Prototype a bounded mutation-owner reorder window for same-shape
+  stored procedures with declared read/write sets. Expected result:
+  fewer aborts under skew without changing WAL-before-visibility
+  publication order.
+- Compare batch triggers by count, microsecond deadline, and hybrid
+  deadline/count thresholds. Failure condition: throughput improves only
+  by adding unacceptable queue wait.
+- Add a GPU OLTP pre-admission experiment: build conflict-reduced
+  ordered batches on CPU, execute the ordered batch on GPU or simulated
+  GPU workers, and publish WAL/visibility in that order. Gate: every
+  abort/defer reason names a dependency edge or stale committed state.
+- Evaluate retry-aware vertex weights. Gate: hot-key workloads improve
+  p99 and max retry count without sacrificing more than a configured
+  throughput budget versus commit-maximizing reordering.
+- Test storage write-before-read fencing with retained resident
+  snapshots. Gate: reads either observe a compatible committed version,
+  wait for a named visibility fence, or fall back; no read is served from
+  a known-stale resident generation.
+- Benchmark decentralized placement: route conflicting transactions to
+  the same partition owner and non-conflicting transactions across
+  owners. Gate: inter-owner conflicts fall without creating a single
+  overloaded hot owner that dominates p99.
