@@ -264,12 +264,13 @@ Append new candidates here as each paper is processed.
   current queued locality/scheduling candidates skewed older; useful for
   routing retained reads by physical residency footprint, buffer/GPU locality,
   and load balance. Journal entry added 2026-06-06.
-- `queued` — **LSched: A Workload-Aware Learned Query Scheduler for Analytical
+- `reviewed` — **LSched: A Workload-Aware Learned Query Scheduler for Analytical
   Database Systems**, Sabek, Ukyab, and Kraska, SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3526141`
+  URL: `https://doi.org/10.1145/3514221.3526158`
+  PDF: `https://people.csail.mit.edu/ibrahimsabek/pdf/22_paper_lsched.pdf`
   Why: Laser cites LSched as learned query scheduling related work; useful for
   comparing reinforcement-learning or workload-aware scheduling with explicit
-  route-footprint scheduling for GPU DB.
+  route-footprint scheduling for GPU DB. Journal entry added 2026-06-06.
 - `queued` — **Self-Tuning Query Scheduling for Analytical Workloads**,
   Wagner, Kohn, and Neumann, SIGMOD 2021.
   URL: `https://doi.org/10.1145/3448016.3457290`
@@ -282,6 +283,20 @@ Append new candidates here as each paper is processed.
   Why: Laser cites it as buffer-pool-aware scheduling; useful for contrasting
   learned buffer reuse against deterministic residency metadata and route
   certificates.
+- `queued` — **Quickstep: A Data Platform Based on the Scaling-up Approach**,
+  Patel et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p663-patel.pdf`
+  Why: LSched is implemented on Quickstep's block/work-order execution model;
+  useful for extracting morsel/work-order, scheduler, and resource-estimation
+  mechanisms that can inform GPU DB operator fragments and route-feature
+  telemetry.
+- `queued` — **Learning Scheduling Algorithms for Data Processing Clusters**,
+  Mao et al., SIGCOMM 2019.
+  URL: `https://doi.org/10.1145/3341302.3342080`
+  Code: `https://github.com/hongzimao/decima-sim`
+  Why: LSched contrasts Decima's black-box DAG scheduling with DB-specific
+  physical-plan features; useful as a control point for what should remain
+  outside GPU DB's hot scheduler when learned policies are evaluated.
 
 ### Database file-system design, storage, and indexing
 
@@ -5021,12 +5036,14 @@ Append new candidates here as each paper is processed.
   Why: Auto-WLM contrasts production admission and elasticity with
   self-tuned scheduling policies; useful for comparing low-overhead heuristic
   tuning against route-specific GPU/CPU/NVMe scheduling knobs.
-- `queued` — **LSched: A Workload-Aware Learned Query Scheduler for
+- `reviewed` — **LSched: A Workload-Aware Learned Query Scheduler for
   Analytical Database Systems**, Sabek, Ukyab, and Kraska, SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3526138`
+  URL: `https://doi.org/10.1145/3514221.3526158`
+  PDF: `https://people.csail.mit.edu/ibrahimsabek/pdf/22_paper_lsched.pdf`
   Why: Auto-WLM cites learned analytical scheduling as related work; useful
   for deciding whether GPU DB route scheduling should learn from plan shape
-  and system state or stay with guardrailed heuristics.
+  and system state or stay with guardrailed heuristics. Duplicate candidate
+  marked reviewed; journal entry added 2026-06-06.
 - `queued` — **Database-Agnostic Workload Management**, Jain, Yan, Cruanes,
   and Howe, CIDR 2019.
   URL: `https://www.cidrdb.org/cidr2019/papers/p82-jain-cidr19.pdf`

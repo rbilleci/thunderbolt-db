@@ -38,6 +38,180 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - LSched makes query scheduling a physical-plan and pressure problem
+
+**Citation:** Ibrahim Sabek, Tenzin Samten Ukyab, and Tim Kraska.
+"LSched: A Workload-Aware Learned Query Scheduler for Analytical Database
+Systems." SIGMOD 2022. doi:10.1145/3514221.3526158. Retrieved 2026-06-06
+from author PDF
+`https://people.csail.mit.edu/ibrahimsabek/pdf/22_paper_lsched.pdf`.
+
+**Category:** query optimization, planning, and runtime scheduling, with
+secondary relevance to GPU execution admission and high-concurrency read
+queues.
+
+**Relevance tags:** learned scheduling; workload-aware routing; physical-plan
+features; operator scheduling; morsels; work orders; pipelining degree; thread
+assignment; average latency; tail latency; scheduling overhead; transfer
+learning; GPU worker admission; route pressure.
+
+**Core idea:** LSched argues that a useful query scheduler cannot treat a query
+as a black-box DAG of tasks. For analytical database workloads, the scheduler
+needs physical operator types, input relations, columns, block/work-order
+footprints, pipeline-breaking edges, remaining work, memory estimates, current
+thread assignment, free threads, and locality. It then learns, at scheduling
+events, which operators to run, how much of each pipeline to preserve, and how
+many threads to grant to each query.
+
+For GPU DB, the transferable idea is not necessarily "put reinforcement
+learning in the hot path." It is that route scheduling needs a feature contract
+rich enough to describe query shape, resident footprint, device pressure, and
+pipeline risk. A GPU read scheduler that sees only FIFO arrival order or a
+coarse cost estimate will miss the same kind of opportunities LSched targets:
+which compatible retained reads should be batched, when a pipeline should stop
+before consuming too many buffers, and when a query should receive fewer GPU or
+CPU slots so another route avoids tail latency.
+
+**Concrete mechanisms:**
+
+- LSched is integrated with Quickstep, where a query physical plan is a DAG of
+  operators and each operator is decomposed into block-level work orders. Work
+  orders carry operator inputs, parameters, block identity, and whether an
+  operator is blocked by a parent or can pipeline.
+- The scheduler extracts three feature classes. Operator features include
+  operator type, graph connectivity, input relations, columns, block footprint,
+  remaining work orders, estimated remaining duration, and estimated memory.
+  Edge features encode whether an edge is pipeline-breaking and the pipeline
+  direction. Query features encode assigned threads, free threads, and thread
+  locality.
+- Static features are populated when the physical plan is produced. Dynamic
+  features are recalculated at scheduling events from execution-monitor
+  statistics, such as completed work orders, duration, memory, and thread
+  assignment.
+- LSched does not build explicit cross-query features from multi-query plans.
+  It relies on per-query dynamic state and all-running-query embeddings to
+  capture the multi-query execution environment.
+- The query encoder combines customized tree convolution with graph attention.
+  Tree convolution is used to capture local parent-child operator patterns in
+  physical plans without the over-smoothing problem the authors identify in
+  Decima-style sequential graph convolution. Graph attention weights child
+  operators and edge features by learned importance.
+- A high-level encoder summarizes each query into a per-query embedding and
+  all active queries into a global embedding. The scheduling predictor uses
+  those embeddings plus local node/edge/query features.
+- The execution model is a single scheduler thread and a pool of worker
+  threads pinned to CPU cores. The pool can grow or shrink, but the scheduler's
+  output is still translated into work orders executed by workers.
+- LSched triggers only on major events: adding or removing a worker thread, a
+  thread finishing all assigned work orders, a new query arrival, or a scheduled
+  operator completing. It deliberately avoids scheduling every work order
+  completion because learned inference overhead can dominate.
+- At each scheduling event, LSched predicts execution roots, the pipeline degree
+  starting from each selected root, and the parallelism degree for each query.
+  Pipeline-degree prediction is central: full aggressive pipelining can waste
+  buffers and thrash, while no pipelining loses locality and throughput.
+- Training uses REINFORCE. The reward combines an approximation of average
+  query latency with a 90th-percentile tail-latency signal, with user-controlled
+  weights. Transfer learning freezes most previously learned hidden/convolution
+  layers and retrains input/output-adjacent layers for a new workload.
+- The evaluation uses an Arch Linux server with 256 GB RAM and an Intel Xeon
+  Gold 6230, Quickstep, TPCH scale factors 2/5/10/50/100, SSB scale factors
+  2/5/10/50, and JOB over the 7.2 GB IMDB dataset. The default setup uses up
+  to 60 execution threads and compares against Decima, SelfTune, Quickstep's
+  scheduler, weighted fair scheduling, and FIFO.
+- Reported results include at least 35% and 50% lower average query duration
+  than Decima for TPCH streaming and batched workloads, respectively. For JOB,
+  the reported improvement over other baselines is at least 38% and 59% in
+  streaming and batching. The paper also reports lower variance in average
+  duration due to the reward's tail-latency component.
+- LSched's advantage shrinks when the system is lightly loaded or when thread
+  count is very high relative to query count, because most schedulers make
+  similar decisions when resources are plentiful.
+- Learned scheduling overhead is significant relative to heuristic schedulers.
+  The authors report that the execution-time savings still exceed scheduling
+  overhead by about 100x on average in their tested TPCH setting, but the
+  overhead grows with active query count and scheduling decisions.
+- Ablations report that removing tree convolution, graph attention, transfer
+  learning, or pipelining prediction all worsens average query duration; removing
+  pipelining prediction increases average duration by about 25% in the shown
+  experiment.
+
+**GPU DB mapping:** The current runtime design already names bounded rings,
+owner domains, GPU execution workers, retained snapshots, and same-shape
+micro-batching. LSched suggests the missing scheduler input should be a stable
+route-feature vector rather than just a request enum. For each admitted read or
+query fragment, GPU DB should expose snapshot generation, table/partition,
+query shape, predicate family, resident bytes, expected output bytes, H2D/D2H
+bytes, pinned-buffer need, GPU stream class, fallback eligibility, queue depth,
+and remaining work.
+
+Pipeline-degree prediction maps to GPU route fusion. A retained route may have
+filter, projection, decompression, join, aggregate, and response-encoding
+stages that can be fused or split. LSched's warning is that "more pipeline" is
+not always better: aggressive fusion may consume device scratch, pinned host
+buffers, or response memory and hurt concurrent sessions. The first GPU DB
+version can use deterministic heuristics, but it should log enough features to
+train or replay better policies later.
+
+Scheduling-event discipline maps directly to low-latency serving. A 1M logical
+session runtime cannot run a neural model per tuple or per tiny work item. A
+reasonable slice is to make decisions when a read batch opens, a GPU queue
+drains, a retained snapshot generation changes, a worker budget changes, or an
+operator fragment completes. Between those points, workers should execute from
+preallocated route descriptors.
+
+The feature extraction is also a planner contract. The SQL planner should
+preserve route-relevant facts, such as columns, predicates, candidate resident
+segments, and pipeline-breaking operators, until admission. If those facts are
+lost after cost planning, the runtime can only schedule by coarse shape and
+queue age.
+
+**Risks and mismatches:** LSched is analytical scheduling on CPU worker threads,
+not OLTP, MVCC, WAL, GPU kernels, or pgwire session admission. It does not cover
+writes, transaction conflicts, snapshot visibility, stale route detection, GPU
+memory residency, CUDA stream contention, or durable commit ordering. Its
+training cost and inference overhead also make it unsuitable as a first hot-path
+dependency.
+
+The evaluation is single-node Quickstep with TPCH, SSB, and JOB. It does not
+measure GPU transfer, kernel launch overhead, pinned-buffer pressure, result
+scattering, network IO, or 1M logical sessions. The scheduler also lacks
+explicit cross-query shared-execution features, which are exactly the features
+GPU DB may need for retained snapshot batching and shared resident-route reuse.
+
+Treat LSched as a feature and benchmark guide first. Any learned scheduling
+policy should be behind deterministic admission gates, invariant checks, and
+replayable logs of why a route was selected.
+
+**Benchmark candidates:**
+
+- Add route-feature logging for retained reads: operator/fragment type,
+  snapshot generation, resident partition, selected columns, predicate family,
+  estimated rows, resident bytes, H2D/D2H bytes, pinned-buffer need, queue
+  depth, fallback eligibility, and response shape. Gate: features are available
+  at admission without violating snapshot or route-generation checks.
+- Compare FIFO, shortest-estimated-route, residency-footprint-aware, and
+  latency-tail-aware scheduling for read snapshot rings. Measure p50/p99
+  latency, batch size, GPU utilization, fallback count, and queue wait.
+- Prototype deterministic pipeline-degree controls for retained GPU routes:
+  split filter/projection/aggregate/encoding stages versus fuse all eligible
+  stages. Failure condition: aggressive fusion improves throughput but worsens
+  p99 latency or pinned/device scratch pressure under concurrent sessions.
+- Add scheduling-event benchmarks: decide per request, per queue drain, per
+  batch-open, and per operator-fragment completion. Gate: scheduler overhead is
+  visible and bounded; no mode may hide overload by growing unbounded queues.
+- Build a replay harness that records route features and decisions, then
+  replays them offline against alternative policies. Expected value: learned or
+  adaptive scheduling can be evaluated without first trusting it in the serving
+  path.
+- Extend micro-batch compatibility checks with pipeline-breaking facts, such as
+  decompression format, join build/probe boundary, aggregate state size, and
+  response encoding. Gate: compatible batches preserve per-request SQL results
+  and precise fallback reasons.
+- Measure whether workload-specific scheduling pays off only under high load,
+  as in LSched. Failure condition: a complex scheduler helps saturated batches
+  but adds overhead and worse p50 latency when the GPU queue is mostly empty.
+
 ### 2026-06-06 - Carousel overlaps read, prepare, commit, and replication when the route shape is known
 
 **Citation:** Xinan Yan, Linguan Yang, Hongbo Zhang, Xiayue Charles
