@@ -4946,12 +4946,21 @@ Append new candidates here as each paper is processed.
   Why: CormCC is one of NeurCC's adaptive CC baselines; useful for comparing
   partition-level mixed protocols and online reconfiguration with per-route
   learned conflict actions.
-- `queued` — **GeminiFS: A Companion File System for GPUs**, Qiu et al.,
+- `reviewed` — **GeminiFS: A Companion File System for GPUs**, Qiu et al.,
   FAST 2025.
   URL: `https://www.usenix.org/conference/fast25/presentation/qiu`
   PDF: `https://www.usenix.org/system/files/fast25-qiu.pdf`
   Why: modern GPU-facing storage interface that cites GMT; useful for comparing
   file-system-level GPU IO services with DB-owned GPU/host/NVMe tier managers.
+  Journal entry added 2026-06-06.
+- `queued` — **Cheetah: Metadata Aggregation for Fast Object Storage without
+  Distributed Ordering**, Zhang et al., EuroSys 2025.
+  URL: `https://doi.org/10.1145/3689031.3696080`
+  PDF: `https://home.cse.ust.hk/~kaichen/papers/cheetah-eurosys25.pdf`
+  Why: GeminiFS embeds per-file block maps to avoid GPU-side metadata
+  traversal; Cheetah is a modern follow-up on aggregating storage metadata to
+  remove distributed write ordering, relevant to GPU DB cold-tier object
+  metadata, checkpoint manifests, and DB-owned file/object layout.
 - `queued` — **Characterizing Emerging Page Replacement Policies**, Wu et al.,
   IISWC 2024.
   URL: `https://www.cs.yale.edu/homes/abhishek/mwu-iiswc24.pdf`

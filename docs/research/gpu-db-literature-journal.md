@@ -94226,3 +94226,174 @@ policy need another modern pass, and GPU execution batching still needs more
 kernel-level evidence. Query optimization now has enough recent learned-route
 coverage to move back toward transaction/runtime or GPU execution unless a
 newer paper directly addresses cache-aware GPU route planning.
+
+### 2026-06-06 - GeminiFS makes GPU storage metadata explicit enough for device-side IO
+
+**Citation:** Shi Qiu, Weinan Liu, Yifan Hu, Jianqin Yan, Zhirong
+Shen, Xin Yao, Renhai Chen, Gong Zhang, and Yiming Zhang. "GeminiFS:
+A Companion File System for GPUs." 23rd USENIX Conference on File and
+Storage Technologies (FAST 25), pp. 221-236, 2025. Retrieved
+2026-06-06 from USENIX: `https://www.usenix.org/conference/fast25/presentation/qiu`.
+PDF: `https://www.usenix.org/system/files/fast25-qiu.pdf`.
+
+**Category:** GPU execution / storage IO, with multi-tier cache / data
+placement and database file-system/storage/indexing relevance.
+
+**Relevance tags:** GeminiFS; GPU-centric storage; NVMe queues; GPU file
+system; embedded block map; GPU page cache; GPUDirect-style storage;
+HBM/DRAM/NVMe placement; route metadata; preallocated files; direct GPU IO;
+software-defined page cache; P8 storage.
+
+**Core idea:** GeminiFS gives GPU programs a file-oriented direct-storage path
+without asking the CPU to initiate every IO. It does this by making just enough
+host-file metadata visible to the GPU: a GPU-specific file format embeds file
+size, access mode, logical-to-NVMe block mapping, and dirty bitmap metadata in
+the file, while a shared NVMe driver lets CPU and GPU queue pairs coexist. The
+GPU then issues file reads/writes through a small library and uses a
+GPU-friendly page cache rather than treating the host file system as an opaque
+CPU service.
+
+The transferable idea for GPU DB is the split between metadata authority and
+metadata visibility. GeminiFS does not try to run a full POSIX file system on
+the GPU. It lets the CPU/host side create, move, delete, and preallocate files,
+then publishes a compact, device-readable mapping for predictable GPU-side IO.
+That is close to what P8 needs for cold/warm segments: CPU/WAL/catalog remain
+the correctness authority, while GPU execution gets a validated route descriptor
+that is small enough to use without CPU round trips.
+
+**Concrete mechanisms:**
+
+- GeminiFS introduces GVDK, a GPU virtual disk format whose first block stores
+  private per-file metadata, including file type, file size, access mode, IO
+  block size, data block metadata, index structure, and a dirty bitmap pointer.
+- A host-side GVDK helper obtains physical block offsets from the host kernel at
+  file creation/preallocation time and embeds the logical-file-block to NVMe
+  physical-block mapping into the file. The paper reports about 0.2% capacity
+  overhead when an 8-byte NVMe offset is stored per 4 KB block.
+- The GPU-side mapping is two-level: an L1 table points to L2 tables, and L2
+  entries point to data blocks. The mapping table is cached in GPU memory on
+  open, so GPU-side reads can translate file offsets to NVMe offsets without
+  walking host file-system structures.
+- SNVMe, the shared NVMe driver, records GPU memory allocations used for IO
+  queues, pins them through NVIDIA peer-to-peer APIs, maps them to DMA
+  addresses, and registers GPU-resident IO queues with the NVMe controller.
+  Completion is polled by GPU threads rather than host interrupts.
+- GeminiFS uses a software-defined GPU page cache. A host management module
+  shares page-cache allocations among GPU processes opening the same file via
+  CUDA interprocess memory handles and persistent mappings.
+- Page-cache locking is done at warp granularity rather than per thread. A hash
+  table maps file pages to memory pages, and a hash-table plus doubly-linked
+  list tracks zero-reference pages for constant-time lookup and cold-page
+  selection.
+- The page cache exposes page-size and prefetch tuning. On misses, it can
+  prefetch multiple pages so one warp can submit enough NVMe commands to fill
+  storage bandwidth while amortizing cache-lock work.
+- The library exposes CPU-side initialization/open/close and GPU-side
+  `G_read`, `G_write`, and `G_sync` operations. It intentionally does not
+  implement full POSIX semantics.
+- Crash consistency is application-selected through `G_sync`; the paper's
+  workload assumptions are mostly read-only long-lived data, append-only model
+  weights/KV-cache, and short-lived intermediate data that may not require
+  persistence.
+- Evaluation used a 64-core Intel Xeon server, 512 GB memory, an 80 GB GPU over
+  PCIe Gen4 x16, and an Intel Optane 5800X NVMe device. GeminiFS used 32 GPU IO
+  queue pairs and 64 host queue pairs.
+- For 4 KB reads without cache effects, GeminiFS averaged 7.33x GPUfs bandwidth
+  and reached NVMe peak bandwidth at 1,024 GPU threads. It was about 4.6% lower
+  bandwidth and about 4.8% higher latency than raw-device BaM because it pays
+  file-interface metadata parsing and address translation overhead.
+- Compared with GDS, GeminiFS lost at low thread counts but scaled better under
+  high GPU parallelism: at 128-512 threads it reached 6.2x GDS bandwidth, and
+  at 1,024 threads its latency was reported as 17% of GDS latency.
+- The page-cache microbenchmarks report prefetch improving read/write page-cache
+  performance by roughly 2.4x/2.34x, warp scaling to about 658 GB/s read and
+  641 GB/s write cache bandwidth, and larger pages approaching memcpy bandwidth.
+- In GPT2-124M training experiments, GeminiFS reduced checkpoint write time by
+  85%, 75%, and 59% versus native, DLRover-RM, and GDS respectively; when
+  activation offload dominated runtime, it reduced training time by 94.5% and
+  91% versus native and GDS respectively.
+- Future work names multi-GPU support, file splitting for parallel reads/writes,
+  RAID over multiple NVMe devices, preallocated slots for less predictable
+  workloads, and PyTorch integration.
+
+**GPU DB mapping:** P8 should treat GPU-visible storage metadata as a published
+route asset, not as an accidental property of host files. A resident or cold
+segment route can carry a compact block map, segment size, checksum, visibility
+boundary, source WAL boundary, supported predicate families, and tier location.
+GPU execution workers can then issue direct reads for eligible cold/warm
+segments without routing every miss through a CPU owner, while mutation/catalog
+owners remain responsible for durable authority and invalidation.
+
+GeminiFS is especially useful for over-resident designs where GPU HBM cannot
+hold every hot candidate segment. Instead of only choosing between full HBM
+residency and CPU fallback, GPU DB can benchmark a third path: GPU-owned direct
+NVMe reads from prevalidated segment maps, with a device-side page cache for
+predictable scans, lookup batches, and route-shaped intermediates. The cache
+should be keyed by route descriptor, snapshot generation, segment id, and block
+range rather than session id.
+
+The embedded block-map idea also maps to checkpoint and cold-tier object
+manifests. GPU DB can let CPU/WAL/checkpoint code allocate segment files,
+commit their metadata, and publish a compact descriptor to GPU workers only
+after durability and visibility fences are satisfied. That avoids asking GPU
+kernels to understand extents, directories, object-store placement, or WAL
+recovery while still removing CPU orchestration from repeated reads.
+
+For session concurrency, GeminiFS argues for batching at the warp/route level.
+A million logical sessions should not each own storage state. They should submit
+work into route cohorts; GPU workers drain compatible requests, translate
+through shared segment maps, use shared page-cache lines, and return results
+through response rings.
+
+**Risks and mismatches:** GeminiFS targets ML training/inference workloads with
+predictable, mostly read-only or append-only data. SQL workloads have harder
+correctness requirements: updates, deletes, DDL, MVCC visibility, WAL replay,
+secondary indexes, snapshots, and transactional error semantics. GPU DB should
+not copy GeminiFS's relaxed POSIX/crash model into SQL-visible storage.
+
+The design depends on preallocation and embedded physical block maps. That is a
+reasonable benchmark mechanism for DB-owned segment files, but it can become
+stale if the host file system moves blocks, if files are resized dynamically,
+or if compaction rewrites cold segments without publishing a new descriptor.
+The descriptor must therefore be versioned, checksummed, invalidated by owners,
+and tied to a WAL/checkpoint boundary.
+
+GPU-side NVMe queues and peer-to-peer DMA require driver support, device
+capability, and careful isolation. The paper's security discussion is limited;
+GPU DB would need stronger tenant/session isolation, descriptor bounds checks,
+and a fallback path when direct GPU IO is unavailable.
+
+The page-cache policy is designed for predictable sequential and shared GPU
+access. It may do poorly for mixed OLTP point lookups plus scans unless route
+admission, page size, and prefetch are tied to measured workload shape. Large
+pages help cache bandwidth but can amplify wasted NVMe traffic and HBM pressure
+for selective predicates.
+
+**Benchmark candidates:**
+
+- Add a three-path cold/warm segment read benchmark: CPU-orchestrated read plus
+  GPU transfer, GPUDirect/GDS-style CPU-submitted IO, and GeminiFS-like
+  GPU-submitted direct NVMe reads from a prevalidated segment map. Measure p50,
+  p99, NVMe bandwidth, CPU cycles, GPU stall time, HBM pressure, and fallback
+  count.
+- Build a P8 segment descriptor prototype with `{table_oid, schema_generation,
+  visibility_boundary, wal_boundary, segment_id, checksum, block_map}`. Gate:
+  GPU workers can read only descriptors whose durability and invalidation state
+  are current, and stale descriptors are rejected deterministically.
+- Test GPU page-cache granularity for SQL routes: 4 KB, 64 KB, 1 MB, and
+  route-shaped prefetch for point lookups, prefix filters, and scans. Failure
+  condition: large pages improve scans but regress lookup p99 or evict resident
+  hot fragments too aggressively.
+- Add a direct-NVMe miss path to retained lookup batching as a benchmark-only
+  prototype. Compare one request per IO versus warp/route-cohort submission and
+  measure whether batching hides NVMe latency without violating singleton SLOs.
+- Crash-test descriptor publication: preallocate and publish a segment map only
+  after WAL/checkpoint fences, inject crashes between allocation, map embed,
+  checksum publication, and route visibility, and verify recovery never trusts a
+  descriptor that canonical WAL replay cannot justify.
+- Evaluate shared GPU page-cache accounting by route family rather than process:
+  resident bytes, cache hits, invalidation hits, prefetch waste, dirty pages,
+  and owner-triggered eviction reasons.
+- Add a capability fallback benchmark where direct GPU IO is unavailable or
+  unsafe. Gate: planner and runtime can route to CPU/GDS paths with explicit
+  telemetry instead of silently assuming GPU file IO support.
