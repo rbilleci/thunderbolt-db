@@ -6958,13 +6958,14 @@ Append new candidates here as each paper is processed.
   replaying log statements across many model/program versions, with
   checkpoint-based parallelism that may map to GPU DB version-tree replay
   and cold snapshot reconstruction benchmarks.
-- `queued` — **Efficient Logging in Non-Volatile Memory by Exploiting
+- `reviewed` — **Efficient Logging in Non-Volatile Memory by Exploiting
   Coherency Protocols**, Cohen, Friedman, and Larus, OOPSLA/PACMPL 2017.
   URL: `https://arxiv.org/abs/1709.02610`
   DOI: `https://doi.org/10.1145/3133891`
   Why: discovered while reviewing REWIND; useful follow-up on persist-order
   costs, coherence-induced reordering, and single-round-trip NVM logging before
   GPU DB adopts any byte-addressable warm-tier log or durable metadata path.
+  Journal entry added 2026-06-06 from the arXiv/PACMPL paper.
 - `queued` — **Fine-Grain Checkpointing with In-Cache-Line Logging**,
   Cohen, Aksun, Avni, and Larus, ASPLOS 2019.
   URL: `https://arxiv.org/abs/1902.00660`
@@ -6972,3 +6973,16 @@ Append new candidates here as each paper is processed.
   Why: discovered while reviewing REWIND; useful follow-up on low-overhead
   persistent Masstree-style structures, in-cache-line undo records, and
   checkpoint granularity for future CPU warm indexes or route metadata.
+- `queued` — **DudeTM: Building Durable Transactions with Decoupling for
+  Persistent Memory**, Liu et al., ASPLOS 2017.
+  DOI: `https://doi.org/10.1145/3037697.3037714`
+  Why: PCSO logging contrasts DudeTM's background persistence and durability
+  latency tradeoff; useful for comparing foreground one-flush durability with
+  decoupled logging when GPU DB evaluates NVM/CXL write-path staging.
+- `queued` — **Log-Structured Non-Volatile Main Memory**, Hu, Ren, Badam, and
+  Moscibroda, USENIX ATC 2017.
+  URL: `https://www.usenix.org/conference/atc17/technical-sessions/presentation/hu`
+  Why: PCSO logging contrasts log-structured NVM management that turns writes
+  into append operations indexed by volatile metadata; useful for comparing
+  persistent warm-tier logs, allocator recovery, and route-metadata rebuild
+  strategies.

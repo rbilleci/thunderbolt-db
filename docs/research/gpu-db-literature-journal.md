@@ -38,6 +38,199 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - PCSO logging turns cache-line order into a one-flush durability proof
+
+**Citation:** Nachshon Cohen, Michal Friedman, and James R. Larus.
+"Efficient Logging in Non-Volatile Memory by Exploiting Coherency
+Protocols." PACMPL/OOPSLA 2017, Article 67. DOI: `10.1145/3133891`.
+Retrieved 2026-06-06 from arXiv at `https://arxiv.org/abs/1709.02610`
+and PDF `https://arxiv.org/pdf/1709.02610`.
+
+**Category:** WAL, logging, and read/write throughput, with secondary
+relevance to future NVM/CXL warm tiers, persistent route metadata, and
+database file-system/storage design.
+
+**Relevance tags:** persistent memory; NVM logging; cache-line atomicity;
+PCSO; clflushopt; sfence; validity bits; flexible validity bit; one-round-trip
+append; persistent hash map; recovery; write amplification; future CXL/NVM
+WAL; durable metadata.
+
+**Core idea:** The paper observes that NVM writes through CPU caches are
+harder than ordinary stores because different cache lines may persist in a
+different order than program order. But within one cache line, if a later
+store is forced to become visible after earlier stores, then seeing that later
+validity store after recovery proves the earlier payload stores in the same
+cache line also reached persistent memory. The authors call this persistent
+cache store order, or PCSO.
+
+For GPU DB, the strongest transferable idea is not to adopt this exact 2017
+NVM algorithm immediately. It is to make durability proofs local, aligned, and
+cheap. Future WAL chunks, persistent route descriptors, warm-tier index
+entries, and checkpoint metadata should be shaped so recovery can validate a
+small cache-line or slab-local proof rather than requiring a second durable
+commit record for every tiny update.
+
+**Concrete mechanisms:**
+
+- PCSO composes ordinary CPU/cache store ordering with cache-to-NVM behavior:
+  stores to different cache lines can persist out of order, while ordered
+  stores to the same cache line can be used as a local persistence proof.
+- The basic CSO-VB log embeds at least one validity bit in every cache line
+  spanned by a log entry. The algorithm writes payload first, then writes the
+  validity bit, then flushes the cache line(s) and fences once. Recovery treats
+  the entry as valid only when every cache-line validity bit has the expected
+  polarity.
+- Circular-log reuse flips the meaning of the validity bit rather than
+  reinitializing the whole log on every wrap. The persistent head records the
+  current polarity; the volatile tail is reconstructed or ignored during
+  recovery.
+- For payloads whose layout cannot be changed, CSO-Random initializes cache
+  lines with a random sentinel and treats a changed final word as evidence of
+  a full write, with a rare fallback when payload data collides with the
+  sentinel.
+- CSO-FVB avoids changing payload layout by finding the final bit that differs
+  between old and new cache-line contents. It stores that bit position and
+  value in nearby metadata, writes the payload in an order that makes the
+  selected bit last, then validates the payload line during recovery by
+  checking that bit.
+- The paper extends the approach to a single-trip persistent set. Hash buckets
+  and next pointers are volatile and rebuilt during recovery from an enhanced
+  persistent log. Updates write key/value/version metadata into log entries
+  with validity bits, then recovery reconstructs the in-memory hash structure.
+- Limited multi-entry transactions in the persistent set use a shared version
+  plus an 8-bit transaction counter. Recovery commits the group only when the
+  number of valid entries with the same version matches the counter.
+- The evaluation emulates NVM with DRAM plus artificial flush delays from
+  0 to 800 ns. CSO-VB performs best in log microbenchmarks when entries fit
+  its layout constraints; CSO-Random and CSO-FVB are close while supporting
+  larger or layout-preserving entries.
+- Replacing TinySTM and Atlas logging with the PCSO-based algorithms improved
+  selected benchmark performance by up to roughly 42% and 38% respectively
+  under the paper's emulated-latency tests. The persistent set improved
+  throughput by 25% with no added flush latency and up to 86% with 800 ns
+  added flush latency in the reported YCSB-like stress test.
+
+**GPU DB mapping:** GPU DB's current WAL-before-visibility invariant should
+remain conservative: append and flush the WAL, then invalidate affected
+resident generations, apply CPU-visible MVCC/catalog state, and only then
+publish visibility. PCSO-style logging can inform the physical shape of future
+small durable records inside that invariant. A WAL chunk, route-metadata
+checkpoint, or persistent warm-index delta can be laid out as cache-line-sized
+records with payload-first, proof-last fields and recovery-side validation.
+
+The validity-bit idea maps to route and residency metadata particularly well.
+If a future CXL/NVM tier stores resident snapshot descriptors, cold-object
+manifests, or warm index leaves, each record should carry a local validity
+proof: relation id, schema generation, WAL boundary, record generation, and a
+proof bit or proof word written last. Recovery should be able to discard torn
+or partially published descriptors without consulting GPU memory or trusting
+volatile owner state.
+
+The circular-log polarity trick maps to append-only metadata slabs. Instead
+of zeroing a large warm-tier log or descriptor arena before reuse, GPU DB can
+test generation/polarity epochs and recover only entries whose local proof
+matches the arena generation. That is useful for high-throughput ingest,
+route-cache checkpoints, and persistent free-list records, but only if wrap
+epochs cannot be confused after crash/recovery.
+
+The persistent-set design is a useful contrast for CPU warm indexes. It makes
+the durable log authoritative and rebuilds volatile next pointers after
+recovery. GPU DB should prefer that shape for future warm/cold indexes until a
+durable pointer structure is proven: persist compact records and versions, then
+rebuild heavier pointer/routing structures from WAL/checkpoint metadata.
+
+The one-flush goal also matters for commit batching. GPU DB can batch WAL
+records for throughput, but small latency-sensitive commits may benefit from
+cache-line-local durable proof records that do not require a second persistent
+link or commit cache line. Any such experiment must still expose flush/fence
+latency separately from GPU execution time and network response time.
+
+**Risks and mismatches:** The paper is about persistent-memory logging and
+persistent data structures, not a full DBMS WAL, replication, MVCC, SQL
+isolation, GPU snapshot invalidation, or crash-recovery design.
+
+The correctness argument depends on cache-line atomicity, specific CPU store
+ordering assumptions, explicit flush/fence instructions, and careful control
+over payload layout and compiler reordering. GPU DB should not apply it to
+ordinary files, NVMe blocks, object storage, DMA buffers, or GPU memory without
+a separate persistence model.
+
+The evaluation predates shipping data-center persistent-memory deployments and
+uses DRAM plus injected flush delay. The relative mechanism is useful, but the
+absolute gains need recalibration on modern CPUs, CXL/NVM hardware, NVMe, and
+any target filesystem or direct-access mode.
+
+CSO-VB is fastest when the record format can reserve validity bits in each
+cache line. CSO-FVB supports arbitrary payloads but needs old-content reads,
+bit searches, and metadata. That overhead may be unacceptable for some WAL or
+metadata records unless the format is designed around proof fields from the
+start.
+
+The persistent set trades fast modification for recovery work proportional to
+allocated log/set memory. That is acceptable for some warm indexes and route
+metadata, but not for every restart path. GPU DB would need recovery-time
+budgets and checkpoint compaction before making this a broad storage pattern.
+
+**Benchmark candidates:**
+
+- Build a CPU-only persistent-record simulator for WAL-side route metadata:
+  two-round commit record, checksum record, cache-line validity bit, and
+  flexible-validity-bit layouts. Measure append latency, bytes written,
+  flush/fence count, recovery reject rate for injected torn writes, and
+  metadata density.
+- Add a future-tier WAL microbenchmark that separates group commit from
+  single-record proof cost. Gate: one-flush records reduce p50 commit latency
+  or metadata-write amplification without weakening WAL-before-visibility.
+- Prototype persistent route-descriptor slabs with generation/polarity wrap
+  fields. Recovery must discard partially written descriptors and reject stale
+  wrap generations before any resident snapshot or route cache is published.
+- Compare rebuildable warm-index formats: durable linked/pointer structure
+  versus persistent log plus volatile rebuilt pointers. Required metrics:
+  update latency, crash-recovery time, checkpoint-compaction cost, and steady
+  read latency.
+- Add a torn-write fault-injection gate for any future NVM/CXL metadata path:
+  randomly stop after payload, after proof field, after flush, and after fence.
+  Failure condition: recovery accepts a record whose relation id, schema
+  generation, WAL boundary, or payload is partially mixed.
+- Track flush/fence telemetry as a first-class write-path metric alongside
+  mutation-owner queue wait, WAL bytes, invalidation latency, and response
+  time. GPU throughput gains should not hide persistence-ordering cost.
+
+### 2026-06-06 - Cross-paper synthesis: route metadata needs proof fields, bounded lifetime, and sampled movement
+
+PCSO logging, MTM, Crystalline, and Aeolus converge on a practical control
+track for GPU DB: hot paths should exchange compact proof-carrying metadata,
+then manage that metadata with bounded lifetime, bounded sampling overhead,
+and explicit admission credits. A route decision is not just a planner answer;
+it is a small object whose durability, visibility, freshness, placement, and
+queue authority must be provable at the moment of execution.
+
+**Converging design tracks:** First, route and storage metadata should be
+written in proof-friendly layouts: payload fields first, generation or
+validity proof last, and recovery rules that reject partial records. Second,
+metadata protection should scale with physical workers, not logical sessions;
+Crystalline-style bounded slots fit retained snapshot descriptors better than
+per-session hazards. Third, tier placement should be a sampled control loop
+over semantic objects such as resident snapshots, key vectors, descriptor
+slabs, pinned buffers, and warm indexes. Fourth, admission should use credits
+or scheduled grants so speculative and retry traffic cannot overwhelm owner
+rings, response rings, or future storage/network fabrics.
+
+**Category gaps:** The queue now has good recent coverage for runtime
+metadata, tier movement, and NVM logging. The next high-value lane should
+prefer transaction scheduling/MVCC or high-concurrency networking, especially
+where a 2023-present paper exposes concrete conflict, admission, or snapshot
+mechanisms.
+
+**Benchmark priorities:** Build a proof-carrying route-metadata benchmark:
+records have WAL boundary, schema generation, resident generation, tier
+placement, proof field, and reclamation generation. Inject torn writes, stale
+route hints, stalled workers, hot/cold tier shifts, and admission overload.
+The proof gate should require recovery rejection of partial records, bounded
+retired bytes, sampled telemetry overhead below budget, and p99 latency that
+names whether delay came from persistence, reclamation, placement, or
+admission.
+
 ### 2026-06-06 - Citron makes remote range locks a static metadata protocol
 
 **Citation:** Jian Gao, Youyou Lu, Minhui Xie, Qing Wang, and Jiwu Shu.
