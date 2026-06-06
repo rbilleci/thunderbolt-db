@@ -323,13 +323,22 @@ Append new candidates here as each paper is processed.
   files, replication, recovery, and read/write performance implications;
   directly relevant to GPU DB WAL-before-visibility and future replica paths.
   Journal entry added 2026-06-06.
-- `queued` — **DecLog: Decentralized Logging in Non-Volatile Memory for Time
+- `reviewed` — **DecLog: Decentralized Logging in Non-Volatile Memory for Time
   Series Database Systems**, Zheng et al., PVLDB 2023.
   PDF: `https://www.vldb.org/pvldb/vol17/p1-zheng.pdf`
   DOI: `https://doi.org/10.14778/3617838.3617839`
   Why: decentralized WAL/logging path for high-ingest workloads; useful for
   comparing owner-local log buffers, NVM/SSD flush behavior, and write
   throughput under massive append pressure.
+  Journal entry added 2026-06-06.
+- `queued` — **NVWAL: Exploiting NVRAM in Write-Ahead Logging**,
+  Kim et al., ASPLOS 2016.
+  URL: `https://doi.org/10.1145/2872362.2872392`
+  Metadata: `https://dblp.org/rec/conf/asplos/KimKBNW16`
+  Why: DecLog contrasts NVM WAL designs that use persistent-memory ordering
+  and consolidated flushing; useful for comparing hardware-shaped WAL records,
+  NVRAM log placement, and SQLite-style transactional durability with GPU DB's
+  future NVM/CXL-tier WAL options.
 - `queued` — **Improving database performance by leveraging network-assisted
   logging**, Future Generation Computer Systems 2025.
   URL: `https://www.sciencedirect.com/science/article/pii/S0167739X25000809`

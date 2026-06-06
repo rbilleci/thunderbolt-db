@@ -38,6 +38,189 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - DecLog: independent writes should not wait behind one global WAL sequence
+
+**Citation:** Bolong Zheng, Yongyong Gao, Jingyi Wan, Lingsen Yan,
+Long Hu, Bo Liu, Yunjun Gao, Xiaofang Zhou, and Christian S.
+Jensen. "DecLog: Decentralized Logging in Non-Volatile Memory for
+Time Series Database Systems." PVLDB 17(1), 2023, pp. 1-14.
+doi:10.14778/3617838.3617839. Retrieved 2026-06-06 from
+`https://www.vldb.org/pvldb/vol17/p1-zheng.pdf`.
+
+**Category:** WAL, logging, and read/write throughput, with write
+path, recovery, checkpointing, and future NVM/CXL-tier relevance.
+
+**Relevance tags:** decentralized WAL; data-driven LSN; relaxed
+persist ordering; persistent memory; log queues; parallel logging;
+thread snapshots; group commit; log compression; checkpoint;
+operation-level replay; insert-heavy workloads; recovery.
+
+**Core idea:** DecLog observes that time-series workloads are
+insert-heavy and have relatively rare update/delete conflicts. A
+centralized ARIES-style log sequence bottleneck and strict persistent
+ordering therefore serialize many writes that are logically
+independent. DecLog moves the dependency signal closer to the data:
+insert-only log entries receive LSN 0, update/delete entries compute a
+small data-driven LSN from the update timestamps of the touched data
+points, and only entries with real dependencies are forced into
+ordered persistence and ordered replay.
+
+The strongest GPU DB lesson is that WAL-before-visibility does not
+require every commit to wait behind one global serialization point.
+The durable commit boundary must still be explicit, but the log owner
+can distinguish independent append-only writes, hot-key updates, and
+conflicting update chains. That distinction can drive separate queues,
+group commit, and replay lanes without weakening recovery correctness.
+
+**Concrete mechanisms:**
+
+- DecLog runs on a three-tier DRAM + NVM + HDD/SSD design: recent
+  database state is in DRAM, logs are persisted to byte-addressable
+  NVM, and checkpoints/data are written to block storage.
+- Each time-series data point uses an extended 64-bit timestamp:
+  one lock bit, one tombstone bit, a 10-bit update timestamp (`uts`),
+  and the original timestamp in the remaining 52 bits. The design
+  assumes microsecond precision is enough for the tested workloads.
+- Insert-only transactions set their log LSN to 0. Update/delete
+  transactions compute `LSN = max(touched_data_point.uts) + 1`, lock
+  the modified data points, validate that `uts` values did not change,
+  then publish the new `uts` values and tombstones before commit.
+- The LSN protocol is OCC-like and intentionally tuned for rare update
+  conflicts. Transactions that update disjoint data can have the same
+  LSN and replay in any order; dependent updates get increasing LSNs.
+- Log entries are buffered in per-logging-thread queues. Entries with
+  `LSN = 0` can share a queue; an entry with `LSN > 0` closes the
+  current queue so following entries move to the next queue.
+- A relaxed ordering strategy reduces persistent-memory barriers. Log
+  flushing persists heads/payloads and tails through a pipeline so
+  independent later inserts are not blocked behind an earlier update's
+  `sfence`, while the last dependent entries still preserve recovery
+  order.
+- Key-based partitioning maps measurement/tag/field keys to logging
+  threads. Recovery can replay at operation granularity in LSN order
+  instead of rebuilding transaction-level order across all log files.
+- Thread snapshotting avoids latch-heavy synchronization across logging
+  threads. DecLog maintains DRAM arrays for the count of persisted
+  update logs per queue and the outstanding LSN per queue; a logging
+  thread waits only when the snapshot proves a lower dependent LSN has
+  not yet persisted.
+- Log entries are compressed by time-series key using delta-of-delta
+  timestamp compression and XOR value compression. A key hash table is
+  created in NVM and mirrored in DRAM so compression metadata survives
+  recovery while reads of the table stay fast.
+- Group commit aligns compressed log data to 256-byte NVM blocks,
+  because the paper reports much poorer persistence behavior for
+  64-byte writes on Optane PMem. Small entries are merged until near a
+  256-byte multiple and then committed in groups.
+- Checkpoint logs record the checkpoint time interval, per-stream log
+  offsets, the LSN-reset time, and the compression hash table. Insert
+  transactions can continue during much of checkpointing, while update
+  transactions are blocked around timestamp reset and hash-table
+  transition.
+- Recovery parses compressed/aligned log blocks, replays insert-only
+  logs in parallel, buckets update logs by LSN, then replays update
+  logs in ascending LSN order. Incomplete aligned groups are discarded.
+- Evaluation uses a modified Beringei on YCSB-TS with 400M data points
+  and 28 transaction threads on a two-socket Optane PMem server. The
+  default DecLog setup uses four logging threads, two queues per
+  thread, and queue length 300.
+- Reported throughput is up to 4.6x Beringei-NVM and close to
+  no-logging: DecLog is 6.2%, 7.5%, 11.3%, and 15.6% below no-logging
+  on the four tested workloads. Compared with Beringei-NVM, average
+  commit latency falls by 39.7% to 80.8% depending on workload.
+- The paper reports DecLog recovery time roughly 80% shorter than
+  Beringei-NVM on tested workloads, and DecLog with checkpoint reduces
+  recovery time by about 95% or more compared with DecLog without
+  checkpoint in Table 2.
+- Ablations attribute gains to relaxed ordering, data-driven LSNs,
+  parallel logging, and alignment. Compression costs a small amount of
+  throughput but reduces log footprint and NVM writes; checkpointing
+  costs more under update workloads because it consumes CPU/IO and
+  blocks updates during part of the protocol.
+
+**GPU DB mapping:** GPU DB can borrow DecLog's separation between
+global durability order and dependency order. The mutation owner can
+keep a global durable WAL position for replay and trimming, while
+write admission classifies batches by conflict domain: append-only
+segment inserts, hot-key updates/deletes, catalog changes, and broad
+invalidations. Independent append batches should be able to reserve
+log space, flush in parallel lanes, and publish visibility after their
+own durable outcome instead of waiting for a single unrelated hot-key
+update to retire.
+
+The data-driven LSN is especially relevant to route invalidation. For
+GPU DB, the "data touched" signal could be table/partition/segment/key
+range plus schema generation. A commit's visibility sequence remains
+comparable, but the invalidation dependency can be narrower: an append
+to a cold segment, an update to a hot resident key range, and a catalog
+DDL event do not need the same replay or refresh lane. That gives P8 a
+path toward high ingest without making every resident snapshot rebuild
+wait on a global queue.
+
+Thread snapshotting maps to owner-local dependency snapshots. Instead
+of taking a global WAL mutex, each logging lane or partition owner can
+publish compact progress facts: last persisted dependency sequence,
+oldest outstanding dependent update, queue saturation, and durable
+callback state. The mutation/admission layer can then wait only on the
+specific lanes that prove dependency, preserving WAL-before-visibility
+while avoiding unnecessary cross-lane stalls.
+
+The compression/alignment lesson is also practical. GPU DB should not
+assume "persistent memory" or future CXL/NVM tiers make write shape
+irrelevant. WAL records, COPY chunks, invalidation records, and resident
+refresh descriptors should be grouped to hardware-efficient write
+granularity, but every group still needs explicit per-transaction or
+per-batch completion facts so visibility is not published from a
+partially durable block.
+
+**Risks and mismatches:** DecLog is a TSDBMS logging paper, not a
+general OLTP or SQL MVCC engine. Its main assumption is insert-heavy
+time-series data with rare update/delete conflicts and stable keys.
+GPU DB must handle ordinary relational updates, deletes, DDL, indexes,
+retained GPU snapshots, query route certificates, and pgwire sessions.
+The 10-bit embedded `uts` trick depends on spare timestamp bits and is
+not generally applicable to arbitrary SQL types.
+
+The design targets Optane PMem, a product line that is no longer a
+safe default hardware assumption. The transferable idea is the
+dependency-aware WAL and hardware-shaped persistence protocol, not a
+requirement to adopt Optane-specific latencies or 256-byte alignment
+unchanged. DecLog also uses operation-level replay for time-series
+records; GPU DB must preserve transaction atomicity, index consistency,
+and WAL-before-visibility across all affected structures.
+
+**Benchmark candidates:**
+
+- Add a WAL dependency-lane benchmark with append-only inserts,
+  hot-key updates, and deletes. Compare one global WAL sequencer with
+  dependency-aware lanes that still publish a single comparable
+  visibility sequence. Gate: replay reconstructs the same table/index
+  state as the global sequencer.
+- Prototype write admission classes: append segment, key-range update,
+  broad table invalidation, and DDL/catalog. Measure whether independent
+  append batches continue while one hot update lane waits on durable
+  flush or conflict validation.
+- Add explicit durable-outcome callbacks per WAL group: reserved LSN
+  range, group block id, dependency lane, visibility generation, success
+  or failure. Failure condition: any resident snapshot, route
+  certificate, or CPU index observes a write before its callback succeeds.
+- Compare WAL record grouping sizes for COPY/INSERT batches: small
+  records, cache-line-sized groups, filesystem/NVMe-friendly blocks, and
+  future NVM-like alignment. Measure throughput, p50/p99 commit latency,
+  replay time, bytes written, and invalidation delay.
+- Build recovery tests for operation-level parallel replay under
+  disjoint append lanes plus ordered update lanes. Gate: inserts replay
+  in parallel, dependent updates replay in order, and transaction-visible
+  atomicity remains intact.
+- Add checkpoint frontier telemetry: durable WAL tail, oldest active
+  write dependency lane, oldest retained read snapshot, resident
+  invalidation frontier, and replay start offset. Failure condition:
+  checkpointing shortens recovery by hiding an unflushed or un-invalidated
+  write.
+- Test conflict skew. As the fraction of hot-key updates rises, the
+  dependency-aware WAL should degrade toward ordered replay instead of
+  producing ambiguous same-LSN dependencies or unbounded retry loops.
+
 ### 2026-06-06 - PALF: Replicated WAL should return file-like commit facts, not just consensus progress
 
 **Citation:** Fusheng Han, Hao Liu, Bin Chen, Debin Jia, Jianfeng
