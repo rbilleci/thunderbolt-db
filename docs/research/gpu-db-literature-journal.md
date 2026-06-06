@@ -38,6 +38,165 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Poplar relaxes WAL order to the dependencies recovery actually needs
+
+**Citation:** Huan Zhou, Jinwei Guo, Huiqi Hu, Weining Qian,
+Xuan Zhou, and Aoying Zhou. "Guaranteeing Recoverability via
+Partially Constrained Transaction Logs." arXiv:1901.06491v1, 2019.
+Retrieved 2026-06-06 from `https://arxiv.org/abs/1901.06491` and
+PDF `https://arxiv.org/pdf/1901.06491`.
+
+**Category:** WAL, logging, checkpointing, and read/write throughput,
+with transaction processing / write path relevance.
+
+**Relevance tags:** recoverability; parallel logging; partial log
+order; scalable sequence number; RAW dependencies; WAW dependencies;
+group commit; durable SSN; committable frontier; parallel recovery;
+multi-device WAL; OCC timestamp allocation.
+
+**Core idea:** Poplar argues that a recoverable in-memory DBMS does
+not need one global WAL order for every transaction. For redo-only
+in-memory recovery, the commit order must respect read-after-write
+dependencies, and log replay order must respect write-after-write
+dependencies. Write-after-read dependencies do not need to constrain
+durable log order because reads have no recovery side effect.
+
+The transferable idea for GPU DB is to separate the logical
+publication order required by SQL visibility from the physical order
+used to persist independent WAL records. A mutation owner can still
+preserve WAL-before-visibility, but independent partitions, keys, or
+route classes should not be forced through one serial LSN allocator if
+a smaller dependency certificate is enough for crash replay.
+
+**Concrete mechanisms:**
+
+- The paper defines three logging constraint levels. Recoverability
+  tracks RAW dependencies in transaction commit order and WAW
+  dependencies in log sequence order. Rigorousness also tracks WAR,
+  and sequentiality forces a total order even for independent
+  transactions.
+- Poplar uses multiple log buffers and logger threads, each bound to a
+  storage device. Worker threads generate log records into their mapped
+  buffers while logger threads flush buffers independently.
+- A scalable sequence number (SSN) replaces a centralized LSN. Each
+  tuple stores the SSN of the transaction that most recently modified
+  it, and each log buffer stores the most recent SSN allocated in that
+  buffer.
+- For a writing transaction, SSN is computed as one greater than the
+  maximum SSN seen in the read/write set and the mapped log buffer.
+  The transaction writes its SSN back to updated tuples, which makes
+  later overwrites observe WAW order. Read-only transactions inherit
+  the maximum SSN of their read set.
+- SSN deliberately does not update tuples that were only read, so WAR
+  dependencies do not inflate the ordering frontier. This is the key
+  difference from stricter dependency-tracking designs.
+- Each log buffer advances a durable SSN (DSN) only after all records in
+  a closed segment have been fully copied and flushed. Segment-index
+  entries track largest SSN, allocated bytes, buffered bytes, start
+  offset, and closed/open state to avoid flushing holes created by
+  concurrent reservation and copying.
+- A global committable SSN (CSN) is the minimum DSN across log buffers.
+  Transactions without RAW dependencies can commit once their own log
+  buffer DSN reaches their SSN. Transactions with RAW dependencies
+  commit only when their SSN is no larger than CSN, proving all earlier
+  dependency records across buffers are durable.
+- The paper integrates SSN with OCC by using SSN as the commit
+  timestamp after read validation and write-lock acquisition. This
+  removes a separate centralized timestamp allocator in the evaluated
+  DBx1000 prototype.
+- Checkpointing is fuzzy: checkpoints record a recovery start SSN, and
+  recovery restores checkpoints plus log records with SSN larger than
+  the checkpoint's recorded RSN. The paper notes that transactions can
+  keep running during checkpointing except for per-tuple locks.
+- Recovery is parallel across checkpoints and log files. Persistent log
+  records are replayed in SSN order where dependencies require it, while
+  independent log streams can be loaded concurrently.
+- Evaluation uses DBx1000 with Silo OCC, YCSB and TPC-C, 20 worker
+  threads, two SSDs by default for Poplar/Silo, 30 MB log buffers for
+  SSD experiments, and group commit every 5 ms or half-buffer full.
+- Reported results show Poplar and Silo reaching the highest throughput
+  as IO bandwidth scales across SSDs; Poplar avoids Silo's epoch
+  commit latency. The paper reports roughly 2x throughput over a
+  centralized logger with two SSDs, about 6x shorter commit latency than
+  Silo, and far higher throughput than an NVM-D direct-flush design on
+  SSDs. Recovery time improves with multiple SSDs because checkpoint and
+  log loading parallelize.
+
+**GPU DB mapping:** GPU DB should treat WAL records as carrying two
+different facts: durability placement and visibility/dependency order.
+The current single mutation-owner path is correct for the first slices,
+but future partition owners should be able to allocate dependency
+generations locally and persist independent WAL streams in parallel.
+Visibility should advance only when the dependency frontier proves that
+RAW predecessors are durable and WAW replay order is unambiguous.
+
+For retained GPU snapshots, Poplar suggests a concrete publication
+contract: a resident refresh generation can depend on a vector or
+minimum frontier of durable owner streams rather than one global LSN.
+Readers would receive a visibility boundary plus per-owner or
+per-partition durability frontier; invalidation and replay can then
+reason about the exact partitions touched instead of forcing every read
+route behind unrelated WAL traffic.
+
+The SSN/DSN/CSN split maps cleanly onto command and response rings.
+Each mutation lane can expose a durable generation, while a small
+commit-frontier service computes the minimum frontier only for routes
+that read across lanes. Single-lane writes can complete against their
+lane-local durable generation; cross-lane or RAW-dependent work pays
+the global frontier cost.
+
+Segment-index hole tracking is directly relevant to GPU DB's log
+buffers and pinned staging buffers. Reserving space in a ring is not
+the same as publishing a durable or visible record. The runtime should
+track reserved, filled, flushed, and visible offsets separately so a
+slow worker cannot create a hole that is mistaken for durable progress.
+
+**Risks and mismatches:** The paper targets redo recovery in an
+in-memory DBMS and assumes uncommitted updates do not need undo from
+durable storage. GPU DB must preserve its own WAL/checkpoint/archive
+contract and cannot drop undo or compensation requirements without a
+separate design proof.
+
+Poplar's partial order is based on tuple-level read and write sets. SQL
+range predicates, secondary indexes, DDL, catalog updates, retained GPU
+snapshots, and cold-tier placement metadata may introduce predicate or
+metadata dependencies that are not captured by tuple SSNs.
+
+The global CSN as minimum DSN can become conservative when many log
+streams exist and only a subset matters to a transaction. GPU DB should
+benchmark per-route frontier vectors or dependency subsets before
+adopting a whole-engine minimum frontier.
+
+The evaluation uses 20 worker threads and a DBx1000 prototype, not a
+million-session networked runtime. The mechanism is useful for WAL
+ordering, but it does not by itself solve session admission, response
+backpressure, or GPU scheduling.
+
+**Benchmark candidates:**
+
+- Build a synthetic multi-owner WAL benchmark with lane-local durable
+  generations and a Poplar-style global committable frontier. Gate:
+  write throughput, commit latency, and recovery correctness versus a
+  single global LSN under independent and cross-lane workloads.
+- Add a log-ring hole stress test: reserve records out of order, delay
+  fills, flush segments, and assert that durable and visible frontiers
+  never advance past an unfilled record.
+- Compare whole-engine minimum frontier versus per-route dependency
+  vectors for retained reads touching one partition, many partitions,
+  and catalog/residency metadata. Failure condition: unrelated WAL
+  streams dominate p99 read latency.
+- Test whether resident refresh publication can use a dependency
+  frontier rather than a scalar source WAL id. The proof gate is crash
+  replay plus route invalidation reproducing the same visible snapshot.
+- Add recovery replay benchmarks with independent WAL streams and
+  WAW-conflicting records to measure whether parallel loading and
+  dependency-ordered apply shorten restart time without changing final
+  state.
+- For OCC write paths, compare centralized timestamp allocation with
+  partition-local SSN allocation under hot-key and disjoint-key mixes.
+  Failure condition: lower timestamp overhead increases aborts,
+  validation anomalies, or route-invalidation ambiguity.
+
 ### 2026-06-06 - FissLock splits fast grant facts from heavy waiter state
 
 **Citation:** Hanze Zhang, Ke Cheng, Rong Chen, and Haibo Chen.

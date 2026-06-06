@@ -3110,17 +3110,25 @@ Append new candidates here as each paper is processed.
   Why: recovery-design follow-up cited by Adaptive Logging; relevant to
   separating volatile GPU/DRAM acceleration state from durable WAL/checkpoint
   truth as future memory tiers arrive.
-- `queued` — **Guaranteeing Recoverability via Partially Constrained
-  Transaction Logs**, Guo et al., arXiv 2019.
+- `reviewed` — **Guaranteeing Recoverability via Partially Constrained
+  Transaction Logs**, Zhou et al., arXiv 2019.
   URL: `https://arxiv.org/abs/1901.06491`
   Why: Poplar-style partial log ordering tracks RAW/WAW dependencies instead of
   forcing one serial LSN stream; useful follow-up for per-owner GPU DB WAL
-  streams and parallel crash recovery.
+  streams and parallel crash recovery. Journal entry added 2026-06-06.
 - `queued` — **Border-Collie: A Wait-free, Read-optimal Algorithm for
   Database Logging on Multicore Hardware**, Kim et al., SIGMOD 2019.
   URL: `https://doi.org/10.1145/3299869.3319869`
   Why: multicore logging algorithm cited by Taurus; relevant to minimizing
   reader-side coordination and cache coherence in the WAL publication path.
+- `queued` — **Write-Behind Logging**, Arulraj, Perron, and Pavlo,
+  PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol10/p337-arulraj.pdf`
+  DOI: `https://doi.org/10.14778/3025111.3025116`
+  Why: Poplar and the NVM recovery lane raise the boundary between
+  write-ahead durability, dependency ordering, and near-instant recovery;
+  WBL is a primary 2015-present contrast that logs changed regions after
+  flushing updates on byte-addressable NVM.
 - `queued` — **ExpressPass: End-to-End Credit-Based Congestion Control for
   Datacenters**, Cho et al., SIGCOMM 2017.
   URL: `https://doi.org/10.1145/3098822.3098843`
