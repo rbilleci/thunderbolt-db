@@ -38,6 +38,181 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - TL4x turns buffered durability into a snapshot-copying contract
+
+**Citation:** Gal Assa, Andreia Correia, Pedro Ramalhete, Valerio
+Schiavoni, and Pascal Felber. "TL4x: Buffered Durable Transactions on
+Disk as Fast as in Memory." PPoPP 2023. DOI:
+`https://doi.org/10.1145/3572848.3577495`. Retrieved 2026-06-06 from
+the PPoPP program page and Zenodo author PDF:
+`https://ppopp23.sigplan.org/details/PPoPP-2023-papers/19/TL4x-Buffered-Durable-Transactions-on-Disk-as-Fast-as-in-Memory`,
+`https://zenodo.org/records/7884520/files/TL4x-zenodo.pdf`.
+
+**Category:** WAL, logging, and read/write throughput; MVCC / snapshot
+/ visibility.
+
+**Relevance tags:** TL4x; buffered durable linearizability; persistent
+transactional memory; snapshot reads; double volatile replicas;
+persistent replica pair; no WAL; block storage; persistent memory; TL2;
+URCU; irrevocable reads; range queries; recovery; durability lag.
+
+**Core idea:** TL4x observes that many deployed databases use buffered
+durability: committed operations may be lost after a crash, but recovery
+must return a consistent state. It exploits that relaxed durability
+target by keeping two volatile data replicas, `Main` and `Back`, and two
+persistent replicas. Writers run on `Main`; `Back` is periodically
+frozen into a consistent snapshot for persistence and for long
+irrevocable read-only transactions. Persistence happens by copying that
+snapshot to the older persistent replica and only then publishing its
+timestamp.
+
+For GPU DB, the strongest transferable idea is not to weaken
+WAL-before-visibility for committed SQL transactions. It is the
+separation between visible execution state, frozen read/persist
+snapshots, and background copy/reconciliation. That shape can inform
+resident GPU snapshots, cold-tier checkpoint images, and non-critical
+route metadata snapshots where bounded durability lag is acceptable and
+explicitly reported.
+
+**Concrete mechanisms:**
+
+- TL4x provides buffered durable linearizable transactions: transactions
+  are linearizable during execution, and crash recovery returns some
+  consistent linearizable history, but not necessarily all transactions
+  that returned before the crash. The paper explicitly states that the
+  amount of lost progress is not bounded by this correctness criterion
+  or by the TL4x design.
+- User data lives in four mapped regions: volatile `Main`, volatile
+  `Back`, and persistent `P0`/`P1`. The persistent pair is updated by
+  choosing the older timestamped region, copying `Back`, flushing or
+  `msync()`ing the data, and publishing the persistent timestamp last.
+- TL4x uses TL2-style speculative transactions on `Main`: writers take
+  eager per-block locks, reads validate lock versions against the
+  transaction start clock, write transactions validate read sets at
+  commit, and the global clock supplies commit sequence values.
+- Blocks are 64 bytes in the implementation. Each `Main` and `Back`
+  block has a volatile sequence value; each persistent replica has one
+  persistent sequence timestamp for the latest modification represented
+  by that replica.
+- A copy thread cycles through `DUPLICATE`, `SYNCHRONIZE`, `SNAPSHOT`,
+  and `DUPLICATE_BLOCK`. In `DUPLICATE`, committed writers copy their
+  changed bytes to `Back`. In `SYNCHRONIZE`, the copy thread uses a
+  user-space RCU synchronization to stop new writers from modifying
+  `Back` and waits for in-flight writers. In `SNAPSHOT`, `Back` is a
+  frozen consistent snapshot used by persistence and irrevocable reads.
+  In `DUPLICATE_BLOCK`, writers and the copy thread copy whole divergent
+  blocks from `Main` back to `Back`.
+- Irrevocable read-only transactions wait for `SNAPSHOT` and then read
+  from `Back` without validation or aborts. This is meant for long range
+  queries or operations with external side effects.
+- Persistence is triggered when the global clock advances more than a
+  configured threshold, `MIN_TXN_SYNC`, or when a read-snapshot event is
+  requested. In the evaluation, `MIN_TXN_SYNC` is 10K transactions.
+- For persistent memory, the implementation uses cache-line write-back
+  and fences. For disk or SSD, it uses synchronous `msync()` on mapped
+  regions. The algorithm treats both as ways to persist the frozen
+  snapshot rather than putting write transactions on a synchronous
+  persist path.
+- Recovery reads the newer timestamped persistent replica, copies it
+  into `Main` and `Back`, reflects it into the older persistent replica,
+  flushes that replica, publishes its timestamp, and sets the global
+  clock to the recovered timestamp plus one.
+- The paper reports that TL4xDB outperforms RocksDB by about 10x on
+  `fillrandom` and 4x on `readrandom` in its db_bench comparison. It
+  also reports that disk, persistent-memory, and no-persistence TL4x
+  variants are similar across most experiments because transactions run
+  against volatile replicas while the copy thread persists snapshots.
+
+**GPU DB mapping:** P8 already says WAL/checkpoint/archive replay is the
+durable authority and GPU-resident state is rebuildable performance
+state. TL4x reinforces a useful split: visible mutation commit should
+stay on the strict WAL-before-visibility path, while resident GPU
+snapshots, route-cache snapshots, and some checkpoint-side images can
+use a frozen-copy publication protocol if their durability lag is
+explicit and recoverable.
+
+The `Main`/`Back` pattern maps to CPU truth plus immutable read
+snapshots. A mutation owner can update canonical WAL/MVCC state, while a
+residency or checkpoint owner periodically freezes a consistent source
+boundary for GPU refresh, long read-only batches, or cold-tier image
+construction. Reads against that frozen image should carry a snapshot
+generation and visibility boundary, not depend on the mutation owner
+for every tuple access.
+
+The `P0`/`P1` timestamp-last protocol maps to resident-fragment manifests
+and checkpoint images. When building a durable or semi-durable image,
+write the payload first, then publish a small generation or manifest
+record last. Recovery should choose the newest complete generation and
+reject incomplete copies without trusting volatile route maps.
+
+The `DUPLICATE_BLOCK` repair phase is a useful warning for GPU DB
+refresh. If writes continue while a snapshot is frozen, the engine needs
+a bounded reconciliation step: copy changed blocks, replay deltas, or
+rebuild affected segments before reusing the staging image. Otherwise a
+stale frozen copy quietly becomes a route-correctness hazard.
+
+Long irrevocable reads map to retained GPU/read snapshots. They should
+avoid per-row validation once admitted, but their admission must wait
+for a compatible published snapshot. For SQL, that should be framed as
+snapshot eligibility and bounded staleness/freshness policy, not as
+automatic permission to lose acknowledged committed transactions.
+
+**Risks and mismatches:** TL4x intentionally provides buffered
+durability. GPU DB cannot apply that guarantee to SQL commits that have
+acknowledged durable success unless the user explicitly chooses a weaker
+durability mode. WAL-before-visibility remains mandatory for normal
+transactions.
+
+The paper is a persistent transactional memory framework and a key-value
+prototype, not a full relational DBMS. It does not cover SQL isolation
+levels beyond the paper's transactional-memory consistency model,
+secondary indexes, query planning, DDL, replication, GPU kernels, pinned
+host buffers, or multi-tenant session admission.
+
+The memory/storage overhead is high: TL4x maintains four full replicas.
+That may be acceptable for a small key-value store or a bounded resident
+snapshot tier, but not for arbitrary large relational tables or GPU HBM.
+GPU DB should transfer the generation protocol, not the full-data
+quadruple-replica policy.
+
+The design does not bound lost progress after a crash. For GPU DB, any
+buffered or asynchronous snapshot path needs a published durability
+boundary, metrics for lag, and a clear distinction between durable
+commit, buffered performance state, and discardable resident state.
+
+Irrevocable readers may wait for a snapshot, and the copy thread can be
+affected by long readers, `msync()` latency, and oversubscription. GPU
+DB needs admission and preemption boundaries so frozen snapshots do not
+block refresh, cleanup, or durable publication indefinitely.
+
+**Benchmark candidates:**
+
+- Add a checkpoint/resident-image publication benchmark with two image
+  slots and timestamp-last manifests. Gate: crash simulation must recover
+  the newest complete image and reject torn or partial publication
+  without trusting volatile route metadata.
+- Compare strict WAL-per-commit, group WAL plus asynchronous resident
+  snapshot copy, and buffered snapshot-only durability for a marked
+  non-production mode. Measure write throughput, p99 commit latency,
+  lost-progress window, recovery time, and visibility boundary clarity.
+- Prototype CPU truth plus frozen GPU-refresh source snapshots. Writers
+  continue against canonical state while refresh reads a frozen boundary;
+  reconciliation uses changed-block or changed-segment tracking. Failure
+  condition: refresh publishes a resident generation that does not match
+  its advertised WAL/visibility boundary.
+- Benchmark long retained read-only scans over frozen snapshots versus
+  speculative/validated reads under concurrent writes. Measure aborts,
+  queue wait, p50/p99 latency, snapshot wait time, and memory retained by
+  long readers.
+- Test memory overhead policies for frozen snapshots: full copy,
+  changed-block copy, segment-level CoW, and delta replay. Gate: the
+  chosen policy must bound retained bytes under update pressure and
+  1M logical-session admission.
+- Add explicit durability-lag telemetry for any asynchronous snapshot or
+  checkpoint path: latest durable WAL boundary, latest resident snapshot
+  boundary, latest copied image boundary, oldest active reader, and
+  maximum lost-progress exposure for opt-in buffered modes.
+
 ### 2026-06-06 - ArchTM makes persistent writes a locality contract
 
 **Citation:** Kai Wu, Jie Ren, Ivy Peng, and Dong Li. "ArchTM:

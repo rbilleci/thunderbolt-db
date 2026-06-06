@@ -605,13 +605,15 @@ Append new candidates here as each paper is processed.
   Why: NV-HALT cites Crafty as an existing HTM-compatible persistent
   transaction design; useful for comparing fast-path persistence,
   instrumentation, and fallback requirements against route-publication tokens.
-- `queued` — **TL4x: Buffered Durable Transactions on Disk as Fast as in
+- `reviewed` — **TL4x: Buffered Durable Transactions on Disk as Fast as in
   Memory**, Assa, Correia, Ramalhete, Schiavoni, and Felber, PPoPP 2023.
-  URL: `https://doi.org/10.1145/3572848.3577476`
+  URL: `https://doi.org/10.1145/3572848.3577495`
   Why: NV-HALT compares against the Trinity/TL2 persistent-transaction line;
   useful for checking whether buffered durable transactions suggest simpler
   software-only durability/fallback baselines before GPU DB reaches for
-  hardware-assisted persistence.
+  hardware-assisted persistence. Journal entry added 2026-06-06 from the
+  PPoPP page and Zenodo author PDF; the paper DOI is
+  `https://doi.org/10.1145/3572848.3577495`.
 - `reviewed` — **ArchTM: Architecture-Aware, High Performance Transaction for
   Persistent Memory**, Wu, Ren, Peng, and Li, FAST 2021.
   URL: `https://www.usenix.org/conference/fast21/presentation/wu-kai`
@@ -1138,6 +1140,19 @@ Append new candidates here as each paper is processed.
   restart, restore, and log-history access; useful for comparing indexed-log
   storage with a more conservative WAL design that opens quickly and performs
   redo/undo work lazily.
+- `queued` — **Can Applications Recover from fsync Failures?**, Rebello,
+  Patel, Alagappan, Chidambaram, and Arpaci-Dusseau, USENIX ATC 2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/rebello`
+  Why: TL4x explicitly calls out `msync()` failure handling; useful for
+  checking how GPU DB should surface, retry, or quarantine failed flushes in
+  WAL, checkpoint, resident-image, and cold-tier manifest publication paths.
+- `queued` — **TIPS: Making Volatile Index Structures Persistent with
+  DRAM-NVMM Tiering**, Ramanathan et al., USENIX ATC 2021.
+  URL: `https://www.usenix.org/conference/atc21/presentation/krishnan`
+  Why: TL4x's replica-copy approach contrasts with tiering volatile index
+  structures onto persistent memory; useful for comparing route/index
+  reconstruction, persistent update granularity, and DRAM/NVMM placement
+  before GPU DB persists warm-tier indexes or resident-fragment directories.
 
 - `queued` — **Atlas: Scalable and Available State Machine Replication**,
   Enes et al., EuroSys 2020.
