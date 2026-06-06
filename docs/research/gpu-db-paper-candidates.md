@@ -6830,12 +6830,27 @@ Append new candidates here as each paper is processed.
   Why: HorseQC's CoGaDB integration reuses Hawk-style code generation; useful
   for route-specific CPU/GPU codegen without tying planner correctness to one
   hardware backend.
-- `queued` — **Reactors: A Case for Predictable, Virtualized Actor Database
+- `reviewed` — **Reactors: A Case for Predictable, Virtualized Actor Database
   Systems**, Shah and Vaz Salles, SIGMOD 2018.
-  URL: `https://doi.org/10.1145/3183713.3190663`
+  URL: `https://doi.org/10.1145/3183713.3183752`
   Why: Snapper uses actor-database work as its programming-model baseline;
   useful for comparing actor-style owner domains, predictable virtualized
-  state, and transaction placement against GPU DB partition owners.
+  state, and transaction placement against GPU DB partition owners. Journal
+  entry added 2026-06-06 from the ACM/author PDF; the queued DOI was
+  corrected to `10.1145/3183713.3183752`.
+- `queued` — **An Evaluation of Intra-Transaction Parallelism in
+  Actor-Relational Database Systems**, Shah and Vaz Salles, arXiv 2022.
+  URL: `https://arxiv.org/abs/2204.10743`
+  Why: modern follow-up from the Reactors authors; useful for stress-testing
+  whether actor-style intra-transaction parallelism really pays once
+  transaction logic, communication cost, and contention are varied.
+- `queued` — **Actor Database Systems: A Manifesto**, Shah and Vaz Salles,
+  arXiv 2017.
+  URL: `https://arxiv.org/abs/1707.06507`
+  Why: Reactors references the broader actor-relational design space; useful
+  background if GPU DB considers exposing owner-domain programming or route
+  decomposition as a product-level abstraction rather than only an internal
+  runtime implementation detail.
 - `reviewed` — **Epoch-based Commit and Replication in Distributed OLTP
   Databases**, Lu, Yu, Cao, and Madden, PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p743-lu.pdf`

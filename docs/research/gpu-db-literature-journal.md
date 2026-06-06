@@ -92728,3 +92728,183 @@ Benchmark priorities:
   policies under hot-key and mixed long-reader workloads.
 - Track p99 latency, retained bytes, invalid route age, and backlog
   age together; a throughput win that hides backlog is not a win.
+
+### 2026-06-06 - Reactors make owner domains a programmable latency boundary
+
+**Citation:** Vivek Shah and Marcos Antonio Vaz Salles. "Reactors:
+A Case for Predictable, Virtualized Actor Database Systems."
+SIGMOD 2018, 259-274. DOI:
+`https://doi.org/10.1145/3183713.3183752`. Retrieved 2026-06-06
+from the ACM/author PDF:
+`https://hjemmesider.diku.dk/~vmarcos/pubs/SS18-reactdb.pdf`.
+
+**Category:** runtime / HFT / session scale and transaction
+processing / write path, with secondary relevance to owner-domain
+placement and route scheduling.
+
+**Relevance tags:** Reactors; ReactDB; relational actors; actor
+database systems; owner domains; asynchronous sub-transactions;
+intra-transaction parallelism; serializability; Silo OCC; 2PC;
+transaction executors; containers; affinity routing; TPC-C;
+Smallbank; latency cost model.
+
+**Core idea:** Reactors proposes a relational actor abstraction for
+in-memory OLTP. A reactor encapsulates relational state and exposes
+procedures; cross-reactor work is expressed as asynchronous function
+calls, but the root invocation remains an ACID transaction. The
+paper then maps those logical reactors onto configurable runtime
+containers and transaction executors, letting the same application
+run as shared-everything, affinity-based shared-everything, or
+shared-nothing without changing application code.
+
+For GPU DB, the useful idea is that owner domains should not be just
+an internal implementation accident. They can be a latency boundary
+with explicit communication cost, affinity, and parallelism. A route
+that touches mutation ownership, residency ownership, GPU execution,
+and a cold-tier owner should be described as a small graph of owned
+sub-steps; the scheduler can then choose whether to keep work local,
+send it asynchronously, or reject the decomposition as too
+communication-heavy for the latency budget.
+
+**Concrete mechanisms:**
+
+- A reactor is an application-defined logical actor whose private
+  state is modeled as relations. Declarative queries are local to one
+  reactor; cross-reactor work uses asynchronous procedure calls.
+- A top-level reactor call is a root transaction. Nested asynchronous
+  calls are sub-transactions inside that root transaction; they do
+  not partially commit. Any sub-transaction abort aborts the whole
+  root transaction.
+- Reactors expose intra-transaction parallelism explicitly. In the
+  paper's exchange example, independent provider-risk computations
+  can be invoked concurrently, while the transaction still commits or
+  aborts atomically.
+- The runtime enforces a conservative intra-transaction safety rule:
+  at most one execution context for the same root transaction may be
+  active on a given reactor. Self-calls execute synchronously, and
+  dangerous cyclic or same-reactor asynchronous structures are
+  rejected or aborted.
+- The paper proves a conflict-serializability correspondence by
+  projecting reactor histories into classic transaction histories.
+  This permits ReactDB to reuse a classic optimistic scheduler rather
+  than inventing a separate correctness model.
+- ReactDB uses Silo-style OCC inside containers and 2PC across
+  containers. Validation locks the write set in involved containers;
+  failed validation aborts across all containers, while success
+  triggers the write phase and releases locks.
+- The runtime separates database containers, which hold one or many
+  reactors in shared-memory regions, from transaction executors,
+  which process reactor calls. Executors may own reactors or share
+  them depending on deployment.
+- Transaction executors maintain request queues and a thread pool
+  with a configurable multiprogramming level. Cooperative
+  multitasking lets a blocked worker hand off the executor queue
+  while it waits for a remote sub-transaction result.
+- The paper evaluates three deployment shapes:
+  shared-everything without affinity, shared-everything with affinity,
+  and shared-nothing. The same reactor application can be booted into
+  different shapes through configuration.
+- The reactor cost model decomposes fork-join transaction latency
+  into sequential processing, synchronous sub-transaction cost, send
+  cost, receive cost, overlapped asynchronous processing, and commit
+  overhead. It is intended as an explainable latency model, not a
+  complete queueing model.
+- In the Smallbank multi-transfer experiment, reformulating the same
+  transaction to overlap sub-transactions reduced latency from about
+  86 microseconds to about 25 microseconds without relaxing
+  consistency.
+- In TPC-C at scale factor 4, affinity-based shared-everything
+  outperformed shared-nothing-async under increasing load because it
+  preserved memory affinity and avoided cross-core communication
+  overheads. Shared-nothing-async helped when transaction work was
+  sufficiently parallel and load was light or normal, but the benefit
+  declined under higher load.
+- The authors report that queueing and skew are outside the simple
+  cost model. Under skewed YCSB multi-update workloads, observed
+  latency reflected queueing, hot reactors, and aborts that the
+  fork-join cost equation does not predict.
+
+**GPU DB mapping:** The high-throughput runtime already names owner
+domains: mutation, catalog, residency, GPU execution, and optional
+partitions. Reactors says these domains need an explicit route graph
+and a latency model. A retained lookup, write, refresh, or cold-tier
+fetch should record which owners it touches, which sub-steps can run
+in parallel, where communication crosses cores/devices/tiers, and
+which owner holds the final publication authority.
+
+The affinity result is a direct warning for 1M logical sessions. More
+asynchrony is not automatically better. Same-shape retained reads
+should stay near their snapshot/GPU worker when communication cost
+dominates useful work; distributed sub-steps should be admitted only
+when they overlap enough CPU/GPU/NVMe work to pay for the ring hops.
+
+The conservative intra-transaction safety rule maps to route
+decomposition. GPU DB should reject or serialize route plans that
+would create two active sub-steps for the same transaction on the
+same mutation, catalog, or residency owner unless a stronger
+commutativity proof exists.
+
+ReactDB's configurable deployment vocabulary is useful for
+benchmarking. GPU DB can run the same logical workload under
+co-located owners, affinity-routed owners, partition-owned execution,
+and more asynchronous GPU/cold-tier execution, then measure whether
+the topology or the route decomposition is the bottleneck.
+
+The OCC/2PC reuse is a reminder to keep correctness below the route
+abstraction. A route may be actor-shaped for performance, but commit,
+visibility publication, and WAL-before-visibility still need a
+database transaction protocol. Reactors does not justify letting GPU
+workers or gateway queues become independent commit authorities.
+
+**Risks and mismatches:** Reactors is a CPU in-memory OLTP paper,
+not a GPU database paper. It does not discuss WAL durability,
+MVCC-version retention, resident GPU snapshots, pinned buffers,
+NVMe, GPUDirect storage, or cold-tier placement.
+
+The programming model assumes applications are willing to decompose
+state and procedures into reactors. GPU DB may want owner domains to
+remain internal for ordinary SQL, with only stored procedures or
+special route families exposing decomposition.
+
+The paper's concurrency implementation is based on Silo OCC and 2PC.
+That is useful as a correctness anchor, but GPU DB currently needs
+WAL-before-visibility, retained snapshot publication, and GPU
+residency invalidation; these add dependencies beyond the paper's
+commit protocol.
+
+The cost model handles fork-join programs and explicitly does not
+predict queueing, skew, or realized parallelism under load. GPU DB
+must combine any actor-route latency model with queue depth,
+contention, GPU occupancy, and tier latency telemetry.
+
+The strongest experimental numbers are on small 2018-era machines
+and microsecond-scale CPU transactions. The direction is valuable,
+but the exact latencies should not be projected onto GPU kernels,
+CXL memory, or NVMe transfer paths.
+
+**Benchmark candidates:**
+
+- Add an owner-topology benchmark that runs the same workload with
+  co-located mutation/residency/GPU owners, affinity-routed owners,
+  and fully split owners. Measure p50/p99 latency, queue hops,
+  owner-local cache hits, aborts, and throughput.
+- Build a route-graph tracer for retained lookups, writes, refreshes,
+  and cold-tier reads. Each route should expose owners touched,
+  synchronous versus asynchronous sub-steps, ring hops, wait time,
+  and final publication authority.
+- Compare same-shape retained read batching under two policies:
+  keep work on the snapshot/GPU-affine worker versus distribute it
+  across idle workers. Failure condition: distribution improves
+  average throughput while p99 regresses due to communication hops.
+- Add a route safety gate mirroring Reactors' active-set rule:
+  reject or serialize transaction plans that create concurrent
+  sub-steps on the same owner for the same root transaction without a
+  commutativity or idempotence proof.
+- Benchmark asynchronous cross-owner writes only when useful work can
+  overlap. Vary remote owner work from tiny metadata updates to
+  expensive refresh/cold-tier work, and find the crossover point
+  where asynchronous decomposition beats affinity-local execution.
+- Add an explainable cost report for fork-join-style stored
+  procedures or retained-route graphs: sequential work, send cost,
+  receive cost, overlapped work, commit/publication cost, and observed
+  queueing delta.
