@@ -6741,7 +6741,7 @@ Append new candidates here as each paper is processed.
   Why: Pangu flags PFC-free and lossy RDMA as future production directions;
   useful before GPU DB assumes lossless fabrics, PFC, or switch tuning for
   accelerator/storage network paths.
-- `queued` — **REWIND: Recovery Write-Ahead System for In-Memory
+- `reviewed` — **REWIND: Recovery Write-Ahead System for In-Memory
   Non-Volatile Data-Structures**, Chatzistergiou, Cintra, and Viglas,
   PVLDB 2015.
   URL: `https://www.vldb.org/pvldb/vol8/p497-chatzistergiou.pdf`
@@ -6749,7 +6749,8 @@ Append new candidates here as each paper is processed.
   Why: FPTree's split/delete micro-logs and persistent allocator make crash
   repair a first-class index concern; REWIND is a primary follow-up for
   comparing write-ahead recovery schemes for persistent data structures before
-  GPU DB stores durable route metadata or future-tier indexes.
+  GPU DB stores durable route metadata or future-tier indexes. Journal entry
+  added 2026-06-06.
 - `reviewed` — **NBR: Neutralization Based Reclamation**, Singh et al.,
   PPoPP 2021.
   URL: `https://doi.org/10.1145/3437801.3441625`
@@ -6859,3 +6860,17 @@ Append new candidates here as each paper is processed.
   replaying log statements across many model/program versions, with
   checkpoint-based parallelism that may map to GPU DB version-tree replay
   and cold snapshot reconstruction benchmarks.
+- `queued` — **Efficient Logging in Non-Volatile Memory by Exploiting
+  Coherency Protocols**, Cohen, Friedman, and Larus, OOPSLA/PACMPL 2017.
+  URL: `https://arxiv.org/abs/1709.02610`
+  DOI: `https://doi.org/10.1145/3133891`
+  Why: discovered while reviewing REWIND; useful follow-up on persist-order
+  costs, coherence-induced reordering, and single-round-trip NVM logging before
+  GPU DB adopts any byte-addressable warm-tier log or durable metadata path.
+- `queued` — **Fine-Grain Checkpointing with In-Cache-Line Logging**,
+  Cohen, Aksun, Avni, and Larus, ASPLOS 2019.
+  URL: `https://arxiv.org/abs/1902.00660`
+  DOI: `https://doi.org/10.1145/3297858.3304046`
+  Why: discovered while reviewing REWIND; useful follow-up on low-overhead
+  persistent Masstree-style structures, in-cache-line undo records, and
+  checkpoint granularity for future CPU warm indexes or route metadata.

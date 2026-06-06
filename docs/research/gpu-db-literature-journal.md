@@ -87601,3 +87601,173 @@ and more relevant tier-placement result.
   certificate, exploration result, and lineage/checkpoint generation do
   not agree on relation id, schema generation, WAL boundary, visibility
   boundary, and invalidation generation.
+
+### 2026-06-06 - REWIND makes byte-addressable durability a log-structure problem
+
+**Citation:** Andreas Chatzistergiou, Marcelo Cintra, and Stratis D.
+Viglas. "REWIND: Recovery Write-Ahead System for In-Memory
+Non-Volatile Data-Structures." PVLDB 8(5):497-508, 2015. DOI:
+`10.14778/2735479.2735483`. Retrieved 2026-06-06 from the PVLDB PDF
+at `https://www.vldb.org/pvldb/vol8/p497-chatzistergiou.pdf`; direct
+`curl` from the cron worker timed out, but the primary PVLDB PDF was
+read through browser fetch.
+
+**Category:** database file-system/storage/indexing and WAL/logging
+throughput, with transaction-processing and future-tier placement
+relevance.
+
+**Relevance tags:** persistent memory; byte-addressable NVM; write-ahead
+logging; recoverable log data structure; physical undo logging;
+non-temporal stores; persist fences; cache-line flushes; fine-grained
+log latching; checkpoint log clearing; distributed logs; B+-tree
+recovery; TPC-C New-order.
+
+**Core idea:** REWIND studies what happens when persistent data
+structures live directly in byte-addressable non-volatile memory instead
+of being serialized through a DBMS or file-system block path. The paper's
+central point is that WAL still matters, but its implementation changes:
+updates happen in place on persistent memory, so log records must become
+persistent before the data writes, and the log itself must be a
+recoverable persistent data structure.
+
+For GPU DB, the transferable idea is to treat any future CXL/NVM warm
+tier, durable route metadata, or persistent CPU-side index as a
+specialized data-structure logging problem rather than as a small
+variant of disk WAL. A byte-addressable tier can reduce copying and
+serialization, but only if the engine makes persist ordering, log
+mutation atomicity, checkpoint clearing, and recovery scan cost explicit.
+
+**Concrete mechanisms:**
+
+- REWIND is a user-mode runtime/library for transactions over persistent
+  in-memory data structures. Programs mark transaction boundaries and log
+  critical memory updates; the paper expects compiler support could
+  automate update logging later.
+- The design uses physical logging because arbitrary imperative updates
+  to memory locations are easier to capture as old/new bytes than as
+  logical operations. The tradeoff is that shifted memory blocks or
+  pointer-heavy structures can generate many log records.
+- Because data is updated directly in NVM, REWIND cannot delay log
+  persistence until commit as a volatile-buffered DBMS might. It relies on
+  persist-order primitives: fences, cache-line flushes, and non-temporal
+  writes that bypass caches when the platform provides persistence
+  guarantees.
+- The log is also stored in persistent memory and must survive crashes
+  while being updated in place. REWIND therefore builds a recoverable
+  Atomic Doubly-Linked List whose insert/remove operations require a
+  constant number of state changes that can be tracked by a small pending
+  operation record.
+- The one-layer log variant stores all records in that persistent list.
+  It makes logging cheap by avoiding a transaction table on the hot path,
+  but rollback/recovery may need linear scans. REWIND clears the log at
+  checkpoints to bound that cost.
+- The two-layer variant adds an AVL-tree index over transaction ids while
+  using the atomic list to recover pending updates to the index. This
+  improves rollback lookup at the cost of extra logging work.
+- Recovery starts by restoring the base persistent log structure, then
+  any auxiliary log index, then user data updates. In one-layer mode,
+  system recovery can undo all uncommitted transactions in a single
+  backward scan instead of selectively chasing one transaction at a time.
+- Checkpointing writes a checkpoint record and removes persistent log
+  records only after the flush boundary is safe. The order matters:
+  clearing committed records too early can make newly inserted records
+  appear persistent when they are not.
+- Concurrency is fine-grained around log records. The paper reports that
+  REWIND scales better than BerkeleyDB, Stasis, and Shore-MT-Numa in a
+  multithreaded B+-tree logging benchmark after the first few threads,
+  while acknowledging OS scheduling effects in the tested setup.
+- REWIND has optimized/batched log variants that group records to reduce
+  fence cost. In the paper's fence-sensitivity experiment, larger groups
+  reduce slowdown as fence latency rises; the design does not require all
+  transactions in a group to share fate because it is not page-based.
+- In synthetic B+-tree recovery tests, REWIND outperforms Stasis,
+  BerkeleyDB, and Shore-MT-Numa by reported factors of 20x, 14x, and 8x
+  for the measured configuration.
+- In a TPC-C New-order variant with B+-tree tables and ten threads,
+  optimized REWIND reaches 197K transactions per minute versus 273K for
+  the non-recoverable persistent B+-tree, a 1.39x overhead. Adding a
+  distributed log reaches 262K transactions per minute, or about 1.05x
+  overhead. A naive REWIND data-structure layout falls to 37K, showing
+  that data-structure/log co-design is decisive.
+
+**GPU DB mapping:** The first direct mapping is future-tier metadata.
+GPU DB should not store route descriptors, warm CPU indexes, or resident
+snapshot catalogs in byte-addressable persistent memory as ordinary
+mutable structs until each update path has a log record, persist-order
+barrier, and recovery contract. A durable route descriptor needs the same
+proof as a table page: either the old descriptor remains valid or the new
+descriptor and its generation boundary are recoverable.
+
+REWIND's recoverable-log-in-persistent-memory idea maps to DB-owned
+metadata files and future CXL/NVM tiers. If GPU DB stores tier locators,
+resident-fragment metadata, key-vector roots, or checkpoint descriptors in
+a persistent warm tier, the metadata index itself must be recoverable.
+That favors small constant-update structures, append/retire lists,
+versioned descriptor tables, or owner-local logs over arbitrary in-place
+tree surgery on the hot path.
+
+The one-layer versus two-layer tradeoff is a useful design knob for GPU
+DB's WAL and metadata side structures. Hot write admission can prefer a
+minimal append/retire log with cheap publish and longer recovery scan,
+while maintenance or rollback-heavy lanes can build auxiliary indexes off
+the log. The choice should be benchmarked by write latency, checkpoint
+clear cost, restart scan depth, and long-reader pinned-generation cleanup.
+
+The distributed-log TPC-C result maps to owner domains. A single global
+metadata or WAL log will likely become a contention point. Per-partition,
+per-owner, or per-route-family logs can reduce synchronization if recovery
+can still reconstruct a total-enough visibility order and if commit
+publication names the relevant log boundaries.
+
+The fence-batching result maps to GPU DB's current micro-batching
+language. WAL append, metadata publication, resident invalidation, and
+future persistent-tier updates should batch at natural boundaries, but
+the batch must not force unrelated transactions to commit or abort
+together. Each request still needs its own visibility and failure result.
+
+**Risks and mismatches:** REWIND targets byte-addressable NVM and
+programmer-managed persistent data structures, not a conventional SQL
+DBMS, a GPU database, or a multi-tier HBM/DRAM/NVMe engine. Its direct
+hardware assumptions predate deployed Optane-era details and the current
+CXL/NVM landscape.
+
+The evaluation uses a TPC-C New-order variant and synthetic B+-tree
+benchmarks, not full TPC-C, not PostgreSQL protocol workloads, and not
+GPU-resident execution. Reported throughput should be used as a design
+signal about logging overhead, not as a comparable performance target.
+
+Physical logging is simple for compiler/library instrumentation, but it
+can be expensive for large structural changes. GPU DB should be cautious
+about applying physical byte logging to columnar fragment rebuilds,
+compressed metadata, or large resident descriptors without measuring log
+amplification.
+
+REWIND's user-code transaction model assumes tight control over data
+structures and operations. GPU DB still needs general SQL correctness,
+WAL-before-visibility, MVCC snapshots, DDL invalidation, replay from
+durable logs/checkpoints, and explicit CPU/GPU fallback.
+
+**Benchmark candidates:**
+
+- Build a persistent-metadata simulator for route descriptors with
+  one-layer append/retire logging versus indexed two-layer logging.
+  Measure publish latency, recovery scan time, checkpoint clearing cost,
+  and bytes written per descriptor update.
+- Add a WAL fence-batching benchmark for owner-local mutation batches.
+  Gate: batched persist fences reduce p99 write latency without making
+  unrelated transactions share commit/abort fate.
+- Compare a global metadata log with per-owner/per-partition metadata
+  logs for resident-fragment invalidation and route publication. Required
+  measurement: log contention, replay ordering proof, stale-route rejection
+  latency, and recovery merge cost.
+- Prototype a recoverable descriptor table for future warm-tier route
+  metadata: old generation, new generation, pending update marker, and
+  checksum. Failure condition: crash/restart can produce a descriptor that
+  points to an invalid resident fragment or unflushed visibility boundary.
+- Measure physical-log amplification for metadata operations that move
+  entries inside a tree or compact an array. Expected result: large
+  structural moves should use copy-publish-retire or append-only metadata
+  updates instead of byte-logging every shifted field.
+- Add a checkpoint-clear stress test with long readers pinning old
+  metadata generations. Gate: checkpoint clearing reclaims safe records
+  without deleting log entries needed by pinned snapshots or recovery.
