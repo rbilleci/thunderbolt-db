@@ -489,14 +489,25 @@ Append new candidates here as each paper is processed.
   and cache coherence; useful for GPU DB's snapshot leases, retained-route
   cache coherence, and multi-tier read/write admission. Journal entry added
   2026-06-06.
-- `queued` — **No Compromises: Distributed Transactions with Consistency,
+- `reviewed` — **No Compromises: Distributed Transactions with Consistency,
   Availability, and Performance**, Dragojevic et al., SOSP 2015.
   URL:
   `https://www.usenix.org/conference/sosp15/technical-sessions/presentation/dragojevic`
   Why: Sundial cites this as a hardware/network-assisted distributed
   transaction baseline; useful for contrasting low-latency remote access,
   RDMA-shaped transaction execution, and consistency guarantees with GPU DB's
-  future warm/cold-tier and replicated-owner paths.
+  future warm/cold-tier and replicated-owner paths. Journal entry added
+  2026-06-06 from the SIGOPS SOSP 2015 PDF after the stale USENIX URL
+  redirected to a 404 page.
+- `queued` — **Fast In-memory Transaction Processing using RDMA and HTM**,
+  Wei, Shi, Chen, Chen, and Chen, SOSP 2015.
+  URL: `https://doi.org/10.1145/2815400.2815419`
+  PDF:
+  `https://sigops.org/sosp/sosp15/current/2015-Monterey/printable/158-wei.pdf`
+  Why: FaRM's SOSP cohort paper explores a different hardware-assisted OLTP
+  path by combining RDMA with hardware transactional memory; useful for
+  comparing owner-mediated validation and WAL publication against HTM-assisted
+  local concurrency control and remote access.
 - `reviewed` — **Everything is a Transaction: Unifying Logical Concurrency
   Control and Physical Data Structure Maintenance in Database Management
   Systems**, Pavlo et al., CIDR 2021.

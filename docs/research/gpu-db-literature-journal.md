@@ -38,6 +38,176 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - FaRM makes distributed commit a reservation-backed RDMA log protocol
+
+**Citation:** Aleksandar Dragojevic, Dushyanth Narayanan, Edmund B.
+Nightingale, Matthew Renzelmann, Alex Shamis, Anirudh Badam, and Miguel
+Castro. "No Compromises: Distributed Transactions with Consistency,
+Availability, and Performance." SOSP 2015, pages 54-70. DOI:
+`10.1145/2815400.2815425`. Retrieved 2026-06-06 from the SIGOPS SOSP
+2015 PDF at
+`https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/227-dragojevic-online.pdf`.
+
+**Category:** transaction processing / write path, with secondary relevance
+to WAL/logging throughput, high-concurrency runtime mechanics, and future
+remote/disaggregated-memory tiers.
+
+**Relevance tags:** FaRM; strict serializability; optimistic concurrency
+control; one-sided RDMA; primary-backup replication; NVRAM logs; log-space
+reservations; read validation; precise membership; short leases; failure
+recovery; background re-replication; TATP; TPC-C.
+
+**Core idea:** FaRM shows that a distributed transactional system can get
+strict serializability, durability, availability, and high throughput when
+the commit path is designed around the real bottleneck: foreground CPU work,
+not only network or storage latency. It uses one-sided RDMA for remote reads,
+validation, and commit-log writes, keeps backups off the foreground CPU path,
+and relies on a carefully shaped recovery protocol to make those CPU-saving
+choices safe.
+
+For GPU DB, the strongest transferable idea is to treat the write path as a
+small, proof-carrying protocol over pre-reserved log and queue capacity. A
+commit should not discover at visibility time that a WAL slot, invalidation
+slot, response slot, or recovery record is unavailable. Reserve the resources
+needed to finish and recover the operation before publication begins, then
+make visibility depend on explicit durable and invalidation proofs.
+
+**Concrete mechanisms:**
+
+- FaRM uses optimistic concurrency control. Transactions buffer writes
+  locally, record object addresses and versions, lock written objects at
+  commit, validate read-only objects by reading versions from primaries, and
+  abort if any version changed.
+- The normal commit protocol has five steps: write `LOCK` records to
+  primaries for written objects; validate reads by one-sided RDMA reads or
+  RPC above a small fanout threshold; write `COMMIT-BACKUP` records to
+  backup NVRAM logs; after all backup hardware acknowledgements arrive, write
+  `COMMIT-PRIMARY` records to primaries; lazily truncate logs after primary
+  acknowledgements.
+- The serialization point for committed read-write transactions is when all
+  write locks are acquired. Read-only transactions serialize at their last
+  read. Strictness comes from placing this point between transaction start
+  and the success report to the application.
+- Backups of read-only participants do not participate. Backup CPU work is
+  deferred until log truncation applies updates to backup objects.
+- Coordinators reserve participant log space for all commit protocol records,
+  including truncate records, before starting commit. This replaces the
+  traditional prepare-time resource check that would require backup CPU
+  involvement.
+- Each sender/receiver pair has receiver-resident ring buffers used as
+  transaction logs or message queues. Senders append with one-sided RDMA
+  writes to the tail; receivers poll the head and lazily publish truncation.
+- FaRM uses primary-backup replication over non-volatile DRAM rather than
+  Paxos state-machine replication for every participant. Coordinators are not
+  replicated, so recovery may abort an undecided transaction whose coordinator
+  failed unless enough commit evidence survived.
+- One-sided RDMA forces a precise-membership protocol: after a configuration
+  change, clients stop issuing RDMA to evicted machines and ignore replies or
+  acknowledgements from machines outside the current configuration, because a
+  remote CPU cannot enforce lease checks on incoming RDMA operations.
+- Failure detection uses very short leases. Under the evaluated 90-machine
+  cluster, the optimized lease path used unreliable datagrams, dedicated queue
+  resources, a high-priority interrupt-driven lease thread, preallocated
+  memory, and pinned code to sustain 5 ms leases without false positives in
+  the reported stress test.
+- Transaction recovery drains logs for the old configuration, identifies only
+  recovering transactions affected by changed replicas, primaries, or
+  coordinators, acquires locks for recovered writes, replicates missing log
+  records, votes on commit or abort from observed log records, and then sends
+  recovery commit/abort/truncate records.
+- Regions become active after lock recovery, before bulk data re-replication
+  finishes. Background data recovery then copies blocks to new backups with
+  pacing so foreground throughput is protected.
+- The evaluation reports 140 million TATP transactions per second on 90
+  machines with 58 microsecond median latency and 645 microsecond 99th
+  percentile latency, 4.5 million TPC-C new-order transactions per second
+  with 808 microsecond median latency and 1.9 ms 99th percentile latency, and
+  lookup-only throughput of 790 million lookups per second. Single-machine
+  failure recovery returns to peak TATP throughput in less than 40 ms in a
+  typical run; the reported median recovery time over repeated runs is around
+  50 ms.
+
+**GPU DB mapping:** GPU DB should keep WAL-before-visibility as the local
+authority, but FaRM's reservation discipline is directly useful. A mutation
+owner can reserve WAL bytes, invalidation records, resident-generation update
+slots, response-ring space, and recovery metadata before it starts the
+publication phase. If reservation fails, reject or delay before any partial
+visibility boundary exists.
+
+The five-step commit shape maps to GPU DB as: acquire or validate write-set
+authority at the mutation/partition owner; validate read snapshot generation
+and catalog generation; append and flush WAL or replicated durable records;
+publish invalidation and CPU-visible MVCC/catalog state; lazily compact or
+truncate old log and version state after safe horizons advance. GPU snapshot
+publication remains a later read-side optimization, not a substitute for the
+commit proof.
+
+FaRM's receiver-resident log rings map to owner-local command and WAL rings.
+Even without RDMA, the hot path should expose per-owner ring reservations,
+tail/head progress, truncation horizons, and recovery lower bounds. The
+important invariant is not the verb; it is that a sender has bounded,
+observable capacity to finish the protocol it begins.
+
+The precise-membership lesson maps to route and snapshot certificates. If a
+resident generation, GPU worker, remote tier, or gateway route is removed
+from the current configuration, stale acknowledgements or completions from
+that generation must be ignored. A CUDA completion, remote read result, or
+cold-tier transfer acknowledgement should carry enough generation metadata to
+be rejected after reconfiguration.
+
+FaRM's recovery split maps cleanly to GPU DB crash and failover planning:
+first recover the minimum lock/visibility state needed to serve foreground
+traffic safely, then pace bulk recovery of replicas, resident segments, warm
+indexes, or GPU caches. Full HBM/NVMe re-warm should not block all traffic if
+CPU truth and visibility metadata are recovered.
+
+**Risks and mismatches:** FaRM is a distributed in-memory object platform,
+not a SQL engine. It does not handle SQL planning, predicate evaluation,
+joins, MVCC version chains, GPU-resident snapshots, WAL files on ordinary
+storage, object-store cold tiers, or PostgreSQL protocol session behavior.
+
+The paper assumes RDMA, a symmetric cluster where every machine runs
+application code and stores data, non-volatile DRAM provided by a distributed
+UPS model, bounded clock drift for safety, and eventually bounded message
+delay for liveness. Those assumptions do not hold for the current GPU DB
+product target.
+
+FaRM's read phase can expose temporary inconsistencies across different
+objects during transaction execution and relies on commit-time validation to
+prevent inconsistent transactions from committing. SQL execution over a
+database may need stronger internal read-shape discipline, especially for
+plans that branch on inconsistent intermediate values.
+
+The impressive throughput numbers come from a 2015 specialized cluster and
+application-linked benchmark code. They are useful as mechanism evidence, not
+as expected GPU DB performance targets.
+
+**Benchmark candidates:**
+
+- Build a CPU-only reservation benchmark for the mutation owner. Compare
+  optimistic append-with-retry against pre-reserving WAL bytes, invalidation
+  entries, response-ring slots, and recovery records. Gate: no partial
+  visibility publication when any downstream capacity is exhausted.
+- Add a commit-protocol simulator with phases for lock/validate, WAL append,
+  invalidation, visibility publish, and lazy truncation. Measure p50/p99
+  latency, abort causes, queue wait, and reserved-but-unused capacity under
+  hot-key and mixed read/write workloads.
+- Prototype generation-bearing acknowledgements for GPU and cold-tier routes:
+  schema generation, snapshot generation, resident generation, owner
+  configuration, and WAL boundary. Failure condition: a stale completion from
+  an old configuration can publish or answer a request.
+- Add a recovery-first benchmark that replays WAL/MVCC/route metadata enough
+  to serve CPU truth before resident GPU re-warm completes. Measure time to
+  safe traffic, time to full residency, and foreground p99 impact during
+  paced re-warm.
+- Compare background recovery pacing policies for resident segments and warm
+  indexes: fixed delay, byte-budgeted, queue-pressure-aware, and aggressive
+  catch-up. Gate: foreground reads and commits report whether delay came from
+  recovery bandwidth, owner queue pressure, or missing residency.
+- Evaluate a read-validation threshold similar to FaRM's RDMA-versus-RPC
+  cutoff: validate small read sets inline, batch larger validation through
+  owner rings, and measure CPU cost versus latency under contention.
+
 ### 2026-06-06 - PCSO logging turns cache-line order into a one-flush durability proof
 
 **Citation:** Nachshon Cohen, Michal Friedman, and James R. Larus.
