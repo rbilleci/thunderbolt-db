@@ -489,12 +489,14 @@ Append new candidates here as each paper is processed.
   regression detection, and fallback strategies before GPU DB trusts learned
   route scoring in production. Journal entry added 2026-06-06; the queued URL
   and DOI were corrected to the PVLDB PDF metadata.
-- `queued` — **RankPQO: Learning-to-Rank for Parametric Query Optimization**,
+- `reviewed` — **RankPQO: Learning-to-Rank for Parametric Query Optimization**,
   Mo et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p863-mo.pdf`
   Why: LEON's pairwise ranking objective is relevant to repeated same-shape
   routes; RankPQO may inform parameter-sensitive plan or route caching for
   pgwire prepared statements, retained lookups, and GPU/CPU fallback choices.
+  Journal entry already exists; this stale duplicate was corrected from
+  `queued` to `reviewed` on 2026-06-06.
 - `queued` — **Learned Query Optimizer: What is New and What is Next**,
   Zhu, Weng, Ding, and Zhou, SIGMOD Companion 2024.
   URL: `https://doi.org/10.1145/3626246.3654692`
@@ -610,7 +612,7 @@ Append new candidates here as each paper is processed.
   useful for checking whether buffered durable transactions suggest simpler
   software-only durability/fallback baselines before GPU DB reaches for
   hardware-assisted persistence.
-- `queued` — **ArchTM: Architecture-Aware, High Performance Transaction for
+- `reviewed` — **ArchTM: Architecture-Aware, High Performance Transaction for
   Persistent Memory**, Wu, Ren, Peng, and Li, FAST 2021.
   URL: `https://www.usenix.org/conference/fast21/presentation/wu-kai`
   PDF: `https://www.usenix.org/system/files/fast21-wu-kai.pdf`
@@ -618,7 +620,19 @@ Append new candidates here as each paper is processed.
   persistent-memory transaction follow-up that emphasizes avoiding small
   random writes and improving sequential/coalesced persistence, useful for a
   software/storage-oriented baseline for future GPU DB CXL/NVM route
-  metadata.
+  metadata. Journal entry added 2026-06-06.
+- `queued` — **Failure-Atomic Persistent Memory Updates via JUSTDO Logging**,
+  Izraelevitz, Kelly, and Kolli, ASPLOS 2016.
+  URL: `https://doi.org/10.1145/2872362.2872410`
+  Why: ArchTM cites JUSTDO as a persistent-memory logging baseline; useful for
+  comparing minimal logging, persist ordering, and recovery annotation against
+  CoW-style route-publication records.
+- `queued` — **Durable Transactional Memory Can Scale with TimeStone**,
+  Krishnan et al., ASPLOS 2020.
+  URL: `https://doi.org/10.1145/3373376.3378493`
+  Why: ArchTM references TimeStone in the durable transaction line; useful for
+  checking scalable durable transaction metadata and persistence barriers
+  before GPU DB designs future NVM/CXL warm-tier route descriptors.
 - `reviewed` — **SpecPMT: Speculative Logging for Resolving Crash Consistency
   Overhead of Persistent Memory**, Ye et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3575693.3575696`

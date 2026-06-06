@@ -38,6 +38,193 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - ArchTM makes persistent writes a locality contract
+
+**Citation:** Kai Wu, Jie Ren, Ivy Peng, and Dong Li. "ArchTM:
+Architecture-Aware, High Performance Transaction for Persistent Memory."
+FAST 2021, 141-153. Retrieved 2026-06-06 from the USENIX page and
+PDF: `https://www.usenix.org/conference/fast21/presentation/wu-kai`,
+`https://www.usenix.org/system/files/fast21-wu-kai.pdf`.
+
+**Category:** WAL, logging, and read/write throughput; database
+file-system/storage/indexing.
+
+**Relevance tags:** ArchTM; persistent memory; Optane; crash
+consistency; copy-on-write; small writes; write amplification;
+coalesced writes; DRAM lookup table; annotation; locality-aware
+allocation; online defragmentation; route metadata; warm-tier
+descriptors.
+
+**Core idea:** ArchTM argues that byte-addressable persistent memory
+should not be treated as slower DRAM. The paper's Optane study finds
+that transaction systems lose large amounts of performance to small
+random metadata writes and locality-oblivious allocation. ArchTM keeps
+the low-write-traffic benefit of copy-on-write, but moves frequent
+metadata changes into DRAM and uses persistent annotations to recover
+crash consistency.
+
+For GPU DB, the transferable idea is that durable route metadata,
+future CXL/NVM warm-tier descriptors, and checkpoint-side indexes need
+a physical write contract. If publication metadata is persisted as many
+tiny scattered updates, the engine can waste the persistence tier before
+query execution or GPU refresh becomes the bottleneck. Durable metadata
+should be grouped, aligned, and recoverable through explicit IDs and
+generation records, not hidden behind arbitrary object writes.
+
+**Concrete mechanisms:**
+
+- ArchTM is CoW-like: updates create new object copies, apply changes
+  out of place, then publish the new version. This avoids the double
+  write of undo/redo logging for data objects, but would normally add
+  many metadata writes for allocation and remapping.
+- The paper characterizes Intel Optane DC PM as having 64-byte CPU
+  cache-line writes but 256-byte internal transaction granularity, plus
+  write-combining buffers. It reports that 64-byte random writes achieve
+  only about 25% of sequential-write bandwidth, and that PM write
+  bandwidth on the tested system is much lower than DRAM write
+  bandwidth.
+- Existing PM transaction systems in the paper's characterization
+  produce many small persistent writes. For 512-byte persistent-object
+  updates, more than 78% of persisted objects are smaller than 64 bytes,
+  and write amplification ranges from about 1.8x to 27x depending on
+  object size and system.
+- ArchTM stores memory-allocation metadata and object lookup metadata
+  in DRAM to avoid frequent small random writes to PM. A scalable DRAM
+  lookup table maps object IDs to latest object copies during normal
+  execution.
+- To make volatile metadata recoverable, ArchTM annotates persistent
+  state. Transaction metadata carries a persistent transaction ID when
+  the transaction starts, and object headers carry object ID, object
+  size, and transaction ID. Recovery can reconnect objects to
+  transaction state without relying on lost DRAM metadata.
+- The allocator favors locality: consecutive allocation requests should
+  receive contiguous memory, because objects allocated together are
+  likely to be written together. That increases the chance that writes
+  land in contiguous PM ranges and are coalesced by the device.
+- Instead of many size-class free lists, ArchTM uses a single free list
+  on the locality-aware allocation path and a recycle list for freed
+  blocks. Online defragmentation aggregates live objects out of highly
+  fragmented regions to recreate large contiguous free regions.
+- The paper evaluates ArchTM against PMDK, Romulus, DUDETM, and an
+  Oracle CoW-style system on real PM. The headline result reports
+  average speedups of 58x, 5x, 3x, and 7x respectively across
+  microbenchmarks and real workloads.
+
+**GPU DB mapping:** P8 already treats GPU-resident state as rebuildable
+performance state and WAL/checkpoint/archive state as the durable
+authority. ArchTM suggests a sharper rule for any future durable or
+semi-durable warm tier: route descriptors, resident-segment manifests,
+checkpoint indexes, and CXL/NVM metadata should be persisted in
+coalesced generation records with stable object IDs, not as tiny
+per-field updates.
+
+The annotation mechanism maps to route publication. A resident or
+warm-tier fragment can carry a table ID, fragment ID, byte length,
+source WAL boundary, visibility boundary, and publication generation in
+its header. The in-memory route table may be volatile and fast, but
+recovery can reconstruct or reject fragments by reading annotations and
+checking the transaction/publication state.
+
+The DRAM lookup-table idea maps to P8's performance/correctness split.
+The hot planner and runtime can use DRAM route tables, snapshot
+handles, and residency maps for speed, while durable recovery relies on
+annotated segment files or warm-tier records. This keeps lookup
+metadata fast without making it the only recovery source.
+
+The locality-aware allocator is relevant to WAL group commit,
+checkpoint manifests, cold-tier metadata compaction, and future
+persistent-memory route descriptors. If a route publication creates
+several related records, allocate and persist them together so the tier
+sees sequential/coalescable writes. For GPU refresh, this also makes
+metadata scanning more sequential.
+
+The online defragmentation warning maps to long-lived MVCC and route
+metadata. A durable warm tier cannot rely on restarting to clear
+fragmentation. It needs explicit compaction, generation movement, and
+rebuildable handles so fragmented metadata does not gradually become a
+tail-latency source.
+
+**Risks and mismatches:** ArchTM is a persistent-memory transaction
+system, not a full SQL DBMS. It does not cover SQL isolation, MVCC
+version visibility, WAL-before-visibility, relational indexes, GPU
+kernels, pinned host memory, NVMe, or tenant/session admission.
+
+The exact Optane behavior is hardware-specific. Future CXL, NVDIMM,
+NVMe, or storage-class tiers may have different granularities and
+combining behavior, so GPU DB should transfer the principle, not the
+256-byte number as a permanent constant.
+
+ArchTM moves metadata to DRAM and relies on annotations for recovery.
+That split is attractive, but GPU DB must ensure that volatile route
+metadata never becomes a correctness authority. Every durable
+publication must remain reconstructable or safely discardable after a
+crash.
+
+CoW can increase space usage and requires object remapping. For
+relational MVCC, copy granularity matters: row-version, segment,
+column-group, and metadata-record CoW have different write
+amplification and snapshot-retention costs.
+
+The paper optimizes write-heavy persistent transactions. It does not
+evaluate mixed OLTP plus GPU-resident reads, long analytical snapshots,
+or persistent metadata under 1M logical sessions.
+
+**Benchmark candidates:**
+
+- Add a durable-metadata write-shape benchmark for route descriptors,
+  checkpoint manifests, and resident-fragment headers. Compare scattered
+  field updates, log records, CoW generation records, and grouped
+  segment headers. Measure write amplification, persist latency, p99
+  publication latency, and recovery reconstructability.
+- Prototype annotated warm-tier fragment headers containing table ID,
+  fragment ID, size, source WAL boundary, visibility boundary,
+  checksum, and publication generation. Gate: recovery must rebuild the
+  volatile route table or reject incomplete fragments without trusting
+  stale DRAM state.
+- Benchmark allocation locality for metadata created by one route
+  publication: adjacent allocation, size-class allocation, and append
+  log allocation. Measure sequential write bandwidth, cache misses,
+  recovery scan time, and fragmentation after churn.
+- Add a compaction/defragmentation benchmark for route metadata and
+  resident-segment manifests under repeated refresh/evict cycles.
+  Failure condition: metadata fragmentation increases route lookup p99
+  or recovery scan time even though the logical data size is stable.
+- Compare per-row CoW, per-segment CoW, and per-publication CoW for
+  future warm-tier MVCC state. Gate: the chosen granularity must not
+  weaken WAL-before-visibility or create unbounded retired bytes under
+  long readers.
+- Track storage-tier hardware granularity explicitly in benchmarks:
+  persist block size, preferred write size, sequential/random write
+  ratio, flush cost, and observed write amplification.
+
+### 2026-06-06 - Cross-paper synthesis: durable metadata needs recoverable shape
+
+**Converging design tracks:** Reactors, OrcGC, and ArchTM point at the
+same publication problem from different angles. Reactors says useful
+work should move between explicit owners only when the communication
+and commit boundary are worth it. OrcGC says published handles need
+bounded protection and retirement, not vague eventual cleanup. ArchTM
+says durable metadata must also have a hardware-aware write shape and a
+recovery annotation path.
+
+For GPU DB, the strongest track is a route-publication record that is
+both scheduler-visible and recovery-visible: it names the owner,
+snapshot generation, durable boundary, resident/warm fragment IDs,
+buffer budget, and retirement epoch. Hot DRAM maps can point at it, but
+the record itself must be reconstructable or rejectable after crash.
+
+**Category gaps:** Recent entries have good runtime/reclamation and
+durability-storage coverage. The next few runs should consider query
+optimization for concurrent/parameterized routes, HTAP freshness, or
+GPU memory sharing only if the queue has a primary source with enough
+mechanism detail.
+
+**Benchmark priorities:** combine the route-descriptor retirement
+simulator with durable metadata write-shape tests. A good design must
+bound retired handles, avoid scattered persistent writes, and preserve
+WAL-before-visibility while still letting read workers and GPU owners
+execute from immutable retained snapshots.
+
 ### 2026-06-06 - SplinterDB turns NVMe storage into a CPU-efficiency problem
 
 **Citation:** Alexander Conway, Abhishek Gupta, Vijay Chidambaram,
