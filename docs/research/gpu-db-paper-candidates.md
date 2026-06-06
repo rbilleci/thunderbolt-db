@@ -443,14 +443,17 @@ Append new candidates here as each paper is processed.
   a learned policy. Journal entry added 2026-06-06 from the open-access VLDB
   Journal 2025 extended paper after the VLDB PDF endpoint timed out from the
   cron worker.
-- `queued` — **Lemo: A Cache-Enhanced Learned Optimizer for Concurrent
+- `reviewed` — **Lemo: A Cache-Enhanced Learned Optimizer for Concurrent
   Queries**, Mo et al., SIGMOD/PACMMOD 2024.
-  URL: `https://dl.acm.org/doi/10.1145/3654972`
+  URL: `https://dl.acm.org/doi/10.1145/3626734`
   Author page: `https://mlxdb.github.io/publication/sigmod24-lemo/`
   Why: the adaptive-query-processing paper identifies Lemo as a newer learned
   optimizer for concurrent queries; useful for comparing learned cache sharing
   and multi-query route selection with deterministic batch-owner filter reuse
-  and GPU residency telemetry.
+  and GPU residency telemetry. Journal entry added 2026-06-06 from the
+  author/project page and indexed ACM/PACMMOD metadata after direct ACM PDF
+  fetches returned Cloudflare 403 pages; the queued DOI was corrected from
+  `10.1145/3654972` to `10.1145/3626734`.
 - `reviewed` — **LIMAO: A Framework for Lifelong Modular Learned Query
   Optimization**, Zhang et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p4546-zhang.pdf`

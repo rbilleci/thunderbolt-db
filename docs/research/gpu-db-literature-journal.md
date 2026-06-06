@@ -94065,3 +94065,164 @@ or must remain in ordinary WAL/redo paths.
   canonical WAL path.
 - Inject nondeterminism deliberately into a metadata function and verify the
   clobber/reexecution path rejects it or falls back to redo logging.
+
+### 2026-06-06 - Lemo makes concurrent query optimization cache-aware
+
+**Citation:** Songsong Mo, Yile Chen, Hao Wang, Gao Cong, and Zhifeng
+Bao. "Lemo: A Cache-Enhanced Learned Optimizer for Concurrent Queries."
+Proceedings of the ACM on Management of Data 1, 4, Article 247, 2023;
+SIGMOD 2024. DOI: `https://doi.org/10.1145/3626734`. Retrieved
+2026-06-06 from the author/project page:
+`https://mlxdb.github.io/publication/sigmod24-lemo/`. Direct ACM PDF
+fetches from the cron worker returned Cloudflare 403 pages, so details below
+are limited to the author abstract, ACM/PACMMOD metadata, and secondary
+indexed abstract text rather than the full paper.
+
+**Category:** query optimization / planning, with runtime scheduling,
+multi-query cache reuse, and shared intermediate placement.
+
+**Relevance tags:** Lemo; learned query optimizer; concurrent queries;
+multi-query optimization; intermediate result cache; shared buffer manager;
+value network; PostgreSQL; route cache; GPU residency; micro-batching;
+same-shape route selection; cache-aware cost model.
+
+**Core idea:** Lemo treats concurrent query optimization as a cache-aware
+multi-query problem. Instead of optimizing every query independently and only
+letting the executor discover accidental overlap, it feeds shared-cache state
+into a learned value network so plan generation can prefer routes that reuse
+cached intermediate sub-query results and avoid redundant computation.
+
+The most transferable idea for GPU DB is not the specific learned model. It is
+the contract between optimizer, scheduler, and cache manager: a route decision
+should know which intermediate results or resident fragments are already
+available, which concurrent requests can reuse them, and whether admitting one
+route improves or harms the next few routes.
+
+**Concrete mechanisms:**
+
+- Lemo proposes a value network to predict latencies for concurrent queries
+  and uses that prediction as the foundation model during query-plan
+  generation.
+- It adds a shared buffer manager that caches intermediate results of
+  sub-queries rather than only base pages or final query outputs.
+- The shared buffer manager uses a replacement policy aimed at maximizing
+  future reuse of cached sub-query results. The exact scoring formula was not
+  available from the accessible sources in this cron run.
+- The value network incorporates shared-buffer state into cost estimation, so
+  cache-resident intermediates can guide plan choice and reduce redundant
+  work across a burst of concurrent queries.
+- The system is reported as integrated into PostgreSQL and evaluated on real
+  datasets, with the authors reporting better efficiency than their baselines.
+  The accessible abstract does not expose the full baseline list, workload
+  details, hardware, or ablation numbers.
+- The paper frames the target gap as practical multi-user access where many
+  users submit queries within a short time window, creating both redundant
+  computation and resource contention.
+- Its abstraction is closer to concurrent analytical/multi-query optimization
+  than OLTP commit scheduling: the reusable unit is an intermediate sub-query
+  result, not a transaction write set or MVCC conflict class.
+
+**GPU DB mapping:** GPU DB should treat retained resident fragments, predicate
+bitmaps, key vectors, decoded text-prefix dictionaries, partial aggregates,
+and same-shape response metadata as optimizer-visible assets, not as hidden
+executor leftovers. A route candidate should include the resident generation,
+visibility boundary, cached intermediate ids, expected reuse count, and
+eviction or refresh pressure it creates.
+
+For the high-throughput runtime, Lemo supports a scheduler shape where a short
+admission window gathers compatible reads and chooses routes that share GPU
+resident work. For example, several `WHERE key = ?` lookups might share a key
+vector batch, while several prefix filters might share a resident predicate
+bitmap or decoded string dictionary. The route owner should expose this as a
+deterministic cache-aware score first; a learned policy can rank eligible
+routes later only behind correctness gates.
+
+The shared-buffer idea also maps to multi-tier placement. GPU HBM should not
+only cache whole tables or columns. It may cache route-shaped intermediates
+with explicit scope: snapshot generation, query-shape family, predicate
+family, output schema, byte cost, expected reuse horizon, and invalidation
+dependencies. System memory or NVMe can hold colder intermediates when HBM is
+too scarce, but the optimizer must see transfer cost and freshness risk.
+
+For 1M logical sessions, the key is to bind reuse to worker/route cohorts
+rather than session-local caches. Logical sessions should submit work into
+bounded windows; owners decide which intermediates are worth retaining and
+which requests can safely join a reusable batch.
+
+**Risks and mismatches:** The accessible sources do not expose Lemo's full
+model architecture, replacement formula, evaluation tables, or failure cases.
+Those details should be checked from the ACM/PACMMOD PDF or author copy before
+copying any numeric claim or algorithm.
+
+The paper is centered on concurrent query optimization in PostgreSQL and
+shared intermediate results. It does not address SQL write concurrency,
+WAL-before-visibility, MVCC snapshot eligibility, GPU kernels, CUDA streams,
+NVMe placement, or admission control for millions of mostly idle sessions.
+
+Learned cache-aware plan selection can regress if the cache signal is stale,
+if training workloads do not match production bursts, or if the policy favors
+reuse while starving latency-sensitive singleton requests. GPU DB should keep
+hard eligibility rules, deterministic fallback, and per-route SLO accounting
+outside the learned model.
+
+Intermediate-result reuse is only correct under matching visibility and route
+semantics. GPU DB cannot reuse a cached bitmap, aggregate, or decoded column
+across different MVCC snapshots unless the result carries a compatible
+snapshot boundary or is proven snapshot-invariant.
+
+**Benchmark candidates:**
+
+- Add a cache-aware route-admission benchmark with concurrent read bursts.
+  Compare independent optimization, deterministic reuse-first scoring, and a
+  learned ranking stub over the same eligible route set. Measure p50/p99
+  latency, GPU kernel launches, HBM bytes retained, reuse hits, and fallback
+  count.
+- Build a same-shape retained-lookup benchmark where the scheduler can share
+  key vectors and response metadata across requests in a microsecond window.
+  Gate: batching improves throughput without violating a p99 latency ceiling
+  for singleton requests.
+- Add a predicate-intermediate cache benchmark for prefix filters and simple
+  integer predicates. Cache predicate bitmaps by `{snapshot, table, column,
+  predicate_family}` and measure reuse benefit versus invalidation and HBM
+  pressure under updates.
+- Test a multi-tier intermediate policy: HBM for hot route fragments, system
+  memory for warm intermediates, and NVMe for cold reusable artifacts. Measure
+  transfer cost, eviction churn, and whether planner-visible placement avoids
+  accidental slow routes.
+- Add a correctness gate for snapshot-compatible reuse. Force concurrent
+  reads at different visibility boundaries and verify cached intermediates are
+  reused only when their snapshot contract permits it.
+- Track telemetry for optimizer-visible intermediates: resident bytes, hit
+  count, avoided kernel launches, refresh/invalidation count, eviction reason,
+  route families waiting on each intermediate, and stale-signal replan count.
+
+### 2026-06-06 - Cross-paper synthesis: reusable work needs visible lifetime contracts
+
+Conditional Access, Clobber-NVM, and Lemo converge on the same architectural
+pressure from different directions: hot paths want to reuse or retire shared
+state aggressively, but correctness depends on making the lifetime contract
+explicit. Conditional Access names a small validation set before dereference;
+Clobber-NVM names deterministic inputs before replay; Lemo names reusable
+intermediate state before plan selection.
+
+For GPU DB, the design track is a route asset registry. A route asset can be a
+resident fragment, predicate bitmap, decoded dictionary, route descriptor,
+warm-tier index root, checkpoint manifest, or response-shape buffer. Each
+asset needs an owner, generation, visibility boundary, durability boundary
+when relevant, dependency set, byte cost, reuse score, and retirement rule.
+Queries should not discover these assets by accident in the executor; the
+optimizer and scheduler should see them through a compact, validated catalog.
+
+The benchmark priority is now clear: measure reuse, retirement, and recovery
+together. A benchmark that only shows cache hits can hide stale snapshots or
+unbounded retained bytes; a benchmark that only shows fast retirement can hide
+lost reuse; a benchmark that only shows smaller durable logs can hide recovery
+ambiguity. The next useful experiments should combine route-cache reuse,
+snapshot-compatible invalidation, bounded descriptor reclamation, and crash
+recovery of route metadata in one harness.
+
+Category gaps after this cluster: OLTP write admission and WAL group-commit
+policy need another modern pass, and GPU execution batching still needs more
+kernel-level evidence. Query optimization now has enough recent learned-route
+coverage to move back toward transaction/runtime or GPU execution unless a
+newer paper directly addresses cache-aware GPU route planning.
