@@ -7225,14 +7225,30 @@ Append new candidates here as each paper is processed.
   Why: Publish on Ping's related work includes automatic/reference-counting
   style reclamation; useful as a contrast to hazard/epoch designs before GPU
   DB picks a route metadata lifetime scheme.
-- `queued` — **OrcGC: Automatic Lock-Free Memory Reclamation**, Correia,
+- `reviewed` — **OrcGC: Automatic Lock-Free Memory Reclamation**, Correia,
   Ramalhete, and Felber, PPoPP 2021.
   URL: `https://doi.org/10.1145/3437801.3441596`
   PDF: `https://zenodo.org/records/7886712/files/OrcGC-zenodo.pdf`
   Why: Hyaline contrasts automatic and reference-counting style reclamation
   designs; OrcGC is a useful follow-up for deciding whether GPU DB route
   metadata should remain manually retired by owner domains or hide
-  protection/deallocation in a more automatic descriptor API.
+  protection/deallocation in a more automatic descriptor API. Journal entry
+  added 2026-06-06 from the author/Zenodo PDF.
+- `queued` — **Practically and Theoretically Efficient Garbage Collection for
+  Multiversioning**, Wei, Blelloch, Fatourou, and Ruppert, PPoPP 2023.
+  URL: `https://doi.org/10.1145/3572848.3577508`
+  arXiv: `https://arxiv.org/abs/2212.13557`
+  PDF: `https://www.cs.cmu.edu/~guyb/papers/3572848.3577508.pdf`
+  Why: OrcGC is a general lock-free reclamation design, but GPU DB's hardest
+  reclamation pressure is multiversion state; this follow-up directly studies
+  MVGC on versioned trees and hash tables with space bounds.
+- `queued` — **Efficient Hardware Primitives for Immediate Memory Reclamation
+  in Optimistic Data Structures**, Singh, Brown, and Spear, arXiv 2023.
+  URL: `https://arxiv.org/abs/2302.12958`
+  Why: OrcGC still delays reclamation through hazard-style protection and
+  handoff; Conditional Access is a hardware-primitive contrast for whether
+  coherence-assisted immediate reclamation could ever matter for future CPU
+  warm indexes or route descriptors.
 - `reviewed` — **To Store or Not to Store: a graph theoretical approach for
   Dataset Versioning**, Guo, Li, Sukprasert, Khuller, Deshpande, and
   Mukherjee, arXiv 2024.

@@ -93068,3 +93068,189 @@ CXL memory, or NVMe transfer paths.
   procedures or retained-route graphs: sequential work, send cost,
   receive cost, overlapped work, commit/publication cost, and observed
   queueing delta.
+
+### 2026-06-06 - OrcGC makes reclamation bounds part of the hot-path contract
+
+**Citation:** Andreia Correia, Pedro Ramalhete, and Pascal Felber.
+"OrcGC: Automatic Lock-Free Memory Reclamation." PPoPP 2021,
+205-218. DOI: `https://doi.org/10.1145/3437801.3441596`.
+Retrieved 2026-06-06 from the author/Zenodo PDF:
+`https://zenodo.org/records/7886712/files/OrcGC-zenodo.pdf`.
+
+**Category:** GC, memory reclamation, and in-memory state movement;
+runtime / HFT / session scale.
+
+**Relevance tags:** OrcGC; pass-the-pointer; PTP; lock-free memory
+reclamation; hazard pointers; reference counting; bounded retired
+objects; system allocator; route descriptors; lock-free indexes;
+snapshot metadata; owner-domain cleanup.
+
+**Core idea:** OrcGC targets a narrow but important systems problem:
+lock-free data structures still need safe memory reclamation, and a
+blocking or unbounded reclamation scheme can quietly destroy the
+progress guarantee of the data structure using it. The paper introduces
+pass-the-pointer (PTP), a manual pointer-based reclamation scheme with
+a linear bound on unreclaimed objects, then builds OrcGC on top as an
+automatic type-annotated scheme that combines per-object hard-link
+reference counts with local pointer protection.
+
+For GPU DB, the transferable idea is that route metadata, CPU-side
+resident indexes, snapshot descriptors, and command-ring side
+structures should not merely be "eventually reclaimed." Their
+retirement policy must have a bound that can be reasoned about under
+high session counts, stalled readers, and owner handoff. If 1M logical
+sessions can cause retired descriptors to grow without a hard limit,
+the reclamation design is part of the latency and admission problem,
+not an implementation detail.
+
+**Concrete mechanisms:**
+
+- PTP uses the same basic protection shape as hazard pointers: before a
+  thread dereferences a shared object pointer, it publishes that pointer
+  in a per-thread hazardous-pointer array and validates that the source
+  pointer did not change.
+- PTP changes the retire path. Instead of accumulating per-thread
+  retired lists, a retiring thread scans published hazardous pointers.
+  If another thread is currently protecting the object, the retiring
+  thread atomically hands responsibility for deletion to the protecting
+  thread's associated handover slot. The last protecting thread that
+  stops using the object continues the handoff scan or deletes it.
+- This handoff design gives the paper's claimed bound of at most
+  `t * (H + 1)` retired-but-not-deleted objects, where `t` is the number
+  of threads and `H` is the maximum hazardous pointers needed by the
+  data-structure algorithm. The paper contrasts this with hazard
+  pointers and pass-the-buck style bounds of `O(H * t^2)`.
+- OrcGC adds one `_orc` field to each tracked object. `_orc` counts
+  hard links from other objects, carries a retired bit, and includes a
+  sequence value so a retiring thread can detect whether the counter
+  changed while it was scanning hazardous pointers.
+- Shared dynamic types extend `orc_base`; shared atomic pointers use
+  `orc_atomic<T*>` instead of `std::atomic<T*>`; local references use
+  `orc_ptr<T*>`. `orc_atomic` overrides load/store/CAS/exchange-style
+  operations so hard-link counts and pointer protection happen at the
+  API boundary rather than through manual `protect()` and `retire()`
+  calls in user code.
+- `orc_atomic.load()` and object creation through `make_orc<T>()`
+  publish the pointer in a hazardous-pointer slot before returning an
+  `orc_ptr`. Local `orc_ptr` copies preserve protection while the local
+  reference is alive.
+- An object can be retired when `_orc` reaches zero, but it can be
+  deleted only if there is a moment when `_orc` is still zero and no
+  hazardous pointer protects the object. This handles the case where an
+  object is temporarily removed and later re-linked by a thread holding
+  a local reference.
+- Deleting an object may decrement hard-link counts for other objects
+  through `orc_atomic` destructors. OrcGC uses a recursive-list mechanism
+  to avoid unbounded program-stack recursion when one deletion triggers
+  a chain of retirements.
+- The paper's applicability limits matter: OrcGC targets lock-free
+  acyclic algorithms. Cyclic structures are allowed only if unreachable
+  cycles are broken before becoming unreachable, and the underlying
+  structure must not create unbounded chains of removed-but-linked
+  objects if the linear bound is required.
+- The evaluation applies PTP/OrcGC to queues, linked lists, a binary
+  search tree, and skip lists on dual-socket Intel and AMD machines.
+  The paper reports little to no PTP throughput impact compared with HP
+  and PTB while improving the memory bound. OrcGC sometimes has little
+  visible cost on Intel, but on AMD and write-heavy linked-list/tree
+  workloads it can impose up to roughly a 50% throughput drop. The
+  authors attribute part of the architecture difference to the cost of
+  synchronization fences or exchange instructions used for pointer
+  publication.
+- The paper also reports a practical skip-list lesson: if removed nodes
+  can remain in long chains, memory footprint can remain high. Their
+  modified skip list breaks those chains with poisoned nodes and search
+  restart, reducing memory use in the reported experiment from about
+  19 GB to under 1 GB.
+
+**GPU DB mapping:** The runtime document already prefers immutable
+snapshots and bounded rings. OrcGC adds a sharper requirement: every
+published route descriptor, retained snapshot handle, CPU resident
+index node, and GPU staging-buffer descriptor should have an explicit
+protection and retirement bound. A route descriptor API that hides
+publication, protection, and release behind typed handles may be safer
+than scattering manual reference-count or epoch calls through query
+paths.
+
+The PTP handoff model maps well to owner-domain cleanup. If a network
+worker, read snapshot worker, or GPU execution owner still protects a
+descriptor, the mutation/residency owner should not spin, block, or put
+the descriptor on an unbounded graveyard list. It can hand cleanup
+responsibility to the worker or owner that still holds the last
+protected reference, while keeping telemetry for retired descriptors by
+owner and route generation.
+
+The `_orc` split between hard links and local references is useful for
+GPU DB's snapshot model. Hard links are persistent publication edges:
+catalog route map to descriptor, snapshot generation to resident
+buffer, index root to index node. Local references are transient
+execution holds: a request, batch, or GPU worker currently using that
+descriptor. Retiring should require both no publication edge and no
+active execution hold.
+
+The acyclic/no-unbounded-chain limit is a warning for MVCC version
+chains. Ordinary row-version chains, old index entries, and retained
+snapshot dependency graphs can form long chains by design. OrcGC's
+automatic API is not enough for them unless the storage layout provides
+bounded unlinking, segment-level retirement, or explicit chain breaking.
+For MVCC state, the follow-up lane should be multiversion-specific GC,
+not only general lock-free object GC.
+
+The evaluation reinforces a mechanical-sympathy point. Automatic safety
+has a cost, and the cost can be architecture-dependent. GPU DB should
+benchmark pointer-protection fences, reference-count updates, epoch
+loads, and owner-local handles on the actual CPU path before putting
+them in per-row or per-request hot loops.
+
+**Risks and mismatches:** OrcGC is not a database MVCC garbage
+collector. It does not address SQL snapshots, WAL-before-visibility,
+crash recovery, GPU memory, pinned host buffers, NVMe tiers, or
+long-running analytical snapshots.
+
+The paper's linear bound is in terms of OS threads and hazardous
+pointers, not logical sessions. GPU DB must avoid one protection slot
+per logical session; protection should be tied to bounded worker/owner
+contexts and batch handles.
+
+Reference counting on hot descriptor objects can create cache-line
+contention. OrcGC is attractive for correctness and API discipline, but
+per-request atomic updates on shared route descriptors could hurt p99
+latency under 1M-session multiplexing.
+
+The acyclic assumption does not hold automatically for MVCC chains,
+secondary-index history, dependency graphs, or retained query-plan
+graphs. Those need segment/generation-level retirement rules or a
+different multiversion reclamation algorithm.
+
+The paper is evaluated with synthetic data structures, not database
+routes, snapshot handles, or mixed OLTP/retained GPU reads. The exact
+throughput numbers should be treated as mechanism evidence, not a
+production forecast.
+
+**Benchmark candidates:**
+
+- Build a route-descriptor retirement simulator with bounded worker
+  threads and many logical sessions. Compare epoch reclamation, simple
+  reference counts, hazard pointers, PTP-style handoff, and owner-local
+  generation retirement. Measure retired descriptor count, p99 route
+  lookup latency, atomic operations per request, and stalled-reader
+  behavior.
+- Add a hard-link/local-hold model for retained snapshots: publication
+  edges from route maps and local holds from executing batches. Gate:
+  eviction or invalidation must retire descriptors only after both edge
+  classes are gone, with a bounded retired-byte metric.
+- Microbenchmark pointer-protection overhead on CPU hot paths:
+  per-request retained lookup, batched lookup, and command-ring dequeue.
+  Compare no protection, Arc-like refcount, epoch token, hazard pointer,
+  and typed-handle protection. Failure condition: safety machinery
+  consumes more latency than the retained route saves.
+- Test chain-breaking policies for MVCC and index history: row-version
+  chains, segment-level retired lists, and descriptor DAGs. Gate:
+  retired bytes must remain bounded under long readers and high update
+  rates without blocking WAL visibility publication.
+- Add telemetry fields for future runtime slices: protected handles by
+  owner, retired handles by generation, maximum retirement age, handoff
+  count, cleanup owner, and cleanup backlog bytes.
+- Prototype an automatic descriptor API only for acyclic route metadata
+  first. Do not apply it to MVCC row versions until a multiversion GC
+  paper or benchmark proves bounded behavior for version chains.
