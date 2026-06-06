@@ -76808,3 +76808,158 @@ session workloads.
   lookups and large cold-segment reads. The expected result is a threshold:
   small work benefits from owner-local completion, while large work must be
   split or offloaded so polling and response rings stay responsive.
+
+### 2026-06-06 - BVLSM moves value separation into WAL admission
+
+**Citation:** Ming Li, Wendi Cheng, Jiahe Wei, Xueqiang Shan, Weikai Liu,
+Xiaonan Zhao, and Xiao Zhang. "BVLSM: Write-Efficient LSM-Tree Storage via
+WAL-Time Key-Value Separation." arXiv 2506.04678v2, 2025. Retrieved
+2026-06-06 from arXiv `https://arxiv.org/abs/2506.04678`.
+PDF: `https://arxiv.org/pdf/2506.04678`.
+
+**Category:** WAL, logging, and read/write throughput, with multi-tier storage
+and cold-tier ingest relevance.
+
+**Relevance tags:** WAL-time key-value separation; LSM tree; write
+amplification; compaction jitter; big values; NVMe multi-queue; value log;
+memtable pressure; metadata-only flush; read cache; cold-tier payloads;
+write-stall smoothing; append-only value files; pointer metadata; size
+thresholds.
+
+**Core idea:** BVLSM argues that flush-time key-value separation is too late
+for big-value LSM workloads. If a large value remains in the WAL/memtable path
+until flush, it consumes memory, shortens the effective memtable capacity, and
+can still create flush latency and write stalls before compaction is helped.
+BVLSM instead separates values during WAL admission: large values are appended
+to dedicated BValue files, while the WAL, memtable, and SSTables carry a
+compact key plus ValueOffset record.
+
+The transferable GPU DB idea is not "use an LSM tree." It is that the write
+path should separate correctness metadata, route metadata, and bulky payload
+bytes at the earliest durable boundary where recovery can still prove the
+payload exists. For GPU DB cold or warm segments, WAL admission could publish
+small visibility/route records while large row groups, text/blob payloads, or
+GPU-friendly column chunks move through separate append queues.
+
+**Concrete mechanisms:**
+
+- BVLSM applies a size threshold. Small values remain co-located with keys in
+  the normal memtable and SSTable path, while values above the threshold are
+  redirected into BValue files.
+- A large value append produces metadata including file path, logical offset,
+  and value size. The in-memory and on-disk LSM record becomes a
+  Key-ValueOffset structure rather than a full key-value pair.
+- In the strong-consistency mode described by the paper, the value is fsynced
+  to the BValue file first. The compact metadata record is then synchronously
+  written to the WAL and inserted into the memtable. The paper's claim is that
+  crash recovery can locate the value through the WAL-recorded metadata.
+- BVLSM also supports a higher-throughput asynchronous mode where values are
+  buffered and written to BValue files by background threads. That mode is
+  useful for measuring throughput ceilings, but it is not directly compatible
+  with GPU DB's WAL-before-visibility invariant unless visibility waits on a
+  durable payload proof.
+- BValue files are append-oriented value logs. Large values are distributed
+  across multiple BValue files and NVMe submission queues using a hash or
+  round-robin style load-balancing policy.
+- The multi-queue design tries to align software queues with NVMe hardware
+  queues, reducing a single shared queue bottleneck and improving write
+  parallelism for large values.
+- BVCache is a fixed-size memory cache, sized like the memtable in the paper's
+  design, that tracks recently written or hot Key-ValueOffset entries and
+  value locations. It uses a hash table for lookup and a deque-like structure
+  for recency/frequency-based eviction.
+- For reads, the key lookup finds the ValueOffset through the smaller LSM path
+  and then fetches the value from the BValue file. BVCache is intended to
+  reduce repeated value-log reads for recently written or hot data.
+- Evaluation uses RocksDB v9.7.3, db_bench, and YCSB on a single server with a
+  1 TB Samsung 990 EVO NVMe SSD. The paper reports that with 64 KB values
+  under asynchronous WAL, BVLSM improves throughput by 7.6x over RocksDB and
+  1.9x over BlobDB.
+- For YCSB-A with 8 KB values and a Zipfian mix of reads and updates, the
+  paper reports insert, update, and read latencies at 27.2%, 28.4%, and 19.7%
+  of RocksDB's corresponding latencies.
+- In a sustained random-write test, BVLSM reports steadier bandwidth than
+  RocksDB and BlobDB, attributing the stability to reduced memtable/compaction
+  pressure plus multi-queue BValue writes.
+- In a separate FIO-style multi-queue experiment, four pinned threads with
+  independent submission queues improved 4 KB random-write throughput by
+  60.6% and reduced latency by 41.2 us compared with sharing one submission
+  queue.
+
+**GPU DB mapping:** GPU DB's P8 write path can borrow the separation boundary.
+Instead of forcing bulky payload bytes, visibility metadata, route metadata,
+and compaction state through one owner queue, admission can create a compact
+durable record that names the payload extent, visibility boundary, checksum,
+tier, and publication generation. The payload itself can be appended into
+NVMe/host/GPU-friendly segment queues that are sized and scheduled separately.
+
+This is especially relevant for `text`, future blob-like columns, compressed
+column chunks, and over-resident cold segments. A write batch could publish a
+small WAL-visible route descriptor only after payload append and checksum
+complete. Memtable-like CPU state, resident route indexes, and snapshot
+publication would then carry offsets and generations instead of copying bulky
+payloads through every metadata structure.
+
+The multi-queue lesson maps to storage and GPU staging owners. Large payload
+append, checksum, compression, H2D staging, and cold-tier writeback should not
+share one global queue if the device exposes parallel queues. The benchmark
+should compare one mutation owner that serializes all payload writes against a
+mutation owner that reserves offsets and dispatches payload writes to bounded
+per-device queues before publishing visibility.
+
+BVCache maps to a warm-payload cache, but the cache key should include the SQL
+snapshot or route generation. A recent-write payload cache is only safe if a
+read can prove that the payload offset belongs to its visibility boundary and
+has not been superseded, reclaimed, or compacted behind the route descriptor.
+
+**Risks and mismatches:** BVLSM is a key-value LSM design for big values, not a
+relational MVCC engine. Its value-log pointer is not enough for SQL visibility,
+DDL safety, tuple-version chain traversal, predicate evaluation, or GPU
+resident snapshot publication. GPU DB would need tuple id, column id, snapshot
+frontier, delete/update state, checksum, and generation metadata in addition to
+file offset and length.
+
+The strongest throughput result is reported under asynchronous WAL. GPU DB
+must treat that as a ceiling experiment, not a production commit protocol.
+Durable commit requires payload durability before visibility, or a recovery
+protocol that can roll back unpublished metadata without exposing partial
+payloads.
+
+BVLSM's evaluation is single-node and focused on values from 4 KB to 64 KB.
+It does not answer whether separation helps small fixed-width OLTP tuples,
+whether value-log garbage collection creates tail latency, or how range scans
+and columnar GPU reads behave when payloads are scattered across value logs.
+The paper also leaves exact threshold tuning and long-term value-log cleanup
+less detailed than GPU DB would need for production.
+
+**Benchmark candidates:**
+
+- Prototype WAL-time payload separation for large `text` or variable-width
+  column payloads. Gate: WAL visibility is published only after payload append,
+  checksum, and route descriptor creation complete; crash replay must either
+  recover the payload route or discard unpublished metadata.
+- Compare three ingest paths for 8 KB, 32 KB, and 64 KB values: inline WAL plus
+  CPU tuple storage, flush-time separation, and WAL-time separation. Measure
+  write throughput, p99 commit latency, memtable/owner memory pressure,
+  compaction bytes, and read latency.
+- Add a multi-queue cold-segment append harness with one shared payload queue
+  versus per-device/per-file queues. Gate: queue parallelism improves
+  throughput without violating deterministic visibility publication or causing
+  unbounded out-of-order completion state.
+- Build a snapshot-aware warm-payload cache keyed by table, column, row/segment
+  id, payload offset, visibility boundary, and route generation. Failure
+  condition: a reader can observe a payload from the wrong tuple version after
+  update, compaction, or route descriptor reuse.
+- Measure read locality after value separation. Compare point lookups,
+  same-shape lookup micro-batches, prefix filters, and column scans when
+  variable-width payloads are inline versus offset-addressed. The useful
+  threshold is where smaller metadata improves cache residency more than
+  extra value-log fetches hurt.
+- Stress value-log cleanup and compaction during retained GPU reads. Gate:
+  old snapshots either keep their payload extents reachable or restart with a
+  precise route-invalid reason; cleanup must not block all writes behind a
+  long reader.
+- Treat async payload writes as an overload mode experiment only. Measure how
+  much throughput is gained when visibility is delayed until durable payload
+  completion versus when durability is relaxed; report the correctness tradeoff
+  explicitly instead of mixing the modes.

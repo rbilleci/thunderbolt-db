@@ -358,12 +358,27 @@ Append new candidates here as each paper is processed.
   Why: recent WAL-overhead reduction paper; useful as a foil for local durable
   WAL, remote durable logging, NIC-assisted persistence, and the throughput
   cost of synchronous commit.
-- `queued` — **BVLSM: Write-Efficient LSM-Tree Storage via WAL-Time Key-Value
+- `reviewed` — **BVLSM: Write-Efficient LSM-Tree Storage via WAL-Time Key-Value
   Separation**, arXiv 2025.
   URL: `https://arxiv.org/abs/2506.04678`
   Why: WAL-time key-value separation links write-ahead logging directly to LSM
   write amplification, memory pressure, and read/write jitter; useful for GPU
   DB cold-tier ingest and compaction policy.
+  Journal entry added 2026-06-06.
+- `queued` — **MatrixKV: Reducing Write Stalls and Write Amplification in
+  LSM-tree Based KV Stores with Matrix Container**, Yao et al., USENIX ATC
+  2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/yao`
+  Why: BVLSM contrasts NVM-oriented key-value separation and write-stall
+  reduction approaches; useful for comparing explicit DRAM/NVM/NVMe tiered
+  value placement and write-stall smoothing.
+- `queued` — **Differentiated Key-Value Storage Management for Balanced I/O
+  Performance**, Li et al., USENIX ATC 2021.
+  URL: `https://www.usenix.org/conference/atc21/presentation/li-yongkun`
+  Why: BVLSM cites differentiated KV storage management as related work;
+  useful for deciding whether GPU DB cold-tier value payloads should be routed
+  by size, update frequency, and read/write interference rather than a single
+  separation threshold.
 - `queued` — **High Throughput Replication with Integrated Membership
   Management**, Fouto, Preguica, and Leitao, USENIX ATC 2022.
   URL: `https://www.usenix.org/conference/atc22/presentation/fouto`
