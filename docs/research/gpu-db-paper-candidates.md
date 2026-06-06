@@ -1648,13 +1648,24 @@ Append new candidates here as each paper is processed.
   lock-free range queries and memory reclamation; useful for checking whether
   retained route metadata can avoid blocking reclamation while preserving
   linearizable/range-snapshot semantics. Journal entry added 2026-06-06.
-- `queued` — **Constant-time Snapshots with Applications to Concurrent Data
+- `reviewed` — **Constant-time Snapshots with Applications to Concurrent Data
   Structures**, Wei et al., PPoPP 2021.
-  URL: `https://doi.org/10.1145/3437801.3441612`
+  URL: `https://doi.org/10.1145/3437801.3441602`
+  PDF: `https://www.cs.cmu.edu/~guyb/papers/3437801.3441602.pdf`
   Why: EEMARQ compares against vCAS and discusses the cost/benefit of
   per-field versioned CAS snapshots; useful for comparing descriptor-level
   versioning, indirection overhead, and constant-time snapshot mechanics before
-  GPU DB chooses retained route metadata publication structures.
+  GPU DB chooses retained route metadata publication structures. Journal entry
+  added 2026-06-06; the previously queued DOI suffix was corrected from
+  `3441612` to `3441602`.
+- `queued` — **VERLIB: Concurrent Versioned Pointers**, Blelloch and Wei,
+  PPoPP 2024.
+  URL: `https://doi.org/10.1145/3627535.3638501`
+  Artifact: `https://zenodo.org/records/10447617`
+  Why: direct successor to constant-time snapshots that removes much of the
+  recorded-once indirection constraint and packages versioned pointers as a C++
+  library; useful before choosing GPU DB's retained route metadata and
+  resident-index publication primitives.
 - `reviewed` — **VBR: Version Based Reclamation**, Sheffi et al., arXiv 2021.
   URL: `https://arxiv.org/abs/2107.13843`
   Why: optimistic memory reclamation scheme related to EBR/hazard-pointer

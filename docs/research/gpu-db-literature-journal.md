@@ -81752,3 +81752,224 @@ refresh, pgwire backpressure, or recovery.
   the same partition owner and non-conflicting transactions across
   owners. Gate: inter-owner conflicts fall without creating a single
   overloaded hot owner that dominates p99.
+
+### 2026-06-06 - Constant-time snapshots make metadata reads lazy and versioned
+
+**Citation:** Yuanhao Wei, Naama Ben-David, Guy E. Blelloch, Panagiota
+Fatourou, Eric Ruppert, and Yihan Sun. "Constant-Time Snapshots with
+Applications to Concurrent Data Structures." PPoPP 2021, pp. 31-46.
+DOI: `https://doi.org/10.1145/3437801.3441602`. Retrieved 2026-06-06
+from the author PDF,
+`https://www.cs.cmu.edu/~guyb/papers/3437801.3441602.pdf`.
+
+**Category:** MVCC / snapshot / visibility, with runtime / concurrent
+metadata relevance.
+
+**Relevance tags:** versioned CAS; camera object; constant-time
+snapshot handle; wait-free versioned reads; linearizable multi-point
+queries; range queries; recorded-once optimization; version lists;
+timestamp helping; epoch-based reclamation; route metadata snapshots;
+resident-index publication; immutable read snapshots.
+
+**Core idea:** The paper shows how to add efficient snapshots to
+CAS-based concurrent data structures without copying the whole data
+structure at snapshot time. A global "camera" object returns a snapshot
+handle in constant time. Individual shared fields become versioned CAS
+objects; later reads use the handle to retrieve the value each field had
+at the snapshot point.
+
+For GPU DB, the transferable idea is that not every read-visible
+metadata snapshot has to be a fully materialized copy. Route metadata,
+resident-index roots, partition directories, and cache-state structures
+can publish a cheap generation handle, then let read workers lazily
+resolve only the fields they touch. That is attractive for 1M logical
+sessions because many sessions may need a stable route view while only
+touching a tiny part of the catalog, residency map, or index metadata.
+
+**Concrete mechanisms:**
+
+- A camera object owns a timestamp counter. `takeSnapshot` reads the
+  current timestamp, attempts to advance it with CAS, and returns the old
+  timestamp as the snapshot handle.
+- Each versioned CAS object stores a version list. The head is the
+  current value; older list nodes carry previous values and timestamps.
+- A successful `vCAS` appends a new head node with timestamp initially
+  marked `TBD`, then records the current camera timestamp in that node.
+- Reads, versioned reads, and failed CAS operations help initialize a
+  head node whose timestamp is still `TBD`. This helping step makes the
+  add-node/read-timestamp/record-timestamp sequence linearizable without
+  locks.
+- `vRead` and current-state `vCAS` take constant time. A
+  `readVersion(ts)` walks back through one object's version list until
+  it finds the newest node with timestamp at most the snapshot handle.
+  Its cost is proportional to successful writes on that object since the
+  snapshot.
+- The method preserves the original CAS-based data structure's
+  asymptotic current-operation time bounds; snapshot reads pay only for
+  write contention on the accessed objects, not for the total data
+  structure size.
+- Multi-point read-only queries run by taking one snapshot handle, then
+  executing a normal sequential query over versioned reads. The paper
+  applies this to queues, linked lists, and binary search trees.
+- For tree/list-like structures, the paper introduces a direct
+  implementation that avoids an extra indirection when the structure has
+  a recorded-once property: a node is successfully installed as the new
+  value of a versioned CAS at most once.
+- The direct implementation stores timestamp and previous-version
+  pointer fields in the data node itself instead of allocating a separate
+  version node for every update.
+- If snapshots are infrequent, consecutive version nodes can have the
+  same timestamp. The implementation can remove redundant versions by
+  helping splice out the second node when its timestamp matches the
+  newest node.
+- To reduce contention on the camera timestamp, `takeSnapshot` can use
+  exponential backoff and allow another concurrent snapshot to advance
+  the timestamp.
+- Memory reclamation uses epoch-based reclamation. In the direct
+  implementation, the authors report collecting the same nodes as
+  non-versioned EBR, with extra memory mostly from timestamp and version
+  pointer fields.
+- The evaluation applies the method to three concurrent binary search
+  trees and compares against specialized range-query data structures.
+  Reported overhead for adding snapshots to the Java trees is 2.7% to
+  9.1% across tested workloads; multi-point query overheads are low for
+  most queries but higher for tiny successor queries where the global
+  counter matters.
+- The paper reports that VcasCT-64 is among the top three Java data
+  structures in all tested workloads and often best overall; the C++
+  VcasBST range queries are reported as 5x to 7x faster than EpochBST in
+  their tested update/range-query mix.
+- The authors also observe a practical EBR limitation: when threads are
+  oversubscribed and a thread is descheduled mid-operation, reclamation
+  can stall and memory usage can grow by several times.
+
+**GPU DB mapping:** GPU DB's production read path wants immutable
+versioned snapshots, but full copying of catalog, residency, route, and
+index metadata at every mutation or refresh boundary would be expensive.
+The camera/versioned-CAS pattern suggests a middle path: publish a small
+snapshot handle for route metadata, then let each read worker resolve
+only the table, partition, resident segment, or index root fields it
+needs.
+
+For retained resident snapshots, this maps to a hierarchy of generation
+handles. A request could hold a catalog generation, residency generation,
+and route/index snapshot handle. The read path would then prove that the
+resident buffers, schema identity, visibility boundary, and route facts
+were all compatible at that handle, rather than forcing every metadata
+change to clone a whole route table.
+
+The per-object version-list cost is useful for hot metadata design. A
+read of a cold partition directory or stable route field remains cheap.
+Only fields with heavy concurrent updates accumulate version-walk cost,
+so telemetry can identify route metadata that needs coarser ownership,
+batch publication, or a different data structure.
+
+The helping rule is relevant to publication fences. A resident-route
+update cannot leave a half-published descriptor visible forever; readers
+that encounter a pending timestamp or descriptor should either help
+finish publication, wait behind a bounded fence, or fall back with a
+named reason.
+
+The recorded-once optimization fits immutable descriptor publication.
+GPU DB already prefers publishing new resident snapshot descriptors
+instead of mutating them in place. If descriptor nodes are installed once
+and then retired, timestamp/version pointers can live in the descriptor
+itself, avoiding a second allocation on hot route reads.
+
+**Risks and mismatches:** This is a concurrent data-structure paper, not
+a database MVCC protocol. It does not provide transaction isolation,
+predicate locking, serializability, WAL ordering, DDL semantics, recovery
+rules, or distributed snapshots.
+
+The global camera timestamp can become a bottleneck for very frequent
+tiny snapshots. GPU DB should not put every point lookup on a single
+global counter if per-table, per-partition, or per-owner route snapshots
+would be enough.
+
+Versioned reads are wait-free but not constant time with respect to
+updates on the accessed object. A hot catalog field, residency state, or
+route pointer could accumulate expensive version walks unless old
+versions are compacted, publication is batched, or writers are
+partitioned.
+
+The direct optimization depends on recorded-once behavior. Some GPU DB
+metadata, such as mutable counters, queue depths, and adaptive cost
+facts, should remain outside the versioned snapshot structure or use a
+different publication mechanism.
+
+Epoch reclamation can stall under oversubscription or paused workers.
+That matters for a 1M logical-session runtime: reclamation should track
+physical worker participation, not every logical session, and it needs a
+clear policy for stalled readers.
+
+The paper's evaluation is CPU-only and tree/list-heavy. It does not
+measure CUDA streams, pinned buffers, GPU resident index layouts,
+NVMe-tier metadata, SQL planner route decisions, or pgwire protocol
+latency.
+
+**Benchmark candidates:**
+
+- Prototype a versioned route-metadata table with camera handles,
+  immutable route descriptors, and per-descriptor version links. Gate:
+  reads can prove schema/residency/visibility compatibility without
+  copying the entire route table per generation.
+- Compare full metadata snapshot copying, RCU pointer-swap snapshots,
+  and versioned-CAS lazy snapshots for catalog plus residency maps.
+  Measure read p50/p99, writer publication latency, memory overhead, and
+  reclaimed descriptor lag.
+- Stress one hot metadata field while many cold fields stay stable.
+  Expected result: only reads touching the hot field pay version-walk
+  cost; failure condition: global timestamp or reclamation dominates all
+  route reads.
+- Add a bounded helping/fallback experiment for half-published route
+  descriptors. Gate: readers either finish publication safely, observe a
+  completed descriptor, or fall back with `route_publication_pending`.
+- Test recorded-once resident snapshot descriptors: install each
+  descriptor once, store generation and previous-version pointer in the
+  descriptor, retire after last physical worker epoch. Gate: no descriptor
+  allocation appears on read-only hot paths.
+- Model reclamation under 1M logical sessions multiplexed over a small IO
+  worker pool. Gate: stalled logical clients do not pin old route
+  descriptors unless they hold an active physical read snapshot.
+- Compare global camera, per-table camera, per-partition camera, and
+  per-owner camera designs. Failure condition: a single camera counter
+  improves correctness simplicity but caps retained read throughput.
+- Use version-walk telemetry as a route health signal. Gate: route
+  metadata with long version walks is promoted to owner-batched
+  publication or coarser immutable snapshot copying.
+
+### 2026-06-06 - Cross-paper synthesis: fast publication needs explicit fences
+
+The last three reviews converge on one design track: fast paths can be
+lazy, reordered, or recovery-oriented only when each path names the fence
+that makes it safe. FineLine asks whether durable state can be an indexed
+log plus lazy reconstruction. OCC batching asks whether contended writes
+can be reordered inside a bounded admission window. Constant-time
+snapshots asks whether readers can hold a cheap handle and lazily resolve
+only the metadata fields they touch. All three are attractive for GPU DB,
+but none can be allowed to hide the WAL, visibility, route, or
+reclamation boundary.
+
+The emerging track is **fenced lazy publication**. WAL epochs publish the
+durable mutation boundary; reorder windows publish a chosen serialization
+order before visibility; route/residency metadata publishes a snapshot
+handle or descriptor generation; reclamation publishes the point at which
+old descriptors and resident buffers are unreachable by physical read
+workers. If these fences are observable and named in telemetry, GPU DB can
+experiment with aggressive lazy rebuilds, batched conflict reduction, and
+cheap retained route snapshots without making stale reads look fast.
+
+Benchmark priority should now shift from isolated throughput to fence
+composition. The useful proof is not just "can a route read avoid copying
+metadata" or "can a hot-key batch abort fewer transactions." It is whether
+one request can carry a durable WAL boundary, selected serialization
+order, visibility boundary, route snapshot handle, resident buffer
+generation, and reclamation epoch through the runtime with clear fallback
+reasons when any piece is incompatible.
+
+Category gaps remain around production optimizer integration and
+high-concurrency networking under these fences. The queue has strong
+candidate coverage for transaction scheduling and MVCC metadata, but the
+next few selections should keep alternating with networking/admission,
+query planning, and tier-placement papers so this does not become only a
+metadata-publication thread.
