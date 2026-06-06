@@ -38,6 +38,170 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Sherman makes remote indexes write-friendly by moving proof to tiny ordered updates
+
+**Citation:** Qing Wang, Youyou Lu, and Jiwu Shu. "Sherman: A
+Write-Optimized Distributed B+Tree Index on Disaggregated Memory."
+SIGMOD 2022. DOI: `https://doi.org/10.1145/3514221.3526054`.
+Retrieved 2026-06-06 from the arXiv preprint,
+`https://arxiv.org/abs/2112.07320`.
+
+**Category:** database file-system/storage/indexing and multi-tier data
+placement, with runtime / HFT relevance for RDMA locking and tail latency.
+
+**Relevance tags:** disaggregated memory; RDMA; B+Tree; remote indexes;
+one-sided verbs; command coalescing; hierarchical locks; on-NIC memory;
+entry-level versions; lock-free reads; write amplification; index cache;
+range indexes; future tiers.
+
+**Core idea:** Sherman targets a specific pain point in remote-memory
+database indexes: one-sided RDMA B+Trees can read quickly, but writes
+collapse under contention because modifying a node normally requires
+multiple network round trips, slow remote atomics, unfair retries, and
+whole-node writeback. Sherman keeps commodity RDMA NICs and near-passive
+memory servers, but redesigns the update path around three mechanisms:
+ordered RDMA command combination, hierarchical on-chip locks, and
+entry-granular versioned leaf updates.
+
+For GPU DB, the strongest transferable idea is that remote or future-tier
+index updates should publish the smallest provable mutation, not rewrite a
+large index node just because readers need consistency checks. A route that
+updates a warm/cold range index, resident key vector metadata, or future
+CXL/RDMA-backed index page should carry a small visibility/version proof and
+an ordered release point, so read routes can remain lock-free while write
+routes avoid whole-node amplification.
+
+**Concrete mechanisms:**
+
+- Sherman stores B+Tree nodes across memory servers and lets compute-server
+  client threads perform index operations with one-sided RDMA verbs.
+- Read operations are lock-free: a client fetches remote nodes with
+  `RDMA_READ` and validates versions instead of taking locks.
+- Write-write conflicts use node-granular exclusive locks, but the locks are
+  separated from tree nodes and stored in global lock tables in RDMA NIC
+  on-chip memory on the memory-server side.
+- Each compute server also keeps local lock tables. Threads acquire the local
+  lock before attempting the remote global lock, reducing failed remote CAS
+  traffic under contention.
+- Local wait queues provide first-come-first-served fairness within a compute
+  server, and lock handover lets a releasing thread pass the lock to a waiting
+  local thread without another remote acquisition. The design limits
+  consecutive handovers to avoid starving other compute servers.
+- Sherman relies on reliable-connected RDMA in-order delivery to combine
+  dependent writes. For example, writeback of a modified node or entry and
+  release of the corresponding lock can be posted together, with only the last
+  command signaled for completion.
+- Leaf nodes are unsorted so insert/delete without split/merge can modify a
+  single entry without shifting the rest of the leaf.
+- Leaf entries carry tiny front/rear entry versions; leaf nodes also carry
+  node-level versions. Normal insert/update/delete modifies the entry and its
+  entry versions, while split/merge updates node-level versions and writes the
+  larger node state.
+- Lookup first checks node versions, then checks the entry version around the
+  matching key. If versions mismatch, it retries the remote read.
+- Range queries fetch multiple leaves in parallel and validate the same way,
+  but the paper explicitly does not provide atomic range queries under
+  concurrent writes; upper layers need snapshot/phantom protection.
+- Compute servers cache internal index nodes to reduce remote traversals.
+  Fence keys and node levels let Sherman detect stale cache steering and
+  invalidate/retry.
+- Memory allocation is two-stage: memory servers hand out 8 MB chunks via a
+  lightweight management path, while clients allocate fixed-size tree nodes
+  locally within chunks.
+- The evaluation uses an emulated disaggregated setup with 8 memory servers
+  and 8 compute servers on 100 Gbps Mellanox ConnectX-5 RDMA, 1 billion
+  entries, 1 KB tree nodes, and YCSB-style read/write mixes.
+- Reported write-intensive skewed results show large gains over the FG+
+  baseline: the paper reports 23.6x higher throughput and 30.2x lower
+  99th-percentile latency for write-intensive skewed workloads after all
+  techniques are enabled.
+- Internal metrics show the mechanism behind the tail improvement: 94% of
+  FG+ writes require 4 round trips, while 93.6% of Sherman writes require
+  3; under skew, FG+'s 99th-percentile round trips reach 453, while Sherman
+  reports 11.
+- For normal writes without splits, Sherman writes back 17 bytes for an
+  8-byte key/value pair plus entry versions instead of a whole node. Only
+  about 0.4% of writes in the skewed experiment trigger node splits.
+- A 400 MB index cache reaches about a 98% hit rate for the evaluated
+  1-billion-entry dataset.
+
+**GPU DB mapping:** P8 currently treats GPU-resident state as acceleration
+and CPU/WAL state as truth. Sherman suggests that future warm/cold index
+metadata should have the same split: mutable remote index structures can be
+fast if their publication proof is tiny, ordered, and versioned. For a GPU DB
+range index over cold segments, the first benchmark should not be a general
+remote B+Tree; it should be a small-update route that changes one index entry,
+posts the entry write and release/publication marker in order, and measures
+how often split/merge or compaction forces a whole-node rewrite.
+
+The hierarchical lock maps to runtime owner domains and gateway/session
+fan-in. If many IO workers or partition owners update the same route metadata,
+failed remote atomics are equivalent to queue retries that burn the shared
+fabric. A local-first lock or owner-local admission queue can collapse same
+gateway contention before it hits the remote tier, while fairness/handover
+telemetry exposes whether one gateway is monopolizing hot keys.
+
+The two-level version mechanism maps cleanly to retained read snapshots and
+resident index descriptors. A reader can validate a node/page/segment version
+first and then validate a smaller entry or slot version around the exact key.
+That lets GPU DB preserve lock-free reads over route metadata without treating
+every update as a full invalidation of an index page or resident key vector.
+
+Command combination is also useful beyond RDMA. Any future tier with ordered
+submission, including NVMe, GPUDirect-style paths, or CXL/RDMA fabrics, should
+be tested for "update plus publish" coalescing: write the modified entry, then
+publish the lock release, visibility bit, or generation marker in one ordered
+submission chain rather than waiting for each step separately.
+
+**Risks and mismatches:** Sherman is not a database transaction protocol. It
+does not provide snapshot-safe range queries under concurrent writes, and it
+expects an upper layer to handle phantom prevention or transactional
+visibility. GPU DB cannot adopt the index read path without adding MVCC
+range certificates, read boundaries, or predicate/index generation checks.
+
+The system assumes RDMA reliable-connected ordering and ConnectX-5-style
+on-chip memory. That is a useful future-tier signal, not a portable baseline
+for today's local CPU/GPU/NVMe path. If the target machine lacks RDMA or
+on-NIC memory, the transferable parts are the local-first contention gate,
+ordered publication, and entry-granular versioning, not the exact NIC lock
+table.
+
+Unsorted leaves improve write amplification but make lookups scan the whole
+leaf and make range queries less naturally ordered. GPU DB should test this
+only for small fixed-size route pages, hot-key maps, or update-heavy warm
+indexes; cold analytical scan indexes may prefer sorted or compressed layouts.
+
+The evaluation is an emulated disaggregated-memory cluster with one baseline
+implementation, not an end-to-end SQL engine with WAL, MVCC, catalog
+invalidations, recovery, and pgwire session pressure. Reported Mops are not
+directly comparable to GPU DB serving throughput.
+
+**Benchmark candidates:**
+
+- Prototype an entry-versioned CPU warm range-index page: node version for
+  split/merge, entry version for single-key insert/update/delete, and
+  lock-free read validation. Gate: read routes never observe torn entries.
+- Compare whole-page index writeback versus entry-sized writeback for
+  update-heavy key distributions. Measure bytes written per mutation, p50/p99
+  update latency, split/merge rate, and read retry rate.
+- Add a local-first hot-key admission gate before any shared remote/future-tier
+  metadata update. Expected result: failed global CAS or remote retry traffic
+  drops under skew while fairness counters show bounded handover.
+- Test ordered "entry update plus generation publish" chains on local NVMe or
+  in-memory simulated queues before any RDMA implementation. Failure
+  condition: a published generation can point at an uncommitted or partially
+  updated entry.
+- Add a range-query mismatch test: concurrent insert/delete against retained
+  prefix/range scans must either use an MVCC range certificate, retry on
+  generation mismatch, or fall back to a stronger CPU path.
+- Track route-index amplification as a first-class metric: bytes written per
+  logical key update, entries invalidated per mutation, remote/global lock
+  attempts per successful write, and index-page generations retired per
+  second.
+- Use Sherman as a future-tier contrast benchmark against DEX and SMART:
+  B+Tree entry-update friendliness versus remote traversal cost versus
+  range-scan friendliness.
+
 ### 2026-06-06 - LeanStore recovery makes WAL a sharded, tiered, and checkpoint-bounded pipeline
 
 **Citation:** Michael Haubenschild, Caetano Sauer, Thomas Neumann, and

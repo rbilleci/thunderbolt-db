@@ -356,14 +356,21 @@ Append new candidates here as each paper is processed.
   memory tier; useful for comparing GPU DB cold/warm range indexes, remote
   placement metadata, and read-path latency under tiered storage. Journal entry
   added 2026-06-06.
-- `queued` — **Sherman: A Write-Optimized Distributed B+Tree Index on
+- `reviewed` — **Sherman: A Write-Optimized Distributed B+Tree Index on
   Disaggregated Memory**, Wang, Lu, and Shu, SIGMOD 2022.
   URL: `https://arxiv.org/abs/2112.07320`
   DOI: `https://doi.org/10.1145/3514221.3526054`
   Why: DEX compares against Sherman as a one-sided RDMA B+-tree baseline;
   useful for write-optimized remote index layouts, RDMA command coalescing,
   hierarchical locks, and entry/node versioning before GPU DB adopts
-  disaggregated range indexes.
+  disaggregated range indexes. Journal entry added 2026-06-06.
+- `queued` — **FORD: Fast One-sided RDMA-based Distributed Transactions for
+  Disaggregated Persistent Memory**, Zhang et al., FAST 2022.
+  URL: `https://www.usenix.org/conference/fast22/presentation/zhang-mingxing`
+  Why: Sherman references FORD as a disaggregated persistent-memory
+  transaction direction; useful for comparing one-sided RDMA transaction
+  ordering, persistence, and remote metadata updates against GPU DB's future
+  warm/cold-tier transaction and index routes.
 - `reviewed` — **SMART: A High-Performance Adaptive Radix Tree for
   Disaggregated Memory**, Luo et al., OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/luo`
