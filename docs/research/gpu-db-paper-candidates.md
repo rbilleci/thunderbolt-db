@@ -5174,12 +5174,22 @@ Append new candidates here as each paper is processed.
   Why: Block-STM contrasts against constraint/pre-execution hints for smart
   contract transactions; useful for comparing off-critical-path route hints
   with active-window dependency learning.
-- `queued` — **Processing Transactions in a Predefined Order**, Saad et al.,
+- `reviewed` — **Processing Transactions in a Predefined Order**, Saad et al.,
   PPoPP 2019.
-  URL: `https://doi.org/10.1145/3293883.3295700`
+  URL: `https://doi.org/10.1145/3293883.3295730`
+  PDF: `https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-ppopp2019.pdf`
   Why: Block-STM compares against predefined-order STM approaches; useful for
   deciding whether GPU DB should use commit-order forwarding, flat combining,
   or Block-STM-style collaborative validation for admitted write windows.
+  Journal entry added 2026-06-06; DOI corrected from the stale queued value.
+- `queued` — **Lerna: Parallelizing Dependent Loops Using Speculation**,
+  Lou et al., SYSTOR 2018.
+  URL: `https://doi.org/10.1145/3211890.3211894`
+  PDF: `https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-systor2018.pdf`
+  Why: Processing Transactions in a Predefined Order names Lerna as a runtime
+  that can integrate ordered STM for speculative execution; useful for
+  comparing automatic loop/window speculation with explicit GPU DB write-window
+  admission and rollback boundaries.
 - `queued` — **SPEEDEX: A Scalable, Parallelizable, and Economically Efficient
   Decentralized EXchange**, Ramseyer, Goel, and Mazieres, arXiv 2021.
   URL: `https://arxiv.org/abs/2111.02719`

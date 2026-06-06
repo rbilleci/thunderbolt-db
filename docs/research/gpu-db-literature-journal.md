@@ -38,6 +38,165 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Predefined-order transactions forward values without giving up the commit order
+
+**Citation:** Mohamed M. Saad, Masoomeh Javidi Kishi, Shihao
+Jing, Sandeep Hans, and Roberto Palmieri. "Processing Transactions in
+a Predefined Order." PPoPP 2019. DOI:
+`https://doi.org/10.1145/3293883.3295730`. Retrieved 2026-06-06 from
+the author PDF,
+`https://www.cse.lehigh.edu/~palmieri/files/pubs/CR-ppopp2019.pdf`.
+
+**Category:** transaction processing / write path and concurrency
+control, with secondary relevance to runtime / HFT / session scale.
+
+**Relevance tags:** predefined commit order; age-based commit order;
+cooperative ordered execution; value forwarding; ordered write-back;
+ordered undo logging; lock stealing; cascading abort; flat combining;
+speculative writes; deterministic write windows; hot-key admission.
+
+**Core idea:** The paper studies a setting where the transaction order
+is known before execution and must be preserved, but executing strictly
+one transaction at a time wastes multicore parallelism. It introduces a
+cooperative ordered model: lower-age transactions may expose values to
+higher-age transactions before final commit, while metadata and abort
+propagation preserve the predefined age-based commit order.
+
+The useful transfer for GPU DB is not to expose dirty SQL-visible state
+to clients. It is to separate "route order is already known" from "work
+must run serially." COPY chunks, stored-procedure batches, hot-key
+write windows, and deterministic replay windows can have a fixed
+publication order while still allowing CPU/GPU workers to precompute,
+forward intermediate values, or prepare WAL/MVCC records ahead of the
+final visibility boundary.
+
+**Concrete mechanisms:**
+
+- Each transaction has a unique externally assigned age. The age does
+  not change across abort/retry, and the age relation defines the only
+  allowed commit order.
+- The Age-based Commit Order rule requires conflicting operations to
+  behave as if lower-age transactions happened before higher-age
+  transactions.
+- A transaction becomes **exposed** when its writes are visible to later
+  transactions but it can still be aborted. It becomes **reachable**
+  when all lower-age transactions have committed, at which point its
+  metadata can be released.
+- The cooperative ordered model permits higher-age transactions to read
+  exposed values from lower-age transactions, building an acyclic
+  dependency chain because dependencies only move forward in age.
+- If an exposed transaction aborts, it cascades aborts to dependent
+  transactions that consumed its exposed values.
+- OWB, Ordered Write Back, keeps writes in a local buffer during
+  execution. At try-commit it validates the read set, acquires versioned
+  locks for the write set, publishes writes to shared memory, and waits
+  until the transaction is reachable before final commit and metadata
+  reclamation.
+- OWB allows higher-age reads of lower-age exposed writers by adding
+  the reader to the writer's dependency list. It aborts a higher-age
+  exposed writer if a lower-age transaction needs the conflicting value.
+- OWB validates reads both before exposure and before final commit; it
+  can skip some revalidation for objects already locked in the write
+  set.
+- OUL, Ordered Undo Log, writes through at encounter time and stores old
+  values in an undo log. Each object has a read-write lock with a
+  writer reference and a bounded visible-reader list.
+- OUL permits read-after-write only from lower-age writers. A writer
+  aborts wrong speculative readers when a lower-age write invalidates
+  their read.
+- OUL-Steal allows a higher-age writer to overwrite a lower-age writer
+  and steal the lock, while keeping enough undo/ownership metadata to
+  return the lock or roll back if a mid-age reader later requires the
+  lower-age value.
+- A validator role finalizes commit-pending transactions in order. The
+  implementation uses flat combining so any thread can take the
+  validator role, but only one validator runs at a time.
+- The evaluation compares OWB, OUL, OUL-Steal, ordered TL2, ordered
+  NOrec, ordered UndoLog variants, STMLite, unordered baselines, and
+  sequential execution on microbenchmarks, STAMP, PARSEC, and SPEC2000.
+  The paper reports peak speedups of 4.3x to 16.5x across micro,
+  STAMP, PARSEC, and SPEC2000 applications, with OUL usually the
+  strongest ordered implementation.
+
+**GPU DB mapping:** GPU DB can use predefined-order execution as a
+design pattern for admitted write windows. A mutation owner can assign
+ordered slots to a COPY chunk, hot-key stored-procedure batch, or
+partition-local transaction window. Workers can then prepare
+per-transaction deltas, read lower-slot speculative outputs when the
+route allows it, and publish visibility strictly in slot order after
+WAL safety is known.
+
+For GPU execution, the mapping is a two-phase route: compute speculative
+effects in parallel, then publish in a deterministic commit lane. The
+GPU should never stream dirty results to clients, but it may compute
+candidate row versions, conflict masks, aggregate deltas, or index
+updates for higher-age slots using lower-age speculative deltas if the
+owner can still roll back or discard the dependent work before
+visibility.
+
+OUL's visible-reader and undo-log shape maps to MVCC delta staging.
+Instead of writing through to canonical table state, GPU DB could stage
+old/new tuple facts in owner-local chunk buffers with dependency lists.
+The final publisher advances the visibility boundary in order and frees
+or invalidates dependent speculative work on abort.
+
+OUL-Steal is a useful warning for hot-key writes. Overwriting a
+speculative value can improve throughput only if the runtime retains
+enough provenance to restore the earlier value when a mid-age read or
+abort requires it. For GPU DB, that means no write coalescing or latest
+value shortcut should discard per-slot undo/provenance until every
+earlier read boundary that could observe it has retired.
+
+The validator role maps to the mutation owner or partition owner. Flat
+combining suggests a benchmark where worker threads prepare commit
+metadata but the owner drains ready slots in order, instead of making
+every worker serialize on a global commit lock.
+
+**Risks and mismatches:** The paper is about software transactional
+memory and speculative loop/state-machine execution, not SQL MVCC,
+WAL, recovery, GPU kernels, or networked sessions. OWB provides TMS1,
+and OUL intentionally weakens opacity while preserving strict
+serializability; GPU DB must preserve SQL-visible snapshot semantics and
+WAL-before-visibility.
+
+Cascading abort can be expensive and tail-hostile. It is acceptable for
+discarded speculative work, but not for client-visible transaction
+results after success has been reported.
+
+The predefined order is externally known. This fits COPY chunks,
+deterministic stored procedures, replay, and partition-owned batches
+better than interactive transactions whose read/write sets and order are
+not known early.
+
+The single validator is a likely bottleneck at very high session scale.
+GPU DB should test per-partition validators, slot windows, and bounded
+publication batches rather than adopting one global finalizer.
+
+**Benchmark candidates:**
+
+- Add a deterministic write-window simulator with ordered slots,
+  parallel delta preparation, and in-order visibility publication.
+  Gate: WAL-before-visibility and per-slot MVCC boundaries remain
+  identical to serial execution.
+- Compare serial owner execution, ordered write-back staging, and
+  ordered undo/delta staging for hot-key increments and TPC-C-like
+  stock/order updates. Failure condition: cooperative staging improves
+  throughput only by increasing abort cascades or p99.9 latency.
+- Prototype dependency-list cleanup for speculative deltas. Gate: abort
+  of one lower slot names and discards every dependent higher-slot
+  speculative artifact before any visible publication.
+- Test a flat-combined validator versus per-partition publication
+  owners. Expected result: per-partition ownership reduces global
+  validator pressure while preserving deterministic order inside each
+  partition.
+- Add a GPU candidate-effect benchmark: GPU computes write deltas or
+  conflict masks for an ordered batch; CPU owner publishes slots in
+  order. Gate: GPU work is reusable after validation often enough to
+  beat CPU-only staging under medium contention.
+- Measure lock-steal-like coalescing for repeated writes to one key.
+  Failure condition: latest-value coalescing loses the ability to serve
+  an earlier snapshot, replay boundary, or mid-window read correctly.
+
 ### 2026-06-06 - Sundial unifies cache validity and transaction order with logical leases
 
 **Citation:** Xiangyao Yu, Yu Xia, Andrew Pavlo, Daniel Sanchez,
