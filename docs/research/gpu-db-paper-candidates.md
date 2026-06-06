@@ -6703,12 +6703,31 @@ Append new candidates here as each paper is processed.
   delayed publication of reservations, making it a modern follow-up for
   lowering hazard-pointer-style read overhead without allowing unbounded
   retired route metadata. Journal entry added 2026-06-06.
-- `queued` — **Crystalline: Fast and Memory Efficient Wait-Free
+- `reviewed` — **Crystalline: Fast and Memory Efficient Wait-Free
   Reclamation**, Nikolaev and Ravindran, arXiv 2021.
   URL: `https://arxiv.org/abs/2108.02763`
   Why: Publish on Ping references Crystalline as related robust reclamation
   work; useful for comparing bounded-garbage, wait-free, and memory-efficient
   retirement policies for route descriptors and lock-free CPU-side indexes.
+  Journal entry added 2026-06-06.
+- `queued` — **Universal Wait-Free Memory Reclamation**, Nikolaev and
+  Ravindran, PPoPP 2020.
+  URL: `https://doi.org/10.1145/3332466.3374540`
+  Why: Crystalline compares against WFE as the prior general wait-free
+  reclamation baseline; useful for deciding whether the full wait-free
+  machinery is justified versus a bounded lock-free route-descriptor scheme.
+- `queued` — **A Marriage of Pointer- and Epoch-Based Reclamation**, Kang
+  and Jung, PLDI 2020.
+  URL: `https://doi.org/10.1145/3385412.3386008`
+  Why: Crystalline discusses PEBR as a hybrid pointer/epoch design; useful
+  contrast for GPU DB if bounded route metadata needs simpler restart-based
+  protection rather than wait-free helper handoff.
+- `queued` — **Stamp-it: a More Thread-efficient, Concurrent Memory
+  Reclamation Scheme in the C++ Memory Model**, Poeter and Traff, SPAA 2018.
+  URL: `https://doi.org/10.1145/3210377.3210660`
+  Why: Crystalline cites Stamp-it as a bounded-reclamation-cost epoch
+  direction; useful for comparing monotonic stamp-based retirement with
+  route generation tokens and owner-local cleanup queues.
 - `queued` — **Concurrent Deferred Reference Counting with Constant-Time
   Overhead**, Anderson, Blelloch, and Wei, PLDI 2021.
   URL: `https://doi.org/10.1145/3453483.3454060`

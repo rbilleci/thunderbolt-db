@@ -38,6 +38,221 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Crystalline bounds reclamation without session-shaped snapshots
+
+**Citation:** Ruslan Nikolaev and Binoy Ravindran. "Crystalline:
+Fast and Memory Efficient Wait-Free Reclamation." arXiv:2108.02763,
+2021. Retrieved 2026-06-06 from `https://arxiv.org/abs/2108.02763`
+and PDF `https://arxiv.org/pdf/2108.02763`.
+
+**Category:** runtime / HFT / session scale, with secondary relevance
+to MVCC / snapshot / visibility and CPU-side index metadata lifetime.
+
+**Relevance tags:** safe memory reclamation; wait-free reclamation;
+bounded retired memory; snapshot-free reclamation; asynchronous
+reclamation; balanced cleanup; hazard-pointer alternative; birth eras;
+dynamic batches; route descriptor lifetime; physical-worker state;
+lock-free indexes.
+
+**Core idea:** Crystalline targets the awkward corner left by common
+safe-memory-reclamation schemes: epoch reclamation is fast but can pin
+unbounded garbage behind stalled threads, hazard pointers bound memory
+but add frequent pointer-publication overhead, and prior wait-free
+schemes pay more in throughput or memory. Crystalline combines
+bounded memory, asynchronous reclamation, balanced cleanup, and a
+wait-free variant for commodity 64-bit hardware.
+
+The GPU DB transfer is that route metadata and CPU-side resident-index
+lifetime should not require per-logical-session hazard snapshots. The
+runtime can give each physical worker a bounded number of protected
+descriptor slots, retire old route or index generations in batches, and
+let cleanup be shared across active workers without letting one stalled
+reader pin unbounded metadata.
+
+**Concrete mechanisms:**
+
+- Crystalline builds on Hyaline-1S. Hyaline-style retired objects are
+  accumulated into batches, with one REFS node carrying a batch reference
+  counter and SLOT nodes linking the retired batch into reservation lists.
+  Active workers decrement the batch counter when they leave or update a
+  protected reservation.
+- Crystalline-L changes the API from cumulative `activate` regions to
+  indexed `protect(ptr, index)` reservations. Each thread can protect at
+  most `MAX_IDX` local pointers, so even a starving traversal cannot
+  reserve an unbounded number of objects.
+- `clear()` resets all reservation indices for a worker. `protect()` is
+  non-cumulative: using the same index replaces the previous protected
+  pointer. This makes memory bounds depend on physical workers and
+  protected slots, not on logical operation count.
+- Nodes carry three header words reused across allocation, retirement,
+  reference-count, birth-era, slot, and list-link roles. The paper notes
+  that container indirection can reduce apparent per-object overhead, but
+  the main design uses three words.
+- Allocations receive birth eras from a global era clock. Retire batches
+  track the minimum birth era and are attached only to reservation lists
+  whose era overlaps the batch, avoiding unnecessary retention behind
+  inactive or older reservations.
+- Dynamic batches allow retirement attempts before collecting
+  `MAX_THREADS * MAX_IDX + 1` nodes. `try_retire()` counts the active
+  overlapping reservation lists, records the slot locations that need a
+  batch link, and completes retirement only when the current batch has
+  enough nodes for those lists.
+- Crystalline-L is lock-free and fully memory bounded. The paper gives a
+  worst-case bound based on `(MAX_THREADS * MAX_IDX + 1)^2` style
+  reservation/batch accounting, while noting that practical batches are
+  usually much smaller.
+- Crystalline-W makes the scheme wait-free using commodity-wide CAS,
+  fetch-and-add, and swap instructions. Architectures without the needed
+  instructions can fall back to Crystalline-L and lose wait-freedom.
+- To make retiring wait-free, Crystalline-W replaces contended CAS-list
+  insertion with unconditional swap plus list tainting. If a concurrent
+  traversal already detached a tail, the retiring thread observes the
+  taint and traverses that tail on the other thread's behalf.
+- To make `protect()` wait-free, Crystalline-W uses a bounded
+  fast-path/slow-path design. `protect()` tries to converge on the global
+  era for a finite number of iterations, then advertises a slow-path
+  state that allocation-era increments must help complete before moving
+  the global era forward.
+- Tags on reservation list and era fields identify slow-path cycles and
+  bound loops. Two extra internal reservations support helper handoff.
+- Object handoff is needed because a parent or retrieved object may
+  already be retired while a helper is trying to complete another
+  thread's `protect()`. The paper uses a parent array and REFS-terminal
+  nodes so helpers can safely pass references without scanning retired
+  lists twice.
+- Evaluation uses a 96-core, four-socket Intel Xeon E7-8890 v4 machine
+  with 256 GiB RAM, hyperthreading off, C++11 implementations, clang
+  9.0.1, jemalloc, 1 to 192 threads, five 10-second runs per point, and
+  prefilled data structures with 50,000 elements.
+- Benchmarks include a wait-free CRTurnQueue and lock-free linked list,
+  hash map, and Natarajan tree. Workloads include write-dominated
+  insert/delete or push/pop mixes and read-dominated get/put mixes.
+- Reported results show Crystalline-L/W generally outperforming existing
+  schemes in throughput and memory efficiency, with especially strong
+  behavior on hash map and Natarajan tree under oversubscription and
+  read-dominated workloads. The paper reports Crystalline-W overhead
+  versus Crystalline-L as negligible and says it outperforms WFE, the
+  prior wait-free reclamation scheme, in almost all tested cases.
+
+**GPU DB mapping:** GPU DB should treat reclamation as a runtime
+contract around physical execution contexts. A pgwire session, queued
+request, or retained snapshot token should not allocate a hazard record.
+Instead, the IO worker, read worker, mutation owner, residency owner, or
+GPU execution owner that is actively dereferencing route metadata should
+own a small fixed set of protected slots.
+
+This maps to route and resident-index descriptors. Publication creates a
+new immutable descriptor generation; invalidation, DDL, refresh, or
+eviction retires the old generation into a batch. Workers protect only
+the descriptors they are currently dereferencing. After all overlapping
+worker reservations clear or update, descriptors can be freed or handed
+to a cleanup owner for heavy CUDA/pinned-memory release.
+
+The indexed-protect API is a useful design constraint. GPU DB route
+traversal should have a known maximum number of live descriptor pointers:
+for example catalog descriptor, table/resident-snapshot descriptor,
+index descriptor, and response-shape descriptor. If a route needs more
+unbounded pointers, it should copy stable handles or restart from a
+generation token rather than widening the reclamation contract.
+
+Dynamic batches fit high-churn route publication. A busy mutation or
+residency owner should not wait to collect one retired object per worker
+before retirement can begin. It should try to retire based on the
+currently overlapping physical reservations and keep batch size
+telemetry: retired descriptors, protected slots touched, cleanup work
+charged to each worker, and final free latency.
+
+Crystalline-W's wait-free goal is most relevant to CPU-side lock-free
+indexes and hot route metadata, not to arbitrary GPU work. Once a route
+has launched a CUDA kernel or started response encoding, reclamation can
+prove descriptor safety, but cancellation and resource lifetime still
+need owner-level protocols.
+
+**Risks and mismatches:** Crystalline is a memory-reclamation paper for
+concurrent data structures, not a database isolation, WAL, crash
+recovery, or GPU resource-management design. It decides when a retired
+object can be freed; it does not decide when a SQL snapshot is visible
+or when a resident GPU buffer is fresh.
+
+The algorithm assumes an explicit SMR API and careful pointer discipline.
+GPU DB would need route/index descriptor APIs that make `protect`,
+slot indices, and clear points auditable. Hiding this inside arbitrary
+Rust references would be dangerous.
+
+Crystalline-W depends on specific atomic operations and intricate helper
+handoff machinery. A first implementation should likely benchmark a
+Crystalline-L-like bounded-slot design or a simpler Hyaline/epoch hybrid
+before adopting full wait-free slow-path machinery.
+
+The paper's evaluation uses in-memory data-structure microbenchmarks, not
+pgwire traffic, SQL routing, MVCC chains, DDL invalidation, GPU queues,
+or NVMe/cache-tier pressure. Throughput claims should be treated as
+evidence that the reclamation mechanics are promising, not as a direct
+database performance prediction.
+
+Balanced reclamation can move cleanup onto threads that did not retire
+the object. That is attractive for throughput, but GPU DB must prevent
+network IO workers from synchronously freeing large device buffers or
+pinned host allocations on the response hot path.
+
+**Benchmark candidates:**
+
+- Add a bounded-slot route-descriptor reclamation simulator: epoch-only,
+  hazard pointer, Hyaline-style batch, and Crystalline-L-style indexed
+  protect. Gate: retired metadata stays bounded when a worker stalls and
+  hot route lookup avoids per-logical-session state.
+- Define the maximum protected descriptor slots for retained-route
+  lookup. Failure condition: a realistic route requires an unbounded
+  number of protected pointers before it can produce a stable generation
+  token.
+- Measure dynamic batch retirement under route churn: publish/retire
+  catalog, resident snapshot, index, and response-shape descriptors while
+  read workers traverse them. Track batch size, retire latency, cleanup
+  work per worker, and p99 lookup latency.
+- Split light descriptor reclamation from heavy resource freeing. Gate:
+  Crystalline-style protection proves descriptor unreachability, but
+  CUDA buffers and pinned host memory are released by a cleanup owner
+  with bounded queue telemetry.
+- Stress 1M logical sessions over a fixed worker pool. Expected result:
+  reclamation state scales with physical workers and slot count, not
+  logical sessions.
+- Add an oversubscription test where route workers outnumber cores and
+  several are delayed. Failure condition: old route descriptors or
+  resident-index nodes grow without a visible bound or admission signal.
+
+### 2026-06-06 - Cross-paper synthesis: adaptive routes also need bounded metadata lifetimes
+
+Crystalline, Multiverse, Adaptive LIP/AJA, Poplar, and FissLock converge
+on one runtime rule: fast routes should publish small, auditable facts,
+then bound the lifetime of the metadata that proves those facts. Route
+choice, visibility, WAL dependency, lock admission, and reclamation are
+not independent subsystems once the engine keeps retained snapshots and
+serves many logical sessions through a small worker pool.
+
+**Converging design tracks:** First, separate logical sessions from
+physical protection state. Session tokens may name a generation, but only
+active workers should pin descriptor pointers. Second, publish compact
+facts at owner boundaries: route generation, visibility boundary, WAL
+dependency frontier, lock grant fact, and resident descriptor id. Third,
+make heavy state local or batch-owned: retired descriptors, long-reader
+versions, bloom filters, waiter queues, and recovery dependency details.
+Fourth, every adaptive or optimistic path needs a fallback proof: if a
+filter, version mode, log dependency, or route descriptor becomes stale,
+the request retries, waits, or falls back through a named boundary rather
+than reading ambiguous state.
+
+**Category gaps:** Recent coverage is strong in runtime metadata,
+MVCC/reclamation, WAL, and adaptive planning. The next useful lane should
+tilt toward storage/tiering or high-concurrency networking unless a
+newer transaction-processing paper has a direct GPU-OLTP mechanism.
+
+**Benchmark priorities:** Build one route-metadata lifetime benchmark
+that combines version promotion, adaptive route filters, WAL publication
+facts, and bounded descriptor reclamation. The proof gate should include
+SQL-correct generation checks, retired-bytes bounds under stalled
+workers, route retry counts, and p99 latency under 1M logical-session
+simulation.
+
 ### 2026-06-06 - Adaptive filters beat brittle route confidence without training
 
 **Citation:** Yunjia Zhang, Yannis Chronis, Jignesh M. Patel, and
