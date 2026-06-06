@@ -6846,13 +6846,22 @@ Append new candidates here as each paper is processed.
   Why: Vegito contrasts SyPer as a snapshot/replica-style HTAP design; useful
   for comparing virtual snapshot freshness, analytical isolation, and OLTP
   degradation against backup-based and GPU-resident snapshot publication.
-- `queued` — **1RMA: Re-Envisioning Remote Memory Access for Multi-Tenant
+- `reviewed` — **1RMA: Re-Envisioning Remote Memory Access for Multi-Tenant
   Datacenters**, Singhvi et al., SIGCOMM 2020.
-  URL: `https://doi.org/10.1145/3387514.3405873`
+  URL: `https://doi.org/10.1145/3387514.3405897`
+  PDF: `https://pages.cs.wisc.edu/~asinghvi/papers/1rma.pdf`
   Why: EQDS builds on 1RMA-style receiver-driven credits for RDMA-compatible
   traffic; useful for comparing tenant isolation, pull-based admission, and
   remote-memory access semantics against GPU DB's future storage or gateway
-  fabric.
+  fabric. Journal entry added 2026-06-06; the stale DOI was corrected during
+  review.
+- `queued` — **RDMA Performance Isolation with Justitia**, Zhang, Tan,
+  Stephens, and Chowdhury, arXiv 2019.
+  URL: `https://arxiv.org/abs/1905.04437`
+  Why: 1RMA contrasts connection-oriented sender shaping and performance
+  isolation with its connection-free finite-resource model; useful for
+  comparing software-only pacing, fairness, and tenant isolation before GPU DB
+  designs route credits for shared gateway or remote-tier access.
 - `reviewed` — **Aeolus: A Building Block for Proactive Transport in
   Datacenters**, Hu et al., SIGCOMM 2020.
   URL: `https://doi.org/10.1145/3387514.3405878`

@@ -89712,3 +89712,246 @@ recalibrated on the target hardware.
   second-scale tier migration, and minute-scale placement policy
   recalibration. Gate: slower tier-control loops never block the
   scheduled request lane.
+
+### 2026-06-06 - 1RMA makes remote memory access connection-free and credit-shaped
+
+**Citation:** Arjun Singhvi, Aditya Akella, Dan Gibson, Thomas F.
+Wenisch, Monica Wong-Chan, Sean Clark, Milo M. K. Martin, Moray
+McLaren, Prashant Chandra, Rob Cauble, Hassan M. G. Wassel, Behnam
+Montazeri, Simon L. Sabato, Joel Scherpelz, and Amin Vahdat. "1RMA:
+Re-envisioning Remote Memory Access for Multi-tenant Datacenters."
+SIGCOMM 2020, pages 708-721. DOI: `10.1145/3387514.3405897`.
+Retrieved 2026-06-06 from the author PDF at
+`https://pages.cs.wisc.edu/~asinghvi/papers/1rma.pdf`; metadata
+checked against Google Research and the SIGCOMM 2020 program.
+
+**Category:** runtime / HFT / session scale, with future
+remote-memory, gateway, multi-tenant storage fabric, and
+high-concurrency admission relevance.
+
+**Relevance tags:** 1RMA; connection-free RMA; remote memory; RDMA;
+multi-tenancy; command slots; solicitation window; finite resources;
+NACK; dispatch timeout; delay-based congestion control; fail-fast
+completion; 4 KiB chunks; line-rate encryption; key rotation;
+receiver-side incast protection.
+
+**Core idea:** 1RMA argues that standard RDMA's connection-oriented
+NIC state and hardware-owned policy are a bad fit for multi-tenant
+datacenters. The paper replaces per-endpoint connection state with
+independent one-shot operations, explicitly finite command and memory
+resources, hardware-enforced solicitation, precise failure outcomes,
+and software-owned pacing, congestion control, retries, and ordering.
+
+For GPU DB, the strongest transferable idea is that high-scale
+session and tier access should be credit-shaped rather than
+connection-shaped. Whether the target is a gateway, remote warm tier,
+future disaggregated memory, or GPU execution lane, each request
+should carry enough route identity and capacity proof to execute as an
+independent operation. Ordering, retries, and recovery stay in the DB
+runtime where SQL visibility and WAL rules are known.
+
+**Concrete mechanisms:**
+
+- 1RMA removes hardware connections. The NIC does not keep state that
+  grows with endpoint pairs; software handles inter-operation ordering
+  when an application needs it.
+- Each operation is bounded to at most 4 KiB. Larger transfers are
+  chunked by a software `CommandExecutor`, which can batch, pipeline,
+  pace, retry, and redirect failed chunks.
+- Operations are issued through fixed command slots in on-NIC SRAM.
+  A process can only have as many outstanding operations as the slots
+  allocated to it, making burst potential and priority allocation
+  explicit.
+- Each initiating NIC maintains a solicitation window backed by SRAM
+  for inbound payloads. An operation cannot start until the initiator
+  has enough local landing capacity, which bounds incast and PCIe/NIC
+  backpressure.
+- Writes are implemented as request-to-read. The writer asks the
+  remote NIC to read the writer's local memory once solicitation
+  allows it. This costs an extra round trip but gives writes the same
+  incast control, replay protection, and timeout semantics as reads.
+- Completion status distinguishes `OK`,
+  `REMOTE_AUTHENTICATION_FAILURE`, `NACK`, `TIMEOUT`, and
+  `DISPATCH_TIMEOUT`. `NACK` identifies remote queue congestion, while
+  `DISPATCH_TIMEOUT` identifies local solicitation-window congestion.
+- Completions include hardware-measured `issue_delay` and
+  `total_delay`. Software derives remote delay from their difference,
+  letting it react separately to local NIC pressure and network or
+  remote-side pressure.
+- Congestion control is software-defined. The evaluated policy uses
+  additive-increase/multiplicative-decrease windows per
+  destination/direction plus a local window, with sharper reductions
+  on timeout-style outcomes.
+- Security is connection-free. A region key protects a registered
+  memory region, and a derived key is bound to initiator host,
+  process, and operation type. Protocol messages are authenticated and
+  data is encrypted.
+- Key rotation is a first-class management operation. The paper
+  reports line-rate encryption at 100 Gbps and 100M operations/s, key
+  rotation unavailability below 1 microsecond with the hardware Rekey
+  primitive, and roughly 27 microseconds through the driver path.
+- The evaluation uses a 40-node testbed plus simulations. The paper
+  reports 1RMA ramping to 100 Gbps in about 40 microseconds,
+  fair-share convergence in a few RTTs, about 20x slower convergence
+  when local and remote congestion are not separated, and 6x-10x lower
+  small-operation slowdown than the compared baselines under a
+  heavy-tailed workload at moderate load.
+- The authors report that one core can drive about 6M operations/s in
+  the software stack, roughly twice what is needed for 100 Gbps with
+  4 KiB operations; the paper summarizes the production cost as about
+  0.5 cores to drive 100 Gbps line rate.
+- The design deliberately makes slow or uncertain operations fail
+  quickly instead of consuming scarce NIC/window resources for a long
+  time. Applications are expected to retry, redirect to another
+  replica, or fail according to their own semantics.
+
+**GPU DB mapping:** GPU DB's runtime should avoid one logical session
+or route peer turning into one heavyweight hot-path connection. A
+million logical sessions should be multiplexed over a smaller number
+of explicit worker, ring, and route-credit objects. The 1RMA command
+slot is a useful analogy for per-session or per-tenant outstanding
+request budgets: a client can only inject work for which ingress,
+execution, memory, and response capacity have been reserved.
+
+The solicitation-window mechanism maps directly to response rings,
+pinned host buffers, GPU result buffers, and remote-tier receive
+capacity. A retained read or cold-tier fetch should not be admitted if
+there is nowhere bounded and observable for the response payload to
+land. For GPU micro-batches, the equivalent proof is that key vectors,
+result slots, D2H/H2D staging bytes, and response-ring bytes are
+reserved before launch.
+
+1RMA's failure codes are a good model for overload visibility. GPU DB
+should distinguish local ingress saturation, response-ring saturation,
+GPU worker saturation, remote tier congestion, expired route
+generation, authentication or tenant failure, and timeout. A generic
+"query failed" loses the signal needed for pacing, routing, and retry.
+
+The split between hardware-independent operations and software-owned
+ordering maps to SQL correctness. GPU DB can use unordered,
+independent read/fetch/execute operations below the runtime, but SQL
+visibility, WAL-before-visibility, snapshot generation, and response
+ordering must be restored by owner domains and route certificates
+above those operations.
+
+The 4 KiB operation size should not be copied literally, but the
+principle matters: break large cold-tier reads, GPU result transfers,
+and refresh work into bounded chunks that provide frequent feedback
+and cannot monopolize the scheduled lane. Large work must be
+preemptible or paced so a background refresh cannot block short
+retained lookups.
+
+1RMA's connection-free key rotation maps to route and tenant
+generation changes. When a table generation, tenant key, resident
+snapshot, or remote storage region is revoked, only operations using
+that region/generation should fail fast; unrelated routes should keep
+running. The completion should carry enough identity to reject stale
+responses after reconfiguration.
+
+**Risks and mismatches:** 1RMA is a networking and NIC architecture,
+not a DBMS. It does not define SQL transactions, MVCC, WAL, storage
+layout, query planning, GPU scheduling, or result encoding. Its
+mechanisms should shape runtime admission and future fabric design,
+not replace database-level correctness.
+
+The paper assumes custom NIC hardware deployed in production
+datacenters. GPU DB's current engine cannot depend on 1RMA
+semantics, line-rate NIC encryption, or hardware solicitation. The
+near-term use is a software analogue: bounded rings, capacity tokens,
+typed failure outcomes, and pacing.
+
+One-shot operations push ordering and retry responsibility to
+software. That is attractive only if the DB runtime has crisp
+idempotence, generation, and replay rules. Mutating SQL work cannot
+be retried like a read chunk unless WAL reservation, duplicate
+detection, and visibility publication are explicit.
+
+The evaluation is network-centric and uses KVCS/synthetic workloads,
+not pgwire, SQL execution, GPU kernels, cold NVMe segments, or
+transactional storage. Reported latencies and throughput are mechanism
+evidence, not GPU DB performance targets.
+
+Small chunking improves feedback and isolation but can increase CPU
+overhead, metadata traffic, and scheduling work. GPU DB needs
+separate chunk-size choices for network ingress, NVMe reads, GPU
+transfers, and result encoding.
+
+**Benchmark candidates:**
+
+- Build a software "1RMA-shaped" admission simulator for GPU DB:
+  command slots per tenant/session class, response solicitation
+  windows, GPU staging-byte windows, and typed completions. Gate:
+  low-priority large reads cannot cause p99 retained-lookup latency to
+  exceed the no-background baseline by more than a chosen SLO budget.
+- Add typed overload outcomes to the existing runtime prototype:
+  local ingress full, response ring full, pinned buffer full, GPU queue
+  full, route generation expired, and remote/cold-tier timeout. Measure
+  whether retries and route fallback improve tail latency compared
+  with a generic overload code.
+- Compare large-transfer chunk policies for cold-tier reads and GPU
+  result return: 4 KiB, 16 KiB, 64 KiB, and route-adaptive chunks.
+  Required measurements: CPU overhead, p50/p99 latency for small
+  concurrent reads, D2H/H2D bandwidth, response-ring wait, and wasted
+  bytes on cancellation.
+- Test separate local-versus-remote pressure signals. Maintain one
+  pacing window for local response/staging pressure and one per
+  remote tier or GPU worker. Failure condition: a single combined
+  delay metric converges slower or starves short reads under incast.
+- Prototype fail-fast route revocation. Revoke a resident generation,
+  tenant key, or cold segment while operations are outstanding; stale
+  completions must fail or be ignored without blocking unrelated
+  routes.
+- Add a replay-safety benchmark for retried operations. Read/fetch
+  chunks may retry freely, but mutations require idempotence tokens,
+  WAL reservations, and duplicate suppression. Gate: injected timeouts
+  cannot create duplicate visibility, missing WAL, or reordered
+  response success.
+
+### 2026-06-06 - Cross-paper synthesis: resource credits should travel with route work
+
+The recent Aeolus, MTM, and 1RMA reviews converge on a runtime
+design track where work is admitted only with explicit resource
+proofs, and where policy loops operate at the right time scale.
+Aeolus separates scheduled work from disposable speculation, MTM
+turns tier placement into budgeted sampling and migration, and 1RMA
+makes remote operations independent, bounded, and fail-fast.
+
+The shared GPU DB design hypothesis is that each route request should
+carry a compact credit certificate: session/tenant budget,
+snapshot-generation eligibility, response bytes, pinned or GPU
+staging bytes, route-object residency state, and retry or revocation
+generation. Mutation routes need WAL and invalidation credits as
+well. The runtime can then schedule, batch, reject, or redirect work
+without discovering late that a hidden resource is missing.
+
+Converging design tracks:
+
+- **Scheduled core plus disposable speculation:** admitted route work
+  gets protected credits; speculative warmup, prefetch, batch fill, and
+  migration can be canceled before it delays scheduled work.
+- **Typed pressure and retry signals:** overload must identify the
+  saturated resource so pacing and fallback can react locally rather
+  than slowing the entire engine.
+- **Budgeted control loops:** microsecond queue telemetry,
+  millisecond pacing, second-scale tier movement, and longer
+  recalibration should be separate loops with bounded overhead.
+- **Generation-safe reconfiguration:** route keys, resident snapshots,
+  cold segments, and tenant/security state need fast revocation where
+  stale completions are rejected without harming unrelated routes.
+
+Category gaps after this cluster remain transaction commit/WAL
+throughput and query-optimizer integration. The next useful paper
+should bias toward commit latency, durable transaction staging,
+optimizer-route feedback, or HTAP snapshot routing rather than another
+pure network or placement paper.
+
+Benchmark priorities:
+
+- implement a route-credit simulator that combines Aeolus-style
+  scheduled/speculative lanes, MTM-style placement heat, and
+  1RMA-style bounded response/staging windows;
+- add typed overload and revocation completions to runtime
+  benchmarks;
+- run a cold-tier read chunking harness before GPU kernels are added;
+- define pass/fail SLOs for speculative work under incast and memory
+  pressure.
