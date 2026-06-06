@@ -610,14 +610,38 @@ Append new candidates here as each paper is processed.
   random writes and improving sequential/coalesced persistence, useful for a
   software/storage-oriented baseline for future GPU DB CXL/NVM route
   metadata.
-- `queued` — **SpecPMT: Speculative Logging for Resolving Crash Consistency
+- `reviewed` — **SpecPMT: Speculative Logging for Resolving Crash Consistency
   Overhead of Persistent Memory**, Ye et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3575693.3575696`
   PDF: `https://research.csc.ncsu.edu/picture/publications/papers/asplos23b_specLog.pdf`
+  Author PDF: `https://yuanchaoxu6.github.io/files/ASPLOS2023_SpecPMT.pdf`
   Why: DUMBO reduces read and marker waits in durable HTM; SpecPMT is a modern
   speculative-logging follow-up for persistent memory, useful for comparing
   bounded speculative logs, hot/cold data handling, and crash-consistency
-  overhead before GPU DB considers persistent warm-tier metadata.
+  overhead before GPU DB considers persistent warm-tier metadata. Journal entry
+  added 2026-06-06 from the author PDF after direct curl of the seeded NCSU
+  PDF URL returned an HTML page.
+- `queued` — **Clobber-NVM: Log Less, Re-execute More**, Xu,
+  Izraelevitz, and Swanson, ASPLOS 2021.
+  URL: `https://doi.org/10.1145/3445814.3446748`
+  Why: SpecPMT compares with re-execution and log-reduction approaches;
+  useful for checking whether deterministic re-execution can reduce durable
+  metadata for GPU DB route maintenance, checkpoint replay, or warm-tier
+  updates without weakening SQL-visible side effects.
+- `queued` — **ASAP: A Speculative Approach to Persistence**, Yadalam,
+  Shah, Yu, and Swift, HPCA 2022.
+  URL: `https://doi.org/10.1109/HPCA53966.2022.00070`
+  Why: SpecPMT discusses speculative persistence approaches that relax
+  ordering around persistence; useful for comparing when GPU DB can safely
+  speculate on durable descriptor publication and when it must return
+  explicit overload or wait for WAL-before-visibility.
+- `queued` — **MOD: Minimally Ordered Durable Data Structures**, Haria,
+  Hill, and Swift, ASPLOS 2020.
+  URL: `https://doi.org/10.1145/3373376.3378482`
+  Why: SpecPMT cites MOD as evidence that ordering can be minimized for
+  durable data structures; useful for deriving minimal persist dependencies
+  for route descriptors, resident metadata, and future CXL/NVM warm-tier
+  structures.
 
 ### Database file-system design, storage, and indexing
 

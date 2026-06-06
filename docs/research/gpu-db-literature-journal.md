@@ -38,6 +38,173 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - SpecPMT turns persistence ordering into early sequential logging
+
+**Citation:** Chencheng Ye, Yuanchao Xu, Xipeng Shen, Yan Sha,
+Xiaofei Liao, Hai Jin, and Yan Solihin. "SpecPMT: Speculative
+Logging for Resolving Crash Consistency Overhead of Persistent
+Memory." ASPLOS 2023, 762-777. DOI: `10.1145/3575693.3575696`.
+Retrieved 2026-06-06 from the DOI metadata and author PDF:
+`https://yuanchaoxu6.github.io/files/ASPLOS2023_SpecPMT.pdf`.
+
+**Category:** WAL, logging, and read/write throughput, with
+transaction processing / write path and future persistent-memory
+tier relevance.
+
+**Relevance tags:** SpecPMT; speculative logging; persistent memory
+transactions; crash consistency; fence removal; sequential logs;
+hot/cold logging; epoch reclamation; TLB hotness tracking; Optane;
+CXL persistent memory; STAMP.
+
+**Core idea:** SpecPMT observes that persistent transactions pay a
+large cost because ordinary undo logging must persist a log record
+before each in-place data update. It moves the log record earlier:
+after a transaction updates a datum, the transaction records the new
+value as a speculative log entry. At commit, it persists the compact
+log stream and commit metadata, while the updated data itself can
+reach the persistence domain later or be reconstructed from the log.
+
+For GPU DB, the transferable idea is to keep route durability
+sequential and dependency-rich while avoiding random persistence on
+the hottest mutation path. A commit descriptor or warm-tier delta can
+be made durable as an append-friendly stream, then resident segments,
+route metadata, or future CXL/NVM structures can be rebuilt or
+patched from that stream without forcing every touched physical
+object to be synchronously flushed before response.
+
+**Concrete mechanisms:**
+
+- SpecPMT keeps in-place data updates but changes the log meaning.
+  Fresh committed speculative log records act like redo records for
+  completed transactions; older records can undo an interrupted
+  transaction by restoring the last committed value.
+- The transaction API adds `splog(addr, value)` after durable data
+  updates. No flush or fence is needed for each log append; commit
+  flushes the transaction's log range and uses a single fence before
+  completion.
+- Software SpecPMT uses per-thread sequential log areas made of
+  linked log blocks. A transaction reserves metadata space, appends
+  address/size/value entries, then writes record size and checksum at
+  commit. The checksum doubles as the committed-status test.
+- Multi-threaded recovery uses transaction timestamps to decide the
+  freshest committed log entry for a datum. Recovery scans from a
+  persistent log head, discards uncommitted/corrupt records, and
+  replays committed records in chronological order.
+- Software reclamation runs in the background. It scans log blocks,
+  uses a volatile hash index from address to candidate freshness, and
+  compacts fresh entries into new log blocks. The hash index is not
+  crash-consistent; it can be rebuilt or the reclamation retried.
+- The paper contrasts this sequential organization with replacing old
+  records in a hash table and reports the random-write hash-table
+  design as much slower in their implementation.
+- Hardware SpecPMT bounds log growth through hybrid logging. Hot
+  pages use speculative logging; cold pages use ordinary undo logging.
+  Hotness is tracked in private TLB-entry metadata rather than OS page
+  tables.
+- Hardware entries add an epoch bit plus a small counter/epoch field
+  in TLBs, and persistence/log bits in L1 cache entries. A page becomes
+  hot after repeated transactional stores while resident in the TLB.
+- Epoch-based reclamation lets software clear an old epoch and reclaim
+  its thread-local speculative log records. Multi-threaded reclamation
+  is safe only when the epoch is inactive and all active epochs start
+  after the reclaimable epoch.
+- For cold-to-hot transitions, hardware logs a whole page before
+  marking it speculative. If this is unprofitable, the system can fall
+  back to undo logging for that region.
+- The evaluation uses STAMP transactional applications. The software
+  version runs on first-generation Intel Optane persistent memory; the
+  hardware version is evaluated in gem5.
+- Reported results include software SpecPMT at 5.1x average speedup
+  over PMDK and 3.02x over Kamino-Tx, and hardware SpecPMT at 1.41x
+  average speedup over EDE. The paper reports persistent-transaction
+  overhead dropping to about 10% for the software design and 7% for
+  the hardware design in its comparisons.
+
+**GPU DB mapping:** P8 should keep WAL-before-visibility as the
+correctness rule, but SpecPMT argues for making the durable hot path
+a compact append stream rather than scattered physical flushes. A
+mutation owner can persist route commit descriptors, row deltas,
+invalidation ranges, and resident-refresh hints sequentially, then let
+CPU indexes, warm chunks, and GPU-resident segments catch up from
+that descriptor stream.
+
+SpecPMT's fresh/stale log distinction maps to derived route metadata.
+Only the newest committed descriptor for a row range, resident segment,
+or route family should matter for recovery and routing; older
+descriptors can remain until an epoch or generation reclamation pass
+compacts them. This fits current retained snapshot rules: old
+generations can stay readable until no reader holds them, but new
+admission should use the freshest compatible generation.
+
+The hot/cold logging split maps to tier policy. Hot mutable metadata,
+route invalidations, and frequently refreshed warm chunks may deserve
+speculative append-style descriptors. Cold durable structures can keep
+simpler undo/redo or checkpoint treatment. The threshold should be
+telemetry-driven, not assumed globally.
+
+Epoch reclamation maps to publication horizons. GPU DB can reclaim
+descriptor epochs only after all active readers, GPU kernels,
+replication/recovery dependencies, and route publications that might
+need the older descriptor have moved beyond it. That is closer to
+MVCC/RCU retirement than ordinary memory free.
+
+The sequential-log emphasis also reinforces MatrixKV's and DUMBO's
+lessons: use coalesced, dependency-aware persistence on the foreground
+path, then perform random or fragmented physical repair, compaction,
+and resident refresh outside the commit critical path.
+
+**Risks and mismatches:** SpecPMT is a persistent-memory transaction
+paper, not a database storage engine. It provides atomic durability
+but leaves isolation and concurrency control to the surrounding
+software. GPU DB must still enforce SQL isolation, MVCC visibility,
+WAL ordering, indexes, DDL safety, response ordering, and recovery.
+
+The hardware design requires TLB/cache changes and new epoch
+instructions. That is a future-tier vocabulary, not something to rely
+on for the current GPU/NVMe implementation.
+
+The software design can consume large speculative-log space and needs
+background reclamation. GPU DB should not adopt unbounded descriptor
+retention without explicit reader horizons, memory budgets, and
+pressure behavior.
+
+SpecPMT assumes byte-addressable persistent memory with DAX-like
+access. Current P8 uses WAL/checkpoint/replay as durable truth and GPU
+memory as rebuildable cache. Any mapping must be through WAL and
+descriptor streams, not direct PMEM pointer identity.
+
+The benchmark suite is STAMP, not TPC-C, YCSB, pgwire fan-in, SQL
+queries, GPU kernels, or cold-tier scans. The reported speedups should
+be treated as evidence for fence/write-traffic reduction, not expected
+database throughput gains.
+
+**Benchmark candidates:**
+
+- Add a WAL/descriptor benchmark with two commit modes: scattered
+  physical flush of derived metadata versus compact append-only route
+  descriptors plus later rebuild. Measure commit p50/p99, bytes
+  written, recovery time, and resident-route freshness.
+- Prototype "fresh descriptor wins" recovery for resident segment
+  metadata: append multiple invalidation/refresh descriptors for the
+  same segment and prove recovery chooses the newest committed one
+  while ignoring corrupt or uncommitted tails.
+- Simulate hot/cold durability policy for route metadata. Hot row
+  ranges use append descriptors; cold ranges use checkpoint/ordinary
+  redo. Gate: switching policy cannot expose stale resident routes or
+  lose WAL-before-visibility.
+- Add descriptor epoch reclamation tied to active read snapshots and
+  GPU kernel generations. Failure condition: reclamation removes a
+  descriptor still needed by a retained reader, recovery, or route
+  invalidation proof.
+- Compare sequential descriptor logging with random update-in-place
+  metadata under mutation bursts. Required metrics: cache misses,
+  write amplification, fsync/fence count or durable-write count,
+  p99 writer latency, and read fallback rate.
+- Crash-inject between descriptor append, commit marker/checksum,
+  resident invalidation, and physical refresh. Gate: recovery exposes
+  either the old valid route or the new valid route and never admits a
+  half-published GPU-resident segment.
+
 ### 2026-06-06 - DUMBO makes durable read-only transactions wait only for older non-durable writes
 
 **Citation:** João Barreto, Daniel Castro, Paolo Romano, and Alexandro
