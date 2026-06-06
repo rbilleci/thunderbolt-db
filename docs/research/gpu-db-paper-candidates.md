@@ -68,18 +68,44 @@ read/write throughput, recovery, compaction, or tail-latency mechanisms.
   Why: modern deterministic large-batch GPU transaction processing cited by
   the GPU OLTP survey; useful for comparing conflict-ordered GPU batches with
   CPU-owned WAL/MVCC publication.
-- `queued` — **PLOR: General Transactions with Predictable, Low Tail
+- `reviewed` — **PLOR: General Transactions with Predictable, Low Tail
   Latency**, Chen et al., SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3517837`
+  URL: `https://doi.org/10.1145/3514221.3517879`
+  PDF: `https://storage.cs.tsinghua.edu.cn/papers/sigmod22plor.pdf`
   Why: GPU-Accelerated OLTP cites PLOR as a low-tail transaction design;
   useful for mapping predictable transaction execution and latency control to
-  GPU DB's hot-key admission and session SLOs.
+  GPU DB's hot-key admission and session SLOs. Journal entry added
+  2026-06-06; the previously queued DOI was corrected to the SIGMOD 2022
+  paper metadata.
 - `queued` — **Mostly-Optimistic Concurrency Control for Highly Contended
   Dynamic Workloads on a Thousand Cores**, Wang and Kimura, PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol10/p49-wang.pdf`
   Why: cited by GPU-Accelerated OLTP as a contention-oriented CPU-side
   concurrency-control baseline; useful for comparing lightweight optimistic
   fallback against GPU conflict ordering under hot keys.
+- `queued` — **Improving Optimistic Concurrency Control through Transaction
+  Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
+  DOI: `https://doi.org/10.14778/3282495.3282502`
+  Why: PLOR contrasts batching/reordering as a throughput and tail-latency
+  direction for OCC; useful for comparing route-level reordering against
+  GPU DB's owner rings, priority retry budgets, and hot-key write admission.
+- `queued` — **Polyjuice: High-Performance Transactions via Learned
+  Concurrency Control**, Wang et al., OSDI 2021.
+  URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`
+  PDF: `https://www.usenix.org/system/files/osdi21-wang-jiachen.pdf`
+  Why: PLOR contrasts modular/learned concurrency-control choices with
+  protocol-internal priority; useful for deciding whether GPU DB should learn
+  route policies while keeping hot-path correctness and tail-priority rules
+  explicit.
+- `queued` — **Deferred Runtime Pipelining for Contentious Multicore Software
+  Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
+  URL: `https://doi.org/10.1145/3302424.3303966`
+  PDF: `https://www.cis.upenn.edu/~sga001/papers/drp-eurosys19.pdf`
+  Why: PLOR contrasts runtime pipelining and transaction chopping with
+  priority-based low-tail conflict handling; useful for evaluating whether GPU
+  DB hot operations should pipeline sub-steps through owner queues without
+  requiring static read/write sets.
 
 ### MVCC, snapshots, and visibility
 

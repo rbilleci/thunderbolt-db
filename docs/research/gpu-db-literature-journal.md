@@ -38,6 +38,248 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Plor makes tail latency a conflict-priority problem, not only a lock-cost problem
+
+**Citation:** Youmin Chen, Xiangyao Yu, Paraschos Koutris, Andrea C.
+Arpaci-Dusseau, Remzi H. Arpaci-Dusseau, and Jiwu Shu. "Plor:
+General Transactions with Predictable, Low Tail Latency." SIGMOD
+2022, pp. 19-33. DOI: `https://doi.org/10.1145/3514221.3517879`.
+Retrieved 2026-06-06 from the Tsinghua author PDF,
+`https://storage.cs.tsinghua.edu.cn/papers/sigmod22plor.pdf`.
+
+**Category:** transaction processing / write path and concurrency control,
+with secondary relevance to runtime admission and tail-latency SLOs.
+
+**Relevance tags:** OLTP; tail latency; pessimistic locking; optimistic
+reading; Wound-Wait; commit priority; latch-free locks; delayed conflict
+detection; delayed write-lock acquisition; interactive transactions; redo
+logging; undo logging; high contention; hot-key admission; serializability.
+
+**Core idea:** Plor argues that high-contention OLTP tail latency is often
+caused by repeated aborts, not just by average lock overhead. Conventional OCC
+keeps throughput high by deferring conflict checks, but a transaction that has
+already aborted comes back with no stronger claim to the hot record and can
+starve in the tail. Traditional 2PL variants such as Wound-Wait can protect old
+transactions, but they block readers and writers too early. Plor combines the
+two: acquire read/write lock state pessimistically, let reads proceed
+optimistically during the read phase, and resolve conflicts at commit using
+timestamp priority so older transactions win.
+
+For GPU DB, the strongest transferable idea is that a hot write route should
+carry an explicit conflict-priority policy. Throughput-oriented admission is
+not enough; the runtime also needs to make sure an unlucky session, refresh, or
+write batch does not repeatedly lose to younger work. The practical design
+track is not to adopt Plor wholesale, but to add starvation-resistant priority
+and bounded retry telemetry to owner/OCC, hot-key, and future GPU
+conflict-ordered write paths.
+
+**Concrete mechanisms:**
+
+- Each worker has a transaction context with a timestamp and status. The
+  timestamp defines commit priority; aborted transactions reuse their original
+  timestamp when retrying, so repeated failures make them older relative to
+  later arrivals.
+- Each record has a lock manager containing the current writer, a timestamp-
+  ordered writer wait list, and an arrival-ordered reader list.
+- During the read phase, a transaction acquires lock state before accessing a
+  record, but read lock acquisition ignores current writers unless the writer
+  is already in exclusive commit mode. Updates are buffered privately until
+  commit, so readers do not see uncommitted writes.
+- Write-write conflicts are resolved with Wound-Wait-style timestamp priority:
+  a requesting older transaction may abort a younger writer; a younger
+  requester waits or is aborted.
+- During commit, a writer upgrades write-set locks to exclusive mode, blocking
+  later readers from reading incomplete data. It scans readers that arrived
+  before the exclusive marker, aborts younger readers, and waits for older
+  readers to finish.
+- After conflict detection, the transaction releases read locks, copies
+  buffered updates into the database, and releases write locks by removing
+  itself from the wait list, disabling exclusive mode, and handing ownership to
+  the oldest waiter.
+- Liveness relies on polling while waiting and on the preemptive-abort rule:
+  the oldest conflicting transaction cannot be killed by younger work and will
+  eventually commit.
+- Insert handling follows a Silo-like pattern: insert an invisible record and
+  index mapping during the read phase, then remove it if the transaction
+  aborts.
+- Read-only transactions are initially handled by validation, as in Silo. Plor
+  uses read locks only after repeated aborts, three retries in the
+  implementation, to balance low overhead against tail protection.
+- Delayed write-lock acquisition can defer blind-write locks until commit.
+  When the full write set is known, write locks can be sorted and acquired in a
+  deterministic order. The paper finds this especially useful for interactive
+  transactions, but too optimistic for some stored-procedure workloads.
+- The latch-free locker separates lock acquisition from conflict detection.
+  Reader lists can be represented by lock-free lists; the implementation
+  further compresses readers into an 8-byte atomic word with one bit per worker
+  and one reserved exclusive marker bit, supporting up to 63 workers on the
+  evaluated platform.
+- The paper proves conflict serializability by showing Plor schedules are
+  conflict-equivalent to serial schedules while keeping 2PL-like lock/unlock
+  ordering and exclusive-mode writes.
+- The implementation is built in DBx1000 and evaluated on a dual-socket Intel
+  Xeon Gold 6240 machine with 36 physical cores, 192 GiB DRAM, and four Optane
+  DCPMMs. Experiments compare against NO_WAIT, WAIT_DIE, WOUND_WAIT, Silo,
+  MOCC, and TicToc.
+- Workloads include YCSB-A for high-contention 50/50 read/write traffic,
+  YCSB-B for read-intensive traffic, TPC-C with varying warehouse counts,
+  stored-procedure mode, an eRPC-based interactive mode, and redo/undo logging
+  to Optane persistent memory.
+- In high-contention stored-procedure YCSB-A, Plor reaches near-OCC throughput:
+  the paper reports peak throughput 9% below Silo and 19% below TicToc, while
+  reducing 99.9th-percentile latency by 14.5x versus Silo and 8.8x versus
+  TicToc at a 1M tps target.
+- Plor needs fewer workers to reach peak throughput in that experiment because
+  conflicting transactions can be killed during execution instead of spending
+  cycles until commit-time validation.
+- Under one-warehouse TPC-C, Plor shows low tail latency across a broader
+  percentile range because long and short transactions contend on the same hot
+  records; long transactions are more likely to suffer repeated OCC aborts.
+- In interactive mode, Plor outperforms WOUND_WAIT by 49% peak throughput on
+  YCSB-A while keeping comparable tail latency; enabling delayed write-lock
+  acquisition improves throughput by another 2x. On TPC-C, delayed write-lock
+  acquisition reaches Silo-like peak throughput with much lower saturated
+  99.9th-percentile latency.
+- Factor analysis reports that the latch-free locker reduces locking overhead
+  from 4.4% to under 0.1% in the tested YCSB-A breakdown. DWA reduces
+  write-write conflict time but can increase abort ratio and collapse under
+  stored-procedure saturation.
+- With bimodal transaction sizes, Silo's 99.9th-percentile latency grows much
+  faster as large transactions get bigger; Plor's tail grows more slowly
+  because repeated abort count is bounded by timestamp priority.
+- Persistent-memory redo logging adds limited overhead in the evaluated setup
+  because redo records are written only after a transaction reaches commit.
+  Undo logging raises tail latency, but Plor still reports the lowest tail
+  latency among compared schemes. The paper does not evaluate conventional
+  NVMe/fsync durability in the same detail.
+- A deadline-based priority variant performs worse as the slack factor grows:
+  large transactions receive later deadlines, lose priority, and are more
+  likely to abort early attempts.
+
+**GPU DB mapping:** Plor fits the current runtime target as a CPU-owner
+concurrency-control lane, not as a GPU kernel design. The mutation owner or
+partition owner can retain lightweight OCC/TicToc-style validation for
+low-conflict writes, but hot records need a priority policy that prevents a
+logical session from repeatedly losing to younger batches. The route
+certificate should therefore include retry count, original arrival generation,
+priority basis, and whether the route may preempt or defer younger work.
+
+The optimistic-reading part maps to retained snapshots and read routes. Reads
+should not block just because a writer has announced intent; they should run on
+a compatible immutable snapshot or validate that a writer has not crossed an
+exclusive/publication boundary. Once a writer enters the publication phase,
+later reads must either choose an older safe snapshot, wait briefly, or fall
+back, rather than reading half-published state.
+
+For GPU hot-key writes, Plor is a warning against treating conflict-ordered
+GPU batches as the only tail-latency answer. Batching can improve throughput,
+but if the admission policy lets a new large batch continuously displace an old
+logical request, the p99.9 tail will be terrible. A GPU batch route should use
+arrival-generation priority and bounded retry promotion before submitting the
+batch order to the CPU WAL/MVCC publication owner.
+
+The latch-free lock representation maps to narrow P8 route metadata. A full
+general-purpose lock manager is probably too expensive for every row or
+resident slot, but compact per-worker/per-lane reader bits, exclusive markers,
+and timestamp/priority words are useful for hot route descriptors, index-page
+refreshes, and partition-local write admission.
+
+Delayed write-lock acquisition is a useful split by workload shape. Interactive
+SQL, where remote or protocol round trips dominate, may benefit from deferring
+write ownership until the full footprint is known. Stored procedures or
+same-shape GPU write batches may reach commit too quickly and create abort
+storms unless admission throttles queue depth or switches to a stronger
+conflict-ordering path.
+
+**Risks and mismatches:** Plor is evaluated in an in-memory DBx1000 prototype,
+not in a full SQL engine with WAL replay, DDL, MVCC snapshots, GPU residency,
+pgwire encoding, or 1M logical sessions. Its direct lock-manager design assumes
+worker counts that fit compact metadata; GPU DB cannot simply attach per-worker
+reader bits to every tuple at session scale.
+
+The paper's persistent logging results use Optane DCPMM and do not establish
+the cost of ordinary NVMe `fsync`, replicated WAL, checkpoint pressure, or
+GPU/CPU publication barriers. GPU DB must preserve WAL-before-visibility even
+if conflict priority says an old transaction should win.
+
+Plor is serializable for the model it implements, but the paper explicitly uses
+weaker isolation for TPC-C Stock-Level. Any GPU DB adaptation must make the
+isolation choice part of the route contract, not an implicit benchmark
+shortcut.
+
+The priority policy can hurt median or non-tail latency because old or large
+transactions receive preferential commit opportunities. That tradeoff may be
+correct for SLO-bound sessions, but the runtime needs telemetry and admission
+classes so background refresh or ingest does not starve foreground reads, or
+vice versa.
+
+**Benchmark candidates:**
+
+- Add a hot-key write admission simulator with three policies: plain OCC retry,
+  Wound-Wait-style original-arrival priority, and conflict-ordered batching.
+  Gate: the priority path reduces p99.9 retry count and latency without
+  violating WAL-before-visibility.
+- Track `original_arrival_generation`, retry count, priority reason, and
+  preemptions on write-route certificates. Failure condition: a logical
+  request can retry indefinitely while younger compatible writes commit.
+- Prototype a compact hot-route lock word for partition metadata or resident
+  index-page publication: reader bits or counters, exclusive marker, writer
+  priority, and generation. Gate: readers never observe half-published route
+  metadata.
+- Compare immediate write ownership versus delayed write-lock acquisition for
+  interactive pgwire transactions and stored-procedure-like fixed-shape
+  batches. Expected result: delayed ownership helps interactive footprints but
+  needs queue-depth caps for same-shape hot batches.
+- Add a bimodal transaction-size test to the runtime suite. Gate: long write
+  batches do not inflate p99.9 latency by repeated aborts, and short reads are
+  not indefinitely blocked behind a large publication phase.
+- For future GPU write batches, apply priority before launch: include oldest
+  request age, retry count, and conflict set in the batch descriptor. Failure
+  condition: GPU batching improves total throughput while starving older
+  sessions or increasing WAL publication lag.
+- Compare redo-after-commit-point style logging with any in-place/undo-style
+  update experiment. Gate: aborted writes do not create unnecessary durable log
+  traffic, and redo publication waits for durable commit before visibility.
+
+### 2026-06-06 - Cross-paper synthesis: tail control needs bounded retry, not only faster queues
+
+The recent WAL, remote-index, GPU-OLTP, and Plor reviews converge on a sharper
+runtime rule: every fast path needs a bounded retry story. LeanStore recovery
+bounded WAL replay with partitioned logs and checkpoint frontiers; Sherman
+bounded remote-index write amplification and failed lock traffic with
+entry-sized updates and local-first locks; GPU-Accelerated OLTP showed that
+high-contention GPU conflict ordering only pays when contention density is high
+enough; Plor shows that even high-throughput OCC can have terrible p99.9
+latency if an unlucky transaction keeps losing priority.
+
+The design track that emerges is priority-aware route admission. Retained read
+routes should carry snapshot and invalidation generations. Write routes should
+carry arrival generation, retry count, conflict class, WAL dependency frontier,
+and publication phase. Cold-index and future-tier routes should carry
+entry/page generation and remote retry counters. GPU routes should carry batch
+age and conflict density. The common goal is to prevent invisible loops where a
+request repeatedly retries behind younger, cheaper, or better-batched work.
+
+Category gaps remain around production-safe integration: how to combine
+priority-aware hot writes with MVCC snapshots, secondary-index maintenance,
+GPU-proposed execution order, and durable WAL publication without rebuilding a
+single global scheduler. The next high-value papers should stay in
+transaction scheduling, GPU OLTP commit ordering, MVCC visibility, and runtime
+admission rather than drifting back to pure analytical scans.
+
+Benchmark priorities:
+
+- Add a retry-budget field to route certificates for retained reads, writes,
+  route refreshes, and cold-index fetches. Gate: every retry loop has a
+  promotion, fallback, or rejection outcome.
+- Measure p99.9 and max retry count for hot-key YCSB/TPC-C-style writes under
+  OCC, priority OCC, and GPU conflict-ordered batching.
+- Add route-stampede tests where many sessions miss the same resident snapshot
+  or cold index page. Gate: physical work is coalesced and older waiters are
+  served before younger repeat arrivals.
+- Tie WAL publication lag to admission priority. Gate: a throughput win is
+  rejected if it hides tail latency in durable-commit or checkpoint backlog.
+
 ### 2026-06-06 - Sherman makes remote indexes write-friendly by moving proof to tiny ordered updates
 
 **Citation:** Qing Wang, Youyou Lu, and Jiwu Shu. "Sherman: A
