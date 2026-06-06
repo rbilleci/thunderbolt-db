@@ -4615,13 +4615,14 @@ Append new candidates here as each paper is processed.
   reader-retention costs as a write-path bottleneck; useful for comparing
   temporal clustering and one-shot reclamation with GPU DB retained-snapshot
   retirement and old-delta compaction. Journal entry added 2026-06-06.
-- `queued` — **TB-Collect: Efficient Garbage Collection for Non-Volatile
+- `reviewed` — **TB-Collect: Efficient Garbage Collection for Non-Volatile
   Memory Online Transaction Processing Engines**, Wei et al., 2025.
   URL: `https://www.mdpi.com/2079-9292/14/10/2080`
   DOI: `https://doi.org/10.3390/electronics14102080`
   Why: discovered while reviewing OneShotGC; applies block-level MVCC garbage
   collection ideas to NVM OLTP engines, useful for comparing future NVM/CXL
-  version storage against GPU DB's DRAM/NVMe retained-delta cleanup.
+  version storage against GPU DB's DRAM/NVMe retained-delta cleanup. Journal
+  entry added 2026-06-06.
 - `queued` — **A Version-aware Data Layout for Heterogeneous Workloads in
   In-Memory Database Systems**, Zhang et al., Research Square preprint 2024.
   URL:
@@ -4629,6 +4630,25 @@ Append new candidates here as each paper is processed.
   Why: discovered through vWeaver/OneShotGC related work; useful for comparing
   version-centric layouts, index-only version searches, and epoch/range
   partitioning against GPU DB visible-row maps and retained snapshot arrays.
+- `queued` — **Falcon: Fast OLTP Engine for Persistent Cache and
+  Non-Volatile Memory**, Ji et al., SOSP 2023.
+  URL:
+  `https://madsys.cs.tsinghua.edu.cn/publication/falcon-fast-oltp-engine-for-persistent-cache-and-non-volatile-memory/`
+  PDF:
+  `https://madsys.cs.tsinghua.edu.cn/publication/falcon-fast-oltp-engine-for-persistent-cache-and-non-volatile-memory/SOSP23-ji.pdf`
+  DOI: `https://doi.org/10.1145/3600006.3613141`
+  Why: TB-Collect cites Falcon as a modern NVM OLTP engine that processes
+  millions of transactions per second while preserving crash consistency;
+  useful for comparing persistent-cache/eADR assumptions, small log windows,
+  and selective data flushes with future GPU DB CXL/NVM metadata paths.
+- `queued` — **Zen: a High-Throughput Log-Free OLTP Engine for
+  Non-Volatile Main Memory**, Liu, Chen, and Chen, PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p835-liu.pdf`
+  DOI: `https://doi.org/10.14778/3446095.3446105`
+  Why: TB-Collect uses Zen as a background-scanning NVM GC and log-free OLTP
+  baseline; useful for comparing metadata-enhanced tuple caches, log-free
+  persistent transactions, and NVM space management with WAL-before-visibility
+  and GPU DB warm-tier durability constraints.
 - `queued` — **RABIT: Efficient Range Queries with Bitmap Indexing**,
   Wang, Xiao, and Athanassoulis, PACMMOD 2025.
   URL: `https://cs-people.bu.edu/mathan/publications/pacmmod25-wang.pdf`

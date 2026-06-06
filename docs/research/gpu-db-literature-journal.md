@@ -91883,3 +91883,153 @@ or cold-tier compaction lane. The key measurements are not just raw
 throughput, but p99 lookup latency during maintenance, write retry
 amplification under skew, and whether every visible result can be traced
 to an explicit WAL/visibility/snapshot boundary.
+
+### 2026-06-06 - TB-Collect makes NVM MVCC cleanup a block-level write-amplification problem
+
+**Citation:** Jianhao Wei, Qian Zhang, Yiwen Xiang, and Xueqing
+Gong. "TB-Collect: Efficient Garbage Collection for Non-Volatile
+Memory Online Transaction Processing Engines." Electronics 14(10),
+2080, 2025. DOI: `https://doi.org/10.3390/electronics14102080`.
+Retrieved 2026-06-06 from the MDPI article page:
+`https://www.mdpi.com/2079-9292/14/10/2080`.
+
+**Category:** MVCC / snapshot / visibility, with multi-tier cache /
+data placement and WAL/logging relevance.
+
+**Relevance tags:** NVM; MVCC garbage collection; obsolete tuple
+versions; block-level reclamation; append-only storage; tuple
+header/content separation; write amplification; TB-Collect; YCSB;
+TPC-C; MySQL storage engine; Quartz NVM simulation; future CXL/NVM
+warm tier.
+
+**Core idea:** TB-Collect starts from a hardware mismatch: MVCC
+garbage collectors designed for DRAM either traverse version chains
+with many random reads or consolidate partitions with many small
+writes. On NVM, random reads are slower than DRAM and writes happen at
+larger effective granularity, so both patterns can damage throughput
+and device endurance.
+
+The paper proposes an NVM-oriented GC path that stores tuple data
+append-only, separates tuple headers from tuple contents, and reclaims
+obsolete versions at block granularity. The transferable idea for GPU
+DB is that version cleanup should be designed around the physical
+write and movement unit of the tier, not only around the logical tuple
+or transaction. Future DRAM/NVMe/CXL/NVM retained-delta tiers should
+avoid making every old-version cleanup a chain traversal or a storm of
+small persistent writes.
+
+**Concrete mechanisms:**
+
+- TB-Collect targets NVM OLTP engines that use MVCC and must reclaim
+  obsolete tuple versions to avoid storage overflow. It contrasts with
+  timely version-chain pruning, background scanning, and partition
+  clearing approaches that were originally shaped by DRAM behavior.
+- The design separates tuple headers from tuple contents. Headers keep
+  the metadata needed for version lookup and state changes, while
+  tuple contents are stored append-only to reduce in-place NVM writes.
+- GC operates at block granularity. Instead of traversing individual
+  tuple version chains to discover reclaimable entries, TB-Collect
+  groups obsolete contents so blocks can be released or reused as a
+  unit.
+- The paper's figures describe a TB-Collect version-storage layout, GC
+  structure, and GC process centered on block-level cleanup rather than
+  per-version free operations.
+- The authors implement TB-Collect in DBx1000 and in a custom
+  NVM-based MySQL 8.4.2 storage engine. The MySQL experiment disables
+  binlog and external locks so the storage-engine GC behavior is easier
+  to isolate; this means the results should not be read as a complete
+  durable MySQL configuration.
+- The evaluation compares TB-Collect with timely version-chain pruning
+  (TVCP), background scanning (BS), partition clearing (PC), and no-GC
+  baselines.
+- For hardware sensitivity, the paper uses Quartz to simulate several
+  NVM configurations. It notes that Intel Optane DC Persistent Memory
+  has about 50% of DRAM read performance, 30% of DRAM write
+  performance, and a 256 B cache line size in the authors' model.
+- In the MySQL TPC-C scalability experiment, My_TB-Collect is reported
+  as the best GC-enabled system; at 40 threads it reaches 88% of the
+  no-GC throughput and about 1.23x-1.58x higher throughput than the
+  other GC-enabled systems.
+- The paper reports that when simulated NVM approaches DRAM-like
+  bandwidth and 64 B granularity, DRAM-shaped GC approaches catch up
+  substantially, but TB-Collect still keeps an advantage because it
+  avoids version-chain traversal and keeps version chains shorter.
+- The article states that the presented data are available in the
+  authors' GitHub repository at
+  `https://github.com/w1397800/TB-Collect/tree/master`.
+
+**GPU DB mapping:** P8 currently treats WAL/checkpoint/archive plus
+CPU MVCC state as truth, while GPU resident state is rebuildable
+acceleration. TB-Collect is most useful for the next tier out: a
+future warm delta store in DRAM/NVMe/CXL/NVM that absorbs mutations,
+retains older visible versions for long readers, and feeds resident
+GPU refresh.
+
+The header/content split maps to a route-descriptor design where small
+mutable metadata stays in owner-controlled CPU structures, while larger
+version payloads live in append-only blocks aligned to the tier's
+write or transfer unit. For GPU DB, those blocks should carry source
+WAL boundary, visibility range, row-count and byte-count summaries,
+table/schema generation, and enough key or row-id metadata to refresh
+resident snapshots without scanning every obsolete version.
+
+Block-level GC maps to retained-snapshot retirement. Instead of
+freeing old tuple versions one by one when a snapshot generation
+retires, the mutation owner could retire blocks or cohorts associated
+with visibility epochs. This fits the existing owner-domain rule:
+cleanup should happen through published generation facts, not through
+reader-side mutation of shared structures.
+
+TB-Collect also sharpens the benchmark question for future CXL/NVM or
+NVMe-backed warm tiers. The right comparison is not just "does GC
+reclaim memory?" It is whether cleanup creates random reads, small
+writes, cache-line write amplification, GPU refresh invalidation, or
+p99 owner-queue stalls.
+
+**Risks and mismatches:** TB-Collect is not a GPU database paper and
+does not address SQL planning, resident HBM layouts, CUDA execution,
+pgwire fan-in, or WAL-before-visibility. It studies NVM OLTP engines,
+not the current P8 design where GPU memory is a volatile cache over
+CPU/WAL truth.
+
+The MySQL experiment disables binlog and external locks, so its TPC-C
+numbers are useful for isolating GC behavior but not sufficient as a
+production durability claim. GPU DB must keep WAL-before-visibility
+even if a future warm tier uses append-only payload blocks.
+
+The paper is published in Electronics rather than a top database or
+systems venue. The mechanisms are still relevant and the source is
+primary/open access, but design adoption should wait for a local
+microbenchmark against the GPU DB tier model.
+
+Block-level reclamation can trade prompt tuple-level cleanup for lower
+write amplification. That is attractive for a warm tier, but dangerous
+if long-lived snapshots or skewed hot keys keep too many blocks alive.
+GPU DB would need age, pressure, and route-validity telemetry around
+each block cohort.
+
+**Benchmark candidates:**
+
+- Build a warm-version cleanup simulator with three policies:
+  tuple-by-tuple chain pruning, partition clearing, and TB-Collect-style
+  block retirement. Measure random reads, small writes, bytes rewritten,
+  retained bytes, cleanup pause time, and p99 mutation-owner latency.
+- Add a visibility-epoch block layout experiment: append old versions
+  into fixed-size blocks tagged with source WAL boundary and visibility
+  range, then retire whole blocks after snapshot release. Gate:
+  WAL-before-visibility remains explicit and recovery never exposes a
+  half-retired block.
+- Compare block sizes aligned to likely tiers: 64 B cache line, 256 B
+  NVM-style write unit, 4 KiB page, 2 MiB huge page, and 16-64 MiB
+  NVMe segment. Failure condition: larger cleanup units reduce write
+  amplification but pin too much stale data under long GPU reads.
+- Prototype header/content separation for CPU MVCC deltas: owner-local
+  headers with append-only payload blocks. Measure visible-version
+  lookup cost, cleanup cost, retained snapshot retirement time, and
+  resident refresh invalidation scope.
+- Stress with YCSB/TPC-C-style skew plus one long reader. Gate:
+  old-version memory growth is bounded by active snapshot/cohort facts,
+  and cleanup does not create foreground response spikes.
+- For any future CXL/NVM path, add write-amplification telemetry:
+  logical bytes retired, physical bytes written, flush/fence count,
+  and route descriptors invalidated per cleanup cycle.
