@@ -83867,3 +83867,213 @@ large stress trace to solve.
   completion, stale route notification, and refresh/eviction races.
   Gate: every stale result has a small rejected history, not only a
   mismatched checksum.
+
+### 2026-06-06 - ALock splits local and remote lock cohorts instead of forcing loopback
+
+**Citation:** Amanda Baran, Jacob Nelson-Slivon, Lewis Tseng, and
+Roberto Palmieri. "ALock: Asymmetric Lock Primitive for RDMA
+Systems." SPAA 2024. DOI `10.1145/3626183.3659977`. Retrieved
+2026-06-06 from `https://doi.org/10.1145/3626183.3659977` and
+arXiv PDF `https://arxiv.org/pdf/2404.17980`.
+
+**Category:** database file-system/storage/indexing and runtime /
+HFT / session scale, with future disaggregated-memory transaction
+relevance.
+
+**Relevance tags:** RDMA; local/remote access asymmetry; loopback
+avoidance; QP thrashing; cohort locks; MCS queue locks; Peterson
+lock; fairness budgets; local spinning; remote-tier metadata locks;
+1M-session admission; future CXL/RDMA tiers.
+
+**Core idea:** ALock addresses a specific RDMA synchronization
+problem: remote one-sided RMW operations are not atomic with local
+shared-memory RMW operations on the same RDMA-accessible memory.
+The common workaround is to force local threads through RNIC
+loopback, or to use RPCs, but both can lose the latency and CPU
+benefits that motivated RDMA in the first place.
+
+The paper's transferable idea is to treat local and remote access as
+different operation classes with different costs and atomicity
+surfaces. ALock does not make every contender use one uniform remote
+primitive. It builds one local cohort and one remote cohort, lets each
+cohort synchronize internally with operations native to that cohort,
+and arbitrates only the cohort leaders with a modified two-party
+Peterson lock.
+
+**Concrete mechanisms:**
+
+- The paper defines local access as ordinary shared-memory operations
+  against RDMA-accessible memory on the same node, and remote access
+  as RDMA operations against memory on another node. It explicitly
+  notes that local reads/writes are atomic with 8-byte RDMA reads and
+  writes, but local and remote RMW/CAS operations are not mutually
+  atomic.
+- ALock has two cohort tails: `tail_l` for local waiters and `tail_r`
+  for remote waiters. A non-null tail simultaneously acts as the
+  cohort's Peterson flag, avoiding another metadata word or remote
+  operation.
+- Each cohort is a modified MCS queue. A local requester uses local
+  CAS/read/write and spins on local descriptor state. A remote
+  requester uses RDMA CAS/write/read and then spins on its local
+  descriptor after it is queued.
+- The cohort leaders compete through a modified Peterson lock with a
+  `victim` field. A leader sets itself as victim and waits until the
+  other cohort's queue is unlocked or the victim changes.
+- Fairness is enforced by per-cohort budgets. A same-cohort handoff
+  decrements the budget; when the budget reaches zero, the next
+  thread must release/reacquire through Peterson so the opposite
+  cohort can make progress if it is waiting.
+- The implementation uses 64-byte-aligned metadata, 8-byte RDMA
+  pointers with node id bits, C++20, and explicit fencing because RDMA
+  memory ordering is not sequentially consistent.
+- Evaluation uses a distributed lock table on up to 20 CloudLab nodes,
+  varying 20/100/1000 locks for high/medium/low contention, locality
+  ratios, node counts, and threads per node. Baselines are an RDMA
+  CAS spinlock and an RDMA-aware MCS lock that use RDMA loopback even
+  for local memory.
+- Reported results: with majority-local workloads, ALock is up to 29x
+  throughput-faster than the MCS baseline and up to 24x faster than
+  the spinlock; in 100% local high-contention latency tests it is
+  reported up to 17x faster than MCS and 33x faster than spinlock.
+  A remote budget of 20 and local budget of 5 performed best in the
+  reported medium-contention tuning experiment.
+- The paper includes a TLA+ specification for correctness, liveness,
+  and fairness, but the performance evaluation is a lock-table
+  microbenchmark rather than a database transaction benchmark.
+
+**GPU DB mapping:** ALock is relevant if GPU DB later places catalog,
+index, residency, or cold-tier metadata in RDMA/CXL-like shared memory
+where the local owner and remote route workers both touch the same
+metadata. The first lesson is to avoid pretending that local CPU
+access and remote one-sided access have the same cost or atomicity.
+A future remote-tier metadata primitive should explicitly encode
+which side is local, which side is remote, and which operations are
+allowed without loopback.
+
+For 1M logical sessions, the useful pattern is cohorting, not the
+literal lock. Many logical sessions should collapse into local runtime
+or partition cohorts before they touch an owner-visible remote-tier
+metadata object. Remote contenders should spin on local descriptors or
+local admission queues, while the authoritative metadata sees compact
+cohort leaders, generation checks, and bounded handoff budgets.
+
+For GPU-resident route metadata, ALock suggests a split between
+fast local owner mutation and remote readers/warm-tier workers. A
+residency owner could update local metadata with shared-memory
+operations while remote workers interact through a narrow remote
+cohort path. Fairness budgets map to read-phase/write-phase or
+local-owner/remote-worker budgets: local fast paths may pass work
+cheaply, but they must periodically yield to pending invalidation,
+refresh, or remote-tier maintenance.
+
+The QP-thrashing observation is also directly relevant to session and
+future-tier admission. GPU DB should not expose one RNIC connection
+or queue-pair-shaped resource per logical session. If a future RDMA
+path exists, queue-pair cache pressure belongs in telemetry and
+admission policy alongside GPU queue depth, pinned-buffer pressure,
+and resident-byte budgets.
+
+**Risks and mismatches:** ALock is a mutual-exclusion primitive, not
+an MVCC protocol, WAL protocol, snapshot publication mechanism, or SQL
+transaction scheduler. Importing it directly as a database lock would
+not provide visibility, recovery, phantom protection, deadlock policy,
+or deterministic fallback.
+
+The system model assumes failure-free asynchronous threads and
+RDMA-accessible shared memory. GPU DB's production tiers need crash,
+reconnect, partial failure, replay, and generation-reset semantics.
+Any ALock-like metadata route would need timeout, abort, and stale
+wakeup handling before it can guard database-visible state.
+
+The evaluation favors lock-table microbenchmarks with controlled
+locality and contention. It does not evaluate TPC-C, YCSB, SQL ranges,
+long reads, DDL, GPU execution, or mixed WAL/residency refresh. The
+reported 29x result is therefore evidence for avoiding loopback under
+local-heavy lock contention, not a throughput promise for database
+transactions.
+
+Fairness budgets are workload-sensitive. A budget that reduces remote
+reacquire overhead may still violate a database SLO if it delays WAL
+invalidation, DDL, snapshot retirement, or high-priority writes. GPU DB
+would need budget telemetry and route-specific limits rather than one
+static pair of values.
+
+CXL/cache-coherent fabrics may reduce some local/remote atomicity
+pain, but ALock's broader warning remains: coherency, loopback,
+remote atomics, and local atomics have different bottlenecks, and a
+future-tier database should measure them as separate route classes.
+
+**Benchmark candidates:**
+
+- Build a local/remote metadata-lock microbenchmark for future-tier
+  route state. Compare all-loopback RDMA CAS, RDMA MCS, ALock-style
+  local/remote cohorts, and owner-message publication. Gate: local
+  owner latency, remote waiter latency, RNIC operations per acquire,
+  and fairness under read-heavy and invalidation-heavy mixes.
+- Add QP-pressure admission telemetry to any RDMA/disaggregated-tier
+  simulator. Gate: logical session count can rise toward 1M without
+  creating per-session QP state; active remote-tier cohorts and RNIC
+  cache pressure remain bounded and observable.
+- Stress budgeted read/write cohort fairness for resident route
+  metadata. Read phases may pass cheaply, but WAL invalidation,
+  refresh publication, DDL, and snapshot retirement must cross their
+  SLO floors under hot local read contention.
+- Test stale remote handoff handling with generation counters. Delay a
+  remote waiter wakeup across eviction, route invalidation, metadata
+  reset, and owner restart. Failure condition: a stale cohort handoff
+  can enter a critical section for an obsolete route generation.
+- Compare local-owner shared-memory updates against remote worker
+  one-sided updates for resident-index metadata. Expected result:
+  one-sided updates are useful only when their remote atomicity and QP
+  costs are lower than owner-message batching plus publication.
+- Model local/remote asymmetry in the planner/runtime route certificate:
+  each remote-tier route should declare whether it uses local owner
+  mutation, remote one-sided reads, remote atomics, RPC/owner messages,
+  or cache-coherent loads, and benchmark each as a separate cost class.
+
+### 2026-06-06 - Cross-paper synthesis: remote routes need tiny authorities and external witnesses
+
+DecLock, Viper, and ALock converge on one design track: fast remote or
+retained routes should keep the authoritative shared fact small, move
+heavy waiter/execution state local, and produce enough history to check
+that the fast path did not outrun its correctness contract.
+
+DecLock and ALock both reject a naive "everyone pounds one remote
+primitive" shape. DecLock moves lock ownership transfer off the memory
+node NIC and keeps local waiter queues; ALock splits local and remote
+cohorts so local owners do not pay RNIC loopback costs. For GPU DB, the
+common lesson is that 1M logical sessions should be represented at
+remote authorities by compact domain, cohort, or generation facts, not
+by per-session remote atomics or queue-pair-shaped state.
+
+Viper supplies the complementary correctness track. If retained GPU
+reads, remote-tier metadata, and cohort handoffs are allowed to execute
+outside the mutation owner, benchmarks need an external witness format:
+begin boundary, commit/response boundary, read-from versions, write ids,
+route generation, and invalidation/refresh facts. The route can be fast
+only if its history can still be explained by the intended isolation
+level.
+
+**Category gaps:** recent reviews have strong coverage for transaction
+admission, MVCC witnesses, and remote/disaggregated synchronization.
+The next useful gap is either modern high-concurrency networking/QP
+scalability or optimizer-visible route selection for remote-tier and
+GPU-resident paths. Pure GPU analytics should stay lower priority until
+the runtime/concurrency balance catches up.
+
+**Benchmark priorities:**
+
+- Combine ALock/DecLock-style cohorting with a 1M logical-session
+  admission simulator. Measure owner-visible waiters, RNIC/QP pressure,
+  wakeup fanout, and memory per blocked session.
+- Add Viper-style history capture to that simulator. Every successful
+  retained or remote-tier read should carry enough begin/commit/read
+  facts to be checked off path for SI or Strong Session SI.
+- Stress delayed wakeups and stale generation notifications across
+  remote lock handoff, resident snapshot invalidation, and route
+  eviction. Failure condition: a compact authority fact can wake work
+  against an obsolete route generation.
+- Benchmark route classes separately: local owner update, owner-message
+  publication, RDMA one-sided read, RDMA atomic, cache-coherent load,
+  and GPU resident execution. The planner should not treat these as one
+  generic "remote fast path."

@@ -518,13 +518,14 @@ Append new candidates here as each paper is processed.
   decentralized priority lock queues against a newer design that reduces
   memory-node NIC contention by decoupling lock ownership transfer from
   centralized lock-state maintenance. Journal entry added 2026-06-06.
-- `queued` — **ALock: Asymmetric Lock Primitive for RDMA Systems**, Baran,
+- `reviewed` — **ALock: Asymmetric Lock Primitive for RDMA Systems**, Baran,
   Nelson-Slivon, Tseng, and Palmieri, SPAA 2024.
   URL: `https://doi.org/10.1145/3626183.3659977`
   arXiv: `https://arxiv.org/abs/2404.17980`
   Why: HDTX cites ALock as modern RDMA lock related work; useful for comparing
   priority scheduling with local/remote cohort locking when GPU DB future tiers
-  mix local CPU accesses and remote/disaggregated-memory accesses.
+  mix local CPU accesses and remote/disaggregated-memory accesses. Journal
+  entry added 2026-06-06.
 - `queued` — **ShiftLock: Mitigate One-sided RDMA Lock Contention via
   Handover**, Gao, Wang, and Shu, USENIX FAST 2025.
   URL: `https://www.usenix.org/conference/fast25/presentation/gao`
@@ -605,6 +606,20 @@ Append new candidates here as each paper is processed.
   key-value stores; useful for comparing ownership partitioning, adaptive
   caching, selective replication, and log-free indexing against GPU DB's
   warm/cold tier metadata and owner domains.
+- `queued` — **StaR: Breaking the Scalability Limit for RDMA**, Wang et al.,
+  ICNP 2021.
+  URL: `https://doi.org/10.1109/ICNP52444.2021.9651935`
+  Why: ALock relies on QP-thrashing limits in commodity RNICs; useful for
+  evaluating whether future GPU DB remote-tier/session paths should reduce
+  QP state, multiplex connections, or expose RNIC-cache pressure as admission
+  telemetry.
+- `queued` — **Fast RDMA-based Ordered Key-Value Store using Remote Learned
+  Cache**, Wei, Chen, and Chen, OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/wei`
+  PDF: `https://www.usenix.org/system/files/osdi20-wei.pdf`
+  Why: ALock contrasts HTM/RDMA synchronization from this line of work; useful
+  for comparing remote learned-cache index routing, local/remote access
+  asymmetry, and fallback behavior for future warm-tier key lookups.
 - `reviewed` — **SkyStore: Cost-Optimized Object Storage Across Regions and
   Clouds**, Liu et al., PVLDB 2025.
   URL: `https://research.ibm.com/publications/skystore-cost-optimized-object-storage-across-regions-and-clouds`
