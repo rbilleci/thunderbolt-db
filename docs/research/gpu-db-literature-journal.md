@@ -87771,3 +87771,160 @@ durable logs/checkpoints, and explicit CPU/GPU fallback.
 - Add a checkpoint-clear stress test with long readers pinning old
   metadata generations. Gate: checkpoint clearing reclaims safe records
   without deleting log entries needed by pinned snapshots or recovery.
+
+### 2026-06-06 - TXBug says transaction correctness tests should be small, semantic, and route-aware
+
+**Citation:** Ziyu Cui, Wensheng Dou, Yu Gao, Dong Wang, Jiansen Song,
+Yingying Zheng, Tao Wang, Rui Yang, Kang Xu, Yixin Hu, Jun Wei, and
+Tao Huang. "Understanding Transaction Bugs in Database Systems." ICSE
+2024, article 163, 13 pages. DOI: `10.1145/3597503.3639207`.
+Retrieved 2026-06-06 from the author PDF at
+`https://criszy.github.io/papers/2024-icse-txbug.pdf`; ICSE program
+page also links the preprint.
+
+**Category:** transaction processing / MVCC and snapshot validation, with
+secondary relevance to route invalidation, DDL/catalog visibility, and
+regression benchmark design.
+
+**Relevance tags:** transaction bugs; MVCC; isolation; atomicity;
+consistency; silent failures; deterministic schedules; small-scope tests;
+DDL under transactions; indexes; read-only constraints; statement
+correctness; transaction-oracle gaps; regression corpus.
+
+**Core idea:** The paper studies 140 confirmed transaction bugs from
+MySQL, PostgreSQL, SQLite, MariaDB, CockroachDB, and TiDB, then classifies
+how they are triggered, what transaction semantics they violate, and which
+existing verification/testing approaches would catch them. Its strongest
+transferable message is that transaction correctness failures are often
+small and deterministic, but they are broader than classic isolation
+anomalies.
+
+For GPU DB, this is a warning against validating retained snapshots only
+with large random histories or key-value serializability checkers. The
+engine needs small, named adversarial schedules that exercise MVCC
+visibility, WAL-before-visibility, catalog generation changes, index route
+validity, read-only gates, and statement behavior while CPU fallback and GPU
+resident routes coexist.
+
+**Concrete mechanisms:**
+
+- The study collected transaction bugs from issue repositories for six
+  widely used relational DBMSs and kept bugs confirmed by DBMS developers.
+  The resulting dataset and classifications are published at
+  `https://github.com/tcse-iscas/TXBug`.
+- A bug is considered a transaction bug when it needs at least one explicit
+  transaction or when a SQL statement's transactional context is necessary
+  to trigger the failure. Bugs in ordinary single-statement SELECT logic are
+  out of scope.
+- The paper analyzes each bug by manifestation, root cause, impact, fix, and
+  whether existing approaches could detect it. It uses issue descriptions,
+  embedded test cases, developer discussions, and fixing patches where
+  available; 63 bugs were reproduced for deeper analysis.
+- The triggering conditions are usually small. The paper reports that 93.6%
+  of bugs need no more than three transactions, 84.7% of involved
+  transactions contain no more than four statements, 89.3% need no more than
+  one initial table, and 86.8% of initial tables contain at most five rows.
+- Most bugs still require specific schema or table properties. The paper
+  reports 71.4% need properties such as key constraints, indexes, column
+  constraints, partition configuration, encoding, temporary tables, virtual
+  tables, or system tables.
+- The schedules are usually controllable. The paper reports that 94.3% of
+  studied bugs can be triggered deterministically by executing statements in
+  a particular order. The remaining nondeterministic cases need repeated
+  parallel execution or manual control of DBMS state.
+- Root causes are classified by violated transaction semantics: atomicity,
+  consistency, isolation, read-only constraint, and statement correctness
+  under transactions. Isolation is split into insufficient isolation and
+  excessive isolation.
+- One highlighted TiDB example combines READ COMMITTED with an index drop
+  and row update. A transaction continues to use schema state from its start
+  timestamp, then returns an old indexed value for one predicate while a
+  primary-key lookup sees the updated row. That is directly relevant to GPU
+  DB route descriptors and resident index invalidation.
+- Silent failures dominate. The paper reports that only 23.6% of bugs cause
+  explicit failures such as crashes or errors; 76.4% produce silent failures
+  such as incorrect database states, incorrect query results, incorrect DBMS
+  state, wrong blocking behavior, or performance degradation.
+- Existing approaches miss much of the corpus. The paper estimates that less
+  than half, 45.7%, can be detected by surveyed transaction verification and
+  testing approaches because many tools focus on simple key-value histories,
+  insufficient-isolation bugs, pairs of transactions, or common SQL features
+  rather than DBMS-specific transactional context.
+
+**GPU DB mapping:** GPU DB should build a transaction-correctness
+regression lane around small named schedules, not only stress tests. Each
+test should include the initialization schema, rows, route metadata, explicit
+and auto transactions, schedule order, expected result, and the violated
+semantic if the engine gets it wrong.
+
+The TiDB schema/index example maps directly to retained route safety. A
+read route should not only know the visibility boundary; it also needs a
+schema generation, index/resident-fragment generation, invalidation
+generation, and fallback rule. If a DDL or index mutation commits while a
+READ COMMITTED transaction continues, the route must either rebind to the
+new generation or produce a contractually correct older snapshot. It must
+never mix a stale predicate/index route with a newer row-visible route.
+
+The "silent failure" finding maps to benchmark oracles. GPU DB needs
+oracles for wrong rows, stale rows, missing rows, duplicate writes, incorrect
+DBMS/session state, unexpected blocking, failure to block, read-only
+violations, and statement errors inside transactions. Crash-only and
+throughput-only tests would miss the majority of the failure space described
+by this paper.
+
+The small-scope finding is important for 1M logical sessions. Correctness
+does not require a million live clients to reveal many transaction bugs.
+The engine can run compact adversarial schedules against owner domains and
+retained snapshots, then separately scale admission/session tests once each
+semantic lane is proven.
+
+The paper's limits also shape the mapping. It is an empirical bug study, not
+a new concurrency-control protocol, and it does not prescribe GPU execution,
+WAL layout, resident cache placement, or snapshot publication algorithms.
+Its value is in workload design, oracle coverage, and the reminder that
+DBMS-specific transactional features must be first-class test inputs.
+
+**Risks and mismatches:** The dataset covers reported, confirmed bugs in six
+DBMSs; it is not an exhaustive taxonomy of all transaction bugs. Bug reports
+can overrepresent visible or developer-confirmed failures, and some
+classifications depend on available issue details.
+
+Several results are about SQL feature coverage and test generation rather
+than runtime architecture. GPU DB should not overfit to reproducing another
+DBMS's exact semantics where its own documented isolation contract differs.
+Instead, each borrowed schedule needs an expected outcome expressed in GPU
+DB's own transaction model.
+
+Existing-tool coverage in the paper is assessed against preconditions of
+published approaches. That is useful for gap analysis, but GPU DB should
+measure its own checkers by actually replaying histories and comparing
+semantic oracles.
+
+**Benchmark candidates:**
+
+- Build a TXBug-inspired compact schedule suite. Start with 20 to 40 tests
+  using one table, five or fewer rows, two or three transactions, and four or
+  fewer statements per transaction. Cover atomicity, consistency, isolation,
+  read-only, and statement-correctness lanes.
+- Add a retained-route DDL/index invalidation test: transaction A reads
+  through a resident/index route, transaction B drops or changes the index
+  and updates a row, then transaction A reads through both predicate and
+  primary-key routes. Gate: results obey the declared isolation level and no
+  stale route can mix generations.
+- Add silent-failure oracles to benchmarks: expected rows, expected final
+  table state, expected session/transaction state, expected blocking or
+  non-blocking, and expected statement error/success. Failure condition:
+  throughput is reported without checking semantic outputs.
+- Compare random high-concurrency history testing with deterministic
+  small-schedule replay for retained snapshots. Measure bugs found per
+  second, reproduction stability, and minimization effort.
+- Add an auto-transaction plus explicit-transaction matrix for COPY/INSERT,
+  UPDATE, DELETE, DDL, and retained reads. Gate: WAL-before-visibility and
+  route invalidation behave identically whether a statement comes from an
+  explicit transaction or an autocommit path.
+- Add a read-only transaction gate across CPU and GPU routes. A read-only
+  session must not mutate CPU tuples, WAL, route metadata, residency state, or
+  future warm-tier indexes except for explicitly allowed telemetry counters.
+- Track each regression by violated semantic, not just by SQL text. Required
+  metadata: isolation level, route family, snapshot generation, schema
+  generation, resident generation, WAL boundary, and expected oracle class.

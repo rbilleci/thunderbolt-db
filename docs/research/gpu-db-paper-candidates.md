@@ -5733,12 +5733,19 @@ Append new candidates here as each paper is processed.
   Why: Vbox cites transaction-oracle work as evidence that claimed isolation
   can fail in practice; useful for generating adversarial SQL histories that
   exercise GPU DB retained snapshots, predicate routes, and fallback ordering.
-- `queued` — **Understanding Transaction Bugs in Database Systems**, Cui et al.,
+- `reviewed` — **Understanding Transaction Bugs in Database Systems**, Cui et al.,
   ICSE 2024.
   URL: `https://doi.org/10.1145/3597503.3639207`
+  PDF: `https://criszy.github.io/papers/2024-icse-txbug.pdf`
   Why: Vbox cites modern transaction-bug evidence; useful for turning real
   anomaly classes into GPU DB regression workloads for MVCC, WAL visibility,
-  predicate reads, and route invalidation.
+  predicate reads, and route invalidation. Journal entry added 2026-06-06.
+- `queued` — **Anomaly Pattern-guided Transaction Bug Testing in Relational
+  Databases**, Xu et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2511.17377`
+  Why: discovered while reviewing the ICSE 2024 TXBug study; useful follow-up
+  for turning empirical transaction-bug patterns into generated adversarial
+  histories for retained snapshots, write publication, and route invalidation.
 - `queued` — **DynaMast: Adaptive Dynamic Mastering for Replicated Systems**,
   Abebe, Glasbergen, and Daudjee, ICDE 2020.
   URL: `https://doi.org/10.1109/ICDE48307.2020.00123`
