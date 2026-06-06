@@ -38,6 +38,169 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Memstrata makes CXL tiering an isolation and outlier-control problem
+
+**Citation:** Yuhong Zhong, Daniel S. Berger, Carl Waldspurger,
+Ryan Wee, Ishwar Agarwal, Rajat Agarwal, Frank Hady, Karthik
+Kumar, Mark D. Hill, Mosharaf Chowdhury, and Asaf Cidon.
+"Managing Memory Tiers with CXL in Virtualized Environments."
+OSDI 2024, 37-56. Retrieved 2026-06-06 from the USENIX PDF:
+`https://www.usenix.org/system/files/osdi24-zhong-yuhong.pdf`.
+
+**Category:** multi-tier cache / data placement, with runtime /
+session-scale and performance-isolation relevance.
+
+**Relevance tags:** CXL; Intel Flat Memory Mode; Memstrata;
+hardware-managed tiering; cache-line placement; mixed mode; page
+coloring; multi-tenant isolation; slowdown estimator; dedicated local
+DRAM; performance counters; virtualized environments; FASTER; Silo;
+TPC-C; PostgreSQL TPC-H.
+
+**Core idea:** The paper argues that page-granular software tiering is
+too expensive and too coarse for virtualized CXL deployments, while
+pure hardware tiering is blind to tenant-level performance. Intel Flat
+Memory Mode handles fine-grained cache-line placement in the memory
+controller, and Memstrata adds a lightweight software layer that
+isolates VMs from each other's local-DRAM conflicts and shifts
+dedicated local pages toward outlier workloads.
+
+For GPU DB, the transferable idea is that future CXL/far-memory tiers
+should not be treated as a passive extension of DRAM. If route
+metadata, warm MVCC blocks, cold indexes, pinned host buffers, or
+snapshot cohorts sit on tiered memory, the engine needs explicit
+isolation, conflict-domain accounting, and outlier detection. Hardware
+can hide some placement detail, but database admission still needs to
+know which routes are latency-sensitive enough to deserve scarce local
+or HBM-backed residency.
+
+**Concrete mechanisms:**
+
+- Intel Flat Memory Mode exposes the aggregate capacity of local DRAM
+  and CXL memory while placing each cache line exclusively in one tier.
+  The memory controller promotes recently accessed lines to local DRAM
+  by swapping them with the conflicting line mapped to the same local
+  DRAM location.
+- The evaluated mixed mode reserves dedicated local DRAM as a separate
+  NUMA range while leaving the rest hardware-tiered. The paper's common
+  configuration uses 33% dedicated local memory plus 67% hardware-tiered
+  memory, which effectively gives 67% local DRAM and 33% CXL capacity
+  under the described mapping.
+- The design is direct-mapped at local-memory-line granularity. That
+  creates potential conflicts when different physical lines map to the
+  same local DRAM line.
+- Memstrata adapts page coloring to this CXL setting. The host groups
+  physical pages that conflict for the same local DRAM backing and
+  allocates conflicting pairs to the same VM, eliminating inter-VM
+  local-DRAM conflicts and reducing cross-tenant interference.
+- Memstrata cannot directly observe per-VM local-memory miss rates
+  because cache-line placement happens in the memory controller. It
+  estimates per-VM pressure from performance counters, especially a
+  proxy based on demand-load L3 miss latency plus related L2, L3, DTLB,
+  and L2-MPKI metrics.
+- A lightweight online random-forest classifier predicts whether a VM
+  is likely to see more than 5% slowdown. The paper reports 88%
+  validation accuracy with the selected performance-counter features,
+  compared with 63% when using MPKI alone.
+- A dynamic page allocator samples every 10 seconds by default, smooths
+  metrics with EWMA, ranks VMs by outlier status and estimated misses
+  per hardware-tiered page, then migrates at most a step-ratio fraction
+  of dedicated local pages from low-ranked VMs to outliers.
+- Page movement uses a custom `exchange_pages` syscall built on Linux
+  `migrate_pages()`, with MMU notifier synchronization for guest and
+  QEMU page tables. The paper reports the kernel/QEMU/userspace
+  Memstrata implementation sizes and uses ONNX for the classifier.
+- The evaluation runs on a preproduction Intel Xeon 6 system with
+  128 GB local DDR5 and 128 GB CXL DDR5 over three CXL cards. The paper
+  reports CXL idle latency at roughly 200-220% of local memory latency,
+  while CXL bandwidth was not the limiting factor in the tested runs.
+- Across 115 workloads, hardware-tiered mixed mode keeps 82% of
+  workloads within 5% slowdown versus local DRAM, but outliers can
+  still see up to 34% slowdown. In multi-VM experiments, Memstrata
+  reduces worst-case slowdown from above 30% to below 6% in realistic
+  mixes, with maximum CPU overhead of 4% of one core and less than 1%
+  of one core per VM.
+- The software-tiering comparison shows a real failure mode for
+  page-granular migration: TPP can thrash and migrate memory at tens of
+  GB/s, creating large slowdowns when the working set is too large or
+  spatial locality is poor under virtualization.
+
+**GPU DB mapping:** P8 currently makes GPU resident state explicit and
+rebuildable over CPU/WAL truth. Memstrata extends that thinking to a
+future host tier: any CXL/far-memory resident state should carry both a
+logical route certificate and a physical isolation certificate. The
+route certificate says which snapshot, table, visibility boundary, and
+operator shape the data serves. The isolation certificate says which
+tier/conflict domain, local-memory budget, and migration policy it
+depends on.
+
+For 1M logical sessions, the page-coloring lesson maps to queue and
+buffer ownership. It is not enough to say "many sessions share a big
+CXL tier." Hot sessions, pinned buffers, and route metadata can evict
+or conflict with one another in hidden hardware-managed structures.
+Admission should track conflict domains, not just bytes.
+
+The slowdown-estimator idea maps to route-level outlier detection.
+GPU DB can build a small classifier or rule model over queue wait,
+GPU/CPU miss counters, H2D/D2H bytes, CXL or host-memory latency, and
+per-route p99 deltas to decide when a retained route needs local/host
+promotion, HBM residency, CPU fallback, or rejection. Correctness
+rules stay deterministic; only performance placement is adaptive.
+
+Mixed mode is a useful design vocabulary for GPU DB tiers. Some memory
+should remain dedicated and DB-owned for route descriptors, command
+rings, WAL publication metadata, pinned staging buffers, and hot
+snapshot handles. Other larger data regions can be hardware- or
+OS-managed if the route can tolerate variable latency and has explicit
+fallback.
+
+**Risks and mismatches:** Memstrata is a cloud virtualization paper,
+not a database storage-engine paper. It does not address WAL,
+snapshot visibility, SQL correctness, GPU kernels, NVMe, or DB-owned
+file layout.
+
+The paper's hardware behavior is specific to Intel Flat Memory Mode
+and a preproduction platform. GPU DB should treat the exact mapping,
+latency, and classifier features as hardware-dependent, not portable
+architecture.
+
+Hardware-managed cache-line tiering hides placement from software.
+That is useful for low overhead, but dangerous if the database assumes
+that route-critical objects are physically stable. DB-owned hot
+metadata and correctness publication structures still need explicit
+placement or a measured eligibility guard.
+
+The outlier detector optimizes performance, not correctness or fairness
+by itself. GPU DB cannot allow adaptive promotion to starve mutation
+owners, WAL flush buffers, or cold-but-SLO-critical sessions.
+
+**Benchmark candidates:**
+
+- Add a tier-conflict simulator for retained route objects: model
+  local DRAM/HBM, hardware-tiered CXL, and cold host memory with
+  direct-mapped conflict groups. Measure p50/p99 route latency,
+  hidden conflict misses, and bytes migrated under random, hotness, and
+  page-coloring-like isolation.
+- Add a "dedicated local budget" benchmark for route metadata,
+  command/response rings, pinned buffers, and hot snapshot handles.
+  Gate: moving these structures to a slower tier must be visible in
+  p99 latency and cannot happen silently under memory pressure.
+- Build a route-outlier detector using existing telemetry dimensions:
+  queue wait, batch size, H2D/D2H bytes, CPU cache misses if available,
+  GPU execution time, fallback count, and p99 delta versus local-only
+  baseline. Failure condition: the detector improves average throughput
+  but misclassifies write-critical routes or violates admission fairness.
+- Compare three CXL placement policies for warm MVCC/version blocks:
+  hardware/OS transparent placement, DB semantic placement by snapshot
+  generation and route importance, and hybrid placement with a reserved
+  local budget for outlier routes.
+- Stress mixed OLTP/retained-read sessions with one latency-sensitive
+  route and several memory-streaming analytical routes. Gate: analytical
+  refresh or scan work must not steal the local-memory budget needed for
+  mutation publication or hot lookup p99.
+- Add telemetry fields to future tiering experiments: tier bytes,
+  conflict-domain id, route-local budget, migration bytes/sec, estimated
+  tier miss rate, and p99 slowdown versus a local-only baseline.
+
 ### 2026-06-06 - Colloid balances loaded tier latency instead of hoarding hot pages
 
 **Citation:** Midhul Vuppalapati and Rachit Agarwal. "Tiered

@@ -4154,6 +4154,12 @@ Append new candidates here as each paper is processed.
   Why: MEMTIS uses CXL latency assumptions from Pond; useful for future CXL
   memory-pool tiers, remote-memory latency budgets, and explicit placement
   boundaries between local DRAM, pooled memory, and GPU-resident state.
+- `queued` — **vTMM: Tiered Memory Management for Virtual Machines**,
+  Sha, Li, Luo, Wang, and Wang, EuroSys 2023.
+  URL: `https://doi.org/10.1145/3552326.3587449`
+  Why: Memstrata contrasts vTMM as a dynamic software tiering manager for VMs;
+  useful for comparing page-modification-log access tracking and VM-aware
+  migration with hardware-managed CXL tiering and DB-owned placement guards.
 - `queued` — **Jovis: A Visualization Tool for PostgreSQL Query Optimizer**,
   Choi et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2411.14788`
@@ -6231,12 +6237,13 @@ Append new candidates here as each paper is processed.
   useful for comparing hotness-only placement with latency-balancing policy
   when CXL/far-memory paths have heterogeneous access costs. Journal entry
   added 2026-06-06; DOI corrected during review.
-- `queued` — **Managing Memory Tiers with CXL in Virtualized Environments**,
+- `reviewed` — **Managing Memory Tiers with CXL in Virtualized Environments**,
   Zhong et al., OSDI 2024.
   URL: `https://www.usenix.org/conference/osdi24/presentation/zhong-yuhong`
   Why: HybridTier references Memstrata as a CXL tier manager for virtualized
   environments; useful for multi-tenant placement, isolation, and whether GPU
-  DB can trust host/VM tiering for route-critical memory.
+  DB can trust host/VM tiering for route-critical memory. Journal entry added
+  2026-06-06 from the USENIX PDF.
 - `queued` — **Understanding the Host Network**, Vuppalapati, Agarwal,
   Schuh, Kasikci, Krishnamurthy, and Agarwal, SIGCOMM 2024.
   URL: `https://doi.org/10.1145/3651890.3672271`
