@@ -94913,3 +94913,227 @@ indexes where per-dereference increments would be too expensive.
   table snapshots. Failure condition for WFE adoption: the helper/scan
   machinery adds measurable p99 cost without reducing unreclaimed metadata
   under realistic retained-read workloads.
+
+### 2026-06-07 - AIFM turns far memory into data-structure policy
+
+**Citation:** Zhenyuan Ruan, Malte Schwarzkopf, Marcos K. Aguilera,
+and Adam Belay. "AIFM: High-Performance, Application-Integrated Far
+Memory." OSDI 2020, pages 315-332. Retrieved 2026-06-07 from the USENIX
+page and PDF: `https://www.usenix.org/conference/osdi20/presentation/ruan`,
+`https://www.usenix.org/system/files/osdi20-ruan.pdf`.
+
+**Category:** Multi-tier cache / data placement, with runtime / HFT /
+session scale and GC, reclamation, and in-memory DB state relevance.
+
+**Relevance tags:** AIFM; far memory; object-granular remoting;
+remoteable pointers; dereference scopes; pauseless evacuation; semantic
+hints; prefetching; non-temporal access; active remote components;
+green threads; cache pollution; page-amplification; future CXL/far
+memory tier.
+
+**Core idea:** AIFM argues that transparent page-level swap is the wrong
+abstraction for fast far memory because the OS cannot see object size,
+access pattern, hotness, or useful remote-side computation. It exposes a
+small runtime/data-structure API instead: allocations become remoteable,
+the runtime can evacuate cold objects to a remote server, and data
+structures provide enough semantic information for object-granular
+fetch, prefetch, non-temporal access, and simple remote offload.
+
+For GPU DB, the strongest transferable idea is that tier placement should
+be attached to database objects with known semantics, not hidden behind a
+generic paging layer. Resident fragments, route descriptors, retained
+snapshot metadata, pinned staging slabs, and cold column chunks each have
+different fetch size, reuse, freshness, and offload properties. The tier
+manager should see those identities and choose movement policy
+accordingly.
+
+**Concrete mechanisms:**
+
+- AIFM represents an object through a remoteable pointer. A local unique
+  remoteable pointer is 64 bits with address bits plus hot, present,
+  dirty, evacuating, and shared-state bits. A remote pointer stores a data
+  structure id, object size, and object id so the runtime can retrieve the
+  object without a page table.
+- Local-object access is optimized as a hot path: load the pointer, test
+  present/evacuating bits, branch to cold path only when needed, extract
+  the address, and return it. The paper reports about a three-micro-op
+  overhead over ordinary pointer dereference on the local path.
+- A `DerefScope` ties the lifetime of a raw local pointer to an explicit
+  scope. The runtime treats dereference scopes as evacuation fences so it
+  does not move an object while application code may still hold a local
+  reference. Access after the scope ends is undefined behavior.
+- Evacuation handlers let a data structure repair its own metadata when
+  an object is moved. For example, a remoteable hash table can remove a
+  local index entry when its key-value object is evacuated, then recreate
+  the entry on a later miss.
+- The remote device abstraction defaults to key-value object
+  read/write/delete by data-structure id and object id, but also supports
+  active remote components. The paper uses this to avoid repeated
+  round-trips for remote hash-table lookup and to offload DataFrame
+  copy/shuffle/aggregate operations.
+- Semantic hints include object hotness bits, custom replacement by data
+  structure id, finite-state-machine prefetching for sequential and
+  strided access, and non-temporal dereference for data that should be
+  reclaimed quickly instead of polluting local memory.
+- The runtime uses green threads and a kernel-bypass TCP/IP stack so a
+  mutator waiting on remote data can yield to other useful work instead
+  of spinning through the remote-memory latency.
+- Local remoteable memory is managed in 2 MB logs with temporal and
+  non-temporal used lists plus per-core allocation buffers. AIFM uses a
+  mark-compact-style evacuator to reduce fragmentation.
+- The pauseless evacuator selects logs, concurrently marks objects by
+  setting evacuation bits, waits for an RCU-style quiescent period, and
+  then either copies cold objects to remote memory or compacts hot objects
+  into new local logs. A mutator that races with evacuation can copy the
+  object locally and use CAS to win the handoff.
+- The green-thread scheduler is co-designed with evacuation. It
+  prioritizes mutators currently in dereference scopes, then evacuation
+  threads, then other mutators, and can force yields under memory pressure
+  to avoid priority inversion and out-of-memory failure.
+- The prototype uses Shenango, a DPDK-based TCP remote-memory backend, and
+  an SPDK SSD backend. The paper explicitly says the prototype is limited
+  to unshared far-memory objects on a single memory server; it does not
+  support dynamic local/remote memory sizing.
+- In a web-front-end-style workload with 5 GB local memory for a 26 GB
+  working set, AIFM with non-temporal array access reaches about 370K
+  requests/s versus 19K for Fastswap and 440K for all-local memory.
+- In a DataFrame workload over NYC taxi data, AIFM reports 78% of
+  all-local throughput with only 1 GB local memory for a 31 GB working set,
+  and more than 95% from about 6 GB local memory. Remote offload is
+  important: copy offload alone improves throughput by 18%-38% in the
+  reported breakdown.
+- The hash-table experiment reports up to 61x throughput over Fastswap
+  under skewed access because AIFM avoids page-level read/write
+  amplification and preserves per-object hotness.
+
+**GPU DB mapping:** The tiering lesson maps directly to P8. GPU DB should
+not treat HBM, host DRAM, NVMe, remote memory, and future CXL/fabric tiers
+as anonymous pages. A resident column chunk, equality-key vector, route
+descriptor, text byte arena, WAL/checkpoint manifest, and temporary result
+buffer should each carry movement policy: fetch granularity, prefetch
+family, non-temporal eligibility, reuse score, visibility boundary, and
+eviction handler.
+
+`DerefScope` maps to snapshot and descriptor protection. Read workers and
+GPU execution workers should enter explicit protection scopes while they
+hold route descriptors, resident-segment handles, pinned buffers, or
+CPU-side decoded chunks. The scope should be per active worker operation,
+not per parked logical session, so 1M logical sessions do not imply 1M
+active raw-pointer hazards.
+
+Evacuation handlers map to route metadata repair. If memory pressure evicts
+a resident segment, demotes a warm chunk, or releases a pinned staging slab,
+the owning data structure should update planner-visible route state,
+fallback reason, and invalidation generation at the same boundary. An
+eviction that only frees bytes but leaves optimistic route hints behind is
+a correctness and p99-latency hazard.
+
+Non-temporal access is useful for scans, one-shot result buffers, COPY
+staging, decompression output, and cold fragment probes. These should avoid
+polluting scarce HBM or hot host DRAM unless they are explicitly promoted by
+observed reuse. Conversely, point-lookup keys, route descriptors, and
+popular resident fragments should use temporal admission with hotness
+tracked at a DB object or segment granularity.
+
+Active remote components map to future storage-side or fabric-side pruning.
+For cold or remote tiers, it may be cheaper to run simple filtering,
+aggregation, decompression, or pointer traversal near the data than to pull
+full fragments into HBM. GPU DB should expose such offload as an optional
+route with deterministic eligibility and fallback, not as a hidden memory
+manager decision.
+
+The scheduler/evacuator co-design maps to memory-pressure admission. When
+resident memory is tight, the runtime should prioritize workers that release
+snapshot/descriptor scopes, then eviction/refresh work, then new allocation
+or promotion. Otherwise high session concurrency can starve cleanup and
+turn a temporary HBM/DRAM spike into admission failure.
+
+**Risks and mismatches:** AIFM is not a DBMS. It does not define SQL
+visibility, WAL-before-visibility, crash recovery, MVCC retention, DDL,
+secondary indexes, replication, or GPU kernel execution. Its far-memory
+objects are private to one compute server and one remote memory server, not
+shared transactional database pages.
+
+The paper assumes application/data-structure developers can obey
+`DerefScope` lifetime rules. GPU DB should not rely on arbitrary unsafe raw
+pointer discipline across query operators; it needs typed handles, guard
+objects, or compiler-enforced lifetimes for route and snapshot protection.
+
+AIFM's active remote components are simple and workload-specific. Moving
+SQL logic near cold storage can quickly become a second execution engine
+with different semantics. Any remote-side filtering or aggregation must
+carry the same predicate, encoding, null, collation, visibility, and
+snapshot rules as the CPU/GPU path.
+
+The evaluation uses web, DataFrame, hash-table, array, and Snappy
+workloads, not OLTP transactions, WAL, MVCC, pgwire fan-in, GPU HBM, NVMe
+plus object storage, or multi-tenant query admission. The reported speedups
+are strong evidence against page-level transparency, not direct proof of a
+database tier policy.
+
+Object-granular remoting can add metadata overhead. GPU DB segments are
+often larger and columnar; a per-row remoteable-pointer scheme would be too
+expensive. The right granularity is likely route descriptor, segment,
+column chunk, key-vector block, text arena block, or temporary buffer slab.
+
+**Benchmark candidates:**
+
+- Build a tier-placement simulator for P8 objects: resident column chunks,
+  key vectors, route descriptors, text arenas, temp result buffers, and COPY
+  staging slabs. Compare page-like LRU, segment-aware CLOCK, semantic
+  hotness, and non-temporal policies. Measure HBM/DRAM hit rate, transfer
+  bytes, p99 query latency, and polluted-hot-fragment evictions.
+- Add explicit protection scopes around route descriptor and resident
+  segment access. Gate: eviction or demotion cannot reclaim a handle while
+  an active read/GPU worker holds the scope, and parked sessions hold only
+  logical generation ids.
+- Prototype evacuation handlers for resident segment eviction. Gate: every
+  eviction updates planner route eligibility, fallback reason, invalidation
+  generation, and telemetry before new reads can choose the stale resident
+  route.
+- Benchmark non-temporal read paths for one-shot scans, result buffers, and
+  COPY/decompression staging against temporal admission. Failure condition:
+  scan-heavy traffic evicts hot point-lookup fragments or route metadata
+  from HBM/DRAM.
+- Test prefetch policies for retained reads: sequential segment prefetch,
+  strided column-chunk prefetch, key-vector micro-batch prefetch, and no
+  prefetch. Measure queue wait, transfer overlap, false prefetch bytes, and
+  p50/p99 under mixed OLTP reads and analytical scans.
+- Add a storage-side/far-tier offload microbenchmark for cold fragments:
+  remote filter, remote aggregate, remote decompression, and full fetch to
+  GPU. Gate: offload is used only when encoding, visibility boundary, and
+  predicate semantics are identical to the local execution path.
+- Stress memory-pressure scheduling with 1M logical sessions and bounded
+  active workers. Compare FIFO, cleanup-priority, scope-release-priority,
+  and admission-throttled policies. Failure condition: new work starves
+  eviction/retirement and causes unbounded resident metadata or pinned-buffer
+  growth.
+
+### 2026-06-07 - Cross-paper synthesis: tier movement needs semantic guards
+
+Falcon, WFE, and AIFM converge on a useful memory-management split for GPU
+DB. Falcon says durability domains and media-write shaping are separate
+contracts. WFE says retired descriptor memory needs bounded protection tied
+to active workers, not logical session count. AIFM says tier movement should
+see object semantics, access scopes, and cleanup handlers rather than
+pretending everything is a page.
+
+The design track is semantic tier movement under explicit guards. Each
+resident or warm object should carry three related but distinct records:
+durability/visibility boundary, protection/retirement state, and placement
+policy. A route is eligible only when all three agree: the data is correct
+for the requested snapshot, cannot be reclaimed during execution, and is in
+the intended tier or has an admitted fetch/offload path.
+
+The category gap is now less about whether explicit tiering matters and
+more about measuring the first implementation granularity. The next
+high-value papers should favor concrete GPU execution batching, OLTP write
+admission under hot keys, MVCC garbage collection under long readers, or
+modern cache-placement policies that produce directly testable thresholds.
+
+Benchmark priority: build one integrated pressure test where writes,
+retained reads, resident refresh, descriptor retirement, and tier eviction
+run together. Report not just throughput, but stale-route rejections,
+durability boundary lag, protected-object count, unreclaimed bytes,
+promotion/demotion bytes, offload/fetch decisions, and p99 latency under
+memory pressure.
