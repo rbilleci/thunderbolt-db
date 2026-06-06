@@ -474,12 +474,26 @@ Append new candidates here as each paper is processed.
   for comparing learned query optimization under workload, data, and schema
   shifts with GPU DB's deterministic route eligibility and adaptive route
   scoring.
-- `queued` — **LEON: A New Framework for ML-Aided Query Optimization**,
+- `reviewed` — **LEON: A New Framework for ML-Aided Query Optimization**,
   Chen et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2261-chen.pdf`
   Why: LIMAO cites LEON among learned optimizer systems that adapt to changing
   data; useful for comparing learned plan search or cost feedback against
-  modular lifelong route-cost learning.
+  modular lifelong route-cost learning. Journal entry added 2026-06-06.
+- `queued` — **Eraser: Eliminating Performance Regression on Learned Query
+  Optimizer**, Weng et al., PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p926-weng.pdf`
+  DOI: `https://doi.org/10.14778/3641204.3641218`
+  Why: LEON emphasizes stability and bounded regression for ML-aided
+  optimizers; Eraser is a modern follow-up for checking guardrails,
+  regression detection, and fallback strategies before GPU DB trusts learned
+  route scoring in production.
+- `queued` — **RankPQO: Learning-to-Rank for Parametric Query Optimization**,
+  Mo et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p863-mo.pdf`
+  Why: LEON's pairwise ranking objective is relevant to repeated same-shape
+  routes; RankPQO may inform parameter-sensitive plan or route caching for
+  pgwire prepared statements, retained lookups, and GPU/CPU fallback choices.
 - `queued` — **Adaptive Concurrent Query Execution Framework for an
   Analytical In-Memory Database System**, Deshmukh, Memisoglu, and Patel,
   IEEE BigData Congress 2017.

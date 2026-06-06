@@ -38,6 +38,164 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - LEON keeps learned route choice behind an expert optimizer
+
+**Citation:** Xu Chen, Haitian Chen, Zibo Liang, Shuncheng Liu,
+Jinghong Wang, Kai Zeng, Han Su, and Kai Zheng. "LEON: A New
+Framework for ML-Aided Query Optimization." PVLDB 16(9),
+2261-2273, 2023. DOI: `10.14778/3598581.3598597`. Retrieved
+2026-06-06 from the PVLDB PDF:
+`https://www.vldb.org/pvldb/vol16/p2261-chen.pdf`.
+
+**Category:** query optimization / planning, with secondary relevance
+to route choice, learned cost calibration, exploration safety, and
+runtime adaptation.
+
+**Relevance tags:** LEON; ML-aided optimizer; expert optimizer;
+learning-to-rank; contextual pairwise ranking; uncertainty-guided
+exploration; mixed cost model; ML-guided pruning; GaussDB(DWS);
+PostgreSQL; Bao; Balsa; dynamic workload.
+
+**Core idea:** LEON argues that machine learning should aid a mature
+query optimizer instead of replacing its algebraic rewrite rules,
+enumeration machinery, and robust baseline cost model. It keeps the
+traditional optimizer as the plan-enumeration and fallback authority,
+then uses an ML model to calibrate cost/ranking decisions for the
+particular deployment and workload.
+
+For GPU DB, the strongest transferable idea is to put learned route
+choice behind explicit route eligibility and deterministic fallback.
+A model can help rank CPU, retained CPU snapshot, resident GPU, cold
+transfer, and background refresh routes, but it should not own the
+validity rules for MVCC boundaries, resident-generation compatibility,
+WAL-before-visibility, buffer credits, or overload outcomes.
+
+**Concrete mechanisms:**
+
+- LEON preserves the expert optimizer's transformation rules,
+  equivalent-set search, and dynamic-programming plan enumeration.
+  The learned component changes the cost/ranking signal used during
+  search rather than generating plans from scratch.
+- The paper frames query optimization as a ranking problem instead of
+  an absolute latency regression problem. Candidate plans only need to
+  be ordered correctly within the same equivalent set and physical
+  property context.
+- LEON uses a mixed cost model: the expert cost model supplies the
+  baseline, while the ML model calibrates erroneous estimates from
+  execution history or query logs. If the learned component is weak,
+  the expert optimizer remains a lower-bound fallback.
+- The learning objective is contextual pairwise ranking. Training
+  compares plans within the optimizer's own equivalent-set context
+  rather than trying to predict globally comparable plan runtimes.
+- Exploration is constrained by top-k ranking and model uncertainty.
+  Higher-ranked plans are more likely to be explored, and uncertain
+  calibrations are used to find plans whose execution feedback is most
+  useful for correcting optimizer mistakes.
+- LEON also uses ML-guided pruning during dynamic-programming search.
+  The model can prune redundant subplans that are unlikely to lead to
+  good complete plans, improving planning efficiency while keeping the
+  optimizer's rule/search framework.
+- The implementation integrates into PostgreSQL for experiments and
+  is also reported as integrated into GaussDB(DWS). The artifact link
+  in the PVLDB paper is `https://github.com/haitianchen/LEON`.
+- Evaluation uses JOB, JOB-EXT, STACK, and TPC-H style workloads and
+  compares against PostgreSQL, Bao, and Balsa. The paper reports that
+  LEON outperforms the expert DBMS after about three hours of training,
+  around a 2x training-efficiency improvement compared with a SOTA
+  RL-based optimizer, and about 8x less performance deterioration than
+  other learning-based methods in its reported stability comparison.
+- In dynamic-workload experiments, LEON's mixed cost model is reported
+  to recover more robustly than Bao because the expert model remains a
+  stable anchor when workload patterns shift.
+- The paper acknowledges optimization-time overhead: LEON takes longer
+  than PostgreSQL to optimize because it modifies PostgreSQL estimation
+  and invokes additional learned-model computation.
+
+**GPU DB mapping:** GPU DB should treat route selection like LEON
+treats plan search: rules and invariants first, learned calibration
+second. The deterministic planner should enumerate only semantically
+valid route families: owner-mediated mutation, retained CPU snapshot,
+resident GPU snapshot, cold-tier transfer, CPU fallback, overload, or
+background refresh. A learned scorer can then rank valid choices using
+measured latency, queue wait, resident bytes, transfer bytes,
+invalidation risk, and route failure history.
+
+The equivalent-set idea maps to route families. A resident GPU scan
+and CPU snapshot scan can compete only when they share the same SQL
+semantics, visibility boundary, snapshot generation, and output shape.
+Comparing routes outside that context risks teaching the model that a
+fast stale route is better than a correct slower one.
+
+LEON's uncertainty-guided exploration maps to benchmark-safe route
+probing. Exploration should happen under explicit budgets: shadow
+route timing, low-priority duplicate execution, or small traffic
+fractions. It must never explore a route that lacks a residency proof,
+MVCC proof, WAL/invalidation proof, or response-buffer budget.
+
+ML-guided pruning maps to planner and scheduler pressure. The GPU DB
+planner can use a learned or calibrated signal to avoid expanding route
+variants that have repeatedly lost, but the pruning decision should be
+auditable and reversible. For early P8 work, deterministic telemetry
+and simple ranking may be enough before any model is added.
+
+The expert-baseline principle also applies to 1M-session runtime
+admission. Learned scoring can tune thresholds, but the runtime needs
+typed rejection and fallback rules that remain correct when training
+data is sparse, workloads shift, or the model is disabled.
+
+**Risks and mismatches:** LEON is a learned query optimizer, not a GPU
+database runtime or transaction-processing design. It does not solve
+MVCC visibility, WAL ordering, resident cache invalidation, GPU
+kernel scheduling, pgwire fan-in, or cold-tier recovery.
+
+Its experiments are query-optimization benchmarks, not high-update
+OLTP workloads with resident GPU state. The reported speedups and
+stability claims should be treated as evidence for the ML-aided design
+pattern, not as expected GPU DB gains.
+
+Optimization-time overhead matters. A planner that invokes a learned
+model per request may hurt p50 latency unless route shapes are cached,
+same-shape requests are batched, or model evaluation is moved out of
+the hottest path.
+
+Exploration is dangerous in a database with strict visibility and
+durability rules. GPU DB should restrict exploration to valid
+alternate routes, shadow measurements, or benchmark modes until route
+publication and recovery proofs are mature.
+
+The paper's details about the exact model architecture are less
+important for GPU DB than the integration boundary. The unknown for
+this project is whether a learned route scorer beats deterministic
+telemetry thresholds once GPU transfer, residency, and queue-pressure
+signals are available.
+
+**Benchmark candidates:**
+
+- Build a route-ranking harness with an expert baseline and optional
+  learned/calibrated score. Route candidates must carry proof fields:
+  snapshot generation, visibility boundary, resident generation,
+  transfer bytes, queue depth, buffer credits, and fallback outcome.
+- Compare absolute-latency regression with pairwise route ranking for
+  CPU snapshot versus resident GPU versus cold-transfer routes. Gate:
+  learned ranking cannot select an invalid or stale route even if its
+  predicted latency is lower.
+- Add uncertainty-budgeted route exploration in benchmark mode:
+  execute a small fraction of valid alternate routes as shadows and
+  record observed latency without affecting user results. Failure
+  condition: exploration consumes GPU/pinned-buffer credits needed by
+  foreground admitted work.
+- Test ML-guided pruning against deterministic thresholds for route
+  enumeration. Required metrics: planning time, p50/p99 query latency,
+  fallback rate, stale-generation rejection, and regret against the
+  best measured valid route.
+- Add a dynamic workload route-choice benchmark where resident data
+  becomes invalidated, queues saturate, and cold-tier reads spike.
+  Gate: learned calibration recovers without worse p99 regression than
+  the expert baseline.
+- Cache learned decisions by route shape and snapshot/residency class.
+  Failure condition: model-evaluation overhead dominates point lookup
+  latency or causes measurable queue buildup under high session fan-in.
+
 ### 2026-06-06 - NV-HALT makes persistence a fine-grained visibility lock
 
 **Citation:** Gaetano Coccimiglio, Trevor Brown, and Srivatsan
