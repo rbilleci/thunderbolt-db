@@ -1277,11 +1277,12 @@ Append new candidates here as each paper is processed.
   lock-free range queries and memory reclamation; useful for checking whether
   retained route metadata can avoid blocking reclamation while preserving
   linearizable/range-snapshot semantics.
-- `queued` — **VBR: Version Based Reclamation**, Sheffi et al., arXiv 2021.
+- `reviewed` — **VBR: Version Based Reclamation**, Sheffi et al., arXiv 2021.
   URL: `https://arxiv.org/abs/2107.13843`
   Why: optimistic memory reclamation scheme related to EBR/hazard-pointer
   tradeoffs; useful for deciding whether route metadata and resident-index
-  descriptors can reclaim aggressively without global epoch stalls.
+  descriptors can reclaim aggressively without global epoch stalls. Reviewed
+  on 2026-06-06 using the arXiv PDF.
 - `queued` — **Predicting and reining in application-level slowdown on
   spatial multitasking GPUs**, Wei et al., JPDC 2020.
   URL: `https://doi.org/10.1016/j.jpdc.2020.03.009`
@@ -5870,3 +5871,19 @@ Append new candidates here as each paper is processed.
   repair a first-class index concern; REWIND is a primary follow-up for
   comparing write-ahead recovery schemes for persistent data structures before
   GPU DB stores durable route metadata or future-tier indexes.
+- `queued` — **NBR: Neutralization Based Reclamation**, Singh et al.,
+  PPoPP 2021.
+  URL: `https://doi.org/10.1145/3437801.3441614`
+  arXiv: `https://arxiv.org/abs/2012.14542`
+  Why: VBR compares against signaling-based robust reclamation; useful for
+  deciding whether route metadata and CPU-side resident indexes should use
+  cooperative optimistic retries, neutralization of stalled workers, or a
+  simpler epoch contract under 1M-session pressure.
+- `queued` — **Snapshot-Free, Transparent, and Robust Memory Reclamation for
+  Lock-Free Data Structures**, Nikolaev and Ravindran, PLDI 2019.
+  URL: `https://doi.org/10.1145/3314221.3314610`
+  arXiv: `https://arxiv.org/abs/1905.07903`
+  Why: VBR contrasts reclamation designs by robustness, transparency, and
+  fence overhead; Hyaline-style snapshot-free reclamation is a useful
+  follow-up for route-publication descriptors and lock-free CPU indexes that
+  should avoid pinning retired state behind long readers.

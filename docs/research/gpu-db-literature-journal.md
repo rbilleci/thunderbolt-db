@@ -75442,3 +75442,145 @@ visibility contract.
 - If CXL/NVM hardware is added later, compare volatile-route plus
   persistent-leaf indexes against fully persistent route trees under
   TATP-like point lookups, range scans, updates, and restart gates.
+
+### 2026-06-06 - VBR reclaims route metadata by validating versions instead of waiting on readers
+
+**Citation:** Gali Sheffi, Maurice Herlihy, and Erez Petrank. "VBR:
+Version Based Reclamation." DISC 2021 / arXiv:2107.13843. Retrieved
+2026-06-06 from `https://arxiv.org/pdf/2107.13843`.
+
+**Category:** runtime / HFT / session scale, with MVCC / snapshot /
+visibility relevance.
+
+**Relevance tags:** lock-free memory reclamation; optimistic
+reclamation; versioned fields; birth epoch; retire epoch; ABA
+avoidance; wide CAS; type-preserving allocator; checkpoint rollback;
+descriptor reuse; route metadata reclamation; resident-index retirement.
+
+**Core idea:** VBR attacks the classic memory-reclamation tension:
+epoch-based reclamation is fast but can retain unbounded garbage behind
+a stalled thread, while hazard-pointer-style schemes are robust but pay
+per-dereference publication and fence costs. VBR's answer is fully
+optimistic reclamation. Retired nodes may be recycled quickly, and
+readers/writers validate that recycled memory did not affect semantics
+by observing global epoch changes and per-field versions.
+
+The paper's transferable lesson is not "use this exact data-structure
+library." It is that reclamation metadata can move from a conservative
+"all readers must leave" contract to a local proof carried by each
+object and mutable field. For GPU DB, that is directly relevant to
+route descriptors, resident index fragments, bitmap-delta fragments,
+and old snapshot metadata that should not stay pinned forever because a
+logical session stalled.
+
+**Concrete mechanisms:**
+
+- Every node carries a birth epoch and retire epoch. Allocation ensures
+  the new birth epoch is strictly greater than the previous retire epoch
+  for the same memory, so an ABA reuse can be detected by epoch/version
+  checks.
+- Each mutable field has an adjacent version. Field updates use a wide
+  CAS over value plus version, and the new version is derived from the
+  relevant node birth epochs. A stale CAS that would otherwise succeed
+  after memory reuse fails because the version no longer matches.
+- Threads keep a local copy of the global epoch. After selected shared
+  reads, they compare against the global epoch; if it changed, the read
+  may have observed recycled memory and execution rolls back to the last
+  checkpoint.
+- Checkpoints are placed at operation starts and after rollback-unsafe
+  successful updates. Failed reads or writes caused by reclamation
+  validation return control to a known restart point rather than adding
+  ad hoc recovery to every call site.
+- The allocator is user-level and type-preserving. Retired nodes move
+  through local retired lists, local pools, and a shared pool, delaying
+  reuse enough to keep global epoch increments infrequent while still
+  avoiding unbounded waiting for stalled threads.
+- The implementation assumes CAS-only updates, invalidation of mutable
+  fields before retirement, one retirement per node, no relinking after
+  final retirement, and data-structure code that can tolerate rollback
+  at the defined checkpoints.
+- Evaluation uses lock-free linked lists, hash tables, and skiplists on
+  a 64-thread AMD Opteron machine, comparing against no reclamation,
+  EBR, hazard pointers, hazard eras, and interval-based reclamation.
+  The paper reports VBR beating the best reclamation competitor by up to
+  60% on hash-table search-heavy workloads, up to 35% on update-heavy
+  skiplists, and smaller but positive margins on linked-list workloads.
+
+**GPU DB mapping:** VBR fits the high-throughput runtime's need for
+bounded hot-path metadata. A pgwire session, read snapshot worker, or
+GPU execution owner should not be able to pin retired route descriptors,
+resident key-vector fragments, or bitmap-delta fragments indefinitely
+just because it stopped after loading a pointer. A versioned descriptor
+layout could let owners recycle memory while readers validate that the
+descriptor identity and generation they observed are still the same.
+
+For P8, the same pattern suggests version-tagged publication records for
+resident routes: table identity, route shape, snapshot generation,
+buffer handles, and invalidation generation should be read with a
+descriptor version. If a refresh, eviction, or DDL publication retires
+and reuses that descriptor while a reader is preparing a retained route,
+the reader should detect the version change and restart route selection
+instead of relying on a stale handle.
+
+The global-epoch side of VBR maps less directly to SQL snapshot
+visibility, but it is useful as a physical-memory generation. SQL
+visibility remains WAL/MVCC-owned; physical reclamation can use a
+separate route-memory epoch that advances when descriptor pools or
+resident-fragment pools are reused. A read can then distinguish "my SQL
+snapshot is still valid" from "the physical route metadata I touched was
+recycled and must be reacquired."
+
+Checkpoint rollback also maps naturally to the runtime boundary. A
+retained read route can make descriptor validation failures restart
+before enqueue, before GPU launch, or before response publication. The
+rollback target should be explicit in the route-selection state machine,
+not hidden in arbitrary CUDA or response-writing code.
+
+**Risks and mismatches:** VBR is a concurrent data-structure memory
+reclamation paper, not a database storage or MVCC paper. It does not
+solve SQL snapshot isolation, WAL replay, multi-index consistency,
+resident GPU buffer lifetimes, CUDA stream synchronization, or NVMe/CXL
+tier movement.
+
+The assumptions are restrictive. VBR needs type-preserving allocation,
+wide CAS over value plus version, CAS-only updates, mutable-field
+invalidation before retire, and data-structure operations that can be
+rolled back at defined checkpoints. Rust ownership, CUDA device memory,
+driver handles, OS file mappings, and mixed-size route records will not
+all fit that model directly. Weakly ordered CPUs also require extra load
+ordering, and the evaluation hardware is old CPU-only infrastructure.
+
+For GPU DB, the main risk is confusing physical reclamation epochs with
+logical visibility epochs. Reusing a route descriptor safely does not
+prove that a tuple, predicate mask, or index entry is visible at a SQL
+snapshot. The benchmark gate must preserve separate correctness proofs:
+WAL/MVCC visibility first, physical descriptor freshness second.
+
+**Benchmark candidates:**
+
+- Prototype a version-tagged route descriptor pool for retained read
+  routes. Gate: if a descriptor is retired and reused between route
+  lookup and enqueue, the reader detects the version change and restarts
+  without using stale GPU handles.
+- Compare descriptor reclamation policies under 1M logical-session
+  simulation: classic epoch pinning, hazard-pointer-style protection,
+  VBR-style version validation, and owner-ring generation reuse. Measure
+  allocations, retained bytes, p99 route-selection latency, restart
+  count, and owner contention.
+- Add a stalled-reader test: pause a reader after loading a route
+  descriptor, then refresh/evict/reuse that descriptor many times.
+  Failure condition: retired route metadata grows without bound or the
+  reader can enqueue work against a stale resident buffer.
+- Split SQL snapshot generation from physical reclamation generation in
+  a test-only route certificate. Gate: changing the physical generation
+  forces route reacquisition, while an unchanged SQL snapshot still
+  returns the same visible rows after reacquisition.
+- Benchmark checkpoint placement for retained route selection: restart
+  before owner enqueue, before GPU launch, and before response publish.
+  Measure wasted CPU work, wasted GPU launches, correctness failures,
+  and p50/p99 latency under refresh churn.
+- Test whether wide-version fields are practical in the local Rust hot
+  path. Compare packed atomic pointer+version, separate atomics with
+  validation, and owner-serialized descriptor slots. Failure condition:
+  version validation costs more than simpler owner-ring generation reuse
+  at the target queue depth.
