@@ -756,13 +756,14 @@ Append new candidates here as each paper is processed.
   virtual file-system layer; useful as a contrast point for DB-owned NVMe
   caches, remote object layout, and local-access abstraction choices. Journal
   entry added 2026-06-06 from arXiv v2.
-- `queued` — **CloudCast: High-Throughput, Cost-Aware Overlay Multicast in the
+- `reviewed` — **CloudCast: High-Throughput, Cost-Aware Overlay Multicast in the
   Cloud**, Wooders et al., NSDI 2024.
   URL: `https://www.usenix.org/conference/nsdi24/presentation/wooders`
   Why: SkyStore builds on the Skyplane/SkyPilot cloud-placement ecosystem and
   cites CloudCast for cost-aware cloud overlays; useful for comparing
   multi-destination cold-tier replication, route fanout, transfer throughput,
   and cost-aware object movement before GPU DB adopts remote object tiers.
+  Journal entry added 2026-06-06 from the USENIX page and PDF.
 - `queued` — **Skyplane: Optimizing Transfer Cost and Throughput Using
   Cloud-Aware Overlays**, Jain et al., NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/jain`
@@ -771,6 +772,12 @@ Append new candidates here as each paper is processed.
   evaluating whether cold-tier promotion should use direct object reads,
   staged transfer, or overlay routing when future GPU DB deployments span
   regions, object stores, or disaggregated storage pools.
+- `queued` — **BDS: A Centralized Near-Optimal Overlay Network for
+  Inter-Datacenter Data Replication**, Zhang et al., EuroSys 2018.
+  URL: `https://doi.org/10.1145/3190508.3190532`
+  Why: Cloudcast cites BDS as a bandwidth-oriented inter-datacenter overlay
+  replication baseline; useful for comparing throughput-first overlay routing
+  with GPU DB's future cost/freshness-aware cold-tier and replica movement.
 
 ### WAL, logging, and read/write throughput
 

@@ -38,6 +38,156 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Cloudcast turns cold-tier replication into an explicit cost, time, and stripe-routing optimization
+
+**Citation:** Sarah Wooders, Shu Liu, Paras Jain, Xiangxi Mo,
+Joseph E. Gonzalez, Vincent Liu, and Ion Stoica. "Cloudcast:
+High-Throughput, Cost-Aware Overlay Multicast in the Cloud." NSDI
+2024, pages 281-296. Retrieved 2026-06-06 from the USENIX paper page
+and PDF at `https://www.usenix.org/conference/nsdi24/presentation/wooders`
+and `https://www.usenix.org/system/files/nsdi24-wooders.pdf`.
+
+**Category:** multi-tier cache / data placement and database
+file-system/storage, with secondary relevance to cold-tier replication,
+geo placement, and future object-store/NVMe archive movement.
+
+**Relevance tags:** cloud multicast; object replication; cold-tier
+placement; egress cost; replication SLO; overlay routing; waypoint
+regions; striping; VM parallelism; transfer profiling; cost-throughput
+Pareto frontier; disaster recovery; multi-region storage.
+
+**Core idea:** Cloudcast studies bulk data replication across cloud
+regions and providers where the goal is not simply maximum bandwidth.
+The optimizer chooses overlay waypoint regions, VM parallelism, and
+stripe-level replication trees to minimize monetary transfer cost while
+meeting a user-specified replication-time budget. It is useful for GPU
+DB because future cold tiers will not be a single anonymous "disk" once
+archives, replicas, object stores, remote pools, or region-aware
+placement enter the design.
+
+The strongest transferable idea is to make cold-tier movement an
+optimizer-visible route choice with explicit inputs: data size,
+freshness/SLO budget, per-link throughput, per-link cost, compute cost,
+and legal placement targets. GPU DB should not hide archive refresh,
+replica fanout, or remote warmup behind one background copy queue.
+
+**Concrete mechanisms:**
+
+- Cloudcast frames replication as constructing an overlay network:
+  choose cloud VM nodes, choose directed paths between nodes, then
+  assign data stripes to one or more replication trees.
+- The objective is cost minimization under a replication-time constraint.
+  Costs include per-GB egress fees and temporary VM resources; the time
+  budget represents freshness or disaster-recovery SLOs.
+- The paper observes that per-GB egress pricing makes the problem
+  different from classical bandwidth-allocation multicast. Data volume,
+  not only allocated bandwidth, must be part of the optimization.
+- The optimizer uses measured cross-region throughput and provider price
+  matrices. In the profiled environment, region-pair prices can differ
+  by up to 23x and observed throughput by up to 202x; provider VM egress
+  limits can make a single source region the bottleneck.
+- Waypoint regions are allowed even when they are neither the source nor
+  a final destination. A waypoint can reduce expensive cross-cloud
+  transfers, offload source egress, or route around slow links.
+- Data is split into stripes so different fractions of the object can use
+  different replication paths. The appendix reports that too few stripes
+  can make a time-constrained solution infeasible or expensive, while too
+  many stripes add solver overhead; the paper uses 8 to 16 stripes in the
+  experiments.
+- The full formulation is a mixed-integer linear program over stripe path
+  indicators, VM counts per region, and flow-feasibility variables. The
+  authors introduce approximations, including node sub-selection and path
+  length limits, to reduce solve time from hours to seconds.
+- Cloudcast is implemented as a centralized control plane with pluggable
+  tree-selection algorithms. It provisions overlay nodes and drives bulk
+  data transfer across AWS, Azure, and GCP.
+- The evaluation reports up to 61.5% cost reduction and 2.3x replication
+  speedup versus AWS multi-region bucket replication, and 7.7x speedup
+  with 28.4% cost savings versus BitTorrent in the tested end-to-end
+  setup. The USENIX page summarizes 61.5% cost reduction and 2.3x
+  speedup against academic and commercial baselines.
+
+**GPU DB mapping:** GPU DB's cold path should model transfer route
+selection the same way it models CPU/GPU execution route selection. A
+future table archive, checkpoint, segment replica, or cold resident
+snapshot should carry a movement certificate: source tier, target tier,
+bytes, required freshness boundary, allowed destinations, observed
+throughput, expected cost, and the chosen route.
+
+The stripe idea maps naturally to P8 segment placement. Large resident
+or cold-tier objects should be divisible into segment stripes with
+independent routes: some stripes can be promoted to local NVMe or DRAM,
+some can remain in object storage, and some can be fanned out to another
+region or replica. The route certificate must still prove that all
+stripes correspond to the same relation id, schema generation, WAL
+boundary, and visibility boundary before a query can treat them as one
+snapshot.
+
+Cloudcast's waypoint concept maps to future staging tiers. A cheapest
+and fastest path to HBM may not be object-store-to-GPU directly. It may
+be object store to local NVMe, local NVMe to pinned host memory, then
+host memory to HBM, or remote object store to regional warm cache before
+serving many readers. Each waypoint should have a measured cost,
+throughput, queue depth, and failure mode.
+
+The time-budgeted optimization maps to admission and refresh. For cold
+partitions, the planner should distinguish "serve now from CPU/cold
+path," "promote within N milliseconds and then use GPU," and "reject or
+defer because freshness or cost budget cannot be met." That is a better
+contract than a binary resident/not-resident flag.
+
+The control-plane shape also matters. Cold-tier placement decisions can
+be centralized and slower than transaction commit, but they must publish
+immutable metadata into the hot route path. The hot query path should
+consume a compact placement certificate, not rerun a global overlay
+optimization while a client waits.
+
+**Risks and mismatches:** Cloudcast is a bulk cloud data-transfer system,
+not a database storage engine. It does not define SQL semantics, WAL,
+MVCC visibility, snapshot invalidation, GPU memory residency, indexes, or
+query planning.
+
+The paper optimizes large transfers where seconds-level planning and
+runtime budgets can be acceptable. GPU DB's p50/p99 query routes need
+precomputed placement metadata and fast fallback; only background
+promotion, replica warmup, backup, and large cold scans can afford this
+style of solver work.
+
+Cost models based on cloud egress prices and VM throughput may not map to
+local NVMe, CXL, or in-rack disaggregated memory. GPU DB should preserve
+the abstraction of cost/time/throughput constraints, but plug in local
+measurements for each tier.
+
+Cloudcast can split data into stripes for transfer efficiency. A database
+cannot expose a partially moved snapshot unless all required stripes meet
+the same visibility and schema contract, or the planner explicitly routes
+around missing stripes.
+
+**Benchmark candidates:**
+
+- Build a cold-tier movement simulator with source tier, destination
+  tier, segment stripes, per-link throughput, per-link cost, queue depth,
+  and freshness budget. Compare direct copy, cheapest path, fastest path,
+  and Cloudcast-style cost-under-time-budget routing.
+- Add a P8 segment-stripe route-certificate benchmark. Gate: a query can
+  only combine stripes when relation id, schema generation, WAL boundary,
+  visibility boundary, encoding, and checksum lineage agree.
+- Prototype background promotion policies: promote whole segment, promote
+  hot stripes only, promote via local NVMe waypoint, or serve from cold
+  CPU path. Measure route latency, bytes moved, HBM/DRAM/NVMe pressure,
+  and failed freshness budgets.
+- Add a cold-replica fanout benchmark for checkpoints or archive
+  manifests. Required outputs: completion time, bytes per tier, transfer
+  cost proxy, p99 impact on foreground WAL/query work, and recovery
+  usefulness of the resulting copies.
+- Test stale or partial movement failure modes. Failure condition: a route
+  uses a partially promoted object as if it were a complete snapshot, or a
+  cheaper waypoint bypasses WAL-before-visibility and invalidation
+  metadata.
+- Add a placement Pareto report to future tier benchmarks: for each policy,
+  show cost proxy versus freshness latency versus foreground p99 impact,
+  not just raw throughput.
+
 ### 2026-06-06 - Xenic puts transaction protocol state on the network edge
 
 **Citation:** Henry N. Schuh, Weihao Liang, Ming Liu, Jacob Nelson,
