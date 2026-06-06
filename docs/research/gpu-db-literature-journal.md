@@ -89955,3 +89955,188 @@ Benchmark priorities:
 - run a cold-tier read chunking harness before GPU kernels are added;
 - define pass/fail SLOs for speculative work under incast and memory
   pressure.
+
+### 2026-06-06 - Quickstep turns query plans into schedulable block work orders
+
+**Citation:** Jignesh M. Patel, Harshad Deshmukh, Jianqiao Zhu,
+Navneet Potti, Zuyu Zhang, Marc Spehlmann, Hakan Memisoglu, and
+Saket Saurabh. "Quickstep: A Data Platform Based on the Scaling-Up
+Approach." PVLDB 11(6), 663-676, 2018. DOI:
+`10.14778/3184470.3184471`. Retrieved 2026-06-06 from the PVLDB PDF:
+`https://www.vldb.org/pvldb/vol11/p663-patel.pdf`.
+
+**Category:** query optimization / planning, with runtime scheduling,
+block storage layout, cache-conscious execution, and route-fragment
+telemetry relevance.
+
+**Relevance tags:** Quickstep; scale-up DBMS; work orders; block-level
+parallelism; mini database blocks; policy enforcer; probabilistic
+scheduler; query suspension; compressed column store; ValueAccessor;
+template metaprogramming; lookahead information passing; exact filters;
+priority scheduling; cold buffer pool.
+
+**Core idea:** Quickstep treats a single large server as a parallel
+data-processing platform by making storage blocks and execution work
+orders the central scheduling unit. A query plan is a DAG of relational
+operators, but execution proceeds by generating independent block-level
+work orders that a policy-driven scheduler can allocate, pause, and
+resume across concurrent queries.
+
+For GPU DB, the strongest transferable idea is to make planner output
+more schedulable. Instead of a retained read route becoming one opaque
+kernel launch or one owner message, a route should lower into bounded
+work fragments with explicit block/segment identity, buffer needs,
+snapshot generation, priority, and compatibility metadata. That gives
+the runtime a place to batch, preempt, fall back, or reuse resident
+work without violating MVCC or WAL ordering.
+
+**Concrete mechanisms:**
+
+- Quickstep's storage manager divides each table into large multi-MB
+  blocks. The default block size is 2 MiB, and blocks are aligned with
+  large virtual-memory pages when available to improve TLB behavior.
+- Each block contains a small self-description header, one tuple-storage
+  sub-block, and zero or more index sub-blocks in contiguous memory.
+  Row-store and column-store layouts can coexist, including compressed
+  variants.
+- Compression is type-specific and per-block. Dictionary compression
+  uses order-preserving integer codes, while numeric values can use
+  leading-zero truncation. The system chooses compression per attribute
+  and block.
+- Operators access different layouts through `ValueAccessor` objects and
+  short functors, using C++ template metaprogramming to avoid virtual
+  dispatch in hot expression and operator loops. The paper argues this
+  produces compact loops amenable to prefetching, SIMD auto-vectorization,
+  and future data-parallel mapping.
+- The optimizer produces a physical plan DAG. The execution layer turns
+  operators into work orders, commonly at block granularity, so the
+  scheduler can dispatch independent units to worker threads.
+- Hash joins split build and probe phases. The build phase constructs one
+  cache-efficient in-memory hash table from build-relation blocks; probe
+  work orders scan probe blocks and materialize output blocks. The
+  implementation uses latch-free concurrent hash tables.
+- Aggregation without `GROUP BY` computes local block-level aggregates and
+  merges them. Grouped aggregation uses a global latch-free hash table of
+  aggregate handles. Sort/top-k use a two-phase per-block sort followed by
+  merge.
+- The scheduler separates policy from mechanism. A policy enforcer assigns
+  each active query a probability of being chosen for the next scheduling
+  decision, allowing priority and resource-allocation policies to change
+  while the work-order mechanism stays generic.
+- Quickstep's "drop early, drop fast" path includes predicate pushdown,
+  over-approximation for complex disjunctive predicates, exact filters,
+  and lookahead information passing across primary-key/foreign-key joins.
+  In SSB experiments, exact filters plus LIP produce at least 50% speedup
+  on 8 of 13 queries and more than 3x on the most complex query group.
+- In the elasticity experiment on SSB scale factor 100 with a cold buffer
+  pool, 11 equal-priority queries run concurrently. When high-priority
+  queries arrive, the scheduler quickly stops scheduling lower-priority
+  work orders, gives CPU to the high-priority query, then resumes lower
+  priority work after completion. The paper highlights this as dynamic
+  adaptation and natural query suspension.
+- End-to-end evaluation compares Quickstep with Spark, PostgreSQL,
+  MonetDB, and VectorWise; the paper reports many cases where Quickstep
+  is faster by an order of magnitude or more. It also reports that
+  column stores are generally preferred for the studied SSB/TPC-H
+  workloads, but with an overall row/column difference around 2x in their
+  apples-to-apples setup rather than the much larger gaps sometimes
+  inferred from cross-system comparisons.
+
+**GPU DB mapping:** The work-order model maps directly to retained read
+route fragments. A GPU DB route descriptor should be able to expose a
+sequence of bounded fragments: resident segment scans, key-vector probes,
+CPU fallback probes, cold-tier chunk reads, result scattering, and response
+encoding. Each fragment should carry the snapshot generation, table/segment
+identity, selected columns, predicate family, buffer requirements, and
+failure/fallback policy.
+
+The block-as-mini-database idea maps to P8 resident column groups and warm
+segments. A resident segment should have a self-description header with
+schema generation, source WAL boundary, visibility boundary, layout kind,
+compression kind, row count, byte count, supported route families, and
+index/scan descriptor offsets. That makes each segment independently
+admissible, evictable, refreshable, and schedulable.
+
+Quickstep's policy enforcer suggests a deterministic equivalent for GPU DB:
+route classes should have scheduling weights, latency ceilings, and
+resource-credit proofs, while the mechanism remains compatible work-fragment
+drain. High-priority retained lookups should be able to pause background
+refresh, warmup, cold-tier scans, and speculative prefetch without custom
+operator suspension code.
+
+The "drop early, drop fast" mechanisms map to GPU predicate and join
+admission. Before launching a GPU route, the planner/runtime should attach
+cheap filter metadata: min/max, dictionary domains, exact key filters,
+prefix summaries, bloom-like membership, or learned/cardinality feedback.
+Fragments that can prove no output should be discarded before using GPU
+staging buffers or response-ring bytes.
+
+Template-specialized `ValueAccessor` loops are a useful CPU-side analogue
+for GPU kernels. The GPU DB should avoid generic dynamic-dispatch kernels on
+hot retained routes. Instead, route descriptors should select a small number
+of layout-specialized kernels or CPU loops for admitted `int4`/`text`
+families, while unsupported shapes fall back explicitly.
+
+The elasticity experiment maps to 1M logical sessions: the runtime should
+not need one thread or one long-lived execution context per query. If work is
+fragmented and generation-safe, sessions can be multiplexed, high-priority
+work can preempt low-priority fragments at fragment boundaries, and paused
+queries retain only compact continuation state.
+
+**Risks and mismatches:** Quickstep targets read-mostly in-memory analytics
+on a single node, not transactional OLTP. It does not solve WAL durability,
+MVCC visibility, write admission, long-reader version retention, or GPU
+resident snapshot invalidation.
+
+The paper's work orders are CPU block tasks. GPU kernels benefit from larger
+coalesced batches, so fragment boundaries must not become so fine-grained
+that kernel-launch overhead dominates. GPU DB needs separate fragment sizes
+for CPU work, H2D/D2H transfers, resident kernels, and response encoding.
+
+Quickstep's scheduler can stop dispatching low-priority work orders, but it
+does not discuss SQL transaction abort/retry semantics for paused mutations.
+GPU DB should apply work-order suspension first to read-only retained routes,
+background refresh, prefetch, and cold scans. Mutation fragments need WAL
+reservation, idempotence, and visibility rules before preemption is safe.
+
+The block layout is not a direct storage design for GPU DB. P8's durable
+truth remains WAL/checkpoint/replay plus CPU MVCC state; resident blocks are
+cache objects. Any Quickstep-like self-description must be tied to source
+WAL and visibility boundaries, not treated as independent durable state.
+
+The evaluation is SSB/TPC-H-centered. That is valuable for route-fragment
+scheduling and scan/filter benchmarks, but it cannot predict transaction
+tail latency, pgwire fan-in, 1M-session behavior, or update-driven
+invalidation cost.
+
+**Benchmark candidates:**
+
+- Lower one retained read plan into explicit route fragments instead of one
+  opaque operation. Required fields: snapshot generation, segment id, route
+  shape, selected columns, predicate family, buffer credits, and response
+  bytes. Gate: fragment metadata is sufficient to reject stale generations
+  and saturated buffers before kernel launch.
+- Implement a work-fragment scheduler simulator with three classes:
+  high-priority retained lookups, normal analytical scans, and background
+  refresh/prefetch. Measure p50/p99 lookup latency when low-priority work is
+  paused only at fragment boundaries. Failure condition: preemption improves
+  p99 by starving refresh long enough to increase stale/fallback rates.
+- Build a P8 resident segment header modeled on the self-describing block:
+  source WAL boundary, visibility boundary, layout kind, compression kind,
+  row count, byte count, route-family bitmap, and descriptor offsets. Gate:
+  the planner can decide route eligibility without inspecting payload bytes.
+- Compare fragment sizes for resident scans and cold-tier chunks: small
+  scheduler-friendly fragments versus large GPU-friendly fragments. Measure
+  queue wait, kernel launches, transfer bandwidth, cancellation waste, and
+  p99 short-query latency.
+- Add "drop early, drop fast" metadata to resident segments: min/max,
+  dictionary-domain summaries, prefix summaries for text, and exact filters
+  for key joins/lookups. Gate: rejected fragments consume no GPU staging or
+  response-ring capacity.
+- Prototype priority-aware fragment suspension for read-only routes only.
+  Gate: paused queries keep bounded continuation state and resume on the same
+  snapshot generation or fail with an explicit generation-expired outcome.
+- Compare layout-specialized CPU/GPU loops against a generic dispatch path
+  for the first `int4` equality and aggregate routes. Failure condition:
+  specialization improves best-case throughput but creates too many route
+  variants for stable planning and cache residency.

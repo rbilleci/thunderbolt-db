@@ -419,13 +419,13 @@ Append new candidates here as each paper is processed.
   intra-query adaptive join-order switching and regret-bound-driven route
   exploration. Journal entry added 2026-06-06 from the arXiv/SIGMOD 2019
   full paper after the VLDB PDF endpoint timed out from the cron worker.
-- `queued` — **Quickstep: A Data Platform Based on the Scaling-up Approach**,
+- `reviewed` — **Quickstep: A Data Platform Based on the Scaling-up Approach**,
   Patel et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p663-patel.pdf`
   Why: LSched is implemented on Quickstep's block/work-order execution model;
   useful for extracting morsel/work-order, scheduler, and resource-estimation
   mechanisms that can inform GPU DB operator fragments and route-feature
-  telemetry.
+  telemetry. Journal entry added 2026-06-06.
 - `queued` — **Learning Scheduling Algorithms for Data Processing Clusters**,
   Mao et al., SIGCOMM 2019.
   URL: `https://doi.org/10.1145/3341302.3342080`
@@ -480,6 +480,21 @@ Append new candidates here as each paper is processed.
   Why: LIMAO cites LEON among learned optimizer systems that adapt to changing
   data; useful for comparing learned plan search or cost feedback against
   modular lifelong route-cost learning.
+- `queued` — **Adaptive Concurrent Query Execution Framework for an
+  Analytical In-Memory Database System**, Deshmukh, Memisoglu, and Patel,
+  IEEE BigData Congress 2017.
+  URL: `https://doi.org/10.1109/BIGDATACONGRESS.2017.38`
+  Why: Quickstep cites this as the scheduling framework behind its elastic
+  concurrent query execution; useful for a deeper look at policy-enforced
+  work-order scheduling, query suspension, and priority/resource allocation
+  before GPU DB implements retained-route fragment scheduling.
+- `queued` — **ByteSlice: Pushing the Envelope of Main Memory Data
+  Processing with a New Storage Layout**, Feng, Lo, Kao, and Xu, SIGMOD
+  2015.
+  URL: `https://doi.org/10.1145/2723372.2747642`
+  Why: Quickstep cites ByteSlice among modern vectorized/block-oriented
+  execution directions; useful for comparing bit-sliced CPU layouts with
+  GPU DB's encoded resident `int4` columns and early predicate pruning.
 - `reviewed` — **Sundial: Harmonizing Concurrency Control and Caching in a
   Distributed OLTP Database Management System**, Yu et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p1289-yu.pdf`
