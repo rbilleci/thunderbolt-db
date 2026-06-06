@@ -764,20 +764,35 @@ Append new candidates here as each paper is processed.
   multi-destination cold-tier replication, route fanout, transfer throughput,
   and cost-aware object movement before GPU DB adopts remote object tiers.
   Journal entry added 2026-06-06 from the USENIX page and PDF.
-- `queued` — **Skyplane: Optimizing Transfer Cost and Throughput Using
+- `reviewed` — **Skyplane: Optimizing Transfer Cost and Throughput Using
   Cloud-Aware Overlays**, Jain et al., NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/jain`
   arXiv: `https://arxiv.org/abs/2210.07259`
   Why: SkyStore cites Skyplane as related intercloud transfer work; useful for
   evaluating whether cold-tier promotion should use direct object reads,
   staged transfer, or overlay routing when future GPU DB deployments span
-  regions, object stores, or disaggregated storage pools.
+  regions, object stores, or disaggregated storage pools. Journal entry added
+  2026-06-06 from the USENIX page and PDF.
 - `queued` — **BDS: A Centralized Near-Optimal Overlay Network for
   Inter-Datacenter Data Replication**, Zhang et al., EuroSys 2018.
   URL: `https://doi.org/10.1145/3190508.3190532`
   Why: Cloudcast cites BDS as a bandwidth-oriented inter-datacenter overlay
   replication baseline; useful for comparing throughput-first overlay routing
   with GPU DB's future cost/freshness-aware cold-tier and replica movement.
+- `queued` — **CodedBulk: Inter-Datacenter Bulk Transfers Using Network
+  Coding**, Tseng et al., NSDI 2021.
+  URL: `https://www.usenix.org/conference/nsdi21/presentation/tseng`
+  Why: Skyplane cites CodedBulk as a bulk-transfer multicast direction;
+  useful for comparing coded replication/fanout with segment-stripe cold-tier
+  movement, checkpoint distribution, and replica warmup under partial-link
+  bottlenecks.
+- `queued` — **Cost-Effective Cloud Edge Traffic Engineering with CASCARA**,
+  Singh et al., NSDI 2021.
+  URL: `https://www.usenix.org/conference/nsdi21/presentation/singh`
+  Why: Skyplane contrasts provider-side traffic engineering with
+  customer-visible cost/throughput planning; useful for deciding which tier
+  placement decisions should remain database-owned versus delegated to
+  provider or fabric-level traffic engineering.
 
 ### WAL, logging, and read/write throughput
 

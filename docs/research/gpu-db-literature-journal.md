@@ -38,6 +38,194 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Skyplane makes cold-tier movement a constrained overlay plan
+
+**Citation:** Paras Jain, Sam Kumar, Sarah Wooders, Shishir G. Patil,
+Joseph E. Gonzalez, and Ion Stoica. "Skyplane: Optimizing Transfer
+Cost and Throughput Using Cloud-Aware Overlays." NSDI 2023, pages
+1375-1389. Retrieved 2026-06-06 from the USENIX paper page and PDF at
+`https://www.usenix.org/conference/nsdi23/presentation/jain` and
+`https://www.usenix.org/system/files/nsdi23-jain.pdf`.
+
+**Category:** multi-tier cache / data placement and database
+file-system/storage, with secondary relevance to high-concurrency
+networking and future remote/cold-tier route planning.
+
+**Relevance tags:** cloud-aware overlay; object-store transfer;
+price-throughput tradeoff; mixed-integer linear programming; relay
+regions; VM elasticity; parallel TCP; gateway VMs; transfer profiling;
+Pareto frontier; path striping; hop-by-hop flow control; cold-tier
+promotion.
+
+**Core idea:** Skyplane shows that wide-area object movement should be
+planned as an explicit route problem, not treated as a single direct
+copy. It profiles inter-region throughput, combines that with cloud
+egress and VM pricing, then solves for overlay paths and resource
+allocation subject to a user constraint: minimize cost under a
+throughput floor or maximize throughput under a cost ceiling.
+
+For GPU DB, the strongest transferable idea is that every future
+cold-tier movement should carry a plan with constraints and proof
+inputs: source and target tiers, candidate waypoint tiers, measured
+throughput, transfer cost, queue capacity, chunking, and a freshness
+or latency budget. A cold object, segment, or checkpoint should not be
+promoted by an opaque background copier when the planner can choose a
+direct path, staged path, or parallel path with known tradeoffs.
+
+**Concrete mechanisms:**
+
+- Skyplane transfers data between cloud object stores through
+  ephemeral gateway VMs in the source, destination, and optional relay
+  regions. Gateways read object chunks, relay them through TCP
+  connections, and write chunks at the destination.
+- The planner uses two matrices: a price grid built from provider
+  egress and instance pricing, and a throughput grid built from
+  measured TCP goodput between ordered region pairs.
+- The system treats cloud elasticity as a planning variable. The plan
+  decides how many gateway VMs to allocate in each region, bounded by
+  service limits and per-VM ingress/egress limits.
+- The planner jointly chooses flow between regions, VM counts, and TCP
+  connection counts. The paper formulates cost minimization as a
+  mixed-integer linear program and notes that a relaxed linear program
+  can approximate the solution with rounded variables.
+- Cost is modeled from egress volume plus VM runtime. This differs from
+  ordinary network-routing cost because cloud egress charges are per
+  byte rather than per unit of reserved bandwidth.
+- For throughput maximization under a cost ceiling, Skyplane samples
+  throughput goals, solves the cost-minimizing problem for each, and
+  extracts a point from the resulting Pareto frontier.
+- Overlay paths may use relay regions when the direct path is slow.
+  A relay can improve throughput, but the planner must account for the
+  extra egress charge on each hop.
+- Skyplane can split a transfer across multiple paths, averaging
+  high-cost/high-throughput and low-cost/low-throughput paths to meet a
+  user constraint more closely.
+- Each VM uses up to 64 parallel outgoing TCP connections, based on the
+  paper's empirical observation that additional connections often give
+  diminishing goodput returns.
+- The implementation assumes objects are divided into approximately
+  equal chunks. It dynamically assigns chunks to TCP connections as
+  they become ready, which mitigates stragglers but can make actual
+  path cost deviate from the planner's target split.
+- Relay gateways use hop-by-hop flow control: a gateway stops reading
+  from incoming connections when its queued chunk buffer reaches
+  capacity.
+- The evaluation covers AWS, Azure, and GCP regions. It reports
+  Skyplane outperforming AWS DataSync by up to 4.6x and GCP Storage
+  Transfer by up to 5.0x in tested transfers, and reports that
+  Skyplane's optimized overlays improve on a RON-style heuristic by
+  finding up to 4.7x higher throughput than the direct path within a
+  14% cost overhead in one academic-baseline comparison.
+
+**GPU DB mapping:** Skyplane maps to P8's future cold and warm tier
+movement. A resident segment should be able to say whether it was
+loaded directly from NVMe/object storage, staged through local NVMe,
+staged through host DRAM, or fetched from a remote replica. The route
+choice should be attached to measured bandwidth, bytes moved, queue
+depth, chunk count, and freshness budget.
+
+The gateway-VM idea maps to movement owners rather than SQL execution
+owners. GPU DB can use storage movement workers that own local NVMe
+reads, object-store fetches, pinned host staging buffers, and HBM
+copies. The planner should choose which movement workers and tiers
+participate, while the hot query path consumes a compact placement
+certificate.
+
+Skyplane's path-splitting mechanism is useful for over-resident reads.
+A cold scan does not have to be all-or-nothing. Some segment stripes
+can be resident in HBM, some in host DRAM, some in NVMe, and some
+served through a CPU/cold path. The query route can combine them only
+when all stripes share relation id, schema generation, visibility
+boundary, and checksum lineage.
+
+The throughput grid maps to tier telemetry. GPU DB should periodically
+measure effective throughput among HBM, pinned host memory, DRAM,
+NVMe, object store, and future remote tiers. Planner cost should use
+those measurements instead of fixed constants, and it should expose
+when a tier path is stale or unprofiled.
+
+The dynamic chunk assignment maps to micro-batch and cold-fetch
+scheduling. For large transfers, let faster lanes take more chunks.
+For SQL-visible reads, that must be paired with deterministic result
+ordering and completion certificates so response generation does not
+observe a partial or mixed-generation snapshot.
+
+**Risks and mismatches:** Skyplane is a bulk object-transfer system,
+not a database storage engine. It does not define WAL, MVCC,
+transaction visibility, resident GPU layouts, SQL result ordering,
+replica recovery, or index maintenance.
+
+The system optimizes large transfers where VM startup, planner solve
+time, and bulk throughput dominate. GPU DB cannot put this style of
+planning on the p50 retained-read path. It belongs in background
+promotion, cold scans, checkpoint/archive fanout, remote warmup, and
+operator-triggered placement jobs.
+
+Skyplane's pricing model is cloud-specific. Local NVMe, CXL, RDMA
+memory, and object storage will need different cost proxies such as
+foreground p99 impact, SSD write amplification, HBM pressure, pinned
+buffer occupancy, and WAL/checkpoint bandwidth.
+
+Dynamic path assignment is a correctness hazard for database snapshots
+unless each chunk carries visibility and schema lineage. A faster lane
+must not let one stripe from a newer generation join an older snapshot.
+
+**Benchmark candidates:**
+
+- Build a tier-transfer planner simulator over HBM, pinned host memory,
+  DRAM, NVMe, object storage, and remote replica tiers. Compare direct
+  copy, fastest path, cheapest path, and constrained Pareto routing.
+- Add a "profile grid freshness" benchmark. Gate: route decisions state
+  when tier-throughput measurements were collected and fall back when a
+  profile is stale or missing.
+- Prototype segment-stripe movement with path splitting. Measure bytes
+  moved per tier, p50/p99 route latency, freshness misses, and
+  foreground WAL/query impact.
+- Compare static chunk assignment with dynamic ready-lane assignment
+  for cold scans and promotions. Failure condition: dynamic assignment
+  breaks deterministic output ordering or combines mismatched snapshot
+  generations.
+- Add hop-by-hop flow-control telemetry for cold-tier movement queues:
+  queued chunks, stalled upstream reads, downstream write pressure,
+  pinned-buffer pressure, and HBM copy wait.
+- Produce a placement Pareto report for every cold-tier benchmark:
+  throughput, cost proxy, freshness latency, foreground p99 impact, and
+  fallback rate.
+
+### 2026-06-06 - Cross-paper synthesis: cold-tier movement needs route certificates, not background mystery copies
+
+Cloudcast, Skyplane, TDSQL, and Xenic converge on a sharper design
+track for GPU DB: the edge and storage movement paths need compact
+route certificates that make placement, freshness, and authority
+explicit. Cloudcast and Skyplane show that moving data across tiers is
+an optimization problem over cost, time, stripes, and waypoints. TDSQL
+shows that proxy/routing and jitter control are part of OLTP
+correctness at scale. Xenic shows that small route facts can move near
+the ingress boundary, but correctness authority must remain clearly
+owned.
+
+**Converging design tracks:** First, cold and warm data placement
+should be a planned route with measured inputs, not an opaque cache
+side effect. Second, query admission should consume a certificate:
+relation id, schema generation, visibility boundary, source WAL
+boundary, tier path, stripe set, and fallback reason. Third, gateways
+may cache compact route hints, but mutation, catalog, residency, and
+WAL owners remain authoritative. Fourth, large movement work should be
+chunked or striped so it can use parallel lanes without hiding partial
+movement or mixed-generation hazards.
+
+**Category gaps:** Recent reviews are strong on storage/tiering,
+runtime routing, and transaction path stability. The next paper should
+prefer WAL/logging, MVCC visibility, or transaction scheduling unless a
+newer networking/session-scale paper directly improves the 1M logical
+session target.
+
+**Benchmark priorities:** Build one route-certificate benchmark that
+combines edge route hints, cold-tier stripe movement, freshness
+budgets, and owner-generation validation. The proof gate should reject
+stale hints, partial stripes, stale throughput profiles, and any route
+that cannot prove WAL-before-visibility.
+
 ### 2026-06-06 - Cloudcast turns cold-tier replication into an explicit cost, time, and stripe-routing optimization
 
 **Citation:** Sarah Wooders, Shu Liu, Paras Jain, Xiangxi Mo,
