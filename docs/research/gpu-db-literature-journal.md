@@ -79788,3 +79788,166 @@ retained route can observe data.
   batch, owner-domain, route class, table/partition id, and latency class.
   Gate: assignment improves reclaimability without weakening visibility or
   starving cold routes.
+
+### 2026-06-06 - Publish on Ping makes reclamation demand-driven instead of read-path pessimistic
+
+**Citation:** Ajay Singh and Trevor Brown. "Publish on Ping: A Better Way
+to Publish Reservations in Memory Reclamation for Concurrent Data
+Structures." PPoPP 2025; arXiv:2501.04250v2, revised 2025-06-04. DOI:
+`https://doi.org/10.48550/arXiv.2501.04250`; Version of Record DOI:
+`https://doi.org/10.1145/3710848.3710890`. Retrieved 2026-06-06 from
+`https://arxiv.org/pdf/2501.04250`.
+
+**Category:** runtime / HFT / session scale, with MVCC / snapshot /
+visibility relevance for route metadata, retained-snapshot retirement, and
+lock-free CPU indexes.
+
+**Relevance tags:** safe memory reclamation; hazard pointers; hazard eras;
+epoch-based reclamation; POSIX signals; publish-on-ping; bounded garbage;
+long readers; lock-free data structures; route generation retirement;
+snapshot handles; per-reader reservation overhead; delayed reclamation;
+1M logical sessions.
+
+**Core idea:** Publish on Ping (POP) targets a specific cost in concurrent
+data structures: hazard-pointer-style readers normally publish a reservation
+and pay ordering overhead before each protected pointer read, even when no
+thread is actually trying to reclaim memory. POP inverts that cost. Readers
+track reservations privately on the hot traversal path. A reclaimer that
+wants to free retired objects sends a signal to participating threads, waits
+until each thread has published its private reservations, then frees only
+unreserved retired objects.
+
+The transferable idea for GPU DB is not "use POSIX signals everywhere." It
+is the split between cheap private read-side reachability tracking and
+demand-driven global publication when retirement pressure appears. For 1M
+logical sessions, retained route handles, old snapshot metadata, resident
+index nodes, and CPU-side route descriptors should avoid a global fence or
+shared publication write on every read. Reclamation can be a maintenance
+event that asks active execution contexts to publish the small set of handles
+they might still dereference.
+
+**Concrete mechanisms:**
+
+- POP is presented as a paradigm and instantiated as HazardPtrPOP,
+  HazardEraPOP, and EpochPOP.
+- In HazardPtrPOP, a reader's `read` operation repeatedly reads the pointer,
+  stores it in a thread-local reservation slot, rereads the pointer, and
+  returns only if the value is stable. No store-load fence is needed on the
+  common read path.
+- Each thread owns local reservation slots, shared reservation slots, a
+  per-thread retire list, and a monotonically increasing publish counter.
+- When a retire list reaches a configured reclaim frequency, the reclaimer
+  records all publish counters, sends `pthread_kill` pings to participating
+  threads, waits until each counter has advanced, scans shared reservations,
+  and frees retired objects not present in the published set.
+- The signal handler publishes local reservations into shared slots and
+  increments the thread's publish counter. Concurrent reclaimer pings can be
+  coalesced because one publication can satisfy multiple reclaimers.
+- HazardPtrPOP keeps the same programmer-facing interface as hazard pointers:
+  `read`, `clear`, and `retire`.
+- The paper explicitly notes a bounded-signal-delivery assumption: pings must
+  cause threads to run the handler in finite time. This is practical on the
+  tested systems but is still an environmental assumption.
+- EpochPOP combines ordinary epoch-based reclamation with private
+  HazardPtrPOP-style reservations. Threads normally announce epochs and free
+  objects whose retire epoch is older than the minimum announced epoch.
+- If a reclaimer's list remains too large after epoch reclamation, EpochPOP
+  suspects a delayed thread and falls back to POP publication. It can then
+  free all but the bounded set of currently reserved objects.
+- EpochPOP avoids global mode switching: different reclaimers may use epoch
+  reclamation or POP-style publication at the same time.
+- The authors evaluate with the public NBR benchmark suite, adding
+  HazardPtrPOP, HazardEraPOP, EpochPOP, and an optimized
+  `sys_membarrier`-style HP baseline similar to Folly's hazard pointers.
+- Evaluated data structures include tree, hash-table, and list structures
+  from the benchmark suite. Workloads include read-heavy, update-heavy, and
+  a long-running-read stress where many readers traverse long lists while
+  update threads reclaim near the head.
+- Reported improvements include 1.2x to 4x over original hazard pointers,
+  up to 20% over the optimized HP baseline, up to 3x over hazard eras, and
+  EpochPOP performance similar to epoch-based reclamation with stronger
+  bounded-garbage behavior.
+- The paper reports that POP variants keep read throughput high in the
+  long-running-read experiment because they do not restart readers, unlike
+  NBR-style signal restart schemes.
+- Limitations called out or implied by the paper include reliance on signals,
+  signal-delivery assumptions, extra reclaimer-side wait work, and the fact
+  that POP protects memory safety rather than database visibility semantics.
+
+**GPU DB mapping:** The direct mapping is route and snapshot metadata
+retirement. A retained read should be able to hold a private pointer or
+generation handle for a resident snapshot, route descriptor, CPU index node,
+or visible-row bitmap without publishing to a contended global reservation
+array on every lookup. When a residency owner, catalog owner, or maintenance
+owner wants to retire old metadata, it can request publication from the small
+set of physical execution contexts that may be holding handles: IO workers,
+read snapshot workers, GPU execution owners, mutation owners, and possibly
+partition owners.
+
+This aligns well with the high-throughput runtime's owner model. Logical
+sessions should not each become a reclamation participant. The participant
+should be the physical worker or owner currently executing or holding route
+state on behalf of many logical sessions. That keeps the publication fan-out
+bounded even if the SQL session count approaches 1M.
+
+For P8, POP suggests a useful split between route validity and memory
+reachability. WAL-before-visibility and MVCC decide whether a route may be
+used. A POP-like retirement protocol decides whether the old route metadata,
+resident buffer descriptor, or CPU index node may be freed. These should be
+separate proof surfaces: a route can be invalid for new readers while still
+reachable by old readers, and a reclaimed generation must fail validation
+rather than being silently reused.
+
+For GPU-resident state, POSIX signals cannot interrupt a CUDA kernel to make
+device threads publish reservations. The mapping should therefore be at GPU
+execution boundaries: before launching a kernel, the GPU owner records the
+resident handles and generation ids that the launch may dereference; after
+kernel completion, it clears them. Reclaimers can ping or message GPU owners,
+not arbitrary device threads.
+
+**Risks and mismatches:** POP is a C/C++ safe-memory-reclamation paper for
+CPU concurrent data structures, not a DBMS paper. It does not handle WAL,
+MVCC visibility, snapshot isolation, DDL invalidation, SQL errors, or GPU
+device execution.
+
+The signal mechanism is attractive for low-intrusion CPU libraries but may
+be a bad production fit for database runtime workers that already use event
+loops, io_uring, pinned threads, or language runtimes. GPU DB may want a
+message-poll or owner-ring publication request instead of POSIX signals.
+
+The bounded-thread set matters. POP would be dangerous if implemented as one
+publication participant per logical client session. It is only attractive if
+logical sessions multiplex through a bounded number of physical workers and
+owners.
+
+POP guarantees memory safety, not semantic freshness. A published
+reservation says "do not free this object yet"; it does not prove that the
+object is still a valid route for a new read boundary.
+
+**Benchmark candidates:**
+
+- Build a route-descriptor reclamation microbenchmark with three modes:
+  eager global hazard publication per route read, epoch-only retirement, and
+  POP-style private reservations with owner-ping publication. Gate: p50/p99
+  route lookup latency drops versus eager hazards while retired bytes stay
+  bounded under delayed workers.
+- Model 1M logical sessions multiplexed through fixed IO/read/GPU workers.
+  Gate: retirement publication fan-out scales with physical workers, not
+  logical sessions.
+- Add a retained-snapshot stress where long readers hold old resident
+  generation handles while writes invalidate and refresh newer generations.
+  Gate: old metadata is freed after owner publication without blocking new
+  route admission or weakening snapshot correctness.
+- Compare POSIX-signal publication with ring-message publication in pinned
+  runtime workers. Failure condition: signal delivery or handler constraints
+  create worse p99 latency than eager publication.
+- For GPU execution owners, record launch-scoped resident handles and clear
+  them after CUDA event completion. Gate: a maintenance owner can name exactly
+  which GPU launches block retirement of a resident generation.
+- Add telemetry for `retired_bytes`, `reserved_handles`, `publication_wait`,
+  `stale_generation_rejections`, and `reclaim_reason`. Gate: every delayed
+  reclamation event identifies whether it is blocked by CPU readers, GPU
+  launches, catalog/DDL references, or maintenance backlog.
+- Test route metadata with a type-preserving allocator versus ordinary free.
+  Gate: stale handles either validate generation and type or fail cleanly;
+  no benchmark relies on allocator behavior that production cannot support.

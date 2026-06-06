@@ -62,12 +62,16 @@ read/write throughput, recovery, compaction, or tail-latency mechanisms.
   Why: GPU-Accelerated OLTP identifies GaccO as the strongest high-contention
   GPU conflict-ordering path; useful for studying batch preprocessing,
   all-access conflict treatment, and GPU transaction route admission.
-- `queued` — **LTPG: Large-Batch Transaction Processing on GPUs with
+- `reviewed` — **LTPG: Large-Batch Transaction Processing on GPUs with
   Deterministic Concurrency Control**, Wei et al., ICDE 2024.
-  URL: `https://doi.org/10.1109/ICDE60146.2024.00300`
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00296`
+  PDF:
+  `https://vbn.aau.dk/ws/portalfiles/portal/821323666/New_LTPG.pdf`
   Why: modern deterministic large-batch GPU transaction processing cited by
   the GPU OLTP survey; useful for comparing conflict-ordered GPU batches with
-  CPU-owned WAL/MVCC publication.
+  CPU-owned WAL/MVCC publication. Journal entry already exists; this stale
+  seed-queue duplicate was corrected from `queued` to `reviewed` and its DOI
+  was fixed on 2026-06-06.
 - `reviewed` — **PLOR: General Transactions with Predictable, Low Tail
   Latency**, Chen et al., SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3517879`
@@ -6242,10 +6246,23 @@ Append new candidates here as each paper is processed.
   fence overhead; Hyaline-style snapshot-free reclamation is a useful
   follow-up for route-publication descriptors and lock-free CPU indexes that
   should avoid pinning retired state behind long readers.
-- `queued` — **Publish on Ping: A Better Way to Publish Reservations in Memory
+- `reviewed` — **Publish on Ping: A Better Way to Publish Reservations in Memory
   Reclamation for Concurrent Data Structures**, arXiv 2025.
   URL: `https://arxiv.org/abs/2501.04250`
+  DOI: `https://doi.org/10.1145/3710848.3710890`
   Why: discovered while reviewing NBR; combines signal-style prompting with
   delayed publication of reservations, making it a modern follow-up for
   lowering hazard-pointer-style read overhead without allowing unbounded
-  retired route metadata.
+  retired route metadata. Journal entry added 2026-06-06.
+- `queued` — **Crystalline: Fast and Memory Efficient Wait-Free
+  Reclamation**, Nikolaev and Ravindran, arXiv 2021.
+  URL: `https://arxiv.org/abs/2108.02763`
+  Why: Publish on Ping references Crystalline as related robust reclamation
+  work; useful for comparing bounded-garbage, wait-free, and memory-efficient
+  retirement policies for route descriptors and lock-free CPU-side indexes.
+- `queued` — **Concurrent Deferred Reference Counting with Constant-Time
+  Overhead**, Anderson, Blelloch, and Wei, PLDI 2021.
+  URL: `https://doi.org/10.1145/3453483.3454060`
+  Why: Publish on Ping's related work includes automatic/reference-counting
+  style reclamation; useful as a contrast to hazard/epoch designs before GPU
+  DB picks a route metadata lifetime scheme.
