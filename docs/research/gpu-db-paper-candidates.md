@@ -816,14 +816,28 @@ Append new candidates here as each paper is processed.
   relevant if the queue needs more recent contention-scheduling contrasts.
   Journal entry added 2026-06-06 from accessible HTML/DOAJ metadata after the
   MDPI PDF endpoint returned HTTP 403.
-- `queued` — **ForeSight: A Predictive-Scheduling Deterministic Database**,
+- `reviewed` — **ForeSight: A Predictive-Scheduling Deterministic Database**,
   Huang et al., arXiv 2025.
   URL: `https://arxiv.org/abs/2508.17375`
   DOI: `https://doi.org/10.48550/arXiv.2508.17375`
   Why: discovered while reviewing DCoS; useful as a newer transaction
   scheduling follow-up that predicts conflicts without pre-obtained read/write
   sets, integrates MVCC-style fallback, and generates conflict-aware
-  deterministic schedules under skew.
+  deterministic schedules under skew. Journal entry added 2026-06-06 from
+  arXiv v2.
+- `queued` — **DoppelGanger++: Towards Fast Dependency Graph Generation for
+  Database Replay**, Lee et al., PACMMOD 2024.
+  DOI: `https://doi.org/10.1145/3639305`
+  Why: ForeSight cites SSFS/DoppelGanger++ as a fast dependency-graph
+  generation baseline; useful for separating replay-oriented dependency graph
+  construction from online route scheduling and conflict prediction.
+- `queued` — **Practical Deterministic Transaction Processing with Low-cost
+  Re-execution**, Li, Wang, and Huang, ICPADS 2024.
+  DOI: `https://doi.org/10.1109/ICPADS63350.2024.00065`
+  Why: ForeSight contrasts DMUCCA as a deterministic re-execution and
+  access-pattern-weighted reordering design; useful for comparing
+  MVCC-style fallback, retry admission, and residual conflict handling under
+  hot transaction batches.
 - `reviewed` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
   Cao et al., PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3603164`

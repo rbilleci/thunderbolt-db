@@ -85168,3 +85168,210 @@ as a direct benchmark baseline for the local GPU database.
   stable-1:1 conversion, and delayed conversion under continuous updates.
   Measure read p99, conversion backlog, deletion-mask size, and resident
   invalidation frequency.
+
+### 2026-06-06 - ForeSight schedules hot transactions before spending execution work
+
+**Citation:** Junfang Huang, Yu Yan, Hongzhi Wang, Yingze Li, and
+Jinghan Lin. "ForeSight: A Predictive-Scheduling Deterministic
+Database." arXiv:2508.17375v2, 2025. Retrieved 2026-06-06 from
+`https://arxiv.org/abs/2508.17375` and PDF
+`https://arxiv.org/pdf/2508.17375`.
+
+**Category:** transaction processing / write path and concurrency
+control, with MVCC / snapshot / visibility and runtime scheduling
+relevance.
+
+**Relevance tags:** deterministic concurrency control; predictive
+scheduling; conflict prediction; Association Sum-Product Network;
+multi-version fallback; matrix two-pass forward scan; hot-key
+contention; batch transaction scheduling; abort reduction; route
+admission.
+
+**Core idea:** ForeSight targets deterministic databases where a
+batch of transactions must produce the same result at every replica,
+but prior systems either require pre-known read/write sets or spend
+work executing transactions that later abort. It predicts likely
+conflicts before execution, uses the prediction to filter and reorder
+the batch, then falls back to multi-version execution for residual
+conflicts.
+
+The transferable GPU DB idea is to treat high-contention scheduling
+as a route-admission problem. Before a hot write batch, refresh batch,
+or same-shape retained-read group consumes owner time, GPU launch
+budget, or WAL bandwidth, the runtime should use cheap route-template
+features and observed key ranges to predict conflicts and choose
+which work runs now, which work is reordered, and which work enters a
+deterministic fallback lane.
+
+**Concrete mechanisms:**
+
+- ForeSight organizes deterministic execution into input, sequencing,
+  scheduling, execution, and storage layers. The workflow is
+  prediction, execution, commit, fallback, and garbage collection.
+- The input layer accepts general SQL transactions without requiring
+  pre-obtained read/write sets, then batches them for deterministic
+  processing.
+- The predictor is an Association Sum-Product Network (ASPN). It
+  models attribute correlations and predicate overlap so the scheduler
+  can estimate transaction conflicts without pre-executing the
+  transactions to discover read/write sets.
+- ASPN uses decomposition, independent, joint, and leaf nodes. It
+  recursively partitions heterogeneous regions, keeps independent
+  attributes as products, and models strongly correlated attributes
+  jointly.
+- For multi-table queries, ASPN samples joined tuples, detects
+  cross-table attribute correlations, merges strongly correlated table
+  pairs into modeling units, and builds local ASPN models for those
+  subgraphs.
+- Online conflict prediction constructs the intersection region of
+  two transaction predicates and evaluates its probability through the
+  ASPN. Empty intersections imply no predicted overlap.
+- Incremental model maintenance reuses the ASPN structure when table
+  changes are local, but falls back to offline reconstruction for major
+  schema changes, new joins, or changed join conditions.
+- Transactions execute on a consistent snapshot and buffer writes as
+  new version-chain nodes instead of modifying records in place during
+  execution.
+- The relaxed validation rule allows WAW dependencies because
+  multi-version storage prevents in-place overwrite, but rejects
+  transactions with RAW dependencies on prior transactions.
+- Fallback transactions run over the version chains generated at the
+  end of the execution phase. They read the latest version before
+  their deterministic TID, append writes as invisible versions, and
+  finalize commits in deterministic timestamp order.
+- Garbage collection is epoch based: versions older than the latest
+  active snapshot and aborted versions are reclaimed after fallback.
+- Matrix Two-pass Forward Scan (MTFS) constructs a compact dependency
+  matrix, propagates indirect dependencies, then selects transactions
+  that appear frequently on RAW-related dependency paths as an abort
+  set to break cycles.
+- The paper evaluates against Aria, AriaFB, BOHM, PWV, Calvin, and a
+  primary-backup baseline using YCSB and TPC-C for protocol
+  throughput, plus TPCH, IMDB, TPC-C, and GAS for prediction. Reported
+  results include 260,800 txns/sec on a YCSB-A setup, up to about 2x
+  throughput improvement on skewed workloads, TPC-C throughput above
+  120,000 txns/sec in the shown partition experiment, and an ablation
+  where full ForeSight improves throughput from 93,496 to 126,933
+  txns/sec.
+
+**GPU DB mapping:** GPU DB should not copy ForeSight as a full
+deterministic database, but its mechanisms fit the owner-ring runtime.
+For known route templates, the sequencer can keep lightweight
+statistics over key ranges, predicates, table generations, and recent
+conflict outcomes. A batch entering the mutation owner or GPU
+execution owner can be classified into likely-independent work,
+reorderable work, and fallback work before it consumes scarce
+execution slots.
+
+ASPN's important lesson is not the exact model; it is that conflict
+prediction should respect predicate shape and attribute correlation.
+For the first GPU DB slice, deterministic histograms, min/max
+metadata, bloom filters, learned cardinality summaries, or route
+certificates may be enough. The proof target is bounded false
+negatives on routes admitted to cheap execution, and bounded false
+positive cost for work deferred to a slower lane.
+
+ForeSight's WAW tolerance maps to append/versioned write admission.
+If GPU DB appends new versions or fragment records and publishes
+visibility only after WAL and validation, multiple writes to the same
+logical key can be staged without destructive overwrite. RAW
+dependencies remain the danger: a retained read or GPU kernel that
+would read stale state after an earlier write must be delayed,
+rerouted, or bound to an older valid snapshot contract.
+
+MTFS maps to batch-drain policy. Compatible requests already grouped
+by route shape can carry dependency summaries; the scheduler can use a
+compact matrix or bitset representation to choose which hot-key writes
+or refresh operations should run in this drain and which should be
+sent to fallback. This is especially useful before launching GPU work
+that would be wasted by validation failure.
+
+The multi-version fallback design also reinforces the current retained
+snapshot architecture. Fallback lanes should not spin on global locks;
+they should execute against version chains or immutable fragments, then
+publish in deterministic owner order. That keeps high-priority reads
+and hot writes from turning into uncontrolled retry storms.
+
+**Risks and mismatches:** ForeSight is an arXiv preprint with
+inconsistent template metadata in the PDF; I treated the arXiv record
+as the citation authority. It is not a GPU paper and does not address
+CUDA scheduling, pinned buffers, WAL flushing, crash recovery, pgwire
+sessions, cold-tier placement, or resident snapshot invalidation.
+
+The paper relies on prediction over query predicates. Interactive SQL,
+user-defined functions, dynamic predicates, secondary-index effects,
+DDL, and foreign-key side effects may be difficult to model safely.
+GPU DB should initially restrict predictive admission to certified
+templates and route families.
+
+ASPN false negatives would be dangerous if they admitted stale reads or
+unsafe write order. The model can guide scheduling, but correctness
+must still be enforced by WAL-before-visibility, snapshot generation
+checks, validation, and fallback.
+
+The evaluation hardware is modest and virtualized, and the benchmark
+configuration is not a direct production comparison. Reported
+throughput values should shape hypotheses, not target numbers.
+
+The fallback proof assumes the paper's deterministic batch semantics.
+GPU DB may mix snapshot isolation, read committed, serializable reads,
+and asynchronous resident refresh, so each route class needs its own
+visibility proof before adopting similar relaxed validation.
+
+**Benchmark candidates:**
+
+- Build a route-template conflict predictor for YCSB/TPC-C-like
+  point-update batches using deterministic key histograms, recent
+  hot-key counters, and predicate metadata. Gate: fewer owner retries
+  and lower p99 latency than FIFO admission under skew.
+- Compare FIFO, hot-key deferral, and MTFS-like bitset scheduling for
+  mutation-owner batch drains. Measure committed writes/sec, abort or
+  retry rate, owner queue wait, and fairness for cold keys.
+- Add a retained-read safety benchmark where write batches are
+  predicted before GPU lookup launch. Failure condition: prediction
+  admits work that later reads stale resident state without fallback.
+- Prototype multi-version fallback for conflicting append/update
+  batches: stage versions, validate RAW dependencies, and publish in
+  deterministic owner order. Gate: no global-lock spin path under hot
+  keys and no violation of WAL-before-visibility.
+- Test false-positive cost by intentionally overpredicting conflicts.
+  Expected result: throughput drops gracefully through fallback rather
+  than creating tail-latency cliffs or starving hot sessions.
+- Stress model invalidation across DDL, statistics refresh, key-range
+  redistribution, and resident snapshot generation changes. Gate:
+  stale predictor state forces conservative fallback before execution.
+
+### 2026-06-06 - Cross-paper synthesis: fast publication needs prediction plus fallback
+
+Template robustness, Vortex, and ForeSight converge on one design
+track: fast routes need a certificate before they run, and a bounded
+fallback when the certificate is missing or stale. Template robustness
+certifies which read-committed transaction shapes are cheap enough to
+run directly. Vortex turns fresh ingest into queryable fragments with
+visibility intervals instead of waiting for full read-optimized
+conversion. ForeSight predicts conflicts before deterministic
+execution, then sends residual work to multi-version fallback.
+
+For GPU DB, the combined hypothesis is a three-lane route runtime.
+Lane one is certified direct execution: retained reads, point writes,
+and fragment appends whose route template, snapshot generation, and
+predicate footprint are known safe. Lane two is predicted batch
+execution: same-shape work that is likely independent or reorderable
+and worth grouping before GPU launch or WAL admission. Lane three is
+fallback: owner-validated CPU/MVCC execution over version chains or
+fresh fragments when prediction, metadata, or residency proof is not
+strong enough.
+
+The category gap is now less about finding more GPU scan papers and
+more about proving admission boundaries for mixed workloads. The next
+high-value papers should keep pressure on transaction scheduling,
+MVCC garbage collection, replicated WAL/frontier design, and
+high-concurrency networking, with only selective GPU analytics papers
+when they expose concrete scheduling or data-placement mechanisms.
+
+Benchmark priority should move toward route certificates that include
+publication proof: predicate family, snapshot generation, WAL frontier,
+resident fragment interval, conflict prediction, and fallback reason.
+The minimum proof gate is simple: no fast route may be admitted unless
+the runtime can explain why it is safe, how it will be invalidated, and
+where it goes when the explanation expires.
