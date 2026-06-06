@@ -6674,10 +6674,33 @@ Append new candidates here as each paper is processed.
   designs; OrcGC is a useful follow-up for deciding whether GPU DB route
   metadata should remain manually retired by owner domains or hide
   protection/deallocation in a more automatic descriptor API.
-- `queued` — **To Store or Not to Store: a graph theoretical approach for
-  Dataset Versioning**, Abdelhamid et al., arXiv 2024.
+- `reviewed` — **To Store or Not to Store: a graph theoretical approach for
+  Dataset Versioning**, Guo, Li, Sukprasert, Khuller, Deshpande, and
+  Mukherjee, arXiv 2024.
   URL: `https://arxiv.org/abs/2402.11741`
   Why: discovered while reviewing the PVLDB 2015 dataset-versioning
   storage/recreation frontier; useful as a modern follow-up on graph-based
   storage and reconstruction optimization before GPU DB turns snapshot
-  retention into an online multi-tier policy.
+  retention into an online multi-tier policy. Journal entry added
+  2026-06-06; the stale author field was corrected during review.
+- `queued` — **CHEX: Multiversion Replay with Ordered Checkpoints**,
+  Manne et al., PVLDB 2022.
+  URL: `https://doi.org/10.14778/3514061.3514075`
+  Why: To Store or Not to Store cites CHEX as a graph snapshot/versioning
+  system; useful for comparing checkpoint placement, replay depth, and
+  version retrieval latency against GPU DB retained snapshots and cold
+  version reconstruction.
+- `queued` — **Materialization and Reuse Optimizations for Production Data
+  Science Pipelines**, Derakhshan et al., SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526186`
+  Why: To Store or Not to Store cites production-pipeline materialization as
+  related version reuse work; useful for deciding when GPU DB should
+  materialize intermediate retained fragments, deltas, or checkpointed
+  generations instead of recomputing them.
+- `queued` — **Mosaic: A Budget-Conscious Storage Engine for Relational
+  Database Systems**, Vogel et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p2662-vogel.pdf`
+  DOI: `https://doi.org/10.14778/3407790.3407858`
+  Why: To Store or Not to Store cites Mosaic as device-aware placement work;
+  useful for comparing cost-aware DRAM/NVM/SSD placement with GPU DB's
+  HBM/DRAM/NVMe resident snapshot and warm-tier policy.

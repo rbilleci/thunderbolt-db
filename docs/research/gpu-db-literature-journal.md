@@ -85505,3 +85505,163 @@ evidence, not as a production admission budget.
   Failure condition: a row omitted by a resident bitmap/filter cannot
   be explained as invisible, predicate-false, or routed to a fallback
   snapshot in the trace.
+
+### 2026-06-06 - Dataset version retention should be a graph frontier, not an age rule
+
+**Citation:** Anxin Guo, Jingwei Li, Pattara Sukprasert, Samir
+Khuller, Amol Deshpande, and Koyel Mukherjee. "To Store or Not to
+Store: a graph theoretical approach for Dataset Versioning."
+arXiv:2402.11741v1, 2024. Retrieved 2026-06-06 from
+`https://arxiv.org/abs/2402.11741` and PDF
+`https://arxiv.org/pdf/2402.11741`.
+
+**Category:** multi-tier cache / data placement, with MVCC / snapshot /
+visibility and storage/checkpoint relevance.
+
+**Relevance tags:** dataset versioning; materialization frontier;
+storage/reconstruction tradeoff; version graph; delta graph; bounded
+treewidth; MinSum Retrieval; BoundedMax Retrieval; LMG-All; DP-MSR;
+DP-BMR; retained snapshots; cold-version reconstruction; tier policy.
+
+**Core idea:** The paper formalizes version retention as an optimization
+problem over a directed graph: versions are vertices, deltas are edges,
+and each candidate materialized version or stored delta has storage and
+retrieval costs. The system must choose which full versions and deltas
+to keep so retrieval remains cheap without storing everything.
+
+For GPU DB, this is a useful abstraction for retained snapshots,
+checkpoint generations, cold versions, resident fragments, and route
+metadata. Retention should not be a fixed age or LRU rule. It should be
+a frontier over a version graph where each decision has a measurable
+storage cost, reconstruction latency, invalidation impact, and expected
+reuse value.
+
+**Concrete mechanisms:**
+
+- The problem input is a directed version graph `G = (V, E)`. Vertices
+  represent dataset versions with materialization costs; directed edges
+  represent deltas with storage and retrieval costs. Retrieval of an
+  unmaterialized version follows a stored path from some materialized
+  ancestor or neighbor.
+- The paper studies storage/retrieval tradeoffs from Bhattacherjee et
+  al.'s PVLDB 2015 model: MinSum Retrieval (MSR), MinMax Retrieval
+  (MMR), BoundedSum Retrieval (BSR), and BoundedMax Retrieval (BMR).
+  These optimize total or worst-case retrieval cost under storage
+  bounds, or storage under retrieval bounds.
+- It proves that the prior Local Move Greedy (LMG) heuristic can be
+  arbitrarily bad in a simple worst case. It also shows strong hardness
+  results for general graphs, including difficulty approximating MSR
+  even when storage constraints are relaxed.
+- The paper argues that practical version graphs often have low
+  treewidth because versions usually arise from edit operations,
+  branches, and merges rather than arbitrary dense relationships.
+- For bounded-treewidth graphs, it gives dynamic-programming
+  approximation schemes. The paper states an FPTAS for MSR on graphs
+  with constant bounded treewidth, and analogous treatment for MMR plus
+  bicriteria variants for BSR/BMR.
+- LMG-All extends LMG by considering single-edge replacement moves, not
+  only materializing one additional version. On each step it starts from
+  a minimum-storage arborescence, evaluates active edges and versions
+  that preserve feasibility and acyclicity, and applies the best
+  cost-benefit move.
+- DP-MSR and DP-BMR extract a bidirectional tree from the input graph
+  using a minimum spanning arborescence, then run dynamic programming
+  over that tree. The paper notes that parallel DP techniques may make
+  this more practical than purely sequential greedy heuristics.
+- Experiments use GitHub repository version graphs, random-compression
+  variants, and Erdos-Renyi-style dense variants. Reported results show
+  DP-MSR often beating LMG-All, LMG-All beating LMG, and DP-MSR being
+  near 1000x better than LMG on the natural 996.ICU graph in the
+  presented figure. For BMR, DP-BMR usually beats MP except when the
+  retrieval constraint is near zero.
+- The paper is algorithmic, not a deployed storage engine. It does not
+  define crash recovery, MVCC visibility, SQL isolation, GPU memory
+  placement, or online cache admission.
+
+**GPU DB mapping:** GPU DB can model retained read snapshots,
+checkpointed CPU truth, resident GPU column fragments, cold NVMe
+segments, delta logs, and route metadata generations as a version graph.
+Materializing a vertex maps to keeping a full snapshot or checkpoint in
+HBM, DRAM, or NVMe. Storing an edge maps to keeping a delta, WAL range,
+fragment transform, compaction recipe, or reconstruction path.
+
+MSR maps to minimizing average retained-route reconstruction latency
+under a memory or storage budget. BMR maps to minimizing storage while
+guaranteeing a maximum reconstruction latency for high-priority
+snapshots, rollback points, or tenant-visible time-travel windows. MMR
+is useful for p99-oriented constraints: no admitted snapshot lineage
+should require an unexpectedly long replay path.
+
+The graph frontier also clarifies cache/tier policy. A hot GPU-resident
+snapshot may be worth full materialization; a warm DRAM snapshot may
+only need compact deltas from a recent checkpoint; a cold NVMe version
+may tolerate a longer reconstruction chain. The selection should depend
+on expected route reuse, byte budget, reconstruction bandwidth, and
+whether reconstruction would block mutation owners, residency owners,
+or GPU execution queues.
+
+Low-treewidth and tree-extraction ideas fit the storage architecture
+because snapshot lineages are not arbitrary in the first slice. WAL
+generations, checkpoints, refreshes, and compactions mostly form
+chains, branches, and merge-like publication points. A DP or greedy
+frontier over that reduced graph can be tested before attempting a
+general online optimizer.
+
+LMG-All's edge-move lesson is important: retention policy should
+consider storing a better delta or reconstruction edge, not only
+keeping another full snapshot. For GPU DB this means measuring
+incremental refresh deltas, fragment-level compaction outputs, resident
+key vectors, visibility masks, and checkpoint shortcuts as first-class
+cache objects.
+
+**Risks and mismatches:** The paper optimizes offline or batch-chosen
+version graphs, while GPU DB needs online admission under concurrent
+writes, long readers, WAL durability, eviction pressure, and GPU memory
+limits. The algorithms are useful design vocabulary, but the hot path
+still needs bounded, deterministic decisions.
+
+The model does not include correctness constraints such as
+WAL-before-visibility, snapshot isolation, DDL invalidation, predicate
+indexes, or crash replay. GPU DB cannot choose a cheaper reconstruction
+path unless it preserves the advertised isolation boundary and durable
+frontier.
+
+Retrieval cost in the paper is an abstract edge weight. GPU DB must
+split that into CPU replay time, NVMe reads, decompression, H2D
+transfer, GPU rebuild time, pinned-buffer occupancy, and queue
+interference. A path with low byte cost may still be bad if it occupies
+the residency owner or GPU stream during a latency-sensitive window.
+
+The practical DP heuristics extract trees from richer graphs. That can
+drop useful reconstruction edges when route fragments, compactions, or
+multi-parent merges are important. GPU DB should compare tree-frontier,
+LMG-All-style edge moves, and small bounded-treewidth windows before
+committing to one policy.
+
+**Benchmark candidates:**
+
+- Build a snapshot-retention graph benchmark with vertices for
+  checkpoints, retained CPU snapshots, GPU resident fragments, and
+  cold NVMe versions; edges for WAL replay, delta refresh, compaction,
+  and H2D rebuild paths. Gate: policy decisions report both storage
+  bytes and predicted reconstruction latency.
+- Compare age/LRU retention against MSR-style and BMR-style frontiers
+  under fixed HBM, DRAM, and NVMe budgets. Measure average route
+  rebuild latency, p99 reconstruction latency, write throughput impact,
+  and retained-read hit rate.
+- Add an edge-object benchmark: full snapshot materialization versus
+  stored deltas, visibility masks, resident key vectors, and fragment
+  compaction shortcuts. Expected result: some edge objects reduce
+  reconstruction latency more per byte than another full snapshot.
+- Stress long readers plus eviction. Failure condition: a reader's
+  advertised snapshot can only be reconstructed by replaying through
+  WAL or deltas that have already been reclaimed below its visibility
+  frontier.
+- Prototype a small LMG-All-style retention planner over route
+  generations, then compare it with a tree-extracted DP planner on
+  chain, branch, and merge-heavy snapshot histories. Gate: the planner
+  handles publication/invalidation changes without blocking mutation
+  or residency owners.
+- Split retrieval weights into CPU, NVMe, H2D, GPU rebuild, and queue
+  occupancy components. Measure whether a byte-optimal policy differs
+  from a latency-optimal policy under mixed reads and writes.
