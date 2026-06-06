@@ -5966,12 +5966,20 @@ Append new candidates here as each paper is processed.
   Why: Forerunner's motivation and later blockchain execution work make this a
   useful measurement baseline for how much parallel/speculative work exists in
   smart-contract traces before adopting richer constraint-checked route hints.
-- `queued` — **NEMO: Faster Parallel Execution for Highly Contended Blockchain
+- `reviewed` — **NEMO: Faster Parallel Execution for Highly Contended Blockchain
   Workloads**, Ezard, Ileri, and Decouchant, arXiv 2025.
   URL: `https://arxiv.org/abs/2510.15122`
   Why: modern high-contention blockchain execution follow-up discovered during
   the Forerunner review; useful for contrasting object-model OCC and
   contention-aware execution with GPU DB's hot-key write-window admission.
+  Journal entry added 2026-06-07 from arXiv v1.
+- `queued` — **Deferred Objects to Enhance Smart Contract Programming with
+  Optimistic Parallel Execution**, Mitenkov et al., arXiv 2024.
+  URL: `https://arxiv.org/abs/2405.06117`
+  Why: NEMO contrasts RapidLane's deferred-object path as a way to turn
+  conflict-heavy smart-contract operations into parallelizable work; useful for
+  comparing semantic deferral, predicted results, and commit-time validation
+  against GPU DB's hot-key write-window and route-hint admission designs.
 - `reviewed` — **Processing Transactions in a Predefined Order**, Saad et al.,
   PPoPP 2019.
   URL: `https://doi.org/10.1145/3293883.3295730`

@@ -94397,3 +94397,179 @@ for selective predicates.
 - Add a capability fallback benchmark where direct GPU IO is unavailable or
   unsafe. Gate: planner and runtime can route to CPU/GDS paths with explicit
   telemetry instead of silently assuming GPU file IO support.
+
+### 2026-06-07 - NEMO treats partial write-set knowledge as a contention throttle
+
+**Citation:** Francois Ezard, Can Umut Ileri, and Jeremie Decouchant.
+"NEMO: Faster Parallel Execution for Highly Contended Blockchain Workloads
+(Full version)." arXiv:2510.15122v1, 2025. Retrieved 2026-06-07 from
+arXiv: `https://arxiv.org/abs/2510.15122`,
+`https://arxiv.org/pdf/2510.15122`.
+
+**Category:** transaction processing / write path and runtime / HFT /
+session scale, with MVCC / snapshot / visibility relevance.
+
+**Relevance tags:** NEMO; optimistic concurrency control; deterministic
+serializability; high contention; object data model; partial read/write hints;
+greedy commit; dependency tracking; priority scheduling; Block-STM; PCC;
+re-execution reduction; hot-key admission; write-window scheduling.
+
+**Core idea:** NEMO targets deterministic blockchain execution, where a block
+must finish with the same state as sequential execution in the consensus order.
+It combines optimistic concurrency control with an object data model so that the
+runtime can use incomplete, statically derivable read/write hints without
+requiring the full pessimistic lock set. The goal is to keep optimistic
+parallelism but reduce pointless re-execution under highly contended workloads.
+
+For GPU DB, the strongest transferable idea is a middle ground between blind
+optimism and full predeclared write sets. Hot write windows can accept partial
+route hints such as known key ranges, guaranteed writes, partition IDs, or
+shared-object markers, then use those hints to order, delay, or prioritize
+admitted work while preserving a validation and retry path for missing facts.
+
+**Concrete mechanisms:**
+
+- NEMO adapts Block-STM to an object model. Objects have globally unique
+  identities, and transactions can expose a statically derived subset of
+  guaranteed object accesses. The hints are allowed to be incomplete; if no
+  hint exists, the system falls back toward Block-STM-style optimism.
+- Transactions that use only owned objects get a greedy fast path. Because an
+  owned object can be used by only one transaction per epoch, such transactions
+  are independent of other transactions in the same epoch and can skip
+  validation and commit immediately after execution.
+- For transactions that touch shared objects, execution records read/write
+  dependencies. NEMO tries to extract dependency information even from
+  successful executions, not only from reads of invalid or estimated values.
+- Dependency resolution is delayed until the blocking transaction passes
+  validation. This can keep dependents blocked longer, but it reduces the risk
+  that a dependent transaction resumes after a merely successful execution that
+  later fails validation and causes cascading re-execution.
+- Partial prior knowledge is used during preprocessing: known writes are marked,
+  and reads of those marked objects create dependencies. This orders known
+  conflicts without overconstraining transactions that might not actually touch
+  a branch-dependent object.
+- The priority scheduler uses a priority queue scored by the number of direct
+  dependents a task is known to block. Ties prefer lower transaction index.
+  This favors transactions that can unblock more work.
+- The implementation is a Rust prototype built on Block-STM, roughly 3,500
+  lines according to the paper. It uses simulated transaction execution rather
+  than a production VM, because the paper studies scheduling and concurrency
+  behavior rather than smart-contract execution cost.
+- The synthetic high-contention workload uses 50 shared objects, log-normal
+  object counts per transaction, Zipf(50, 2.0) object popularity, and mixed
+  read/read-write/write accesses. Execution time is simulated from a log-normal
+  distribution with mean around 8.4 ms.
+- The paper compares NEMO with sequential execution, Block-STM, and a
+  pessimistic baseline inspired by Sui/Lutris. With 16 workers and full prior
+  knowledge, NEMO reports 1,574 TPS versus 1,105 TPS for Block-STM, a 42.4%
+  improvement, and 60.8% over the PCC baseline. At 16 workers and 75% prior
+  knowledge, it reports 1,243 TPS versus 1,076 TPS for Block-STM.
+- A key limitation appears in the evaluation: priority scheduling helps most
+  when prior knowledge is very complete, but can increase re-executions when
+  hints are partial because a later known blocker can jump ahead of an earlier
+  unknown blocker.
+
+**GPU DB mapping:** The current runtime target already separates mutation
+owners, read-snapshot workers, GPU execution owners, and bounded rings. NEMO
+suggests that mutation admission should expose a small route-hint envelope
+before the transaction reaches the owner: known table/partition, known key or
+range, guaranteed write set if available, possible read/write families, and
+whether the transaction is single-object, owned-partition, or shared-hot-key.
+
+The greedy owned-object rule maps to partition-owned or key-owned write lanes.
+If a request is proven to mutate only one owner domain and no shared route
+metadata, it can bypass cross-partition conflict machinery and go straight to
+that owner lane. The proof must be deterministic and conservative, because SQL
+side effects, indexes, foreign keys, sequences, triggers, and DDL can turn a
+seemingly local mutation into shared work.
+
+Partial hints map to prepared statements and route descriptors. A prepared
+write shape can advertise guaranteed keys, partition columns, and possible
+secondary-index families without pretending to know every branch result.
+Admission can then order obvious conflicts and leave validation to catch
+branch-dependent or data-dependent accesses.
+
+Delayed dependency release maps to retry policy. Instead of immediately
+resubmitting a read/write window after an intermediate execution result, GPU DB
+can hold blocked retries until the writer's WAL/MVCC visibility publication is
+validated. This may add queue wait but can reduce repeated GPU/CPU work under
+hot-key contention.
+
+The priority scheduler maps to hot-key unblock ordering. A mutation owner can
+prioritize the transaction whose commit would unblock the largest known cohort
+of retained reads, dependent writes, or refresh tasks, while still enforcing
+fairness and p99 SLO caps. Unknown dependencies should not be allowed to starve
+earlier work.
+
+**Risks and mismatches:** NEMO is a blockchain execution paper, not a SQL DBMS
+paper. It assumes deterministic serializability relative to a preordered block,
+lazy block commit, and a smart-contract object model. GPU DB still needs
+SQL-visible transaction semantics, WAL-before-visibility, MVCC snapshots,
+secondary indexes, DDL, error behavior, and pgwire response ordering.
+
+The evaluation uses simulated execution and synthetic workloads, not a real
+database executor, TPC-C, YCSB, pgwire fan-in, GPU kernels, WAL flushes, or
+storage IO. The reported throughput improvements are evidence that partial
+dependency hints can reduce redundant work, not a direct database speedup.
+
+Priority scheduling is fragile under incomplete hints. If GPU DB adds blocker
+scoring, it needs telemetry and fallback that detect when the score is making
+unknown conflicts worse. A simple FIFO or deterministic transaction order may
+beat a clever policy under poor hint quality.
+
+Owned-object fast paths can be dangerous in SQL. A single-row update may still
+touch indexes, constraints, sequences, materialized views, route invalidation,
+or resident refresh metadata. Any "owned" classification must include all
+logical and physical side effects, not only the base row.
+
+**Benchmark candidates:**
+
+- Add a hot-key write-window simulator comparing FIFO owner execution, blind
+  optimistic execution, full predeclared write-set scheduling, and NEMO-style
+  partial hints. Measure throughput, aborts/retries, p50/p99, queue wait, and
+  wasted GPU/CPU work.
+- Prototype a route-hint envelope for prepared writes:
+  `{table, partition, guaranteed_keys, possible_index_families,
+  shared_metadata_flags}`. Gate: missing hints never bypass validation, and bad
+  hints produce retry/fallback rather than stale visibility.
+- Test an owned-partition fast path for single-partition mutations. Failure
+  condition: any secondary index, DDL, constraint, sequence, or resident-route
+  invalidation side effect is skipped by the fast path.
+- Compare retry release policies under contention: immediate retry after
+  execution, retry after validation, and retry after WAL/MVCC publication.
+  Measure redundant executions, commit latency, and blocked-reader latency.
+- Add a blocker-priority scheduler benchmark. Score transactions by known
+  dependents and compare against FIFO/deterministic order under 25%, 50%, 75%,
+  and 100% hint quality. Gate: priority scheduling must disable itself when
+  hint quality causes worse p99 or more retries.
+- Stress mixed retained reads plus hot writes. Known hot-key writers should
+  unblock compatible retained reads only after visibility publication, and
+  stale read snapshots must not be reused across conflicting write windows.
+
+### 2026-06-07 - Cross-paper synthesis: route hints need measured trust
+
+GeminiFS, Lemo, Eraser, and NEMO converge on a sharper route contract. GeminiFS
+says a GPU worker can move faster when it receives compact, validated storage
+metadata. Lemo says concurrent queries need optimizer-visible reusable assets.
+Eraser says learned route choices need a reliability gate before they can
+override conservative plans. NEMO says even transaction scheduling can benefit
+from incomplete hints, but only if validation and fallback remain in the loop.
+
+The design track is a measured route-hint layer. Hints should be first-class
+records with source, scope, generation, visibility boundary, durability boundary
+when relevant, observed accuracy, and fallback path. They can describe GPU
+block maps, retained intermediates, parameterized plan families, or hot write
+dependencies. The runtime should spend trust gradually: deterministic
+eligibility first, calibrated performance ranking second, and speculation only
+inside an explicit retry or regression budget.
+
+Category gaps now point back toward WAL group commit, MVCC garbage collection,
+and GPU kernel-level batching. Query optimization and storage metadata have
+strong recent coverage; the next high-value paper should preferably deepen
+write admission, snapshot cleanup, or concrete GPU execution batching unless a
+newer primary source is clearly stronger.
+
+Benchmark priorities: combine route-hint accuracy with runtime outcomes. A
+useful benchmark should report not only speedup, but hint coverage, hint
+precision, retries caused by missing hints, stale-route rejections, fallback
+counts, and p99 impact when hint quality degrades.
