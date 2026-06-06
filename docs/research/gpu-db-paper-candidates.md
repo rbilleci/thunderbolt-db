@@ -56,12 +56,14 @@ read/write throughput, recovery, compaction, or tail-latency mechanisms.
   and TPC-C; selected after recent reviews skewed storage/indexing and the
   queue lacked a strong modern transaction/GPU-OLTP candidate. Journal entry
   added 2026-06-06.
-- `queued` — **GaccO: A GPU-Accelerated OLTP DBMS**, Boeschen and Binnig,
+- `reviewed` — **GaccO: A GPU-Accelerated OLTP DBMS**, Boeschen and Binnig,
   SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526123`
   Why: GPU-Accelerated OLTP identifies GaccO as the strongest high-contention
   GPU conflict-ordering path; useful for studying batch preprocessing,
   all-access conflict treatment, and GPU transaction route admission.
+  Journal entry already exists; this stale seed-queue duplicate was corrected
+  from `queued` to `reviewed` on 2026-06-06.
 - `reviewed` — **LTPG: Large-Batch Transaction Processing on GPUs with
   Deterministic Concurrency Control**, Wei et al., ICDE 2024.
   URL: `https://doi.org/10.1109/ICDE60146.2024.00296`
@@ -6163,13 +6165,14 @@ Append new candidates here as each paper is processed.
   native versioned storage engine; useful for comparing branch-aware storage
   primitives against GPU DB's MVCC lineage, retained snapshots, and
   old-version reconstruction cost. Journal entry added 2026-06-06.
-- `queued` — **Principles of Dataset Versioning: Exploring the
+- `reviewed` — **Principles of Dataset Versioning: Exploring the
   Recreation/Storage Tradeoff**, Bhattacherjee et al., PVLDB 2015.
   URL: `https://www.vldb.org/pvldb/vol8/p1346-bhattacherjee.pdf`
   arXiv: `https://arxiv.org/abs/1505.05211`
   Why: OrpheusDB builds on the recreation/storage tradeoff for versioned
   datasets; useful for turning GPU DB snapshot-retention, checkpoint, and
   cold-version reconstruction policy into an explicit cost frontier.
+  Journal entry added 2026-06-06.
 - `queued` — **DataHub: Collaborative Data Science & Dataset Version
   Management at Scale**, Bhardwaj et al., CIDR 2015.
   URL: `https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper18.pdf`
@@ -6368,3 +6371,10 @@ Append new candidates here as each paper is processed.
   designs; OrcGC is a useful follow-up for deciding whether GPU DB route
   metadata should remain manually retired by owner domains or hide
   protection/deallocation in a more automatic descriptor API.
+- `queued` — **To Store or Not to Store: a graph theoretical approach for
+  Dataset Versioning**, Abdelhamid et al., arXiv 2024.
+  URL: `https://arxiv.org/abs/2402.11741`
+  Why: discovered while reviewing the PVLDB 2015 dataset-versioning
+  storage/recreation frontier; useful as a modern follow-up on graph-based
+  storage and reconstruction optimization before GPU DB turns snapshot
+  retention into an online multi-tier policy.

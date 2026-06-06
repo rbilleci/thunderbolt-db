@@ -38,6 +38,208 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Dataset versioning turns snapshot retention into a storage-recreation frontier
+
+**Citation:** Souvik Bhattacherjee, Amit Chavan, Silu Huang,
+Amol Deshpande, and Aditya Parameswaran. "Principles of Dataset
+Versioning: Exploring the Recreation/Storage Tradeoff." PVLDB
+8(12), pp. 1346-1357, 2015. DOI:
+`https://doi.org/10.14778/2824032.2824035`. Retrieved 2026-06-06
+from the arXiv PDF, `https://arxiv.org/pdf/1505.05211`; the VLDB
+PDF URL is `https://www.vldb.org/pvldb/vol8/p1346-bhattacherjee.pdf`
+but direct `curl` to `vldb.org` timed out during this run.
+
+**Category:** MVCC / snapshot / visibility and database storage
+layout, with secondary relevance to multi-tier cache / data placement.
+
+**Relevance tags:** dataset versions; snapshot retention; delta
+chains; recreation cost; storage cost; materialization policy; version
+graph; storage graph; checkpoint placement; cold-version
+reconstruction; workload-aware retention; NP-hard placement; greedy
+materialization; maximum recreation bound.
+
+**Core idea:** The paper frames version management as an explicit
+tradeoff between storing complete versions and storing deltas that can
+recreate them. More materialized versions consume more storage but
+reduce retrieval latency; fewer materialized versions reduce storage
+but increase reconstruction cost through delta chains.
+
+The useful transfer for GPU DB is to treat retained snapshots,
+checkpoints, resident segments, and cold historical versions as points
+on the same storage-recreation frontier. Instead of retaining or
+evicting snapshots with only age or LRU, the engine should know how
+expensive each version is to store, how expensive it is to reconstruct,
+and which versions or route frontiers are likely to be requested.
+
+**Concrete mechanisms:**
+
+- The system models versions as a directed version graph. A version may
+  be materialized in full or stored as a delta from another version.
+- It separates storage cost from recreation cost. A delta may be small
+  but expensive to apply, or larger but cheap to replay, so the paper
+  represents the two quantities as separate matrices `Delta` and `Phi`.
+- A storage solution is represented as a storage graph rooted at a
+  dummy source node. Edges from the dummy node mean full
+  materialization; edges between versions mean stored deltas.
+- A valid storage graph must let every version be reconstructed from at
+  least one materialized root through a path of deltas. The paper shows
+  the optimal storage graph for its six formulations is a spanning tree
+  rooted at the dummy node.
+- The extreme cases are simple: minimizing only storage maps to a
+  minimum spanning tree over storage costs, and minimizing only
+  recreation maps to a shortest-path tree over recreation costs.
+- The useful middle problems constrain either total storage or
+  recreation while minimizing the other metric. The paper considers
+  both sum-of-recreation and maximum-recreation objectives, plus
+  directed and undirected delta variants.
+- Most balanced formulations are NP-hard, including cases with
+  symmetric proportional costs. The paper gives reductions from set
+  cover and related bounded-diameter tree problems.
+- The Local Move Greedy heuristic starts from a storage-minimal tree and
+  greedily replaces delta edges with shortest-path-tree edges that give
+  the largest reduction in total recreation cost per added storage byte.
+  It can weight recreation reduction by access frequency.
+- The Modified Prim heuristic targets a maximum recreation bound. It
+  grows a tree by low marginal storage cost while maintaining that each
+  version's reconstruction path stays within a threshold.
+- The LAST variant balances a minimum spanning tree and shortest-path
+  tree by replacing long reconstruction paths when they exceed an
+  approximation threshold.
+- The Git-style heuristic sorts versions by size, uses a sliding window
+  of candidate parents, and chooses low delta cost while respecting a
+  chain-depth bound. The paper uses it as a practical baseline.
+- The prototype is a DATAHUB-oriented version-management system with a
+  Git/SVN-like interface over HTTP. It evaluates synthetic workloads and
+  real GitHub repository histories.
+- Evaluation reports that a small storage increase over the minimum
+  storage solution can sharply reduce reconstruction cost. In one
+  directed dataset example, increasing storage to about 1.1x the
+  minimum storage solution reduces total recreation cost by roughly
+  three orders of magnitude.
+- LMG is reported as strongest for total recreation/storage tradeoff,
+  MP as strongest when maximum recreation cost matters, and Git-style
+  greedy choices as often requiring significantly more storage for
+  similar recreation behavior.
+- The workload-aware LMG variant improves results when version access
+  frequencies are skewed, but the paper's offline model does not solve
+  online arrival of new versions.
+
+**GPU DB mapping:** GPU DB already has durable WAL/checkpoints, CPU
+truth, retained read snapshots, resident GPU buffers, and future cold
+tiers. This paper suggests turning those into a named optimization
+problem: choose which frontiers to materialize and which frontiers to
+recreate from deltas, WAL, checkpoints, or resident segment ancestors.
+
+For MVCC, a version is not just a dataset branch. It can be a visibility
+frontier, checkpoint generation, resident segment generation, catalog
+generation, or route certificate. The storage graph edge is the
+reconstruction method: replay WAL from checkpoint, apply row deltas,
+rebuild a column group, reconstruct a resident key vector, or copy from
+another tier.
+
+For P8, `Delta` should be byte cost across tiers: HBM bytes, pinned host
+bytes, DRAM bytes, NVMe bytes, object bytes, and metadata bytes. `Phi`
+should be route cost: reconstruction latency, CPU cycles, GPU rebuild
+time, IO stall, decompression cost, and possible p99 impact. Those are
+not always proportional, so a compressed delta and an HBM snapshot need
+separate storage and recreation accounting.
+
+The maximum-recreation objective maps directly to route SLOs. A cold
+snapshot chain can be storage-efficient but still unacceptable if
+recreating a hot retained-read frontier crosses the query latency
+budget. MP-style thresholds suggest a policy: every route-visible
+snapshot must have a bounded reconstruction path, even if total storage
+would be lower with deeper chains.
+
+The workload-aware LMG idea maps to prepared statements and route
+telemetry. Retain full snapshots or cheap checkpoints for frontiers with
+high access frequency, high latency sensitivity, large fan-out, or high
+rebuild cost; let rarely used cold versions become longer delta chains.
+
+**Risks and mismatches:** The paper is about collaborative dataset
+versioning, not SQL MVCC, durability, WAL ordering, DDL invalidation, or
+GPU execution. Its storage graph is a planning abstraction; GPU DB still
+needs WAL-before-visibility and exact snapshot semantics before any
+version is visible.
+
+The evaluated workloads are file/dataset histories, not transactional
+tuple-version chains with concurrent readers and writers. Delta
+construction cost can dominate and is only partly represented in the
+offline model.
+
+The model stores each version as a delta from a single parent. GPU DB
+may need multi-parent reconstruction, such as checkpoint plus WAL plus
+catalog delta plus resident segment copy, which is closer to a DAG than
+a tree.
+
+The paper focuses on static offline optimization. GPU DB needs an online
+policy that handles continuous writes, snapshot retirement, eviction,
+crash recovery, and tier pressure under active sessions.
+
+**Benchmark candidates:**
+
+- Build a snapshot-retention simulator where versions are visibility
+  frontiers and edges are reconstruction methods: checkpoint load, WAL
+  replay, row delta apply, GPU segment rebuild, and tier copy. Gate:
+  every policy reports storage bytes and p50/p99 reconstruction latency.
+- Compare LRU, age-based retention, LMG-style sum-latency reduction,
+  and MP-style maximum-recreation bound for retained read snapshots.
+  Expected result: bounded-recreation policies avoid deep cold chains
+  for hot route frontiers with modest storage overhead.
+- Add workload-aware retention using route frequency, tenant priority,
+  prepared-statement shape, and rebuild time as weights. Gate: hot
+  retained routes keep shallow reconstruction paths while cold versions
+  are demoted.
+- Evaluate storage/recreation as separate metrics across HBM, DRAM,
+  NVMe, and object storage. Failure condition: a policy that minimizes
+  bytes creates unacceptable route p99 because compressed or remote
+  deltas are too slow to apply.
+- Test crash-recovery opening modes: fully materialize recent
+  checkpoints before serving, open with longer reconstruction chains, or
+  materialize only SLO-critical frontiers. Gate: correctness is identical
+  and every route explains its reconstruction path.
+- Extend the simulator from tree to DAG reconstruction. Gate: combined
+  WAL plus checkpoint plus resident-copy paths are compared against the
+  simpler single-parent approximation before adopting a production
+  policy.
+
+### 2026-06-06 - Cross-paper synthesis: retained routes need bounded reconstruction, placement, and retirement
+
+The last three modern reviews make the route certificate more concrete
+across time. SkyStore says a replica should stay only while expected
+reuse beats storage and transfer cost. Hyaline says old descriptors and
+resident handles should retire by physical-worker reachability rather
+than by per-logical-session state. Dataset versioning adds the missing
+historical dimension: a route-visible generation should have an explicit
+storage-recreation budget, not just a timestamp.
+
+The converging design track is a bounded retained-route graph. Each
+route generation needs three facts: where it is placed, how it can be
+reconstructed if evicted, and when it can be retired. Hot frontiers get
+materialized or shallow reconstruction paths; cold frontiers get deeper
+delta/replay chains; unreachable descriptors are retired without
+polluting the read hot path.
+
+Category gaps remain around online policy under active writes and SQL
+predicate/range snapshots. The next useful papers should keep balancing
+MVCC/snapshot retention, runtime reclamation, and tier placement against
+transactional write admission, so the design does not become only a
+cache policy.
+
+Benchmark priorities:
+
+- Simulate route generations as a graph with placement, reconstruction,
+  and retirement metadata. Gate: every retained route reports storage
+  cost, expected reconstruction latency, freshness boundary, and
+  reclamation state.
+- Combine SkyStore-style TTL break-even with dataset-versioning
+  recreation bounds. Gate: HBM/DRAM/NVMe demotion never leaves an
+  SLO-critical route with a reconstruction path above its latency budget.
+- Stress Hyaline-style descriptor retirement while the retention policy
+  publishes and evicts many generations. Failure condition: reclamation
+  state scales with logical sessions instead of physical workers, or
+  cleanup shifts heavy frees onto latency-sensitive IO workers.
+
 ### 2026-06-06 - Hyaline keeps lock-free metadata retirement off the read hot path
 
 **Citation:** Ruslan Nikolaev and Binoy Ravindran. "Snapshot-Free,
