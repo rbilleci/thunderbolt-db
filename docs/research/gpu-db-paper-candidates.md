@@ -5774,13 +5774,13 @@ Append new candidates here as each paper is processed.
   compaction behavior; this primary RocksDB design paper is useful for
   comparing space amplification, compaction, and cold-tier write pressure
   before GPU DB designs realistic LSM-like benchmark traces.
-- `queued` — **FPTree: A Hybrid SCM-DRAM Persistent and Concurrent B-Tree for
+- `reviewed` — **FPTree: A Hybrid SCM-DRAM Persistent and Concurrent B-Tree for
   Storage Class Memory**, Oukid et al., SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2915251`
   Why: SAP HANA NVM cites FPTree as a persistent-memory index direction;
   useful for comparing DRAM-resident volatile inner nodes plus persistent
   leaves against GPU DB's CPU warm indexes, resident key vectors, and rebuild
-  policy after restart.
+  policy after restart. Reviewed on 2026-06-06.
 - `queued` — **On Testing Persistent-Memory-Based Software**, Oukid et al.,
   DaMoN 2016.
   URL: `https://doi.org/10.1145/2933349.2933355`
@@ -5861,3 +5861,12 @@ Append new candidates here as each paper is processed.
   Why: EQDS names Aeolus as a Homa-like proactive transport option; useful for
   comparing receiver-driven low-latency request/response transport with GPU
   DB's command-ring credits and micro-batch admission.
+- `queued` — **REWIND: Recovery Write-Ahead System for In-Memory
+  Non-Volatile Data-Structures**, Chatzistergiou, Cintra, and Viglas,
+  PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol8/p497-chatzistergiou.pdf`
+  DOI: `https://doi.org/10.14778/2735479.2735483`
+  Why: FPTree's split/delete micro-logs and persistent allocator make crash
+  repair a first-class index concern; REWIND is a primary follow-up for
+  comparing write-ahead recovery schemes for persistent data structures before
+  GPU DB stores durable route metadata or future-tier indexes.

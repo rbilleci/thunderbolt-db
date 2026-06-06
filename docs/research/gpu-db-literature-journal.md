@@ -75299,3 +75299,146 @@ Benchmark priorities:
 - execution-shape comparison for stop-early, skip-heavy, and fused routes
 - retired-state pressure under long GPU snapshots and high update churn
 - CPU fallback fairness gates for every claimed GPU route win
+
+### 2026-06-06 - FPTree: persistent leaves, volatile routing, and crash-bounded index repair
+
+**Citation:** Ismail Oukid, Johan Lasperas, Anisoara Nica, Thomas
+Willhalm, and Wolfgang Lehner. "FPTree: A Hybrid SCM-DRAM
+Persistent and Concurrent B-Tree for Storage Class Memory." SIGMOD
+2016, pp. 371-386. doi:10.1145/2882903.2915251. Retrieved
+2026-06-06 from the ACM DOI metadata and the TU Dresden
+self-archived accepted version,
+`https://nbn-resolving.org/urn:nbn:de:bsz:14-qucosa2-804432`.
+
+**Category:** multi-tier cache / data placement, with persistent
+index and concurrency-control relevance.
+
+**Relevance tags:** persistent memory; selective persistence;
+volatile inner nodes; persistent leaves; crash recovery; B+ tree;
+fingerprints; persistent allocator; micro-logs; HTM; fine-grained
+leaf locks; future CXL/NVM tiers; warm CPU indexes.
+
+**Core idea:** FPTree splits a B+ tree by durability value. Leaf
+nodes contain the primary key/value data and live in storage-class
+memory, while inner routing nodes stay in DRAM and are rebuilt
+after restart by scanning the persistent leaf chain. The paper's
+central lesson is that a high-performance persistent index does not
+need to make every byte durable. It should persist only the state
+whose loss would lose information, and keep cheap, derivable route
+metadata volatile.
+
+The same split appears in the concurrency design. FPTree uses HTM
+for traversal and volatile inner-node edits, but moves persistent
+leaf writes and cache-line flushes outside HTM because flush
+instructions conflict with current HTM implementations. Persistent
+leaf changes are protected with fine-grained leaf locks and small
+operation-specific recovery records.
+
+**Concrete mechanisms:**
+
+- Leaves are unsorted, persistent, linked by persistent pointers,
+  and carry a validity bitmap. Inner nodes are ordinary sorted DRAM
+  nodes and can be rebuilt from the leaf linked list.
+- Each leaf stores one-byte key fingerprints contiguously near the
+  front of the leaf. Lookup scans fingerprints before probing full
+  keys, reducing expected in-leaf key probes to roughly one under a
+  uniform fingerprint hash.
+- Persistent pointers contain a file id and offset rather than a
+  process virtual address, so pointers remain interpretable after
+  restart.
+- The persistent allocator is passed a persistent pointer owned by
+  the data structure. Allocation persists the returned address there;
+  deallocation clears it. Recovery can then determine whether an
+  interrupted allocation should be completed, rolled back, or
+  reclaimed, avoiding persistent memory leaks.
+- Writes larger than the assumed p-atomic size are guarded by
+  p-atomic flags or bitmap changes. Insert writes and persists the
+  key/value and fingerprint first, then makes the entry visible by
+  persisting the bitmap.
+- Leaf splits use a micro-log with persistent pointers for the
+  current leaf and new leaf. Recovery can replay from allocation,
+  copy, bitmap split, or link update depending on which pointers and
+  bitmaps were persisted.
+- Leaf deletion similarly logs the current and previous leaf so
+  recovery can finish unlinking or deallocating the removed leaf.
+- Leaf groups amortize expensive persistent allocation by allocating
+  multiple leaves at once and keeping a volatile free-leaf vector.
+- The evaluation compares FPTree against persistent tree variants
+  under emulated SCM latencies, many-core concurrency, memcached,
+  and a prototype database with TATP. The paper reports that FPTree
+  uses less than 3% DRAM for inner nodes, scales to 88 logical
+  cores, and keeps prototype database overhead to about 8.7% at
+  160 ns SCM latency and 12.8% at 650 ns versus a transient tree.
+
+**GPU DB mapping:** For GPU DB's P8 storage design, FPTree is a
+good model for a future CPU warm-tier or CXL/NVM-resident index:
+make the durable leaf or segment payload the recovery authority,
+but keep route nodes, GPU route metadata, and planner-friendly
+summaries rebuildable. A restart should validate durable leaves or
+segments, rebuild volatile routing and GPU residency metadata, then
+serve CPU fallback while the GPU tier warms.
+
+The bitmap-last visibility pattern maps directly to resident
+snapshot publication. A key/value, bitmap word, predicate mask, or
+resident segment can be prepared and flushed before a small
+generation/validity word makes it visible to readers. That mirrors
+WAL-before-visibility: data and recovery metadata first, visible
+route certificate last.
+
+FPTree's persistent pointer discipline is also useful even before
+real persistent memory exists. Any future tier that stores route
+metadata outside normal process memory should avoid raw virtual
+pointers in durable records. Durable metadata should identify table,
+segment, file or arena, offset, generation, and schema/layout
+version; volatile handles can be reconstructed from that identity.
+
+For the high-throughput runtime, selective concurrency suggests a
+clean owner-domain split. Keep volatile route selection, GPU stream
+choice, and inner routing state in fast owner-local memory; isolate
+durable or semi-durable publication into small locked or owned
+critical sections with bounded recovery descriptors. Do not put
+flush/fsync/persistent-allocation work inside a speculative hot-path
+transaction or global owner lock.
+
+**Risks and mismatches:** The paper targets storage-class memory
+and CPU B+ trees, not GPUs, CUDA memory, NVMe, SQL MVCC, or WAL
+integration. It assumes persistent memory byte addressability and
+models SCM latencies with DRAM-based hardware support rather than
+modern CXL/NVDIMM products. Its HTM path depends on TSX-like
+hardware behavior and a global fallback lock; that is not a portable
+production assumption.
+
+The volatile-inner-node rebuild is attractive only when rebuild
+time and memory footprint are bounded. GPU DB should not persist
+only leaves for an index so large that restart spends unacceptable
+time reconstructing routing state before traffic can resume. The
+paper's leaf locks protect physical operations, not SQL-level
+serializability, predicate-lock correctness, or multi-index snapshot
+consistency. Those layers still need the database's WAL, MVCC, and
+visibility contract.
+
+**Benchmark candidates:**
+
+- Prototype a rebuildable warm-tier index shape: durable leaf or
+  segment records plus volatile route nodes. Gate: restart rebuilds
+  route metadata within a fixed budget and can serve CPU fallback
+  before GPU residency warms.
+- Add a visibility-publication microbenchmark with data-first,
+  bitmap-or-generation-last publication for resident key vectors and
+  predicate masks. Measure reader correctness under forced crashes
+  or injected interruption points.
+- Compare persistent-pointer-style route identities against raw
+  in-process handles for cached route metadata. Failure condition:
+  any durable or cross-tier record requires a stale process address
+  to recover or validate.
+- Build a crash-injection harness for split/delete/evict style
+  metadata publication. Inject failure after allocation, copy,
+  bitmap update, link update, and descriptor clear; recovery must
+  either complete or roll back without leaks or double visibility.
+- Measure allocation strategy for hot index or resident-fragment
+  churn: per-fragment allocation, grouped allocation, and fixed owner
+  rings. Track p50/p99 write latency, allocator contention, restart
+  scan time, and wasted bytes.
+- If CXL/NVM hardware is added later, compare volatile-route plus
+  persistent-leaf indexes against fully persistent route trees under
+  TATP-like point lookups, range scans, updates, and restart gates.
