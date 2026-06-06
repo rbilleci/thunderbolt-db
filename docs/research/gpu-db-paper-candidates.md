@@ -6106,13 +6106,25 @@ Append new candidates here as each paper is processed.
   serializability checking with predicate database operations and more use of
   transaction time information, directly relevant to moving GPU DB audit traces
   beyond point-key histories. Journal entry added 2026-06-06.
-- `queued` — **Efficient Black-box Checking of Snapshot Isolation in
+- `reviewed` — **Efficient Black-box Checking of Snapshot Isolation in
   Databases**, PolySI, arXiv 2023.
   URL: `https://arxiv.org/abs/2301.07313`
+  PDF: `https://arxiv.org/pdf/2301.07313`
+  DOI: `https://doi.org/10.14778/3583140.3583145`
   Why: discovered while reviewing Cobra's isolation-checking follow-up line;
   useful for validating MVCC/snapshot routes when the engine intentionally
   offers snapshot isolation or retained read snapshots rather than full
-  serializability.
+  serializability. Journal entry added 2026-06-07 from arXiv v2 / PVLDB 2023
+  metadata.
+- `queued` — **CoFI: Consistency-Guided Fault Injection for Cloud Systems**,
+  Chen, Dou, Wang, and Qin, ASE 2020.
+  URL: `https://doi.org/10.1145/3324884.3416548`
+  Author PDF: `https://wsdou.github.io/papers/2020-ase-cofi.pdf`
+  Project: `https://hanseychen.github.io/CoFI/`
+  Why: PolySI's discussion points to fault injection as a natural way to
+  trigger isolation bugs; useful for deciding how GPU DB should schedule
+  network partitions, crash/replay interruptions, and tier/route invalidation
+  faults around inconsistent states before running black-box SI witnesses.
 - `reviewed` — **Viper: A Fast Snapshot Isolation Checker**, Zhang, Ji, Mu,
   and Tan, EuroSys 2023.
   URL: `https://doi.org/10.1145/3552326.3567492`

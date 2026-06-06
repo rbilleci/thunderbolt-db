@@ -95137,3 +95137,169 @@ run together. Report not just throughput, but stale-route rejections,
 durability boundary lag, protected-object count, unreclaimed bytes,
 promotion/demotion bytes, offload/fetch decisions, and p99 latency under
 memory pressure.
+
+### 2026-06-07 - PolySI makes snapshot claims black-box testable
+
+**Citation:** Kaile Huang, Si Liu, Zhenge Chen, Hengfeng Wei,
+David Basin, Haixiang Li, and Anqun Pan. "Efficient Black-box
+Checking of Snapshot Isolation in Databases." PVLDB 16(6), 2023,
+pages 1264-1276. Retrieved 2026-06-07 from arXiv v2 / PVLDB
+metadata: `https://arxiv.org/abs/2301.07313`,
+`https://arxiv.org/pdf/2301.07313`,
+`https://doi.org/10.14778/3583140.3583145`.
+
+**Category:** MVCC / snapshot / visibility, with testing and
+transaction-correctness relevance.
+
+**Relevance tags:** PolySI; snapshot isolation; black-box
+checking; generalized polygraphs; uncertain dependencies; SMT;
+MonoSAT; anomaly counterexamples; lost updates; causality
+violations; retained snapshot validation; route-audit traces.
+
+**Core idea:** PolySI turns snapshot-isolation claims into an
+offline black-box checking problem over client-observable
+transaction histories. The paper argues that a useful SI checker
+must be sound, complete for determinate histories, informative,
+effective on real systems, general enough for standard key-value
+or SQL APIs, and efficient under concurrent workloads.
+
+The transferable lesson for GPU DB is not that the hot path should
+run an SMT solver. It is that retained read snapshots, CPU/GPU
+fallbacks, route invalidations, and WAL publication need an
+external witness format rich enough to prove or refute the claimed
+isolation contract after a stress run. If a query can execute from a
+resident GPU generation, a CPU fallback, or an older retained
+snapshot, the benchmark harness should be able to reconstruct the
+read/write history and check whether the observable behavior still
+matches the advertised snapshot semantics.
+
+**Concrete mechanisms:**
+
+- PolySI models a history as transactions plus session order and
+  read-from observations. It builds known session-order and
+  write-read dependencies, then represents unknown write-write and
+  read-write ordering choices as generalized polygraph constraints.
+- A generalized constraint compacts the ordering alternatives for
+  two writers and the transactions that read from them. This avoids
+  expanding every possible dependency graph before solving.
+- The SI characterization reduces checking to finding whether the
+  induced SI graph has an acyclic compatible graph, while also
+  checking aborted-read and intermediate-read anomalies outside the
+  committed-transaction dependency graph.
+- The checker constructs the generalized polygraph, repeatedly
+  prunes constraint alternatives that would already create forbidden
+  cycles in the known induced graph, encodes the remaining graph
+  constraints, and calls MonoSAT for acyclicity.
+- The interpretation algorithm turns a solver cycle into a smaller
+  counterexample by restoring pruned or missing participants,
+  resolving uncertain dependencies, and removing irrelevant
+  dependencies. The goal is to explain whether the cause is a lost
+  update, causality violation, long fork, or related SI anomaly.
+- The workload generator records histories from ordinary database
+  APIs using unique written values, so reads can be tied back to
+  candidate writers without relying on internal timestamps.
+- The evaluation reproduces 2477 known SI anomalies and reports
+  new SI violations in Dgraph, MariaDB-Galera, and YugabyteDB.
+- For valid histories, PolySI outperforms dbcop and a Cobra-based
+  SI reduction under the paper's general workloads. The paper
+  reports that pruning can reduce hundreds of thousands of
+  constraints to thousands or zero depending on workload, and that
+  one-million-transaction workloads with hundreds of millions of
+  operations remain checkable on modern hardware, though some
+  cases take hours and tens of GB of memory.
+- The paper explicitly notes current black-box checkers do not
+  cover predicate-specific anomalies and suggests predicates as
+  future work.
+
+**GPU DB mapping:** The engine should emit route-audit histories
+for correctness stress tests: transaction id, session id, statement
+shape, key/value or row identifiers, read values, write values,
+commit/abort status, selected route, snapshot generation, resident
+generation, fallback reason, WAL visibility boundary, and
+invalidation generation. PolySI-style checking then becomes a gate
+for retained snapshot and CPU/GPU route experiments.
+
+The generalized-polygraph idea maps to route uncertainty. When a
+black-box trace cannot see which writer a retained read should have
+observed, or whether a CPU fallback and GPU route saw compatible
+boundaries, the checker should represent those alternatives
+explicitly rather than guessing a single history. That is especially
+useful for same-shape micro-batches where many reads share a
+snapshot generation but scatter results to different sessions.
+
+The pruning lesson maps to benchmark practicality. Hot-path
+telemetry can expose enough known order to remove most
+uncertainty before expensive offline checking: WAL append order,
+visibility publication order, invalidation-before-visibility order,
+snapshot acquisition generation, and route admission/rejection
+time. These are not a substitute for black-box checking, but they
+can make large histories tractable.
+
+The interpretation algorithm is valuable for developer workflow.
+A failing retained-snapshot stress test should not only say
+"not SI"; it should produce a small counterexample naming the
+sessions, route generations, reads, writes, and invalidation/fallback
+events that explain the anomaly.
+
+Predicate limitations are directly relevant. GPU DB wants range
+reads, prefix predicates, scans, and aggregates over resident data.
+PolySI's key-value form is a good first gate for point reads and
+write/write conflicts, but GPU DB also needs predicate-aware
+histories for phantom-sensitive retained scans and range/index
+routes.
+
+**Risks and mismatches:** PolySI is an offline checker, not an
+online concurrency-control mechanism. It can validate a stress run
+but cannot choose commit order, enforce WAL-before-visibility, or
+protect resident buffers while a query executes.
+
+The paper's core schema is key-value-like, with unique written
+values. SQL rows with duplicate values, projections, aggregation,
+NULLs, collations, prefix predicates, and range scans need a richer
+trace encoding before the same style of checker can validate them.
+
+The completeness claim assumes determinate transactions. GPU DB
+tests must record whether every statement and transaction
+committed, aborted, timed out, retried, or returned an ambiguous
+client result; otherwise the checker can only report an unknown or
+bounded claim.
+
+The scalability numbers are promising but still offline. A
+one-million-transaction check taking hours is acceptable for nightly
+or release gates, not for every local benchmark iteration.
+
+PolySI tests external behavior, so it will not by itself prove
+internal invariants such as no use-after-free of resident handles,
+pinned-buffer lifetime safety, or correct checkpoint replay. It
+should complement internal invariant checks and replay tests.
+
+**Benchmark candidates:**
+
+- Add a point-key SI witness harness for retained reads and writes.
+  Record unique values, session order, commit/abort status, route
+  choice, snapshot generation, invalidation generation, and WAL
+  boundary. Gate: all retained-read, CPU fallback, and mixed-route
+  histories satisfy SI under a PolySI-style checker.
+- Run adversarial histories that combine writes, invalidation,
+  retained GPU reads, stale-route rejection, and CPU fallback.
+  Failure condition: a read observes a resident generation that is
+  inconsistent with the transaction's snapshot boundary.
+- Add a reduced counterexample exporter. On any isolation failure,
+  emit the smallest sessions, operations, routes, and generations
+  needed to reproduce the anomaly.
+- Compare trace detail levels: black-box key/value only,
+  route-generation annotations, WAL-boundary annotations, and full
+  internal debug telemetry. Measure checker time, unresolved
+  dependencies, and false "unknown" outcomes.
+- Extend the witness format for predicate routes: range reads,
+  prefix scans, aggregates over visible rows, and phantom-sensitive
+  index probes. Gate: retained scans cannot pass point-key SI while
+  violating predicate snapshot consistency.
+- Use fault injection around route publication: crash after WAL
+  append, crash before visibility publication, invalidate during GPU
+  queue wait, evict during snapshot hold, and retry after fallback.
+  Then run the checker over the resulting histories.
+- Maintain two validation tiers: fast local checks over thousands
+  of transactions for each runtime/storage slice, and longer
+  nightly checks over million-transaction mixed workloads with
+  route churn and memory pressure.
