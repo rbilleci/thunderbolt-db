@@ -82514,3 +82514,181 @@ scheduling state.
 - Simulate tuning intervals of 1 s, 5 s, 20 s, and 60 s under bursty
   GPU memory pressure. Failure condition: the self-tuner chases stale
   history while hard fallback rules would have protected p99.
+
+### 2026-06-06 - HDTX coalesces remote transaction fences without giving up priority
+
+**Citation:** Haodi Lu, Haikun Liu, Yujian Zhang, Zhuohui Duan,
+Xiaofei Liao, Hai Jin, and Yu Zhang. "Fast Distributed Transactions
+for RDMA-based Disaggregated Memory." USENIX ATC 2025, pages
+943-958. Retrieved 2026-06-06 from USENIX,
+`https://www.usenix.org/system/files/atc25-lu.pdf`.
+
+**Category:** transaction processing / write path, with runtime /
+HFT-style mechanics and future-tier data placement relevance.
+
+**Relevance tags:** RDMA; disaggregated memory; fast commit protocol;
+visibility control; redo logging; primary-backup replication; one-sided
+primitives; RDMA Wait/Enable; priority locks; tail latency; hot-write
+admission; future CXL/RDMA tiers; commit fence coalescing.
+
+**Core idea:** HDTX targets distributed transactions over
+RDMA-attached disaggregated memory, where compute nodes have local CPU
+but memory nodes have little spare compute. The paper's central move is
+to reduce commit latency by explicitly coalescing transaction phases
+around the ordering guarantees of RDMA primitives, then using visibility
+control, redo logs, and an asynchronous release phase to preserve
+consistency.
+
+For GPU DB, the strongest transferable idea is not "use RDMA now." It is
+that a high-throughput transaction path can merge remote validation,
+commit, replication, and release work only when each merged step has a
+named ordering primitive and an explicit visibility boundary. That maps
+well to future GPU/CPU/NVMe/CXL/RDMA tiering: route admission can become
+aggressive only if WAL, visibility, residency publication, and release or
+retirement fences stay observable.
+
+**Concrete mechanisms:**
+
+- Baseline RDMA distributed transactions commonly spend separate round
+  trips on execution, locking, validation, backup commit, and primary
+  commit. The paper states that FORD reduces this for disaggregated
+  memory but still needs multiple commit phases.
+- HDTX's fast commit protocol first replaces sequential backup and
+  primary commit with a commit phase plus an asynchronous release phase,
+  then coalesces validation and commit because the paper argues those
+  phases have no data dependency once redo logs and visibility control
+  are arranged correctly.
+- The resulting path commits after execution and locking with one
+  additional round trip for the combined validation/commit phase, while
+  release performs data synchronization, version update, and lock release
+  asynchronously.
+- The protocol uses redo logs rather than FORD-style undo logging. Redo
+  records are already written to memory nodes during commit, so the
+  release path can copy from local memory-node log state instead of
+  sending the latest value from the coordinator again.
+- RDMA-enabled release offloading orchestrates RDMA Write, Atomic,
+  Wait, and Enable primitives so memory-node RNICs can perform release
+  operations with little memory-node CPU involvement.
+- The paper calls out RDMA ordering limits directly: some primitive
+  pairs are ordered naturally, while read/atomic followed by a non-read
+  operation may require fencing. The transaction protocol is shaped
+  around those ordering rules instead of treating RDMA as a generic fast
+  RPC substrate.
+- Decentralized priority-based locking encodes lock requests with RDMA
+  Fetch-and-Add. Mission-critical transactions can request higher
+  priority, giving them more opportunities to acquire required locks
+  without a centralized scheduler running on memory-node CPUs.
+- The implementation uses multiple user-space coroutines per thread as
+  coordinators while waiting on RDMA acknowledgments, plus batching of
+  posted work requests.
+- Evaluation uses OLTP-style TPC-C, SmallBank, and TATP workloads. The
+  USENIX page reports HDTX reduces distributed-transaction latency by up
+  to 88.3% versus FaRM and 72.1% versus FORD, and improves throughput by
+  up to 2.08x and 84.7%, respectively.
+- The paper's microbenchmarks report FCP cutting average latency by up
+  to 67.7% under skewed access, release offloading reducing RDMA
+  bandwidth by up to 19.1% and improving throughput by up to 18.5%, and
+  priority locking reducing mission-critical average latency by 57.1%
+  versus CAS-based locking and 52.8% versus FAA-based locking.
+- The sensitivity results show HDTX scaling better with more coordinator
+  threads and computing nodes, especially for write-conflict-heavy TPC-C;
+  the benefit is smaller on read-mostly TATP.
+
+**GPU DB mapping:** GPU DB's current durable path is local
+WAL-before-visibility, not replicated RDMA commit. HDTX still gives a
+useful design vocabulary for future replicated owners, remote cold/warm
+memory tiers, and CXL/RDMA-style disaggregated buffers. The runtime
+should treat every remote or accelerator-adjacent state transition as a
+phase that can be merged only if its ordering primitive, completion
+signal, and visibility effect are named.
+
+The fast commit protocol maps to a future benchmark where mutation-owner
+admission groups validation, WAL append, resident invalidation, and
+visibility publication into a compact sequence. The benchmark question is
+whether fewer fences reduce lock or ownership duration without allowing a
+reader to observe data before WAL durability, route invalidation, or
+snapshot compatibility is proven.
+
+Redo-log release offloading maps to resident refresh and cold-tier
+promotion. If a future tier already holds the committed bytes or segment
+delta, the release or publish step should avoid sending the same payload
+again. That suggests measuring "bytes already staged by the commit path"
+as a first-class input to refresh, demotion, and replica publication.
+
+The priority lock mechanism maps to hot-key admission and SLO-aware
+transaction routing. GPU DB should be careful not to add a global
+priority scheduler inside the correctness path, but it can attach
+priority to lock/admission requests and let owner-local or partition-local
+queues prefer latency-sensitive work within bounded fairness rules.
+
+Coroutines-as-coordinators map to the 1M logical-session target: many
+logical transactions can wait on durable, remote, NVMe, or GPU completion
+events without occupying one thread each, as long as active coordinators
+remain bounded and backpressure is applied at rings rather than sessions.
+
+**Risks and mismatches:** HDTX is built for RDMA-based disaggregated
+memory and primary-backup replicated objects, not a single-node GPU DB
+with local WAL and CUDA execution. It does not solve SQL planning, MVCC
+snapshot semantics, GPU memory residency, CUDA stream scheduling, NVMe
+file layout, object-store placement, DDL invalidation, or PostgreSQL wire
+protocol session multiplexing.
+
+The protocol assumes RDMA ordering primitives and RNIC capabilities that
+may not exist, may vary by vendor, or may not map cleanly to CXL, NVMe,
+GPU DMA, or cloud object storage. GPU DB should translate the idea into
+explicit fences and completion events, not depend on RDMA-specific
+features before hardware requirements are known.
+
+FCP can require rollback of commit work when validation fails. That is a
+dangerous mismatch for GPU DB if resident invalidation, WAL visibility, or
+external acknowledgments are published too early. Any coalesced path needs
+a proof that rollback affects only unpublished state, or else needs
+compensating recovery rules.
+
+Priority locks improve mission-critical latency but can starve ordinary
+work if admission lacks fairness floors. GPU DB will need explicit
+minimum progress for WAL flush, invalidation, recovery, refresh, and
+snapshot retirement, not just high priority for foreground requests.
+
+The evaluation focuses on distributed transaction systems and reports
+large wins for write-conflict-heavy workloads, while read-mostly TATP
+shows less differentiation. The paper does not measure 1M logical
+sessions, GPU launch/batch effects, storage-tier compaction, or long
+reader snapshot retention.
+
+**Benchmark candidates:**
+
+- Build a transaction-fence simulator with phases for validation, WAL
+  append, resident invalidation, visibility publication, response, and
+  asynchronous release. Compare conservative sequential fences with
+  coalesced validation/publication fences. Gate: every response carries a
+  durable boundary and no stale resident read can pass compatibility
+  checks.
+- Prototype a mutation-owner microbenchmark that shortens the time a hot
+  key is reserved by moving post-visibility cleanup into an asynchronous
+  release queue. Measure write throughput, p99 lock duration, abort rate,
+  release backlog, and reader fallback reasons.
+- Add a "staged bytes reuse" benchmark for resident refresh: commit path
+  writes deltas once into a reusable staged buffer, and refresh/publication
+  consumes that staged data rather than re-encoding from canonical rows.
+  Failure condition: staged data complicates WAL replay or exposes
+  uncommitted bytes.
+- Compare CAS-style retries, FIFO owner locking, and bounded
+  priority-aware hot-key admission for latency-sensitive transactions.
+  Gate: priority work improves p99 while ordinary writes, WAL flush, and
+  snapshot retirement retain configured progress floors.
+- Model coroutine-backed transaction coordinators versus thread-per-active
+  transaction under remote completion waits. Gate: 1M logical sessions do
+  not become 1M stacks or hot scheduler entries; only active requests
+  consume coordinator state.
+- For future disaggregated tiers, define a hardware-neutral fence table:
+  CPU atomic fence, WAL fsync, NVMe completion, CUDA event, DMA completion,
+  RDMA ACK, and object-store commit. Gate: route code can state which
+  fence proves durability, visibility, residency, and release.
+- Stress rollback after coalesced validation/commit under skewed hot keys.
+  Failure condition: rollback must touch published resident snapshots,
+  externally acknowledged responses, or durable WAL records that have
+  already crossed the visibility boundary.
+- Track bytes and round trips per transaction phase. Expected result:
+  optimizing fence count and duplicate data movement explains more latency
+  variance than raw request count under remote-tier pressure.

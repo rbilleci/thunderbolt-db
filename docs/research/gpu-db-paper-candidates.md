@@ -493,13 +493,28 @@ Append new candidates here as each paper is processed.
   ordering, persistence, and remote metadata updates against GPU DB's future
   warm/cold-tier transaction and index routes. Journal entry added
   2026-06-06; the previously queued USENIX URL was corrected.
-- `queued` — **Fast Distributed Transactions for RDMA-based Disaggregated
+- `reviewed` — **Fast Distributed Transactions for RDMA-based Disaggregated
   Memory**, Lu et al., USENIX ATC 2025.
   URL: `https://www.usenix.org/conference/atc25/presentation/lu`
   Why: modern follow-up that compares against FORD and targets faster
   distributed transactions over RDMA-based disaggregated memory; useful for
   checking whether FORD's one-sided, rollback-oriented commit path has been
-  superseded by newer localized-validation or hybrid-RDMA designs.
+  superseded by newer localized-validation or hybrid-RDMA designs. Journal
+  entry added 2026-06-06.
+- `queued` — **DecLock: A Case of Decoupled Locking for Disaggregated
+  Memory**, Zhang, Cheng, Chen, Wei, and Chen, arXiv 2025.
+  URL: `https://arxiv.org/abs/2505.17641`
+  Why: discovered while reviewing HDTX; useful for comparing HDTX's
+  decentralized priority lock queues against a newer design that reduces
+  memory-node NIC contention by decoupling lock ownership transfer from
+  centralized lock-state maintenance.
+- `queued` — **ALock: Asymmetric Lock Primitive for RDMA Systems**, Baran,
+  Nelson-Slivon, Tseng, and Palmieri, SPAA 2024.
+  URL: `https://doi.org/10.1145/3626183.3659977`
+  arXiv: `https://arxiv.org/abs/2404.17980`
+  Why: HDTX cites ALock as modern RDMA lock related work; useful for comparing
+  priority scheduling with local/remote cohort locking when GPU DB future tiers
+  mix local CPU accesses and remote/disaggregated-memory accesses.
 - `queued` — **The Case for Distributed Shared-Memory Databases with
   RDMA-Enabled Memory Disaggregation**, Zhou et al., arXiv 2022.
   URL: `https://arxiv.org/abs/2207.03027`
