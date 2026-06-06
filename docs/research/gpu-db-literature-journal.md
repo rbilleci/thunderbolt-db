@@ -87074,3 +87074,186 @@ to the mutation owner and WAL boundary.
 - Use metadata scans for dry-run route budgets: estimate HBM bytes, DRAM/NVMe
   bytes, H2D transfer, and GPU queue load before admission. Gate: admission can
   reject or choose CPU fallback with a concrete cost reason.
+
+### 2026-06-06 - CHEX turns multiversion replay into bounded checkpoint placement
+
+**Citation:** Naga Nithin Manne, Shilvi Satpati, Tanu Malik, Amitabha
+Bagchi, Ashish Gehani, and Amitabh Chaudhary. "CHEX: Multiversion
+Replay with Ordered Checkpoints." PVLDB 15(6):1297-1310, 2022. DOI:
+`10.14778/3514061.3514075`. Retrieved 2026-06-06 from the PVLDB PDF at
+`https://www.vldb.org/pvldb/vol15/p1297-malik.pdf`.
+
+**Category:** MVCC / snapshot / visibility and multi-tier cache / data
+placement, with database storage/checkpoint relevance.
+
+**Relevance tags:** multiversion replay; ordered checkpoints; execution
+lineage; bounded cache; checkpoint-restore-switch; execution tree;
+version reconstruction; retained snapshot placement; replay-cost model;
+lineage equality; DFS replay sequences.
+
+**Core idea:** CHEX studies a multiversion replay problem: many related
+program versions share common prefixes, but replaying every version from
+scratch wastes time and checkpointing every intermediate state consumes
+too much memory. It audits executions, uses lineage to prove when states
+are equivalent across versions, builds an execution tree, and chooses a
+bounded set of checkpoints plus restore/switch operations to minimize
+replay cost under a cache-size limit.
+
+For GPU DB, the transferable idea is to treat retained snapshots,
+checkpointed generations, cold deltas, and reconstructed versions as a
+placement problem over a version tree, not as a binary keep/drop policy.
+The engine should be able to ask: given memory pressure, long readers,
+replay depth, and refresh cost, which generation boundaries deserve HBM,
+DRAM, NVMe checkpoint, or recomputation placement?
+
+**Concrete mechanisms:**
+
+- CHEX records per-cell execution metadata: computation time, state size,
+  code hash, and lineage. Lineage combines the predecessor lineage, the
+  cell code hash, ordered system-call events, and hashes of externally
+  accessed content.
+- Equal program states across versions are merged into an execution tree.
+  Each root-to-leaf path is a version, common prefixes represent reusable
+  computation, and branches represent the first non-reusable state.
+- Replay uses four operations over the execution tree and bounded cache:
+  compute a node, checkpoint a computed node, restore a checkpoint and
+  switch to one of its children, and evict a checkpoint.
+- The paper frames the cache-bounded multiversion replay optimization as
+  NP-hard, then restricts the search to DFS-based replay sequences and
+  proposes efficient heuristics for choosing checkpoint locations.
+- The design deliberately keeps shared packages lightweight: original
+  producers share versions, dependencies, and the execution tree, not
+  their checkpoints. Replayers create checkpoints locally.
+- The prototype works with Jupyter/REPL-style cells but can transform
+  regular programs into cell-like paragraphs. It assumes versions execute
+  in natural top-to-bottom order and does not handle out-of-order notebook
+  execution.
+- The evaluation reports that CHEX improves total multiversion replay
+  time by about 50% on average across real machine-learning/scientific
+  notebooks and synthetic datasets, while avoiding the 50-550GB memory
+  footprint that indiscriminately checkpointing all cells can require for
+  moderately sized programs.
+
+**GPU DB mapping:** GPU DB can model retained read generations as an
+execution/version tree. Nodes are durable or reconstructable states:
+WAL/checkpoint boundaries, MVCC visibility horizons, resident GPU column
+groups, warm DRAM fragments, cold NVMe segments, route-metadata views,
+and branch points caused by DDL, compaction, repartitioning, or retained
+long-reader snapshots.
+
+Lineage equality maps to route/snapshot certificates. A generation is
+reusable only if the relation id, schema generation, WAL boundary,
+visibility boundary, fragment lineage, compaction source set, encoding
+identity, and invalidation generation match. A hash of SQL-level inputs
+alone is not enough; the certificate must prove that indexes, resident
+layouts, and visibility masks still describe the same logical state.
+
+Checkpoint-restore-switch maps to snapshot reconstruction. Instead of
+rebuilding every retained generation from the base checkpoint plus WAL,
+GPU DB can retain selected intermediate CPU/DRAM/NVMe checkpoints and
+restore/switch into nearby branches, then apply a shorter delta. The same
+idea applies to GPU residency: keep selected column-group generations in
+HBM, demote others to DRAM or NVMe, and recompute cold branches only when
+their reuse probability justifies it.
+
+The bounded-cache formulation is a good fit for HBM. HBM should not hold
+the newest version by default; it should hold the versions that minimize
+expected route latency under workload probabilities, refresh cost,
+reconstruction depth, and long-reader pressure. DRAM and NVMe can store
+larger but slower checkpoint tiers with the same objective function.
+
+DFS replay sequences are not a literal serving algorithm, but they suggest
+a benchmarkable simplification: evaluate offline or epoch-local placement
+orders over a version tree before attempting a full online optimal policy.
+For transaction serving, the online policy must preserve WAL-before-
+visibility and cannot evict a generation still pinned by readers.
+
+**Risks and mismatches:** CHEX is about reproducible program replay, not a
+database concurrency-control protocol. It does not define MVCC visibility,
+serializable isolation, WAL durability, SQL indexes, GPU kernels, or
+low-latency admission.
+
+The equivalence signal is system-call lineage plus content hashes for
+program cells. GPU DB needs stronger, DB-native equivalence across logical
+rows, indexes, schemas, visibility masks, and durable log boundaries.
+
+CHEX's cache is in-memory and replay-oriented. GPU DB has multiple tiers
+with different restore costs, transfer costs, eviction hazards, and
+correctness roles. HBM-resident snapshots are performance caches only;
+durable reconstruction still comes from WAL/checkpoints/archive.
+
+The paper assumes top-to-bottom version execution and offline planning
+over known versions. GPU DB has online writes, unpredictable readers, DDL,
+memory pressure, and admission decisions. Any CHEX-like policy must be
+adapted into an incremental, telemetry-driven placement algorithm.
+
+**Benchmark candidates:**
+
+- Build a synthetic MVCC version-tree simulator with node size, replay
+  cost, read probability, HBM/DRAM/NVMe tier cost, and pinned-reader
+  constraints. Compare newest-only, LRU, full checkpointing, CHEX-like
+  bounded placement, and cost-aware multi-tier placement.
+- Add a "restore-switch" benchmark for retained snapshots: reconstruct a
+  target generation from base checkpoint plus WAL versus from the nearest
+  retained intermediate generation. Measure replay bytes, latency, CPU
+  time, and whether visibility certificates still match.
+- Prototype a snapshot lineage certificate containing relation id, schema
+  generation, source WAL boundary, visibility boundary, fragment ids,
+  encoding identity, compaction lineage, and invalidation generation. Gate:
+  no route can reuse a checkpoint without an explainable certificate.
+- Simulate long readers as pinned nodes in the version tree. Failure
+  condition: the placement policy evicts a pinned generation or lets pinned
+  obsolete nodes force unbounded HBM/DRAM growth.
+- Evaluate tiered checkpoint placement under HBM pressure: selected hot
+  generations in HBM, warm checkpoints in DRAM, cold checkpoints/deltas on
+  NVMe. Measure p50/p99 route latency, eviction churn, rebuild work, and
+  bytes moved between tiers.
+- Test an epoch-local DFS-style placement heuristic after each checkpoint
+  or compaction epoch. Gate: planning overhead is small compared with the
+  replay/refresh work it saves, and online mutations still publish
+  visibility only after WAL-safe boundaries.
+
+### 2026-06-06 - Cross-paper synthesis: route decisions need explainable metadata, bounded exploration, and version-tree placement
+
+**Papers synthesized:** SkinnerDB, Big Metadata, and CHEX.
+
+**Converging design tracks:** These three papers converge on a route
+runtime that treats planning state as executable data rather than static
+catalog trivia. SkinnerDB says uncertain route choices can be explored
+under bounded budgets; Big Metadata says pruning/route metadata should be
+stored and scanned as a first-class columnar data product; CHEX says
+version reuse and checkpoint placement should be optimized over a bounded
+version tree instead of keeping or dropping generations naively.
+
+For GPU DB, the promising track is a three-stage retained-route pipeline:
+first scan route metadata to produce an eligibility certificate, then
+choose or briefly probe CPU/GPU/cold routes under an explicit exploration
+budget, then place retained generations across HBM/DRAM/NVMe according to
+version-tree reuse and reconstruction cost.
+
+The shared invariant is explainability. A retained route should be able to
+name the metadata rows that made it eligible, the budget that allowed or
+stopped exploration, and the lineage/checkpoint node used to reconstruct
+or reuse a generation. This is the difference between a fast cache and a
+debuggable database subsystem.
+
+**Category gaps:** Recent work is still skewing toward planning,
+metadata, storage, and version placement. The next high-value paper should
+come from transaction processing, MVCC/visibility, WAL/logging, admission,
+or low-latency runtime mechanics unless the queue exposes a clearly newer
+and more relevant tier-placement result.
+
+**Benchmark priorities:**
+
+- Route-certificate benchmark: per-fragment metadata scan produces
+  included/pruned/ineligible fragments, selected tier, visibility boundary,
+  and fallback reason.
+- Bounded route exploration benchmark: deterministic planner versus
+  microsecond-capped adaptive probing for CPU index, GPU resident scan,
+  GPU lookup, and cold-transfer routes.
+- Version-tree placement benchmark: HBM/DRAM/NVMe snapshot placement under
+  long-reader pins, reconstruction cost, and read probability.
+- Integrated failure gate: a route must not execute if its metadata
+  certificate, exploration result, and lineage/checkpoint generation do
+  not agree on relation id, schema generation, WAL boundary, visibility
+  boundary, and invalidation generation.

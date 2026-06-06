@@ -6803,13 +6803,13 @@ Append new candidates here as each paper is processed.
   storage and reconstruction optimization before GPU DB turns snapshot
   retention into an online multi-tier policy. Journal entry added
   2026-06-06; the stale author field was corrected during review.
-- `queued` — **CHEX: Multiversion Replay with Ordered Checkpoints**,
+- `reviewed` — **CHEX: Multiversion Replay with Ordered Checkpoints**,
   Manne et al., PVLDB 2022.
   URL: `https://doi.org/10.14778/3514061.3514075`
   Why: To Store or Not to Store cites CHEX as a graph snapshot/versioning
   system; useful for comparing checkpoint placement, replay depth, and
   version retrieval latency against GPU DB retained snapshots and cold
-  version reconstruction.
+  version reconstruction. Journal entry added 2026-06-06.
 - `queued` — **Materialization and Reuse Optimizations for Production Data
   Science Pipelines**, Derakhshan et al., SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526186`
@@ -6824,3 +6824,17 @@ Append new candidates here as each paper is processed.
   Why: To Store or Not to Store cites Mosaic as device-aware placement work;
   useful for comparing cost-aware DRAM/NVM/SSD placement with GPU DB's
   HBM/DRAM/NVMe resident snapshot and warm-tier policy.
+- `queued` — **Your Notebook is not Crumby Enough, REPLace it**,
+  Brachmann et al., CIDR 2020.
+  URL: `https://www.cidrdb.org/cidr2020/papers/p5-brachmann-cidr20.pdf`
+  Why: CHEX depends on REPL-style cell lineage and cites this notebook
+  provenance/replay line; useful for deciding how fine-grained retained
+  route lineage should be before GPU DB can safely reuse intermediate
+  snapshot fragments or explain replay decisions.
+- `queued` — **Multiversion Hindsight Logging for Continuous Training**,
+  arXiv 2023.
+  URL: `https://arxiv.org/abs/2310.07898`
+  Why: discovered while reviewing CHEX; useful as a modern follow-up on
+  replaying log statements across many model/program versions, with
+  checkpoint-based parallelism that may map to GPU DB version-tree replay
+  and cold snapshot reconstruction benchmarks.
