@@ -85863,3 +85863,166 @@ unless a much stronger modern OLTP/MVCC paper appears.
   refresh, with latency ceilings and explicit overload/fallback reasons.
 - Split/merge route-generation simulation under long readers, hot writes, and
   cold-tier eviction.
+
+### 2026-06-06 - SkinnerDB turns bad join orders into bounded exploration cost
+
+**Citation:** Immanuel Trummer, Junxiong Wang, Deepak Maram, Samuel
+Moseley, Saehan Jo, and Joseph Antonakakis. "SkinnerDB: Regret-Bounded
+Query Evaluation via Reinforcement Learning." SIGMOD 2019 / arXiv
+1901.05152; earlier PVLDB 11(12):2074-2077, 2018 demonstration paper.
+DOI: `10.1145/3299869.3300088` for the SIGMOD paper and
+`10.14778/3229863.3236263` for the PVLDB demonstration. Retrieved
+2026-06-06 from arXiv after the VLDB PDF endpoint timed out from the
+cron worker.
+
+**Category:** query optimization / planning, with runtime scheduling and
+adaptive execution relevance.
+
+**Relevance tags:** intra-query learning; regret-bounded execution;
+adaptive join ordering; UCT; exploration versus exploitation; join-order
+switching; progress tracking; duplicate result elimination; generic
+engine wrapper; specialized multi-way join; timeout budgets; robust route
+fallback.
+
+**Core idea:** SkinnerDB does not try to make a conventional cost model
+perfect before execution starts. It treats join ordering as an online
+decision problem inside the current query: run a join order briefly,
+measure useful progress, update a reinforcement-learning policy, and
+switch to another order when exploration is worth the cost. The design
+goal is not "always pick the optimizer's best plan"; it is to bound how
+much execution time can be wasted on bad choices when estimates are
+wrong.
+
+For GPU DB, the transferable idea is that route choice for complex
+queries should sometimes be executed as bounded, measurable exploration
+instead of a single brittle CPU/GPU decision. A retained route can spend a
+small, capped budget sampling CPU, GPU resident, GPU cold-transfer, or
+alternative join-shape fragments, then commit the remaining work to the
+route that demonstrates real progress.
+
+**Concrete mechanisms:**
+
+- SkinnerDB represents join-order search as a tree where each level
+  chooses the next relation in a left-deep join order. It applies UCT
+  (upper confidence bounds applied to trees) so each time slice balances
+  exploiting orders with high observed reward and exploring under-sampled
+  choices.
+- Query execution is split into many small slices. A selected join order
+  executes for a bounded budget, result fragments from different orders
+  are merged, and execution stops when the complete result has been
+  produced.
+- The generic Skinner-G variant can run above an existing SQL engine. It
+  partitions base tables into batches, forces join orders with optimizer
+  hints or equivalent controls, and uses a pyramid timeout scheme so
+  larger timeouts are tried only after lower timeout levels receive
+  comparable budget. Success or timeout becomes the reward signal.
+- Skinner-H alternates learned plans with plans proposed by the native
+  optimizer, preserving a bounded fallback to conventional planning when
+  the native optimizer already performs well.
+- The specialized Skinner-C engine is built for fast switching. It uses a
+  depth-first multi-way join instead of a sequence of binary joins, stores
+  intermediate state as small vectors of tuple indexes, limits live
+  intermediate state to at most one partial tuple, and keeps a result set
+  of tuple-index vectors to remove duplicates across orders.
+- Skinner-C backs up and restores execution state per join order and
+  shares progress between orders with the same prefix. It also hashes
+  equality-join columns during preprocessing so tuple-index advancement
+  can jump to candidates satisfying applicable equality predicates.
+- The paper proves correctness for all variants and derives regret
+  bounds under stated assumptions. The strongest specialized result is
+  that Skinner-C's expected-to-optimal execution-time ratio is bounded
+  and converges to the number of joined tables as data size grows.
+- Evaluation covers the Join Order Benchmark and TPC-H variants with
+  user-defined functions. The reported headline is that Skinner-C reduces
+  catastrophic join-order failures: on the single-threaded Join Order
+  Benchmark it reports 183 seconds total versus 726 seconds for
+  PostgreSQL and 986 seconds for MonetDB, while multi-threaded MonetDB
+  remains faster overall on that setup because Skinner-C's join phase was
+  not parallelized.
+
+**GPU DB mapping:** GPU DB's planner should separate hard eligibility
+from bounded exploration. Hard facts include snapshot generation, schema
+generation, resident layout identity, supported predicates, available GPU
+memory, and WAL/visibility fences. Within those safe choices, the runtime
+can spend a small exploration budget on route alternatives whose costs
+are hard to estimate: CPU index lookup versus resident GPU scan, encoded
+scan-index path versus full column scan, GPU cold-transfer path versus
+CPU fallback, or two possible join orders over resident fragments.
+
+The UCT tree maps well to route-shape search when each decision is a
+small, explainable choice: first relation or fragment, CPU/GPU operator,
+scan versus lookup, transfer-first versus predicate-first, or selected
+resident index. The reward must be route-native: rows accepted per
+microsecond, bytes pruned per microsecond, H2D bytes avoided, queue wait
+avoided, or completed result fragments per kernel launch.
+
+Skinner-C's progress tracker is a warning against opaque acceleration.
+If GPU DB switches between route shapes mid-query, progress must be
+stored in stable logical units such as row-id ranges, key-vector offsets,
+segment ids, visibility-mask ranges, or join frontier descriptors. It
+cannot depend on private GPU kernel state that cannot be resumed,
+audited, or merged safely.
+
+The hybrid Skinner-H lesson is especially useful for production routing:
+learned/adaptive exploration should be a bounded overlay, not the only
+planner. A conventional deterministic plan or CPU fallback should retain
+budget, and exploration should stop when it threatens latency SLOs,
+resident memory, or correctness fences.
+
+The pyramid timeout scheme is a concrete design candidate for cold-route
+probing. GPU DB often will not know whether a transfer-heavy GPU path is
+worth it until some work has started. Allocate tiny budgets first, expand
+only if earlier probes make progress, and report which route exhausted
+its exploration budget.
+
+**Risks and mismatches:** SkinnerDB focuses on analytical SPJ queries and
+left-deep join orders. GPU DB also needs OLTP writes, MVCC visibility,
+WAL-before-visibility, DDL invalidation, session admission, and GPU memory
+residency safety. Its adaptive route exploration cannot violate snapshot
+or transaction boundaries.
+
+Skinner-C assumes a main-memory column-store style execution engine and
+does not parallelize the join execution phase in the described prototype.
+GPU DB must test whether frequent route switching is still worthwhile
+when kernels, H2D/D2H transfer, pinned buffers, and CUDA stream occupancy
+make switching more expensive than CPU tuple-index loops.
+
+The result-merge model relies on duplicate elimination over tuple-index
+vectors. SQL-visible duplicates, ordering, limits, aggregates, outer
+joins, and transaction visibility can make fragment merging more subtle.
+Any GPU DB adaptive path needs an explicit result-fragment contract before
+it can switch among plans mid-query.
+
+The paper's formal bounds rely on simplifying assumptions around fixed
+query properties, large input data, timeout suitability, and progress
+correlation. Treat the bounds as design vocabulary, not as proof that a
+GPU route explorer will be safe or fast without its own measured reward
+model.
+
+**Benchmark candidates:**
+
+- Implement a route-exploration simulator for retained joins with
+  candidate choices over CPU index, GPU resident scan, GPU resident
+  lookup, and cold-transfer scan. Gate: exploration budget is explicitly
+  capped and never routes through an ineligible snapshot or layout.
+- Compare deterministic cost-model route choice against UCT-style
+  intra-query exploration on skewed predicates and stale statistics.
+  Measure p50/p99 latency, total work, wrong-route time, and fallback
+  count.
+- Prototype resumable progress descriptors for adaptive retained scans:
+  row-id ranges, segment ids, key-vector offsets, visibility-mask ranges,
+  and result-fragment ids. Failure condition: switching route shapes loses
+  or duplicates SQL-visible rows.
+- Test a Skinner-H-style hybrid planner where the deterministic CPU plan
+  keeps a reserved budget while GPU alternatives explore under a small
+  microsecond cap. Gate: catastrophic GPU route choices cannot consume
+  more than the configured fraction of query latency.
+- Add a pyramid-timeout probe for over-resident GPU routes. Start with a
+  tiny cold-transfer or decompression budget, expand only when progress
+  per byte or per microsecond beats CPU fallback, and record the final
+  route decision.
+- Measure reward signals directly: rows accepted per microsecond,
+  predicate bytes pruned, H2D bytes avoided, queue wait avoided, and
+  completed fragments per kernel launch. Expected result: at least one
+  reward signal predicts winning route families better than static row
+  count alone.

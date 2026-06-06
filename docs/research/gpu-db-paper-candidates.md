@@ -410,14 +410,15 @@ Append new candidates here as each paper is processed.
   Why: Laser cites it as buffer-pool-aware scheduling; useful for contrasting
   learned buffer reuse against deterministic residency metadata and route
   certificates. Journal entry added 2026-06-06 from arXiv v3.
-- `queued` — **SkinnerDB: Regret-Bounded Query Evaluation via Reinforcement
+- `reviewed` — **SkinnerDB: Regret-Bounded Query Evaluation via Reinforcement
   Learning**, Trummer et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p2074-trummer.pdf`
   DOI: `https://doi.org/10.14778/3229863.3236263`
   Why: SmartQueue cites SkinnerDB as reinforcement-learning query execution
   work; useful for contrasting queue-level cache-aware scheduling with
   intra-query adaptive join-order switching and regret-bound-driven route
-  exploration.
+  exploration. Journal entry added 2026-06-06 from the arXiv/SIGMOD 2019
+  full paper after the VLDB PDF endpoint timed out from the cron worker.
 - `queued` — **Quickstep: A Data Platform Based on the Scaling-up Approach**,
   Patel et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p663-patel.pdf`
@@ -432,6 +433,22 @@ Append new candidates here as each paper is processed.
   Why: LSched contrasts Decima's black-box DAG scheduling with DB-specific
   physical-plan features; useful as a control point for what should remain
   outside GPU DB's hot scheduler when learned policies are evaluated.
+- `queued` — **Simple Adaptive Query Processing vs. Learned Query
+  Optimizers: Observations and Analysis**, Zhang et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p2962-zhang.pdf`
+  DOI: `https://doi.org/10.14778/3611479.3611500`
+  Why: discovered while reviewing SkinnerDB; modern comparison of simple
+  adaptive query processing and learned optimizers, useful for deciding when
+  GPU DB route choice should rely on deterministic adaptive probes instead of
+  a learned policy.
+- `queued` — **SkinnerDB: Regret-bounded Query Evaluation via Reinforcement
+  Learning**, Trummer et al., ACM TODS 2021.
+  URL: `https://doi.org/10.1145/3464389`
+  Open PDF: `https://par.nsf.gov/servlets/purl/10377793`
+  Why: extended journal version discovered while reviewing the PVLDB/SIGMOD
+  SkinnerDB line; useful if the loop needs deeper formal and implementation
+  details for intra-query learning, progress tracking, and specialized
+  execution-engine support.
 - `reviewed` — **Sundial: Harmonizing Concurrency Control and Caching in a
   Distributed OLTP Database Management System**, Yu et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p1289-yu.pdf`
