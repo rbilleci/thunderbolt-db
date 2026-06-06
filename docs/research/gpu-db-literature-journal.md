@@ -38,6 +38,155 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - SMART makes remote index traversal a cache-validation and IOPS-shaping problem
+
+**Citation:** Xuchuan Luo, Pengfei Zuo, Jiacheng Shen, Jiazhen Gu,
+Xin Wang, Michael R. Lyu, and Yangfan Zhou. "SMART:
+A High-Performance Adaptive Radix Tree for Disaggregated Memory."
+OSDI 2023, pp. 553-571. Retrieved 2026-06-06 from USENIX,
+`https://www.usenix.org/system/files/osdi23-luo.pdf`.
+
+**Category:** database file-system design, storage, and indexing, with
+secondary relevance to multi-tier cache/data placement and future remote
+memory tiers.
+
+**Relevance tags:** adaptive radix tree; disaggregated memory; range index;
+RDMA; remote pointer traversal; read amplification; write amplification;
+hybrid concurrency control; computing-side cache validation; read delegation;
+write combining; reverse checks; future-tier indexes.
+
+**Core idea:** SMART argues that B+-tree range indexes are a poor default for
+disaggregated memory because each lookup or update consumes too much network
+bandwidth and memory-side RNIC IOPS. A radix tree reduces leaf read/write
+amplification, but only if the implementation also handles remote locking,
+redundant concurrent reads/writes from compute nodes, and validation of cached
+tree nodes whose parent/child links or node types can change.
+
+For GPU DB, the transferable idea is that any future warm/cold range index
+outside local CPU memory needs an explicit traversal budget and cache-validity
+proof. A resident or remote index route should not be admitted just because an
+index exists. It should know how many remote reads, writes, atomics, and cache
+checks the route may consume, and it should expose the exact reason a cached
+index node is still valid for the route certificate.
+
+**Concrete mechanisms:**
+
+- SMART uses adaptive radix tree structure instead of a B+-tree on
+  disaggregated memory, because ART internal nodes do not store whole keys and
+  can reduce both read and write amplification for point operations.
+- Internal nodes are made homogeneous: each 8-byte slot embeds partial key
+  bits, a child pointer, a leaf/internal flag, and node-type metadata. This lets
+  a pointer and its partial key be changed atomically with RDMA CAS.
+- Internal nodes are updated mostly lock-free. SMART supports normal insert,
+  leaf split, header split, and node-type switch through RDMA writes and CAS
+  operations rather than coarse remote node locks.
+- Leaf nodes keep one key-value item and use fine-grained lock-based
+  update-in-place. A checksum protects readers from concurrent updates; writers
+  recompute the checksum and release the embedded rear lock in the same remote
+  write.
+- Placing the lock at the rear of the leaf node relies on RNIC in-order
+  delivery so the payload write completes before the lock is released, saving a
+  separate remote round trip for unlock.
+- RDMA optimizations include inline writes for small nodes, unsignaled verbs
+  for asynchronous writes, and doorbell batching when multiple work queue
+  entries target the same queue pair.
+- Read delegation uses compute-node-local hash locks. The first client reading
+  a key performs the remote traversal and shares the result with local waiters
+  for the same key; hash conflicts fall back to normal remote reads.
+- Write combining uses the same local lock window to merge concurrent writes to
+  the same key into one consensus remote write. Readers and writers share the
+  window discipline so a read cannot be delegated across a causally earlier
+  write and return the old value.
+- Compute-side ART caches store snapshots of internal-node traversal contexts.
+  SMART identifies three invalidation cases: parent/child relationship changes,
+  node-type changes, and deleted nodes.
+- The reverse check mechanism validates cached pointers by storing a reverse
+  parent pointer in remote nodes, a node-type field in node headers, and a
+  valid bit for leaves. Mismatch invalidates the compute-side cache entry and
+  restarts traversal.
+- Scans are supported by parallel RDMA reads over all nodes inside the key
+  range, but the paper states scans are not atomic with concurrent insert or
+  update operations, similar to prior disaggregated tree indexes.
+- The evaluation runs on 16 physical machines on CloudLab, with 16 compute
+  nodes, two memory nodes, 100 Gbps Mellanox ConnectX-6 RNICs, YCSB workloads,
+  60 million populated keys, and integer and string key variants.
+- Reported results include up to 6.1x higher throughput and 1.4x lower latency
+  than Sherman for typical write-intensive workloads, and 2.8x higher
+  throughput with similar latency for read-only workloads. SMART reaches up to
+  96M requests/s on read-only integer-key YCSB C, above the memory-side RNIC
+  IOPS bound because delegated duplicate reads share one remote read.
+- The scan result is more mixed: for small 8-byte values SMART is weaker than
+  Sherman because many small leaf nodes saturate memory-side IOPS, while for
+  values larger than 64 bytes Sherman becomes worse as bandwidth amplification
+  dominates.
+
+**GPU DB mapping:** P8 currently treats GPU resident structures as local
+performance caches and leaves broader range-index families for later. SMART
+suggests that the first future-tier range index should publish a route
+certificate containing index family, node/cache generation, key range, expected
+remote reads, expected remote atomics, expected bytes, and cache-validation
+method. Without those fields, a remote index can silently become the bottleneck
+for 1M logical sessions even if each individual lookup is correct.
+
+The read-delegation and write-combining pattern maps to hot retained lookups
+and future remote metadata. Many sessions may ask for the same key, range, or
+resident-segment pointer at once. A per-owner or per-IO-worker local combining
+window can collapse duplicate validation probes, index-node fetches, or route
+metadata reads before they hit a remote tier. The same window must preserve
+causal read-after-write ordering, as SMART explicitly does for local readers
+and writers on one key.
+
+SMART's reverse checks map cleanly to GPU DB's route-generation model. A cached
+index node, resident key vector, segment dictionary, or cold-tier fence pointer
+should carry a reverse or parent-generation check that proves it is still
+attached to the tree/segment version used by the route. If the check fails,
+the result should be a named stale-index or stale-route fallback, not a silent
+wrong-path traversal.
+
+The hybrid concurrency design is also a useful warning for GPU indexes. Fully
+lock-free structures can move addresses often and thrash caches; fully locked
+remote nodes can burn remote atomics and p99 latency. A better first slice may
+be lock-free metadata/internal routing with fine-grained locked or owner-owned
+leaf updates, while immutable resident GPU snapshots handle read batches.
+
+**Risks and mismatches:** SMART is an RDMA/disaggregated-memory ART, not a
+SQL storage engine, MVCC index, GPU kernel, or durable WAL design. It does not
+provide snapshot isolation, serializable scans, index recovery, secondary-index
+maintenance under SQL constraints, or GPU memory residency. Its scan operation
+is explicitly not atomic with concurrent updates, so it cannot be lifted into
+GPU DB as a SQL-visible range-scan index without additional snapshot fencing.
+
+The evaluation uses fixed-size values for the main implementation. The paper
+discusses variable-sized keys and values through RCU-style leaf replacement,
+but that would reintroduce address changes and cache-validation pressure. GPU
+DB's `text` columns, MVCC versions, and resident segment dictionaries would
+need a stricter validity contract than the fixed-size YCSB microbenchmarks.
+
+**Benchmark candidates:**
+
+- Add a remote-index route simulator comparing B+-tree-style node pages,
+  radix-style single-item leaves, and resident key-vector lookup. Metrics:
+  remote reads, remote writes, atomics, bytes, p50/p99, and fallback reason.
+- Prototype a route-validation cache with reverse checks: parent generation,
+  node type, valid bit, and route generation. Gate: DML, DDL, refresh, split,
+  delete, and eviction all invalidate stale cached route nodes.
+- Add local duplicate-probe collapsing for retained lookups: one IO worker or
+  owner window delegates identical route/index validation probes to a single
+  remote or owner read. Failure condition: read-after-write or
+  invalidation-after-read ordering can return an old route.
+- Compare fine-grained locked leaves versus owner-owned leaf update queues for
+  hot resident key metadata. Expected result: the crossover where locks beat
+  queueing for low contention and queues beat locks under skew is visible.
+- Test range scans over a mutable remote index with snapshot fencing. Gate:
+  scans either prove a stable index generation or fall back to CPU/MVCC; they
+  must not inherit SMART's non-atomic scan semantics.
+- Include value-size sensitivity in cold/warm-tier index benchmarks. Failure
+  condition: a radix-like design wins point lookup throughput but loses scan or
+  larger-payload performance because it saturates IOPS with tiny leaf reads.
+- Add route telemetry for remote-index pressure: duplicate probes collapsed,
+  reverse-check failures, stale node retries, remote atomics, remote bytes, and
+  per-key combining-window size.
+
 ### 2026-06-06 - LSched makes query scheduling a physical-plan and pressure problem
 
 **Citation:** Ibrahim Sabek, Tenzin Samten Ukyab, and Tim Kraska.

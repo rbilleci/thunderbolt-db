@@ -331,19 +331,35 @@ Append new candidates here as each paper is processed.
   useful for write-optimized remote index layouts, RDMA command coalescing,
   hierarchical locks, and entry/node versioning before GPU DB adopts
   disaggregated range indexes.
-- `queued` — **SMART: A High-Performance Adaptive Radix Tree for
-  Disaggregated Memory**, Le et al., PVLDB 2023.
-  URL: `https://www.vldb.org/pvldb/vol16/p3323-le.pdf`
-  DOI: `https://doi.org/10.14778/3611540.3611545`
+- `reviewed` — **SMART: A High-Performance Adaptive Radix Tree for
+  Disaggregated Memory**, Luo et al., OSDI 2023.
+  URL: `https://www.usenix.org/conference/osdi23/presentation/luo`
+  PDF: `https://www.usenix.org/system/files/osdi23-luo.pdf`
   Why: DEX compares against SMART as a trie/radix-tree disaggregated-memory
   index baseline; useful for contrasting B+-tree range routing with adaptive
-  radix indexing and limited compute-side cache coherence.
+  radix indexing and limited compute-side cache coherence. Journal entry added
+  2026-06-06; the previously queued PVLDB/DOI metadata was corrected to the
+  OSDI 2023 paper.
 - `queued` — **Cabin: A Practical Scan Index for Data Lakes**, SIGMOD 2024.
   URL: `https://2024.sigmod.org/toc-2-1.html`
   Why: recent scan-index design for file-backed/lake-style analytical storage;
   relevant to deciding when GPU DB should maintain compact auxiliary indexes
   over cold segments instead of relying only on full scans or B-tree-like
   access paths.
+- `queued` — **PULSE: Accelerating Distributed Pointer-Traversals on
+  Disaggregated Memory**, Zuo et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2305.02388`
+  Why: SMART shows that remote pointer traversal saturates memory-side IOPS;
+  PULSE explores pushing pointer traversal work closer to disaggregated memory,
+  a useful future-tier contrast before GPU DB puts more range-index logic in
+  remote memory or storage-side execution.
+- `queued` — **DINOMO: An Elastic, Scalable, High-Performance Key-Value Store
+  for Disaggregated Persistent Memory**, Wei et al., arXiv 2022.
+  URL: `https://arxiv.org/abs/2209.08743`
+  Why: SMART's related ecosystem includes disaggregated persistent-memory
+  key-value stores; useful for comparing ownership partitioning, adaptive
+  caching, selective replication, and log-free indexing against GPU DB's
+  warm/cold tier metadata and owner domains.
 - `queued` — **SkyStore: Cost-Optimized Object Storage Across Regions and
   Clouds**, Liu et al., PVLDB 2025.
   URL: `https://research.ibm.com/publications/skystore-cost-optimized-object-storage-across-regions-and-clouds`
