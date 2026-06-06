@@ -92361,3 +92361,172 @@ each block cohort.
 - For any future CXL/NVM path, add write-amplification telemetry:
   logical bytes retired, physical bytes written, flush/fence count,
   and route descriptors invalidated per cleanup cycle.
+
+### 2026-06-06 - DiffKV makes value placement a scan/write ordering dial
+
+**Citation:** Yongkun Li, Zhen Liu, Patrick P. C. Lee, Jiayu Wu,
+Yinlong Xu, Yi Wu, Liu Tang, Qi Liu, and Qiu Cui. "Differentiated
+Key-Value Storage Management for Balanced I/O Performance." USENIX
+ATC 2021. Retrieved 2026-06-06 from the USENIX page and PDF:
+`https://www.usenix.org/conference/atc21/presentation/li-yongkun`.
+
+**Category:** WAL/logging and read/write throughput, with
+database storage/indexing and multi-tier data-placement relevance.
+
+**Relevance tags:** LSM tree; KV separation; value log; partial
+ordering; vTree; scan performance; write amplification; compaction;
+lazy merge; lazy GC; value-size tiers; hot/cold value logs; YCSB;
+Titan/RocksDB; cold-tier segment layout.
+
+**Core idea:** DiffKV starts from a practical LSM tension: keeping
+full key/value ordering helps range scans, while key-value separation
+reduces write amplification and improves point reads but scatters
+values across append-only logs. The paper's central move is to keep
+keys fully sorted in the LSM tree while managing values with a
+separate partially sorted structure whose ordering is coordinated with
+LSM compaction.
+
+The transferable idea for GPU DB is that cold and warm value payloads
+do not need one universal placement rule. Payload placement can be a
+route-visible dial: tiny values stay with keys, medium values move into
+partially ordered scan-friendly segment groups, and large values move
+into append-only hot/cold logs where random-read overhead is amortized
+by value size.
+
+**Concrete mechanisms:**
+
+- DiffKV builds on RocksDB/Titan-style KV separation. Keys and value
+  locations remain in the LSM tree; values are stored separately.
+- Medium-size values are stored in a new LSM-like value structure
+  called the vTree. A vTree level contains sorted groups of fixed-size
+  vTables. Values are sorted within each group, but groups in the same
+  level may overlap in key range, so the level is partially ordered.
+- vTree merge work is triggered by LSM compaction. When keys move from
+  one LSM level to another, the corresponding values can be identified
+  and moved without a separate full value-validity lookup. New value
+  locations are written back through the same compaction path.
+- Merges append new sorted groups to the next vTree level instead of
+  rewriting the whole destination level. This lowers value write
+  amplification while preserving enough value locality for range scans.
+- Lazy merge aggregates lower vTree levels and delays frequent merges
+  there. The paper argues this has limited scan cost because the last
+  LSM/vTree levels contain most data and dominate scan behavior.
+- Scan-optimized merge tracks vTables with many overlapping key ranges.
+  If overlap exceeds a configured `max_sorted_run` threshold, tagged
+  vTables participate in a later compaction-triggered merge to increase
+  value ordering where scans suffer.
+- vTree garbage collection is state-aware and lazy. DiffKV tracks the
+  invalid-value fraction per vTable, tags vTables whose invalid fraction
+  exceeds `gc_threshold`, and folds reclamation into later
+  compaction-triggered merges instead of immediately querying and
+  rewriting value locations.
+- Fine-grained KV separation divides values by size. In the reported
+  configuration, small values below 128 B stay directly in the LSM tree,
+  medium values use the vTree, and large values above 8 KiB use
+  append-only vLogs.
+- Large-value vLogs use a simple hot/cold split: user writes append to a
+  hot log, while valid values rewritten during GC append to a cold log.
+  The assumption is that GC-surviving values are usually colder than
+  newly written values.
+- DiffKV keeps a WAL for ordinary KV pairs and preserves RocksDB/Titan
+  crash-consistency semantics. Large values separated before the
+  MemTable can avoid being written to the WAL as full values; their keys
+  and value locations still enter the normal path.
+- The prototype is about 2.1K lines on top of Titan. The evaluation uses
+  a single 12-core Xeon E5-2650v4 machine, 16 GiB memory, and a Samsung
+  860 EVO SSD, with a 100 GiB store and YCSB-derived workloads.
+- In microbenchmarks, the paper reports DiffKV at 3.8x insert, 3.7x
+  update, and 2.6x read throughput over RocksDB, while maintaining
+  comparable scan performance. Compared with Titan, DiffKV reports
+  3.2x scan throughput and up to 43.2% lower scan latency.
+- For YCSB workloads, the paper reports DiffKV at 1.7x-4.5x throughput
+  over RocksDB on read/write-heavy workloads and about 2x scan
+  throughput over Titan under the scan-heavy workload.
+- The merge analysis reports compaction-triggered merge reducing value
+  management time by 60.7% versus Titan background GC in the tested
+  update workload. Lazy merge reduces merge count and merged data by
+  about 65%, while scan-optimized merge recovers scan locality by
+  reducing sorted-group overlap.
+
+**GPU DB mapping:** P8's durable truth is still WAL/checkpoint/archive
+plus CPU MVCC state, while GPU memory is rebuildable acceleration.
+DiffKV is most relevant below the GPU tier: CPU/NVMe cold segments,
+future warm value payloads, and resident-refresh source layouts.
+
+The small/medium/large value split maps well to route families. Fixed
+small scalar columns can stay inline in CPU/GPU column groups. Medium
+payloads that still participate in prefix/range scans need partial
+ordering by key or row-id so refresh and scan kernels avoid random
+payload gathers. Large payloads can live in separate logs or objects as
+long as descriptors expose byte ranges, visibility bounds, and fallback
+costs.
+
+The vTree idea suggests a cold-tier segment design where value segments
+are not fully sorted globally, but carry enough sorted-group metadata
+for route pruning and sequential range transfer. For GPU DB, the
+descriptor should include key range, row-id range, visibility
+generation, source WAL boundary, sorted-group id, invalid-byte estimate,
+and resident-refresh compatibility.
+
+Compaction-triggered value movement maps to GPU DB's publication model:
+do not run background value movement as an invisible side effect. Tie
+segment movement, descriptor changes, and invalid-byte accounting to
+owner-published maintenance epochs, then make readers choose only
+snapshots whose descriptor set is complete.
+
+Lazy GC reinforces the earlier TB-Collect lesson: reclamation should use
+tier-shaped units and piggyback on already necessary movement when
+possible. For GPU DB, old medium-value segments should be tagged for
+future refresh/merge work by invalid byte fraction and scan-overlap
+pressure, rather than being eagerly rewritten one tuple at a time.
+
+**Risks and mismatches:** DiffKV is a storage-engine/KV paper, not a SQL
+or GPU execution paper. It does not discuss CUDA kernels, retained GPU
+snapshots, pgwire sessions, MVCC visibility rules, SQL range semantics,
+or WAL-before-visibility across a relational catalog.
+
+The evaluated hardware is a commodity SSD and a relatively small memory
+server, not NVMe arrays, GPUDirect Storage, CXL memory, or disaggregated
+storage. Its parameters should not be copied directly to GPU DB.
+
+The value-size thresholds are workload and hardware dependent. GPU DB
+must tune by transfer size, kernel access pattern, compression, and
+snapshot retention, not only by byte length.
+
+Partial value ordering improves scans but can complicate maintenance and
+route correctness. A descriptor bug could make readers miss values or
+observe a mixed generation. Any adoption needs crash tests around merge,
+manifest publish, old segment retirement, and resident cache invalidation.
+
+The hot/cold vLog assumption may fail for some database workloads:
+values surviving GC are not always cold, especially for stable hot rows
+with frequent metadata updates. GPU DB should use observed route hits
+and refresh pressure rather than relying only on GC origin.
+
+**Benchmark candidates:**
+
+- Build a cold-tier segment simulator with three payload layouts:
+  inline key/value segments, unsorted value logs, and DiffKV-style
+  partially ordered value groups. Measure write amplification, scan
+  throughput, random-read count, resident-refresh bytes, and p99 lookup
+  latency.
+- Add value-size tier experiments for P8: inline scalar, medium
+  partially ordered payload segment, and large append-only payload log.
+  Sweep thresholds by value size, row width, scan length, and update
+  rate. Gate: no threshold can be hard-coded without telemetry support.
+- Prototype segment descriptors with sorted-group overlap counts and
+  invalid-byte fractions. Use them to schedule refresh/merge work under
+  latency ceilings. Failure condition: maintenance improves throughput
+  but creates foreground p99 spikes or stale resident routes.
+- Compare eager tuple cleanup, TB-Collect-style block retirement, and
+  DiffKV-style lazy merge/GC for old MVCC payloads. Measure bytes
+  rewritten, retained stale bytes, snapshot-retirement lag, and owner
+  queue wait.
+- Test crash boundaries around a value-segment merge: after writing new
+  value groups, after descriptor/manifest update, and after old group
+  retirement. Recovery must expose either the old descriptor set or the
+  new descriptor set, never a mixed partial set.
+- For GPU refresh, measure whether partially ordered medium-value
+  groups reduce H2D scatter and improve range/prefix scan kernels versus
+  unsorted logs, especially for 100-key, 1K-key, and 10K-key scan
+  windows.

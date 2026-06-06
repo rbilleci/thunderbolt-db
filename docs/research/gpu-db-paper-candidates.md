@@ -1001,13 +1001,28 @@ Append new candidates here as each paper is processed.
   reduction approaches; useful for comparing explicit DRAM/NVM/NVMe tiered
   value placement and write-stall smoothing. Journal entry added 2026-06-06
   from the USENIX page and PDF.
-- `queued` — **Differentiated Key-Value Storage Management for Balanced I/O
+- `reviewed` — **Differentiated Key-Value Storage Management for Balanced I/O
   Performance**, Li et al., USENIX ATC 2021.
   URL: `https://www.usenix.org/conference/atc21/presentation/li-yongkun`
   Why: BVLSM cites differentiated KV storage management as related work;
   useful for deciding whether GPU DB cold-tier value payloads should be routed
   by size, update frequency, and read/write interference rather than a single
-  separation threshold.
+  separation threshold. Journal entry added 2026-06-06 from the USENIX page
+  and PDF.
+- `queued` — **SILK: Preventing Latency Spikes in Log-Structured Merge
+  Key-Value Stores**, Balmau et al., USENIX ATC 2019.
+  URL: `https://www.usenix.org/conference/atc19/presentation/balmau`
+  Why: DiffKV's balanced-write/read/scan design still leaves foreground
+  compaction and merge interference as a tail-latency question; SILK is a
+  focused follow-up for scheduler-level compaction smoothing and latency-spike
+  control in LSM-style cold/warm tiers.
+- `queued` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
+  Stores**, Conway et al., USENIX ATC 2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/conway`
+  Why: DiffKV evaluates commodity SSD LSM tradeoffs; SplinterDB is a modern
+  NVMe-oriented KV-store design useful for comparing write-optimized indexing,
+  space amplification, and scan/read behavior before GPU DB commits to an
+  LSM-like cold-tier structure.
 - `queued` — **Redesigning LSMs for Nonvolatile Memory with NoveLSM**,
   Kannan, Bhat, Gavrilovska, Arpaci-Dusseau, and Arpaci-Dusseau, USENIX
   ATC 2018.
