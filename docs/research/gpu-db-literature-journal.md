@@ -38,6 +38,159 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Paella turns GPU scheduling into a software-owned dispatch contract
+
+**Citation:** Kelvin K. W. Ng, Henri Maxime Demoulin, and Vincent Liu.
+"Paella: Low-latency Model Serving with Software-defined GPU Scheduling."
+SOSP 2023, pages 595-610. DOI: `10.1145/3600006.3613163`. Retrieved
+2026-06-06 from the author PDF at
+`https://kelvin-ng.github.io/assets/sosp2023-final224.pdf`, after the ACM
+PDF endpoint returned HTTP 403.
+
+**Category:** GPU execution / runtime scheduling, with secondary relevance to
+session admission, response rings, and latency protection for mixed retained
+reads, scans, and refresh work.
+
+**Relevance tags:** software-defined GPU scheduling; kernel-level dispatch;
+head-of-line blocking; shared-memory request channels; hybrid interrupt and
+polling; SM occupancy tracking; compiler instrumentation; SRPT scheduling;
+deficit fairness; GPU queue flow control; low-latency dispatch; batching
+tradeoffs.
+
+**Core idea:** Paella argues that a high-level serving framework should not
+blindly submit whole jobs to the CUDA runtime and trust opaque FIFO hardware
+queues. It co-designs compiler instrumentation, a local client interface, and
+a one-core dispatcher so the system can hold most kernels outside the GPU,
+observe actual block placement/completion, and release only enough work to keep
+the device saturated while preserving software control over job ordering.
+
+For GPU DB, the strongest transferable idea is that GPU execution owners should
+own dispatch policy explicitly. Retained reads, short lookups, scans, refresh
+kernels, decompression kernels, and result scattering should not all disappear
+into black-box CUDA stream queues. The database needs a compact per-route GPU
+dispatch contract: resource footprint, estimated remaining work, latency class,
+snapshot generation, queue budget, fairness state, and fallback/rejection
+policy.
+
+**Concrete mechanisms:**
+
+- Paella instruments TVM-generated CUDA kernels so selected threads publish
+  block placement and block completion notifications, including SM id and
+  kernel id, to a host-visible notification queue.
+- The dispatcher maintains per-SM resource accounting for blocks, threads,
+  registers, and shared memory. It uses compile-time or load-time kernel
+  metadata plus runtime placement/completion notifications to estimate whether
+  another kernel can be launched without filling opaque hardware queues.
+- Host-side CUDA calls are wrapped. Instead of immediately submitting every
+  kernel or memory copy to CUDA streams, Paella puts operations into per-job
+  waitlists that preserve CUDA stream dependency semantics while allowing the
+  dispatcher to decide release time.
+- The dispatcher runs on a dedicated CPU core with real-time priority. It uses
+  cooperative coroutines to keep CUDA-like job code without creating one OS
+  thread per request.
+- Client-to-dispatcher submission uses shared memory buffers to avoid
+  marshaling. The paper describes a local path and sketches remote inference
+  through a local RPC server, while explicitly leaving full low-latency remote
+  inference outside the paper's scope.
+- GPU-to-dispatcher notification uses pinned/shared memory with compact
+  64-bit queue entries. Paella batches placement/completion notifications for
+  groups of up to 16 thread blocks to reduce queue traffic.
+- Result retrieval uses a hybrid IPC design: a client sleeps on a Unix socket
+  until an "almost finished" notification, then polls shared memory briefly for
+  completion. This avoids always-spinning client threads while keeping result
+  wakeup latency low.
+- The default scheduling policy is shortest-remaining-processing-time-like.
+  It estimates remaining job time from profiling and online observations, then
+  combines that with deficit counters so long jobs do not starve.
+- To keep the GPU saturated despite notification delay, Paella launches a
+  configurable amount of extra work beyond estimated full utilization. The
+  queue still remains software-controlled rather than allowing unbounded kernel
+  backlog inside CUDA.
+- Evaluation uses a Tesla T4, Linux 4.15, CUDA 11.7, modified TVM 0.10.0, and
+  eight image models. The paper reports that Paella's scheduler alone sustains
+  1.4x more load and 1.35x lower latency than its baseline, and that the full
+  system sustains up to 58x more load and 11x lower latency than Triton in the
+  tested setup. Device-side notification overhead is reported in microseconds
+  for empty kernels, with aggregation trading a few microseconds of kernel time
+  for lower dispatcher overhead.
+
+**GPU DB mapping:** GPU DB's GPU execution workers should treat CUDA stream
+submission as a narrow lower-level mechanism, not as the scheduling authority.
+The database can maintain per-route descriptors for kernel sequence, expected
+SM/register/shared-memory footprint, H2D/D2H bytes, pinned-buffer needs,
+snapshot generation, and output shape. The GPU owner then releases kernels
+only when they fit the current resource and latency budget.
+
+Paella's shared-memory submission path maps to the existing command/response
+ring target. For local retained reads, IO workers should submit request
+descriptors and buffers through bounded rings, not serialize through a heavy
+serving process. For result return, the "almost finished then poll" idea maps
+to response rings: wake the network worker when completion is near enough to
+avoid busy spinning per logical session.
+
+The SRPT-plus-deficit design maps to mixed query classes. Short retained
+lookups should not sit behind long scans or refresh kernels, but background
+refresh and analytical scans need fairness budgets so they eventually make
+progress. The route scheduler should expose this as policy state, not bury it
+inside CUDA stream priority.
+
+Paella's block placement telemetry is too invasive to assume for all database
+kernels, but the principle is useful: GPU DB should collect real dispatch
+signals, not just planner estimates. At minimum, each GPU worker should report
+queued requests, launched kernels, CUDA event time, H2D/D2H bytes, scratch and
+pinned-buffer pressure, batch size, and fallback/rejection reasons.
+
+The waitlist design maps to route validity. A GPU DB job may have dependent
+steps such as load/filter/decompress/project/scatter. Holding later steps in a
+software-owned waitlist lets the scheduler cancel or redirect a route if a
+snapshot becomes invalid, queue pressure crosses a deadline, or a cheaper CPU
+fallback becomes preferable before the GPU has been flooded with work.
+
+**Risks and mismatches:** Paella is a model-serving system, not a database. It
+does not define SQL correctness, MVCC visibility, WAL-before-visibility,
+catalog invalidation, deterministic row ordering, recovery, or multi-tenant
+database isolation.
+
+The implementation depends on instrumenting kernels, wrapping CUDA calls, and
+restricting job behavior. User code should not spawn arbitrary threads, use
+non-CUDA blocking calls, or mutate shared objects in ways that break coroutine
+assumptions. GPU DB can satisfy some of these restrictions for its own kernels,
+but it should not expose this machinery to arbitrary extension code without a
+stronger sandbox.
+
+The evaluation focuses on inference models on T4/P100-class GPUs. Database
+kernels can be shorter, more memory-bound, more transfer-heavy, or tied to
+snapshot/result correctness. Paella's reported speedups should be treated as
+evidence that software dispatch can matter, not as expected DBMS gains.
+
+Dynamic batching is explicitly not implemented in Paella because it conflicted
+with the TVM setup used in the paper. GPU DB cannot skip batching: retained
+lookups and aggregates need micro-batching under latency ceilings, so the
+Paella-style scheduler must be combined with database-shaped batch formation.
+
+**Benchmark candidates:**
+
+- Build a GPU dispatch simulator with route classes for point lookup,
+  grouped lookup, scan, refresh, decompression, and result scatter. Compare
+  FIFO CUDA-stream submission, per-route streams, SRPT, and SRPT plus fairness
+  budgets.
+- Add a short-read protection benchmark: run short retained lookups while long
+  scans and refresh jobs are queued. Gate: p99 lookup latency stays bounded
+  without starving refresh progress.
+- Prototype a bounded GPU waitlist in front of CUDA streams. Required metrics:
+  queue wait, launched kernels, CUDA event time, estimated remaining work,
+  batch size, cancellation/fallback rate, and stale-snapshot rejection.
+- Test response-ring wakeup policy inspired by Paella's hybrid interrupt/poll
+  design. Compare always-polling, blocking-only, and near-completion wakeup
+  for many logical sessions.
+- Measure instrumentation alternatives before adopting kernel-level telemetry:
+  CUDA events only, host-side launch/completion accounting, cooperative kernel
+  counters, and Paella-style device notifications. Failure condition:
+  telemetry overhead dominates p50 retained lookup latency.
+- Add a scheduling correctness gate: a queued GPU route must prove schema
+  generation, snapshot generation, resident generation, and output ordering at
+  dispatch time, not only at admission time.
+
 ### 2026-06-06 - Skyplane makes cold-tier movement a constrained overlay plan
 
 **Citation:** Paras Jain, Sam Kumar, Sarah Wooders, Shishir G. Patil,

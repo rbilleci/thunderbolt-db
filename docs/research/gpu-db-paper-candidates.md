@@ -2489,12 +2489,27 @@ Append new candidates here as each paper is processed.
   Why: SGDRC contrasts TGS temporal multiplexing and CUDA-container switching
   overhead; useful for evaluating whether GPU DB request classes should ever
   use exclusive time slices instead of spatial sharing or chunked preemption.
-- `queued` — **Paella: Low-Latency Model Serving with Software-Defined GPU
+- `reviewed` — **Paella: Low-Latency Model Serving with Software-Defined GPU
   Scheduling**, Ng, Demoulin, and Liu, SOSP 2023.
   URL: `https://doi.org/10.1145/3600006.3613163`
+  PDF: `https://kelvin-ng.github.io/assets/sosp2023-final224.pdf`
   Why: Orion contrasts Paella as a low-latency GPU serving scheduler that is
   not compute/memory-profile aware; useful for comparing model-serving
   scheduling policies against GPU DB route-class and chunking policies.
+  Journal entry added 2026-06-06 from the author PDF after the ACM PDF
+  endpoint returned HTTP 403.
+- `queued` — **FaaSwap: SLO-Aware, GPU-Efficient Serverless Inference via
+  Model Swapping**, Gunasekaran et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2306.03622`
+  Why: discovered while retrieving Paella; useful for comparing SLO-aware GPU
+  request scheduling, model/state swapping, and GPU memory locality against
+  GPU DB response deadlines, resident-fragment pressure, and fallback policy.
+- `queued` — **Fast Distributed Inference Serving for Large Language Models**,
+  Wu et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2305.05920`
+  Why: discovered while retrieving Paella; useful for comparing preemptive GPU
+  scheduling and host/GPU state movement under head-of-line blocking with GPU
+  DB's long-scan versus short-retained-read admission problem.
 - `queued` — **Zico: Efficient GPU Memory Sharing for Concurrent DNN
   Training**, Lim et al., USENIX ATC 2021.
   URL: `https://www.usenix.org/conference/atc21/presentation/lim`
