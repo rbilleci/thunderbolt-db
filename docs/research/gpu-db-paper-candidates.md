@@ -7270,21 +7270,37 @@ Append new candidates here as each paper is processed.
   metadata should remain manually retired by owner domains or hide
   protection/deallocation in a more automatic descriptor API. Journal entry
   added 2026-06-06 from the author/Zenodo PDF.
-- `queued` — **Practically and Theoretically Efficient Garbage Collection for
+- `reviewed` — **Practically and Theoretically Efficient Garbage Collection for
   Multiversioning**, Wei, Blelloch, Fatourou, and Ruppert, PPoPP 2023.
   URL: `https://doi.org/10.1145/3572848.3577508`
   arXiv: `https://arxiv.org/abs/2212.13557`
   PDF: `https://www.cs.cmu.edu/~guyb/papers/3572848.3577508.pdf`
   Why: OrcGC is a general lock-free reclamation design, but GPU DB's hardest
   reclamation pressure is multiversion state; this follow-up directly studies
-  MVGC on versioned trees and hash tables with space bounds.
-- `queued` — **Efficient Hardware Primitives for Immediate Memory Reclamation
+  MVGC on versioned trees and hash tables with space bounds. Journal entry
+  already exists; this stale duplicate was corrected from `queued` to
+  `reviewed` on 2026-06-06.
+- `reviewed` — **Efficient Hardware Primitives for Immediate Memory Reclamation
   in Optimistic Data Structures**, Singh, Brown, and Spear, arXiv 2023.
   URL: `https://arxiv.org/abs/2302.12958`
   Why: OrcGC still delays reclamation through hazard-style protection and
   handoff; Conditional Access is a hardware-primitive contrast for whether
   coherence-assisted immediate reclamation could ever matter for future CPU
-  warm indexes or route descriptors.
+  warm indexes or route descriptors. Journal entry added 2026-06-06 from
+  arXiv v1.
+- `queued` — **Memory Tagging: Minimalist Synchronization for Scalable
+  Concurrent Data Structures**, Alistarh, Brown, and Singhal, SPAA 2020.
+  URL: `https://doi.org/10.1145/3350755.3400243`
+  PDF: `https://mc.uwaterloo.ca/pubs/spaa20_memtags/paper.pdf`
+  Why: Conditional Access is inspired by this cache-line tagging primitive;
+  useful for comparing validation-before-access synchronization with
+  immediate reclamation and route-descriptor protection.
+- `queued` — **Hand-Over-Hand Transactions with Precise Memory Reclamation**,
+  Zhou, Luchangco, and Spear, SPAA 2017.
+  URL: `https://doi.org/10.1145/3087556.3087583`
+  Why: Conditional Access contrasts itself with short hardware transactions
+  for precise reclamation; useful as a boundary case for whether GPU DB should
+  rely on HTM-like critical sections for CPU-side indexes or metadata.
 - `reviewed` — **To Store or Not to Store: a graph theoretical approach for
   Dataset Versioning**, Guo, Li, Sukprasert, Khuller, Deshpande, and
   Mukherjee, arXiv 2024.

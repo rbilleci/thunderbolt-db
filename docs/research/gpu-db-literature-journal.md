@@ -93794,3 +93794,132 @@ Benchmark priorities:
   logical sessions; p99 wins are invalid if retired bytes grow unbounded.
 - Add overload telemetry that distinguishes owner saturation, byte-budget
   saturation, operation-budget saturation, and cleanup-backlog saturation.
+
+### 2026-06-06 - Conditional Access makes reclamation a cache-coherence contract
+
+**Citation:** Ajay Singh, Trevor Brown, and Michael Spear. "Efficient
+Hardware Primitives for Immediate Memory Reclamation in Optimistic Data
+Structures." arXiv:2302.12958v1, 2023. Retrieved 2026-06-06 from
+`https://arxiv.org/abs/2302.12958`.
+
+**Category:** runtime / HFT / session scale; GC, memory reclamation, and
+in-memory state movement.
+
+**Relevance tags:** Conditional Access; safe memory reclamation; immediate
+reclamation; cache coherence; tagged cache lines; `cread`; `cwrite`;
+optimistic data structures; route descriptors; CPU indexes; retained metadata;
+tail latency; memory footprint.
+
+**Core idea:** The paper asks whether safe memory reclamation has to delay
+freeing retired nodes. Instead of making reclaimers wait for hazard pointers,
+epochs, quiescent states, or retired batches, Conditional Access lets a
+reclaimer free an unlinked node immediately and makes future readers detect
+that their previously observed cache line was invalidated.
+
+The proposed primitive is hardware-assisted but conceptually small: a thread
+uses conditional reads and writes over tagged locations, and the cache tracks
+whether another core invalidated any tagged cache line. If validation fails,
+the operation restarts before using potentially freed memory. The paper's
+Graphite simulator results suggest that this can approach tuned reclamation
+schemes while keeping the memory footprint close to the live data structure.
+
+**Concrete mechanisms:**
+
+- Conditional Access adds `cread`, `cwrite`, `untagOne`, `untagAll`, and a
+  failure/status check. `cread` tags a location and reads it only if no tagged
+  location was revoked; `cwrite` conditionally writes after checking that no
+  tagged location has changed.
+- Each core tracks a tag set and an `accessRevokedBit`. Remote invalidations
+  of tagged cache lines set the revocation bit, so later conditional accesses
+  fail locally instead of fetching a stale or newly reused node.
+- The implementation sketch uses one tag bit per L1 cache line plus per-core
+  revocation tracking. The authors argue this is a subset of the machinery
+  needed for hardware transactional memory, without requiring a full HTM
+  transaction.
+- Reclaimers must write to a tagged location, such as a mark bit or next
+  pointer, before freeing. That coherence event revokes readers that had
+  tagged the node before it was removed.
+- The paper shows replace-and-analyze patterns for optimistic structures:
+  replace unsafe loads/stores with `cread`/`cwrite`, then prove a read is safe
+  if a small set of previously read locations has not changed.
+- Examples include a stack, lazy linked list, external binary search tree, and
+  chained hash table. The paper argues Conditional Access avoids ABA for
+  conditional accesses because a modification invalidates the tagged line.
+- Evaluation uses the Graphite multicore simulator with a directory MSI
+  protocol, private 32 KB L1 caches, shared inclusive 256 KB L2 cache, and
+  64-byte cache lines.
+- Benchmarks compare Conditional Access with leaky no-reclamation, IBR, RCU,
+  QSBR, hazard pointers, and hazard eras across read-only, 10% update, and
+  100% update workloads from 1 to 32 simulated threads.
+- CA is slower in read-only workloads than the lowest-overhead schemes because
+  each conditional read must check revocation state, but it becomes closer or
+  faster under update-heavy, high-contention workloads.
+- In the lazy-list memory-footprint experiment, CA keeps allocated-but-not-yet
+  freed nodes near the live list size, while delayed reclamation schemes retain
+  extra nodes in retired batches; RCU/QSBR can grow without bound if a thread
+  delays reclamation.
+
+**GPU DB mapping:** GPU DB should not depend on Conditional Access existing in
+shipping CPUs, but the design names a useful target: retired route descriptors,
+CPU-side indexes, resident snapshot metadata, and command-buffer nodes should
+have bounded lifetime without periodic giant frees or unbounded stalled-reader
+retention. The paper reinforces that latency and memory footprint are linked:
+batching reclamation hides per-free cost but can produce large pauses and
+memory spikes.
+
+The cache-coherence contract maps to a software requirement for GPU DB's
+current hardware. A reader should validate a compact protection set before
+using a descriptor: route-generation word, descriptor pointer, invalidation
+generation, and owner epoch. If any changes, the request restarts or falls
+back before touching reclaimed buffers. That is a software analog of
+`cread`/`cwrite`, even if it uses generation counters and owner-local epochs
+instead of tagged cache lines.
+
+Immediate reclamation is attractive for route descriptors and CPU warm-tier
+indexes because 1M logical sessions cannot each pin arbitrary retired state.
+The production shape should still bind protection to bounded workers, batches,
+or snapshot handles rather than logical sessions. For GPU buffers, the analog
+must also include CUDA stream/event completion, pinned-buffer lifetime, and
+response-ring ownership; CPU cache invalidation alone cannot prove a device
+or network writer is done.
+
+**Risks and mismatches:** Conditional Access is a proposed hardware primitive
+evaluated in simulation, not a generally available production CPU feature. It
+does not address SQL isolation, MVCC version visibility, WAL, durable
+recovery, GPU memory, NVMe tiers, or distributed fabrics.
+
+The programming model requires all potentially unsafe shared accesses to use
+the conditional instructions and to maintain a proof that a small validation
+set is sufficient. Missing one ordinary load can reintroduce use-after-free
+bugs. GPU DB should treat this as a design vocabulary for bounded validation,
+not as an implementation dependency.
+
+False positives, tag-set capacity, interrupts, associativity evictions, and
+fallback policies are hardware-dependent. The paper's simulator throughput
+should not be projected onto current x86/ARM servers. For GPU DB, the
+actionable part is the benchmark target: compare delayed/batched reclamation
+against immediate or near-immediate owner-local retirement under contention.
+
+**Benchmark candidates:**
+
+- Build a route-descriptor reclamation microbenchmark with readers validating
+  `{pointer, generation, owner_epoch}` before use. Compare epoch batches,
+  hazard pointers, reference counts, and immediate owner-local retirement.
+  Gate: no use-after-free under forced invalidation and bounded retained
+  descriptor bytes under stalled logical sessions.
+- Add a CPU-index retired-node benchmark for hot range/equality indexes.
+  Measure update throughput, read retry rate, p99 lookup latency, retired-node
+  bytes, and free-batch pause time.
+- Simulate CA-style local validation in software: make readers restart if the
+  descriptor generation changes before dereference. Failure condition:
+  retries or validation loads dominate the latency saved by direct reads.
+- Test reclamation batch sizing explicitly. Compare small, medium, and large
+  retire batches under 100% update and mixed read/write workloads. Measure
+  pause spikes and memory footprint, not only average throughput.
+- Add a GPU-specific lifetime gate for resident buffers: CPU descriptor
+  retirement is allowed only after active snapshot handles, response holds,
+  and CUDA event dependencies are clear. Gate: reclaimed GPU/pinned buffers
+  never appear in a later response or kernel.
+- Track telemetry for retired objects by owner: live descriptors, retired
+  descriptors, max retirement age, free-batch duration, retry count,
+  validation-failure count, and bytes blocked by each protection class.
