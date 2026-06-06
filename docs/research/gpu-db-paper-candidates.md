@@ -620,12 +620,13 @@ Append new candidates here as each paper is processed.
   locks need centralized waiter queues, predecessor handoff, or phase-fair
   reader batching under hot remote indexes. Journal entry added 2026-06-06
   from the USENIX page and PDF.
-- `queued` — **Citron: Distributed Range Lock Management with One-sided
+- `reviewed` — **Citron: Distributed Range Lock Management with One-sided
   RDMA**, Gao, Lu, Xie, Wang, and Shu, USENIX FAST 2023.
   URL: `https://www.usenix.org/conference/fast23/presentation/gao`
   Why: ShiftLock cites Citron as one-sided RDMA range-lock work; useful for
   comparing point-lock handoff against range-lock metadata, interval conflicts,
-  and future remote-tier range/index ownership.
+  and future remote-tier range/index ownership. Journal entry added
+  2026-06-06 from the USENIX page and PDF.
 - `queued` — **Distributed Lock Management with RDMA: Decentralization without
   Starvation**, Yoon, Chowdhury, and Mozafari, SIGMOD 2018.
   URL: `https://doi.org/10.1145/3183713.3196890`
@@ -649,6 +650,18 @@ Append new candidates here as each paper is processed.
   needs a direct comparison between full on-switch participant state and
   fissioned compact grant metadata before considering NIC/switch-assisted
   route admission.
+- `queued` — **SeqDLM: A Sequencer-Based Distributed Lock Manager for
+  Efficient Shared File Access in a Parallel File System**, Chen et al.,
+  SC 2022.
+  URL:
+  `https://sc22.supercomputing.org/proceedings/tech_paper/tech_paper_pages/pap149.html`
+  DOI: `https://doi.org/10.1109/SC41404.2022.00060`
+  PDF:
+  `https://madsys.cs.tsinghua.edu.cn/publication/seqdlm-a-sequencer-based-distributed-lock-manager-for-efficient-shared-file-access-in-a-parallel-file-system/SC2022-chen.pdf`
+  Why: Citron cites SeqDLM as a CPU/sequencer-based distributed lock manager
+  for parallel shared-file access; useful for comparing one-sided static
+  remote range locks against sequenced early-grant/early-revocation semantics
+  when GPU DB studies cold-tier file/object concurrency.
 - `queued` — **The Case for Distributed Shared-Memory Databases with
   RDMA-Enabled Memory Disaggregation**, Zhou et al., arXiv 2022.
   URL: `https://arxiv.org/abs/2207.03027`

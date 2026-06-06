@@ -38,6 +38,150 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Citron makes remote range locks a static metadata protocol
+
+**Citation:** Jian Gao, Youyou Lu, Minhui Xie, Qing Wang, and Jiwu Shu.
+"Citron: Distributed Range Lock Management with One-sided RDMA." FAST 2023,
+pages 297-314. Retrieved 2026-06-06 from the USENIX paper page and PDF at
+`https://www.usenix.org/conference/fast23/presentation/gao` and
+`https://www.usenix.org/system/files/fast23-gao.pdf`.
+
+**Category:** database file-system/storage/indexing and runtime concurrency,
+with secondary relevance to future remote/disaggregated-memory tiers and
+range-index ownership.
+
+**Relevance tags:** range locks; one-sided RDMA; segment tree; static remote
+metadata; masked atomics; range-index concurrency; remote-tier locking;
+spillover mutex; dynamic capacity expansion; client failure leases; tail
+latency; disaggregated storage.
+
+**Core idea:** Citron shows that remote range locking does not have to route
+every request through a central CPU lock manager. It maps dynamic byte or
+address ranges onto a static quaternary segment tree stored in remote memory,
+then uses one-sided RDMA atomics so clients can acquire and release compatible
+range locks without server-side CPU traversal on the critical path.
+
+For GPU DB, the strongest transferable idea is not "use RDMA locks now." It is
+that future remote-tier metadata should be shaped so conflict checks are small,
+bounded, and mechanically verifiable. A range lock, resident stripe lock, or
+cold-object interval claim should not require a hot owner CPU to walk an
+unbounded dynamic tree for every request if the protected address space can be
+represented by static, generation-tagged metadata plus explicit fallback for
+out-of-bound ranges.
+
+**Concrete mechanisms:**
+
+- Citron represents the protected address space `[0,N)` with a flat,
+  level-order quaternary segment tree. There are no remote pointers; children
+  and parents are found by index arithmetic, which makes the tree suitable for
+  one-sided remote memory access.
+- Leaf nodes are 64-bit bitmaps over small address units and are changed with
+  masked compare-and-swap. Internal nodes are 64-bit words split into flags and
+  counter fields manipulated with masked fetch-and-add.
+- A requested range is decomposed into a bounded set of tree nodes. The paper
+  tunes the maximum node count to reduce false conflicts without making each
+  request touch too many remote locations.
+- Conflict resolution relies on the segment-tree property that a node's range
+  intersects only its ancestors and descendants. Clients synchronize with those
+  ancestor/descendant paths rather than comparing against an arbitrary interval
+  set.
+- The internal-node protocol uses ticket-like counter pairs, borrowing from
+  bakery-style ordering, so conflicting descendants or ancestors can observe
+  who may proceed without a central queue.
+- The best-case acquisition path takes two RDMA round trips. More complex or
+  contended paths require more polling and retries, but the critical path is
+  still client-driven through one-sided verbs.
+- Ranges beyond the current tree capacity use a spillover mutex. Citron adds a
+  maximizer variable and a scale-up protocol so clients can request tree
+  growth; the server performs minimal allocation/configuration while normal
+  lock traffic mostly continues.
+- Client failure recovery is lease based. Clients agree on a lock lease time,
+  the cluster manager detects failures and tears down QPs, and waiting clients
+  can lazily repair stalled nodes after lease-derived timeouts.
+- The evaluation uses RDMA testbeds and file-system/HPC-style workloads. The
+  USENIX abstract reports up to 3.05x throughput and 76.4% lower tail latency
+  than CPU-based range-lock managers; the paper also reports that scale-up
+  completes in tens of microseconds and that false-conflict/abort rates depend
+  on tree decomposition and wait-time tuning.
+
+**GPU DB mapping:** Citron maps most directly to future warm/cold range
+metadata: remote NVMe/object stripes, disaggregated-memory range indexes,
+resident fragment intervals, and DB-owned cold-tier files. If GPU DB later
+lets many compute or gateway workers coordinate over shared remote objects, the
+range metadata should be pre-shaped into compact arrays, generation counters,
+and bounded conflict paths rather than ordinary heap structures.
+
+The flat segment-tree idea can become an in-process benchmark even without
+RDMA. Represent relation fragments, key ranges, or byte stripes as a flat
+tree; route reads/writes to compatible nodes; measure false conflicts,
+metadata bytes, owner queue pressure, and tail latency. Only if that wins
+locally should RDMA or remote-memory atomics enter the design.
+
+Citron's spillover mutex is a useful warning. Out-of-range or underprovisioned
+metadata collapses concurrency to one coarse lock. GPU DB's range certificates
+should therefore expose "covered by lock tree" versus "spillover/fallback" as
+a first-class route fact, especially for growing relations, append-heavy
+segments, and remote-tier namespace expansion.
+
+The lease recovery design maps to retained snapshot and route metadata
+carefully but not directly. GPU DB can use leases or epochs for remote
+metadata liveness, but SQL-visible visibility still needs WAL-before-visibility
+and owner publication. A timeout may repair a remote lock word; it must not
+invent commit order or silently release a lock whose holder may still have a
+durable transaction in flight.
+
+The one-sided path is also a design contrast for owner domains. Local mutation
+owners remain simpler and safer for current P8, but future remote range-index
+lookups may need a hybrid: owner-published tree generations plus client-side
+read or lock attempts over immutable or bounded mutable metadata.
+
+**Risks and mismatches:** Citron is a distributed range lock manager for shared
+storage address spaces, not a database concurrency-control protocol. It does
+not define SQL isolation, MVCC version visibility, WAL ordering, catalog
+invalidation, deadlock handling for multi-object SQL transactions, or recovery
+from partially durable database updates.
+
+The design assumes RDMA-capable infrastructure, masked atomics, cluster
+membership/failure detection, and reasonably well-behaved clocks for lease
+reasoning. GPU DB should not make those assumptions for the local product
+target.
+
+False conflicts are a real tradeoff. Mapping an arbitrary SQL key range or
+storage byte range to a bounded number of tree nodes can serialize disjoint
+logical requests if the decomposition is too coarse. Conversely, finer
+decomposition increases remote operations and polling.
+
+One-sided remote atomics can remove a server CPU bottleneck but shift pressure
+to RNIC state, remote-memory hot words, polling loops, and failure recovery.
+The recent StaR/SRNIC and lock-management reviews remain relevant before any
+future-tier path assumes that remote atomics scale indefinitely.
+
+**Benchmark candidates:**
+
+- Build a CPU-only flat segment-tree range-lock simulator for resident
+  fragments and cold-tier byte stripes. Compare owner-queued interval locks,
+  coarse partition locks, flat segment-tree locks, and optimistic no-lock
+  validation.
+- Measure false conflicts for GPU DB-shaped ranges: append chunks, range
+  scans, key-order vector slices, cold object stripes, and metadata compaction
+  intervals. Gate: lower owner queue pressure without serializing disjoint hot
+  key ranges.
+- Add a "spillover collapse" benchmark. Grow a relation beyond the advertised
+  range metadata and measure how quickly route throughput falls back to a
+  coarse lock; require telemetry that names spillover/fallback as the reason.
+- Prototype generation-tagged range certificates: relation id, schema
+  generation, WAL boundary, range tree generation, locked node set, and
+  fallback status. Gate: stale tree generations and mixed visibility
+  boundaries are rejected before execution.
+- Compare lease/epoch cleanup policies for abandoned metadata claims. Failure
+  condition: timeout-based cleanup can expose a committed-but-unpublished or
+  WAL-unsafe route.
+- For future RDMA experiments only, compare central CPU lock owner,
+  two-sided RPC lock service, one-sided static-tree metadata, and switch/NIC
+  assisted locks under the same interval workload. Required metrics: p50/p99
+  lock latency, remote operations per lock, abort/retry rate, RNIC/QP pressure,
+  and foreground query impact.
+
 ### 2026-06-06 - Paella turns GPU scheduling into a software-owned dispatch contract
 
 **Citation:** Kelvin K. W. Ng, Henri Maxime Demoulin, and Vincent Liu.
