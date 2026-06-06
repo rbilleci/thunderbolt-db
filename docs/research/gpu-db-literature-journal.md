@@ -38,6 +38,168 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - TDSQL makes scale-out OLTP a proxy, shard, and jitter-control problem
+
+**Citation:** Yuxing Chen, Anqun Pan, Hailin Lei, Anda Ye, Shuo Han,
+Yan Tang, Wei Lu, Yunpeng Chai, Feng Zhang, and Xiaoyong Du.
+"TDSQL: Tencent Distributed Database System." PVLDB 17(12):
+3869-3882, 2024. DOI: `10.14778/3685800.3685812`. Retrieved
+2026-06-06 from the PVLDB PDF at
+`https://www.vldb.org/pvldb/vol17/p3869-chen.pdf`.
+
+**Category:** transaction processing / write path and runtime /
+session scale, with secondary relevance to WAL/logging, high
+availability, and distributed query routing.
+
+**Relevance tags:** production distributed OLTP; shared-nothing
+shards; SQL proxy; distributed transaction control; synchronous
+replication; failover; lock optimization; connection memory; TPC-C;
+jitter; high-concurrency access; banking workloads; route metadata.
+
+**Core idea:** TDSQL is a production distributed relational database
+paper rather than a narrow algorithm paper. Its strongest message is
+that large-scale OLTP throughput comes from making the whole serving
+path explicit: resource management, shard placement, SQL routing,
+distributed transaction control, replication, failover, monitoring,
+and memory use all have to scale together. The paper's TPC-C result
+also emphasizes stability: throughput is not enough if jitter, forced
+rollbacks, or inconsistency appear under long stress runs.
+
+For GPU DB, the transferable idea is to treat the gateway/proxy,
+route planner, mutation owner, residency owner, and runtime queues as
+one measured transaction path. A fast GPU kernel or retained snapshot
+will not matter if connection state, routing metadata, lock cohorts,
+replication/WAL waits, or failover recovery become the real bottleneck.
+
+**Concrete mechanisms:**
+
+- TDSQL uses a layered architecture: a resource layer over physical or
+  virtual machines, a storage layer with Noshard and distributed
+  clusters, a compute layer that handles SQL rewrite and distributed
+  transactions, operations and maintenance modules, backup, migration,
+  validation, auditing, and SQL firewall services.
+- The SQL engine encapsulates permission checking, lexical analysis,
+  parsing, distributed transaction control, and globally unique
+  auto-increment handling. In distributed mode, the SQL layer is not
+  merely a pass-through client protocol endpoint; it is a routing and
+  transaction-control boundary.
+- The paper highlights practical optimizations in the kernel,
+  synchronous replication, and transaction processing rather than
+  claiming that one concurrency-control idea explains the result.
+- Its TPC-C configuration used 3 manager nodes, 1650 data nodes, 495
+  client nodes, and 495 RTE nodes, with 100 Gbps networking and more
+  than 100,000 physical cores, 1.4 PB memory, and 70 PB disk storage.
+- The initial TPC-C database contained 64,003,500 warehouses. The
+  paper estimates about 10 PB initial data and roughly 45 PB disk use
+  after 60 days for dynamic tables.
+- The benchmark reports 814,854,791 tpmC for New-order transactions
+  across 1650 data nodes during the 8-hour stability period, with
+  average and 90th percentile latency below 0.01 seconds and 0.02
+  seconds respectively before including the mandatory 0.1-second
+  TPC-C delay.
+- The paper reports jitter below 0.2%, zero data inconsistency across
+  more than 860 billion transactions, nearly 40 trillion order details,
+  and no unexpected forced rollbacks in the 8-hour run.
+- Optimization breakdown names three important contributors:
+  physical-replication implementation and optimization, lock
+  optimizations, and memory optimization. The reported effects are
+  over 100% performance improvement from physical replication, about
+  15% from lock optimizations and 30% in high-contention scenarios,
+  plus more than 90% connection-memory savings from network-model
+  optimization.
+- Durability testing simulates failures of manager, client, and data
+  nodes and checks consistency using TPC-C order counters before and
+  after the failure window.
+- The paper gives less detail about the exact lock and replication
+  algorithms than an algorithm paper would. The concrete reliable
+  claim is that production-scale throughput depends on optimizations
+  across replication, lock handling, connection memory, failover, and
+  operational control planes.
+
+**GPU DB mapping:** TDSQL argues for making GPU DB's protocol gateway
+a first-class execution component. The production target should avoid
+one-thread-per-client and should budget connection state explicitly.
+For the 1M logical-session goal, connection metadata, prepared route
+state, response buffers, and authentication/session objects need the
+same kind of memory accounting as HBM and pinned host buffers.
+
+The SQL rewrite/distributed-transaction boundary maps to GPU DB route
+planning. A request should leave the gateway with a route certificate:
+target owner domain, relation and schema generation, snapshot
+boundary, supported CPU/GPU path, residency state, required WAL or
+visibility fence, and fallback reason. That certificate should be
+observable in monitoring, not hidden inside a kernel launch.
+
+TDSQL's optimization breakdown is a useful warning against overfitting
+benchmarks to the GPU stage. GPU DB should measure physical
+replication/WAL publication, lock or lease cohorts, connection memory,
+queue jitter, and failover recovery before claiming throughput wins.
+If a retained GPU read path is fast but mutation invalidation, WAL
+publication, or response delivery produces jitter, the system is not
+production-stable.
+
+The paper's scale-out TPC-C test suggests a benchmark shape: long
+duration, ramp-up, stable interval, failure injection, consistency
+checks, and jitter reporting. GPU DB's current microbenchmarks should
+eventually grow a stability lane that verifies no stale resident reads,
+no forced rollbacks from route pressure, and no unexplained
+backpressure collapse while throughput stays steady.
+
+The memory optimization result maps directly to session admission.
+At 1M logical sessions, even small per-session objects can dominate.
+GPU DB should separate logical sessions from physical sockets, use
+compact route/session handles, pool response buffers, and report
+connection-state bytes independently from table, snapshot, and GPU
+buffers.
+
+**Risks and mismatches:** TDSQL is a production system paper with many
+high-level descriptions; some implementation details are not exposed
+enough to reproduce the exact replication, lock, or network-memory
+optimizations.
+
+The system is a large distributed relational database, not a single-node
+GPU database. It does not discuss CUDA streams, HBM residency, pinned
+host staging, GPU kernels, or GPU snapshot invalidation.
+
+The reported TPC-C setup is enormous and includes a mandatory TPC-C
+think/delay component. Its throughput and latency numbers should guide
+stability-test shape, not be treated as a comparable target for the
+current GPU DB prototype.
+
+The paper emphasizes strong synchronization and high availability, but
+it does not provide a complete formal treatment of isolation beyond
+the TPC-C ACID tests and consistency checks described. GPU DB still
+needs explicit WAL-before-visibility, MVCC, route invalidation, and
+snapshot-retirement proofs.
+
+**Benchmark candidates:**
+
+- Add a long-running route-stability benchmark with ramp-up, steady
+  interval, ramp-down, jitter reporting, and forced owner/gateway
+  restart simulation. Gate: no stale resident reads, no unexpected
+  route rollbacks, and explainable recovery state.
+- Build a per-session memory benchmark for 10K, 100K, and simulated
+  1M logical sessions. Measure session object bytes, prepared route
+  bytes, response-buffer bytes, queue handles, and authentication
+  metadata. Failure condition: per-session memory grows with active
+  route complexity instead of compact handles.
+- Add a TPC-C-inspired hot-write benchmark that reports not only
+  throughput but lock/lease wait, mutation-owner queue wait, WAL
+  publication latency, resident invalidation latency, and p99 route
+  jitter.
+- Compare a pass-through pgwire gateway with a route-certificate
+  gateway that performs SQL rewrite/route selection before owner
+  admission. Gate: the certificate path must improve observability
+  without adding unacceptable p50 latency for simple point lookups.
+- Add a failure-injection consistency gate for resident snapshots:
+  kill or restart the gateway/owner during a write-heavy run, then
+  verify order/count invariants and resident-generation invalidation
+  before new reads are admitted.
+- Track physical-replication or WAL-like publication as a separate
+  budget even before distributed replication exists. Expected result:
+  queue jitter and write throughput should expose the publication
+  boundary rather than hiding it inside total query latency.
+
 ### 2026-06-06 - ShiftLock turns hot remote locks into handoff queues
 
 **Citation:** Jian Gao, Qing Wang, and Jiwu Shu. "ShiftLock:

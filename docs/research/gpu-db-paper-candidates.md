@@ -3784,18 +3784,29 @@ Append new candidates here as each paper is processed.
   Why: Minerva relates this HDCC line to Aria-style OCC plus deterministic
   rescheduling; useful for deciding when GPU DB should switch from optimistic
   validation to deterministic owner execution under high contention.
-- `queued` — **TDSQL: Tencent Distributed Database System**, Chen et al.,
+- `reviewed` — **TDSQL: Tencent Distributed Database System**, Chen et al.,
   PVLDB 2024.
-  URL: `https://doi.org/10.14778/3685800.3685844`
+  URL: `https://www.vldb.org/pvldb/vol17/p3869-chen.pdf`
+  DOI: `https://doi.org/10.14778/3685800.3685812`
   Why: HDCC cites TDSQL as a production distributed DBMS context for hybrid
   concurrency-control mechanisms; useful for comparing research-grade Calvin/OCC
   integration with deployed MVCC, logging, failover, and transaction routing.
-- `queued` — **Epoch-Based Commit and Replication in Distributed OLTP
+  Journal entry added 2026-06-06; the stale DOI was corrected during review.
+- `queued` — **Scalable Replay-Based Replication For Fast Databases**, Qin,
+  Goel, and Brown, PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p2025-qin.pdf`
+  Why: TDSQL's production replication path raises backup catch-up and log
+  transfer as throughput risks; replay-based replication is a primary follow-up
+  for comparing transaction-input shipping, parallel backup replay, and
+  replication bandwidth against GPU DB's future WAL/replica publication path.
+- `reviewed` — **Epoch-Based Commit and Replication in Distributed OLTP
   Databases**, Lu et al., PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p743-lu.pdf`
   Why: COCO is Minerva's epoch-commit baseline; useful for comparing
   epoch-sized commit, replication, and validation units with GPU DB
-  WAL-before-visibility batches and retained snapshot publication.
+  WAL-before-visibility batches and retained snapshot publication. Journal
+  entry already exists; this stale duplicate was corrected from `queued` to
+  `reviewed` on 2026-06-06.
 - `queued` — **Basil: Breaking up BFT with ACID (transactions)**,
   Suri-Payer et al., SOSP 2021.
   URL: `https://www.cs.cornell.edu/~matthelb/papers/basil-sosp21.pdf`
