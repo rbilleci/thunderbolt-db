@@ -559,19 +559,33 @@ Append new candidates here as each paper is processed.
   HTM follow-up for read-only transactions, useful for comparing persistent
   read barriers and retained-snapshot fast paths before GPU DB adds durable
   route metadata around read-only execution.
-- `queued` — **Persistent HyTM via Fast Path Fine-Grained Locking**, Maldonado
-  et al., arXiv 2025.
+- `reviewed` — **Persistent HyTM via Fast Path Fine-Grained Locking**,
+  Coccimiglio, Brown, and Ravi, arXiv 2025.
   URL: `https://arxiv.org/abs/2501.14783`
   Why: discovered while checking DHTM follow-ups; useful for contrasting
   hardware-fast-path persistence with software fallback paths, progress
   guarantees, and fine-grained lock interaction under future persistent-memory
-  transaction metadata.
+  transaction metadata. Journal entry added 2026-06-06 from arXiv v2; the
+  queued author metadata was corrected.
 - `queued` — **SPHT: Scalable Persistent Hardware Transactions**, Vila et al.,
   2021.
   URL: `https://doi.org/10.1145/3437801.3441581`
   Why: DHTM is one early durable-HTM design; SPHT appears in the follow-up
   durable transaction line and is useful for checking whether hardware
   persistence support scales beyond a single simulated cache/log-buffer design.
+- `queued` — **Crafty: Efficient, HTM-Compatible Persistent Transactions**,
+  Genc, Bond, and Xu, PLDI 2020.
+  URL: `https://doi.org/10.1145/3385412.3385981`
+  Why: NV-HALT cites Crafty as an existing HTM-compatible persistent
+  transaction design; useful for comparing fast-path persistence,
+  instrumentation, and fallback requirements against route-publication tokens.
+- `queued` — **TL4x: Buffered Durable Transactions on Disk as Fast as in
+  Memory**, Assa, Correia, Ramalhete, Schiavoni, and Felber, PPoPP 2023.
+  URL: `https://doi.org/10.1145/3572848.3577476`
+  Why: NV-HALT compares against the Trinity/TL2 persistent-transaction line;
+  useful for checking whether buffered durable transactions suggest simpler
+  software-only durability/fallback baselines before GPU DB reaches for
+  hardware-assisted persistence.
 
 ### Database file-system design, storage, and indexing
 

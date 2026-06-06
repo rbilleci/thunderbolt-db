@@ -38,6 +38,198 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - NV-HALT makes persistence a fine-grained visibility lock
+
+**Citation:** Gaetano Coccimiglio, Trevor Brown, and Srivatsan
+Ravi. "Persistent HyTM via Fast Path Fine-Grained Locking."
+arXiv:2501.14783v2, 2025. Retrieved 2026-06-06 from arXiv:
+`https://arxiv.org/abs/2501.14783` and
+`https://arxiv.org/pdf/2501.14783`.
+
+**Category:** transaction processing / write path and WAL/logging
+throughput, with secondary relevance to MVCC visibility, future
+persistent-memory tiers, and memory reclamation.
+
+**Relevance tags:** NV-HALT; persistent HyTM; hardware transactional
+memory; fine-grained locks; durable linearizability; opacity; eADR;
+NVM; Trinity; SPHT; epoch reclamation; lock table; colocated locks.
+
+**Core idea:** The paper argues that persistent hardware transactions
+cannot simply commit in HTM and then flush later, because other threads
+could observe data that has become volatile-visible but is not yet
+durable. NV-HALT solves this by using the HTM fast path mainly to read
+or acquire fine-grained versioned locks around transactional addresses.
+Modified addresses stay locked after the hardware transaction commits,
+then the thread persists the write set, advances its persistent version,
+and only then releases the locks.
+
+For GPU DB, the strongest transferable idea is the distinction between
+volatile execution success and durable visibility. A route that updates
+CPU MVCC state, resident descriptors, warm-tier chunks, or future
+persistent metadata should not become observable merely because its fast
+execution path finished. It should hold a small visibility proof until
+WAL, invalidation, recovery metadata, and descriptor publication are
+durably or atomically complete.
+
+**Concrete mechanisms:**
+
+- NV-HALT is a word-based persistent hybrid transactional memory with
+  a hardware fast path and software fallback path. Transactions try HTM
+  a fixed number of times, then fall back to a progressive software path;
+  the paper calls this O(1)-abortable progressiveness.
+- Each transactional address is protected by a versioned fine-grained
+  lock. The software path instruments reads and writes, buffers writes,
+  validates read locks, acquires write locks at commit time, writes and
+  flushes persistent metadata, updates volatile memory, advances a
+  per-thread persistent version, and releases locks.
+- The persistence mechanism borrows Trinity-style per-address undo
+  metadata in persistent memory: old value, per-thread persistent
+  version, and new value. Recovery traverses persistent memory and
+  reverts words whose recorded version is newer than the recovered
+  thread version.
+- The hardware path instruments reads to check that the corresponding
+  lock is unlocked or owned by the current thread. It instruments writes
+  to acquire the lock inside the HTM transaction, record the address and
+  old value in a thread-local write log, and update the volatile value.
+- After `xend`, hardware-path writes remain protected because their
+  locks are still held. The thread then writes and flushes the
+  persistent metadata for each modified address, advances and flushes
+  its persistent version number, and releases the locks.
+- The paper emphasizes that eADR removes explicit flush needs on some
+  platforms but does not remove write-ordering correctness. A data
+  structure can still recover corrupt state if persistent writes become
+  ordered incorrectly.
+- NV-HALT offers variants with weak and strong progressiveness. The
+  strongly progressive version adds a software-path global clock plus
+  separate software and hardware lock-version fields so software
+  transactions can distinguish software conflicts from concurrent HTM
+  writes without making hardware transactions increment a global clock.
+- The implementation uses a fixed-size lock table by default, with an
+  optional colocated-lock version using custom types. The paper notes
+  colocated locks can help some tree workloads but hurt some hash-map
+  layouts.
+- The allocator avoids transactional allocator metadata. It uses a
+  mimalloc-based custom allocator and epoch-based reclamation; allocated
+  objects are tracked for abort cleanup, while frees retire after a
+  committed transaction and safe epoch.
+- The evaluation uses a two-socket Intel Xeon Gold 5220R system with
+  96 hardware threads and 1.5 TiB Intel Optane DCPMM in app-direct mode.
+  Workloads include an `(a,b)` tree, a hash map, and selected STAMP
+  benchmarks.
+- Reported results: NV-HALT achieves up to 10x throughput improvement
+  over Trinity and up to 2.6x over SPHT, with up to 3.5x better energy
+  efficiency in the reported experiments. The strongest gains appear in
+  update-heavy workloads where SPHT's global-lock fallback and log
+  replay become bottlenecks.
+
+**GPU DB mapping:** GPU DB can use NV-HALT's lock-after-fast-path
+pattern as a design vocabulary for route publication. A write route can
+execute fast against owner-local or GPU-prepared state, but any modified
+logical object should remain behind a publication token until durable
+WAL, invalidation descriptors, resident-generation changes, and recovery
+records are complete.
+
+The fine-grained lock is not necessarily a blocking mutex in GPU DB. It
+could be a versioned route publication token: table OID, partition id,
+row or segment range, visibility boundary, resident generation, and
+state `locked/pending/committed/released`. Reads validate the token
+before using cached descriptors or resident handles. Writes release the
+token only after the durable proof is complete.
+
+The paper also reinforces that eADR, CXL memory, or future persistent
+metadata tiers will not remove database ordering rules. WAL-before-
+visibility still needs explicit commit markers and descriptor ordering;
+hardware persistence only changes which flushes are needed.
+
+NV-HALT's allocator result maps to GPU DB's high-churn arenas. Under
+1M logical sessions, transactional route metadata, result buffers,
+pinned host slabs, and snapshot descriptors should not be allocated
+through a shared transactional metadata path. They need owner-local or
+epoch-retired pools whose recovery state can be reconstructed from
+durable route descriptors.
+
+The strongly progressive variant is useful as a warning about fallback
+paths. A fast-path route that falls back to CPU, software validation, or
+owner replay must keep bounded abort/retry behavior; otherwise hot keys,
+capacity misses, or descriptor collisions can livelock the system while
+all routes appear individually optimistic.
+
+**Risks and mismatches:** NV-HALT is a persistent transactional-memory
+algorithm, not a DBMS concurrency-control protocol. It operates on
+word-level transactional addresses, not SQL rows, indexes, WAL streams,
+schemas, GPU resident buffers, network sessions, or replicated commit.
+
+The design depends on HTM availability and behavior. Intel RTM can be
+disabled, capacity-limited, or unavailable, and GPU DB should not make
+HTM a production requirement.
+
+The recovery model traverses persistent memory and reverts individual
+words. GPU DB recovery must replay WAL/checkpoint/archive records and
+validate segment or descriptor generations; word-level undo metadata may
+be too fine-grained or too expensive for relational storage.
+
+Fine-grained publication tokens can reduce unnecessary blocking, but
+they add metadata pressure and validation work. Token granularity must
+be benchmarked against route-cache hit rate, hot-key conflict rate, and
+resident invalidation cost.
+
+The paper's evaluation is on Optane persistent memory and concurrent
+data-structure benchmarks. Its throughput ratios are mechanism evidence
+for persistence/synchronization design, not expected GPU DB gains.
+
+**Benchmark candidates:**
+
+- Build a route-publication-token simulator with row, segment, and
+  partition token granularities. Gate: no read can observe a route whose
+  WAL/invalidation/recovery proof is incomplete.
+- Compare release-after-WAL versus release-after-resident-refresh for
+  mutation routes. Measure write p50/p99, stale-generation rejection,
+  retained-read fallback rate, and recovery replay time.
+- Add a fast-path/fallback stress test where optimistic GPU or owner
+  routes abort after bounded retries and fall back to ordered software
+  validation. Failure condition: retry loops can livelock under hot-key
+  conflicts or descriptor-token collisions.
+- Prototype epoch-retired route arenas for result buffers, pinned host
+  slabs, and retained snapshot descriptors. Required measurements:
+  allocation latency, retired bytes, reclamation delay under long
+  readers, and crash-reconstructable metadata.
+- Benchmark token granularity: one token per table, partition, segment,
+  key range, or row group. Required output: conflict rate, validation
+  overhead, metadata bytes, and p99 latency under mixed reads/writes.
+- Add a persistence-order crash-injection harness for future CXL/NVM
+  metadata: descriptor write, commit marker, token release, and old
+  descriptor retirement. Gate: recovery exposes either the old valid
+  route or the new valid route, never a half-published one.
+
+### 2026-06-06 - Cross-paper synthesis: durable publication needs small proofs with bounded fallback
+
+NVWAL, DHTM, DrTM, and NV-HALT converge on the same
+implementation hypothesis: the fast path is only trustworthy when it
+turns durability and visibility into small explicit proofs. NVWAL
+minimizes WAL bytes and separates log frames from commit marks. DHTM
+keeps redo and commit-complete state separate. DrTM acquires remote
+locks, leases, and logs before local fast execution. NV-HALT keeps
+fine-grained locks held after HTM commit until persistence catches up.
+
+For GPU DB, the next design track should be a route publication record
+that unifies WAL reservation, resident invalidation, descriptor
+generation, response/idempotence slot, and fallback state. The record
+should be small enough for the mutation owner to manipulate at high
+rate, but complete enough for readers, recovery, and benchmark fault
+injection to reject half-published state.
+
+Category gaps: the durable write path is now well sampled, and the next
+few runs should lean back toward query optimizer/route choice,
+high-concurrency networking/session admission, and practical MVCC
+snapshot GC so the publication-proof vocabulary does not become only a
+transaction-memory or persistent-memory story.
+
+Benchmark priority: build a single crash-injectable publication-token
+harness before adding more route variants. It should cover retained
+lookup, mutation, and background refresh routes, with measurements for
+token conflict rate, queue wait, WAL bytes, reader fallback, retired
+metadata bytes, and p99 route latency.
+
 ### 2026-06-06 - DHTM treats durability as part of the transaction fast path
 
 **Citation:** Arpit Joshi, Vijay Nagarajan, Marcelo Cintra, and
