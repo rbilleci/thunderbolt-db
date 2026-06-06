@@ -727,12 +727,13 @@ Append new candidates here as each paper is processed.
   COS review; relevant to future cold-tier placement, replication, cost-aware
   promotion, and region/cloud-aware object movement policy. Journal entry
   added 2026-06-06.
-- `queued` — **ByteHouse: A Cloud-Native OLAP Engine with Incremental
+- `reviewed` — **ByteHouse: A Cloud-Native OLAP Engine with Incremental
   Computation and Multi-Modal Retrieval**, arXiv 2026.
   URL: `https://arxiv.org/abs/2602.08226`
   Why: modern cloud-native warehouse architecture with SSD-backed cache and a
   virtual file-system layer; useful as a contrast point for DB-owned NVMe
-  caches, remote object layout, and local-access abstraction choices.
+  caches, remote object layout, and local-access abstraction choices. Journal
+  entry added 2026-06-06 from arXiv v2.
 - `queued` — **CloudCast: High-Throughput, Cost-Aware Overlay Multicast in the
   Cloud**, Wooders et al., NSDI 2024.
   URL: `https://www.usenix.org/conference/nsdi24/presentation/wooders`
@@ -6657,6 +6658,20 @@ Append new candidates here as each paper is processed.
   Why: discovered while reviewing Crystal's semantic-region caching; useful as
   a modern follow-up on compact semantic cache summaries, aggregate-result
   inference, and adaptive cache bounds for repeated OLAP-style routes.
+- `queued` — **Lance: Efficient Random Access in Columnar Storage through
+  Adaptive Structural Encodings**, Pace et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2504.15247`
+  Why: ByteHouse stores persistent multimodal data in formats including Lance;
+  useful for comparing random-access columnar layout, vector/metadata access,
+  and GPU DB's cold-tier point lookup path before adopting a self-describing
+  file format for mixed scalar/text/vector columns.
+- `queued` — **An Empirical Evaluation of Columnar Storage Formats**,
+  Zeng et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2304.05028`
+  Why: ByteHouse's Sniffer format raises the question of tier-specific columnar
+  file layout; this modern evaluation is useful for comparing Parquet, ORC,
+  Arrow, and GPU-decoding implications before GPU DB fixes its own
+  HBM/DRAM/NVMe segment format.
 - `queued` — **SyPer: Connecting the Pieces for Hybrid Transactional and
   Analytical Processing**, Wang et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p673-wang.pdf`

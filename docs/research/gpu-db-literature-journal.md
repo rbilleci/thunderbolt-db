@@ -38,6 +38,169 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - ByteHouse makes disaggregated storage local through SSD chunks and route modes
+
+**Citation:** Yuxing Han et al. "ByteHouse: ByteDance's Cloud-Native
+Data Warehouse for Real-Time Multimodal Data Analytics." SIGMOD
+Companion 2026 / arXiv:2602.08226v2, 2026. DOI:
+`10.1145/3788853.3803080`. Retrieved 2026-06-06 from
+`https://arxiv.org/abs/2602.08226` and PDF
+`https://arxiv.org/pdf/2602.08226`.
+
+**Category:** multi-tier cache / data placement, with secondary
+relevance to hybrid HTAP, query optimization / planning, and storage
+layout.
+
+**Relevance tags:** SSD-backed distributed cache; shared-storage
+warehouse; virtual file system; chunk cache; staging-to-columnar write
+path; MVCC snapshots; adaptive compaction; incremental execution;
+mode selection; predicate pushdown learning; tiered point lookup;
+remote object storage; Arrow exchange.
+
+**Core idea:** ByteHouse is a production cloud-native warehouse that
+tries to recover locality lost by compute/storage disaggregation. Its
+storage layer combines a unified table engine, an SSD-backed
+cluster-scale cache called CrossCache, and a compute-side virtual file
+system called NexusFS. Its runtime chooses among analytical pipeline,
+staged batch, and incremental execution modes, while the control layer
+keeps versioned metadata, placement, transactions, and optimizer
+decisions coordinated.
+
+The strongest GPU DB transfer is to treat cold-tier access as a
+first-class route with its own local-cache namespace, chunk granularity,
+alignment rules, write buffering, and mode selection. A GPU DB should
+not model NVMe/object storage as a slow version of memory. It should
+publish explicit route facts: which chunks are local, which need
+remote fetch, which writes are buffered, which snapshot is visible,
+and whether the request should run as an immediate retained read,
+staged batch, or incremental refresh.
+
+**Concrete mechanisms:**
+
+- The control layer stores versioned metadata in ByteKV, exposes
+  snapshot-consistent schemas, partitions, and index definitions, and
+  uses a global transaction manager to assign ordered commit
+  timestamps for serializable transactions and consistent snapshot
+  reads.
+- The unified table engine uses a two-tier logical model over
+  documents and chunks, with stable and delta segments. Delta segments
+  capture recent inserts, updates, and feature refreshes while stable
+  segments preserve scan-friendly columnar data.
+- Adaptive compaction controls delta cleanup with a bounded linear
+  controller over the number of active delta segments. The controller
+  increases trigger frequency, merge batch size, and background-task
+  priority as delta accumulation rises, then backs off near an
+  equilibrium level to avoid redundant write I/O.
+- The tiered write path first stages row-level writes in ByteKV with a
+  transaction id and WAL record, then flushes buffered data into
+  compressed columnar segments once size or retention thresholds are
+  reached. Point lookups resolve both the staging store and columnar
+  parts under snapshot isolation.
+- ByteHouse's self-describing Sniffer file format stores file-scoped
+  metadata, per-column encodings, data-type-aware compression, and
+  navigation metadata close to column data. The paper argues this
+  avoids opening scattered auxiliary structures for point and
+  small-range access.
+- CrossCache splits cached files into 12 MB blocks and 4 MB chunks.
+  Cache nodes maintain local SSD-resident block files, in-memory chunk
+  indexes, and read/write paths to backends. Non-contiguous chunks can
+  be buffered until they coalesce into continuous ranges.
+- CrossCache uses cache coordinators for the global namespace and
+  cache nodes for local SSD storage. For writes, cache nodes buffer
+  data locally, upload completed block files concurrently as temporary
+  objects, and later merge or concatenate them into backend files to
+  avoid single-writer backend bottlenecks.
+- NexusFS presents a unified namespace over object storage, HDFS, and
+  local SSDs. It manages aligned regions, coordinated metadata lookup,
+  buffers, logical-file-offset mapping, cached segment locations, and
+  space reclamation through a two-level hash hierarchy.
+- The compute layer has three modes: analytic pipeline mode for
+  low-latency interactive analytics, staged batch mode for long-running
+  recoverable pipelines, and incremental processing mode for
+  delta-aware maintenance with lineage tracking and versioned
+  operator state.
+- A lightweight regression model predicts latency, CPU, and memory
+  demand from query-level, access-pattern, and plan-structure features.
+  It maps predictions to execution modes using percentile thresholds
+  recalibrated from recent cluster workload statistics.
+- Evaluation reports lower TPC-DS tail latency than StarRocks and
+  Doris, 25.4% lower ClickBench latency than ClickHouse, 28.4%-69.2%
+  CPU-time reduction from incremental processing on selected TPC-H
+  joins, and CrossCache latency reductions versus a 50% hit-rate
+  single-node cache of about 25% at p50, 18% at p90, and 22% at p99.
+
+**GPU DB mapping:** CrossCache maps directly to a CPU/NVMe warm-tier
+cache in front of remote or cold storage, but GPU DB should make chunk
+residency visible to the route planner and GPU execution workers. A
+retained read route should know whether its column group is in HBM,
+host DRAM, local NVMe cache, or remote object storage, and whether a
+GPU batch can overlap fetch, decode, and kernel work.
+
+The staging-to-columnar write path is a useful P8 shape: keep WAL and
+recent row-level writes in a mutation-owned staging tier, then flush
+snapshot-visible data into compressed, GPU-friendly column groups.
+Point lookups should consult recent visible deltas before older
+resident/cold segments, with the visibility proof carried as part of
+the route descriptor.
+
+ByteHouse's mode selector suggests a production boundary for GPU DB:
+eligibility remains deterministic, but execution mode can be adaptive.
+The runtime can choose immediate CPU/GPU lookup, GPU micro-batch,
+staged cold scan, or incremental refresh based on predicted queue wait,
+resident bytes, transfer bytes, and freshness lag.
+
+NexusFS is a warning against leaving alignment and cache metadata to an
+opaque file system. GPU DB's P8 storage manager should own segment
+offset maps, chunk state, SSD-cache occupancy, reclaim decisions, and
+remote-fetch telemetry so the planner can reason about tail latency
+before admitting a cold route.
+
+**Risks and mismatches:** ByteHouse is primarily an OLAP and
+multimodal warehouse paper, not a transaction-processing GPU database
+paper. It does not describe GPU execution, CUDA buffers, WAL recovery
+details, or PostgreSQL-style interactive transactions.
+
+The paper is a SIGMOD Companion / arXiv systems description. Some
+production mechanisms are high level, and low-level correctness,
+failure, and cache-coherence details are not fully specified. Treat the
+reported evaluation as directionally useful rather than a full
+reproducible benchmark recipe.
+
+CrossCache's 12 MB blocks and 4 MB chunks are tuned for ByteHouse
+workloads and storage backends. GPU DB may need smaller lookup chunks,
+larger scan segments, or separate GPU-transfer slabs depending on HBM
+budget, NVMe bandwidth, and kernel launch amortization.
+
+Learning-based mode selection is useful only behind deterministic route
+eligibility. A bad predictor must not choose a stale snapshot, skip the
+mutation staging tier, or overload GPU queues under interactive p99
+goals.
+
+**Benchmark candidates:**
+
+- Prototype a P8 warm-tier cache descriptor with chunk size, local NVMe
+  presence, host DRAM presence, HBM presence, remote object offset,
+  snapshot generation, and visibility boundary. Gate: every retained
+  read route can explain which tiers it will touch.
+- Compare three chunk granularities for cold retained scans and point
+  lookups: 1 MB, 4 MB, and 16 MB. Measure read amplification,
+  transfer overlap, p50/p99 latency, SSD write amplification, and GPU
+  occupancy.
+- Add a staging-plus-columnar benchmark: recent WAL-visible row deltas
+  plus older compressed column groups. Expected result: point lookups
+  stay low-latency without forcing immediate full segment refresh.
+- Evaluate an adaptive compaction controller for resident/cold delta
+  segments. Failure condition: compaction oscillates, hurts write p99,
+  or invalidates resident GPU snapshots faster than reads can reuse
+  them.
+- Test execution-mode selection with deterministic eligibility:
+  immediate CPU lookup, GPU resident lookup batch, staged cold scan, and
+  incremental refresh. Gate: wrong predictions are bounded by fallback
+  and admission thresholds.
+- Build a NexusFS-style alignment benchmark for local NVMe cache reads:
+  aligned region reads versus arbitrary byte-range fetches, with GPU
+  transfer overlap and response-ring tail latency measured separately.
+
 ### 2026-06-06 - LIMAO keeps learned route cost models from forgetting old winners
 
 **Citation:** Qihan Zhang, Shaolin Xie, and Ibrahim Sabek.
