@@ -90,14 +90,14 @@ read/write throughput, recovery, compaction, or tail-latency mechanisms.
   Why: PLOR contrasts batching/reordering as a throughput and tail-latency
   direction for OCC; useful for comparing route-level reordering against
   GPU DB's owner rings, priority retry budgets, and hot-key write admission.
-- `queued` — **Polyjuice: High-Performance Transactions via Learned
+- `reviewed` — **Polyjuice: High-Performance Transactions via Learned
   Concurrency Control**, Wang et al., OSDI 2021.
   URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`
   PDF: `https://www.usenix.org/system/files/osdi21-wang-jiachen.pdf`
   Why: PLOR contrasts modular/learned concurrency-control choices with
   protocol-internal priority; useful for deciding whether GPU DB should learn
   route policies while keeping hot-path correctness and tail-priority rules
-  explicit.
+  explicit. Journal entry added 2026-06-06.
 - `queued` — **Deferred Runtime Pipelining for Contentious Multicore Software
   Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
   URL: `https://doi.org/10.1145/3302424.3303966`
@@ -356,6 +356,24 @@ Append new candidates here as each paper is processed.
   Why: LSched contrasts Decima's black-box DAG scheduling with DB-specific
   physical-plan features; useful as a control point for what should remain
   outside GPU DB's hot scheduler when learned policies are evaluated.
+- `queued` — **Sundial: Harmonizing Concurrency Control and Caching in a
+  Distributed OLTP Database Management System**, Yu et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p1289-yu.pdf`
+  DOI: `https://doi.org/10.14778/3231751.3231763`
+  Why: Polyjuice contrasts fixed hybrid CC choices with learned policies, and
+  Sundial combines logical leases, distributed transaction concurrency control,
+  and cache coherence; useful for GPU DB's snapshot leases, retained-route
+  cache coherence, and multi-tier read/write admission.
+- `queued` — **Everything is a Transaction: Unifying Logical Concurrency
+  Control and Physical Data Structure Maintenance in Database Management
+  Systems**, Pavlo et al., CIDR 2021.
+  URL: `https://www.cidrdb.org/cidr2021/papers/cidr2021_paper06.pdf`
+  Author PDF: `https://www.pdl.cmu.edu/PDL-FTP/Database/zhang-CIDR21.pdf`
+  Why: discovered while following Polyjuice's related-work line around
+  logical concurrency and physical maintenance; useful for folding index
+  refresh, resident-cache invalidation, and cold-tier maintenance into
+  transactional visibility instead of treating them as detached background
+  jobs.
 
 ### Database file-system design, storage, and indexing
 
