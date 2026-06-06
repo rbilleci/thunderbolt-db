@@ -3762,12 +3762,22 @@ Append new candidates here as each paper is processed.
   functions; useful for deciding whether tiny validated index or metadata
   probes can live near the kernel/storage boundary without violating SQL
   visibility or WAL recovery contracts.
-- `queued` — **Xenic: SmartNIC-Accelerated Distributed Transactions**,
+- `reviewed` — **Xenic: SmartNIC-Accelerated Distributed Transactions**,
   Schuh et al., SOSP 2021.
-  URL: `https://doi.org/10.1145/3477132.3483565`
+  URL: `https://doi.org/10.1145/3477132.3483555`
+  PDF: `https://homes.cs.washington.edu/~arvind/papers/xenic.pdf`
   Why: DINT contrasts against SmartNIC transaction offload; useful for
   comparing eBPF/kernel-side admission with future NIC/DPU-side transaction
-  routing and request steering.
+  routing and request steering. Journal entry added 2026-06-06; the stale
+  DOI was corrected during review.
+- `queued` — **AlNiCo: SmartNIC-accelerated Contention-aware Request
+  Scheduling for Transaction Processing**, Li et al., USENIX ATC 2022.
+  URL: `https://www.usenix.org/conference/atc22/presentation/li-junru`
+  PDF: `https://www.usenix.org/system/files/atc22-li-junru.pdf`
+  Why: discovered while reviewing Xenic; useful follow-up on using
+  SmartNIC-side compact feature vectors and feedback to steer incoming
+  transactions to CPU workers while reducing contention, which maps to GPU
+  DB gateway admission and owner-ring selection.
 - `reviewed` — **Ocean Vista: Gossip-based Visibility Control for Speedy
   Geo-Distributed Transactions**, Fan and Golab, PVLDB 2019.
   URL: `https://doi.org/10.14778/3342263.3342627`

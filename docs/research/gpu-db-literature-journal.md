@@ -38,6 +38,188 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Xenic puts transaction protocol state on the network edge
+
+**Citation:** Henry N. Schuh, Weihao Liang, Ming Liu, Jacob Nelson,
+and Arvind Krishnamurthy. "Xenic: SmartNIC-Accelerated Distributed
+Transactions." SOSP 2021, pages 740-755. DOI:
+`10.1145/3477132.3483555`. Retrieved 2026-06-06 from the author PDF at
+`https://homes.cs.washington.edu/~arvind/papers/xenic.pdf`.
+
+**Category:** transaction processing / write path and runtime /
+session scale, with secondary relevance to high-concurrency networking
+and future SmartNIC/DPU route admission.
+
+**Relevance tags:** SmartNIC; distributed transactions; OCC;
+primary-backup replication; function shipping; NIC-resident metadata;
+asynchronous batching; PCIe DMA batching; multi-hop commit; remote
+object lookup; gateway offload; request steering; TPC-C; Retwis;
+Smallbank.
+
+**Core idea:** Xenic argues that fast distributed transactions should
+not treat the network device as only an RDMA verb engine. One-sided
+RDMA avoids target CPU work, but its primitive read/write/atomic API
+forces awkward data structures and extra protocol messages. Xenic uses
+programmable on-path SmartNIC cores and NIC memory to hold just enough
+remote-object metadata, lock/version state, and temporary transaction
+state to make the commit path fewer-message, asynchronous, and batched.
+
+For GPU DB, the strongest transferable idea is not "put SQL on a
+SmartNIC." It is to move small, correctness-relevant route facts closer
+to the ingress boundary while leaving heavy state on the host/GPU
+owners. A future gateway, DPU, or NIC-side scheduler can hold compact
+route, lock, generation, or buffer-credit metadata, but it must publish
+clear boundaries for WAL, visibility, DMA completion, and cache
+invalidation.
+
+**Concrete mechanisms:**
+
+- Xenic targets serializable distributed transactions over a replicated
+  key-value store with partition primaries and backups. The commit shape
+  extends OCC with execute, validate, log, and commit phases.
+- The design uses on-path Marvell LiquidIO SmartNICs with 24 ARM cores,
+  16 GB onboard DRAM, and 100 Gbps total network bandwidth per server in
+  the evaluated setup.
+- The paper first characterizes SmartNIC costs. SmartNIC packet handling
+  is more flexible but can have higher per-operation latency than
+  hardware RDMA, so the design only wins if programmability removes
+  enough PCIe, host RPC, and network-message work.
+- Xenic stores all key-value objects in host DRAM, but keeps a
+  SmartNIC-side caching index with hot objects, location hints for host
+  table segments, lock state, version numbers, and transaction metadata
+  for objects involved in active transactions.
+- The host data store is a modified Robinhood hash table tuned for
+  SmartNIC DMA lookup. It caps displacement with overflow buckets so
+  lookup cost remains bounded, and it favors contiguous reads because a
+  single PCIe DMA is much cheaper than multiple disjoint memory reads.
+- NIC index entries store the highest known displacement for a host
+  segment. On a cache miss, the NIC reads the likely contiguous host
+  range by DMA; if the hint is stale, it performs a second adjacent read
+  up to the displacement limit.
+- Insertions and deletions preserve DMA consistency. Robinhood swaps are
+  performed from the last free element backward, and larger multi-cache-
+  line object swaps are wrapped in hardware transactional memory so a
+  concurrent NIC DMA does not observe a torn move.
+- The SmartNIC appends log and commit records to host-memory logs by DMA.
+  Host worker threads later apply logged writes to the primary and
+  backup hash tables off the critical path.
+- Commit ordering still requires the log record to be written to host
+  memory before the corresponding Log or Commit acknowledgement returns.
+  The paper states that Xenic follows FaRM-style recovery constraints:
+  lock state is rebuilt on recovery, logs are scanned, recovering
+  transactions reacquire locks, and replicas agree whether each
+  recovering transaction aborts or fully applies.
+- Function shipping lets transaction execution logic run on the
+  coordinator-side NIC when the function and application state are
+  small. If execution discovers additional keys, the NIC can issue more
+  execute requests before proceeding.
+- Multi-hop OCC communication can ship execution to a remote primary NIC
+  when that reduces commit message delays. For example, for transactions
+  involving the local shard and one remote shard, the remote primary can
+  execute and issue log requests directly to backups, with backup
+  responses returning to the coordinator NIC.
+- Xenic uses continuation-passing asynchronous operations on NIC cores.
+  Each core collects pending read/write DMA vectors with callbacks, then
+  runs callback work when completion status bytes arrive.
+- The runtime batches at multiple boundaries: DMA submissions, Ethernet
+  transmissions, NIC-to-host packets, and NIC-to-NIC packets. This is
+  necessary because single transaction operations often cannot fill a
+  DMA vector or MTU on their own.
+- The evaluation compares against RDMA/RPC-style transaction baselines
+  on TPC-C, Retwis, and Smallbank. Reported peak throughput improvements
+  are 2.42x, 2.07x, and 2.21x respectively, with median latency
+  reductions of 59%, 42%, and 22%, while saving normalized host-thread
+  resources.
+- The benefit depends strongly on hardware shape. The paper explicitly
+  warns that SmartNICs without low-latency packet handling and efficient
+  host-memory access may not justify offload over host-only or RDMA
+  designs.
+
+**GPU DB mapping:** Xenic maps cleanly to GPU DB's gateway and owner
+ring design. The gateway should be able to hold a compact route cache:
+relation id, schema generation, snapshot generation, owner id, resident
+fragment id, buffer-credit state, route family, and fallback reason.
+Heavy state remains with mutation, catalog, residency, and GPU
+execution owners. The edge cache accelerates admission and routing, but
+owners remain the authority for WAL-before-visibility, invalidation, and
+snapshot publication.
+
+The SmartNIC index is a useful analogy for route metadata. Store small
+location hints near ingress, then perform one bounded read of heavier
+metadata when a hint misses. GPU DB can use this shape for resident
+fragment descriptors, hot prepared routes, and future remote-tier object
+locators: hit in a compact edge cache, otherwise read a bounded
+descriptor range from the owner or metadata table.
+
+Xenic's asynchronous DMA callback model maps to GPU DB's pinned host
+buffers and CUDA transfer queues. Work should not block a gateway or GPU
+execution worker while waiting for H2D/D2H completion. Instead, each
+transfer should carry a callback or continuation that publishes response
+work, retires buffers, or advances a route only after the relevant
+completion event.
+
+The multi-hop commit idea is relevant to future partition owners. When a
+transaction is naturally remote to the gateway but local to one owner,
+the gateway should be able to hand execution to the owner that can
+complete the shortest proof path, as long as the route certificate still
+names every WAL, visibility, and invalidation dependency. GPU DB should
+prefer "execute where the proof is shortest" over "always execute where
+the connection entered."
+
+The paper also argues for batching as a property of every boundary, not
+only GPU kernels. GPU DB should batch network responses, route-cache
+refreshes, pinned-buffer DMA work, WAL append chunks, and same-shape GPU
+queries independently, with latency ceilings at each boundary.
+
+**Risks and mismatches:** Xenic is a distributed in-memory key-value
+transaction system, not a SQL engine and not a GPU database. It does not
+cover SQL planning, tuple visibility rules, PostgreSQL protocol
+semantics, GPU-resident snapshots, CUDA streams, or columnar HBM
+layouts.
+
+The paper assumes an on-path SmartNIC with efficient host-memory DMA and
+enough onboard memory for hot metadata. Many modern DPU/SmartNIC
+platforms have different latency, memory, isolation, and programming
+constraints. GPU DB should benchmark any edge-offload path before making
+it part of the correctness-critical serving route.
+
+Function shipping only works for small, simple execution logic. General
+SQL expressions, joins, triggers, and user-defined functions are not good
+NIC-side candidates. For GPU DB, edge-side work should be restricted to
+route admission, fixed-shape request classification, compact lock/credit
+checks, and descriptor lookup.
+
+Xenic keeps locks and active transaction metadata on the NIC, then
+rebuilds them on recovery. GPU DB must be stricter for WAL/MVCC
+publication: no gateway or DPU cache may become the only copy of
+visibility, invalidation, or commit state.
+
+**Benchmark candidates:**
+
+- Build a route-edge-cache benchmark: gateway-side compact route hints
+  versus owner-only route lookup for 10K, 100K, and simulated 1M logical
+  sessions. Measure p50/p99 route latency, cache-hit rate, invalidation
+  traffic, and stale-hint rejection.
+- Prototype asynchronous pinned-buffer continuations for GPU transfers.
+  Gate: network/session workers do not block on transfer completion, and
+  every response names the CUDA/DMA completion boundary that made it
+  safe.
+- Compare owner-local execution versus gateway-first execution for
+  partitioned writes. Expected result: routes that execute where the WAL
+  and visibility proof is shortest should reduce messages without
+  hiding dependency edges.
+- Add independent batching counters for network responses, WAL chunks,
+  route-cache refreshes, H2D/D2H transfers, and same-shape GPU kernels.
+  Failure condition: one boundary claims batching wins while another
+  boundary becomes the p99 latency source.
+- Simulate stale route hints under mutation and DDL pressure. Gate:
+  every stale edge-cache hit is rejected or refreshed before execution;
+  no cached route can bypass owner-generation checks.
+- Evaluate an "edge metadata only" DPU/SmartNIC model: fixed-shape
+  admission and descriptor lookup at the edge, all WAL/MVCC/GPU state on
+  owners. Compare it against full host routing and against an unsafe
+  over-offloaded model to quantify the correctness/performance tradeoff.
+
 ### 2026-06-06 - TDSQL makes scale-out OLTP a proxy, shard, and jitter-control problem
 
 **Citation:** Yuxing Chen, Anqun Pan, Hailin Lei, Anda Ye, Shuo Han,
