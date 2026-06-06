@@ -7142,13 +7142,14 @@ Append new candidates here as each paper is processed.
   remote-memory access semantics against GPU DB's future storage or gateway
   fabric. Journal entry added 2026-06-06; the stale DOI was corrected during
   review.
-- `queued` — **RDMA Performance Isolation with Justitia**, Zhang, Tan,
+- `reviewed` — **RDMA Performance Isolation with Justitia**, Zhang, Tan,
   Stephens, and Chowdhury, arXiv 2019.
   URL: `https://arxiv.org/abs/1905.04437`
   Why: 1RMA contrasts connection-oriented sender shaping and performance
   isolation with its connection-free finite-resource model; useful for
   comparing software-only pacing, fairness, and tenant isolation before GPU DB
-  designs route credits for shared gateway or remote-tier access.
+  designs route credits for shared gateway or remote-tier access. Journal
+  entry added 2026-06-06 from the arXiv PDF.
 - `reviewed` — **Aeolus: A Building Block for Proactive Transport in
   Datacenters**, Hu et al., SIGCOMM 2020.
   URL: `https://doi.org/10.1145/3387514.3405878`
@@ -7172,6 +7173,12 @@ Append new candidates here as each paper is processed.
   Why: Pangu flags PFC-free and lossy RDMA as future production directions;
   useful before GPU DB assumes lossless fabrics, PFC, or switch tuning for
   accelerator/storage network paths.
+- `queued` — **Silo: Predictable Message Latency in the Cloud**, Jang,
+  Sherry, Ballani, and Moncaster, SIGCOMM 2015.
+  URL: `https://doi.org/10.1145/2785956.2787479`
+  Why: Justitia cites Silo as a datacenter latency/bandwidth guarantee design;
+  useful for comparing burst allowances, latency reservations, and network
+  admission against GPU DB's local gateway/ring credit model.
 - `reviewed` — **REWIND: Recovery Write-Ahead System for In-Memory
   Non-Volatile Data-Structures**, Chatzistergiou, Cintra, and Viglas,
   PVLDB 2015.

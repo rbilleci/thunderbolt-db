@@ -93441,3 +93441,181 @@ production forecast.
 - Prototype an automatic descriptor API only for acyclic route metadata
   first. Do not apply it to MVCC row versions until a multiversion GC
   paper or benchmark proves bounded behavior for version chains.
+
+### 2026-06-06 - Justitia makes shared-fabric admission a multi-resource credit problem
+
+**Citation:** Yiwen Zhang, Yue Tan, Brent Stephens, and Mosharaf
+Chowdhury. "RDMA Performance Isolation With Justitia." arXiv:1905.04437,
+2019. Retrieved 2026-06-06 from `https://arxiv.org/abs/1905.04437`.
+
+**Category:** runtime / HFT / session scale; high-concurrency networking
+and admission.
+
+**Relevance tags:** Justitia; RDMA; RNIC performance isolation; sender-side
+shaping; token flow control; latency-sensitive flows; throughput-sensitive
+flows; bandwidth-sensitive flows; head-of-line blocking; multi-resource
+credits; eRPC; FaSST; gateway admission; remote-tier fabrics.
+
+**Core idea:** Justitia starts from a practical RDMA problem: RDMA's
+microsecond latency and high message rate often hold only when an
+application runs alone. When small latency-sensitive messages,
+small-message throughput flows, and large bandwidth-heavy transfers share an
+RNIC, the NIC's link bandwidth and execution-unit throughput can interfere in
+ways that ordinary congestion control does not isolate.
+
+The transferable idea for GPU DB is that "queue capacity" is not one
+resource. Gateway and remote-tier admission should account separately for
+message rate, bytes, latency class, and head-of-line risk. A large cold-tier
+transfer, GPU result spill, or replication stream can be correct and still
+destroy p99 latency for small retained reads unless it is chunked, paced, and
+charged against explicit multi-resource credits.
+
+**Concrete mechanisms:**
+
+- The paper classifies RDMA flows as latency-sensitive small messages,
+  throughput-sensitive small-message streams, and bandwidth-sensitive large
+  transfers. All need RNIC resources in different proportions.
+- Its measurements show pervasive sharing anomalies across InfiniBand,
+  RoCEv2, and iWARP. In the application experiments, FaSST throughput drops
+  by 74% and eRPC throughput drops by 93% when competing with an RDMA-backed
+  storage application; eRPC median and tail latencies rise by 67x and 40x.
+- The authors argue that the anomalies are end-host/RNIC resource issues, not
+  only network congestion. DCQCN and limited hardware virtual lanes do not
+  fully solve the mixed-flow interference.
+- Justitia is host-side and software-only. Each machine runs a daemon that
+  monitors latency and distributes tokens to bandwidth- and
+  throughput-sensitive flows; latency-sensitive flows are not paced directly.
+- Instead of sampling application latency-sensitive flows, Justitia runs a
+  system-wide reference flow of tiny messages and estimates the 99th
+  percentile latency over a sliding window using a count-min sketch.
+- The daemon computes `SafeUtil`, the safe utilization for resource-hungry
+  flows, with an AIMD loop. If reference-flow p99 exceeds the target, it cuts
+  `SafeUtil`; otherwise it increases it gradually.
+- Justitia preserves a sharing-incentive floor: with `L` latency-sensitive,
+  `B` bandwidth-sensitive, and `T` throughput-sensitive flows, the
+  resource-hungry flows retain at least their proportional `B + T` share of
+  RNIC resources while the daemon searches for more utilization.
+- Tokens are multi-resource: one token represents both a byte budget and an
+  operation budget. Bandwidth-sensitive flows exhaust bytes; throughput flows
+  exhaust operation count.
+- Large bandwidth-sensitive messages are transparently split into chunks and
+  paced so the RNIC sees roughly equal-sized pieces, reducing HOL blocking.
+  Throughput-sensitive flows are paced by operation-count tokens without
+  splitting.
+- RDMA READs need receiver-side awareness because remote reads compete with
+  local sends at the target RNIC. Justitia handles this by exchanging updated
+  guaranteed utilization with remote senders rather than shipping every token
+  across machines.
+- If the target p99 cannot be achieved, Justitia can switch policy and focus
+  on sharing resource-hungry flows evenly instead of chasing an unattainable
+  latency goal.
+- The implementation uses a user-space daemon and driver-level shapers. It
+  keeps tokens large enough to avoid token distribution becoming the
+  bottleneck, and uses default small chunks for bandwidth flows when latency
+  flows are present.
+- Evaluation on InfiniBand and RoCEv2 reports strong isolation improvements:
+  with FaSST competing against a bandwidth-sensitive storage application,
+  FaSST throughput improves by 2.5x; with eRPC, Justitia improves median/tail
+  latency by 56.9x/32.2x and throughput by 9.7x while preserving sharing
+  incentive.
+
+**GPU DB mapping:** The high-throughput runtime's command and response rings
+should not admit work by request count alone. A retained point lookup, an
+OLTP write, a GPU result transfer, a cold NVMe/RDMA fetch, and a refresh
+stream consume different mixtures of operations, bytes, pinned buffers, GPU
+copy bandwidth, and owner attention. Justitia suggests assigning each route a
+small vector of credits rather than a scalar queue slot.
+
+The reference-flow idea maps cleanly to gateway telemetry. GPU DB can keep a
+tiny synthetic retained-read or ping route per gateway/runtime owner and use
+its p99 as a guardrail for increasing or decreasing admission of large
+transfers, refreshes, result streams, or cold-tier reads. This is safer than
+waiting for real user traffic to provide enough samples after p99 is already
+damaged.
+
+Justitia's chunking lesson applies to GPU DB response and storage paths:
+large result sets, cold-tier transfers, and resident refreshes should have
+preemption boundaries. They should not monopolize a response ring, network
+worker, pinned buffer pool, or copy engine while latency-sensitive same-shape
+lookups wait behind them.
+
+Remote READ handling is a useful warning for future tiers. A remote storage,
+CXL, or disaggregated-memory read may look like sender-side work at the
+requesting node, but it can consume resources at the owner node that small
+local responses need. Admission needs a receiver-side view for shared
+gateway, remote-tier, and accelerator-facing fabrics.
+
+**Risks and mismatches:** Justitia is a networking/RDMA paper, not a database
+runtime paper. It does not address SQL correctness, WAL-before-visibility,
+MVCC snapshots, GPU memory residency, CUDA copy engines, NVMe scheduling, or
+query planning.
+
+The design assumes cooperative classification of flow types. GPU DB can avoid
+that particular trust issue internally because route classes are known, but
+external clients still need admission based on measured behavior rather than
+declared priority.
+
+Justitia spends dedicated CPU cores on the daemon/reference flow in the
+reported implementation. GPU DB must measure whether similar telemetry and
+token pacing fit inside gateway workers or require separate runtime owners.
+
+The paper's exact chunk sizes and RDMA latencies should not be copied
+directly. The useful artifact is the control loop and resource vector, not a
+particular 2019 RNIC tuning point.
+
+**Benchmark candidates:**
+
+- Add a gateway admission benchmark with three route classes: tiny retained
+  reads, high-message-rate small writes, and large result/cold-tier transfers.
+  Compare scalar queue slots against multi-resource credits for ops, bytes,
+  pinned buffers, and response-ring occupancy.
+- Implement a synthetic reference route per gateway or runtime owner. Use its
+  p99 to AIMD-adjust admission for large transfers and refresh streams. Gate:
+  reference-route p99 stays within target while total throughput remains
+  work-conserving under light load.
+- Benchmark chunked versus unchunked large responses and cold-tier transfers.
+  Failure condition: chunking improves p99 but loses so much bandwidth that
+  sustained backlog grows without an overload signal.
+- Add receiver-side credit accounting for any future remote-tier path: a
+  requester may issue a read only if the owner has exported credits for bytes,
+  operations, and response-buffer pressure.
+- Compare FIFO, priority-only, and Justitia-style token scheduling for mixed
+  retained reads plus refresh/copy streams. Measure p50/p99, rejected work,
+  bandwidth, message rate, owner wait time, and maximum backlog age.
+- Add a policy test for unattainable latency targets: the runtime must choose
+  and report either strict p99 protection with lower utilization or fair
+  resource sharing with explicit SLO degradation.
+
+### 2026-06-06 - Cross-paper synthesis: owner routes need credits and bounded cleanup
+
+Reactors, OrcGC, and Justitia converge on a runtime design track: every hot
+path should name the owner that can safely act, the resource credits consumed
+to reach that owner, and the cleanup obligation left behind after publication.
+Reactors turns cross-domain execution into an explicit route graph; Justitia
+turns shared-fabric admission into multi-resource token control; OrcGC turns
+retired metadata into a bounded handoff problem instead of an unbounded
+background detail.
+
+For GPU DB, the common descriptor is a route work record carrying owner
+domain, snapshot or visibility generation, byte/message/pinned-buffer budget,
+latency class, preemption boundary, publication authority, and retirement
+generation. That one vocabulary can cover retained reads, mutation batches,
+resident refreshes, cold-tier transfers, response streams, and descriptor
+cleanup.
+
+The immediate category gap remains OLTP/MVCC under high session counts rather
+than more analytical GPU work. The next balancing paper should preferably be
+from MVCC retention, transaction admission/conflict handling, or durable
+write/recovery paths, unless the queue needs a session-networking follow-up to
+finish the credit model.
+
+Benchmark priorities:
+
+- Build route tracing that records owner hops, credit consumption, queue wait,
+  and cleanup generation for each request.
+- Stress tiny retained reads beside large transfers and refresh work with
+  scalar queue slots versus multi-resource credits.
+- Bound retired route/snapshot descriptors under stalled workers and many
+  logical sessions; p99 wins are invalid if retired bytes grow unbounded.
+- Add overload telemetry that distinguishes owner saturation, byte-budget
+  saturation, operation-budget saturation, and cleanup-backlog saturation.
