@@ -566,13 +566,14 @@ Append new candidates here as each paper is processed.
   transactional visibility instead of treating them as detached background
   jobs. Journal entry already exists; this stale duplicate was corrected from
   `queued` to `reviewed` on 2026-06-06.
-- `queued` — **DUMBO: Making durable read-only transactions fly on hardware
-  transactional memory**, Dileep et al., arXiv 2024.
+- `reviewed` — **DUMBO: Making durable read-only transactions fly on hardware
+  transactional memory**, Barreto et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2410.16110`
   Why: DHTM focuses on durable update transactions; DUMBO is a modern durable
   HTM follow-up for read-only transactions, useful for comparing persistent
   read barriers and retained-snapshot fast paths before GPU DB adds durable
-  route metadata around read-only execution.
+  route metadata around read-only execution. Journal entry added 2026-06-06
+  from arXiv v1; the queued author metadata was corrected.
 - `reviewed` — **Persistent HyTM via Fast Path Fine-Grained Locking**,
   Coccimiglio, Brown, and Ravi, arXiv 2025.
   URL: `https://arxiv.org/abs/2501.14783`
@@ -600,6 +601,23 @@ Append new candidates here as each paper is processed.
   useful for checking whether buffered durable transactions suggest simpler
   software-only durability/fallback baselines before GPU DB reaches for
   hardware-assisted persistence.
+- `queued` — **ArchTM: Architecture-Aware, High Performance Transaction for
+  Persistent Memory**, Wu, Ren, Peng, and Li, FAST 2021.
+  URL: `https://www.usenix.org/conference/fast21/presentation/wu-kai`
+  PDF: `https://www.usenix.org/system/files/fast21-wu-kai.pdf`
+  Why: DUMBO's durability optimizations are HTM-specific; ArchTM is a primary
+  persistent-memory transaction follow-up that emphasizes avoiding small
+  random writes and improving sequential/coalesced persistence, useful for a
+  software/storage-oriented baseline for future GPU DB CXL/NVM route
+  metadata.
+- `queued` — **SpecPMT: Speculative Logging for Resolving Crash Consistency
+  Overhead of Persistent Memory**, Ye et al., ASPLOS 2023.
+  URL: `https://doi.org/10.1145/3575693.3575696`
+  PDF: `https://research.csc.ncsu.edu/picture/publications/papers/asplos23b_specLog.pdf`
+  Why: DUMBO reduces read and marker waits in durable HTM; SpecPMT is a modern
+  speculative-logging follow-up for persistent memory, useful for comparing
+  bounded speculative logs, hot/cold data handling, and crash-consistency
+  overhead before GPU DB considers persistent warm-tier metadata.
 
 ### Database file-system design, storage, and indexing
 

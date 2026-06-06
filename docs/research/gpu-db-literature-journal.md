@@ -38,6 +38,175 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - DUMBO makes durable read-only transactions wait only for older non-durable writes
+
+**Citation:** João Barreto, Daniel Castro, Paolo Romano, and Alexandro
+Baldassin. "DUMBO: Making durable read-only transactions fly on
+hardware transactional memory." arXiv:2410.16110v1, 2024. Retrieved
+2026-06-06 from arXiv: `https://arxiv.org/abs/2410.16110` and
+`https://arxiv.org/pdf/2410.16110`.
+
+**Category:** transaction processing / write path and MVCC / snapshot
+/ visibility, with secondary relevance to WAL/logging throughput,
+future persistent-memory tiers, and retained read paths.
+
+**Relevance tags:** DUMBO; persistent hardware transactions; durable
+read-only transactions; unlimited reads; pruned durability wait;
+isolation wait; opportunistic redo-log flushing; partially ordered
+durability markers; POWER9 HTM; CXL persistent memory; TPC-C.
+
+**Core idea:** DUMBO observes that persistent HTM designs can make
+read-only transactions slow even when the read itself is logically
+simple. A read-only transaction cannot return until every write it may
+have observed is durable. Prior persistent HTM systems conservatively
+wait for both older and concurrent update transactions, so read-heavy
+TPC-C mixes can spend most read latency in durability waiting rather
+than useful work.
+
+DUMBO combines unlimited-read hardware transactions with a stronger
+separation between concurrent and older writes. Update transactions use
+an isolation wait before HTM commit so concurrent transactions cannot
+read from one another. That lets a read-only transaction prune its
+durability wait: it only waits for non-durable update transactions whose
+state timestamp predates the read's begin timestamp. Concurrent updates
+are not in the read's dependency set.
+
+For GPU DB, the transferable idea is not to require HTM. It is to make
+durable read snapshots carry a minimal dependency proof. A retained CPU
+or GPU read should not wait for every active writer, refresh, or route
+publication. It should wait only for the specific older publication
+facts it could have observed and bypass concurrent work that cannot be
+part of its snapshot.
+
+**Concrete mechanisms:**
+
+- DUMBO keeps a DRAM shadow copy of a persistent heap and maintains
+  per-thread persistent redo logs plus volatile state arrays. A log
+  replayer applies durable redo records to the persistent heap during
+  recovery or log pruning.
+- Each thread publishes transaction state as active, inactive, or
+  non-durable, with timestamps for active/non-durable transitions.
+  The timestamp distinguishes the transaction a reader observed from a
+  later transaction by the same thread.
+- Read-only transactions do not start a regular HTM transaction. They
+  publish active state, execute reads with unlimited read capacity, then
+  publish inactive state and run the pruned durability wait.
+- Update transactions execute in HTM. In SI mode they can run without
+  load tracking; in opacity mode only read-only transactions get the
+  unlimited-read benefit, while updates use normal access tracking.
+- Before update commit, DUMBO suspends access tracking, publishes the
+  inactive state, acquires a durable logical timestamp, opportunistically
+  flushes copied redo-log entries, and performs an isolation wait until
+  transactions active at the start of the wait have moved on.
+- After the isolation wait, the update enters non-durable state, resumes
+  access tracking, commits HTM, fences to complete redo-log flushes,
+  performs the pruned durability wait, flushes a durability marker, and
+  returns to inactive state.
+- The pruned durability wait scans only transactions in non-durable
+  state whose timestamp is older than the caller's begin timestamp.
+  State is split into arrays so read-dominated workloads avoid constant
+  cache-line invalidation from read-only active/inactive updates.
+- DUMBO replaces totally ordered durability markers with a partial order.
+  Concurrent update transactions that cannot have read from one another
+  may flush durability markers in any order after their older
+  dependencies are durable.
+- Durability markers live in a global circular array indexed by logical
+  durable timestamps. Each marker points to the redo log and entry count.
+  The log replayer scans the marker array rather than all per-thread
+  logs, avoiding the classic scan bottleneck.
+- If a transaction aborts after taking a durable timestamp, it writes an
+  abort marker. Crash-induced holes can be skipped; after seeing enough
+  holes relative to worker count, the replayer can stop.
+- The evaluation uses a POWER9 system in a VM with 64 virtual cores and
+  emulated Optane-like persistent-memory flush latency. Workloads are
+  TPC-C transaction mixes. The paper reports up to 4.0x improvement over
+  the best competing persistent HTM/software-TM alternative, with
+  especially strong gains when read footprints exceed HTM capacity or
+  read-only transactions otherwise wait on concurrent writes.
+
+**GPU DB mapping:** GPU DB's retained read snapshots should copy the
+shape of DUMBO's dependency test. A read route should carry `begin_lsn`
+or `begin_txn`, snapshot generation, resident generation, and the set of
+older non-durable publication tokens it must wait for. Concurrent writes
+that started after the read boundary, or refreshes publishing a newer
+generation, should not block the read unless they invalidate the route's
+chosen snapshot before admission.
+
+The state-array idea maps to owner-domain publication metadata. Instead
+of letting every read touch a heavyweight transaction table, the runtime
+can keep compact per-owner arrays for active writers, non-durable
+publication tokens, and published generations. Read workers and GPU
+execution owners validate a small cached snapshot of those arrays before
+launching work.
+
+DUMBO's partial-order durability markers map to route publication. A GPU
+DB mutation route does not need one global marker order for independent
+partitions or resident fragments. It needs proof that any earlier
+dependency visible to the route is durable and that recovery can replay
+the committed route descriptors in a dependency-safe order.
+
+Opportunistic redo-log flushing also maps to batching and queue-drain
+time. While a writer is waiting for route isolation, residency
+invalidation, or conflict ordering, the engine can preflush WAL bytes,
+copy descriptor records, or stage invalidation metadata, then fence only
+at the publication point.
+
+The log-replayer marker-array design suggests a benchmark for GPU DB WAL
+metadata: publish compact commit descriptors that let recovery scan a
+single ordered descriptor space, while still allowing independent route
+families to commit without contending on one total-order marker.
+
+**Risks and mismatches:** DUMBO is a persistent transactional-memory
+design, not a SQL engine. It operates on memory transactions over a
+persistent heap, not rows, indexes, catalog versions, GPU buffers,
+network sessions, replicas, or SQL isolation levels beyond its TM
+opacity/SI framing.
+
+The design depends on HTM suspend/resume features. The paper's main
+implementation uses POWER9 behavior; the authors note that Intel TSX
+only supports load-tracking suspension, so the update-side durability
+optimizations do not port directly.
+
+The evaluation uses emulated persistent-memory flush latency rather than
+real CXL persistent memory, and it disables log replay during normal
+transaction processing. Reported throughput should be treated as
+mechanism evidence, not expected GPU DB gains.
+
+Pruned waits are only safe if the dependency proof is correct. In GPU DB,
+snapshot admission must account for DDL, resident invalidation, index
+maintenance, WAL flush, and recovery descriptors, not just whether a
+writer was concurrent.
+
+Partial marker order reduces coordination but complicates recovery
+auditing. GPU DB should not relax WAL-before-visibility; it should only
+allow independent route descriptors to avoid unnecessary global waits
+when dependency metadata proves independence.
+
+**Benchmark candidates:**
+
+- Add a retained-read dependency simulator with active writer tokens,
+  non-durable publication tokens, and snapshot begin timestamps. Gate:
+  reads wait only for older non-durable dependencies and never observe a
+  half-published route.
+- Compare conservative read admission against pruned wait admission under
+  read-heavy TPC-C-like mixes and long GPU reads. Measure read p50/p99,
+  writer publication latency, stale-generation rejection, and retired
+  token backlog.
+- Prototype per-owner compact state arrays for `active`, `non_durable`,
+  and `published_generation`. Required measurement: cache-line traffic,
+  validation latency, and behavior under 1M logical-session fan-in.
+- Test independent partial-order commit descriptors for disjoint table or
+  partition updates. Gate: recovery produces a dependency-consistent
+  replay order without one global descriptor bottleneck.
+- Use route-isolation wait time to preflush WAL or copy invalidation
+  descriptors, then fence at publication. Failure condition: preflush
+  work extends hot-key isolation wait or increases read p99 under
+  contention.
+- Add crash-injection cases for descriptor holes, abort markers, and
+  partially published route descriptors. Gate: recovery either replays a
+  fully durable route or skips/rolls it back without exposing stale GPU
+  residency.
+
 ### 2026-06-06 - LEON keeps learned route choice behind an expert optimizer
 
 **Citation:** Xu Chen, Haitian Chen, Zibo Liang, Shuncheng Liu,
