@@ -13,6 +13,10 @@ synthesize papers that may improve:
 - MVCC, snapshot isolation, or comparable visibility models
 - multi-tier cache and data placement across GPU memory, system memory,
   disk/NVMe, and future tiers
+- database file-system/storage layout, indexing metadata, and DB-owned cold-tier
+  file/object management
+- WAL, logging, checkpointing, replay, and read/write throughput under durable
+  commit constraints
 - GPU execution, batching, micro-batching, and memory layout
 
 The output is not a single predetermined architecture. It is a growing research
@@ -48,7 +52,8 @@ important to the engine, not because OLAP is the only goal. Do not process more
 than two analytics/GPU-OLAP papers consecutively. When the recent journal skews
 analytical, the next paper should come from OLTP/concurrency control,
 MVCC/snapshot/storage, high-concurrency runtime/admission, HFT-style low-latency
-systems, multi-tier cache/storage management, or query optimization/planning.
+systems, multi-tier cache/storage management, database file-system/indexing
+design, WAL/logging throughput, or query optimization/planning.
 
 Prefer papers from:
 
@@ -72,6 +77,12 @@ Prefer topics that map directly to current GPU DB design questions:
 - **multi-tier cache and data placement**: GPU HBM, CPU DRAM, compressed host
   segments, OS page cache, explicit buffer pools, NVMe, GPUDirect storage,
   prefetching, eviction, demotion, promotion, and tier-aware admission
+- **database file-system design, storage, and indexing**: DB-owned file/object
+  layout, page/segment formats, cold-tier namespace management, auxiliary scan
+  indexes, range indexes, metadata publication, and file-system avoidance
+- **WAL and read/write throughput**: write-ahead logging, parallel logging,
+  replicated logs, checkpoint/replay, synchronous commit cost, log-buffer
+  ownership, and how logging choices affect read latency and write throughput
 - **HFT/runtime mechanics**: cache-friendly queues, rings, preallocation,
   pinned buffers, low-allocation hot paths, and mechanical sympathy
 - **GPU execution and batching**: GPU database scheduling, concurrent GPU query
@@ -90,6 +101,7 @@ The candidate queue and journal should keep a healthy mix:
 - MVCC / snapshot / visibility: at least 20%
 - runtime, HFT-style mechanics, concurrency, and session scale: at least 20%
 - multi-tier cache, buffer management, and data placement: at least 15%
+- database file-system/storage/indexing and WAL/logging throughput: at least 15%
 - GPU execution / analytics / over-resident execution: at most 30% unless
   explicitly requested for a GPU-specific phase
 - query optimization and hybrid HTAP: fill the remaining mix and break ties

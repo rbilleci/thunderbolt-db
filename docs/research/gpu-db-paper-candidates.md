@@ -15,6 +15,10 @@ should not process more than two analytics/GPU-OLAP papers consecutively. If
 recent reviews skew analytical, the next candidate should come from
 transaction processing, MVCC/snapshots, runtime/session scale, HFT-style
 mechanical sympathy, multi-tier cache/data placement, or query optimization.
+Database file-system design for storage/indexing and WAL throughput are
+explicit priority lanes. When adding or selecting storage papers, prefer sources
+that expose concrete file layout, index metadata, WAL/checkpoint ordering,
+read/write throughput, recovery, compaction, or tail-latency mechanisms.
 
 ## Seed Queue
 
@@ -250,6 +254,65 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
 ## Newly Discovered Queue
 
 Append new candidates here as each paper is processed.
+
+### Database file-system design, storage, and indexing
+
+- `queued` — **Native Cloud Object Storage in Db2 Warehouse: Implementing a
+  Fast and Cost-Efficient Cloud Storage Architecture**, Kalmuk et al.,
+  SIGMOD/PODS Companion 2024.
+  URL: `https://research.ibm.com/publications/native-cloud-object-storage-in-db2-warehouse-implementing-a-fast-and-cost-efficient-cloud-storage-architecture`
+  Why: modern production DBMS storage architecture over durable object storage;
+  relevant to separating database-owned storage metadata, page/object layout,
+  cache hierarchy, and read throughput from conventional local file-system
+  assumptions.
+- `queued` — **Vortex: A Stream-oriented Storage Engine For Big Data
+  Analytics**, Lamb et al., SIGMOD/PODS Companion 2024.
+  URL: `https://research.google/pubs/vortex-a-stream-oriented-storage-engine-for-big-data-analytics/`
+  PDF: `https://www.cs.cmu.edu/~15721-f24/papers/Google_Vortex.pdf`
+  Why: recent high-throughput storage-engine design for streaming and batch
+  analytics; useful for GPU DB ingestion, scan throughput, file layout,
+  indexing metadata, and bounded freshness tradeoffs.
+- `queued` — **DEX: Scalable Range Indexing on Disaggregated Memory**, VLDB
+  2024.
+  URL: `https://www.microsoft.com/en-us/research/publication/dex-scalable-range-indexing-on-disaggregated-memory/`
+  Why: modern scalable B+-tree/range-index design for a remote/disaggregated
+  memory tier; useful for comparing GPU DB cold/warm range indexes, remote
+  placement metadata, and read-path latency under tiered storage.
+- `queued` — **Cabin: A Practical Scan Index for Data Lakes**, SIGMOD 2024.
+  URL: `https://2024.sigmod.org/toc-2-1.html`
+  Why: recent scan-index design for file-backed/lake-style analytical storage;
+  relevant to deciding when GPU DB should maintain compact auxiliary indexes
+  over cold segments instead of relying only on full scans or B-tree-like
+  access paths.
+
+### WAL, logging, and read/write throughput
+
+- `queued` — **PALF: Replicated Write-Ahead Logging for Distributed
+  Databases**, Xu et al., PVLDB 2024.
+  PDF: `https://www.vldb.org/pvldb/vol17/p3745-xu.pdf`
+  DOI: `https://doi.org/10.14778/3685800.3685803`
+  Why: production distributed WAL design from OceanBase with append-only log
+  files, replication, recovery, and read/write performance implications;
+  directly relevant to GPU DB WAL-before-visibility and future replica paths.
+- `queued` — **DecLog: Decentralized Logging in Non-Volatile Memory for Time
+  Series Database Systems**, Zheng et al., PVLDB 2023.
+  PDF: `https://www.vldb.org/pvldb/vol17/p1-zheng.pdf`
+  DOI: `https://doi.org/10.14778/3617838.3617839`
+  Why: decentralized WAL/logging path for high-ingest workloads; useful for
+  comparing owner-local log buffers, NVM/SSD flush behavior, and write
+  throughput under massive append pressure.
+- `queued` — **Improving database performance by leveraging network-assisted
+  logging**, Future Generation Computer Systems 2025.
+  URL: `https://www.sciencedirect.com/science/article/pii/S0167739X25000809`
+  Why: recent WAL-overhead reduction paper; useful as a foil for local durable
+  WAL, remote durable logging, NIC-assisted persistence, and the throughput
+  cost of synchronous commit.
+- `queued` — **BVLSM: Write-Efficient LSM-Tree Storage via WAL-Time Key-Value
+  Separation**, arXiv 2025.
+  URL: `https://arxiv.org/abs/2506.04678`
+  Why: WAL-time key-value separation links write-ahead logging directly to LSM
+  write amplification, memory pressure, and read/write jitter; useful for GPU
+  DB cold-tier ingest and compaction policy.
 
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
