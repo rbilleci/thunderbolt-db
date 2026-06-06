@@ -2174,13 +2174,23 @@ Append new candidates here as each paper is processed.
   Why: HetExchange cites Voodoo as a portable hardware-conscious algebra;
   useful for comparing route descriptors and device providers with a
   declarative intermediate representation for CPU/GPU portability.
-- `queued` — **How to Architect a Query Compiler, Revisited**, Tahboub,
+- `reviewed` — **How to Architect a Query Compiler, Revisited**, Tahboub,
   Essertel, and Rompf, SIGMOD 2018.
   URL: `https://doi.org/10.1145/3183713.3196893`
+  PDF: `https://www.cs.purdue.edu/homes/rompf/papers/tahboub-sigmod18.pdf`
   Why: Kersten et al. cite query-compiler architecture as a major source of
   maintainability complexity; useful for deciding whether GPU DB route
   fragments should use staged compilation, a compact IR, or handwritten
-  kernels with deterministic planner guardrails.
+  kernels with deterministic planner guardrails. Journal entry added
+  2026-06-06.
+- `queued` — **Query Compilation Without Regrets**, Grulich et al.,
+  PACMMOD/SIGMOD 2024.
+  URL: `https://doi.org/10.1145/3654970`
+  PDF: `https://nebula.stream/paper/grulich_sigmod2024.pdf`
+  Why: modern Nautilus follow-up that bridges interpretation and compilation;
+  useful for deciding whether GPU DB should use cached generated fragments,
+  adaptive tiered execution, or interpreter-first execution for latency-sensitive
+  route shapes.
 - `queued` — **A Common Runtime for High Performance Data Analysis**, Palkar
   et al., CIDR 2017.
   URL: `https://www.cidrdb.org/cidr2017/papers/p51-palkar-cidr17.pdf`

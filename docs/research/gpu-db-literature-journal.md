@@ -38,6 +38,215 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Query compiler architecture should preserve planner facts until code generation
+
+**Citation:** Ruby Y. Tahboub, Gregory M. Essertel, and Tiark Rompf.
+"How to Architect a Query Compiler, Revisited." SIGMOD 2018,
+pp. 307-322. doi:10.1145/3183713.3196893. Retrieved 2026-06-06
+from the ACM DOI/DBLP metadata and the author-hosted PDF,
+`https://www.cs.purdue.edu/homes/rompf/papers/tahboub-sigmod18.pdf`.
+
+**Category:** query optimization / planning, with runtime code-generation
+and heterogeneous route-selection relevance.
+
+**Relevance tags:** query compilation; staged interpreters; Futamura
+projection; data-centric execution; callbacks; route certificates;
+CPU fallback; generated kernels; code motion; data layout selection;
+index injection; dictionary encoding; planner-owned access paths.
+
+**Core idea:** The paper argues that a fast query compiler does not need
+to be either a brittle string-template expander or a many-pass compiler
+stack that recovers high-level database facts from lowered imperative
+code. LB2 treats compilation as specialization of a high-level query
+interpreter: static query-plan structure is evaluated at generation time,
+while dynamic tuple values become generated code. With the right
+interpreter shape, operator dispatch, record abstractions, hash-map
+objects, layout choices, and some allocation work disappear from the
+residual hot path.
+
+The strongest GPU DB lesson is that route compilation should keep
+planner and storage facts explicit until the last responsible moment.
+If a route certificate already knows snapshot generation, resident
+layout, key/index availability, dictionary identity, device eligibility,
+and fallback constraints, the compiler should consume those facts
+directly. It should not lower to generic loops and then try to rediscover
+"this is a resident key lookup" or "this predicate can use a compressed
+dictionary" from low-level code.
+
+**Concrete mechanisms:**
+
+- LB2 uses the first Futamura projection as a design guide: specialize an
+  interpreter with respect to a fixed query plan, producing generated
+  code for the dynamic data path.
+- The paper contrasts Volcano-style pull evaluation with data-centric
+  push evaluation. Data-centric execution specializes better because
+  inter-operator control flow is not driven by dynamic tuple availability
+  in the same way as `next()` chains.
+- LB2 replaces the usual `produce`/`consume` interface with a single
+  callback-style `exec(cb)` API. Hash join, for example, invokes the left
+  child with one callback to build a hash table and the right child with
+  another callback to probe it, avoiding parent pointers and phase flags.
+- Code generation is pushed below operator templates into generation-time
+  abstractions. `Record`, `Value`, `Buffer`, and hash-map objects are
+  ordinary high-level objects while generating, but disappear into raw
+  arrays, pointer reads/writes, and loops in emitted code.
+- Row and column layouts are implementation classes behind the same
+  record/buffer interface. Operators can use either without changing the
+  main query-evaluator code; materializing pipeline breakers are natural
+  format-conversion points.
+- Aggregate hash maps and join multimaps are specialized data structures
+  rather than calls into a generic C library. LB2 can choose open
+  addressing for aggregates and linked buckets for joins while preserving
+  a shared high-level interface.
+- Access paths are chosen by query planning, not inferred from lowered
+  generated code. LB2 uses explicit indexed operators and uniform index
+  interfaces; the paper criticizes DBLAB-style reverse engineering of
+  index opportunities from lower-level imperative code.
+- Date indexes and string dictionaries are represented as data-layout and
+  field/value implementation choices. Dictionary comparisons are only
+  valid within the same dictionary; otherwise the engine must fall back
+  to uncompressed strings.
+- Code motion is expressed by changing the high-level callback shape. An
+  aggregate can allocate its hash table and then return a data-loop
+  function, letting generated code move allocation outside the timed or
+  frequently executed region.
+- Parallelism is also encoded through callback structure. LB2 adds a
+  parallel operator interface with thread callbacks, thread-local data
+  loops, specialized parallel hash maps, merge phases, and OpenMP code
+  generation.
+- Evaluation uses TPC-H SF10 against PostgreSQL, HyPer, and DBLAB. The
+  paper reports that LB2 is competitive with HyPer and often faster than
+  DBLAB under matched plans, and that LB2 scales in the same broad range
+  as HyPer on selected 2-16 core parallel queries. Some comparisons use
+  explicit supplied plans for LB2/DBLAB while HyPer has its optimizer.
+- The appendix reports code-generation plus GCC compilation overheads in
+  the hundreds of milliseconds to low seconds per TPC-H query, depending
+  on query and optimization configuration. That matters for serving
+  latency even if the generated code is fast.
+
+**GPU DB mapping:** GPU DB should treat route certificates as the query
+compiler's source language for retained routes. A certificate can carry
+relation identity, schema generation, SQL snapshot, resident layout,
+selected columns, predicate family, index/dictionary identity, GPU/CPU
+eligibility, response shape, and fallback policy. Generated CPU fallback
+or retained GPU-staging code should specialize from that certificate
+rather than from a generic lowered loop.
+
+The callback-style data-centric model maps well to route fragments:
+scan or key-vector lookup produces candidate row ids, filters consume
+or stage masks, joins build/probe only at pipeline breakers, and response
+encoding receives final rows. For GPU work, the same conceptual shape can
+compile into host staging plus kernel descriptors rather than only C
+loops. The important rule is that each route shape should define where
+materialization, synchronization, GPU launch, and response publication
+occur.
+
+Generation-time abstractions are useful for the CPU side of P8. Resident
+segments might expose `Record`-like access while generating, but lower to
+column buffers, offsets, dictionary ids, visibility masks, or key-vector
+loads in the hot path. Hash maps, predicate masks, dictionaries, and
+response builders should be selected as implementation classes by the
+planner and storage metadata, not patched in later by peephole passes.
+
+The paper is also a warning about index and dictionary decisions.
+Creating every possible access path or using every available dictionary
+can lose. GPU DB should keep access-path choice costed: resident GPU scan,
+resident key-vector lookup, CPU index lookup, compressed warm-tier scan,
+and cold transfer are alternatives with different queue, memory, and
+freshness costs. The compiler should implement the chosen route; the
+planner/admission layer should choose it.
+
+For high-concurrency serving, compilation latency cannot be hidden behind
+"fast generated code." Interactive retained lookups and short writes need
+interpreted, cached, or precompiled route families. Full specialization is
+better suited to hot prepared shapes, repeated dashboards, batch queries,
+or background route warming. Generated artifacts must also be invalidated
+by schema, layout, dictionary, and snapshot-generation changes.
+
+**Risks and mismatches:** LB2 is a CPU query-compiler paper evaluated on
+TPC-H analytics, not an OLTP engine, MVCC system, GPU runtime, or pgwire
+serving stack. It does not address WAL-before-visibility, retained
+snapshot retirement, CUDA stream ownership, GPU memory residency,
+multi-tenant session admission, or query cancellation after GPU launch.
+
+The paper's "single pass is enough" conclusion is scoped to standard
+relational query compilation where the query plan already contains the
+right facts. GPU DB may need more than one IR when crossing very different
+front ends or execution targets, such as SQL, GPU kernels, storage
+pushdown, and UDFs. The safer takeaway is not "never use IRs"; it is
+"do not erase database semantics and then recover them from low-level
+code." Compilation time is also a major mismatch for p50/p99 serving
+latency unless routes are cached or generated ahead of demand.
+
+**Benchmark candidates:**
+
+- Define a test-only route-certificate-to-CPU-fragment generator for one
+  retained `int4` filter/aggregate shape. Gate: generated code contains
+  no per-row dynamic dispatch or heap allocation and matches interpreted
+  CPU fallback results under the same SQL snapshot.
+- Compare three route implementations for the same shape: interpreted
+  row loop, generated CPU column loop, and retained GPU route. Measure
+  compile time, p50/p99 latency, throughput, rows/sec, and invalidation
+  cost under schema/layout changes.
+- Add a compilation-cache benchmark keyed by route certificate fields:
+  table identity, schema generation, route shape, resident layout,
+  dictionary ids, and response shape. Failure condition: stale generated
+  code survives DDL, refresh, dictionary change, or visibility-boundary
+  incompatibility.
+- Prototype dictionary-aware text-prefix generation. Gate: generated
+  compressed comparisons only run when both operands share a dictionary;
+  otherwise the route falls back to uncompressed comparison without
+  changing SQL results.
+- Benchmark access-path choice before code generation: CPU index lookup,
+  generated CPU column scan, resident GPU scan, and resident key-vector
+  lookup. Failure condition: the compiler blindly uses an available
+  access path that the planner's observed-cost telemetry says is slower.
+- Measure code-motion effects for response and hash/aggregate buffers:
+  allocate inside the hot loop, allocate before data loop, and reuse from
+  owner-local pools. Track allocations, cache misses if available, p99
+  latency, and cleanup correctness after cancellation.
+
+### 2026-06-06 - Cross-paper synthesis: fast routes need semantic certificates, reusable descriptors, and generation gates
+
+FPTree, VBR, and the LB2 query-compiler paper converge on the same
+principle from three directions: fast paths should use compact,
+specialized physical structures, but readers must carry enough semantic
+proof to know that the structure is still the right one. FPTree makes
+durable leaves authoritative and volatile routing rebuildable. VBR lets
+readers validate recycled metadata with versions instead of pinning all
+retired state behind stalled readers. LB2 shows that generated code
+should consume high-level plan and layout facts directly instead of
+rediscovering them after lowering.
+
+The next design track should be a route certificate that bridges these
+ideas. It should identify the SQL-visible snapshot and the physical route:
+table/schema generation, layout generation, resident buffer generation,
+dictionary/index identity, response shape, execution shape, and physical
+descriptor version. A retained read may then specialize aggressively, but
+only after proving both logical visibility and physical descriptor
+freshness. If either proof fails, the route restarts selection or falls
+back before enqueue, GPU launch, or response publication.
+
+Category gaps remain: the journal has a rich set of runtime/cache/GPU
+execution ideas, but the compiler/planner path still needs more modern
+work on compilation latency, mixed interpretation/compilation, route
+caching, and heterogeneous executor boundaries. MVCC visibility has good
+coverage, but route certificates should now connect MVCC generations to
+physical layout generations in benchmarks rather than prose only.
+
+Benchmark priorities:
+
+- route certificate validation under DDL, refresh, eviction, dictionary
+  rebuild, and descriptor reuse
+- generated CPU fallback versus interpreted CPU versus retained GPU for
+  the same certified route shape
+- compilation-cache invalidation and warmup cost for hot prepared query
+  shapes
+- stale-reader tests that force physical descriptor reuse while SQL
+  snapshots remain logically valid
+- publication-last protocols for durable/warm-tier leaves, resident GPU
+  buffers, and generated-route handles
+
 ### 2026-06-06 - Datacenter Ethernet and RDMA: Issues at Hyperscale
 
 **Citation:** Torsten Hoefler, Duncan Roweth, Keith Underwood,
