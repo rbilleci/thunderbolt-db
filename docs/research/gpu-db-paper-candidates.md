@@ -20,6 +20,63 @@ explicit priority lanes. When adding or selecting storage papers, prefer sources
 that expose concrete file layout, index metadata, WAL/checkpoint ordering,
 read/write throughput, recovery, compaction, or tail-latency mechanisms.
 
+## Research Search Terms
+
+### GC, reclamation, and in-memory DB state
+
+Use these search terms to expand the GC lane beyond ordinary MVCC cleanup and
+evaluate where modern GC ideas matter inside the DB engine:
+
+- `"moving garbage collector" database engine stable handles`
+- `"compacting garbage collection" in-memory database`
+- `"concurrent compacting garbage collector" "read barrier" "write barrier"`
+- `"generational garbage collection" "region" "database"`
+- `"region-based memory management" "query execution" database`
+- `"arena allocation" "query execution" database engine`
+- `"epoch-based reclamation" "in-memory database" MVCC`
+- `"hazard pointers" "database index" memory reclamation`
+- `"RCU" "database system" "metadata" reclamation`
+- `"multiversion garbage collection" "database" "bounded memory"`
+- `"MVCC garbage collection" "long-running transactions" HTAP`
+- `"old version reclamation" "snapshot isolation" "in-memory"`
+- `"moving collector" "stable handles" "object relocation"`
+- `"object relocation" "handle table" "database"`
+- `"copying collector" "persistent data structures" database`
+- `"priority garbage collection" software caches database`
+- `"cache-aware garbage collection" "database buffer"`
+- `"memory pressure" "query cache" garbage collection`
+- `"DBMS buffer management" "garbage collection" "compaction"`
+- `"log-structured storage" "garbage collection" tail latency`
+- `"value log garbage collection" "LSM" "latency"`
+- `"blob garbage collection" database storage engine`
+- `"checkpoint garbage collection" "write-ahead log" database`
+- `"catalog version garbage collection" database`
+- `"plan cache" "garbage collection" database`
+- `"GPU memory management" "database" "garbage collection"`
+- `"pinned memory" "garbage collection" "GPU" database`
+- `"Bower" "garbage collection" database`
+- `"Bower" "moving collector" runtime`
+- `"BOHM" MVCC garbage collection database`
+- `"Boehm" "conservative garbage collection" database engine`
+
+Where this matters most for GPU DB, in priority order:
+
+1. MVCC version chains and retained snapshot cleanup, because long readers and
+   GPU-resident snapshots can turn correctness into unbounded memory growth.
+2. Route/catalog/plan publication metadata, because stale descriptors can
+   accumulate under high session counts and must be reclaimed without blocking
+   readers.
+3. Query temporary arenas and result buffers, because they are high-churn and
+   should be reclaimed or recycled with near-zero coordination overhead.
+4. Resident CPU/GPU snapshot state, pinned host buffers, and command rings,
+   because movement/compaction pressure here directly affects latency and
+   memory residency.
+5. Warm/cold cache and storage segments, because eviction, demotion,
+   compaction, and value-log cleanup are the storage-engine analogues of
+   prioritized or moving GC.
+6. WAL/checkpoint/replay side state, because safe reclamation depends on
+   durability horizons, replica acknowledgement, and recovery guarantees.
+
 ## Seed Queue
 
 ### Transaction processing, write path, and concurrency control

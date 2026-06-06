@@ -92,6 +92,11 @@ Prefer topics that map directly to current GPU DB design questions:
   predicate pushdown/transfer, join planning, and workload-aware execution
 - **hybrid HTAP**: approaches that balance transactional writes and analytical
   reads without starving either side
+- **GC, memory reclamation, and in-memory state movement**: modern concurrent,
+  generational, region, compacting, moving, and real-time garbage collection;
+  epoch/hazard/RCU reclamation; multiversion garbage collection; cache-aware
+  object layout; and managed-heap designs that can inform DB-owned in-memory
+  state, not just language runtimes
 
 ## Balance Targets
 
@@ -110,6 +115,37 @@ The candidate queue and journal should keep a healthy mix:
 These are directional targets, not rigid quotas. They exist to prevent the
 research loop from optimizing only for analytical scans when the product target
 also includes transaction processing.
+
+## GC Research Lane
+
+Treat SOTA GC as an engine-wide design vocabulary, not a direct instruction to
+put the database inside a JVM. When selecting papers in this lane, prefer work
+that exposes mechanisms and invariants: moving/compacting collectors,
+concurrent marking, generational or region collectors, read/write barriers,
+snapshot/epoch reclamation, bounded retired memory, memory-pressure-aware cache
+eviction, and object relocation through stable handles.
+
+Highest-priority applicability targets:
+
+- MVCC version chains, snapshot retention, tombstones, and old-index-entry
+  cleanup
+- route metadata, plan caches, catalog snapshots, and publication descriptors
+- query/session temporary state, result buffers, arenas, and retry queues
+- resident GPU/CPU snapshot objects, pinned host buffers, and command/response
+  rings
+- warm/cold cache tiers where GC-style priority or pressure signals can drive
+  eviction, demotion, and compaction
+- WAL/checkpoint/replay side state whose lifetime is tied to durability,
+  replica acknowledgement, or recovery horizons
+- DB-owned storage segments, value logs, LSM levels, blob files, and cold-tier
+  objects where compaction resembles a moving collector
+
+For moving collectors specifically, look for designs that preserve stable
+logical identity while relocating physical storage through handles, forwarding
+records, page tables, indirection arrays, or copy-publish-reclaim epochs. Flag
+any paper that assumes the runtime can update every pointer if that assumption
+does not hold for SQL-visible row identity, indexes, WAL records, replicas, or
+external references.
 
 ## Processing Protocol
 
