@@ -424,12 +424,15 @@ Append new candidates here as each paper is processed.
   radix indexing and limited compute-side cache coherence. Journal entry added
   2026-06-06; the previously queued PVLDB/DOI metadata was corrected to the
   OSDI 2023 paper.
-- `queued` — **Cabin: A Practical Scan Index for Data Lakes**, SIGMOD 2024.
-  URL: `https://2024.sigmod.org/toc-2-1.html`
-  Why: recent scan-index design for file-backed/lake-style analytical storage;
-  relevant to deciding when GPU DB should maintain compact auxiliary indexes
-  over cold segments instead of relying only on full scans or B-tree-like
-  access paths.
+- `reviewed` — **Cabin: a Compressed Adaptive Binned Scan Index**,
+  Chen and Chen, SIGMOD/PACMMOD 2024.
+  URL: `https://doi.org/10.1145/3639312`
+  PDF: `https://www.shimin-chen.com/papers/cabin-sigmod24.pdf`
+  Why: recent scan-index design for compact auxiliary predicate metadata;
+  relevant to deciding when GPU DB should maintain budgeted scan descriptors
+  over resident, warm, or cold segments instead of relying only on full scans
+  or B-tree-like access paths. Journal entry added 2026-06-06; the previously
+  queued title/venue wording was corrected to the PACMMOD paper metadata.
 - `queued` — **PULSE: Accelerating Distributed Pointer-Traversals on
   Disaggregated Memory**, Zuo et al., arXiv 2023.
   URL: `https://arxiv.org/abs/2305.02388`
@@ -437,6 +440,13 @@ Append new candidates here as each paper is processed.
   PULSE explores pushing pointer traversal work closer to disaggregated memory,
   a useful future-tier contrast before GPU DB puts more range-index logic in
   remote memory or storage-side execution.
+- `queued` — **Rethinking the Encoding of Integers for Scans on Skewed Data**,
+  Prammer and Patel, SIGMOD/PACMMOD 2023.
+  URL: `https://doi.org/10.1145/3626751`
+  PDF: `https://www.pdl.cmu.edu/ftp/Database/rethinking-encoding.pdf`
+  Why: modern bit-parallel scan encoding work discovered while reviewing
+  Cabin; useful for comparing compact scan indexes against encoded resident
+  column layouts that move pruning-relevant bits earlier for skewed data.
 - `queued` — **DINOMO: An Elastic, Scalable, High-Performance Key-Value Store
   for Disaggregated Persistent Memory**, Wei et al., arXiv 2022.
   URL: `https://arxiv.org/abs/2209.08743`

@@ -38,6 +38,208 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Cross-paper synthesis: budgeted metadata must carry route proof, not only speed
+
+**Papers synthesized:** Cabin, NBR, Polyjuice, Orthrus, and Plor.
+
+The recent transaction/runtime papers converge on a route contract with three
+separate decisions. Plor and Orthrus argue that hot writes need explicit
+conflict ownership and priority/fairness rules, not just faster optimistic
+retry. Polyjuice argues that route-policy choice can be learned or tuned, but
+only if correctness remains guarded by validation, isolation, and commit
+publication. NBR adds that old route metadata and snapshots need bounded
+retirement phases so slow workers cannot pin unbounded memory. Cabin extends
+the same idea into scan/index placement: resident metadata should be budgeted,
+versioned, and route-visible instead of treated as free acceleration state.
+
+The strongest design track is now "proof-shaped route descriptors." A retained
+route descriptor should name the snapshot generation, conflict/admission
+policy, reclamation phase, memory budget, and scan/index metadata it depends
+on. The planner or scheduler can change policy, batch shape, and placement, but
+the execution path must still carry enough facts to prove visibility,
+WAL-before-visibility, index freshness, and safe retirement.
+
+Category gaps remain around incremental index refresh under write pressure and
+around CPU/GPU split execution for compact predicate metadata. The queue has
+many candidates for GPU analytics and distributed storage, but fewer measured
+tracks that combine write admission, MVCC delta/main refresh, and auxiliary
+scan-index rebuild cost.
+
+Benchmark priorities:
+
+- Route-certificate benchmark: compare static, tuned, and learned admission
+  policies while requiring identical WAL/MVCC proof checks.
+- Bounded-retirement benchmark: stall a physical worker and prove retired route
+  descriptors, resident snapshots, and scan metadata remain bounded.
+- Main/delta metadata benchmark: retain Cabin-like scan metadata for immutable
+  main segments while applying writes to a delta; measure read latency, refresh
+  lag, and write-path interference.
+- Hot-key fairness benchmark: combine Plor-style priority, Orthrus-style
+  conflict ownership, and Polyjuice-style backoff policy under skew; fail if
+  throughput improves by starving old or high-priority transactions.
+- Placement benchmark: keep scan sketches, position arrays, and resident
+  columns in different GPU/host/NVMe tiers and require route telemetry to
+  explain every fallback or promotion.
+
+### 2026-06-06 - Cabin makes scan indexes budgetable resident metadata
+
+**Citation:** Yiyuan Chen and Shimin Chen. "Cabin: a Compressed
+Adaptive Binned Scan Index." Proceedings of the ACM on Management of
+Data 2(1), Article 57, SIGMOD 2024. DOI:
+`https://doi.org/10.1145/3639312`. Retrieved 2026-06-06 from the
+author PDF, `https://www.shimin-chen.com/papers/cabin-sigmod24.pdf`.
+
+**Category:** database file-system/storage/indexing and multi-tier
+cache / data placement, with secondary relevance to GPU execution /
+analytics.
+
+**Relevance tags:** scan index; binned index; filter sketches;
+selective position array; data-aware intervals; SIMD draft bit
+vectors; resident scan metadata; predicate bit vectors; memory budget;
+skew-aware intervals; delta/main updates; cold segment auxiliary index.
+
+**Core idea:** Cabin starts from a practical problem for resident
+analytical acceleration: the fastest scan indexes can be larger than
+the base column, which makes them hard to keep in memory. Cabin keeps
+the useful BinDex shape, a sorted row-id position array plus
+record-order predicate summaries, but compresses and adapts that
+metadata so a scan index can be chosen under an explicit space budget.
+
+The strongest transferable idea for GPU DB is that cold or warm
+segments should not have a binary choice between "full resident scan"
+and "large B-tree/range index." They can carry compact scan metadata
+that returns a result bit vector, prunes most records, and degrades
+gracefully as the index budget shrinks. That is a good fit for P8's
+resident column-group snapshots, GPU predicate kernels, and future
+NVMe/object-backed segments where a compact auxiliary index can avoid
+moving full columns into GPU memory.
+
+**Concrete mechanisms:**
+
+- Cabin targets single-column scans over fixed-size values with
+  predicates such as `<`, `>`, `<=`, `>=`, `=`, `!=`, and `BETWEEN`;
+  variable strings are expected to be dictionary encoded when this
+  range-predicate model applies.
+- BinDex stores one filter bit vector per pre-defined value interval
+  and a full sorted row-id position array. Cabin replaces groups of
+  `2^w - 2` filter bit vectors with `w` record-order filter sketches,
+  using two virtual intervals so each group covers the full value
+  range.
+- Filter sketches use a vertical bit layout. For a draft result, Cabin
+  combines sketch planes with SIMD logical operations instead of
+  reconstructing per-row codes.
+- The paper's MLO encoding assigns interval codes so membership in a
+  prefix of intervals can be computed with up to `w - 1` logical
+  operations, instead of the `5w + 1` operation shape of a direct
+  vertical-bit comparison loop.
+- After producing a draft result for the nearest interval boundary,
+  Cabin uses the position array to flip the smaller side of the
+  boundary correction. It also extends a shortcut optimization for
+  low-selectivity operators by directly setting matching bits.
+- The selective position array stores sorted row ids only for a
+  fraction of intervals. If a predicate lands in an interval without
+  stored row ids, Cabin falls back to sketch-driven refinement, trading
+  latency for lower memory.
+- Data-aware intervals avoid equal-width intervals when a column has
+  many duplicates from skew or low-cardinality categorical data.
+  Popular values can receive interval treatment that improves both
+  space and scan time.
+- A design-selection model chooses sketch width, interval grouping, and
+  selective-position-array fraction under a space budget. The paper
+  reports this selection step taking microseconds in its experiments.
+- Updates are handled as main plus delta: deletes go to a delete bit
+  vector, inserts append to delta data, scans combine Cabin-enhanced
+  main scans with plain delta scans, and merge/rebuild constructs a new
+  main Cabin index.
+- The PAX discussion is simple but useful: build one Cabin per row
+  group, which maps directly to segment-local auxiliary metadata.
+- Evaluation compares against zone maps, column sketches, ByteSlice,
+  BinDex, and B+-trees across synthetic and real data. The paper
+  reports 1.70x to 4.48x better average scan performance than
+  state-of-the-art scan solutions at the same space budget; in MonetDB,
+  Cabin improves selected TPC-H/SSB query times by 1.1x to 49.9x when
+  scan time is material to the query.
+- Build cost is higher than simpler indexes. For `10^9` 32-bit values,
+  the reported build time is 117 seconds for Cabin versus 88.9 seconds
+  for BinDex and 0.22 seconds for zone maps.
+
+**GPU DB mapping:** Cabin fits P8 as a resident or warm-tier scan
+descriptor attached to immutable column-group segments. For each
+segment and admitted predicate column, GPU DB could keep a compact
+filter-sketch plane in host memory, GPU memory, or NVMe-adjacent
+metadata, plus an optional selective row-id array for intervals that
+pay their way. A retained route would first compute or fetch a result
+bit vector from the scan descriptor, then either launch a GPU kernel
+over the surviving rows or decide that CPU/NVMe fallback is cheaper.
+
+The selective position array is especially relevant to tier placement.
+Hot ranges or popular categorical values can keep row-id correction
+metadata in GPU HBM; warm intervals can keep it in host DRAM; cold
+intervals can rely on sketches and base-column checks. This gives the
+cache manager an explicit byte-for-latency knob instead of a monolithic
+"index resident" flag.
+
+Data-aware intervals also align with route telemetry. If a public
+tenant or table has hot status codes, tenant ids, or time buckets, the
+resident descriptor should shape intervals around those values rather
+than equal-width numeric ranges. Query history can later decide which
+intervals deserve a physical position array, but the first benchmark
+can use data distribution only, matching the paper.
+
+For MVCC, Cabin should be treated as segment-generation metadata, not a
+standalone correctness index. A result bit vector is valid only for the
+column values and visibility boundary used to build it. Deletes can be
+represented by an MVCC/delete mask; inserts and updates belong in a
+delta segment until a refresh publishes a new immutable generation.
+
+**Risks and mismatches:** Cabin is a main-memory analytical scan index,
+not an OLTP concurrency-control mechanism. It does not solve
+WAL-before-visibility, transaction conflict handling, long-running
+snapshot GC, GPU kernel scheduling, text `LIKE` matching, or
+out-of-memory execution by itself.
+
+The paper's scans are CPU SIMD over fixed-size columns. GPU DB still
+has to measure whether sketch-plane evaluation on CPU, GPU, or both
+beats direct resident GPU scans after transfer, kernel launch, and
+result-scatter costs are counted.
+
+Cabin's build time is non-trivial. A write-heavy table could spend too
+much time rebuilding scan indexes unless the main/delta boundary is
+large, refresh is off the write-critical path, and admission exposes
+staleness or fallback clearly.
+
+The index returns a bit vector, which is natural for scan pipelines but
+not always ideal for low-selectivity point lookups or highly selective
+range reads. GPU DB should compare it against resident key vectors,
+learned/range indexes, and plain compressed scans before making it a
+default index family.
+
+**Benchmark candidates:**
+
+- Build a CPU prototype for one `int4` column segment: zone map, plain
+  scan, BinDex-like full bit-vector index, and Cabin-like filter
+  sketches under equal byte budgets. Gate: Cabin-like metadata wins
+  scan latency or bytes-read at the same memory budget on skewed and
+  uniform data.
+- Add a GPU route simulation where CPU produces a predicate bit vector
+  from sketch metadata and GPU scans only surviving rows. Failure
+  condition: bit-vector production plus transfer/scatter is slower than
+  a full resident GPU scan for common selectivities.
+- Test three placement policies: all scan metadata in GPU memory,
+  sketches in GPU plus position arrays in host memory, and all metadata
+  in host memory. Gate: telemetry can explain the chosen route by
+  resident bytes, selectivity, queue wait, and H2D/D2H bytes.
+- Add main/delta MVCC refresh benchmark: base segment has immutable
+  Cabin-style metadata, delta segment uses plain scan plus delete mask.
+  Gate: writes do not block on index rebuild, and reads report whether
+  they scanned main, delta, or both.
+- Evaluate data-aware intervals for tenant/status/time-bucket skew.
+  Failure condition: equal-width intervals perform similarly, meaning
+  the added interval-selection complexity is not justified.
+- Compare result-bit-vector output with row-id-list output for GPU
+  filtering. Expected result: bit vectors win medium/high selectivity,
+  while row-id lists or key vectors may win very low selectivity.
+
 ### 2026-06-06 - NBR bounds retired route metadata by neutralizing slow readers
 
 **Citation:** Ajay Singh, Trevor Brown, and Ali Mashtizadeh. "NBR:
