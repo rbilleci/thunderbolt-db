@@ -84077,3 +84077,170 @@ the runtime/concurrency balance catches up.
   publication, RDMA one-sided read, RDMA atomic, cache-coherent load,
   and GPU resident execution. The planner should not treat these as one
   generic "remote fast path."
+
+### 2026-06-06 - StaR moves RDMA connection state off the fan-in bottleneck
+
+**Citation:** Xizheng Wang, Guo Chen, Xijin Yin, Huichen Dai,
+Bojie Li, Binzhang Fu, and Kun Tan. "StaR: Breaking the
+Scalability Limit for RDMA." ICNP 2021. DOI
+`10.1109/ICNP52444.2021.9651935`. Retrieved 2026-06-06 from
+`https://doi.org/10.1109/ICNP52444.2021.9651935` and the ICNP
+conference PDF
+`https://icnp21.cs.ucr.edu/papers/icnp21camera-paper30.pdf`.
+
+**Category:** runtime / HFT / session scale, with future
+remote-tier and disaggregated-memory relevance.
+
+**Relevance tags:** RDMA; RNIC connection-state cache; queue-pair
+scalability; stateless bottleneck endpoint; asymmetric fan-in;
+packet-carried state; completion delivery; security whitelist;
+FPGA NIC prototype; 1M logical sessions; remote-tier admission.
+
+**Core idea:** StaR attacks RDMA's connection scalability limit at
+the NIC state-placement layer. Reliable connected RDMA keeps
+per-connection DMA, networking, and security state on each RNIC; the
+paper states a typical implementation uses about 256 bytes per
+connection, and its ConnectX-6 measurements show throughput falling
+after roughly 450 concurrent connections when connection-state misses
+force PCIe fetches from host memory.
+
+The transferable idea is asymmetric state ownership. In fan-in or
+fan-out services, the busy server endpoint may have many connections
+while each client has only a few. StaR makes the high-concurrency
+side's RNIC stateless and moves both sides' connection state to the
+low-concurrency side. Packets sent to the stateless side carry the
+operation state needed to DMA data, generate ACKs, and deliver
+completion events.
+
+**Concrete mechanisms:**
+
+- StaR focuses on reliable connected RDMA and preserves the verbs API
+  for applications except for an optional setup extension that lets a
+  user request stateless or stateful mode.
+- Connection setup chooses the stateless side explicitly or through
+  auto-negotiation based on each side's current number of stateful
+  connections. The stateless side transfers initial state such as
+  queue pair number, page size, protection domain, and memory metadata
+  to the stateful side.
+- A stateless RNIC does not retain posted work queue elements. It
+  packs a posted WQE into a WQE packet and sends it to the stateful
+  side. A software timeout in the modified library tracks WQE-packet
+  delivery and reposts on loss; after repeated timeouts it reports an
+  operation error.
+- The paper defines seven packet types: WQEP, CQEP, event ACK, data
+  received by the stateless side, data-receive ACK, data-get request,
+  and data-get ACK carrying returned data. These packet pairs let the
+  stateful side drive reliable transfer while the stateless side acts
+  from packet-carried addresses, lengths, queue numbers, packet
+  sequence numbers, and checksums.
+- Completion on the stateless side is also packet-driven: the
+  stateful side sends a CQE packet, the stateless RNIC DMAs the CQE
+  into the host completion queue, and an event ACK lets the stateful
+  side stop retransmitting the completion.
+- Security moves to the sender side under a trusted datacenter
+  operator model. Each NIC has a security-check module; the stateful
+  side maintains whitelist rules over server address, QPN, protection
+  domain, memory region, and memory window, and drops illegal packets
+  before they reach a stateless server RNIC.
+- StaR NICs can simultaneously host stateless StaR connections,
+  stateful StaR connections, normal RDMA, and Ethernet, selected by
+  packet classification. The paper notes a tradeoff: StaR adds extra
+  WQE/CQE round trips and can be worse for low-concurrency or
+  symmetric high-concurrency communication.
+- The implementation is an FPGA-based 10Gbps RNIC prototype. The
+  evaluation uses nine machines and compares StaR with normal RDMA,
+  a normal RDMA stack on the FPGA, and a ScalaRDMA-style
+  software grouping baseline under simple RPC and synchronous
+  distributed-machine-learning patterns.
+- Reported results include up to 4.13x throughput over original RDMA
+  and 1.35x over the software-based baseline in high-concurrency
+  scenarios. In low-concurrency cases StaR is slower because its
+  packet/state migration adds extra latency.
+
+**GPU DB mapping:** StaR is most valuable as a warning against
+per-session remote fabric state. A GPU DB aiming for 1M logical
+sessions should not map logical sessions one-to-one onto RDMA queue
+pairs, NIC cache entries, GPU streams, pinned buffers, or remote-tier
+lock waiters. Logical sessions should collapse into gateway workers,
+owner domains, route cohorts, and bounded command/response rings.
+
+For future remote tiers, StaR's state migration suggests making the
+high-fan-in database owner or gateway as stateless as possible with
+respect to inactive clients. The endpoint that has fewer active
+connections, or the gateway tier that already owns admission state,
+can carry connection/session descriptors and present compact
+packet-carried work to the bottleneck authority. In local terms, that
+maps to request descriptors that carry route generation, snapshot
+boundary, buffer handle, and response-ring identity, rather than
+forcing the owner or GPU worker to retain every session's full state.
+
+The packet-carried-state idea also fits retained GPU reads and
+remote-tier routes. A request admitted to a GPU execution ring can
+carry the exact immutable snapshot id, resident generation, query
+shape, output buffer class, and completion target. The GPU worker or
+residency owner should not need to consult per-session mutable state
+to decide whether the operation is legal; it should validate a compact
+route certificate and either execute, reject, or fall back.
+
+StaR's security mechanism maps to route certificates and admission
+whitelists. If GPU DB ever exposes direct remote memory, GPU buffers,
+or RDMA-like storage paths, authorization cannot live only at the
+stateless receiver. The gateway/admission side must prove that a
+packet or descriptor is allowed to touch a table, snapshot generation,
+resident buffer, memory region, and response target before it reaches
+the low-level fast path.
+
+**Risks and mismatches:** StaR changes NIC hardware and assumes a
+trusted operator-controlled datacenter where every NIC can enforce the
+sender-side security module. That is much stronger than a portable
+database deployment and is not directly available on commodity NICs.
+
+The paper's stateless side is stateless at the RNIC protocol layer,
+not at the database semantics layer. GPU DB still needs WAL ordering,
+MVCC visibility, DDL invalidation, recovery, tenant authorization,
+and per-session transaction semantics. Packet-carried state must be
+treated as a verifiable descriptor, not as truth.
+
+The evaluation is on a 10Gbps FPGA prototype and two synthetic
+workloads. The reported 4.13x improvement supports the connection
+state bottleneck hypothesis, but it is not a direct prediction for
+SQL, pgwire, GPU kernels, NVMe, or WAL-bound commits.
+
+StaR's extra WQE/CQE round trip hurts low-concurrency operations.
+GPU DB should not blindly move all session state away from the hot
+endpoint if the request stream is already small or symmetric. Dynamic
+route choice and explicit telemetry are required.
+
+The security design explicitly notes that unauthenticated RDMA-like
+traffic remains vulnerable if uncontrolled hosts can forge packets.
+For GPU DB, any fast remote memory path needs cryptographic,
+capability, or tenant-isolated validation appropriate to the
+deployment, not only trust in a homogeneous fabric.
+
+**Benchmark candidates:**
+
+- Add a 1M logical-session admission simulator that compares
+  per-session owner state, gateway-held session descriptors, and
+  StaR-style packet-carried descriptors. Gate: owner-visible memory,
+  cache misses, active ring entries, and p99 admission latency remain
+  bounded as inactive sessions grow.
+- Build a remote-tier/QP-pressure model. Vary logical sessions,
+  active sessions, queue pairs, route cohorts, and request rate;
+  expose RNIC-like state-cache pressure as an admission metric next to
+  GPU queue depth, pinned-buffer pressure, and response-ring backlog.
+- Prototype route descriptors for retained reads that carry snapshot
+  generation, resident generation, query shape, output buffer class,
+  and response target. Failure condition: a GPU worker needs
+  per-session mutable lookup to prove route legality.
+- Compare low-concurrency and high-fan-in modes. For small active
+  session counts, direct owner messages may win; for high fan-in,
+  gateway-owned descriptors and cohorting should reduce owner memory
+  and queue churn. The benchmark should select modes by telemetry.
+- Add security/authorization checks to the descriptor path. Measure
+  the cost of validating table id, tenant/session id, snapshot
+  generation, memory region/buffer handle, and response target before
+  work enters a GPU or remote-tier ring.
+- Stress lost, duplicated, delayed, and stale descriptors around
+  invalidation, eviction, DDL, and session close. Gate: generation
+  checks reject stale work and completions cannot be delivered to a
+  recycled response target.

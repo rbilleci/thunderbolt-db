@@ -606,13 +606,24 @@ Append new candidates here as each paper is processed.
   key-value stores; useful for comparing ownership partitioning, adaptive
   caching, selective replication, and log-free indexing against GPU DB's
   warm/cold tier metadata and owner domains.
-- `queued` — **StaR: Breaking the Scalability Limit for RDMA**, Wang et al.,
+- `reviewed` — **StaR: Breaking the Scalability Limit for RDMA**, Wang et al.,
   ICNP 2021.
   URL: `https://doi.org/10.1109/ICNP52444.2021.9651935`
+  PDF: `https://icnp21.cs.ucr.edu/papers/icnp21camera-paper30.pdf`
   Why: ALock relies on QP-thrashing limits in commodity RNICs; useful for
   evaluating whether future GPU DB remote-tier/session paths should reduce
   QP state, multiplex connections, or expose RNIC-cache pressure as admission
-  telemetry.
+  telemetry. Journal entry added 2026-06-06.
+- `queued` — **SRNIC: A Scalable Architecture for RDMA NICs**, Wang et al.,
+  NSDI 2023.
+  URL: `https://www.usenix.org/conference/nsdi23/presentation/wang-zilong`
+  PDF: `https://www.usenix.org/system/files/nsdi23-wang-zilong.pdf`
+  Why: StaR solves fan-in RNIC state by moving state to the low-concurrency
+  endpoint; SRNIC is a newer open USENIX follow-up that redesigns on-chip
+  RDMA data structures with cache-free QP scheduling and memory-free
+  selective repeat, useful for comparing descriptor placement against
+  hardware-scalable reliable transport before GPU DB adopts remote-tier
+  session or storage paths.
 - `queued` — **Fast RDMA-based Ordered Key-Value Store using Remote Learned
   Cache**, Wei, Chen, and Chen, OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/wei`
