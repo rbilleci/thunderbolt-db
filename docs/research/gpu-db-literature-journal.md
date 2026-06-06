@@ -80511,3 +80511,171 @@ Benchmark priorities:
 - Compare WAL replication shapes before any production replica work: fanout,
   quorum fanout, and chain pipeline. Gate: route selection accounts for p99
   commit latency, network bytes, replica count, and membership-change cost.
+
+### 2026-06-06 - FineLine turns durable storage into an indexed recovery log
+
+**Citation:** Caetano Sauer, Goetz Graefe, and Theo Haerder.
+"FineLine: Log-structured Transactional Storage and Recovery." PVLDB
+11(13), pp. 2249-2262, 2018. DOI:
+`https://doi.org/10.14778/3275366.3275373`. Retrieved 2026-06-06
+from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol11/p2249-sauer.pdf`.
+
+**Category:** WAL / logging / read-write throughput, with secondary
+relevance to database storage layout, recovery, and multi-tier data
+placement.
+
+**Relevance tags:** indexed log; single-storage recovery; redo-only
+logging; epoch group commit; partitioned B-tree log; physiological log
+records; on-demand recovery; no checkpoints; no-steal propagation;
+larger-than-memory storage; log/database split; recovery warm-up.
+
+**Core idea:** FineLine attacks the traditional split between a
+write-optimized WAL and a read-optimized materialized database. Instead
+of keeping two persistent representations that must be synchronized, it
+keeps all durable data in one indexed, log-structured data structure.
+The in-memory tables and indexes are treated as volatile access paths
+over that durable indexed log.
+
+The useful transfer for GPU DB is not to discard WAL-before-visibility.
+It is to question whether every cold-tier tuple, index, and recovery
+object needs both a sequential WAL identity and a separate materialized
+page identity. For selected partitions or append-heavy resident rebuild
+streams, an indexed log can be the durable source of truth while CPU and
+GPU indexes are rebuilt, cached, or refreshed as acceleration state.
+
+**Concrete mechanisms:**
+
+- FineLine stores persistent state in an indexed log, implemented in
+  the prototype as a partitioned B-tree ordered primarily by page
+  identifier and secondarily by LSN.
+- The design keeps arbitrary in-memory access paths and concurrency
+  control outside the persistent representation. Persistence is a layer
+  below memory-resident records, indexes, and buffer management.
+- During transaction execution, updates create physiological redo log
+  records in a transaction-private log. A page-local volatile log chain
+  points to those pending records until the transaction pre-commits.
+- A committing transaction appends a commit record to its private log
+  and enters pre-commit. It is then assigned to the next commit epoch.
+- Group commit drains one epoch at a time. Log records for committed
+  transactions in the epoch are sorted by page id and LSN, written into
+  the active indexed-log partition, and only then may the transactions
+  be acknowledged as committed.
+- FineLine uses redo-only recovery for committed transactions. Private
+  transaction logs remain volatile until group commit; if a transaction
+  aborts before commit, its changes are rolled back from volatile state
+  without needing persistent undo.
+- The newest partition can be unsorted while active; background merging
+  reorganizes partitions into the indexed order, similar in spirit to
+  LSM compaction but for recovery records.
+- Buffer-pool eviction does not write a materialized dirty page to a
+  database file. A page can be discarded after its committed update log
+  records have reached the durable indexed log.
+- Fetching a page or record from storage means retrieving its update
+  history from the indexed log and reconstructing the page state in the
+  buffer pool. Recovery can do the same work on demand.
+- System transactions such as B-tree splits, page allocations, and space
+  management tasks are logged independently so their effects survive
+  even if a user transaction later aborts.
+- The paper argues that FineLine retains ARIES-like features such as
+  media recovery, partial rollbacks, physiological records, index/space
+  management, and larger-than-memory operation, while adding on-demand
+  recovery and localized repair.
+- The Shore-MT/Zero prototype compares FineLine with a traditional WAL
+  system and a LevelDB-based LSM storage module using TPC-C and YCSB.
+  The evaluation reports much lower log-buffer insertion pressure than
+  WAL because FineLine inserts one durable log batch per transaction
+  plus system actions, rather than every physiological record
+  individually.
+- In restart experiments after ten million TPC-C transactions, FineLine
+  begins accepting work within a few seconds while the traditional WAL
+  variant remains unavailable for more than two minutes. WAL with
+  instant restart warms slightly faster than FineLine in the prototype.
+- Larger-than-memory TPC-C experiments show FineLine ahead of WAL for
+  medium buffer-pool sizes, but WAL is better at the smallest tested
+  memory budgets where indexed-log fetches dominate latency.
+- In the YCSB comparison, FineLine has higher throughput than the WAL
+  and LevelDB-style LSM variants in the reported mixes and writes less
+  total data than the LSM variant, while WAL suffers from page write-back
+  amplification on small record updates.
+
+**GPU DB mapping:** FineLine maps cleanly to the P8 question of what is
+durable truth versus acceleration state. GPU DB already treats GPU
+resident buffers as rebuildable. FineLine suggests extending that split:
+some CPU cold-tier partitions could be represented durably as indexed
+physiological records, while CPU row/index structures and GPU column
+segments are regenerated into cacheable working sets.
+
+For WAL-before-visibility, the epoch group-commit shape is the important
+contract. A mutation owner can stage per-transaction or per-chunk redo
+records, sort or cluster them by partition/page/segment, flush the epoch,
+and only then publish MVCC visibility and resident-route invalidations.
+This is compatible with GPU DB's owner-domain model if the epoch boundary
+is a named fence shared by WAL, visibility, cache invalidation, and
+recovery.
+
+For P8 storage, the indexed-log key does not need to be a traditional
+page id forever. A GPU-oriented variant could index by table/partition,
+segment id, row ordinal range, column group, and LSN. That would let
+recovery reconstruct CPU tuple chains or GPU column snapshots lazily for
+hot segments while leaving cold segments compressed in log-structured
+storage.
+
+FineLine also sharpens the recovery benchmark target. Startup should not
+mean "rebuild every CPU index and every GPU cache before opening." It
+can open after the durable indexed log and minimal catalog fences are
+available, then rebuild CPU/GPU access paths on demand with explicit
+route readiness and fallback reasons.
+
+**Risks and mismatches:** FineLine is a CPU storage/recovery design, not
+a GPU execution paper. It does not evaluate CUDA memory, kernel launch
+overheads, resident columnar layouts, pgwire sessions, or 1M logical
+client multiplexing.
+
+The prototype reuses a WAL-like unsorted last partition and has cold
+index-probe overhead during restart; even the paper notes WAL with
+instant restart warms slightly faster in the reported implementation.
+GPU DB should treat indexed-log reconstruction as a measured storage
+path, not assume it is always faster than page-oriented WAL.
+
+The design is attractive for append-heavy and recovery-heavy paths, but
+point reads over scarce memory can suffer when every miss reconstructs
+state through log lookup. P8 still needs a materialized hot working set,
+resident GPU snapshots, and predictable admission for low-latency reads.
+
+Collapsing WAL and database identity also changes operational tooling:
+backup, archive, corruption repair, object layout, and human inspection
+all need indexed-log-aware tools. A simple WAL plus checkpoint design may
+remain better for the first implementation slice until the recovery and
+tiering benchmarks prove otherwise.
+
+**Benchmark candidates:**
+
+- Build a recovery simulator with three durable layouts: WAL plus
+  materialized CPU tuples, WAL plus checkpoints plus lazy GPU rebuild,
+  and FineLine-style indexed physiological log. Gate: same
+  WAL-before-visibility history reconstructs identical MVCC-visible
+  tuples and resident-route invalidations.
+- Prototype epoch group commit that sorts flushed records by
+  table/partition/segment before publication. Expected result: fewer
+  random cold-tier writes and faster segment reconstruction without
+  increasing commit p99 beyond the configured epoch budget.
+- Add an on-demand segment recovery benchmark: after restart, open for
+  traffic with cold GPU residency, reconstruct the first touched segment
+  from indexed log records, then publish a resident snapshot. Gate:
+  every route names whether it used recovered CPU truth, rebuilt GPU
+  state, or a fallback path.
+- Compare page-id indexing versus GPU-segment indexing for log records.
+  Failure condition: segment-oriented indexing improves GPU rebuild but
+  makes single-row OLTP recovery or point lookup latency unacceptable.
+- Measure write amplification for small updates under page write-back,
+  LSM-style compaction, and indexed-log merge. Gate: report bytes
+  written, commit latency, recovery latency, and cache warm-up time
+  together rather than optimizing one metric alone.
+- Stress scarce-memory reads where the indexed log must reconstruct many
+  cold pages or segments. Failure condition: FineLine-style storage wins
+  write throughput but causes retained-read p99 to exceed the CPU
+  materialized baseline.
+- Add system-action logging for resident metadata changes: allocation,
+  segment split, route invalidation, and eviction. Gate: recovery can
+  rebuild metadata fences without relying on GPU cache contents.

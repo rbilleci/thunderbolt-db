@@ -560,7 +560,7 @@ Append new candidates here as each paper is processed.
   command/physiological logging, checkpoint boundaries, and recovery latency.
   Journal entry added 2026-06-06; the previously queued DOI was corrected to
   the SIGMOD 2020 paper metadata.
-- `queued` — **FineLine: Log-structured Transactional Storage and Recovery**,
+- `reviewed` — **FineLine: Log-structured Transactional Storage and Recovery**,
   Sauer, Graefe, and Haerder, PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p2249-sauer.pdf`
   DOI: `https://doi.org/10.14778/3275366.3275373`
@@ -568,7 +568,14 @@ Append new candidates here as each paper is processed.
   log-structured recovery design with page-based WAL/checkpointing; useful for
   testing whether GPU DB cold-tier segments should preserve a separate
   WAL/database split or collapse some persistent data into indexed log
-  structures.
+  structures. Journal entry added 2026-06-06.
+- `queued` — **Instant recovery with write-ahead logging**,
+  Graefe, Guy, Sauer, and Haerder, Datenbank-Spektrum 2015.
+  DOI: `https://doi.org/10.1007/s13222-015-0204-3`
+  Why: FineLine builds on instant-recovery ideas such as on-demand page repair,
+  restart, restore, and log-history access; useful for comparing indexed-log
+  storage with a more conservative WAL design that opens quickly and performs
+  redo/undo work lazily.
 
 - `queued` — **Atlas: Scalable and Available State Machine Replication**,
   Enes et al., EuroSys 2020.
@@ -5893,14 +5900,15 @@ Append new candidates here as each paper is processed.
   Why: Index Checkpoints builds on indexed-log recovery; useful for comparing
   log-offset indexes, on-demand tuple restore, and whether GPU DB should make
   cold CPU tuple reconstruction lazy while keeping route metadata eager.
-- `queued` — **FineLine: Log-structured Transactional Storage and
+- `reviewed` — **FineLine: Log-structured Transactional Storage and
   Recovery**, Sauer, Graefe, and Harder, PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p2249-sauer.pdf`
   DOI: `https://doi.org/10.14778/3275366.3275373`
   Why: Indexed Log File contrasts with FineLine's indexed single-storage log;
   useful for deciding whether GPU DB cold CPU truth should remain WAL plus
   materialized state or move selected partitions toward log-structured,
-  tuple-addressable recovery storage.
+  tuple-addressable recovery storage. Duplicate queue entry marked reviewed
+  after the journal entry was added on 2026-06-06.
 - `queued` — **Fast Failure Recovery for Main-Memory DBMSs on Multicores**,
   Wu, Guo, Chan, and Tan, SIGMOD 2017.
   URL: `https://doi.org/10.1145/3035918.3064011`
