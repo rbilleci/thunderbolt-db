@@ -360,14 +360,23 @@ Append new candidates here as each paper is processed.
   Why: LSched contrasts Decima's black-box DAG scheduling with DB-specific
   physical-plan features; useful as a control point for what should remain
   outside GPU DB's hot scheduler when learned policies are evaluated.
-- `queued` — **Sundial: Harmonizing Concurrency Control and Caching in a
+- `reviewed` — **Sundial: Harmonizing Concurrency Control and Caching in a
   Distributed OLTP Database Management System**, Yu et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p1289-yu.pdf`
   DOI: `https://doi.org/10.14778/3231751.3231763`
   Why: Polyjuice contrasts fixed hybrid CC choices with learned policies, and
   Sundial combines logical leases, distributed transaction concurrency control,
   and cache coherence; useful for GPU DB's snapshot leases, retained-route
-  cache coherence, and multi-tier read/write admission.
+  cache coherence, and multi-tier read/write admission. Journal entry added
+  2026-06-06.
+- `queued` — **No Compromises: Distributed Transactions with Consistency,
+  Availability, and Performance**, Dragojevic et al., SOSP 2015.
+  URL:
+  `https://www.usenix.org/conference/sosp15/technical-sessions/presentation/dragojevic`
+  Why: Sundial cites this as a hardware/network-assisted distributed
+  transaction baseline; useful for contrasting low-latency remote access,
+  RDMA-shaped transaction execution, and consistency guarantees with GPU DB's
+  future warm/cold-tier and replicated-owner paths.
 - `queued` — **Everything is a Transaction: Unifying Logical Concurrency
   Control and Physical Data Structure Maintenance in Database Management
   Systems**, Pavlo et al., CIDR 2021.

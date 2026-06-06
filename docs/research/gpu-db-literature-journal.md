@@ -38,6 +38,181 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Sundial unifies cache validity and transaction order with logical leases
+
+**Citation:** Xiangyao Yu, Yu Xia, Andrew Pavlo, Daniel Sanchez,
+Larry Rudolph, and Srinivas Devadas. "Sundial: Harmonizing
+Concurrency Control and Caching in a Distributed OLTP Database
+Management System." PVLDB 11(10), pp. 1289-1302, 2018. DOI:
+`https://doi.org/10.14778/3231751.3231763`. Retrieved 2026-06-06
+from the PVLDB PDF, `https://www.vldb.org/pvldb/vol11/p1289-yu.pdf`.
+
+**Category:** transaction processing / write path and concurrency
+control, with secondary relevance to MVCC / snapshot / visibility and
+multi-tier cache / data placement.
+
+**Relevance tags:** logical leases; distributed OLTP; cache coherence;
+serializability; dynamic commit timestamp; read-write conflict
+reordering; local cache; hybrid cache policy; timestamp intervals;
+index leases; recovery upper-bound timestamp; remote read avoidance;
+route-cache validity.
+
+**Core idea:** Sundial attacks two distributed OLTP costs at once:
+remote data access latency and aborts caused by that latency. Each
+tuple carries a logical lease, represented by a write timestamp and a
+read-timestamp upper bound. A transaction computes a commit timestamp
+that overlaps the leases of every tuple it read or wrote. Because this
+logical commit order can differ from physical execution order, some
+read-write conflicts that would abort under ordinary OCC can commit by
+placing the reader logically before the writer.
+
+The useful GPU DB transfer is that cached or resident data does not
+always need to be physically freshest to be correct. It needs a
+route-visible validity interval that proves the query can be serialized
+against the chosen visibility boundary. That is a sharper contract than
+a binary "cache hit is valid" flag for CPU/GPU/NVMe placement.
+
+**Concrete mechanisms:**
+
+- Each tuple stores `{wts, rts, owner, waitlist, data}`. The timestamps
+  define the logical interval in which the tuple version may be read.
+- Writes use pessimistic 2PL with Wait-Die for write-write conflicts.
+  Reads are optimistic for read-write conflicts so transactions do not
+  block during normal execution.
+- A read records `{wts, rts, data}` in the transaction read set and
+  raises the transaction's candidate commit timestamp to at least the
+  tuple's `wts`.
+- A write locks the home tuple and raises the transaction's commit
+  timestamp to at least `rts + 1`, so the new value is logically after
+  the prior lease.
+- During prepare, the transaction validates every read. If its chosen
+  commit timestamp exceeds a read tuple's `rts`, the coordinator asks
+  the home server to extend the lease. Extension fails if the tuple was
+  modified or is locked in a way that makes the requested timestamp
+  unsafe.
+- Physical and logical commit order may differ. A transaction that read
+  an older value can still commit after a writer in wall-clock time if
+  its logical commit timestamp remains before the writer's timestamp.
+- Index nodes are treated like tuples for phantom protection. Inserts
+  and deletes write index nodes; lookups and scans read index nodes and
+  later validate their versions. The paper notes that finer-grained
+  leases inside an index node could reduce false sharing, but Sundial
+  attaches leases at index-node granularity.
+- Sundial logs an upper-bound timestamp per server for recovery rather
+  than logging every lease extension. After recovery, leases are reset
+  to `[UT, UT]`, avoiding non-serializable schedules caused by losing
+  lease state while keeping log traffic lower than per-read lease
+  logging.
+- The cache sits near the network side, split into hash-selected banks
+  with small indexes and LRU replacement. Reads may use local cached
+  copies; writes update both the home tuple and the local cached copy.
+- Cache coherence is folded into the logical-lease validation. A cached
+  tuple may be stale in physical time but still serializable if the
+  transaction's commit timestamp falls within the cached lease.
+- Three cache policies are evaluated: Always Reuse, Always Request, and
+  Hybrid. Always Request checks the home server even on a hit but can
+  avoid transferring tuple data when `wts` matches. Hybrid tracks
+  `vote_cache` and `vote_remote`; it reuses cached data when recent
+  evidence says cached reads tend to be safe, otherwise it requests the
+  home server.
+- For read-only or read-intensive tables, Sundial amortizes lease
+  extension by maintaining table-level `tab_wts` and `tab_rts`, and by
+  speculatively extending leases beyond the immediate commit timestamp
+  as evidence accumulates that the table is read-only.
+- Evaluation uses YCSB and TPC-C against 2PL/Wait-Die, Google F1-style
+  OCC, and MaaT. The paper reports up to 57% higher throughput than the
+  next-best protocol under high contention, up to 41% lower latency, and
+  up to 4.6x improvement from caching under skewed read-intensive
+  workloads.
+- The abort breakdown shows Sundial's measured abort rate at 14.00%
+  versus 46.66% for MaaT in the reported YCSB experiment. A later
+  comparison reports Sundial 17.5% faster than a dynamic timestamp-range
+  protocol at low contention and 70% faster at high contention.
+
+**GPU DB mapping:** Sundial maps to retained route descriptors and
+multi-tier cache validity. Instead of treating GPU-resident, host-warm,
+or NVMe-adjacent data as simply fresh/stale, GPU DB can attach a compact
+validity interval or generation range to route metadata. A read route is
+eligible if its chosen snapshot/visibility boundary fits that interval;
+otherwise it asks the owner to extend, refresh, revalidate, or fall back.
+
+For hot retained reads, this suggests a "lease-shaped route certificate":
+relation generation, resident segment generation, value/version interval,
+index-node or scan-metadata interval, and the read boundary selected by
+the session. The runtime can then admit cached reads without contacting
+the mutation owner every time, but still has a precise failure reason
+when the interval no longer covers the requested visibility.
+
+The hybrid cache policy is also a good fit for P8 placement. GPU DB can
+measure whether a resident segment, warm host copy, or cold index page is
+usually safe to reuse for a route shape. Read-mostly metadata can receive
+longer speculative validity intervals; frequently updated metadata can
+switch to request/validate mode or bypass the cache to avoid repeated
+abort/retry loops.
+
+Index-node leases map to resident key vectors, range indexes, and Cabin-
+style scan metadata. The important rule is that index metadata must carry
+its own generation or interval proof, not merely point to a base segment.
+Deletes, inserts, and refreshes should update the relevant index/scan
+descriptor boundary before new reads can rely on it.
+
+The recovery upper-bound timestamp is relevant to WAL-before-visibility.
+If GPU DB ever stores durable route metadata or recovered warm-tier
+leases, replay must restore a conservative upper bound so old resident or
+cached metadata cannot be treated as valid at an unsafe logical time.
+
+**Risks and mismatches:** Sundial is distributed CPU OLTP, not a GPU
+execution system. It does not evaluate CUDA launch overhead, GPU memory
+placement, pinned buffers, pgwire session multiplexing, NVMe recovery, or
+multi-version storage costs.
+
+The protocol is single-version and serializable through logical leases.
+GPU DB already has MVCC tuple versions, retained snapshots, and WAL
+boundaries, so the natural adaptation is interval/generation metadata for
+routes, not replacing MVCC with Sundial wholesale.
+
+Cached stale reads are only safe when the later validation has enough
+information to prove serializability. A GPU route must not launch an
+expensive kernel and stream results to the client before the required
+snapshot, lease, and index-generation proof is known.
+
+The Hybrid policy is intentionally simple and workload-sensitive. It can
+misclassify tables during phase shifts; GPU DB needs visible fallback and
+retry budgets so a speculative long lease does not turn into hidden tail
+latency or stale-result risk.
+
+Table-level lease extension is attractive for read-mostly dimensions but
+too coarse for write-heavy fact or tenant tables. Segment-local,
+partition-local, or index-node-local intervals are safer first
+benchmarks.
+
+**Benchmark candidates:**
+
+- Add a retained-read route simulator with fresh-only validation,
+  Sundial-style validity intervals, and owner revalidation. Gate:
+  interval routes reduce owner round trips without returning a value
+  outside the requested MVCC snapshot boundary.
+- Attach generation intervals to resident key-vector and scan-index
+  descriptors. Failure condition: a read can use auxiliary metadata after
+  a mutation that should have advanced the descriptor boundary.
+- Compare Always Reuse, Always Request, and Hybrid policies for retained
+  GPU reads over read-mostly and write-skewed tables. Gate: Hybrid avoids
+  the repeated stale-cache abort pattern while preserving most local-hit
+  latency on read-mostly data.
+- Prototype table-level versus segment-level speculative lease extension.
+  Expected result: table-level wins read-only dimension tables; segment-
+  level wins mixed tables by avoiding false sharing across hot partitions.
+- Add a recovery test for persisted route metadata: replay from WAL with a
+  conservative upper-bound generation and prove no pre-crash cached route
+  is admitted at an unsafe boundary.
+- Measure whether validating before GPU launch or after CPU-side bit-vector
+  pruning is the better split. Failure condition: optimistic GPU launch
+  improves average latency but wastes enough work on failed lease extension
+  to hurt p99.9 under writes.
+- Add telemetry for interval misses: expired interval, locked tuple/index
+  descriptor, modified descriptor, owner validation timeout, and fallback
+  route. Gate: every cached-route rejection names exactly one cause.
+
 ### 2026-06-06 - Cross-paper synthesis: budgeted metadata must carry route proof, not only speed
 
 **Papers synthesized:** Cabin, NBR, Polyjuice, Orthrus, and Plor.
