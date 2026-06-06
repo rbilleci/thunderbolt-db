@@ -3433,13 +3433,14 @@ Append new candidates here as each paper is processed.
   Why: modern mixed-isolation robustness follow-up; useful for deciding whether
   GPU DB can rely on conflict-robustness checks for route templates or needs a
   broader view-robustness model for MVCC-visible retained reads.
-- `queued` — **Robustness against Read Committed for Transaction Templates**,
+- `reviewed` — **Robustness against Read Committed for Transaction Templates**,
   Vandevoort et al., PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p2141-vandevoort.pdf`
   DOI: `https://doi.org/10.14778/3476249.3476268`
   Why: transaction-template robustness and selective read-promotion baseline;
   useful for benchmarking whether known OLTP command shapes can safely use a
-  cheaper RC-style route while preserving serializable outcomes.
+  cheaper RC-style route while preserving serializable outcomes. Journal entry
+  added 2026-06-06.
 - `queued` — **Robustness Against Read Committed for Transaction Templates with
   Functional Constraints**, Vandevoort et al., ICDT 2022.
   URL: `https://arxiv.org/abs/2201.05021`

@@ -84809,3 +84809,143 @@ Benchmark priorities:
   generation and buffer-token checks.
 - 1M-session active-set benchmark: memory and p99 admission latency should
   track active cohorts, not total logical sessions.
+
+### 2026-06-06 - Template robustness certifies cheap read-committed routes before runtime
+
+**Citation:** Brecht Vandevoort, Bas Ketsman, Christoph Koch, and
+Frank Neven. "Robustness against Read Committed for Transaction
+Templates." PVLDB 14(11), 2021. doi:10.14778/3476249.3476268.
+Retrieved 2026-06-06 from
+`https://www.vldb.org/pvldb/vol14/p2141-vandevoort.pdf`.
+
+**Category:** MVCC / snapshot / visibility, with transaction
+processing / write path and route-planning relevance.
+
+**Relevance tags:** multiversion read committed; serializability;
+transaction templates; static robustness; typed route parameters;
+atomic updates; attribute-level conflicts; read promotion; SmallBank;
+TPC-C key-value; offline route certification.
+
+**Core idea:** The paper asks when a workload can run under
+multiversion Read Committed while still guaranteeing that every
+possible execution is serializable. Instead of analyzing one concrete
+transaction at a time, it models stored-procedure-like transaction
+templates whose concrete keys are supplied at runtime, then gives a
+sound and complete polynomial-time robustness test for that template
+model.
+
+For GPU DB, the useful idea is not "use RC everywhere." It is to
+certify cheap route classes offline. If a hot command shape is proven
+robust, the runtime can admit it to an RC-like current-read path or
+retained snapshot route without sending every instance through the
+strongest owner validation path. If it is not proven robust, the route
+must carry stronger visibility, owner, or snapshot requirements.
+
+**Concrete mechanisms:**
+
+- The model represents each transaction program as a sequence of read,
+  write, and atomic update operations over tuple variables. Variables
+  are typed, so variables over different relations cannot alias at
+  runtime.
+- Operations refer to attribute sets rather than whole tuples. This
+  lets the analysis distinguish, for example, a read of one attribute
+  from an update of a disjoint attribute in the same tuple.
+- Atomic updates are first-class operations: they read and then write
+  the same database object atomically. Modeling these directly finds
+  larger robust subsets than rewriting every update as a separate read
+  followed by a write.
+- The decision procedure characterizes when RC-allowed schedules can
+  yield a nonserializable conflict cycle. For the paper's template
+  abstraction, robustness against multiversion RC is decidable in
+  polynomial time and is both sound and complete.
+- The abstraction deliberately restricts predicate reads over mutable
+  attributes. Selections are over fixed read-only attributes such as
+  primary keys; this avoids the phantom-analysis cases that would make
+  the problem undecidable in the general case.
+- The authors analyze SmallBank and a key-value-style TPC-C variant.
+  Atomic updates and attribute-level conflicts identify larger robust
+  subsets than prior RC robustness checks.
+- To make full benchmarks robust, the paper promotes selective reads
+  into identity-style update operations. This preserves application
+  semantics while creating earlier write conflicts that prevent unsafe
+  RC interleavings.
+- Evaluation uses an unmodified DBMS and compares RC, SI, SSI, an
+  earlier RC robustness transformation, and the paper's promoted RC
+  workloads. Reported results show promoted RC outperforming SI and
+  SSI under contention; in one TPC-Ckv setting with five warehouses,
+  the paper reports about 8300 transactions/s for attribute-level
+  promoted RC versus about 4100 for SI.
+
+**GPU DB mapping:** Treat the first production SQL surface as a small
+catalog of route templates: retained point read, retained aggregate,
+insert chunk, update by key, delete by key, refresh publication, and
+simple range read. Each template should declare relation ids, typed
+parameter roles, read attributes, write attributes, atomic update
+classes, predicate families, and required visibility class.
+
+The robustness test maps to an offline route-certification step. A
+template proven robust can use a cheaper current-read or retained
+snapshot path with generation checks. A template that depends on
+predicate reads, mutable key predicates, secondary-index phantoms, DDL,
+or unknown control flow must be rejected from the cheap route and
+handled by stronger owner/MVCC validation.
+
+Attribute-level conflicts are directly relevant to resident layouts.
+If a GPU resident query reads only a stable key vector and one value
+column, an unrelated update to another column should not necessarily
+invalidate the same route class. The runtime still needs WAL-before-
+visibility, but route metadata can be more precise than whole-table or
+whole-tuple invalidation when the template certificate supports it.
+
+Read promotion maps to early write-intent declaration. For a template
+that would otherwise do expensive GPU, DRAM, or NVMe work before
+discovering a conflict, the runtime can acquire a partition or key-class
+intent first. That may reduce wasted accelerator and tier work under
+hot-key contention, but should be applied only to rare or write-heavy
+templates where the certificate and measurements justify it.
+
+For 1M logical sessions, template-level certification keeps safety
+state per route class rather than per connection. Dormant sessions do
+not need isolation-specific state in the mutation owner; active
+requests carry a compact route certificate plus snapshot/frontier
+requirements.
+
+**Risks and mismatches:** The model excludes predicate reads over
+mutable attributes, inserts, deletes, branches, loops, foreign-key
+dependencies, and many real SQL plan shapes. GPU DB cannot use this as
+a proof for range scans, prefix filters, joins, or secondary-index
+routes until those shapes have their own predicate-aware analysis.
+
+The paper's RC semantics are formal multiversion RC, and practical DBMS
+implementations may allow fewer or different interleavings. GPU DB must
+define its own visibility semantics before importing the proof.
+
+Read promotion adds write conflicts and can hurt high-frequency
+read-only routes. It is a measured optimization, not a blanket rule.
+
+The evaluation is CPU OLTP over SmallBank and TPC-Ckv, not GPU
+execution, WAL-stream partitioning, retained GPU snapshots, pgwire
+session multiplexing, or multi-tier storage.
+
+**Benchmark candidates:**
+
+- Build a route-template certificate file for the first OLTP command
+  shapes. Gate: each cheap route records typed parameters, read/write
+  attributes, predicate family, snapshot class, and why the route is
+  certified or rejected.
+- Compare whole-table, tuple-level, and attribute-level invalidation for
+  retained point reads and updates. Expected result: attribute-level
+  certificates reduce unnecessary resident invalidations without
+  permitting stale reads.
+- Simulate RC-like current reads versus SI/owner-validated reads for
+  certified point-update templates under SmallBank-style skew. Measure
+  throughput, abort/retry rate, p99 latency, and owner queue depth.
+- Test early write-intent promotion before GPU or NVMe work. Failure
+  condition: promotion saves wasted work on rare hot writes but reduces
+  total throughput by adding conflicts to frequent retained reads.
+- Add a negative-certification benchmark for range and prefix predicates.
+  Gate: phantom-sensitive templates are denied cheap-route admission
+  until predicate-aware safety analysis exists.
+- Stress stale route certificates across DDL, key updates, attribute
+  layout changes, and resident snapshot invalidation. Gate: generation
+  checks force fallback before execution.
