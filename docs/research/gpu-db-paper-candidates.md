@@ -47,6 +47,39 @@ read/write throughput, recovery, compaction, or tail-latency mechanisms.
   Why: MVCC transaction repair approach that may inform conflict handling
   without throwing away all work. The previously queued arXiv 2024 URL was
   unrelated and has been corrected to the SIGMOD 2017 paper.
+- `reviewed` — **GPU-Accelerated OLTP: An In-Depth Analysis of Concurrency
+  Control Schemes**, Sun et al., arXiv 2024 / ICDE 2026.
+  URL: `https://arxiv.org/abs/2406.10158`
+  PDF: `https://arxiv.org/pdf/2406.10158`
+  Why: modern GPU OLTP concurrency-control testbed comparing OCC, MVCC,
+  timestamp ordering, locking, and GPU conflict-ordering schemes under YCSB
+  and TPC-C; selected after recent reviews skewed storage/indexing and the
+  queue lacked a strong modern transaction/GPU-OLTP candidate. Journal entry
+  added 2026-06-06.
+- `queued` — **GaccO: A GPU-Accelerated OLTP DBMS**, Boeschen and Binnig,
+  SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526123`
+  Why: GPU-Accelerated OLTP identifies GaccO as the strongest high-contention
+  GPU conflict-ordering path; useful for studying batch preprocessing,
+  all-access conflict treatment, and GPU transaction route admission.
+- `queued` — **LTPG: Large-Batch Transaction Processing on GPUs with
+  Deterministic Concurrency Control**, Wei et al., ICDE 2024.
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00300`
+  Why: modern deterministic large-batch GPU transaction processing cited by
+  the GPU OLTP survey; useful for comparing conflict-ordered GPU batches with
+  CPU-owned WAL/MVCC publication.
+- `queued` — **PLOR: General Transactions with Predictable, Low Tail
+  Latency**, Chen et al., SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517837`
+  Why: GPU-Accelerated OLTP cites PLOR as a low-tail transaction design;
+  useful for mapping predictable transaction execution and latency control to
+  GPU DB's hot-key admission and session SLOs.
+- `queued` — **Mostly-Optimistic Concurrency Control for Highly Contended
+  Dynamic Workloads on a Thousand Cores**, Wang and Kimura, PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol10/p49-wang.pdf`
+  Why: cited by GPU-Accelerated OLTP as a contention-oriented CPU-side
+  concurrency-control baseline; useful for comparing lightweight optimistic
+  fallback against GPU conflict ordering under hot keys.
 
 ### MVCC, snapshots, and visibility
 
