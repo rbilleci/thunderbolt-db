@@ -524,13 +524,15 @@ Append new candidates here as each paper is processed.
   comparing owner-mediated validation and WAL publication against HTM-assisted
   local concurrency control and remote access. Journal entry added
   2026-06-06.
-- `queued` — **DHTM: Durable Hardware Transactional Memory**, Joshi,
+- `reviewed` — **DHTM: Durable Hardware Transactional Memory**, Joshi,
   Nagarajan, Cintra, and Viglas, ISCA 2018.
-  URL: `https://doi.org/10.1109/ISCA.2018.00047`
+  URL: `https://doi.org/10.1109/ISCA.2018.00045`
+  PDF: `https://www.pure.ed.ac.uk/ws/portalfiles/portal/59203973/DHTM.pdf`
   Why: DrTM relies on HTM plus separate NVRAM logging for durability; DHTM is a
   hardware-oriented follow-up for comparing whether durable transactional
   memory ideas can simplify or bound future CPU warm-tier route metadata,
-  undo/redo records, and crash-consistent descriptor updates.
+  undo/redo records, and crash-consistent descriptor updates. Journal entry
+  added 2026-06-06; the queued DOI was corrected from `.00047` to `.00045`.
 - `queued` — **RHKV: An RDMA and HTM friendly key-value store for
   data-intensive computing**, Shi et al., Future Generation Computer Systems
   2019.
@@ -550,6 +552,26 @@ Append new candidates here as each paper is processed.
   transactional visibility instead of treating them as detached background
   jobs. Journal entry already exists; this stale duplicate was corrected from
   `queued` to `reviewed` on 2026-06-06.
+- `queued` — **DUMBO: Making durable read-only transactions fly on hardware
+  transactional memory**, Dileep et al., arXiv 2024.
+  URL: `https://arxiv.org/abs/2410.16110`
+  Why: DHTM focuses on durable update transactions; DUMBO is a modern durable
+  HTM follow-up for read-only transactions, useful for comparing persistent
+  read barriers and retained-snapshot fast paths before GPU DB adds durable
+  route metadata around read-only execution.
+- `queued` — **Persistent HyTM via Fast Path Fine-Grained Locking**, Maldonado
+  et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2501.14783`
+  Why: discovered while checking DHTM follow-ups; useful for contrasting
+  hardware-fast-path persistence with software fallback paths, progress
+  guarantees, and fine-grained lock interaction under future persistent-memory
+  transaction metadata.
+- `queued` — **SPHT: Scalable Persistent Hardware Transactions**, Vila et al.,
+  2021.
+  URL: `https://doi.org/10.1145/3437801.3441581`
+  Why: DHTM is one early durable-HTM design; SPHT appears in the follow-up
+  durable transaction line and is useful for checking whether hardware
+  persistence support scales beyond a single simulated cache/log-buffer design.
 
 ### Database file-system design, storage, and indexing
 

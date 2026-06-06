@@ -38,6 +38,177 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - DHTM treats durability as part of the transaction fast path
+
+**Citation:** Arpit Joshi, Vijay Nagarajan, Marcelo Cintra, and
+Stratis Viglas. "DHTM: Durable Hardware Transactional Memory."
+ISCA 2018, pages 452-465. DOI: `10.1109/ISCA.2018.00045`.
+Retrieved 2026-06-06 from the University of Edinburgh author
+manuscript:
+`https://www.pure.ed.ac.uk/ws/portalfiles/portal/59203973/DHTM.pdf`.
+
+**Category:** transaction processing / write path and WAL/logging
+throughput, with secondary relevance to future persistent-memory or
+CXL-style metadata tiers.
+
+**Relevance tags:** DHTM; durable HTM; RTM; persistent memory; redo
+logging; log coalescing; L1-to-LLC write-set overflow; commit record;
+complete record; abort record; transaction log; overflow list; TPC-C;
+TATP.
+
+**Core idea:** DHTM asks how much ACID cost remains if persistent
+memory is fast but the transaction system still has to provide both
+atomic visibility and atomic durability. Its answer is to start from a
+commercial RTM-like hardware transaction for visibility, then add
+hardware redo logging for durability. The same logging machinery is
+also used to let transactional write sets overflow from the L1 cache
+into the LLC instead of aborting immediately.
+
+For GPU DB, the transferable idea is not to depend on durable HTM. It
+is to make durability a first-class commit-path proof instead of an
+afterthought bolted onto an otherwise fast route. A mutation route
+should become visible only after its compact redo, invalidation, and
+recovery records have crossed an explicit commit marker; physical data
+refresh can happen later if recovery can finish the state from the log.
+
+**Concrete mechanisms:**
+
+- DHTM assumes byte-addressable non-volatile memory and an RTM-like HTM
+  with private L1 caches and a shared LLC. HTM provides atomic
+  visibility and conflict detection; hardware-generated redo records
+  provide atomic durability.
+- Each thread gets a private transaction log area and an overflow list,
+  allocated and tracked by the OS. On log overflow, the transaction
+  aborts with a log-overflow indication so software can allocate a
+  larger log and retry.
+- The L1 cache controller creates redo log entries for transactional
+  stores and writes them to persistent memory while bypassing the LLC.
+  Log writes are distinguished from data writes so they do not inflate
+  the transaction's HTM write set.
+- The design chooses redo logging because commit can complete when redo
+  records are persistent. Data cache lines may be written back to their
+  in-place locations after the transaction is already committed.
+- A fully associative L1 log buffer tracks cache lines that still need
+  redo records. Instead of logging every word store separately, DHTM
+  coalesces multiple stores to the same cache line and emits the redo
+  record when the line leaves the log buffer or when the transaction
+  ends.
+- The paper reports that a 64-entry log buffer is the best point in
+  its hash benchmark: smaller buffers lose coalescing and waste memory
+  bandwidth, while larger buffers delay too many log writes into the
+  commit critical path.
+- Dirty transactional cache lines may overflow from L1 to LLC. DHTM
+  records overflowed addresses in a persistent overflow list, marks the
+  LLC line dirty, and keeps enough coherence state to identify the line
+  as speculative if it is reread or must be invalidated on abort.
+- On commit, pending log-buffer entries and a commit record are written
+  to the transaction log; HTM read/write tracking is cleared so the
+  transaction is visible. A later commit-complete phase writes dirty
+  data lines back through the cache hierarchy, clears the overflow
+  list, and writes a complete record.
+- On abort, DHTM writes an abort record, clears speculative read/log
+  state, invalidates L1 write-set lines, then uses the overflow list to
+  invalidate overflowed LLC lines. Because redo logging leaves old
+  in-place memory unchanged until commit completion, conflicting reads
+  do not need to stall behind undo application.
+- The evaluated hardware overhead is modest in the paper's model: an
+  L1 log buffer, transaction-state register, and registers for log-area
+  and overflow-list start/next/size pointers.
+- The evaluation uses gem5/Ruby, 8 in-order 2 GHz cores, 32 KiB L1
+  caches, 1 MiB-per-tile LLC, and modeled NVM read/write latencies.
+  Workloads include TPC-C, TATP, and six persistent data-structure
+  microbenchmarks.
+- Reported average microbenchmark throughput is 61% higher than the
+  software-only baseline and 26% higher than ATOM, the paper's
+  hardware-undo-logging baseline. For TPC-C, DHTM reports 1.88x the
+  software-only throughput and 21% higher throughput than ATOM; for
+  TATP, it reports 1.53x software-only and 26% higher than ATOM.
+- The authors find memory bandwidth is the main gap to a non-persistent
+  HTM design. With 10x baseline memory bandwidth in the hash benchmark,
+  DHTM approaches the volatile-only design much more closely.
+
+**GPU DB mapping:** DHTM reinforces that a write route should have a
+small durable description of what it changed before visibility. GPU DB
+can translate this into route-level redo records: tuple-version deltas,
+index delta descriptors, resident-generation invalidations, cold-tier
+manifest updates, and response/idempotence tokens. The commit marker,
+not the physical refresh, should be the publication boundary.
+
+The log-buffer idea maps to mutation-owner staging. Within a transaction
+or deterministic admission batch, the owner can coalesce multiple row,
+column, index, or invalidation updates into one cache-line- or
+segment-granular redo descriptor before flushing. The benchmarkable
+question is where coalescing stops helping because it pushes too much
+durable work into the commit tail.
+
+The overflow-list idea maps to route proof accounting. If a mutation
+touches more descriptors, resident handles, cold chunks, or index pages
+than fit in the hot staging budget, the engine needs an explicit
+overflow path with retry/fallback semantics. Silent expansion of a fast
+path risks unbounded p99 latency; a typed overflow outcome lets the
+scheduler choose retry, chunking, CPU fallback, or rejection.
+
+DHTM's commit versus commit-complete split is useful for GPU resident
+state. SQL visibility can publish after WAL/redo and invalidation are
+durable, while resident GPU refresh, cold-tier compaction, and physical
+segment rewrite complete afterward. Recovery must be able to determine
+whether to finish a committed route or discard an aborted one without
+trusting GPU memory.
+
+The memory-bandwidth result matters for future CXL/NVM or disaggregated
+tiers. Durable metadata paths may become latency-light but still
+bandwidth-heavy. GPU DB should budget WAL, invalidation, and descriptor
+bytes as first-class route credits rather than assuming a faster medium
+makes durability free.
+
+**Risks and mismatches:** DHTM is an architecture proposal evaluated in
+simulation, not a deployable DBMS mechanism available on today's CPUs.
+The design depends on HTM behavior, coherence modifications, and
+byte-addressable persistent memory.
+
+The evaluated transactions are in-memory OLTP and data-structure
+operations, not SQL engines with secondary-index maintenance, DDL,
+MVCC vacuum, GPU cache invalidation, network sessions, or pgwire
+response backpressure.
+
+Redo logging at cache-line granularity is not automatically the right
+semantic unit for GPU DB. The engine may need column-delta, row-version,
+index-delta, or manifest-fragment records to make recovery and route
+invalidations meaningful.
+
+The commit/commit-complete split is only safe if readers, recovery, and
+replicas agree on the marker semantics. GPU DB must not expose a
+visible transaction whose required invalidation or redo descriptor is
+still missing.
+
+**Benchmark candidates:**
+
+- Build a mutation-owner redo-coalescing benchmark with coalescing units
+  of row delta, column delta, index delta, and resident-invalidation
+  descriptor. Measure WAL bytes, commit p50/p99, memory bandwidth, and
+  recovery replay cost.
+- Add a route commit-state model with `pending`, `committed`,
+  `complete`, and `aborted` records. Gate: crash injection after each
+  state either exposes the old snapshot, finishes the committed route,
+  or discards the aborted route.
+- Prototype a typed overflow path for write batches whose staged redo or
+  invalidation descriptors exceed the fast-path budget. Outcomes should
+  include chunk retry, lower-priority continuation, CPU fallback, or
+  overload. Failure condition: overflow work can publish visibility
+  without all redo and invalidation records.
+- Compare eager physical refresh versus commit-now/refresh-later for GPU
+  resident segments after small updates. Required measurements: write
+  p99, retained-read fallback rate, resident staleness duration, and
+  recovery replay time.
+- Add a durability-bandwidth stress test where WAL, invalidation, and
+  descriptor writes contend with cold-tier reads and GPU staging.
+  Required output: route-level bytes by purpose and the saturation point
+  where commit latency stops being CPU-bound.
+- Evaluate log-buffer sizing analogues for the mutation owner: number of
+  staged descriptor slots, byte budget, and microsecond drain ceiling.
+  Failure condition: larger staging improves throughput but creates
+  unacceptable commit-tail spikes.
+
 ### 2026-06-06 - DrTM turns hardware transactions into a local fast path with remote locks as proof
 
 **Citation:** Xingda Wei, Jiaxin Shi, Yanzhe Chen, Rong Chen, and
