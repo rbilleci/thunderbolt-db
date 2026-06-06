@@ -4732,7 +4732,7 @@ Append new candidates here as each paper is processed.
   Why: discovered through vWeaver/OneShotGC related work; useful for comparing
   version-centric layouts, index-only version searches, and epoch/range
   partitioning against GPU DB visible-row maps and retained snapshot arrays.
-- `queued` — **Falcon: Fast OLTP Engine for Persistent Cache and
+- `reviewed` — **Falcon: Fast OLTP Engine for Persistent Cache and
   Non-Volatile Memory**, Ji et al., SOSP 2023.
   URL:
   `https://madsys.cs.tsinghua.edu.cn/publication/falcon-fast-oltp-engine-for-persistent-cache-and-non-volatile-memory/`
@@ -4743,6 +4743,7 @@ Append new candidates here as each paper is processed.
   millions of transactions per second while preserving crash consistency;
   useful for comparing persistent-cache/eADR assumptions, small log windows,
   and selective data flushes with future GPU DB CXL/NVM metadata paths.
+  Journal entry added 2026-06-07.
 - `queued` — **Zen: a High-Throughput Log-Free OLTP Engine for
   Non-Volatile Main Memory**, Liu, Chen, and Chen, PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p835-liu.pdf`
@@ -4751,6 +4752,20 @@ Append new candidates here as each paper is processed.
   baseline; useful for comparing metadata-enhanced tuple caches, log-free
   persistent transactions, and NVM space management with WAL-before-visibility
   and GPU DB warm-tier durability constraints.
+- `queued` — **Silo: Speculative Hardware Logging for Atomic Durability in
+  Persistent Memory**, Zhang and Hua, IEEE Transactions on Computers 2024.
+  URL: `https://doi.org/10.1109/TC.2023.3332118`
+  Why: Falcon cites Silo as a hardware logging design that keeps transactional
+  logs on chip and writes them back only on crash; useful as a contrast to
+  Falcon's software small-log-window approach before GPU DB assumes future
+  hardware support for durable route-publication windows.
+- `queued` — **BBB: Simplifying Persistent Programming using Battery-Backed
+  Buffers**, Alshboul, Ramrakhyani, Wang, and Solihin, HPCA 2021.
+  URL: `https://doi.org/10.1109/HPCA51647.2021.00078`
+  Why: Falcon names BBB as a persistent-cache alternative to eADR; useful for
+  checking whether battery-backed or protected host buffers can provide a
+  durable domain for GPU DB commit windows without forcing every WAL or route
+  descriptor byte to underlying NVM media during normal execution.
 - `queued` — **RABIT: Efficient Range Queries with Bitmap Indexing**,
   Wang, Xiao, and Athanassoulis, PACMMOD 2025.
   URL: `https://cs-people.bu.edu/mathan/publications/pacmmod25-wang.pdf`

@@ -94573,3 +94573,175 @@ Benchmark priorities: combine route-hint accuracy with runtime outcomes. A
 useful benchmark should report not only speedup, but hint coverage, hint
 precision, retries caused by missing hints, stale-route rejections, fallback
 counts, and p99 impact when hint quality degrades.
+
+### 2026-06-07 - Falcon makes persistent-cache durability a write-amplification problem
+
+**Citation:** Zhicheng Ji, Kang Chen, Leping Wang, Mingxing Zhang, and
+Yongwei Wu. "Falcon: Fast OLTP Engine for Persistent Cache and
+Non-Volatile Memory." SOSP 2023, pages 531-544. Retrieved 2026-06-07
+from the MADSys author page and PDF:
+`https://madsys.cs.tsinghua.edu.cn/publication/falcon-fast-oltp-engine-for-persistent-cache-and-non-volatile-memory/`,
+`https://madsys.cs.tsinghua.edu.cn/publication/falcon-fast-oltp-engine-for-persistent-cache-and-non-volatile-memory/SOSP23-ji.pdf`.
+DOI: `https://doi.org/10.1145/3600006.3613141`.
+
+**Category:** WAL, logging, and read/write throughput, with transaction
+processing / write path, MVCC / snapshot / visibility, and multi-tier
+cache / data placement relevance.
+
+**Relevance tags:** Falcon; eADR; persistent cache; NVM; write
+amplification; in-place update; redo logs; small log window; selective
+flush; hot tuple tracking; hinted flush; persistent indexes; recovery;
+MVCC old-version placement; future CXL/NVM tier.
+
+**Core idea:** Falcon observes that persistent CPU caches change the old
+NVM OLTP tradeoff. If cache contents are in the persistence domain, redo
+logs do not need explicit cache-line writeback to be crash-safe, so the
+main problem shifts from "how do we force every durable byte out of cache"
+to "how do we avoid accidentally writing too many bytes to NVM." The
+paper's key warning is that simply deleting `clwb` from an existing NVM
+engine is not enough: random cache evictions can make 64-byte cache-line
+writes turn into read-modify-write traffic against larger NVM media
+granules.
+
+For GPU DB, the transferable idea is to treat future persistent tiers as
+durability domains with explicit write-shaping policy. A WAL or route
+descriptor can be durable once it reaches a protected cache/persistent
+buffer, but the engine still needs a separate policy for when data pages,
+indexes, resident-refresh manifests, and route metadata are pushed to the
+underlying medium.
+
+**Concrete mechanisms:**
+
+- Falcon chooses an in-place update architecture for eADR-enabled NVM. It
+  writes redo information before touching tuples, then updates tuples in
+  place. Because tuple addresses do not change, persistent indexes can
+  point directly at tuple locations and do not need frequent update-induced
+  pointer rewrites.
+- Each worker owns a small circular log window, sized to hold the redo
+  records for a few active transactions. The window is reused frequently
+  and is intended to stay in CPU cache. Under eADR-style persistent cache,
+  the logs are crash-persistent even before they are written back to NVM
+  media, so normal execution avoids NVM writes for redo logging.
+- The commit/update path records idempotent redo operations in the local
+  write set, marks the write-set state committed, updates tuples in place,
+  releases locks, executes an `sfence`, and then performs selective data
+  flush. During recovery, uncommitted write sets are discarded and committed
+  write sets are replayed.
+- Falcon's selective data flush has two parts. Hinted flush deliberately
+  brings back cache-line writeback as a performance hint, not as the
+  correctness mechanism: it issues an `sfence + clwbs` sequence over
+  contiguous cache lines so the NVM module has a better chance to merge
+  writes into larger media-granule writes. Hot tuple tracking keeps a small
+  LRU set of frequently updated tuple ids and avoids manually flushing
+  those tuples, leaving them in persistent cache when possible.
+- MVCC old versions are stored in DRAM, not NVM. The NVM tuple heap holds
+  the latest tuple version, while version chains for nonblocking reads live
+  in per-thread DRAM version queues. Old versions are reclaimed by comparing
+  version end timestamps against the TIDs of running transactions.
+- Falcon stores catalog metadata in NVM, including index roots, tuple heap
+  addresses, redo-log locations, and schema metadata. Recovery scans only
+  the small redo windows and recovers the persistent index, rather than
+  scanning the whole tuple heap to rebuild DRAM indexes.
+- The implementation supports 2PL, timestamp ordering, OCC, and MVCC
+  combinations. The paper reports a Rust implementation of more than
+  14,000 lines, evaluated on a dual-socket Intel Xeon Gold 5320 server with
+  768 GB of Optane persistent memory in DAX mode and eADR enabled.
+- In TPC-C at 48 threads, Falcon reports 1.21x to 1.35x improvement over
+  the state-of-the-art Zen-style NVM OLTP baseline. Against a pure in-place
+  engine, the small log window plus selective flush improves throughput by
+  12.5% to 14.2% and lowers latency by 13.1% to 18.6%.
+- In YCSB write-heavy workloads, the log-window effect is much larger:
+  Falcon reports 1.71x to 2.01x throughput improvement over a pure
+  in-place engine for uniform YCSB-A/F, and up to 3.14x under Zipfian
+  workloads where hot tuple tracking avoids repeated hot writes.
+- For a 256 GB YCSB database, Falcon reports 3.276 ms recovery, including
+  persistent-index recovery and redo replay, while the Zen-style baseline
+  takes 9.4 s because recovery scans NVM tuples to rebuild an in-DRAM index.
+
+**GPU DB mapping:** The immediate mapping is to keep WAL-before-visibility
+as the SQL authority while separating "commit has reached a durable domain"
+from "all affected physical bytes have been shaped and flushed to the slow
+tier." If future hardware exposes eADR, CXL Global Persistent Flush,
+battery-backed host buffers, or similar protected domains, GPU DB can
+benchmark a small durable commit window per mutation owner before forcing
+every route descriptor, index fragment, or cold-tier manifest to media.
+
+Small log windows map naturally to bounded mutation-owner commit windows.
+Each owner could keep a small circular redo/descriptor window for the last
+few admitted transactions or refresh publications. Visibility would still
+publish only after the owner has crossed the correct durability fence, but
+normal operation would avoid writing short-lived redo bytes twice if they
+remain in a protected persistence domain.
+
+Falcon's selective flush is useful for P8 because resident snapshots and
+cold-tier descriptors will contain both cold bulk data and tiny hot
+metadata. Contiguous checkpoint manifests, route maps, and segment headers
+should be flushed in merge-friendly groups; hot counters, generation cells,
+or route-cache hints should not be pushed to NVM/NVMe after every touch if
+a protected cache can absorb churn safely.
+
+The in-place/latest-version plus DRAM-old-version split is a cautionary
+model for GPU DB MVCC. GPU DB may keep the latest CPU truth or stable
+segment directory in a durable/future tier, but keep old visibility maps,
+retained snapshot deltas, or GPU-readable version summaries in rebuildable
+DRAM/HBM when crash recovery can reconstruct them from WAL/checkpoints.
+That reduces durable write pressure without weakening SQL-visible recovery.
+
+Persistent indexes are the other strong mapping. If tuple or segment
+addresses remain stable across updates, cold/warm indexes and route maps can
+be persistent and recover quickly. If compaction or out-of-place update
+changes addresses constantly, the engine either pays index rewrite traffic
+or must rebuild indexes after recovery. P8 should make this a measured
+layout decision, not an accident.
+
+**Risks and mismatches:** Falcon depends on persistent-cache hardware. The
+paper used Intel Optane eADR, and Optane as a product line is discontinued.
+The authors note related mechanisms such as CXL Global Persistent Flush and
+battery-backed buffers, but GPU DB should treat this as a future-tier design
+lane rather than an assumption for current commodity machines.
+
+The small log window limits transaction redo size. Falcon argues this fits
+many OLTP transactions, but large SQL statements, COPY batches, index
+maintenance, DDL, and resident snapshot refresh can exceed a tiny window.
+GPU DB would need window overflow policy, fallback to normal WAL, and
+explicit telemetry before using the design on arbitrary SQL.
+
+Falcon places old MVCC versions in DRAM and discards them after crash. That
+is reasonable when committed state can be recovered from latest tuples plus
+redo, but GPU DB must preserve externally visible snapshot semantics,
+replication, PITR, and long-reader guarantees. Rebuildable acceleration
+state can disappear; durable historical state cannot unless WAL/archive
+semantics prove it can be reconstructed.
+
+Hinted flush is advisory. Falcon cannot force CPU cache eviction order, and
+the underlying NVM controller may not merge writes as intended. A GPU DB
+implementation should measure actual media traffic and p99 latency rather
+than assume `clwb`-like hints shape future CXL/NVM devices the same way.
+
+**Benchmark candidates:**
+
+- Add a mutation-owner durable-window simulator: compare direct WAL append,
+  per-transaction flushed redo, and Falcon-style small durable windows under
+  TPC-C-like short writes, COPY chunks, and mixed retained-read invalidation.
+  Measure commit latency, durable bytes, media writes, recovery work, and
+  overflow rate.
+- Prototype a route-descriptor publication window for P8 metadata:
+  `{owner_id, window_generation, committed_state, descriptor_delta,
+  visibility_boundary}`. Gate: visibility is never published before the
+  durable fence, and every committed descriptor delta is replayable
+  idempotently after crash.
+- Benchmark selective flush policies for future warm-tier metadata:
+  flush-all, no-manual-flush, contiguous hinted flush, and hot-cell
+  no-flush. Measure write amplification, p99 mutation latency, and stale or
+  lost descriptor failures under crash injection.
+- Test stable-address versus out-of-place segment metadata. Compare
+  persistent index recovery when updates preserve segment/tuple addresses
+  against a compaction-heavy design that rewrites physical addresses and
+  rebuilds route indexes after restart.
+- Add MVCC old-version placement experiments: durable old versions,
+  DRAM-only rebuildable old versions, and HBM-visible snapshot summaries.
+  Gate: long retained reads and PITR remain correct, and rebuildable state is
+  explicitly invalidated or reconstructed after crash.
+- Add a large-transaction overflow test for small commit windows. Failure
+  condition: COPY, DDL, multi-index update, or refresh publication silently
+  exceeds the window and loses idempotent recovery information.
