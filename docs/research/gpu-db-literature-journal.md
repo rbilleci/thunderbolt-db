@@ -38,6 +38,216 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - DrTM turns hardware transactions into a local fast path with remote locks as proof
+
+**Citation:** Xingda Wei, Jiaxin Shi, Yanzhe Chen, Rong Chen, and
+Haibo Chen. "Fast In-memory Transaction Processing using RDMA and
+HTM." SOSP 2015, pages 87-104. DOI:
+`10.1145/2815400.2815419`. Retrieved 2026-06-06 from the SIGOPS
+SOSP 2015 PDF:
+`https://sigops.org/sosp/sosp15/current/2015-Monterey/printable/158-wei.pdf`.
+
+**Category:** transaction processing / write path and runtime / HFT /
+session scale, with secondary relevance to WAL/logging and remote-tier
+metadata design.
+
+**Relevance tags:** DrTM; RDMA; HTM; RTM; strict two-phase locking;
+read leases; transaction chopping; location cache; incarnation
+checking; cooperative logging; remote write-back; fallback handler;
+TPC-C; SmallBank.
+
+**Core idea:** DrTM asks whether modern hardware can make distributed
+OLTP much faster without changing the transaction contract. Its answer
+is to keep most local concurrency control inside hardware transactional
+memory, then use one-sided RDMA compare-and-swap locks and read leases
+to make remote records participate in a strict-2PL-style protocol.
+Remote records are locked or leased before the local hardware
+transaction begins, local reads/writes run inside RTM, and remote
+updates are written back after local commit.
+
+For GPU DB, the strongest transferable idea is not "use HTM
+everywhere." It is the split between a small local fast path and a
+remote/tier proof path. A mutation or retained-route owner can execute
+locally with cheap optimistic machinery only if every remote, cold,
+resident, WAL, and invalidation dependency has already been converted
+into a bounded proof: lock, lease, reservation, generation token, or
+published descriptor.
+
+**Concrete mechanisms:**
+
+- DrTM partitions data across machines and runs worker threads that
+  execute one transaction at a time. Local records are accessed inside
+  Intel RTM regions; remote records are fetched and protected through
+  one-sided RDMA operations.
+- A distributed transaction has Start, LocalTX, and Commit phases. In
+  Start, it locks or leases remote records and copies their values into
+  a local cache. In LocalTX, it runs local logic inside an HTM region.
+  In Commit, it commits the HTM region, writes remote updates back, and
+  releases exclusive locks.
+- RDMA operations are cache coherent with the target CPU's local
+  accesses, so a conflicting one-sided remote access can abort an HTM
+  transaction that touched the same cache line. DrTM uses that property
+  to bridge remote 2PL and local HTM conflict detection.
+- Remote writes use RDMA CAS to acquire an exclusive lock. Remote reads
+  use a lease-based shared lock so readers can share records instead of
+  turning every remote read into exclusive access.
+- Read leases are represented in a 64-bit record state word together
+  with an exclusive-lock bit and owner-machine id. Transactions confirm
+  that leases remain valid before local HTM commit; expired leases cause
+  retry/abort rather than speculative commit.
+- Read-only transactions bypass HTM because their read sets may be too
+  large. They acquire shared leases for all records with a common end
+  time, fetch values, and confirm the lease window to read a consistent
+  serializable state.
+- Large transactions may be chopped into smaller HTM-sized pieces. The
+  paper assumes read/write sets are known in advance for proper locking,
+  and only the first chopped piece may contain a user-initiated abort.
+- The fallback handler is not a simple global lock. After too many RTM
+  aborts, DrTM releases owned remote locks, reacquires all needed locks
+  in global order, validates leases, logs ahead of updates, and executes
+  outside HTM while preserving strict 2PL.
+- The RDMA-friendly hash table separates header buckets from key/value
+  entries. Header slots contain key, type, offset, and a lossy
+  incarnation; entries carry full incarnation, version, lock/lease
+  state, key, and value.
+- DrTM caches locations, not values. A cached entry address remains safe
+  across ordinary reads/writes; deletion increments an incarnation so a
+  stale cached location is detected as a miss.
+- Durability uses cooperative logging and recovery. Before remote
+  exclusive locking, DrTM writes a lock-ahead log; before HTM commit, it
+  logs local and remote updates to NVRAM. If a machine fails after HTM
+  commit, recovery uses the write-ahead log to finish local and remote
+  write-back/unlock.
+- The reported setup is a 6-node cluster with 20-core Intel Xeon E5-2650
+  v3 machines and Mellanox ConnectX-3 InfiniBand. Logging is disabled
+  in most throughput experiments and then evaluated separately.
+- On TPC-C standard mix, DrTM reports 3.67 M transactions/s on 6
+  machines and 5.52 M transactions/s when using two logical nodes per
+  physical machine. With logging enabled on 6 machines, throughput drops
+  from 3.67 M to 3.24 M transactions/s.
+- On SmallBank with 1% distributed transactions, the paper reports over
+  138 M transactions/s on 6 machines. When TPC-C cross-warehouse
+  accesses reach 100%, new-order throughput drops by about 85% because
+  the workload no longer benefits from local HTM execution.
+- Read leases improve the paper's hotspot/read-write microbenchmarks;
+  the reported hotspot gain reaches up to 29% on 6 machines.
+- The authors list important limitations: advance read/write-set
+  knowledge, optimized unordered hash storage but not RDMA-friendly
+  ordered stores, and durability rather than high availability after
+  machine failure.
+
+**GPU DB mapping:** GPU DB's owner-domain architecture can borrow the
+phase split without borrowing HTM as a required dependency. Before a
+mutation owner publishes visibility, it should turn all remote or
+derived-state dependencies into explicit proofs: WAL slot reserved,
+commit marker pending, resident generation invalidated, response slot
+reserved, cold-tier descriptor locked or leased, and recovery metadata
+available.
+
+The read-lease mechanism maps to retained snapshots and route
+descriptors. A retained read should not hold mutable locks, but it can
+hold a generation lease: table OID, schema generation, visibility
+boundary, resident layout generation, and expiration/retirement rules.
+Writes that cannot invalidate or wait safely should reject that route
+instead of silently using stale state.
+
+DrTM's location cache is a strong analogue for GPU DB route metadata.
+Cache addresses, descriptor offsets, resident buffer handles, and
+cold-tier chunk locations can be cached cheaply if they are validated by
+incarnation/generation fields before use. Caching values is more
+expensive because it needs invalidation; caching addresses plus proof
+fields can keep the hot path small.
+
+The cooperative logging lesson is useful for future remote or
+disaggregated tiers. If one-sided operations can mutate data without
+the owner CPU, then the initiator must log enough to repair locks,
+finish committed writes, or discard uncommitted work. GPU DB should
+prefer owner-mediated publication unless a future remote path has an
+equally explicit recovery contract.
+
+Transaction chopping maps to route fragments and GPU micro-batches. A
+large operation can be split only when each piece has clear abort,
+retry, WAL, snapshot, and invalidation semantics. Read-only retained
+routes and background refresh are safer first targets than arbitrary
+write transactions.
+
+**Risks and mismatches:** DrTM depends on Intel RTM behavior and
+RDMA/CPU cache-coherence interactions that are hardware-specific and
+less portable than owner-message protocols. Modern systems may also
+avoid HTM because of capacity aborts, disabling, security mitigations,
+or weak availability across CPU generations.
+
+The paper requires advance read/write sets for distributed transaction
+locking. Interactive SQL, ad hoc plans, secondary-index maintenance,
+triggers, and GPU-dependent route choice often discover work during
+execution, so GPU DB cannot assume every route can be locked up front.
+
+Durability is evaluated on emulated battery-backed NVRAM and most
+throughput experiments disable logging. The reported numbers are useful
+for mechanism direction, not direct GPU DB throughput targets.
+
+DrTM handles an unordered hash store well but does not provide an
+equally optimized RDMA ordered store. GPU DB's range, prefix, text, and
+scan routes need index/range proof mechanisms beyond hash lookup.
+
+The design preserves durability but not high availability on machine
+failure. GPU DB's WAL, checkpoint, and future replication story should
+not inherit one-sided mutation without replicated recovery and
+membership rules.
+
+**Benchmark candidates:**
+
+- Build a transaction-route phase simulator with Start/Local/Commit
+  proof states: WAL reservation, resident invalidation, cold-tier
+  descriptor lease, response-slot reservation, and recovery record.
+  Gate: no visibility publication can happen with a missing proof.
+- Prototype location-only route caching for resident/cold descriptors.
+  Cache descriptor offsets and buffer handles, validate them with
+  generation/incarnation fields, and measure hit rate, validation cost,
+  stale-handle rejection, and p99 lookup latency.
+- Compare retained read generation leases against lock-free snapshot
+  handles. Required measurement: reader admission latency, writer
+  invalidation delay, retained memory growth, and retry rate under hot
+  updates.
+- Add a fallback-path benchmark where optimistic route execution exceeds
+  retry or capacity limits and must reacquire proof tokens in global
+  order. Failure condition: fallback can deadlock or publish partial
+  visibility.
+- Test route chopping for read-only retained scans and background
+  refresh before writes. Gate: each fragment can be canceled, retried,
+  or resumed without changing the SQL-visible snapshot boundary.
+- Model remote one-sided mutation as a future-tier option and compare it
+  to owner-mediated messages. Required proof: crash injection can finish
+  or unwind every committed/uncommitted remote descriptor state.
+
+### 2026-06-06 - Cross-paper synthesis: fast routes need proof before execution, not cleanup after failure
+
+Quickstep, MatrixKV, and DrTM converge on one design track: execution
+work should be decomposed only where the boundary carries enough proof
+to schedule, cancel, recover, and retry safely. Quickstep turns query
+plans into work orders with scheduling metadata. MatrixKV bounds
+storage maintenance by compaction range. DrTM requires remote locks,
+leases, and logs before local fast execution starts.
+
+For GPU DB, the design implication is that route fragments should not
+be anonymous tasks. A fragment needs a source WAL boundary, visibility
+boundary, generation/incarnation proof, buffer credits, fallback policy,
+and recovery or cancellation rule. With those fields, the runtime can
+pause background refresh for retained lookups, keep compaction from
+stealing foreground capacity, and reject stale cached handles before
+GPU launch.
+
+The benchmark priority is now a proof-shaped route-fragment harness:
+one retained lookup route, one background refresh route, and one
+mutation route should all flow through the same admission vocabulary.
+Measure queue wait, p99 retained latency, refresh starvation, WAL
+reservation delay, stale-generation rejection, and crash/cancel safety.
+
+Category gaps after this cluster: MVCC snapshot lifecycle is healthy,
+but the next few runs should keep pressure on practical transaction
+commit, replication/WAL availability, and optimizer integration so the
+route-proof vocabulary does not become only a runtime abstraction.
+
 ### 2026-06-06 - NVWAL makes durable logging a byte-granular persistent-memory protocol
 
 **Citation:** Wook-Hee Kim, Jinwoong Kim, Woongki Baek, Beomseok

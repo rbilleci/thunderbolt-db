@@ -514,7 +514,7 @@ Append new candidates here as each paper is processed.
   future warm/cold-tier and replicated-owner paths. Journal entry added
   2026-06-06 from the SIGOPS SOSP 2015 PDF after the stale USENIX URL
   redirected to a 404 page.
-- `queued` — **Fast In-memory Transaction Processing using RDMA and HTM**,
+- `reviewed` — **Fast In-memory Transaction Processing using RDMA and HTM**,
   Wei, Shi, Chen, Chen, and Chen, SOSP 2015.
   URL: `https://doi.org/10.1145/2815400.2815419`
   PDF:
@@ -522,7 +522,23 @@ Append new candidates here as each paper is processed.
   Why: FaRM's SOSP cohort paper explores a different hardware-assisted OLTP
   path by combining RDMA with hardware transactional memory; useful for
   comparing owner-mediated validation and WAL publication against HTM-assisted
-  local concurrency control and remote access.
+  local concurrency control and remote access. Journal entry added
+  2026-06-06.
+- `queued` — **DHTM: Durable Hardware Transactional Memory**, Joshi,
+  Nagarajan, Cintra, and Viglas, ISCA 2018.
+  URL: `https://doi.org/10.1109/ISCA.2018.00047`
+  Why: DrTM relies on HTM plus separate NVRAM logging for durability; DHTM is a
+  hardware-oriented follow-up for comparing whether durable transactional
+  memory ideas can simplify or bound future CPU warm-tier route metadata,
+  undo/redo records, and crash-consistent descriptor updates.
+- `queued` — **RHKV: An RDMA and HTM friendly key-value store for
+  data-intensive computing**, Shi et al., Future Generation Computer Systems
+  2019.
+  DOI: `https://doi.org/10.1016/j.future.2018.10.001`
+  Why: DrTM's location-cache and HTM/RDMA hash-table mechanisms motivate a
+  narrower key-value follow-up; useful for comparing address-only caches,
+  incarnation validation, and remote write support before GPU DB caches
+  resident or cold-tier route locations.
 - `reviewed` — **Everything is a Transaction: Unifying Logical Concurrency
   Control and Physical Data Structure Maintenance in Database Management
   Systems**, Pavlo et al., CIDR 2021.
