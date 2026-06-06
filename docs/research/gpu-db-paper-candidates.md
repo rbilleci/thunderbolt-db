@@ -472,13 +472,14 @@ Append new candidates here as each paper is processed.
   relevant to separating database-owned storage metadata, page/object layout,
   cache hierarchy, and read throughput from conventional local file-system
   assumptions. Journal entry added 2026-06-06.
-- `queued` — **Vortex: A Stream-oriented Storage Engine For Big Data
-  Analytics**, Lamb et al., SIGMOD/PODS Companion 2024.
+- `reviewed` — **Vortex: A Stream-oriented Storage Engine For Big Data
+  Analytics**, Edara, Forbes, and Li, SIGMOD/PODS Companion 2024.
   URL: `https://research.google/pubs/vortex-a-stream-oriented-storage-engine-for-big-data-analytics/`
   PDF: `https://www.cs.cmu.edu/~15721-f24/papers/Google_Vortex.pdf`
   Why: recent high-throughput storage-engine design for streaming and batch
   analytics; useful for GPU DB ingestion, scan throughput, file layout,
-  indexing metadata, and bounded freshness tradeoffs.
+  indexing metadata, and bounded freshness tradeoffs. Journal entry added
+  2026-06-06.
 - `reviewed` — **DEX: Scalable Range Indexing on Disaggregated Memory**, VLDB
   2024.
   URL: `https://www.microsoft.com/en-us/research/publication/dex-scalable-range-indexing-on-disaggregated-memory/`
@@ -518,6 +519,19 @@ Append new candidates here as each paper is processed.
   decentralized priority lock queues against a newer design that reduces
   memory-node NIC contention by decoupling lock ownership transfer from
   centralized lock-state maintenance. Journal entry added 2026-06-06.
+- `queued` — **Big Metadata: When Metadata is Big Data**, Edara and
+  Pasumansky, PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p3083-edara.pdf`
+  DOI: `https://doi.org/10.14778/3476311.3476383`
+  Why: Vortex relies on Big Metadata for large-scale column properties and
+  partition pruning; useful for GPU DB's route metadata, resident-fragment
+  pruning, snapshot-safe metadata publication, and metadata compaction.
+- `queued` — **Pravega: A Tiered Storage System for Data Streams**,
+  Gracia-Tinedo et al., Middleware 2023.
+  URL: `https://doi.org/10.1145/3590140.3629113`
+  Why: Vortex compares against Pravega's stream/tier abstraction; useful for
+  studying stream-oriented tiering, truncation, transactions, and data
+  placement across hot and cold storage.
 - `reviewed` — **ALock: Asymmetric Lock Primitive for RDMA Systems**, Baran,
   Nelson-Slivon, Tseng, and Palmieri, SPAA 2024.
   URL: `https://doi.org/10.1145/3626183.3659977`

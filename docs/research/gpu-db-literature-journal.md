@@ -84949,3 +84949,222 @@ session multiplexing, or multi-tier storage.
 - Stress stale route certificates across DDL, key updates, attribute
   layout changes, and resident snapshot invalidation. Gate: generation
   checks force fallback before execution.
+
+### 2026-06-06 - Vortex makes streaming ingest the storage authority, then continuously reshapes it for reads
+
+**Citation:** Pavan Edara, Jonathan Forbes, and Bigang Li. "Vortex:
+A Stream-oriented Storage Engine For Big Data Analytics."
+SIGMOD/PODS Companion 2024. doi:10.1145/3626246.3653396.
+Retrieved 2026-06-06 from
+`https://www.cs.cmu.edu/~15721-f24/papers/Google_Vortex.pdf`.
+
+**Category:** database file-system design, storage, and indexing,
+with multi-tier cache / data placement and hybrid HTAP relevance.
+
+**Relevance tags:** streaming-first storage; append streams;
+streamlets; fragments; write-optimized storage; read-optimized
+storage; WOS-to-ROS conversion; snapshot timestamps; deletion masks;
+metadata compaction; partition pruning; flow control; exactly-once
+ingest; batch commit; read-after-write freshness; BigQuery.
+
+**Core idea:** Vortex is BigQuery's streaming-first storage engine:
+data lands directly in an append-oriented durable format, remains
+queryable with read-after-write freshness, and is continuously
+converted into read-optimized columnar fragments. Instead of staging
+streaming data outside the warehouse and later importing it, Vortex
+uses one API and one storage management path for streaming and batch
+ingest.
+
+For GPU DB, the strongest transferable idea is to treat fresh writes
+as first-class queryable storage, not as a side buffer waiting for a
+bulk load. The engine can accept append chunks into a write-optimized
+CPU/WAL tier, expose a correct snapshot boundary immediately, and
+let background maintenance reshape those chunks into GPU-friendly
+resident column groups when doing so improves read throughput.
+
+**Concrete mechanisms:**
+
+- The user-facing abstraction is a table containing append-only
+  Streams. Each row has a stream id plus row offset. Tens of thousands
+  of clients can write concurrently, usually through dedicated streams.
+- Stream types expose different visibility and atomicity contracts.
+  UNBUFFERED appends are durable and visible on successful return.
+  BUFFERED streams accept durable but hidden appends until a
+  FlushStream advances the committed offset. PENDING streams remain
+  hidden until a batch commit makes multiple streams atomically visible.
+- AppendStream can include an expected row offset. A duplicate retry
+  at the same offset becomes idempotent because only the append at the
+  current stream length succeeds. Clients may omit the offset for lower
+  latency and at-least-once semantics.
+- Internally, a Stream is an ordered list of Streamlets. A Streamlet is
+  a contiguous range of stream rows assigned to a stream server and
+  replicated to two clusters before success is reported. Streamlets are
+  split into Fragments, typically ranges inside log files stored in
+  Colossus.
+- Vortex separates a write-optimized storage format (WOS), used by the
+  append API, from read-optimized storage (ROS), usually a columnar
+  format such as Capacitor or Parquet. A storage optimization service
+  converts WOS fragments to ROS and maintains an LSM-like stack of
+  progressively optimized fragments.
+- Fragment visibility is timestamp based. Fragments carry creation and
+  deletion timestamps, and a snapshot read includes fragments whose
+  snapshot timestamp lies in the interval
+  `[creation_timestamp, deletion_timestamp)`. Optimization atomically
+  deletes old fragments and creates replacements so each row is read
+  exactly once.
+- Stream servers maintain fragment metadata including committed size,
+  record timestamp bounds, schema version, partitioning/clustering
+  columns, and finalization state. Finalized fragments include bloom
+  filters for partitioning and clustering key values.
+- Reads normally go directly from storage through a thick client
+  library, not through the stream server. The stream server's in-memory
+  metadata is an optimization; file maps in fragment headers allow
+  readers to reconstruct committed fragment sizes if the stream server
+  is unavailable.
+- Appends carry server-assigned TrueTime timestamps with bounded clock
+  skew. Readers stop when they encounter an append timestamp greater
+  than the snapshot timestamp.
+- If the final append in a fragment has ambiguous replica sizes, the
+  client asks the metadata service to reconcile the final length so all
+  readers agree on committed data.
+- Vortex supports INSERT, UPSERT, and DELETE through a virtual
+  `_CHANGE_TYPE` column. DELETE and UPDATE-like operations persist
+  deletion masks against fragments or streamlet ranges; updates are
+  delete plus insert.
+- Storage optimization yields to DML commits to avoid races with
+  deletion-mask publication. To avoid optimization starvation under
+  long or continuous DML, Vortex supports stable 1:1 conversion from
+  WOS to ROS so deletion masks can still map to optimized fragments.
+- Metadata is split by authority. Stream server logs and checkpoints
+  are the source of truth for streamlet/fragment state while Spanner
+  caches coarse metadata until finalization. Big Metadata indexes fine
+  column properties for large-scale pruning.
+- The tail of rapidly changing fragment metadata is compacted by
+  keeping live fragment entries together and maintaining a watermark for
+  the oldest live fragment not yet optimized.
+- The thick client adapts between short unary RPCs for low-volume
+  streams and long-lived bidirectional RPCs for high-volume streams.
+  Bidirectional streams allow pipelined appends and per-connection flow
+  control when uncommitted in-flight data would otherwise exhaust stream
+  server memory.
+- Production results report multiple GB/sec per table, sub-second data
+  freshness, p50 append latency around 10 ms, and p99 append latency
+  around 30 ms across table throughputs from under 1 MB/sec to over
+  1 GB/sec.
+
+**GPU DB mapping:** GPU DB's current P8 slice already separates CPU
+canonical MVCC state from GPU resident column-group snapshots. Vortex
+suggests a sharper write/read storage split: an append chunk can be a
+first-class WOS fragment with durable WAL identity, committed length,
+timestamp/generation bounds, optional bloom/min-max metadata, and a
+later ROS/resident conversion record.
+
+The stream/streamlet/fragment vocabulary maps well to owner domains.
+A mutation owner can own stream offsets and WAL-before-visibility. A
+residency owner can own conversion from CPU/WAL fragments to GPU
+resident ROS-like column groups. Read workers can consume a union of
+fresh WOS fragments and optimized resident fragments at a snapshot
+generation instead of requiring all data to be resident before it is
+queryable.
+
+BUFFERED and PENDING streams are useful API shapes for bulk ingest.
+GPU DB could support append chunks that are durable but not visible
+until a flush boundary, and larger batch commits that atomically publish
+multiple partition-local streams. That gives COPY/ETL paths more
+throughput without weakening read-after-write semantics for ordinary
+UNBUFFERED-style commits.
+
+The expected row offset mechanism maps to idempotent client retry and
+exactly-once ingestion. A pgwire/COPY or future ingestion API can carry
+stream id plus next offset, making duplicate retry rejection local to
+the append stream rather than dependent on expensive row-value
+deduplication.
+
+Fragment visibility intervals map to retained snapshot publication.
+Instead of invalidating a whole resident table on every mutation, the
+planner can choose from a union of fragment generations whose
+visibility ranges cover the read snapshot. A fresh fragment may run on
+CPU or cold GPU transfer while older optimized fragments remain resident
+and reusable.
+
+Deletion masks are a practical compromise for UPDATE/DELETE over
+append storage. GPU DB could first benchmark fragment-level or
+row-range deletion masks before attempting in-place resident updates,
+with a rule that resident kernels always apply the mask for the chosen
+snapshot generation.
+
+The metadata-tail problem is directly relevant to 1M logical sessions.
+If every fresh fragment and resident route descriptor must be scanned by
+the scheduler, low-latency reads will suffer. GPU DB should compact
+live route metadata, keep hot fragment descriptors contiguous, and make
+snapshot route lookup depend on live metadata size rather than total
+historical churn.
+
+Vortex's client adaptation also maps to session admission. Low-volume
+sessions should use cheap pooled/unary-style request state, while hot
+ingest streams can justify persistent rings, pipelining, and per-stream
+flow control. The runtime should not pay bidirectional-stream memory
+cost for dormant logical sessions.
+
+**Risks and mismatches:** Vortex is optimized for BigQuery-scale
+analytics and streaming ingest, not low-latency OLTP with secondary
+index maintenance, strict SQL transaction interaction, GPU kernels, or
+single-node NVMe/HBM placement.
+
+The paper exposes production architecture but not all internal
+algorithms. Exact optimizer thresholds, fragment sizes, metadata index
+schemas, and Big Metadata pruning internals are not fully specified in
+this paper.
+
+TrueTime, Spanner, Colossus, Borg, and Big Metadata are Google
+infrastructure dependencies. GPU DB needs local substitutes: WAL
+frontiers and logical generations instead of TrueTime, local/remote
+NVMe/object metadata instead of Colossus, and DB-owned route metadata
+instead of Big Metadata.
+
+Deletion masks and 1:1 conversion may increase read amplification and
+resident-kernel branch work. They are likely best as an initial
+correctness mechanism and as a fallback when compaction or refresh
+cannot keep up.
+
+Yielding storage optimization to DML preserves correctness but can
+create read-performance cliffs under continuous mutation. GPU DB needs
+an explicit policy for when refresh, compaction, or resident conversion
+is allowed to lag, shed, or switch to stable 1:1 conversion.
+
+The reported latency numbers are append API latencies inside Google's
+production environment. They should guide target shape, not be treated
+as a direct benchmark baseline for the local GPU database.
+
+**Benchmark candidates:**
+
+- Build an append-fragment ingest prototype with stream id, expected row
+  offset, committed length, WAL generation, and idempotent retry checks.
+  Gate: duplicate retries at the same offset are rejected or acknowledged
+  deterministically without duplicate visible rows.
+- Compare direct MVCC tuple ingest versus WOS fragment ingest followed
+  by resident ROS conversion for COPY-heavy workloads. Measure write
+  throughput, read-after-write latency, resident refresh cost, and p99
+  retained-read latency.
+- Implement a snapshot union read over fresh WOS fragments plus resident
+  ROS fragments. Gate: fresh writes become visible before conversion,
+  optimized fragments remain reusable, and each row appears exactly once
+  across visibility intervals.
+- Add fragment-level min/max and bloom metadata for the first int4 key
+  and prefix/text column. Measure route-pruning cost versus scanning live
+  fragment descriptors under high fragment churn.
+- Prototype deletion masks for UPDATE/DELETE over append fragments and
+  retained resident snapshots. Failure condition: masks reduce write
+  amplification but make retained kernels slower than CPU fallback for
+  common read shapes.
+- Benchmark unary-style ingest requests versus persistent pipelined
+  stream rings. Expected result: persistent rings win for hot streams,
+  while pooled request state is cheaper for many cold or dormant logical
+  sessions.
+- Add a metadata-tail compaction benchmark. Gate: snapshot route lookup
+  latency tracks live hot fragments and resident descriptors, not total
+  historical fragments created by optimization, refresh, and DML.
+- Stress DML versus resident conversion. Compare yield-to-DML,
+  stable-1:1 conversion, and delayed conversion under continuous updates.
+  Measure read p99, conversion backlog, deletion-mask size, and resident
+  invalidation frequency.
