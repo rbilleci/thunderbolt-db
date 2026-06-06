@@ -5222,12 +5222,24 @@ Append new candidates here as each paper is processed.
   Why: OCToPus cites Block-STM as a deterministic ordered blockchain execution
   baseline; useful for comparing optimistic parallel execution, dependency
   tracking, and re-execution costs against semantic fast paths.
-- `queued` — **Forerunner: Constraint-based Speculative Transaction Execution
+- `reviewed` — **Forerunner: Constraint-based Speculative Transaction Execution
   for Ethereum**, Chen et al., SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483564`
   Why: Block-STM contrasts against constraint/pre-execution hints for smart
   contract transactions; useful for comparing off-critical-path route hints
-  with active-window dependency learning.
+  with active-window dependency learning. Journal entry added 2026-06-06.
+- `queued` — **An Empirical Study of Speculative Concurrency in Ethereum Smart
+  Contracts**, Bartoletti and Pompianu, arXiv 2019.
+  URL: `https://arxiv.org/abs/1901.01376`
+  Why: Forerunner's motivation and later blockchain execution work make this a
+  useful measurement baseline for how much parallel/speculative work exists in
+  smart-contract traces before adopting richer constraint-checked route hints.
+- `queued` — **NEMO: Faster Parallel Execution for Highly Contended Blockchain
+  Workloads**, Ezard, Ileri, and Decouchant, arXiv 2025.
+  URL: `https://arxiv.org/abs/2510.15122`
+  Why: modern high-contention blockchain execution follow-up discovered during
+  the Forerunner review; useful for contrasting object-model OCC and
+  contention-aware execution with GPU DB's hot-key write-window admission.
 - `reviewed` — **Processing Transactions in a Predefined Order**, Saad et al.,
   PPoPP 2019.
   URL: `https://doi.org/10.1145/3293883.3295730`

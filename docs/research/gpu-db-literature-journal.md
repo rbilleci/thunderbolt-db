@@ -38,6 +38,169 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Forerunner turns speculative work into constraint-checked fast paths
+
+**Citation:** Yang Chen, Zhongxin Guo, Runhuai Li, Shuo Chen,
+Lidong Zhou, Yajin Zhou, and Xian Zhang. "Forerunner:
+Constraint-based Speculative Transaction Execution for Ethereum."
+SOSP 2021, pp. 570-587. DOI:
+`https://doi.org/10.1145/3477132.3483564`. Retrieved 2026-06-06
+from the Microsoft Research author PDF,
+`https://www.microsoft.com/en-us/research/uploads/prod/2021/09/3477132.3483564.pdf`;
+primary metadata page:
+`https://www.microsoft.com/en-us/research/publication/forerunner-constraint-based-speculative-transaction-execution-for-ethereum/`.
+
+**Category:** transaction processing / write path and runtime / HFT /
+session scale, with secondary relevance to query compilation and
+admission.
+
+**Relevance tags:** speculative execution; many-future execution;
+constraint checking; transaction fast path; pre-execution; memoization;
+program specialization; read-set prefetch; fallback; critical-path
+shrinkage; deterministic state machine; route hints; write-window
+admission.
+
+**Core idea:** Forerunner uses the gap between seeing a transaction
+and having to execute it in final order to do speculative work off the
+critical path. Instead of requiring a perfect prediction of the final
+execution context, it pre-executes across possible future contexts and
+derives constraints under which a specialized fast-path program remains
+equivalent to the original execution.
+
+The transferable idea is not blockchain-specific: an engine can
+precompute route work, dependency facts, resident-state fetches, or
+compiled fragments before the final visibility/order boundary is known,
+as long as the actual execution first checks explicit constraints and
+falls back to the canonical path when the proof fails.
+
+**Concrete mechanisms:**
+
+- The paper names the model Dissemination-Consensus-Execution: a
+  transaction is known during dissemination, final order/context is
+  decided later, and execution is on the critical path.
+- Forerunner speculates on multiple future contexts rather than one
+  predicted future. Each pre-execution records an instruction trace,
+  read set, write set, data dependencies, and context variables.
+- It generates CD-Equiv constraints: control-flow equivalence plus
+  equivalent data dependencies for variable-location or variable-size
+  accesses. If the actual context satisfies the constraints, the
+  specialized path is guaranteed to produce the same result as normal
+  execution for that context.
+- It synthesizes an Accelerated Program from traced EVM execution. The
+  AP contains merged constraint sets, fast paths, and shortcuts.
+- It translates stack-oriented EVM traces into a register-oriented
+  S-EVM intermediate form where instructions are simplified into read,
+  write, and compute operations. This makes dependencies explicit enough
+  for constant folding, common subexpression elimination, register
+  promotion, and memoization.
+- Constraint checks are inserted as guard instructions at control-flow
+  and data-dependency decision points. Guard failure aborts the AP and
+  runs the original transaction execution.
+- Memoization shortcuts skip repeated computation when decisive values
+  match those seen in speculation, even if the entire context is not a
+  perfect match.
+- A multi-future predictor monitors the chain and pending transaction
+  pool, constructs likely future contexts, and sends them to the
+  speculator. A prefetcher uses read sets to pull persistent state before
+  the critical execution phase.
+- Evaluation used a fully implemented Ethereum node on live worldwide
+  traffic and recorded replays. The main live period processed 13
+  million transactions in real time; the paper reports 8.39x effective
+  speedup on heard transactions, 6.06x end-to-end speedup across all
+  transactions, and 99.16% AP constraint-set satisfaction on heard
+  transactions.
+- Correctness was checked through Ethereum state-root equality: the
+  evaluation reports matching Merkle roots for 121,210 blocks and
+  22,557,724 transactions while using speculative execution.
+- The off-critical-path machinery is not free. The paper reports average
+  AP synthesis cost of 12.19x normal execution time per speculated
+  context, plus higher resource use than baseline geth: 67.05 GB memory
+  versus 19.15 GB and 23.84% aggregate CPU utilization versus 5.51% in
+  the reported setup.
+
+**GPU DB mapping:** GPU DB has similar windows even without blockchain
+consensus: prepared statements before execution, queued writes before
+WAL visibility, read routes before final snapshot selection, resident
+refresh before publication, and micro-batches waiting behind owner
+rings. Forerunner suggests representing those windows as a
+constraint-checked speculation pipeline instead of either doing nothing
+early or trusting stale guesses.
+
+For retained reads, the engine can prebuild route candidates keyed by
+query shape, relation generation, resident layout id, predicate family,
+and expected visibility boundary. At execution time the route is usable
+only if guards prove that catalog generation, MVCC boundary, residency
+generation, invalidation generation, and output shape still match the
+route certificate.
+
+For writes, the useful analog is a speculative write-window plan:
+precompute key hashes, partition routes, conflict classes, encoded row
+buffers, index update descriptors, and maybe GPU batch fragments before
+the mutation owner reaches the WAL publication point. The owner still
+performs WAL-before-visibility and canonical conflict checks; speculative
+work is discarded or repaired when guards fail.
+
+For P8 tiering, Forerunner's prefetcher maps to read-set and
+resident-state prefetch. A route predictor can identify pages, column
+groups, compressed segments, or index metadata likely to be needed and
+stage them from NVMe/DRAM/HBM before final admission. Constraint checks
+then make tier speculation explicit: use the prefetched resident path
+only if the resident generation and visibility proof still hold.
+
+For compilation, the AP idea maps to narrow route-specific kernels or
+CPU fragments generated from observed query shapes. GPU DB should avoid
+making the first slice a general JIT project, but it can still use the
+principle: compile or specialize only when the guard set is small,
+observable, and cheap enough to check.
+
+**Risks and mismatches:** Ethereum transactions are deterministic smart
+contract executions in a replicated state machine, not SQL transactions
+with MVCC, predicate reads, DDL invalidation, WAL, indexes, and user
+sessions. CD-Equiv over EVM traces does not directly prove SQL
+serializability or snapshot validity.
+
+The paper spends substantial CPU and memory off the critical path. GPU DB
+cannot let speculation compete with mutation owners, IO workers, or GPU
+execution streams in a way that worsens p99 latency.
+
+Speculative route certificates can become too broad or too expensive to
+check. If guard checks approach the cost of canonical planning/execution,
+the fast path is not useful.
+
+The many-future opportunity is clearer in Ethereum's dissemination
+window than in a database under immediate client latency goals. GPU DB
+must identify real local windows: prepared statements, admission queues,
+known COPY chunks, refresh pipelines, and repeatedly observed hot
+transaction shapes.
+
+**Benchmark candidates:**
+
+- Build a retained-read route-certificate prototype with explicit guards:
+  catalog generation, visibility boundary, resident layout id,
+  invalidation generation, predicate shape, and output shape. Gate:
+  guard check is measurably cheaper than canonical route planning and no
+  stale resident route can pass.
+- Add speculative prefetch for read routes while queued behind admission:
+  prefetch CPU index pages, host column segments, or HBM resident handles
+  based on predicted route. Expected result: lower p50/p99 for admitted
+  routes when prediction is right; failure condition: prefetch pressure
+  evicts hotter resident data or increases mutation latency.
+- Prototype speculative write-window preparation for batches: encode rows,
+  hash keys, partition commands, and prepare index descriptors before the
+  mutation owner reaches the commit check. Gate: WAL-before-visibility and
+  canonical conflict checks remain authoritative.
+- Compare perfect-match route caching against constraint-checked route
+  reuse. Expected result: constraint checks reuse more prepared work when
+  only harmless context values change.
+- Track speculation resource budgets explicitly: CPU time, memory, HBM
+  staging bytes, pinned-buffer usage, and queue delay. Failure condition:
+  off-critical-path speculation harms p99 more than it helps mean
+  throughput.
+- For GPU kernels, test a route-specific specialized fragment only after
+  the guard set is stable. Minimum proof: generated or cached fragment
+  improves same-shape micro-batches without hiding fallback reasons or
+  correctness proofs.
+
 ### 2026-06-06 - Dataset versioning turns snapshot retention into a storage-recreation frontier
 
 **Citation:** Souvik Bhattacherjee, Amit Chavan, Silu Huang,
