@@ -85375,3 +85375,133 @@ resident fragment interval, conflict prediction, and fallback reason.
 The minimum proof gate is simple: no fast route may be admitted unless
 the runtime can explain why it is safe, how it will be invalidated, and
 where it goes when the explanation expires.
+
+### 2026-06-06 - Vbox makes predicate serializability checking compact enough for route audits
+
+**Citation:** Weihua Sun and Zhaonian Zou, "Vbox: Efficient
+Black-Box Serializability Verification," arXiv 2025. URL:
+`https://arxiv.org/abs/2503.05163`. Retrieved 2026-06-06.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** serializability verification, predicate reads,
+black-box histories, client timestamps, compact transitive closure,
+SAT-guided anomaly checking, route audit harness.
+
+**Core idea:** Vbox extends Cobra-style black-box serializability
+checking so the verifier can reason about predicate reads and writes,
+not just point-object histories. The paper models an observed history
+as incomplete: predicate operations may hide which version was read
+when the predicate evaluates false. Vbox searches for a compatible
+complete history whose direct serialization graph is acyclic, while
+adding predicate constraints that represent the possible predicate
+read-dependency and anti-dependency edge sets.
+
+The transfer to GPU DB is not to put this solver on the hot path. The
+valuable idea is that fast retained routes need an offline or nearline
+witness format that covers predicates, time windows, and version
+choices. Point-key histories are too weak for a system whose
+accelerated paths include retained scans, range filters, prefix
+filters, bitmap filters, resident fragments, and fallback CPU/MVCC
+execution.
+
+**Concrete mechanisms:**
+
+- Predicate constraints: for an unknown predicate read, Vbox builds
+  candidate edge sets from versions that could have made the predicate
+  false, plus anti-dependency edges to later versions that flip the
+  predicate. Assigning item and predicate constraints together avoids
+  enumerating complete version orders first.
+- Known graph from client time: each transaction records a client
+  start timestamp and end timestamp. Non-overlapping transactions
+  contribute time-dependency edges, and those edges infer some write
+  and anti-dependencies before the expensive search starts.
+- Constraint reduction: non-overlapping item writers do not need
+  pairwise item constraints because time already fixes their order.
+  Edge sets that would immediately create cycles are pruned, and
+  singleton choices are folded into the known graph.
+- Compact transitive closure: transactions are sorted by start time;
+  reachability for non-overlapping transactions is inferred from
+  timestamps, while explicit closure state is kept mainly for the
+  overlap window. The paper reports this as the source of near-linear
+  scaling.
+- Solver structure: MiniSAT handles the simplified boolean formula for
+  item and predicate choices, while a custom theory solver uses the
+  compact closure to propagate forced choices and explain cycles with
+  learned clauses.
+- Evaluation claims: on 10K-transaction histories, Vbox is reported as
+  60-100x faster than Cobra and 20-70x lower in memory. On BlindW-WR
+  histories from 10K to 100K transactions, reported verification time
+  grows from 0.31s to 4.16s and memory from 44MB to 417MB. The tested
+  workloads include TPC-C, C-Twitter, BlindW read/write mixes, and a
+  BlindW predicate variant.
+
+**GPU DB mapping:** The immediate mapping is a correctness audit lane
+for route certificates. Each benchmark transaction should emit begin
+and end timestamps, route id, snapshot generation, predicate family,
+read keys/ranges when available, written row ids or key intervals, WAL
+frontier, fallback reason, and observed result identity. A Vbox-like
+checker can then test whether retained GPU routes, CPU fallback, and
+mutation-owner paths still admit a serial order under mixed predicate
+reads and writes.
+
+The compact-closure idea also maps to session scale. A 1M logical
+session target cannot retain a dense transaction-by-transaction
+closure. Histories should be chunked by overlap windows, route family,
+and WAL/snapshot frontier so non-overlapping work is represented by
+time and frontier edges, while only genuinely concurrent windows need
+explicit graph state.
+
+For MVCC design, Vbox argues that predicate-read validation must be a
+first-class benchmark surface. A point lookup can record a concrete
+version, but a retained scan that omits rows because a predicate was
+false needs enough metadata to reconstruct why omitted rows were
+invisible or predicate-false at the chosen snapshot. That means
+resident filters and bitmap/index routes should expose audit summaries,
+not just result rows.
+
+**Risks and mismatches:** Vbox is a verifier, not a concurrency-control
+protocol, storage engine, or GPU execution mechanism. Its client time
+method assumes synchronized client clocks and conservative begin/end
+capture; GPU DB should prefer server-side monotonic sequence stamps
+where possible, and use client stamps only as external witness data.
+
+The paper targets serializability. GPU DB may intentionally expose
+snapshot isolation, read committed, or retained read snapshots, so the
+checker must be matched to the advertised isolation contract. Vbox's
+future-work note explicitly says weaker isolation support remains open.
+
+Predicate support is formal but still depends on the observed history
+containing enough predicate/write information to build candidate edge
+sets. For SQL queries with complex expressions, joins, GPU-side
+filters, approximate filters, or compressed resident formats, the
+engine must decide what audit abstraction is faithful enough.
+
+The evaluation is an arXiv preprint with an ACM placeholder venue
+string in the extracted PDF, so publication status is unknown from the
+retrieved source. Treat the reported speedups as promising verifier
+evidence, not as a production admission budget.
+
+**Benchmark candidates:**
+
+- Build a route-history trace format for mixed retained reads and
+  writes: begin/end stamps, snapshot generation, WAL frontier,
+  route id, predicate family, read result ids, write ids/ranges, and
+  fallback reason. Gate: the trace can distinguish point-read,
+  predicate-read, write-write, and read-write dependency edges.
+- Add a predicate anomaly benchmark where retained GPU scans and CPU
+  fallback writes interleave on the same key ranges. Expected result:
+  the checker either finds a serial order or produces a minimal cycle
+  witness; no stale resident route may pass silently.
+- Compare dense closure versus overlap-window closure for generated
+  histories from 10K to 1M logical sessions. Measure verifier memory,
+  cycle-witness quality, and the maximum overlap window created by the
+  runtime admission policy.
+- Use server-side route timestamps instead of client timestamps and
+  verify whether time-derived dependency pruning remains sound across
+  network IO workers, mutation owner queues, GPU execution queues, and
+  response rings.
+- Create a retained-filter audit benchmark for prefix/range predicates.
+  Failure condition: a row omitted by a resident bitmap/filter cannot
+  be explained as invisible, predicate-false, or routed to a fallback
+  snapshot in the trace.

@@ -5571,13 +5571,13 @@ Append new candidates here as each paper is processed.
   continuous black-box serializability verifier for transactional key-value
   workloads, useful for comparing route-history checking against solver-backed
   verification and transaction segmentation. Journal entry added 2026-06-06.
-- `queued` — **Vbox: Efficient Black-Box Serializability Verification**, Sun
+- `reviewed` — **Vbox: Efficient Black-Box Serializability Verification**, Sun
   and Zou, arXiv 2025.
   URL: `https://arxiv.org/abs/2503.05163`
   Why: discovered while reviewing Cobra; claims broader black-box
   serializability checking with predicate database operations and more use of
   transaction time information, directly relevant to moving GPU DB audit traces
-  beyond point-key histories.
+  beyond point-key histories. Journal entry added 2026-06-06.
 - `queued` — **Efficient Black-box Checking of Snapshot Isolation in
   Databases**, PolySI, arXiv 2023.
   URL: `https://arxiv.org/abs/2301.07313`
@@ -5613,6 +5613,24 @@ Append new candidates here as each paper is processed.
   Why: Viper contrasts black-box checking with MongoDB white-box verification;
   useful for deciding which GPU DB invariants should be proved from internal
   route/WAL/residency protocol facts rather than only tested from histories.
+- `queued` — **Leopard: A Black-Box Approach for Efficiently Verifying Various
+  Isolation Levels**, Li et al., ICDE 2023.
+  URL: `https://doi.org/10.1109/ICDE55515.2023.00061`
+  Why: Vbox contrasts Leopard as a protocol-aware isolation verifier; useful
+  for deciding when GPU DB validation should use lightweight online checks for
+  declared protocols versus protocol-agnostic serializability/SI witnesses.
+- `queued` — **Detecting Isolation Bugs via Transaction Oracle Construction**,
+  Dou et al., ICSE 2023.
+  URL: `https://doi.org/10.1109/ICSE48619.2023.00101`
+  Why: Vbox cites transaction-oracle work as evidence that claimed isolation
+  can fail in practice; useful for generating adversarial SQL histories that
+  exercise GPU DB retained snapshots, predicate routes, and fallback ordering.
+- `queued` — **Understanding Transaction Bugs in Database Systems**, Cui et al.,
+  ICSE 2024.
+  URL: `https://doi.org/10.1145/3597503.3639207`
+  Why: Vbox cites modern transaction-bug evidence; useful for turning real
+  anomaly classes into GPU DB regression workloads for MVCC, WAL visibility,
+  predicate reads, and route invalidation.
 - `queued` — **DynaMast: Adaptive Dynamic Mastering for Replicated Systems**,
   Abebe, Glasbergen, and Daudjee, ICDE 2020.
   URL: `https://doi.org/10.1109/ICDE48307.2020.00123`
