@@ -140,12 +140,14 @@ Where this matters most for GPU DB, in priority order:
   GPU DB's hot-key admission and session SLOs. Journal entry added
   2026-06-06; the previously queued DOI was corrected to the SIGMOD 2022
   paper metadata.
-- `queued` — **Mostly-Optimistic Concurrency Control for Highly Contended
+- `reviewed` — **Mostly-Optimistic Concurrency Control for Highly Contended
   Dynamic Workloads on a Thousand Cores**, Wang and Kimura, PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol10/p49-wang.pdf`
   Why: cited by GPU-Accelerated OLTP as a contention-oriented CPU-side
   concurrency-control baseline; useful for comparing lightweight optimistic
-  fallback against GPU conflict ordering under hot keys.
+  fallback against GPU conflict ordering under hot keys. Journal entry already
+  exists; this stale seed-queue duplicate was corrected from `queued` to
+  `reviewed` on 2026-06-06.
 - `reviewed` — **Improving Optimistic Concurrency Control through Transaction
   Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
@@ -5477,13 +5479,34 @@ Append new candidates here as each paper is processed.
   useful for validating MVCC/snapshot routes when the engine intentionally
   offers snapshot isolation or retained read snapshots rather than full
   serializability.
-- `queued` — **Viper: A Fast Snapshot Isolation Checker**, Winter et al.,
-  EuroSys 2023.
+- `reviewed` — **Viper: A Fast Snapshot Isolation Checker**, Zhang, Ji, Mu,
+  and Tan, EuroSys 2023.
   URL: `https://doi.org/10.1145/3552326.3567492`
   PDF: `https://mpaxos.com/pub/viper-eurosys23.pdf`
   Why: discovered while reviewing Cobra; a fast SI checker is relevant to
   building low-overhead benchmark witnesses for retained snapshots, range
-  reads, and MVCC route validation.
+  reads, and MVCC route validation. Journal entry added 2026-06-06; the
+  previously queued author metadata was corrected.
+- `queued` — **On the Complexity of Checking Transactional Consistency**,
+  Biswas and Enea, OOPSLA 2019.
+  URL: `https://doi.org/10.1145/3360591`
+  arXiv: `https://arxiv.org/abs/1908.04509`
+  Why: Viper builds on the result that black-box checking SI is NP-complete;
+  useful for separating hot-path route certification from offline or reduced
+  history checking in GPU DB validation.
+- `queued` — **Seeing is Believing: A Client-Centric Specification of
+  Database Isolation**, Crooks, Pu, Alvisi, and Clement, PODC 2017.
+  URL: `https://doi.org/10.1145/3087801.3087802`
+  PDF: `https://www.cs.cornell.edu/~youerpu/papers/2017-podc-seeing.pdf`
+  Why: Viper uses the Crooks et al. hierarchy of SI variants; useful for
+  defining GPU DB retained-snapshot contracts in terms clients can observe
+  across sessions, fallbacks, and refresh boundaries.
+- `queued` — **Verifying Transactional Consistency of MongoDB**, Ouyang,
+  Wei, Huang, Li, and Pan, arXiv 2021.
+  URL: `https://arxiv.org/abs/2111.14946`
+  Why: Viper contrasts black-box checking with MongoDB white-box verification;
+  useful for deciding which GPU DB invariants should be proved from internal
+  route/WAL/residency protocol facts rather than only tested from histories.
 - `queued` — **DynaMast: Adaptive Dynamic Mastering for Replicated Systems**,
   Abebe, Glasbergen, and Daudjee, ICDE 2020.
   URL: `https://doi.org/10.1109/ICDE48307.2020.00123`

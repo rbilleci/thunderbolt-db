@@ -83301,3 +83301,180 @@ an obsolete route certificate.
   or explicit overload. Failure condition: reset can affect an already
   durable WAL record, an externally acknowledged response, or a visible
   snapshot generation.
+
+### 2026-06-06 - Viper turns snapshot isolation into begin/commit graph acyclicity
+
+**Citation:** Jian Zhang, Ye Ji, Shuai Mu, and Cheng Tan. "Viper:
+A Fast Snapshot Isolation Checker." EuroSys 2023. DOI
+`10.1145/3552326.3567492`. Retrieved 2026-06-06 from
+`https://doi.org/10.1145/3552326.3567492` and author PDF
+`https://mpaxos.com/pub/viper-eurosys23.pdf`.
+
+**Category:** MVCC / snapshot / visibility, with transaction
+correctness and runtime validation relevance.
+
+**Relevance tags:** snapshot isolation; black-box checking;
+BC-polygraphs; begin/commit ordering; range-query validation;
+tombstones; SI variants; Strong SI; Strong Session SI; route-history
+audit; retained snapshot correctness; benchmark witness generation.
+
+**Core idea:** Viper targets the practical problem of deciding whether
+observed black-box database histories obey snapshot isolation. Existing
+black-box SI checking is hard because write order, anti-dependencies,
+and internal schedule facts are hidden; direct SAT/SMT encodings are
+slow, while some practical tools give up soundness by inferring missing
+write order heuristically.
+
+Viper's main abstraction is the BC-polygraph. Instead of representing
+each transaction as one serialization-graph node, it represents each
+committed transaction with a begin node and a commit node. Known facts
+become edges: begin-to-commit program order and commit-to-begin
+read-from dependencies. Unknown but necessary ordering choices become
+two-edge constraints: for two conflicting writes, one commit must
+precede the other's begin; for a read and a later conflicting write,
+either the reader began before that write committed or the write was
+ordered before the version the reader observed.
+
+The key theorem is that a history is SI iff its BC-polygraph has some
+compatible acyclic graph after choosing exactly one edge from every
+constraint. This converts checking SI into a graph acyclicity search
+with XOR constraints, which maps well to MonoSAT. The paper also extends
+the representation to range queries and major SI variants.
+
+**Concrete mechanisms:**
+
+- Each committed transaction contributes two graph nodes, `B_i` and
+  `C_i`, plus an intra-transaction edge `B_i -> C_i`.
+- A read that returns a value written by transaction `T_j` adds a known
+  edge `C_j -> B_i`, enforcing that the read observes a committed
+  transaction rather than a concurrent one.
+- Two transactions writing the same key contribute a write-order
+  constraint with two possible commit-before-begin edges; exactly one
+  may be selected in a compatible graph.
+- A read of a version and another transaction's write of the same key
+  contribute an anti-dependency/write-order constraint that captures
+  whether the write is after the read's begin or before the source
+  version's writer.
+- The checker builds the BC-polygraph in `O(n^2)` over read/write
+  operations, then encodes known edges, XOR constraints, and graph
+  acyclicity in MonoSAT.
+- Heuristic pruning topologically sorts the known graph, adds tentative
+  commit-to-begin edges for nodes far apart in that order, and retries
+  with weaker assumptions if the solver rejects. This preserves
+  acceptance soundness for SI histories, but can add work for non-SI
+  histories.
+- Range queries are handled by replacing deletes with tombstone writes
+  through the history collector. Returned tombstones identify delete
+  writers, so missing-key range facts can be reduced to ordinary
+  read/write dependencies. The paper explicitly notes this can hurt
+  workload behavior and skip testing true delete implementation paths.
+- Strong SI and Generalized SI add real-time edges based on client
+  timestamps and a bounded clock-drift threshold. Strong Session SI adds
+  session-order edges from earlier transaction commits to later begins.
+- The implementation uses Java history collectors and a Python checker.
+  Values carry unique write ids so reads can be associated with source
+  writes; a virtual genesis transaction handles reads of initially
+  absent keys.
+- Evaluation uses TiDB, SQL Server, and YugabyteDB histories, plus five
+  benchmarks including BlindW, range-query variants, TPC-C, RUBiS, and
+  Twitter-style workloads. For a 400-transaction BlindW-RW history,
+  the paper reports Viper at 0.04 seconds versus 115.98 seconds for the
+  second-best baseline; it checks 10K BlindW-RW transactions in
+  439.7 seconds. For 5K-transaction macrobenchmarks, it reports
+  2.48 seconds for TPC-C, 17.39 seconds for RUBiS, and 0.56 seconds
+  for Twitter.
+- Viper detects five real-world SI-violation histories from Jepsen
+  reports in under 10 seconds in the reported experiments. Synthetic
+  non-SI histories can be much less predictable; the paper reports
+  solver nondeterminism and timeouts for some injected anomalies.
+
+**GPU DB mapping:** The immediate mapping is an offline or CI-grade
+snapshot-correctness witness for retained GPU routes. GPU DB will
+publish immutable resident snapshots, route descriptors, visibility
+generations, and response batches outside the mutation owner. Viper
+suggests that every benchmark exercising retained reads should be able
+to emit a compact begin/commit/read/write history and ask whether the
+observed results are compatible with the claimed isolation level.
+
+BC-polygraphs are a useful design vocabulary for route certificates.
+Instead of treating a retained GPU read as "fast path succeeded", the
+engine can log the begin boundary, source WAL or visibility generation,
+commit/response boundary, read-from version ids, and conflicting writes.
+An external checker can then validate that micro-batched GPU lookups,
+range reads, refresh publication, and CPU fallback all fit one snapshot
+ordering.
+
+The begin/commit split also maps cleanly to the runtime architecture.
+Network workers can stamp request begin and response/commit events;
+mutation owners can stamp WAL/visibility publication; residency owners
+can stamp snapshot generation publication; GPU execution workers can
+stamp launch and result boundaries. The checker does not need to know
+the internal owner schedule if the observed history carries enough
+read-from and write-id facts.
+
+For range reads, Viper's tombstone trick is not a production storage
+policy for GPU DB, but it is a benchmark instrumentation pattern. A
+test-only visibility log can expose deleted row ids or range tombstones
+so retained range scans and resident scan indexes can be checked for
+phantom-like omissions without weakening production delete/GC design.
+
+For 1M logical sessions, the lesson is to keep audit histories sampled,
+bounded, and route-shaped. Full black-box checking is NP-complete and
+not a hot-path admission mechanism. It belongs in stress tests, canary
+traces, failure injection, and reduced histories around suspicious
+visibility generations.
+
+**Risks and mismatches:** Viper is a checker, not a concurrency-control
+protocol. It does not improve write throughput or read latency by
+itself, and it should not be placed on the request path.
+
+The range-query tombstone mechanism changes application-visible storage
+behavior if used literally. GPU DB should use it as test-only tracing or
+internal audit metadata, not as a production reason to retain all deleted
+keys in user-visible indexes.
+
+Strong SI and GSI checking depend on bounded clock drift. That is
+acceptable for external audit, but GPU DB's actual correctness should be
+driven by logical WAL, visibility, catalog, and residency generations,
+not wall-clock timestamps.
+
+Viper handles SI and stricter variants; it does not support weaker
+models such as PSI because BC-graph acyclicity assumes one compatible
+commit order. If GPU DB intentionally exposes weaker cross-partition or
+replicated semantics later, this checker alone will not characterize the
+contract.
+
+The paper reports unpredictable runtime for some non-SI histories due to
+SMT solver nondeterminism. A GPU DB validation harness should therefore
+set time budgets, minimize histories around suspected generations, and
+fall back to smaller targeted witnesses rather than requiring every
+large stress trace to solve.
+
+**Benchmark candidates:**
+
+- Add an isolation-audit trace mode for retained GPU reads. Log
+  transaction/session id, begin boundary, response/commit boundary,
+  read-from version ids, write ids, relation/key/range facts, and the
+  route certificate used. Gate: a reduced history from every retained
+  snapshot stress test can be checked for SI or Strong Session SI.
+- Build a micro-batched lookup SI witness test. Mix CPU writes,
+  resident GPU point reads, refreshes, and fallback reads; then verify
+  that scattered batch results fit one BC-polygraph-compatible snapshot
+  order. Failure condition: any result can only be explained by reading
+  from a concurrent or future write.
+- Add a retained range-scan audit mode with internal delete/tombstone
+  witnesses. The benchmark should verify that resident scan indexes do
+  not omit keys that were visible at the read boundary and do not include
+  keys deleted before it.
+- Compare audit cost for full histories, sampled histories, and
+  generation-window histories around invalidation/refresh events.
+  Expected result: generation-window extraction gives actionable
+  witnesses without solver timeouts on long runs.
+- Test SI variants explicitly: Adya SI for ordinary retained snapshots,
+  Strong Session SI for per-connection monotonic reads, and Strong SI
+  only when logical generation edges are substituted for wall-clock
+  assumptions.
+- Use Viper-style histories as a fault-injection oracle for delayed GPU
+  completion, stale route notification, and refresh/eviction races.
+  Gate: every stale result has a small rejected history, not only a
+  mismatched checksum.
