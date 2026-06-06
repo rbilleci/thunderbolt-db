@@ -1458,13 +1458,20 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up from the same GPU multitasking line that models
   cross-kernel slowdown; relevant to route resource-class calibration and
   conservative GPU co-scheduling.
-- `queued` — **EEMARQ: Efficient Lock-Free Range Queries with Memory
-  Reclamation**, Arbel-Raviv and Brown, arXiv 2022.
+- `reviewed` — **EEMARQ: Efficient Lock-Free Range Queries with Memory
+  Reclamation**, Sheffi, Ramalhete, and Petrank, arXiv 2022.
   URL: `https://arxiv.org/abs/2210.17086`
   Why: modern follow-up to epoch-based range queries that explicitly combines
   lock-free range queries and memory reclamation; useful for checking whether
   retained route metadata can avoid blocking reclamation while preserving
-  linearizable/range-snapshot semantics.
+  linearizable/range-snapshot semantics. Journal entry added 2026-06-06.
+- `queued` — **Constant-time Snapshots with Applications to Concurrent Data
+  Structures**, Wei et al., PPoPP 2021.
+  URL: `https://doi.org/10.1145/3437801.3441612`
+  Why: EEMARQ compares against vCAS and discusses the cost/benefit of
+  per-field versioned CAS snapshots; useful for comparing descriptor-level
+  versioning, indirection overhead, and constant-time snapshot mechanics before
+  GPU DB chooses retained route metadata publication structures.
 - `reviewed` — **VBR: Version Based Reclamation**, Sheffi et al., arXiv 2021.
   URL: `https://arxiv.org/abs/2107.13843`
   Why: optimistic memory reclamation scheme related to EBR/hazard-pointer

@@ -38,6 +38,186 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - EEMARQ makes retained range snapshots compatible with aggressive reclamation
+
+**Citation:** Gali Sheffi, Pedro Ramalhete, and Erez Petrank.
+"EEMARQ: Efficient Lock-Free Range Queries with Memory Reclamation."
+arXiv:2210.17086, 2022. Retrieved 2026-06-06 from
+`https://arxiv.org/pdf/2210.17086`.
+
+**Category:** MVCC / snapshot / visibility, with secondary relevance to
+runtime metadata structures and retained-snapshot reclamation.
+
+**Relevance tags:** MVCC; linearizable range queries; safe memory reclamation;
+lock-free maps; version lists; version-based reclamation; birth epochs;
+timestamp clocks; fast external indexes; range snapshots; route metadata;
+retained snapshot retirement.
+
+**Core idea:** EEMARQ targets a hard interaction between MVCC and memory
+reclamation. MVCC range queries need old nodes to remain reachable through
+version links, but most safe memory reclamation schemes assume retired objects
+are no longer reachable. EEMARQ adapts version-based reclamation so retired
+nodes can remain on version paths, be recycled quickly, and still let readers
+detect when they have followed a stale pointer and restart.
+
+For GPU DB, the transferable idea is that retained read snapshots, route
+metadata, resident index descriptors, and predicate masks need a reclamation
+contract as explicit as their visibility contract. Long readers should not pin
+all retired route/index objects forever, but aggressive reuse must include a
+cheap stale-object detection proof and a named restart/fallback path.
+
+**Concrete mechanisms:**
+
+- EEMARQ builds a lock-free ordered map from a modified Harris linked list.
+  Inserts and deletes are linearized by timestamped physical changes rather
+  than by the initial mark bit alone.
+- Physical deletion replaces the successor of a run of marked nodes with a new
+  representative node. That representative carries a `prior` pointer to the
+  old successor, forming a version path that range queries can traverse.
+- Range queries increment a global timestamp and use it as their linearization
+  point. During traversal, if a successor's timestamp is newer than the query
+  timestamp, the query follows `prior` links until it reaches the version that
+  existed at the query timestamp.
+- The design avoids per-update version records on the traversal path. Update
+  metadata is embedded in list nodes, reducing the extra indirection that the
+  paper identifies as a major cost in vCAS and bundle-style schemes.
+- EEMARQ separates the range-query timestamp clock from the reclamation epoch
+  clock. The timestamp clock can advance on every range query, while the VBR
+  epoch clock ticks slowly for memory reuse.
+- The modified VBR layout associates each node with a birth epoch and each
+  mutable next pointer with a version. Readers validate birth epochs after
+  field reads and validate successor birth epochs against pointer versions.
+- `prior` pointers are immutable and not versioned, so readers check that the
+  prior successor's birth epoch is not greater than the predecessor's birth
+  epoch. A violation means the referenced memory was reclaimed and reallocated,
+  so the operation rolls back to a checkpoint.
+- Retire lists are pooled. When a full retire list is returned to the global
+  pool, it records an epoch; if a thread later pulls a list from the pool in
+  the same epoch, the global epoch advances before reuse.
+- A fast external index, implemented as either a skip list or BST in the
+  evaluation, maps keys to linked-list nodes. The index is only an accelerator:
+  it need not maintain versions, and stale or failed index probes fall back to
+  the underlying list traversal.
+- Index updates happen after list insertion, and removed nodes are deleted from
+  the index before retirement. The implemented index update checks node birth
+  epochs so a reclaimed node is not substituted incorrectly.
+- The evaluation compares EEMARQ with EBR-RQ, vCAS, Bundles, and an unsafe scan
+  baseline on a 128-thread, two-socket Intel Xeon Gold 6338 machine. Workloads
+  use a one-million-key range, half prefill, 10-second runs, and C++ with
+  `-O3 -mcx16`.
+- Reported throughput gains are up to 65% over the next-best skip-list
+  competitor in lookup-heavy workloads, 50% in mixed workloads, and 70% in
+  update-heavy workloads. For the tree variant, reported gains are up to 75%,
+  65%, and 70% over the next best competitor across those workloads.
+- The paper reports that EEMARQ remains ahead for large range queries, even
+  when rollbacks can occur, because the fast index makes retries cheap and the
+  reclamation path avoids global EBR stalls.
+
+**GPU DB mapping:** P8's retained GPU snapshots and the high-throughput
+runtime's route certificates should not be retired with a single global epoch
+that any stalled session can pin indefinitely. EEMARQ suggests a sharper
+contract: route/index descriptors can be aggressively recycled if every reader
+can validate a birth generation, pointer/version generation, and parent/prior
+relationship before trusting the object. A failed check becomes a stale-route
+restart, not undefined behavior.
+
+The fast-index separation maps to resident indexes and route metadata. A GPU
+resident key vector, CPU range index, or cold-tier fence directory can be used
+as a fast access path without becoming the source of truth for visibility.
+Correctness remains in the immutable snapshot or MVCC route generation; stale
+index probes must fall back to the canonical snapshot/owner path.
+
+The two-clock design maps directly to retained-read serving. SQL snapshot
+generations may advance on every committed visibility boundary, but reclamation
+epochs should advance on memory-safety and reuse cadence. Conflating those
+clocks would either make every read pay reclamation overhead or let long-lived
+readers pin too much memory.
+
+The `prior`-path validation also informs snapshot delta design. If GPU DB keeps
+old route descriptors, resident segment descriptors, delete masks, or predicate
+index fragments reachable for old readers, each back-edge needs a cheap proof
+that the target object still represents the same generation. Otherwise,
+recycling descriptor memory under 1M logical sessions can turn a stale route
+into a silent wrong result.
+
+**Risks and mismatches:** EEMARQ is a shared-memory concurrent map, not a SQL
+DBMS, durable MVCC storage engine, WAL protocol, or GPU execution system. Its
+range-query correctness is linearizability over a map, not SQL snapshot
+isolation across tables, indexes, catalog generations, and WAL replay.
+
+The implementation relies on pointer tagging, wide CAS, type-preserving object
+pools, and in-process shared memory. GPU DB may not be able to apply those
+mechanics directly across CUDA memory, pinned host buffers, disk-backed
+segments, or language/runtime boundaries. The paper's object pools also cannot
+return reclaimed memory to the operating system, which may be unacceptable for
+large resident segment buffers.
+
+The evaluation is a microbenchmark over in-memory integer-key maps. It does
+not measure durable writes, transaction aborts, SQL result encoding, GPU
+kernel launches, cold-tier IO, string columns, or plan-cache invalidation.
+Treat the result as a design source for metadata reclamation and retained
+range/index snapshots, not as a replacement for DBMS MVCC GC benchmarks.
+
+**Benchmark candidates:**
+
+- Add a retained-route descriptor reclamation harness with birth generation,
+  pointer generation, parent/prior generation, and stale-route restart. Gate:
+  readers can never observe a recycled descriptor as a valid route.
+- Compare global epoch retirement, per-owner epoch retirement, hazard-pointer
+  style protection, and EEMARQ/VBR-style optimistic reclamation for route
+  metadata. Measure memory pinned by stalled sessions, p50/p99 read latency,
+  restart count, and update throughput.
+- Prototype a fast resident-index path that is explicitly not the visibility
+  authority. Failure condition: stale index entries can return results without
+  revalidating snapshot and route generation.
+- Split SQL visibility generation from reclamation epoch in telemetry. Gate:
+  many commits can advance visibility without forcing all retained readers to
+  refresh reclamation state on every request.
+- Add a long-reader stress test: one slow retained range read plus high-rate
+  route/index updates and descriptor recycling. Expected result: memory stays
+  bounded and stale checks produce restarts or CPU fallback, never wrong rows.
+- Test descriptor-pool type preservation separately for route descriptors,
+  index nodes, predicate masks, response templates, and resident segment
+  metadata. Failure condition: one object class can be recycled as another
+  while an old reader still holds a pointer or handle.
+- Measure retry locality. If a route descriptor is reclaimed mid-read, a retry
+  should restart from the nearest safe owner/index boundary rather than from
+  global admission when the snapshot remains valid.
+
+### 2026-06-06 - Cross-paper synthesis: route proofs need reclamation proofs too
+
+The recent SMART, LSched, Carousel, and EEMARQ reviews converge on a stricter
+definition of a "valid route." SMART says remote or cached index traversal
+needs reverse checks and IOPS budgets. LSched says scheduling needs physical
+plan and pressure features, not only FIFO arrival. Carousel says transaction
+work can overlap read, prepare, and commit only when the footprint is declared
+early. EEMARQ adds that a route object must also prove it has not been
+reclaimed and reused while a retained reader still follows it.
+
+The design track is now a route certificate with four proof layers: logical
+visibility, physical placement, pressure/admission, and lifetime/reclamation.
+Logical visibility proves snapshot and schema generation. Physical placement
+proves resident segment, index, dictionary, and tier identity. Pressure proves
+queue, worker, buffer, and fallback capacity. Lifetime proves the descriptor,
+index node, parent/prior link, and reusable buffer still belong to the same
+generation the reader intends to use.
+
+Category gaps remain in SQL-level optimizer integration and in durable
+checkpoint/replay interactions with retained descriptors. The next useful
+papers should favor optimizer route certificates, MVCC GC/checkpoint
+boundaries, or tiered index maintenance under long readers rather than another
+pure analytical scan kernel.
+
+Benchmark priorities:
+
+- route certificates that include descriptor birth/lifetime generation, not
+  only snapshot and resident generation
+- stale-route restart and fallback counters for every retained read path
+- long-reader stress with high update, invalidation, and descriptor reuse
+- footprint-aware scheduling that refuses routes whose lifetime proof is stale
+- WAL/checkpoint tests proving reclaimed route metadata can be rebuilt from CPU
+  truth without becoming a durable dependency
+
 ### 2026-06-06 - SMART makes remote index traversal a cache-validation and IOPS-shaping problem
 
 **Citation:** Xuchuan Luo, Pengfei Zuo, Jiacheng Shen, Jiazhen Gu,
