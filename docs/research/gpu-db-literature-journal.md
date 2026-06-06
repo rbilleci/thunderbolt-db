@@ -84244,3 +84244,186 @@ deployment, not only trust in a homogeneous fabric.
   invalidation, eviction, DDL, and session close. Gate: generation
   checks reject stale work and completions cannot be delivered to a
   recycled response target.
+
+### 2026-06-06 - SRNIC minimizes NIC-resident per-connection state
+
+**Citation:** Zilong Wang, Layong Luo, Qingsong Ning, Chaoliang
+Zeng, Wenxue Li, Xinchen Wan, Peng Xie, Tao Feng, Ke Cheng,
+Xiongfei Geng, Tianhao Wang, Weicheng Ling, Kejia Huo, Pingbo
+An, Kui Ji, Shideng Zhang, Bin Xu, Ruiqing Feng, Tao Ding,
+Kai Chen, and Chuanxiong Guo. "SRNIC: A Scalable Architecture
+for RDMA NICs." NSDI 2023. Retrieved 2026-06-06 from
+`https://www.usenix.org/conference/nsdi23/presentation/wang-zilong`
+and
+`https://www.usenix.org/system/files/nsdi23-wang-zilong.pdf`.
+
+**Category:** runtime / HFT / session scale, with future
+remote-tier and disaggregated-memory relevance.
+
+**Relevance tags:** RDMA; connection scalability; queue pairs;
+NIC SRAM; cache-free scheduling; selective repeat; lossy
+datacenter networks; packet-carried metadata; host-memory
+bitmaps; bounded per-connection state; 1M logical sessions;
+future remote tiers.
+
+**Core idea:** SRNIC starts from the same failure mode as StaR:
+commercial RoCEv2 NICs can deliver high throughput and low CPU
+overhead, but throughput collapses as active queue pairs outgrow
+small on-chip state. Instead of moving the hot endpoint's state to
+the other side as StaR does, SRNIC redesigns the NIC data
+structures so most per-QP state either disappears, stays tiny, or
+moves to host memory only on rare loss paths.
+
+The paper's transferable idea is a tiered-state rule for high-fan-in
+runtimes. The hot authority should keep only the state needed for
+the common uncontended path, while bulky, uncommon, or
+recoverable state should be encoded in descriptors, fetched in
+batches, or pushed to a slower side structure. For GPU DB, that
+maps directly to session descriptors, response buffers, snapshot
+certificates, retry queues, and future remote-tier metadata: do not
+let every logical session consume scarce owner, GPU, pinned-memory,
+or NIC-resident state.
+
+**Concrete mechanisms:**
+
+- SRNIC classifies RNIC memory into common RDMA structures and
+  lossy-selective-repeat structures. In its 10K-QP accounting,
+  receive buffering, QP context, memory translation, WQE caching,
+  bitmaps, reordering buffers, and outstanding-request tables would
+  otherwise consume far more SRAM than a DRAM-free NIC can hold.
+- The SQ scheduler is cache-free. Doorbells, credit updates, and
+  dequeue events update per-QP scheduling state; only QPs that are
+  both active and have congestion-control credit enter a compact
+  schedule queue. A scheduled QP fetches up to a small WQE count
+  and up to a burst-size byte budget, then drops unused WQEs rather
+  than caching per-QP WQE state on the NIC.
+- The RQ side also avoids per-QP receive-WQE caches. The paper
+  accepts roughly one PCIe round trip of extra latency for incoming
+  SEND handling because that buys connection scalability; it notes
+  that a shared cache can be reintroduced for rack-scale cases where
+  the extra microsecond matters.
+- SRNIC eliminates outstanding-request tables and reordering
+  buffers by extending packet headers. Packets carry metadata such
+  as packet sequence number, message sequence number, packet offset,
+  SEND sequence, and target address so the receiver can place
+  out-of-order data directly into the correct pinned user buffer and
+  the requester can locate retransmission state without a large
+  on-chip table.
+- Selective-repeat bitmaps are onloaded to host memory. Hardware
+  tracks the sequential fast path with expected and last-acked
+  sequence numbers. Only out-of-order packets enter a software
+  recovery path where host-memory bitmaps track received/lost
+  packets and a retry queue resubmits retransmissions.
+- A fast-exit rule handles races when leaving loss recovery. The NIC
+  tracks the most advanced sequential PSN range observed while
+  metadata is crossing between NIC and CPU; a software-provided
+  expected PSN can advance to the recorded right boundary if it falls
+  inside that range.
+- The design keeps QP context on chip, keeps the memory-translation
+  table in host memory with an on-chip cache, and makes QP-irrelevant
+  structures constant-size. The FPGA prototype uses 4.4 MB SRAM for
+  10K QPs, with the QPC table and MTT cache as the main memory
+  partition tradeoff.
+- Evaluation reports near-line-rate 97 Gbps throughput from 128 to
+  10K QPs, 3.3 microsecond 64-byte message latency, less than 5%
+  CPU overhead, and much better goodput than a Mellanox CX-6 under
+  synthetic loss because selective repeat retransmits less than
+  go-back-N. Large-scale simulations compare SRNIC with IRN and a
+  PFC/RoCE-like baseline.
+
+**GPU DB mapping:** SRNIC reinforces the target runtime's bounded
+ring model. The GPU DB equivalent of a cache-free QP scheduler is a
+route scheduler that keeps compact readiness state per route or
+cohort, not per session, and drains bounded work in chunks sized by
+both latency and downstream credits. A read route should be admitted
+only when it has a valid snapshot generation, resident generation,
+output-buffer credit, and GPU/CPU execution credit.
+
+The fetch-and-drop WQE strategy maps to request descriptors. It may
+be cheaper to refetch or rebuild a small descriptor than to pin a
+large amount of per-session state in the mutation owner, GPU worker,
+or remote-tier authority. For 1M logical sessions, the scarce state
+should be active ring entries, route certificates, buffer handles,
+and response targets for currently admitted work, not dormant
+session objects inside every owner domain.
+
+SRNIC's in-place reordering is a useful analogy for response and
+result buffers. If a retained lookup batch scatters results back to
+many sessions, each descriptor should carry enough offset and target
+information for direct placement into a pre-owned response buffer.
+That avoids per-session staging queues in the GPU worker and makes
+lost, retried, or delayed completions validate against generation and
+buffer-token checks.
+
+The hardware-fast/software-slow loss split maps to database retries.
+Common successful reads should execute with immutable snapshot
+certificates and no owner lookup. Stale snapshot, eviction, DDL,
+write conflict, or buffer exhaustion should move to explicit fallback
+or retry structures that can be larger and slower without polluting
+the hot path. Correctness still belongs to WAL/MVCC publication, not
+to the descriptor itself.
+
+For future remote tiers, SRNIC suggests exposing NIC/QP-like state
+pressure as first-class admission telemetry. Even if commodity NICs
+do not implement SRNIC, GPU DB should treat remote connections,
+registered memory, pinned host buffers, GPU streams, and response
+rings as scarce caches with explicit active counts and refill costs.
+
+**Risks and mismatches:** SRNIC is a NIC architecture paper, not a
+database runtime. It changes RDMA packet headers and relies on an
+FPGA prototype, so its mechanisms are not directly deployable on
+ordinary RoCE devices.
+
+The 10K-QP result is not a 1M-session result. It supports the
+principle of compressing active transport state, but GPU DB still
+needs logical-session multiplexing above the transport, because
+per-session QPs, streams, pinned buffers, or snapshots would remain
+too expensive.
+
+The paper's correctness domain is reliable packet delivery. Database
+correctness also needs WAL-before-visibility, isolation, DDL
+invalidation, authorization, recovery, and snapshot retirement.
+Descriptor-carried offsets or generations must be validated against
+database-owned authority before execution and completion.
+
+SRNIC deliberately trades some latency for connection scalability.
+That is appropriate for high-fan-in paths but may be wrong for
+single-session or ultra-low-latency operations. GPU DB should select
+direct owner execution, retained snapshot execution, or batched GPU
+execution by measured queue depth and SLO, not by a single global
+policy.
+
+The loss-recovery and simulation results use network/RDMA workloads,
+not pgwire, SQL queries, MVCC chains, GPU kernels, WAL flushes, or
+NVMe reads. The benchmark value is in the state-placement pattern,
+not in importing the reported throughput numbers.
+
+**Benchmark candidates:**
+
+- Build a route-scheduler microbenchmark with SRNIC-style readiness
+  state. Compare per-session queue entries, per-route active/credit
+  bits, and cohort queues under 1M logical sessions with 1K-100K
+  active requests. Gate: owner-visible memory and p99 admission
+  latency stay bounded as inactive sessions grow.
+- Prototype descriptor-carried result placement for retained lookup
+  batches. Each descriptor carries snapshot generation, route
+  generation, output buffer token, response offset, and completion
+  target. Failure condition: a GPU worker needs a mutable per-session
+  lookup to place or validate a result.
+- Add a slow-path retry/fallback queue for stale snapshot, eviction,
+  DDL invalidation, buffer exhaustion, and conflict cases. Measure
+  whether the common retained-read path stays allocation-light while
+  rare fallback state can grow without blocking unrelated routes.
+- Compare cache-free descriptor refetch against pinned descriptor
+  caches. Gate: refetch/rebuild cost is lower than keeping dormant
+  session state resident in the owner, GPU worker, or future remote
+  tier under high fan-in.
+- Model scarce-state budgets together: active remote QPs, registered
+  memory regions, pinned host buffers, GPU streams, route snapshots,
+  response-ring slots, and WAL/admission credits. Expected result:
+  admission should reject or fallback at the first saturated budget,
+  not wait for downstream latency collapse.
+- Stress stale completions and retries across session close, response
+  buffer reuse, resident generation invalidation, and DDL. Gate:
+  generation and buffer-token checks reject all delayed work before
+  it writes into a recycled target or reports a stale result.

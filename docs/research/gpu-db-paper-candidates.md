@@ -614,7 +614,7 @@ Append new candidates here as each paper is processed.
   evaluating whether future GPU DB remote-tier/session paths should reduce
   QP state, multiplex connections, or expose RNIC-cache pressure as admission
   telemetry. Journal entry added 2026-06-06.
-- `queued` — **SRNIC: A Scalable Architecture for RDMA NICs**, Wang et al.,
+- `reviewed` — **SRNIC: A Scalable Architecture for RDMA NICs**, Wang et al.,
   NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/wang-zilong`
   PDF: `https://www.usenix.org/system/files/nsdi23-wang-zilong.pdf`
@@ -623,7 +623,16 @@ Append new candidates here as each paper is processed.
   RDMA data structures with cache-free QP scheduling and memory-free
   selective repeat, useful for comparing descriptor placement against
   hardware-scalable reliable transport before GPU DB adopts remote-tier
-  session or storage paths.
+  session or storage paths. Journal entry added 2026-06-06.
+- `queued` — **Revisiting Network Support for RDMA**, Mittal et al.,
+  SIGCOMM 2018.
+  URL: `https://doi.org/10.1145/3230543.3230557`
+  PDF: `https://cs.nyu.edu/~apanda/assets/papers/sigcomm18-irn.pdf`
+  arXiv: `https://arxiv.org/abs/1806.08159`
+  Why: SRNIC builds on IRN's PFC-free lossy-RDMA direction with selective
+  repeat; useful for comparing whether GPU DB future remote tiers need
+  lossless fabrics, selective retransmission, or database-owned fallback when
+  remote-memory transport becomes congested or lossy.
 - `queued` — **Fast RDMA-based Ordered Key-Value Store using Remote Learned
   Cache**, Wei, Chen, and Chen, OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/wei`
