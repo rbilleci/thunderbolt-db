@@ -6223,18 +6223,29 @@ Append new candidates here as each paper is processed.
   reviewing Kona would expose the baseline fake-physical-memory indirection,
   accelerator-local cache design, and coherence assumptions that UniMem tries
   to replace.
-- `queued` — **Tiered Memory Management: Access Latency is the Key!**,
+- `reviewed` — **Tiered Memory Management: Access Latency is the Key!**,
   Vuppalapati and Agarwal, SOSP 2024.
-  URL: `https://doi.org/10.1145/3694715.3695964`
+  URL: `https://doi.org/10.1145/3694715.3695968`
+  PDF: `https://www.cs.cornell.edu/~ragarwal/pubs/colloid.pdf`
   Why: HybridTier notes Colloid as complementary latency-balanced tiering;
   useful for comparing hotness-only placement with latency-balancing policy
-  when CXL/far-memory paths have heterogeneous access costs.
+  when CXL/far-memory paths have heterogeneous access costs. Journal entry
+  added 2026-06-06; DOI corrected during review.
 - `queued` — **Managing Memory Tiers with CXL in Virtualized Environments**,
   Zhong et al., OSDI 2024.
   URL: `https://www.usenix.org/conference/osdi24/presentation/zhong-yuhong`
   Why: HybridTier references Memstrata as a CXL tier manager for virtualized
   environments; useful for multi-tenant placement, isolation, and whether GPU
   DB can trust host/VM tiering for route-critical memory.
+- `queued` — **Understanding the Host Network**, Vuppalapati, Agarwal,
+  Schuh, Kasikci, Krishnamurthy, and Agarwal, SIGCOMM 2024.
+  URL: `https://doi.org/10.1145/3651890.3672271`
+  PDF:
+  `https://www.cs.cornell.edu/~saksham/assets/pdf/UnderstandingHostNetwork.pdf`
+  Why: Colloid depends on host-network contention and CHA-level latency
+  measurement; useful for understanding CPU/memory/peripheral interconnect
+  contention before GPU DB treats HBM, PCIe/NVLink, CXL, NIC, storage, and
+  host-memory movement as independent route resources.
 - `reviewed` — **Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its
   Reliability on High Latency Memory**, Mahling, Weisgut, and Rabl, DaMoN 2025.
   URL: `https://doi.org/10.1145/3736227.3736231`

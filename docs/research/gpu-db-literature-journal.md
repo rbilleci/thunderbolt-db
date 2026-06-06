@@ -38,6 +38,171 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Colloid balances loaded tier latency instead of hoarding hot pages
+
+**Citation:** Midhul Vuppalapati and Rachit Agarwal. "Tiered
+Memory Management: Access Latency is the Key!" SOSP 2024, 79-94.
+DOI: `https://doi.org/10.1145/3694715.3695968`. Retrieved
+2026-06-06 from the author PDF:
+`https://www.cs.cornell.edu/~ragarwal/pubs/colloid.pdf`.
+
+**Category:** multi-tier cache / data placement, with runtime
+admission, memory-pressure telemetry, and future CXL/HBM relevance.
+
+**Relevance tags:** Colloid; tiered memory; CXL; HBM; loaded
+latency; memory interconnect contention; Little's Law; page
+placement; HeMem; TPP; MEMTIS; Silo/YCSB; CacheLib; GAPBS.
+
+**Core idea:** Existing tiered-memory managers usually pack the
+hottest pages into the tier with the lowest unloaded latency. Colloid
+shows that this is not always optimal once many concurrent requests
+inflate queueing delay on that "fast" tier. The right control signal is
+loaded access latency, not static tier rank or raw hotness.
+
+For GPU DB, the strongest transferable idea is that HBM/DRAM/CXL/NVMe
+placement should not be a fixed hot-object pyramid. A route object,
+resident segment, old-version block, or host index may belong in a
+nominally slower tier if the faster tier is overloaded and its measured
+service latency is now worse. Tier placement needs to behave like a
+feedback controller over observed queueing and access latency.
+
+**Concrete mechanisms:**
+
+- Colloid defines default and alternate memory tiers by unloaded
+  latency, but makes placement decisions from loaded per-tier access
+  latency measured during each control quantum.
+- The paper demonstrates that the default tier can suffer large loaded
+  latency inflation under memory interconnect contention even when
+  nominal bandwidth is not saturated. In the reported setup, default
+  tier latency rises enough to exceed alternate-tier latency under
+  moderate contention.
+- Colloid uses the processor Caching and Home Agent as a measurement
+  vantage point. It samples per-tier queue occupancy and request
+  arrival rates, then applies Little's Law to estimate per-tier access
+  latency.
+- Measurements are smoothed with EWMA. The paper notes that this trades
+  reaction speed for stability.
+- The placement policy tries to balance average access latencies across
+  tiers. If the default tier latency is lower, Colloid promotes more
+  hot pages into it; if the default tier latency is higher, it demotes
+  hot pages out of it.
+- The algorithm maintains low/high watermarks over the fraction of
+  access probability assigned to the default tier. It moves toward the
+  midpoint in a binary-search style procedure and resets watermarks
+  when workload or contention changes shift the equilibrium.
+- Migration is bounded by both the desired access-probability shift and
+  a static migration cap. This prevents tiny final corrections from
+  causing large migration traffic near equilibrium.
+- Colloid is integrated with existing tiering systems rather than
+  replacing their tracking and migration mechanisms: HeMem uses PEBS
+  frequency counts, MEMTIS uses its hot lists and page-size handling,
+  and TPP uses hint faults and time-to-fault as an access-probability
+  proxy.
+- The implementation effort reported by the paper is small: about 520
+  lines for HeMem, 411 for MEMTIS, and roughly 315 lines plus a kernel
+  module for TPP.
+- In steady-state GUPS experiments, Colloid improves throughput by up
+  to about 2.3x depending on the underlying tiering system and
+  contention intensity, and keeps the systems near their manually
+  measured best-case placements.
+- In real-application experiments, Colloid improves GAPBS, Silo/YCSB-C,
+  and CacheLib most when memory interconnect contention is present. The
+  paper reports smaller Silo gains than synthetic GUPS gains, but still
+  shows improvement under higher contention.
+- The paper reports low CPU overhead for HeMem and MEMTIS integration
+  and somewhat higher overhead for TPP because one core is used for
+  latency measurement.
+- Colloid is designed for cache-coherent tiered memory with separate
+  memory-controller paths, including local DDR, remote socket memory,
+  CXL-attached memory, and HBM.
+
+**GPU DB mapping:** The P8 storage design already separates
+correctness from acceleration: WAL/CPU MVCC state is truth, while GPU
+resident state is versioned performance state. Colloid argues that the
+cache manager should rank performance state by measured loaded
+latency, not just by object heat or tier label.
+
+For retained GPU reads, the resident-cache manager should track HBM
+queue delay, GPU execution queue wait, host DRAM access latency, cold
+transfer time, and refresh pressure as first-class route signals. If
+HBM-resident execution is congested, a CPU/DRAM route or a less
+resident CXL/far-memory route may be better for p99 even when the data
+is hotter.
+
+Colloid's access-probability shift maps to route-object cohorts rather
+than raw 4 KiB pages. Candidate movement units are resident column
+groups, snapshot generations, warm MVCC delta blocks, host-index
+leaves, pinned staging buffers, and cold-tier chunks. The control loop
+should move a bounded fraction of request probability, not blindly
+migrate the hottest bytes.
+
+The Little's-Law measurement pattern is a useful template for DB-owned
+telemetry. GPU DB can estimate loaded latency from queue occupancy and
+arrival/completion rates at owner rings, read-snapshot workers, GPU
+execution rings, residency refresh queues, pinned-buffer pools, and
+cold-transfer lanes. Hardware CHA counters are useful when available,
+but the DB should also maintain its own per-route queueing model.
+
+The binary-search watermark idea maps to tier policy stability. Instead
+of oscillating resident segments between HBM and DRAM after every load
+spike, the cache manager can maintain a target share of request
+probability per tier, adjust gradually, and reset only when measured
+latencies prove that the equilibrium moved.
+
+**Risks and mismatches:** Colloid is an OS/memory-management paper,
+not a DBMS paper. It does not cover WAL-before-visibility, MVCC
+snapshot retention, SQL route correctness, GPU kernel scheduling, or
+NVMe object layout.
+
+The unit of movement in the paper is a memory page. GPU DB movement
+units are often semantic and larger: column groups, snapshot
+generations, index fragments, pinned buffers, or WAL-bounded deltas.
+Moving by page can violate route locality or split data that should be
+published and retired together.
+
+Colloid assumes cache-coherent load/store tiers and processor-side
+hardware counters. Disk/NVMe tiers, object storage, and GPU HBM paths
+need different measurements: transfer latency, kernel queue wait,
+DMA/copy bandwidth, PCIe/NVLink contention, and refresh invalidation
+cost.
+
+The policy optimizes average memory access latency. GPU DB also needs
+tail latency, fairness, WAL durability, snapshot age, and long-reader
+retention constraints. A placement that balances average latency can
+still starve a small latency-critical route or retain too many old
+versions.
+
+Migration traffic itself can interfere with queries. Colloid bounds
+migration, but GPU DB must make movement cancelable or schedulable
+around visibility publication, GPU stream ownership, and cold-tier IO.
+
+**Benchmark candidates:**
+
+- Add a tier-placement control-loop simulator with HBM, DRAM, emulated
+  CXL/far memory, and NVMe lanes. Compare hotness-only placement,
+  Colloid-style loaded-latency balancing, and DB-semantic placement by
+  resident segment or snapshot generation.
+- Instrument owner rings and GPU execution queues with Little's-Law
+  style loaded-latency estimates: average occupancy, arrival rate,
+  completion rate, and observed wait. Gate: routing decisions must
+  explain when the "fast" tier is no longer fast.
+- Build a retained-read benchmark where many same-shape lookups
+  overload HBM/GPU execution while a DRAM route remains available.
+  Measure p50/p99 latency, throughput, fallback count, and route
+  oscillation under hot-set shifts.
+- Compare migration units: 4 KiB pages, column groups, snapshot
+  generations, host-index leaves, and WAL-bounded delta blocks. Failure
+  condition: fine-grained movement improves average latency but breaks
+  publication locality or increases invalidation churn.
+- Add migration-budget sensitivity tests. Vary the fraction of request
+  probability allowed to move per control interval and measure
+  convergence time, migration bytes, p99 query latency, and refresh
+  stalls.
+- Test loaded-latency placement under mixed write/read pressure:
+  mutation owner WAL flushes, retained reads, refresh work, and cold
+  transfers. Gate: no placement policy may reduce average read latency
+  by delaying WAL-before-visibility or unbounding old snapshot memory.
+
 ### 2026-06-06 - Eraser makes learned route choice prove its own reliability
 
 **Citation:** Lianggui Weng, Rong Zhu, Di Wu, Bolin Ding, Bolong
