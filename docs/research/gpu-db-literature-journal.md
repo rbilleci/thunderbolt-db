@@ -38,6 +38,154 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - ITLogging turns WAL overhead into an admission-boundary problem
+
+**Citation:** Hwajung Kim. "Improving database performance by leveraging
+network-assisted logging." Future Generation Computer Systems 169, Article
+107785, 2025. DOI: `https://doi.org/10.1016/j.future.2025.107785`.
+Retrieved 2026-06-06 from ScienceDirect,
+`https://www.sciencedirect.com/science/article/pii/S0167739X25000809`.
+
+**Category:** WAL, logging, and read/write throughput, with secondary relevance
+to runtime/session admission and network IO ownership.
+
+**Relevance tags:** WAL; network-assisted logging; in-transit logging;
+deep packet inspection; MySQL; TPC-C; LinkBench; request replay recovery;
+packet logging; dedicated inspection core; client emulation; checkpointed
+request logs; pgwire ingress; durability boundary; write-admission split.
+
+**Core idea:** ITLogging argues that a large part of database write latency
+comes from doing logging on the application/database critical path. Instead of
+having the database server construct and persist conventional WAL records
+before processing writes, it captures incoming database request payloads at the
+network layer, persists the data before application processing, and recovers by
+replaying the captured requests through an emulated client.
+
+For GPU DB, the most useful transfer is not to replace SQL WAL with raw packet
+capture. The useful idea is to treat ingress, durability, and mutation
+execution as separable owner domains with a provable handoff. A network or
+pgwire ingress worker may be able to durably stage request bytes before the
+mutation owner parses and executes them, reducing time spent in the mutation
+owner while keeping WAL-before-visibility intact.
+
+**Concrete mechanisms:**
+
+- ITLogging captures traffic destined for the database server at the network
+  layer and filters/parses packets, using Ethernet and IPv4 header inspection
+  before identifying application payloads relevant to MySQL.
+- The logged unit is the incoming request payload, not a physiological or
+  logical database redo record generated after execution. Recovery replays the
+  original client requests instead of replaying page or tuple deltas.
+- Packet distinction is based on original source port numbers. During
+  recovery, the system creates client-side emulation with the same number of
+  connections and replays preserved packets on separate localhost connections
+  in original request-arrival order.
+- ITLogging periodically checkpoints so replay does not always start from an
+  unbounded request log. Exact checkpoint structure and truncation policy were
+  not visible in the accessible ScienceDirect preview.
+- The implementation dedicates a separate CPU core to packet inspection and
+  logging, moving work away from the database application's main processing
+  path.
+- The paper evaluates MySQL 8.0 on Ubuntu 18.04/Linux 5.13 with ext4, Intel
+  Xeon W-2245 machines, Intel P4510 NVMe SSDs, and a direct 10 Gbps network.
+- The evaluated workloads are TPC-C for transaction processing and LinkBench
+  for a social-graph workload. The ScienceDirect preview reports 16% higher
+  TPC-C throughput and 15% higher LinkBench throughput versus vanilla MySQL
+  with WAL.
+- The comparison includes an idealized no-logging case to show the remaining
+  distance between ITLogging and removing WAL overhead entirely. Detailed
+  p99 latency, fsync policy, transaction mix, crash cases, and failure matrix
+  were not available in the accessible preview.
+
+**GPU DB mapping:** The current runtime target already separates network IO
+workers, bounded command rings, mutation owners, and response rings. ITLogging
+suggests a concrete benchmark for moving durable ingress staging to the edge of
+that topology. A pgwire IO worker could append framed write requests into a
+preallocated durable ingress log before enqueuing a compact command descriptor
+to the mutation owner. The mutation owner would then parse/execute from a
+stable request reference and publish visibility only after the request log,
+logical WAL record, or both satisfy the selected durability contract.
+
+This maps especially well to COPY, batched INSERT, and stored-procedure-style
+write routes. Large incoming request bodies are already present at ingress; an
+edge log could avoid copying the same bytes through multiple owner-local
+buffers before durable admission. The route certificate for a write batch
+should include ingress-log extent, request checksum, connection/session
+ordering token, mutation-owner sequence number, and the durable WAL/visibility
+boundary that eventually makes the write SQL-visible.
+
+The design also sharpens a boundary for 1M logical sessions. Network workers
+can multiplex many sessions, but only a bounded amount of uncommitted request
+data should be admitted into durable staging. If the edge log is full, the
+system should apply backpressure before the mutation owner receives work,
+rather than letting session fan-in create unbounded parse buffers or partial
+write state.
+
+ITLogging's recovery-by-client-replay is useful as a foil. GPU DB should not
+depend on re-executing arbitrary SQL text for committed state unless execution
+is deterministic, idempotent, and tied to a precise catalog/snapshot boundary.
+However, an ingress request log can still be valuable before the mutation
+owner converts a request into canonical WAL records. Crash recovery can replay
+only requests whose edge-log records reached a durable handoff state but whose
+canonical WAL records were not yet published, while ordinary recovery remains
+driven by GPU DB's WAL/checkpoint/archive truth.
+
+**Risks and mismatches:** The accessible primary source was the ScienceDirect
+article preview, not a full open PDF. Packet parser details, checkpoint format,
+full correctness proof, exact recovery ordering under multi-statement
+transactions, and complete evaluation graphs are unknown from the available
+text.
+
+Raw network-layer request logging is a poor direct replacement for a DBMS WAL
+in GPU DB. SQL execution may depend on nondeterministic functions, catalog
+generations, isolation state, trigger behavior, error timing, sequence values,
+and concurrent transaction ordering. Replaying bytes can re-run work, not
+necessarily reconstruct the exact committed state unless the system records
+enough execution context or restricts the workload.
+
+The approach is tied to MySQL packet semantics and to writes arriving over the
+network. It does not cover local sessions, background maintenance, refresh,
+checkpoint, compaction, DDL, or GPU-resident snapshot publication. It also
+adds security and privacy concerns because request payloads are captured below
+the database layer, where encryption, authentication, redaction, tenant
+boundaries, and prepared-statement parameter handling may be harder to enforce.
+
+Finally, a dedicated inspection core is still a resource budget. At high
+session counts, network-assisted logging can become an ingress bottleneck or a
+new backpressure boundary if durable staging cannot keep up with packet
+arrival, fsync, or checkpoint truncation.
+
+**Benchmark candidates:**
+
+- Prototype a durable ingress log for pgwire write requests. Gate: the
+  mutation owner never sees an admitted write descriptor unless the request
+  bytes are durably staged or the route is explicitly marked non-durable for a
+  test-only mode.
+- Compare three write-admission paths for INSERT/COPY: owner-built WAL only,
+  edge-staged request bytes plus owner-built logical WAL, and direct owner
+  ingestion from socket buffers. Measure write throughput, p50/p99 commit
+  latency, owner CPU time, bytes copied, and recovery work.
+- Add a crash test at every handoff state: socket received, request staged,
+  command enqueued, logical WAL appended, WAL flushed, CPU state applied,
+  resident state invalidated, and visibility published. Failure condition:
+  any crash can expose a write without either canonical WAL recovery or a
+  deterministic request-replay path.
+- Test request replay determinism for a restricted stored-procedure/COPY route.
+  Gate: replay produces the same committed rows, errors, generated ids, and
+  visibility boundaries as canonical WAL replay for the admitted subset.
+- Add ingress-log backpressure telemetry: durable bytes pending, per-session
+  staged bytes, checkpoint/truncation lag, mutation-owner lag, and rejection
+  reason. Expected result: overload is stopped at ingress before unbounded
+  per-session buffers form.
+- Evaluate whether payload checksums and catalog/snapshot generation stamps are
+  enough to make staged request references safe for parsing after a delay.
+  Failure condition: DDL or prepared-statement changes let a staged request be
+  interpreted under the wrong schema or parameter contract.
+- Keep canonical WAL as the correctness baseline and use edge logging only as a
+  measured optimization. The benchmark should report how much latency is saved
+  by shifting byte persistence out of the mutation owner without weakening
+  WAL-before-visibility.
+
 ### 2026-06-06 - EEMARQ makes retained range snapshots compatible with aggressive reclamation
 
 **Citation:** Gali Sheffi, Pedro Ramalhete, and Erez Petrank.

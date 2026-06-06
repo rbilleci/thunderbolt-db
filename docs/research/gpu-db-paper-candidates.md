@@ -399,12 +399,15 @@ Append new candidates here as each paper is processed.
   and consolidated flushing; useful for comparing hardware-shaped WAL records,
   NVRAM log placement, and SQLite-style transactional durability with GPU DB's
   future NVM/CXL-tier WAL options.
-- `queued` — **Improving database performance by leveraging network-assisted
+- `reviewed` — **Improving database performance by leveraging network-assisted
   logging**, Future Generation Computer Systems 2025.
   URL: `https://www.sciencedirect.com/science/article/pii/S0167739X25000809`
+  DOI: `https://doi.org/10.1016/j.future.2025.107785`
   Why: recent WAL-overhead reduction paper; useful as a foil for local durable
   WAL, remote durable logging, NIC-assisted persistence, and the throughput
   cost of synchronous commit.
+  Journal entry added 2026-06-06 from the accessible ScienceDirect preview;
+  full body/details were not openly available.
 - `reviewed` — **BVLSM: Write-Efficient LSM-Tree Storage via WAL-Time Key-Value
   Separation**, arXiv 2025.
   URL: `https://arxiv.org/abs/2506.04678`
@@ -438,6 +441,13 @@ Append new candidates here as each paper is processed.
   Why: PALF compares CSN-style database ordering with replicated log services;
   useful for deciding whether GPU DB should keep WAL bundled with mutation
   owners or expose an independent replicated log service.
+- `queued` — **Rethinking Logging, Checkpoints, and Recovery for
+  High-Performance Storage Engines**, Haubenschild, Sauer, Neumann, and Leis,
+  SIGMOD/PACMMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3380593`
+  Why: cited by ITLogging as a modern high-performance logging and recovery
+  baseline; useful for comparing edge-staged request logs with canonical
+  command/physiological logging, checkpoint boundaries, and recovery latency.
 
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
