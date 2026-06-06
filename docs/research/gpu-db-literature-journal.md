@@ -95303,3 +95303,163 @@ should complement internal invariant checks and replay tests.
   of transactions for each runtime/storage slice, and longer
   nightly checks over million-transaction mixed workloads with
   route churn and memory pressure.
+
+### 2026-06-07 - Learned Query Optimizer keeps ML outside the correctness core
+
+**Citation:** Rong Zhu, Lianggui Weng, Bolin Ding, and Jingren
+Zhou. "Learned Query Optimizer: What is New and What is Next."
+SIGMOD Companion 2024, pages 561-569. Retrieved 2026-06-07 from
+author PDF and DOI metadata: `https://bolinding.github.io/papers/sigmod24learnedqo.pdf`,
+`https://doi.org/10.1145/3626246.3654692`.
+
+**Category:** query optimization / planning, with runtime scheduling,
+route-costing, and learned-systems deployment relevance.
+
+**Relevance tags:** learned query optimizer; learned cardinality
+estimation; learned cost model; concurrent-query cost model; join-order
+search; end-to-end LQO; regression guard; PilotScope; CPU/GPU route
+advisor; deterministic eligibility; route fallback.
+
+**Core idea:** This tutorial surveys the learned-query-optimizer
+surface rather than proposing one new optimizer. The useful synthesis
+for GPU DB is that learned planning is not one mechanism. It can enter
+through cardinality estimation, plan cost prediction, concurrent-query
+performance prediction, join-order exploration, learned steering of a
+native optimizer, or middleware that injects learned decisions into a
+database through narrow push/pull interfaces.
+
+The strongest transferable idea is to separate learned advice from
+correctness and route eligibility. GPU DB can use learned models to rank
+eligible CPU, GPU-resident, GPU-cold-transfer, and fallback routes, but
+the model should not decide whether a resident snapshot is visible,
+whether a route is invalidated, whether memory budgets are exceeded, or
+whether WAL-before-visibility holds. Those remain deterministic guards.
+
+**Concrete mechanisms:**
+
+- The tutorial decomposes classical optimizers into cardinality
+  estimator, cost model, and plan enumerator. Learned methods can target
+  each piece independently instead of replacing the whole optimizer.
+- Learned cardinality estimators are grouped into query-driven models,
+  data-driven models, and hybrids. Recent examples include uncertainty
+  estimates, workload-drift adaptation, query re-optimization from
+  executed operator cardinalities, and attention/transformer methods
+  that combine query and data signals.
+- Learned cost models encode physical plan structure using tree
+  convolution, Tree-LSTM, plan auto-encoders, transformer plan
+  embeddings, and zero-shot variants. The tutorial also calls out
+  concurrent-query cost models that predict co-running query performance
+  with graph embeddings, tree-convolution pipelines, or
+  resource-aware attention.
+- Learned join-order search splits into offline learning from past
+  queries and online adaptive execution. Reinforcement-learning and
+  Monte-Carlo methods can explore join orders during execution, but the
+  paper treats those as optimizer mechanisms, not isolation or resource
+  guarantees.
+- End-to-end learned optimizers are summarized as candidate-plan
+  generation followed by a learned risk/cost model. Some systems search
+  plans directly, while Bao/HyperQO/Lero-style systems steer an existing
+  optimizer through hints or cardinality perturbations and then rank the
+  resulting candidates.
+- Regression-control mechanisms are first-class. Examples include model
+  update under drift, variance-based filtering of uncertain plans,
+  coarse filters that remove unseen-feature plans, and finer plan-cluster
+  selection to avoid performance regressions before execution.
+- Benchmarking guidance matters because classic TPC-H, TPC-DS, SSB, and
+  JOB can miss real data correlations or join complexity. The tutorial
+  highlights STATS and end-to-end PostgreSQL evaluations as stronger
+  tests of learned optimizer behavior.
+- PilotScope is presented as deployment middleware. It packages an
+  AI4DB task as a driver with algorithm code and ML models, connects to
+  databases through a DB interactor, and exposes push/pull operators so
+  drivers can collect training data, tune hints, inject cardinalities,
+  request candidate plans, or return selected plans while keeping DB
+  patches relatively small.
+
+**GPU DB mapping:** GPU DB should treat learned planning as a sidecar
+route advisor over deterministic route families. The planner first
+computes the legal set: CPU tuple/index path, CPU column/segment path,
+GPU resident scan/index path, GPU cold-transfer path, or explicit
+overload/rejection. Deterministic checks include snapshot generation,
+resident validity, invalidation generation, supported predicate family,
+memory/pinned-buffer budget, queue capacity, and WAL visibility
+boundary. A learned model may then rank only those legal routes by
+expected latency, throughput, or tail risk.
+
+The concurrent-query cost-model lane maps directly to the high-throughput
+runtime. GPU route choice should include active GPU queue depth, CUDA
+stream occupancy, resident-fragment pressure, transfer bytes, response
+ring pressure, CPU fallback load, and co-running query shapes. A
+single-query cost model that ignores queueing can choose a route that is
+locally fast but globally harmful at 1M logical sessions.
+
+The regression-guard lane is more important than raw average speedup.
+For retained GPU routes, a bad learned decision can overflow HBM,
+pollute the resident cache, stall refresh work, or create p99 spikes.
+GPU DB needs pessimistic fallbacks: uncertainty thresholds, unseen-route
+filters, plan-cluster or route-family confidence, and deterministic
+upper bounds for transfer/result sizes before admitting a learned route.
+
+PilotScope suggests an integration shape: expose training and inference
+hooks around route planning, but keep model runtime outside the mutation
+owner and GPU execution hot path. A driver can pull route traces,
+candidate-route features, measured latency, queue wait, transfer bytes,
+and fallback reasons; push updated scoring parameters, hints, or
+cardinality corrections; and run background retraining without owning
+visibility or residency state.
+
+For MVCC and retained snapshots, the query-driven/data-driven split
+warns that model freshness depends on both workload and data movement.
+Route models must see not only table statistics, but also resident-cache
+state, snapshot age, invalidation churn, segment hotness, and tier
+placement. A model trained on warm resident data can be wrong after
+eviction or under write-heavy refresh churn.
+
+**Risks and mismatches:** The paper is a tutorial, so it provides a
+taxonomy and deployment guidance rather than a single evaluated
+mechanism. It does not report new GPU DB measurements, OLTP isolation
+results, or a production route-admission proof.
+
+Most learned optimizer work targets analytical join planning and
+cardinality/cost estimation. GPU DB's immediate risks also include
+write-path admission, MVCC visibility, WAL ordering, queue saturation,
+and resident-memory pressure, which are outside the normal LQO objective.
+
+PilotScope-style drivers may use Python and background model code. That
+is fine for offline training and route scoring experiments, but not for
+the microsecond hot path of mutation owners, GPU workers, or response
+rings. Any production model output should be compiled into cheap route
+tables, calibrated coefficients, or bounded inference calls.
+
+Learned models can hide errors behind averages. A route model that
+improves mean latency but increases stale-route retries, HBM overflow,
+fallback storms, or p99 latency is a failure for this engine.
+
+**Benchmark candidates:**
+
+- Build a deterministic route-eligibility layer plus learned ranking
+  sidecar. Gate: the model can reorder only legal routes, and every
+  illegal route has a deterministic rejection reason independent of the
+  model.
+- Train a CPU/GPU route scorer over recorded features: cardinality
+  estimate, selected columns, predicate family, resident generation,
+  transfer bytes, GPU queue depth, CPU fallback load, pinned-buffer
+  pressure, and invalidation age. Measure route regret, p50/p99 latency,
+  fallback rate, and HBM/pinned-memory budget violations.
+- Add uncertainty and drift guards. Compare unguarded learned ranking,
+  variance-threshold fallback, unseen-feature filtering, and pessimistic
+  transfer/result-size upper bounds. Failure condition: the learned path
+  wins average latency but causes p99 spikes or overload rejections.
+- Run a concurrent-query cost benchmark with co-running retained
+  lookups, aggregates, cold transfers, and writes. Gate: the scorer
+  accounts for queue wait and co-running GPU kernels, not just isolated
+  operator time.
+- Prototype a PilotScope-like offline driver for GPU DB route traces.
+  It should pull candidate routes and execution telemetry, train outside
+  the hot path, and push bounded scoring tables or coefficients. Gate:
+  mutation owner and GPU worker hot paths perform no blocking model
+  training, network calls, or dynamic Python execution.
+- Compare benchmark corpora: TPC-H/SSB-style analytical queries, mixed
+  retained OLTP lookups, and HTAP workloads with invalidation churn.
+  Failure condition: a model that looks good on analytical joins chooses
+  poor routes under write-heavy retained snapshots or memory pressure.

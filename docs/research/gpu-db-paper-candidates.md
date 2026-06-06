@@ -500,14 +500,29 @@ Append new candidates here as each paper is processed.
   pgwire prepared statements, retained lookups, and GPU/CPU fallback choices.
   Journal entry already exists; this stale duplicate was corrected from
   `queued` to `reviewed` on 2026-06-06.
-- `queued` — **Learned Query Optimizer: What is New and What is Next**,
+- `reviewed` — **Learned Query Optimizer: What is New and What is Next**,
   Zhu, Weng, Ding, and Zhou, SIGMOD Companion 2024.
   URL: `https://doi.org/10.1145/3626246.3654692`
   Author PDF: `https://bolinding.github.io/papers/sigmod24learnedqo.pdf`
   Why: Eraser's authors cite this tutorial as broader learned-optimizer
   deployment context; useful for checking which LQO pieces are mature enough
   for GPU DB route scoring and which should remain guarded by deterministic
-  eligibility and fallback rules.
+  eligibility and fallback rules. Journal entry added 2026-06-07 from the
+  author PDF and DOI metadata.
+- `queued` — **PilotScope: Steering Databases with Machine Learning Drivers**,
+  Zhu et al., PVLDB 2024.
+  URL: `https://github.com/alibaba/pilotscope`
+  Why: Learned Query Optimizer highlights PilotScope as a deployment bridge for
+  ML drivers that push/pull plans, hints, cardinalities, and runtime data
+  through database-specific interactors; useful for designing GPU DB route
+  advisor hooks without putting Python or model lifecycle work on the hot path.
+- `queued` — **QueryFormer: A Tree Transformer Model for Query Plan
+  Representation**, Zhao, Cong, Shi, and Miao, PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p1658-zhao.pdf`
+  Why: Learned Query Optimizer cites plan-embedding models as reusable inputs
+  for cost estimation and other optimizer tasks; useful for comparing compact
+  plan-shape embeddings against deterministic route-family keys for CPU/GPU
+  cost and latency prediction.
 - `queued` — **Adaptive Concurrent Query Execution Framework for an
   Analytical In-Memory Database System**, Deshmukh, Memisoglu, and Patel,
   IEEE BigData Congress 2017.
