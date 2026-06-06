@@ -38,6 +38,151 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - NBR bounds retired route metadata by neutralizing slow readers
+
+**Citation:** Ajay Singh, Trevor Brown, and Ali Mashtizadeh. "NBR:
+Neutralization Based Reclamation." PPoPP 2021, pp. 175-190. DOI:
+`https://doi.org/10.1145/3437801.3441625`. Retrieved 2026-06-06 from
+the arXiv PDF, `https://arxiv.org/pdf/2012.14542`.
+
+**Category:** runtime / HFT / session scale, with secondary relevance to
+MVCC / snapshot / visibility and CPU-side index metadata reclamation.
+
+**Relevance tags:** safe memory reclamation; neutralization; bounded garbage;
+epoch-based reclamation; hazard pointers; POSIX signals; read phase restart;
+write phase reservation; delayed workers; oversubscription; retained snapshot
+retirement; route metadata generations; lock-free indexes.
+
+**Core idea:** NBR addresses the safe-memory-reclamation tradeoff that is
+awkward for high-concurrency runtimes: epoch-based reclamation is fast but can
+leave unbounded retired objects behind a stalled thread, while hazard pointers
+bound garbage but add per-record fences and pointer publication overhead. NBR
+keeps a fast epoch-like shape, but when a thread's retired-object buffer crosses
+a threshold it sends neutralizing signals to other participating threads. A
+thread that is still in a read-only phase restarts from a safe point and drops
+private pointers; a thread that has entered a write phase is allowed to finish
+because it has already reserved the records it may mutate.
+
+The transferable idea for GPU DB is not to adopt POSIX signals blindly. It is
+to make reclamation a bounded route contract. Retired resident-snapshot handles,
+route descriptors, CPU index nodes, and old MVCC metadata should not remain
+pinned forever by one delayed worker or logical session. The runtime should
+know which phases are restartable, which phases have crossed a publication or
+mutation point, and when an owner may force retry, detach, or reject old work so
+retired memory stays bounded.
+
+**Concrete mechanisms:**
+
+- NBR assumes each data-structure operation can be split into a preamble, a
+  read phase, a reservation phase, and a write phase.
+- The read phase may traverse shared records but cannot write shared records,
+  perform CAS, or make system calls. Because it has not changed shared state,
+  it can be restarted by `siglongjmp` after a neutralizing signal.
+- The reservation phase identifies all shared records that may be modified in
+  the write phase. The write phase may access and mutate only those reserved
+  records.
+- Each thread puts unlinked records into a private limbo buffer. When the
+  buffer exceeds a threshold, it sends neutralizing signals to other threads.
+- A neutralized thread in a quiescent or preamble phase has no shared-record
+  pointers and can ignore the signal. A neutralized thread in the read phase
+  drops private traversal state and restarts from the read-phase checkpoint.
+  A thread in the write phase continues because restarting after shared writes
+  could corrupt the data structure.
+- This differs from DEBRA+: NBR does not require data-structure-specific
+  recovery code and can support some lock-based structures with lock-free
+  searches.
+- NBR+ reduces signal traffic by passively observing signals already being
+  sent in the system and using those observations to infer relaxed grace
+  periods.
+- The paper frames the target properties as high throughput/low latency,
+  bounded unreclaimed garbage even with delayed or halted threads, low
+  programmer burden, consistent behavior under oversubscription, and broad
+  applicability across data structures.
+- Experiments use a lock-based binary search tree, a lazy linked list, an
+  ABTree, and a Harris list. The paper compares against algorithms including
+  DEBRA, DEBRA+, hazard pointers, RCU, QSBR, IBR, and NBR+.
+- In the abstract, the authors report NBR faster than DEBRA by up to 38% on
+  the tree and 15% on the list, and faster than hazard pointers by up to 17%
+  on the tree and 243% on the list.
+- In oversubscribed lazy-list experiments, the paper reports NBR+ comparable
+  to RCU, QSBR, and DEBRA, while outperforming hazard pointers and IBR.
+- The paper notes a useful side effect: forced restarts can behave like
+  contention management, with one experiment showing slightly lower L3 cache
+  misses after restarts.
+
+**GPU DB mapping:** NBR fits the CPU runtime around GPU DB's immutable
+snapshot publication model. A retained read route should have an explicit
+restartable phase while it is only choosing a snapshot, reading route metadata,
+or traversing a CPU resident-index descriptor. Once it has submitted GPU work,
+entered response encoding, or acquired a mutation/publication reservation, it
+should no longer be neutralized casually; it should finish, cancel through an
+explicit owner path, or return a named retry result.
+
+The reservation phase maps to route certificates. Before a worker mutates route
+metadata, refresh state, index nodes, or WAL/MVCC publication state, it should
+name the records or generations it may touch. That makes it possible for
+reclamation to distinguish harmless readers from operations that are already
+inside a non-restartable publication step.
+
+For 1M logical sessions, NBR argues against tying memory reclamation directly
+to session count. Physical workers, not logical sessions, should own pinned
+route pointers. Long-lived logical sessions should hold compact snapshot
+tokens or generation ids; if they block retirement too long, admission can
+force a retry on a newer generation rather than pinning arbitrary descriptor
+graphs.
+
+NBR also complements the OneShotGC review. OneShotGC groups old MVCC versions
+by temporal partitions; NBR gives a runtime-side policy for stalled workers
+that might otherwise keep those retired partitions live forever. Together they
+suggest a benchmark track: temporal retirement cohorts plus bounded worker
+neutralization or retry at route boundaries.
+
+**Risks and mismatches:** NBR is a CPU shared-memory reclamation algorithm, not
+a database transaction protocol. It does not handle WAL-before-visibility,
+MVCC semantics, durable recovery, GPU kernels, CUDA cancellation, pgwire
+encoding, or disk/NVMe tiers.
+
+POSIX signal neutralization is intrusive and fragile in a database engine with
+foreign libraries, CUDA calls, async runtimes, syscalls, and protocol IO. GPU
+DB should first adapt the phase model and bounded-retirement contract through
+cooperative cancellation, epoch tokens, owner messages, or fiber/task checks,
+not process-wide asynchronous signals.
+
+The required phase discipline is real engineering work. Arbitrary code that
+allocates, performs IO, or writes thread-local state during a supposedly
+restartable read phase can leak memory or corrupt local structures. That means
+route metadata traversal must be narrow and auditable before any neutralization
+idea is allowed near the hot path.
+
+NBR's experiments are on data structures, not end-to-end SQL workloads. The
+reported throughput gains do not directly predict GPU DB latency under many
+clients, response backpressure, retained snapshot invalidation, or memory
+pressure from GPU pinned buffers.
+
+**Benchmark candidates:**
+
+- Add a route-metadata reclamation simulator with EBR, hazard-pointer-style
+  protection, and cooperative neutralization at read-phase boundaries. Gate:
+  retired descriptor bytes remain bounded when one worker stalls.
+- Split retained-read execution into restartable and non-restartable phases.
+  Gate: a read may be retried before GPU submission, but not after a result
+  starts observing a specific snapshot generation.
+- Track pinned retired bytes by physical worker, not logical session. Failure
+  condition: increasing logical sessions from 10,000 to 1,000,000 linearly
+  increases unreclaimable route metadata.
+- Add generation-token handles for resident snapshot and CPU index descriptors.
+  Gate: after retirement, stale handles return an invalid-generation result
+  instead of dereferencing recycled memory.
+- Compare forced retry of old retained reads with waiting for reader drain
+  under route refresh pressure. Expected result: bounded retry reduces memory
+  pressure, but can hurt p99 if used after too much work has been done.
+- Test long-running readers against temporal MVCC partitions from the
+  OneShotGC track. Gate: one delayed worker cannot pin unbounded old-version
+  chunks without an observable admission or retry policy.
+- Measure the cost of protection in a CPU warm-index lookup path. Failure
+  condition: hazard-pointer-style fences erase the benefit of using the warm
+  index before GPU or retained execution.
+
 ### 2026-06-06 - Polyjuice treats concurrency control as a learned route policy
 
 **Citation:** Jiachen Wang, Ding Ding, Huan Wang, Conrad Christensen,

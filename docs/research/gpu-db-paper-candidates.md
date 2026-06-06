@@ -6215,14 +6215,15 @@ Append new candidates here as each paper is processed.
   repair a first-class index concern; REWIND is a primary follow-up for
   comparing write-ahead recovery schemes for persistent data structures before
   GPU DB stores durable route metadata or future-tier indexes.
-- `queued` — **NBR: Neutralization Based Reclamation**, Singh et al.,
+- `reviewed` — **NBR: Neutralization Based Reclamation**, Singh et al.,
   PPoPP 2021.
-  URL: `https://doi.org/10.1145/3437801.3441614`
+  URL: `https://doi.org/10.1145/3437801.3441625`
   arXiv: `https://arxiv.org/abs/2012.14542`
   Why: VBR compares against signaling-based robust reclamation; useful for
   deciding whether route metadata and CPU-side resident indexes should use
   cooperative optimistic retries, neutralization of stalled workers, or a
-  simpler epoch contract under 1M-session pressure.
+  simpler epoch contract under 1M-session pressure. Journal entry added
+  2026-06-06.
 - `queued` — **Snapshot-Free, Transparent, and Robust Memory Reclamation for
   Lock-Free Data Structures**, Nikolaev and Ravindran, PLDI 2019.
   URL: `https://doi.org/10.1145/3314221.3314610`
@@ -6231,3 +6232,10 @@ Append new candidates here as each paper is processed.
   fence overhead; Hyaline-style snapshot-free reclamation is a useful
   follow-up for route-publication descriptors and lock-free CPU indexes that
   should avoid pinning retired state behind long readers.
+- `queued` — **Publish on Ping: A Better Way to Publish Reservations in Memory
+  Reclamation for Concurrent Data Structures**, arXiv 2025.
+  URL: `https://arxiv.org/abs/2501.04250`
+  Why: discovered while reviewing NBR; combines signal-style prompting with
+  delayed publication of reservations, making it a modern follow-up for
+  lowering hazard-pointer-style read overhead without allowing unbounded
+  retired route metadata.
