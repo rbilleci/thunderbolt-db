@@ -451,12 +451,14 @@ Append new candidates here as each paper is processed.
   optimizer for concurrent queries; useful for comparing learned cache sharing
   and multi-query route selection with deterministic batch-owner filter reuse
   and GPU residency telemetry.
-- `queued` — **LIMAO: A Framework for Lifelong Modular Learned Query
+- `reviewed` — **LIMAO: A Framework for Lifelong Modular Learned Query
   Optimization**, Zhang et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p4546-zhang.pdf`
   Why: discovered while checking newer learned-optimizer follow-ups; useful
   for contrasting reusable learned sub-plan knowledge with GPU DB's explicit
   route descriptors, adaptive thresholds, and no-training fallback path.
+  Journal entry added 2026-06-06 from the arXiv PDF after the VLDB PDF
+  endpoint stalled from the cron worker.
 - `queued` — **SkinnerDB: Regret-bounded Query Evaluation via Reinforcement
   Learning**, Trummer et al., ACM TODS 2021.
   URL: `https://doi.org/10.1145/3464389`
@@ -465,6 +467,19 @@ Append new candidates here as each paper is processed.
   SkinnerDB line; useful if the loop needs deeper formal and implementation
   details for intra-query learning, progress tracking, and specialized
   execution-engine support.
+- `queued` — **HybridQO: Hybrid Learned Query Optimizer**, Zhu et al.,
+  CIDR 2022.
+  URL: `https://www.cidrdb.org/cidr2022/papers/p16-hilprecht.pdf`
+  Why: LIMAO contrasts prior dynamic-environment learned optimizers; useful
+  for comparing learned query optimization under workload, data, and schema
+  shifts with GPU DB's deterministic route eligibility and adaptive route
+  scoring.
+- `queued` — **LEON: A New Framework for ML-Aided Query Optimization**,
+  Chen et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p2261-chen.pdf`
+  Why: LIMAO cites LEON among learned optimizer systems that adapt to changing
+  data; useful for comparing learned plan search or cost feedback against
+  modular lifelong route-cost learning.
 - `reviewed` — **Sundial: Harmonizing Concurrency Control and Caching in a
   Distributed OLTP Database Management System**, Yu et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p1289-yu.pdf`

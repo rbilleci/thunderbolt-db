@@ -38,6 +38,166 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - LIMAO keeps learned route cost models from forgetting old winners
+
+**Citation:** Qihan Zhang, Shaolin Xie, and Ibrahim Sabek.
+"LIMAO: A Framework for Lifelong Modular Learned Query
+Optimization." PVLDB 18(11):4546-4559, 2025. DOI:
+`10.14778/3749646.3749712`. Retrieved 2026-06-06 from
+`https://www.vldb.org/pvldb/vol18/p4546-zhang.pdf` and arXiv
+`https://arxiv.org/abs/2507.00188`.
+
+**Category:** query optimization / planning, with secondary relevance
+to runtime route choice and adaptive CPU/GPU/tier placement.
+
+**Relevance tags:** learned cost prediction; lifelong learning;
+catastrophic forgetting; modular route knowledge; plan decomposition;
+attention-based module composition; experience replay; episodic
+updates; route stability; dynamic workloads; CPU/GPU route telemetry.
+
+**Core idea:** LIMAO addresses a practical weakness in learned query
+optimizers: a learned cost model trained for one workload or data
+distribution can become unstable when the environment shifts, and
+retraining can erase previously useful knowledge. Instead of treating
+the whole plan as one monolithic learned object, LIMAO decomposes plans
+into reusable sub-plan tasks, stores task-specialized neural modules in
+module hubs, composes the selected modules with attention, and trains
+with episodic online updates plus replay-buffer-based offline updates.
+
+For GPU DB, the transferable idea is not "replace the planner with a
+neural network." It is to let adaptive route-cost learning remember
+stable route fragments: resident scan, CPU index lookup, GPU key-vector
+lookup, cold transfer, predicate prefilter, decompression, and join
+fragment choices. Dynamic data placement should not force a full
+relearning cycle every time a table changes residency, cardinality,
+compression, or tier location.
+
+**Concrete mechanisms:**
+
+- LIMAO focuses on learned cost prediction inside learned query
+  optimizers. The learned model predicts costs for candidate or partial
+  plans and guides the plan search, while execution feedback enters a
+  replay buffer for later training.
+- Plan decomposition uses "break" operators. A break operator splits a
+  plan tree at the first occurrence of an operator type during
+  traversal. The paper chooses join operators because they are
+  performance-critical and produce sub-plans that are neither too coarse
+  nor too shallow.
+- A plan is traversed independently for each break-operator type, so
+  tasks can structurally overlap when they are rooted at different
+  operator families. Non-break parts are kept in an OTH-style task hub.
+- Task encodings combine table selectivity, operator mapping, preorder
+  tree index, and query-level features for subquery, aggregation,
+  `GROUP BY`, and `ORDER BY`.
+- Module hubs store representative neural modules per task type. LIMAO
+  uses a K-prototype-style clustering method over mixed numerical and
+  categorical task features to assign tasks to representative modules.
+- At inference, a task selects the closest representative module. If a
+  task is too dissimilar to existing clusters, the maintainer can create
+  a new cluster; tiny clusters can later be removed.
+- The cost model composes selected modules with an attention-based
+  neural architecture. Each task module emits a representation; an
+  attention merger weights task contributions before output layers
+  produce the final plan-cost estimate.
+- Training has two phases. The online phase executes queries in small
+  episodes, records feedback and module combinations, and lightly trains
+  a model copy after each episode. The offline phase replaces the main
+  model with that copy and retrains using either all historical
+  experience when drift is detected or only recent experience when no
+  drift is detected.
+- The implementation integrates LIMAO with Balsa and Bao, showing that
+  the framework can sit under both build-from-scratch learned optimizers
+  and hint-based learned optimizer steering.
+- Evaluation uses IMDB/JOB/CEB/BaoQs and TPC-H workloads under static,
+  workload-switch, volume-switch, and combined-switch scenarios on
+  PostgreSQL 12.5. Reported results include up to 40% query execution
+  improvement, up to 60% variance reduction for IMDB, more than 2x
+  TPC-H speedup in selected settings, large stability gains under
+  dynamic shifts, and fewer bad plans/timeouts than Balsa.
+- The paper reports overhead from episodic training and replay, but
+  argues faster convergence can offset it. For IMDB experiments,
+  episodic training is about 3 seconds per episode and post-iteration
+  training about 4-9 seconds per iteration.
+
+**GPU DB mapping:** GPU DB's planner should treat CPU/GPU/tier route
+learning as modular knowledge over route fragments, not one global
+black-box decision. Break operators can become route breakpoints:
+join, scan/index choice, transfer/decompress boundary, predicate
+prefilter, aggregation, and response-shape encoding. Module hubs map to
+route-family learners that remember how those fragments behaved under
+specific residency, cardinality, compression, queue, and visibility
+conditions.
+
+The same design fits the P8 tier model. A retained read may move among
+HBM, host DRAM, NVMe, WAL replay, and future remote tiers over time.
+LIMAO suggests keeping reusable knowledge for "same logical fragment,
+new physical situation" instead of relearning from scratch after every
+resident-generation change. Experience records should therefore include
+snapshot generation, layout identity, visibility boundary, resident
+bytes, transfer bytes, compression mode, queue wait, kernel elapsed
+time, CPU fallback time, and invalidation/retry reason.
+
+The episodic update mechanism maps to a production-safe learning
+boundary. Online route telemetry can tune a shadow model or route-score
+table after small batches, but the deterministic planner remains the
+eligibility authority. Offline replay can then update stable route
+weights using recent and historical workloads without allowing a bad
+GPU route to monopolize a latency-sensitive session.
+
+LIMAO's module-size lesson is also useful: too few route modules hide
+important differences, while too many modules underfit because each
+module sees too little evidence. GPU DB should start with a small
+fixed set of route families and only split a family when telemetry
+shows distinct behavior, such as resident scan versus cold-transfer
+scan or short lookup batch versus large lookup batch.
+
+**Risks and mismatches:** LIMAO is evaluated on analytical query
+optimization, not OLTP writes, MVCC commit ordering, WAL recovery,
+session admission, or GPU execution. It does not prove that learned
+route choices are safe for SQL-visible snapshots; eligibility and
+fallback still need deterministic checks.
+
+Training overhead is non-trivial and the paper's implementation assumes
+feedback from executing candidate plans. GPU DB must cap exploration so
+route learning cannot burn p99 latency or GPU queue capacity.
+
+The break-operator choice is manual in the paper, and future work calls
+out automatic break-operator and module-size selection. For GPU DB,
+route breakpoints should initially be hand-audited and tied to existing
+planner/runtime facts rather than inferred silently.
+
+The paper reports strong stability improvements but still depends on
+learned model quality, cluster thresholds, and drift detection. A bad
+drift detector or over-specific module hub could cause stale route
+knowledge to survive when hardware, schema, or tier placement changes
+substantially.
+
+**Benchmark candidates:**
+
+- Add a route-fragment telemetry schema for retained reads: route
+  family, snapshot generation, layout identity, resident tier, bytes
+  moved, queue wait, kernel time, rows accepted, fallback reason, and
+  invalidation/retry reason. Gate: every adaptive route decision can be
+  replayed offline.
+- Prototype modular route-cost learners for four fragments: CPU index
+  lookup, GPU resident scan, GPU lookup batch, and cold-transfer scan.
+  Compare one monolithic learner against per-fragment modules under
+  changing residency and data volume.
+- Test episodic shadow updates under a dynamic workload switch: hot
+  resident lookup, over-resident scan, cold-tier fallback, and join
+  query phases. Failure condition: learned updates select ineligible
+  snapshots or consume more than a configured exploration budget.
+- Measure catastrophic forgetting for route choice by reverting a table
+  from cold to resident and back. Gate: historical winning routes regain
+  low latency without full retraining.
+- Evaluate module-hub granularity. Start with coarse route families,
+  split only when telemetry variance remains high, and reject splits
+  that leave too few examples per module.
+- Keep a deterministic fallback planner in the benchmark. Expected
+  result: learned route scoring improves average latency or route
+  stability, but wrong choices are bounded by eligibility checks,
+  latency ceilings, and explicit fallback.
+
 ### 2026-06-06 - Crystalline bounds reclamation without session-shaped snapshots
 
 **Citation:** Ruslan Nikolaev and Binoy Ravindran. "Crystalline:
