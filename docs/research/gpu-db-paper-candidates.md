@@ -1759,14 +1759,22 @@ Append new candidates here as each paper is processed.
   GPU DB chooses retained route metadata publication structures. Journal entry
   added 2026-06-06; the previously queued DOI suffix was corrected from
   `3441612` to `3441602`.
-- `queued` — **VERLIB: Concurrent Versioned Pointers**, Blelloch and Wei,
+- `reviewed` — **VERLIB: Concurrent Versioned Pointers**, Blelloch and Wei,
   PPoPP 2024.
   URL: `https://doi.org/10.1145/3627535.3638501`
+  PDF: `https://par.nsf.gov/servlets/purl/10539480`
   Artifact: `https://zenodo.org/records/10447617`
   Why: direct successor to constant-time snapshots that removes much of the
   recorded-once indirection constraint and packages versioned pointers as a C++
   library; useful before choosing GPU DB's retained route metadata and
-  resident-index publication primitives.
+  resident-index publication primitives. Journal entry added 2026-06-06.
+- `queued` — **Multiverse: Transactional Memory with Dynamic
+  Multiversioning**, Coccimiglio, Brown, and Ravi, arXiv/PPoPP 2026.
+  URL: `https://arxiv.org/abs/2601.09735`
+  Why: discovered while reviewing VERLIB; useful for comparing dynamic
+  versioned/unversioned transaction modes with GPU DB's need to keep common
+  short writes cheap while still supporting long retained reads and
+  snapshot-heavy metadata scans.
 - `reviewed` — **VBR: Version Based Reclamation**, Sheffi et al., arXiv 2021.
   URL: `https://arxiv.org/abs/2107.13843`
   Why: optimistic memory reclamation scheme related to EBR/hazard-pointer

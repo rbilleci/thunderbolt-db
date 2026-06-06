@@ -82692,3 +82692,249 @@ reader snapshot retention.
 - Track bytes and round trips per transaction phase. Expected result:
   optimizing fence count and duplicate data movement explains more latency
   variance than raw request count under remote-tier pressure.
+
+### 2026-06-06 - VERLIB makes snapshot handles a pointer primitive
+
+**Citation:** Guy E. Blelloch and Yuanhao Wei. "VERLIB: Concurrent
+Versioned Pointers." PPoPP 2024, pages 200-214. DOI:
+`https://doi.org/10.1145/3627535.3638501`. Retrieved 2026-06-06 from
+the NSF Public Access Repository accepted manuscript,
+`https://par.nsf.gov/servlets/purl/10539480`. Artifact:
+`https://zenodo.org/records/10447617`.
+
+**Category:** MVCC / snapshot / visibility, with runtime / concurrent
+metadata and GC / reclamation relevance.
+
+**Relevance tags:** versioned pointers; constant-time snapshots;
+linearizable range queries; indirection-on-need; version lists;
+idempotent CAS; lock-free locks; optimistic timestamps; route metadata;
+resident-index publication; snapshot-safe descriptors; epoch
+reclamation; stable handles.
+
+**Core idea:** VERLIB turns snapshot participation into a local pointer
+type. A data structure replaces selected atomic pointer fields with
+`versioned_ptr<T>`, has pointed-to objects inherit a small `versioned`
+base, and wraps multi-location reads in `with_snapshot`. Loads inside
+the wrapper observe one linearized snapshot of those versioned pointers,
+while ordinary loads, stores, and CAS operations remain constant-time in
+the common case.
+
+The paper extends the earlier constant-time snapshot approach in two
+important ways. First, it removes the subtle "recorded-once" restriction
+that was previously needed to avoid an extra level of indirection on
+pointers. Its indirection-on-need scheme stores version metadata on the
+pointed-to object when safe, falls back to an indirect version link only
+when sharing makes that unsafe, and later shortcuts the indirection when
+old snapshots no longer need it. Second, it makes versioning compatible
+with lock-free locks by using timestamp state to implement an idempotent
+CAS, so helpers running the same critical section can agree whether the
+CAS succeeded.
+
+For GPU DB, the transferable idea is a small, typed publication handle
+for read-mostly shared metadata. Route descriptors, resident-index roots,
+segment manifests, catalog/residency pointers, and GPU snapshot handles
+could expose versioned pointer cells so readers can take a cheap
+metadata snapshot without routing every read through the owner.
+
+**Concrete mechanisms:**
+
+- A `versioned_ptr<T>` supports atomic `load`, `store`, and `cas`. The
+  target type must inherit `versioned`, which gives VERLIB a place to
+  attach timestamp and prior-version metadata.
+- `with_snapshot(f)` runs a read-only thunk so all loads from versioned
+  pointers inside `f` see one memory snapshot. The paper states that the
+  wrapper adds constant overhead; a load inside the snapshot may traverse
+  versions proportional to concurrent updates on that same pointer.
+- The underlying version-list design stores the value, a timestamp, and a
+  previous-version pointer. A snapshot reads the newest version whose
+  timestamp is at or below the snapshot timestamp.
+- Earlier work avoided an extra pointer chase by storing metadata on the
+  pointed-to object, but needed a recorded-once pointer-use discipline.
+  VERLIB's indirection-on-need checks when direct metadata reuse is safe,
+  uses an indirect version link only when needed, and shortcuts back to a
+  direct pointer after relevant old snapshots are gone.
+- The paper uses set-stamp helping for in-flight version links whose
+  timestamps are initially `TBD`. Readers and writers that encounter
+  `TBD` help install a real timestamp.
+- VERLIB can run with standard locks or with the flock lock-free-lock
+  library. With lock-free locks, helpers may execute the same critical
+  section, so shared-memory operations must be idempotent.
+- The idempotent CAS trick relies on version timestamps: a versioned CAS
+  succeeds if the pointer now contains the new value or the new version's
+  timestamp has been set. That avoids double-word CAS while giving helpers
+  a common success result.
+- For write paths protected by locks, VERLIB provides a direct
+  no-write-race store specialization that avoids the extra load-plus-CAS
+  steps; the paper reports up to 8% improvement on 50% update workloads
+  in tested B-tree settings.
+- Timestamp choices are explicit. The paper evaluates hardware RDTSC
+  timestamps, update-increment timestamps, query-increment timestamps,
+  TL2-style timestamps, and an optimistic software timestamp scheme.
+  Optimistic timestamps first try the read-only snapshot without
+  incrementing the global clock and rerun at most once when they hit an
+  equal timestamp.
+- Memory reclamation in the implementation is epoch-based. The paper
+  notes that other multiversion garbage-collection techniques could be
+  applied, but the evaluation does not prove a production DB GC policy.
+- Evaluation uses a 64-core AWS c6i-metal machine with 128 hardware
+  threads, C++ implementations of a B-tree, adaptive radix tree, doubly
+  linked list, and hash table, and workloads mixing updates, finds, range
+  queries, and multi-finds over up to 10M keys.
+- The paper reports that versioning overhead is generally low on the
+  tested data structures, that indirection-on-need can improve over the
+  always-indirect version by almost 2x on a read-heavy ART case, and that
+  optimistic software timestamps perform close to hardware timestamps.
+- The range-query comparison shows VERLIB B-trees substantially faster
+  than evaluated linearizable-range-query competitors, largely because the
+  library lets versioning be applied to a cache-friendly high-fanout
+  baseline tree.
+- In oversubscribed thread counts, lock-free-lock versions avoid the
+  severe blocking-lock throughput drop shown in the paper's ART/B-tree
+  scalability plots.
+- Space overhead depends on node granularity. The reported bytes per
+  entry show B-tree overhead small because version metadata is per large
+  node, while smaller-node structures pay more.
+
+**GPU DB mapping:** GPU DB already aims to publish immutable read
+snapshots containing relation identity, schema generation, visibility
+boundary, resident layout identity, device handles, route families, and
+invalidation generation. VERLIB suggests that the publication boundary
+does not always need to be a coarse cloned map or owner-thread message.
+Some read-mostly fields can be published through versioned pointer cells:
+the route root pointer, resident segment directory, per-partition index
+root, plan-cache descriptor, or catalog-generation pointer.
+
+The strongest immediate mapping is "snapshot the route metadata, not the
+world." A network or read worker could enter a route-metadata
+`with_snapshot`, read a small set of versioned roots, validate the
+visibility/invalidation generation, and then enqueue GPU work with a
+compact certificate. That avoids per-query owner hops while preserving a
+linearized view of the metadata needed to prove the route.
+
+Indirection-on-need is useful for stable handle design. GPU DB should not
+make every descriptor lookup pay an extra pointer chase just because rare
+updates need historical versions. A route descriptor can keep the current
+pointer direct, allocate an old-version link only under concurrent
+snapshot/update pressure, and shortcut after retirement. This maps to
+catalog descriptors, resident-buffer handles, and cold-tier manifests.
+
+The idempotent CAS mechanism is less directly applicable but valuable as
+a design pattern. If GPU DB later uses helper threads for hot-key
+operations, release queues, or lock-free metadata maintenance, each helper
+visible state change needs a single success witness. VERLIB uses the
+timestamp transition from `TBD` to real as that witness; GPU DB could use
+generation publication, WAL sequence assignment, or CUDA event completion
+similarly.
+
+Optimistic timestamps also map well to route reads. A retained metadata
+read can often run without advancing a global epoch. Only if it hits a
+currently-being-published descriptor does it need to advance or retry
+under a stronger snapshot boundary. That is a better shape for 1M logical
+sessions than making every route lookup mutate a global snapshot clock.
+
+For resident indexes, VERLIB argues for high-fanout, cache-friendly
+structures with versioned publication points rather than a bespoke
+"snapshot index" that is slow in the non-snapshot case. The GPU DB
+resident-index benchmark should compare direct immutable generation roots
+against per-node versioned roots and always-indirect descriptors.
+
+**Risks and mismatches:** VERLIB is a shared-memory concurrent
+data-structure library, not a database MVCC engine. It does not provide
+SQL transaction isolation, WAL durability, crash recovery, DDL semantics,
+replication, GPU memory safety, or tuple visibility rules.
+
+The values are pointers. GPU DB must not expose raw process pointers as
+SQL-visible identity, WAL content, cross-process handles, or GPU-device
+addresses without a translation layer. Durable row identity still needs
+logical ids, WAL records, and replayable metadata.
+
+The snapshot scope is exactly the selected versioned pointers. Any
+non-versioned fields read inside a route must either be immutable, covered
+by the versioned descriptor, or validated separately. Mixing versioned and
+ordinary fields casually would recreate the stale-route bugs the runtime
+design is trying to avoid.
+
+The evaluation focuses on in-memory CPU data structures. It does not
+measure long SQL readers, snapshot retention across GPU kernels, pinned
+host buffers, device memory pressure, NVMe/object tiers, recovery, or
+schema changes. Its epoch-based reclamation is a prototype choice, not
+proof that epoch reclamation is sufficient for GPU DB.
+
+The optimistic timestamp scheme can rerun the read-only thunk. GPU DB
+route reads must therefore keep snapshot thunks side-effect-free: no
+buffer pin, GPU launch, admission counter mutation, or response emission
+can occur until after the route certificate is accepted.
+
+**Benchmark candidates:**
+
+- Prototype a route-metadata table with versioned pointer cells for
+  catalog generation, resident segment root, and per-partition route
+  descriptor. Compare owner-thread route lookup, immutable cloned maps,
+  direct generation roots, and VERLIB-style versioned cells. Gate:
+  route p50/p99, owner queue pressure, stale-route retries, and retired
+  descriptor bytes are reported.
+- Compare always-indirect descriptors with indirection-on-need under
+  read-heavy route lookup and periodic DDL/residency refresh. Expected
+  result: direct current pointers keep hot reads cache-friendly while
+  old snapshots remain valid. Failure condition: shortcutting creates
+  tail spikes or stale descriptor reuse.
+- Add an optimistic metadata-snapshot benchmark. First pass reads without
+  advancing the route epoch; on publication conflict it reruns under an
+  incremented generation. Gate: global generation mutations per second
+  stay far below route reads per second, and rerun rates are visible.
+- Test versioned resident-index roots for range lookups: immutable root
+  swap only, per-node versioned links, and full cloned index generations.
+  Measure read throughput, update latency, memory overhead, and GPU
+  batch compatibility.
+- Build a side-effect audit for route snapshot thunks. Gate: every field
+  read is immutable, versioned, or post-validated; every side effect is
+  delayed until after certificate acceptance.
+- Stress reclamation with long GPU kernels holding old route snapshots.
+  Compare epoch reclamation, VBR-style validation, and cohort retirement.
+  Failure condition: one long read pins unbounded descriptor or resident
+  metadata history.
+- For helper-based metadata maintenance, define a single success witness
+  per operation: generation assigned, WAL LSN assigned, CUDA event
+  complete, or descriptor timestamp installed. Gate: duplicate helpers
+  cannot double-publish or double-free route state.
+
+### 2026-06-06 - Cross-paper synthesis: publication primitives need retry-safe handles
+
+FineLine, OCC batching, Constant-time Snapshots, Self-tuning Scheduling,
+HDTX, and VERLIB converge on one implementation track: the engine should
+name the exact primitive that proves a state transition, then keep retry
+and cleanup outside the published boundary. FineLine makes recovery an
+indexed log boundary. OCC batching makes conflict order a batch boundary.
+Constant-time Snapshots and VERLIB make read-mostly metadata visible
+through versioned handles. Self-tuning scheduling says route order should
+adapt only inside hard floors. HDTX shows that commit fences can be
+coalesced only when the ordering primitive is explicit.
+
+For GPU DB, the converging design track is a small set of publication
+cells: WAL LSN, visibility generation, catalog generation, residency
+generation, route-descriptor pointer, resident-index root, and release or
+retirement epoch. Reads should assemble certificates from these cells and
+only then launch GPU work or emit responses. Writes may batch and reorder
+inside owner domains, but publication must remain a named fence rather
+than a side effect of queue drain.
+
+Category gaps after this batch are production optimizer integration and
+multi-index SQL snapshot consistency. The queue has many storage,
+runtime, and concurrency mechanisms, but the next high-value reviews
+should test whether planners can consume these certificates without
+turning route selection into an opaque learned policy or a slow owner hop.
+
+Benchmark priorities:
+
+- Build a route-certificate microbenchmark that reads versioned metadata
+  cells, validates WAL/visibility/residency generations, then launches a
+  no-op GPU or CPU route. Measure certificate build cost and retry rate.
+- Add a publication-fence simulator where WAL, visibility, residency,
+  and release fences can be sequential, coalesced, or deferred. Gate:
+  stale reads, double publication, and rollback-after-response are
+  impossible by construction.
+- Compare adaptive route scheduling with and without hard service floors
+  for WAL flush, invalidation, snapshot retirement, and foreground reads.
+- Stress long readers against descriptor reclamation. The pass condition
+  is bounded memory growth with explicit fallback or retry reasons, not
+  only high mean throughput.
