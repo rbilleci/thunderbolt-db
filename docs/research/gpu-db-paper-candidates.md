@@ -6321,14 +6321,15 @@ Append new candidates here as each paper is processed.
   cooperative optimistic retries, neutralization of stalled workers, or a
   simpler epoch contract under 1M-session pressure. Journal entry added
   2026-06-06.
-- `queued` — **Snapshot-Free, Transparent, and Robust Memory Reclamation for
-  Lock-Free Data Structures**, Nikolaev and Ravindran, PLDI 2019.
-  URL: `https://doi.org/10.1145/3314221.3314610`
+- `reviewed` — **Snapshot-Free, Transparent, and Robust Memory Reclamation for
+  Lock-Free Data Structures**, Nikolaev and Ravindran, PLDI 2021.
+  URL: `https://doi.org/10.1145/3453483.3454090`
   arXiv: `https://arxiv.org/abs/1905.07903`
   Why: VBR contrasts reclamation designs by robustness, transparency, and
   fence overhead; Hyaline-style snapshot-free reclamation is a useful
   follow-up for route-publication descriptors and lock-free CPU indexes that
-  should avoid pinning retired state behind long readers.
+  should avoid pinning retired state behind long readers. Journal entry added
+  2026-06-06.
 - `reviewed` — **Publish on Ping: A Better Way to Publish Reservations in Memory
   Reclamation for Concurrent Data Structures**, arXiv 2025.
   URL: `https://arxiv.org/abs/2501.04250`
@@ -6349,3 +6350,11 @@ Append new candidates here as each paper is processed.
   Why: Publish on Ping's related work includes automatic/reference-counting
   style reclamation; useful as a contrast to hazard/epoch designs before GPU
   DB picks a route metadata lifetime scheme.
+- `queued` — **OrcGC: Automatic Lock-Free Memory Reclamation**, Correia,
+  Ramalhete, and Felber, PPoPP 2021.
+  URL: `https://doi.org/10.1145/3437801.3441596`
+  PDF: `https://zenodo.org/records/7886712/files/OrcGC-zenodo.pdf`
+  Why: Hyaline contrasts automatic and reference-counting style reclamation
+  designs; OrcGC is a useful follow-up for deciding whether GPU DB route
+  metadata should remain manually retired by owner domains or hide
+  protection/deallocation in a more automatic descriptor API.

@@ -38,6 +38,160 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Hyaline keeps lock-free metadata retirement off the read hot path
+
+**Citation:** Ruslan Nikolaev and Binoy Ravindran. "Snapshot-Free,
+Transparent, and Robust Memory Reclamation for Lock-Free Data
+Structures." PLDI 2021. DOI:
+`https://doi.org/10.1145/3453483.3454090`. Retrieved 2026-06-06
+from the arXiv author version, `https://arxiv.org/abs/1905.07903`
+and `https://arxiv.org/pdf/1905.07903`.
+
+**Category:** runtime / HFT / session scale, with secondary relevance
+to MVCC / snapshot / visibility and resident route metadata lifetime.
+
+**Relevance tags:** safe memory reclamation; lock-free indexes;
+route descriptor retirement; snapshot-free reclamation; bounded retired
+metadata; stalled threads; reference-counted retirement; dynamic
+threads; oversubscription; read-dominated workloads; retire batching;
+birth eras; hazard-pointer alternative; epoch alternative.
+
+**Core idea:** Hyaline revisits reference counting for safe memory
+reclamation, but moves reference-counter work away from individual
+object reads. Threads announce entry into a protected operation, retired
+objects are linked into shared retirement lists, and reference counters
+are adjusted only as retired batches become eligible for cleanup.
+
+The useful transfer for GPU DB is that route metadata, lock-free CPU
+indexes, placement descriptors, and retired resident-snapshot handles
+do not need to put a write barrier or global snapshot scan on every
+read. Reclamation can be charged to retirement and leave paths, while
+read-only traversals stay close to the cost profile needed for 1M
+logical sessions multiplexed over far fewer physical workers.
+
+**Concrete mechanisms:**
+
+- Hyaline keeps `enter` and `leave` calls around data-structure
+  operations, similar to epoch-based reclamation, but it does not take
+  per-thread snapshots of hazard pointers or eras.
+- Retired nodes carry small headers and are appended to retirement
+  lists. A head tuple tracks the list pointer and active thread count.
+- When a thread enters, it increments the active count for a slot and
+  records the current retirement-list head as its handle.
+- When a thread leaves, it decrements the active count and traverses
+  only the retired sublist between the current head and the handle it
+  observed at entry, decrementing batch reference counters along that
+  range.
+- A node or batch is freed when its retirement reference counter reaches
+  zero. The counter represents threads that could still reach the
+  retired batch, not ordinary object references on every pointer read.
+- The scalable version uses multiple slots, selected randomly or by
+  thread identity, so `enter`/`leave` do not all contend on one global
+  head. Retired batches are inserted into slots with active readers.
+- Batches amortize reclamation metadata. One reference counter can cover
+  at least `k + 1` retired nodes when there are `k` slots.
+- Hyaline requires LL/SC or double-width compare-and-swap in its general
+  form. Hyaline-1 is a specialized single-width-CAS variant where each
+  thread has a unique slot.
+- Hyaline-S and Hyaline-1S add robustness for stalled threads by tagging
+  allocations with birth eras and wrapping pointer reads with `deref`,
+  allowing active threads to avoid slots whose access era is stale.
+- Hyaline-S tracks acknowledgments per slot. If a slot appears occupied
+  by stalled threads beyond a threshold, entering threads choose another
+  slot; the paper also describes adaptive slot-array growth to preserve
+  robustness.
+- The paper proves reclamation safety, lock-freedom, `O(n/k)`
+  reclamation cost for general Hyaline, `O(1)` reclamation cost for
+  Hyaline-1/Hyaline-1S, and bounded memory for robust variants under
+  the paper's stalled-thread model.
+- Evaluation uses linked-list, lock-free hash map, Bonsai tree, and
+  Natarajan-Mittal tree benchmarks up to 144 threads on a 72-core Xeon
+  system. The paper reports Hyaline variants often near EBR throughput,
+  better memory efficiency than epoch/era schemes in read-dominated
+  cases, about 10% Bonsai-tree throughput gain over EBR, and up to 2x
+  gains in oversubscribed hash-map settings.
+
+**GPU DB mapping:** The production runtime wants immutable retained
+read snapshots, route-generation descriptors, placement snapshots,
+response metadata, and CPU-side resident indexes to be shared by many
+read workers while owners publish newer generations. Hyaline suggests a
+metadata-lifetime design where reads enter a lightweight protected
+region, traverse route/index descriptors without per-object write
+publication, and let retirement batches reclaim old generations after
+physical workers have left their protected regions.
+
+This maps especially well to the gap between 1M logical sessions and a
+bounded number of physical execution contexts. GPU DB should not have a
+hazard record per logical session. It should have reclamation state per
+IO worker, read worker, mutation owner, residency owner, or GPU
+execution worker. Logical sessions borrow those contexts; retired route
+metadata is held only by active physical contexts.
+
+Hyaline also gives a concrete alternative to naive epoch reclamation for
+long readers. Basic epoch schemes can pin all retired descriptors behind
+one stalled worker. Robust Hyaline-style birth eras or a Publish-on-Ping
+style prompt could bound retired descriptor growth while keeping the
+common read path close to `enter/read/leave`.
+
+For P8, the same pattern applies to resident segment metadata and CPU
+warm indexes. A mutation, DDL, eviction, or refresh publishes a new
+descriptor and retires the old one in a batch. Actual device buffers,
+pinned host buffers, and index nodes are released only after all active
+physical workers have left the protected generation.
+
+**Risks and mismatches:** Hyaline is a CPU memory-reclamation paper,
+not a database isolation protocol. It does not decide SQL visibility,
+WAL ordering, snapshot validity, or GPU buffer freshness. Those remain
+owner/fence responsibilities.
+
+The general algorithm relies on LL/SC or double-width CAS, and the
+single-width variant gives up some transparency by requiring unique
+slots. Rust implementation choices need careful mapping to available
+atomics, allocator behavior, and ownership types.
+
+Hyaline-S robustness requires pointer reads to go through `deref`.
+That is acceptable for lock-free indexes or route descriptors, but it
+is too invasive for arbitrary application-level references unless the
+engine hides it inside a small descriptor API.
+
+Reclamation work can happen on threads that did not retire the objects.
+That helps balance cleanup, but GPU DB must avoid letting a latency
+sensitive network worker unexpectedly free large GPU or pinned-host
+buffers. Heavy frees may need handoff to a cleanup owner after the
+Hyaline-style proof says the descriptor is unreachable.
+
+The evaluation is on lock-free data structures, not pgwire, SQL
+planning, MVCC chains, CUDA resources, or resident snapshots. Treat the
+throughput results as evidence for reclamation mechanics, not as a
+database latency forecast.
+
+**Benchmark candidates:**
+
+- Prototype route-descriptor reclamation with three policies:
+  epoch-only, hazard-pointer-style protected descriptors, and
+  Hyaline-style batched retirement per physical worker. Gate: read-route
+  hot path reports atomic writes, cache misses if available, retired
+  descriptors, and p50/p99 route lookup latency.
+- Simulate 1M logical sessions over a fixed number of IO/read workers.
+  Expected result: reclamation metadata scales with physical workers,
+  not session count.
+- Add a stalled-worker test where one read worker enters a retained
+  snapshot and stops while owners publish and retire many generations.
+  Gate: robust reclamation keeps retired descriptor memory bounded and
+  new readers continue on newer generations.
+- Separate descriptor retirement from heavy resource freeing. Gate:
+  network/read workers prove descriptors unreachable, but large CUDA or
+  pinned-host buffer release is performed by a cleanup owner with
+  bounded queue telemetry.
+- Compare route lookup under read-dominated and write-heavy generation
+  churn. Failure condition: Hyaline-style leave traversal moves enough
+  work onto p99 read latency that a simpler epoch/fence design is
+  better for the first slice.
+- Add a correctness trace for descriptor lifetime: descriptor id,
+  publication generation, retirement generation, worker enter/leave
+  slot, and final free. Gate: no descriptor or buffer is freed while a
+  worker can still reference it.
+
 ### 2026-06-06 - SkyStore makes cold-tier placement a per-object break-even decision
 
 **Citation:** Shu Liu, Xiangxi Mo, Moshik Hershcovitch, Henric
