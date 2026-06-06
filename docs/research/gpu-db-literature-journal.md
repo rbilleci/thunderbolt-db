@@ -88945,3 +88945,232 @@ isolation, MVCC visibility, GPU kernel launch overhead, WAL durability, or
   work, speculative accepted work, speculative canceled work, retries
   promoted to scheduled, and resource-specific thresholds that caused each
   cancellation.
+
+### 2026-06-06 - MTM makes tier placement a sampled control loop, not a static hot-page rule
+
+**Citation:** Jie Ren, Dong Xu, Junhee Ryu, Kwangsik Shin, Daewoo
+Kim, and Dong Li. "MTM: Rethinking Memory Profiling and Migration
+for Multi-Tiered Large Memory." EuroSys 2024, pages 1064-1078.
+DOI: `10.1145/3627703.3650075`. Retrieved 2026-06-06 from the
+author PDF at `https://pasalabs.org/papers/2024/Eurosys24_M3_Camera_Ready.pdf`;
+metadata checked against the EuroSys 2024 accepted-papers page and
+the ACM DOI.
+
+**Category:** multi-tier cache / data placement, with runtime
+telemetry, future CXL/HBM/DRAM/NVMe tiering, and migration-overhead
+relevance.
+
+**Relevance tags:** multi-tier memory; page profiling; PTE scans;
+DAMON; performance-counter guidance; exponential moving average;
+fast promotion; slow demotion; huge pages; adaptive migration;
+Optane; CXL; tier-placement telemetry; migration critical path.
+
+**Core idea:** MTM argues that large memory systems with more than
+two tiers need placement control that is tied to profiling quality,
+not just a fixed rule that sends the hottest pages to the fastest
+tier. Existing page-management systems often control overhead by
+limiting sampled regions or by migrating only between neighboring
+tiers. On terabyte-scale, multi-tier memory, that can miss hot pages,
+react too slowly to changing access patterns, and spend multiple
+intervals walking data toward the top tier.
+
+The transferable idea for GPU DB is that tier placement should be a
+measured control loop with an explicit overhead budget. GPU DB should
+not rely on one global "hot means HBM" rule or transparent OS page
+movement for route-critical structures. It needs lightweight, bounded
+sampling of route-object heat, a global view across all tiers, direct
+promotion for the highest-value objects, conservative demotion, and
+separate migration mechanisms for read-heavy versus write-heavy
+state.
+
+**Concrete mechanisms:**
+
+- MTM targets multi-terabyte memory systems with more than two tiers
+  that differ in latency and bandwidth. Its motivating hardware is a
+  two-socket Optane-based system that exposes local DRAM, remote
+  DRAM, local persistent memory, and remote persistent memory as four
+  tiers.
+- The paper identifies three coupled problems: page profiling over
+  very large memory is expensive; two-tier or neighbor-only migration
+  abstractions react too slowly across several tiers; and transparent
+  huge pages complicate region formation and migration decisions.
+- MTM controls profiling overhead by budgeting the total number of
+  PTE scans per interval, not by forcing a fixed number of profiled
+  regions. In the evaluation, the default profiling overhead target
+  is 5% and the default profiling interval is 10 seconds.
+- Memory is divided into logical memory regions. Regions can be
+  merged when adjacent regions show similar hotness and split when
+  sampled pages inside a region show high hotness variance. Splitting
+  does not increase the total PTE-scan budget; sample quotas are
+  redistributed.
+- MTM scans sampled PTE access bits multiple times per profiling
+  interval. The paper uses three scans per page sample by default;
+  changing this value affects many migration decisions, while larger
+  values showed little additional benefit in the reported study.
+- Adaptive page sampling gives extra samples to regions with large
+  recent changes in hotness. MTM tracks the top-five largest
+  hotness-variance regions as a lightweight way to decide where the
+  saved sample budget should move.
+- The slowest tier uses performance-counter guidance to quickly find
+  accessed regions before applying higher-quality PTE scanning. The
+  implementation uses Intel PEBS events for persistent-memory loads;
+  the paper notes that similar memory-access events could support
+  other architectures.
+- Placement uses a global view of all regions across all tiers.
+  Hotness is smoothed with an exponential moving average so transient
+  bursts do not immediately force migration. A histogram over region
+  hotness drives promotion and demotion decisions.
+- The migration policy is "fast promotion and slow demotion." Hot
+  regions from lower tiers can be promoted directly to the fastest
+  useful tier instead of walking tier by tier. When space is needed,
+  cold regions are demoted only to the next lower tier with available
+  capacity.
+- For multithreaded programs with different NUMA views, MTM decides
+  the destination tier from the view of the thread that generated the
+  most accesses to a page. It samples access origin with Linux
+  hint-fault support, amortizing that higher cost over PTE scans.
+- MTM is huge-page aware. Profiling recognizes huge-page mappings,
+  and region splitting is aligned so a huge page is not split into
+  two regions with conflicting migration decisions.
+- The migration mechanism chooses between asynchronous and
+  synchronous page copy. It starts with asynchronous copying to keep
+  read-heavy migration off the critical path, but if a write is
+  detected during migration it switches to synchronous migration to
+  avoid repeated copying.
+- The implementation combines a kernel module for profiling with a
+  user-space daemon for policy and a `move_memory_regions()` API for
+  adaptive migration. Profiling results are shared with the daemon
+  through shared memory.
+- Evaluation uses GUPS, VoltDB running TPC-C, Cassandra/YCSB, BFS,
+  SSSP, and Spark TeraSort with working sets from hundreds of GB to
+  1.2 TB. The paper reports MTM outperforming seven alternatives by
+  up to 42% and 17% on average.
+- In the paper's overall results, MTM outperforms hardware-managed
+  memory caching by up to 40%, first-touch NUMA by up to 24%, patched
+  tiered-AutoNUMA by up to 35%, and AutoTiering by up to 42%. The
+  exact gains vary by workload.
+- For VoltDB, MTM records 293M fastest-tier memory accesses in the
+  reported measurement versus 270M for tiered-AutoNUMA and 258M for
+  AutoTiering, suggesting that better profiling translated into more
+  useful placement for the in-memory database workload.
+- The reported memory-management metadata overhead is below 0.01% of
+  workload memory footprint, though still hundreds of MB at TB scale.
+- Ablations show sensitivity to policy details: disabling adaptive
+  memory regions makes VoltDB execution 22% longer, disabling
+  adaptive page sampling loses 21%, disabling profiling-overhead
+  control increases profiling time by 3x, and disabling asynchronous
+  migration increases migration overhead.
+
+**GPU DB mapping:** The first mapping is to replace simple heat
+counters with route-object profiling budgets. GPU DB has objects that
+are smaller and more semantic than OS pages: resident column groups,
+key vectors, route descriptors, plan-cache entries, pinned host
+buffers, decompressed warm segments, cold segment indexes, and old
+snapshot generations. Each object family should expose a bounded
+sample budget, heat signal, placement state, and migration cost rather
+than relying only on LRU or opaque page faults.
+
+The second mapping is a global tier view. MTM's direct promotion
+across four memory tiers maps to HBM, local DRAM, CXL/far memory,
+NVMe-backed warm segments, and future storage tiers. A resident
+snapshot or hot key-vector should be promotable directly from cold or
+warm state when the route benefit justifies rebuild or transfer cost;
+it should not have to pass through a fixed sequence of intermediate
+states if the planner already has enough evidence.
+
+The fast-promotion/slow-demotion rule is a useful cache-manager
+default. Promotion can be aggressive when a route's heat, latency
+regret, and expected reuse are high. Demotion should be conservative
+for published snapshots and route metadata because premature demotion
+can cause latency cliffs, invalidation churn, or forced CPU fallback.
+Demotion should prefer one tier down, with a recoverable mapping and
+telemetry, unless memory pressure requires eviction.
+
+The asynchronous-versus-synchronous migration split maps to GPU DB's
+read-heavy and write-heavy objects. Read-mostly retained snapshots,
+compressed warm segments, and plan descriptors can move or rebuild in
+the background if publication is copy-publish-reclaim and old handles
+remain valid. Mutable write-path objects, WAL buffers, lock/epoch
+metadata, and owner queues need stronger synchronization and should
+not be migrated speculatively on the hot path.
+
+MTM's overhead budget is directly applicable to telemetry. Sampling
+heat, queue pressure, fallback regret, and object access frequency
+must itself have a budget. A profiler that touches every session,
+route, or page under 1M logical sessions can become the bottleneck.
+GPU DB should define per-interval sample quotas per object family and
+move sampling effort toward objects whose heat is changing, whose
+route decisions are uncertain, or whose placement caused recent
+fallbacks.
+
+The huge-page lesson generalizes to fixed-format GPU DB objects:
+sampling and movement boundaries must align with the object being
+moved. Splitting a resident column group, compressed string block,
+or route descriptor slab at an arbitrary page boundary can destroy
+coalesced GPU access, decompression alignment, or snapshot-publication
+invariants. Placement units should be semantic first, page-aligned
+second.
+
+**Risks and mismatches:** MTM is application-transparent OS memory
+management. GPU DB cannot delegate route-critical HBM residency,
+snapshot validity, WAL ordering, or result-buffer ownership entirely
+to OS page migration. The paper informs telemetry and movement policy;
+it does not replace DB-owned placement metadata.
+
+MTM operates at page and memory-region granularity. GPU DB often needs
+relation, partition, column, index, buffer-pool, and snapshot-generation
+granularity. A direct page-level policy could move bytes that the
+planner cannot reason about or fail to move the semantic unit required
+for a valid GPU route.
+
+The paper's migration intervals are seconds-scale and its default
+overhead target is 5%. That is plausible for background tier placement
+but too slow and too expensive for per-query admission, microsecond
+batching, or p99 read-route choices. Hot-path routing needs cached
+decisions and much cheaper telemetry.
+
+The evaluation includes VoltDB/TPC-C, which is valuable, but MTM is
+not a transactional storage-engine paper. It does not address MVCC
+visibility, WAL-before-visibility, snapshot retirement, GPU kernel
+scheduling, or pgwire/session fan-in.
+
+Optane-era four-tier behavior may not match future CXL, HBM, NVMe,
+or GPU-direct storage behavior. The policy shape is transferable, but
+the thresholds, migration sizes, and access counters must be
+recalibrated on the target hardware.
+
+**Benchmark candidates:**
+
+- Build a route-object heat profiler with an explicit overhead budget.
+  Track sampled accesses for resident snapshots, key vectors, CPU warm
+  indexes, compressed segments, route descriptors, and pinned buffers.
+  Gate: telemetry stays below a fixed CPU budget and never adds owner
+  queue contention to read-only retained routes.
+- Compare four placement policies for retained reads: LRU, simple hot
+  counter, MTM-style EMA with direct promotion and slow demotion, and
+  planner-regret-aware placement. Measure p50/p99 latency, HBM hit
+  rate, CPU fallback rate, refresh traffic, and demotion-induced
+  latency cliffs.
+- Add a multi-tier replay with HBM, DRAM, emulated CXL/far memory, and
+  NVMe. Promotion may jump directly to HBM when route heat justifies
+  it; demotion moves one tier at a time unless hard pressure forces
+  eviction. Failure condition: direct promotion improves hit rate but
+  causes refresh or transfer work to dominate query latency.
+- Split object movement by mutability. Read-mostly snapshots and
+  column groups use copy-build-publish-retire; write-path objects,
+  WAL buffers, and owner queues require synchronous ownership
+  transfer or are declared nonmovable. Gate: no stale snapshot handle,
+  WAL record, or route descriptor can observe partially moved state.
+- Test adaptive sampling under changing workloads. Move sample budget
+  toward route families with high heat variance or high fallback
+  regret. Compare against uniform sampling at equal overhead.
+- Add semantic alignment checks for movement units: column group,
+  compressed text block, resident key vector, and descriptor slab.
+  Failure condition: a placement or demotion operation splits an object
+  in a way that invalidates GPU coalescing, decompression, or snapshot
+  publication invariants.
+- Evaluate telemetry intervals separately for control planes:
+  microsecond queue telemetry, millisecond route-regret counters,
+  second-scale tier migration, and minute-scale placement policy
+  recalibration. Gate: slower tier-control loops never block the
+  scheduled request lane.

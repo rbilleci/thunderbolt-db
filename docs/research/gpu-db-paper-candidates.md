@@ -5985,12 +5985,27 @@ Append new candidates here as each paper is processed.
   Why: NeoMem frames frequency-sensitive page promotion as the central CXL
   tiering challenge; useful for comparing software frequency estimation with
   device-side hot-page telemetry before relying on OS-transparent placement.
-- `queued` — **MTM: Rethinking Memory Profiling and Migration for Multi-Tiered
+- `reviewed` — **MTM: Rethinking Memory Profiling and Migration for Multi-Tiered
   Large Memory**, Ren et al., EuroSys 2024.
-  URL: `https://doi.org/10.1145/3627703.3650074`
+  URL: `https://doi.org/10.1145/3627703.3650075`
+  PDF: `https://pasalabs.org/papers/2024/Eurosys24_M3_Camera_Ready.pdf`
   Why: HybridTier omits end-to-end comparison because source was unavailable at
   submission; MTM is a modern multi-tier profiling/migration baseline for
   comparing DB-owned placement against application-transparent page movement.
+  Journal entry added 2026-06-06; DOI corrected during review.
+- `queued` — **Cori: Dancing to the Right Beat of Periodic Data Movements over
+  Hybrid Memory Systems**, Doudali, Zahka, and Gavrilovska, IPDPS 2021.
+  URL: `https://doi.org/10.1109/IPDPS49936.2021.00043`
+  Why: MTM cites Cori as related periodic data-movement work; useful for
+  comparing phase-aware movement cadence and migration timing against GPU DB's
+  tier-control loops and refresh/demotion intervals.
+- `queued` — **Kleio: A Hybrid Memory Page Scheduler with Machine
+  Intelligence**, Doudali, Blagodurov, Vishnu, Gurumurthi, and Gavrilovska,
+  HPDC 2019.
+  URL: `https://doi.org/10.1145/3307681.3325408`
+  Why: MTM cites ML-assisted hybrid-memory scheduling; useful contrast before
+  GPU DB uses learned placement or route-regret signals for HBM/DRAM/future-tier
+  object migration.
 - `reviewed` — **FlexMem: Adaptive Page Profiling and Migration for Tiered
   Memory**, Xu et al., USENIX ATC 2024.
   URL: `https://www.usenix.org/conference/atc24/presentation/xu-dong`
