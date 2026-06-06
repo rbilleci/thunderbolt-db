@@ -38,6 +38,174 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - SmartQueue treats cache residency as scheduler state
+
+**Citation:** Chi Zhang, Ryan Marcus, Anat Kleiman, and Olga
+Papaemmanouil. "Buffer Pool Aware Query Scheduling via Deep
+Reinforcement Learning." arXiv:2007.10568v3, 2022 extended abstract
+of the 2020 work. Retrieved 2026-06-06 from
+`https://arxiv.org/abs/2007.10568` and PDF
+`https://arxiv.org/pdf/2007.10568`.
+
+**Category:** query optimization / planning and multi-tier cache /
+data placement, with secondary runtime / session-admission relevance.
+
+**Relevance tags:** buffer-aware scheduling; deep reinforcement
+learning; query queue ordering; residency telemetry; buffer-hit reward;
+query read-set features; cache reuse; planner state; SLA-aware reward;
+GPU/host/NVMe route scheduling.
+
+**Core idea:** SmartQueue asks a narrow but useful scheduling question:
+given a queue of queries, the current buffer-pool contents, and an
+estimate of each query's block reads, can the system reorder queued
+queries to increase long-term cache hits instead of greedily executing
+the query with the best immediate reuse? The prototype frames that as a
+deep Q-learning problem. Actions are candidate queries, state is buffer
+residency plus per-query read predictions, and reward is the executed
+query's buffer-hit ratio.
+
+For GPU DB, the transferable idea is not the particular neural network.
+It is the representation boundary: route scheduling should see explicit
+residency and expected-footprint features. A scheduler choosing among
+retained GPU reads, CPU reads, refresh work, and cold-tier fetches should
+not optimize only by query age or estimated standalone cost; it should
+also account for what executing now keeps warm for the next compatible
+requests.
+
+**Concrete mechanisms:**
+
+- Incoming queries are held in an execution queue. The scheduler chooses
+  the next query to execute, then observes the new buffer state and the
+  realized buffer-hit reward.
+- Buffer state is represented as a relation-by-block bitmap. Because
+  full tables can contain many blocks, relation rows are downsampled by
+  a moving-average-style aggregation into fixed-size vectors.
+- Query state is a bitmap-like vector estimating which base-relation and
+  index blocks a query will access. The prototype derives this from
+  PostgreSQL `EXPLAIN` plans without executing the query.
+- Full scans mark all blocks of a relation as likely reads. Index scans
+  estimate accessed tuples from selectivity, assume uniform tuple
+  placement across blocks, and mark base-relation and index-block
+  probabilities accordingly.
+- SmartQueue models scheduling as a Markov decision process. Executing
+  one query transitions the buffer pool to a new state, and the reward is
+  `buffer hits / total block requests` for that query.
+- The Q-value combines immediate reward with discounted future reward,
+  using the usual learning-rate and discount-factor knobs to trade off
+  short-term buffer reuse against longer-term cache-shaping effects.
+- The prototype uses a fully connected Keras network with two hidden
+  layers of 128 neurons, Adam, and mean squared error loss.
+- The evaluation uses 1,000 random TPC-DS query instances over a 49 GB
+  PostgreSQL database on a 4-core, 32 GB server, with PostgreSQL shared
+  buffers set to 2 GB and OS filesystem cache bypassed.
+- Compared with first-come-first-served and a greedy immediate-hit
+  scheduler, the paper reports that after training SmartQueue reaches a
+  buffer-hit ratio about 65% higher than FCFS and 35% higher than
+  Greedy, and completes the 1,000-query workload about 55% faster than
+  FCFS and 42% faster than Greedy.
+- For unseen TPC-DS templates, the reported average hit ratio increases
+  from 0.2 when untrained to 0.64 after training on 950 queries; unseen
+  queries are eventually 11% faster than FCFS and 22% faster than
+  Greedy in the reported setup.
+- The prototype overhead is high: training 950 queries takes about 240
+  minutes, or 3.95 minutes per query on average, and inference takes
+  about 3.12 seconds versus 2.52 seconds for Greedy and 0.0012 seconds
+  for FCFS.
+- The authors explicitly list future directions that matter here:
+  better network architectures, SLA-aware reward signals, optimizer
+  integration so plan choice depends on buffer state, and combined query
+  scheduling plus buffer-management decisions.
+
+**GPU DB mapping:** GPU DB already wants route certificates that include
+catalog generation, visibility boundary, residency generation, resident
+layout, supported predicates, queue saturation, and fallback reasons.
+SmartQueue adds one more class of features: expected residency footprint
+and reuse value. A retained read route should expose which GPU columns,
+host segments, cold objects, or indexes it will touch, and a scheduler
+should be able to group or defer work when that improves future reuse
+without breaking latency floors.
+
+The first practical mapping is deterministic before learned. Build
+bitsets or compact sketches for resident GPU column groups, CPU hot
+segments, and NVMe/object extents. Attach expected-footprint sketches to
+planned routes. Then compare FCFS, immediate-residency greedy, and a
+bounded lookahead policy before adding any DRL model.
+
+For micro-batching, the paper supports batching by physical footprint in
+addition to query shape. Two queries with the same SQL shape but
+different partitions may not share residency. Two different aggregate or
+lookup shapes might still reuse the same resident column group, cold
+segment, or index page. The scheduler should therefore record both
+logical compatibility and tier-footprint compatibility.
+
+For 1M logical sessions, the scheduler must not require per-session
+model inference. The mapping should be per active runtime domain or per
+drained queue window: compute route features once, group compatible
+requests, and decide a small number of next batches. Learned policy can
+rank batches or adjust weights; owner domains still enforce
+WAL-before-visibility, snapshot validity, queue caps, and SLO floors.
+
+For optimizer integration, SmartQueue's future-work note is directly
+useful. CPU/GPU route choice should account for current residency: a
+plan with a higher standalone cost can be better if its columns are
+already resident or if it warms a segment needed by queued work. But the
+planner should consume explicit telemetry rather than letting a learned
+scheduler silently mutate correctness-related route choices.
+
+**Risks and mismatches:** The paper is an extended abstract and proof of
+concept, not a production scheduler. Its workload is TPC-DS analytics on
+a single PostgreSQL instance, so it does not prove behavior for OLTP,
+mixed reads/writes, MVCC snapshots, WAL flushes, DDL, GPU kernels,
+multi-tenant session caps, or cold object storage.
+
+The reward optimizes buffer-hit ratio. GPU DB needs a multi-objective
+reward or hard constraints: read latency, write admission, WAL flush,
+resident invalidation, refresh freshness, GPU memory pressure, pinned
+buffer budgets, and fairness cannot be reduced to cache hits alone.
+
+The read-set estimates are coarse. Uniform block assumptions and
+downsampled bitmaps may be enough for broad scans, but hot-key lookups,
+skewed partitions, compressed encodings, and resident GPU columns need
+more precise route sketches.
+
+The reported training and inference overheads are far too high for a hot
+path. Any learned version must run offline, asynchronously, or at batch
+granularity, with deterministic fallbacks when the model is cold, slow,
+or out of distribution.
+
+Reordering queries can damage tail latency or freshness. GPU DB must
+keep explicit service floors for WAL/invalidation/refresh, per-session
+deadlines, and old-snapshot retirement; cache-aware ordering is an
+admission hint, not a license to starve writes or long-waiting reads.
+
+**Benchmark candidates:**
+
+- Build a route-footprint scheduler benchmark with FCFS,
+  immediate-residency greedy, bounded lookahead, and optional offline
+  learned ranking. Gate: GPU-resident hit rate, host/NVMe bytes, p50/p99
+  latency, and starvation counters are reported together.
+- Represent each route by compact sketches for GPU column groups, CPU
+  segments, index pages, and cold objects. Measure feature-build cost and
+  scheduling decision cost under 1K, 10K, and 100K queued logical
+  requests.
+- Add hard service floors for WAL flush, invalidation, refresh, and
+  foreground reads to a cache-aware scheduler. Failure condition:
+  residency reuse improves means while write or refresh p99 violates the
+  configured floor.
+- Compare query-shape batching with physical-footprint batching. Expected
+  result: shape batching wins for kernel reuse, footprint batching wins
+  for cold/warm tier reuse, and the combined policy exposes the tradeoff.
+- Test route-aware plan choice under changing residency: CPU path, GPU
+  resident scan, GPU cold-transfer path, and CPU index path. Gate: the
+  planner explains whether current residency changed the selected route.
+- Stress skewed lookups where uniform block-read estimates are wrong.
+  Gate: route sketches or feedback detect the mismatch and fall back to a
+  conservative scheduler before p99 collapses.
+- Run an asynchronous model update experiment: deterministic scheduler on
+  the hot path, background learner updates weights, and model decisions
+  are accepted only when inference stays below a microsecond or batch
+  budget.
+
 ### 2026-06-06 - FORD makes remote durable transactions a round-trip budget
 
 **Citation:** Ming Zhang, Yu Hua, Pengfei Zuo, and Lurong Liu.

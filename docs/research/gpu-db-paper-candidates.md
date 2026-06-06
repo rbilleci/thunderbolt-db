@@ -402,12 +402,20 @@ Append new candidates here as each paper is processed.
   deciding whether GPU DB's read runtime should tune queue order by observed
   latency, cache locality, and short-query priority. Journal entry added
   2026-06-06; the DOI was corrected to `10.1145/3448016.3457260`.
-- `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
+- `reviewed` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
   Learning**, Zhang, Marcus, Kleiman, and Papaemmanouil, arXiv 2020.
   URL: `https://arxiv.org/abs/2007.10568`
   Why: Laser cites it as buffer-pool-aware scheduling; useful for contrasting
   learned buffer reuse against deterministic residency metadata and route
-  certificates.
+  certificates. Journal entry added 2026-06-06 from arXiv v3.
+- `queued` — **SkinnerDB: Regret-Bounded Query Evaluation via Reinforcement
+  Learning**, Trummer et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p2074-trummer.pdf`
+  DOI: `https://doi.org/10.14778/3229863.3236263`
+  Why: SmartQueue cites SkinnerDB as reinforcement-learning query execution
+  work; useful for contrasting queue-level cache-aware scheduling with
+  intra-query adaptive join-order switching and regret-bound-driven route
+  exploration.
 - `queued` — **Quickstep: A Data Platform Based on the Scaling-up Approach**,
   Patel et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p663-patel.pdf`
@@ -5287,13 +5295,15 @@ Append new candidates here as each paper is processed.
   hyperparameters; AutoCE is a follow-up for choosing route-estimator families
   by workload, robustness, and training cost instead of adopting one learned
   model globally.
-- `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
+- `reviewed` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
   Learning**, Zhang et al., AIDB@VLDB 2020.
   URL:
   `https://drive.google.com/file/d/1trNYAcQ3S71SHu5dbtkBR2hjcK-dIHt21c-/view`
   Why: Stage identifies buffer-pool and cache state as hard-to-featurize
   environment factors; useful for comparing learned scheduling with explicit
-  GPU/host/NVMe residency telemetry and cache-aware admission.
+  GPU/host/NVMe residency telemetry and cache-aware admission. Duplicate
+  queue entry marked reviewed on 2026-06-06; journal entry uses the arXiv v3
+  source at `https://arxiv.org/abs/2007.10568`.
 - `reviewed` — **Auto-WLM: Machine Learning Enhanced Workload Management in
   Amazon Redshift**, Saxena et al., SIGMOD Companion 2023.
   URL: `https://doi.org/10.1145/3555041.3589677`
