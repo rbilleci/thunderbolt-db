@@ -38,6 +38,158 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Adaptive filters beat brittle route confidence without training
+
+**Citation:** Yunjia Zhang, Yannis Chronis, Jignesh M. Patel, and
+Theodoros Rekatsinas. "Simple Adaptive Query Processing vs. Learned Query
+Optimizers: Observations and Analysis." PVLDB 2023; extended VLDB Journal
+34:62, 2025. DOI: `10.1007/s00778-025-00936-6`. Retrieved 2026-06-06 from
+the open Springer PDF after the VLDB PDF endpoint timed out from the cron
+worker.
+
+**Category:** query optimization / planning, with runtime scheduling and
+GPU route-choice relevance.
+
+**Relevance tags:** adaptive query processing; learned query optimizer
+baseline; LIP; lookahead bloom filters; adaptive join algorithm; runtime
+statistics; join-order robustness; physical-operator switching; CTE/subplan
+support; no training step; interpretable route fallback.
+
+**Core idea:** The paper asks whether reinforcement-learning query optimizers
+are the only good way to avoid bad plans. Its answer is no: a simple adaptive
+execution layer combining Lookahead Information Passing (LIP) with an
+Adaptive Join Algorithm (AJA) can match or beat representative learned query
+optimizers on several benchmarks, while needing no training and remaining
+usable on query shapes that the learned optimizers cannot currently handle.
+
+The GPU DB lesson is that route choice should not overtrust a learned or
+static cost model when cheap runtime signals can repair the decision in flight.
+For retained GPU routes, the first production layer should expose adaptive,
+bounded, interpretable corrections such as filter pushdown, route pruning,
+operator switching, and CPU/GPU fallback before relying on opaque learned
+route selection.
+
+**Concrete mechanisms:**
+
+- LIP takes a physical plan from any optimizer and injects lookahead bloom
+  filters into equijoin pipelines. A selective predicate on one table can
+  build a bloom filter over join keys and probe that filter earlier on another
+  table lower in the pipeline, reducing tuples passed into later joins even
+  when the original join order is not ideal.
+- If multiple LIP filters apply to a table, their probe order is adapted using
+  runtime pruning statistics so more selective filters run earlier. Filters
+  that prune too little can be disabled and periodically re-evaluated.
+- The PostgreSQL prototype builds bloom filters through extension functions in
+  shared memory so parallel workers can build and probe them. The reported
+  configuration uses a target false-positive rate of 0.01, a key threshold of
+  `10^7`, seven hash functions, and about 11 MiB per bloom filter.
+- LIP uses two planning/build heuristics: skip a filter when the source
+  predicate is not expected to prune enough join keys, and skip it when the
+  filter cannot be pushed at least one level down the pipeline. At runtime it
+  measures pruning over an initial row window, disables weak probes for a
+  larger window, then checks again.
+- AJA starts a join as a hash join, observes the size of the built hash table,
+  and switches to index nested-loop join when an index exists and the built
+  side is below a threshold. Without a suitable index, it can switch to simple
+  nested loop only at a much smaller threshold. Otherwise it continues as a
+  normal hash join.
+- The paper tunes AJA thresholds with a one-join grid search. In the described
+  PostgreSQL setup, the threshold for index nested loop is 500,000 built-side
+  keys, while the simple nested-loop threshold is 1.
+- The implementation is intentionally simple: LIP is a PostgreSQL extension
+  driven by query rewrites, while AJA is simulated using true runtime
+  cardinalities and PostgreSQL execution hints. The paper explicitly marks a
+  full in-engine AJA implementation as future work.
+- Evaluation compares LIP+AJA with PostgreSQL, Balsa, Bao, learned
+  cardinality estimators, and true-cardinality injection across JOB, Stack,
+  STATS-CEB, IMDB-CEB, TPC-H complex queries, and TPC-DS complex queries.
+- Reported results show LIP+AJA matching or outperforming Balsa/Bao in many
+  cases: for example, 2.0x PostgreSQL improvement on JOB-Slow versus 1.4x for
+  Balsa and Bao, up to 3.6x improvement on IMDB-CEB-Slow, and 403 seconds for
+  selected TPC-DS complex queries versus more than five hours for PostgreSQL.
+- Learned or true cardinality estimates help slow queries but do not guarantee
+  faster plans when the rest of the optimizer and cost model remain unchanged.
+  The paper reports LIP+AJA outperforming PostgreSQL even with injected true
+  cardinalities on the evaluated STATS-CEB slow workload.
+- Runtime overhead is real. LIP's bloom-filter build/probe work accounts for
+  26% of LIP+AJA runtime on JOB-Rand and 18% on JOB-Slow in the prototype, and
+  weak filters can slow already-fast queries. AJA overhead is reported below
+  1% on JOB because switching happens only when the built side is small.
+
+**GPU DB mapping:** GPU DB's route planner should treat learned ranking and
+static cost estimates as advisory, then attach cheap adaptive operators that
+can correct a route after seeing real cardinality, pruning, queue, and tier
+signals. For retained joins, LIP maps to route-local runtime filters: build
+compact key or predicate summaries from selective resident fragments, push
+them ahead of H2D transfer or downstream GPU kernels, and reorder probes by
+observed pruning per microsecond.
+
+AJA maps to CPU/GPU and operator-family switching. A route can begin by
+preparing a GPU hash or scan path, then switch to CPU index lookup, GPU
+resident lookup, or a smaller nested probe when the built-side key vector or
+result estimate crosses a measured threshold. The switch must use stable
+progress descriptors and explicit result-fragment contracts so rows are not
+lost or duplicated.
+
+The paper also argues for a first-class "adaptive but explainable" layer over
+any learned route model. GPU DB can start with deterministic thresholds:
+filter build bytes, expected H2D bytes avoided, bloom false-positive rate,
+row-window pruning rate, GPU queue wait, resident snapshot age, and CPU index
+availability. Those signals are easier to audit than an opaque model and can
+feed learned ranking later.
+
+For 1M logical sessions, the strongest transfer is admission simplicity.
+Runtime filters and operator switching should be attached to batch/route
+families, not each session as heavyweight state. The adaptive state can live
+in execution-owner memory as small counters, filter descriptors, and route
+thresholds shared by compatible requests.
+
+**Risks and mismatches:** The paper targets analytical equijoin workloads and
+PostgreSQL-style execution, not OLTP writes, MVCC visibility, WAL-before-
+visibility, DDL invalidation, GPU memory management, or session admission at
+large scale.
+
+LIP bloom filters are safe only when they are semijoin filters over equality
+keys and false positives cannot drop valid rows. GPU DB must be careful with
+SQL NULL semantics, outer joins, non-equality predicates, collations, text
+prefix routes, and snapshot-specific visibility masks before pushing filters
+across operators or tiers.
+
+The prototype scans inputs twice to build filters and uses extension-level
+probe functions, so its exact overheads are not a production cost model. GPU
+DB needs in-engine filter construction and GPU-aware measurements before
+assuming the same thresholds or speedups.
+
+AJA in the paper is simulated rather than fully implemented. GPU DB should not
+claim adaptive route switching is cheap until it accounts for CUDA launch
+costs, pinned-buffer lifetime, transfer cancellation, result scattering, and
+response ordering.
+
+**Benchmark candidates:**
+
+- Build a retained-route LIP benchmark: generate compact runtime filters from
+  selective resident fragments, push them before GPU scans or H2D transfer,
+  and measure rows pruned, bytes avoided, filter overhead, and p99 latency.
+  Gate: weak filters deactivate automatically and never change query results.
+- Add an adaptive CPU/GPU join operator simulator with AJA-style thresholds:
+  switch among CPU index lookup, GPU hash probe, GPU resident scan, and CPU
+  fallback after observing built-side key counts and queue/tier telemetry.
+  Failure condition: switching loses or duplicates rows.
+- Compare static planner, learned route ranker, and deterministic adaptive
+  LIP+AJA-style corrections on stale statistics and skewed predicates.
+  Measure wrong-route time, training cost, p50/p99 latency, and explanation
+  quality for each final route.
+- Test route-filter state sharing across compatible sessions. A batch owner
+  should build one filter for a snapshot/query family and reuse it across many
+  logical requests without per-session heavyweight state.
+- Add a fast-query overhead guard: disable adaptive filters when estimated
+  route latency is below a configured budget unless early telemetry proves the
+  filter is pruning enough work.
+- Verify SQL edge cases for pushed filters: NULLs, duplicate-preserving joins,
+  outer joins, text collations, prefix predicates, and snapshot visibility
+  masks. Proof gate: adaptive filters can only remove rows that a later join
+  predicate would have removed under the same snapshot.
+
 ### 2026-06-06 - Multiverse versions only when long readers prove they need it
 
 **Citation:** Gaetano Coccimiglio, Trevor Brown, and Srivatsan

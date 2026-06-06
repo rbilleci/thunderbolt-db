@@ -433,14 +433,30 @@ Append new candidates here as each paper is processed.
   Why: LSched contrasts Decima's black-box DAG scheduling with DB-specific
   physical-plan features; useful as a control point for what should remain
   outside GPU DB's hot scheduler when learned policies are evaluated.
-- `queued` — **Simple Adaptive Query Processing vs. Learned Query
+- `reviewed` — **Simple Adaptive Query Processing vs. Learned Query
   Optimizers: Observations and Analysis**, Zhang et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2962-zhang.pdf`
   DOI: `https://doi.org/10.14778/3611479.3611500`
   Why: discovered while reviewing SkinnerDB; modern comparison of simple
   adaptive query processing and learned optimizers, useful for deciding when
   GPU DB route choice should rely on deterministic adaptive probes instead of
-  a learned policy.
+  a learned policy. Journal entry added 2026-06-06 from the open-access VLDB
+  Journal 2025 extended paper after the VLDB PDF endpoint timed out from the
+  cron worker.
+- `queued` — **Lemo: A Cache-Enhanced Learned Optimizer for Concurrent
+  Queries**, Mo et al., SIGMOD/PACMMOD 2024.
+  URL: `https://dl.acm.org/doi/10.1145/3654972`
+  Author page: `https://mlxdb.github.io/publication/sigmod24-lemo/`
+  Why: the adaptive-query-processing paper identifies Lemo as a newer learned
+  optimizer for concurrent queries; useful for comparing learned cache sharing
+  and multi-query route selection with deterministic batch-owner filter reuse
+  and GPU residency telemetry.
+- `queued` — **LIMAO: A Framework for Lifelong Modular Learned Query
+  Optimization**, Zhang et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p4546-zhang.pdf`
+  Why: discovered while checking newer learned-optimizer follow-ups; useful
+  for contrasting reusable learned sub-plan knowledge with GPU DB's explicit
+  route descriptors, adaptive thresholds, and no-training fallback path.
 - `queued` — **SkinnerDB: Regret-bounded Query Evaluation via Reinforcement
   Learning**, Trummer et al., ACM TODS 2021.
   URL: `https://doi.org/10.1145/3464389`
