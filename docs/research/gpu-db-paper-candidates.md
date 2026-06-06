@@ -5813,12 +5813,12 @@ Append new candidates here as each paper is processed.
   Why: Flowcut contrasts with ConWeave's switch-side in-network reordering;
   useful for comparing endpoint/NIC pause-and-reroute against fabric-buffered
   reordering when future GPU DB gateways need in-order high-throughput flows.
-- `queued` — **When Cloud Storage Meets RDMA**, Gao et al., NSDI 2021.
+- `reviewed` — **When Cloud Storage Meets RDMA**, Gao et al., NSDI 2021.
   URL: `https://www.usenix.org/conference/nsdi21/presentation/gao`
   Why: ConWeave cites it as production-scale cloud-storage RDMA context;
   useful for understanding real RDMA service mixes, CPU offload, and
   storage/network tail-latency interactions before GPU DB considers
-  RDMA-connected storage or gateway paths.
+  RDMA-connected storage or gateway paths. Journal entry added 2026-06-06.
 - `reviewed` — **Backpressure Flow Control**, Goyal et al., NSDI 2022.
   URL: `https://www.usenix.org/conference/nsdi22/presentation/goyal`
   Why: ConWeave discusses switch resource exhaustion and cites backpressure
@@ -5998,6 +5998,12 @@ Append new candidates here as each paper is processed.
   Why: EQDS names Aeolus as a Homa-like proactive transport option; useful for
   comparing receiver-driven low-latency request/response transport with GPU
   DB's command-ring credits and micro-batch admission.
+- `queued` — **Rogue: RDMA over Generic Unconverged Ethernet**, Le, Stephens,
+  Singhvi, Akella, and Swift, SoCC 2018.
+  URL: `https://doi.org/10.1145/3267809.3267828`
+  Why: Pangu flags PFC-free and lossy RDMA as future production directions;
+  useful before GPU DB assumes lossless fabrics, PFC, or switch tuning for
+  accelerator/storage network paths.
 - `queued` — **REWIND: Recovery Write-Ahead System for In-Memory
   Non-Volatile Data-Structures**, Chatzistergiou, Cintra, and Viglas,
   PVLDB 2015.

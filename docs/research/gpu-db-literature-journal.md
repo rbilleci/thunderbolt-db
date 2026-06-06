@@ -76593,3 +76593,218 @@ Benchmark priorities:
   version-tagged route descriptors. Gate: old readers can finish or restart
   safely, new readers cannot observe unpublished segments, and restart can
   rebuild volatile route metadata.
+
+### 2026-06-06 - Pangu makes RDMA a fast path with TCP as the safety valve
+
+**Citation:** Yixiao Gao, Qiang Li, Lingbo Tang, Yongqing Xi, Pengcheng
+Zhang, Wenwen Peng, Bo Li, Yaohui Wu, Shaozong Liu, Lei Yan, Fei Feng,
+Yan Zhuang, Fan Liu, Pan Liu, Xingkui Liu, Zhongjie Wu, Junping Wu, Zheng
+Cao, Chen Tian, Jinbo Wu, Jiaji Zhu, Haiyong Wang, Dennis Cai, and
+Jiesheng Wu. "When Cloud Storage Meets RDMA." NSDI 2021, pp. 519-533.
+Retrieved 2026-06-06 from USENIX
+`https://www.usenix.org/conference/nsdi21/presentation/gao`.
+PDF: `https://www.usenix.org/system/files/nsdi21-gao.pdf`.
+
+**Category:** runtime / HFT / session scale, with multi-tier storage,
+networked storage, and tail-latency relevance.
+
+**Relevance tags:** RDMA; cloud storage; user-space storage stack;
+NVMe; zero copy; scatter-gather DMA; CRC offload; run-to-completion;
+queue pairs; shared links; bounded failure domains; TCP fallback; PFC
+storms; dual-home topology; failover; slow I/O monitoring; storage-level
+SLA; RDMA/TCP route switching; gateway admission.
+
+**Core idea:** Alibaba's Pangu storage system treats RDMA as a production
+fast path, not as an unconditional correctness dependency. The paper
+describes four years of deploying RDMA inside a large cloud storage system
+whose disks and storage-class memory made the network the bottleneck.
+The transferable lesson is the shape of the contract: use RDMA, user-space
+storage, zero-copy layouts, offload, and run-to-completion execution where
+they buy microsecond latency and high throughput, but keep a TCP escape
+path, monitoring, and storage-level failover semantics so fabric problems
+degrade service instead of freezing storage.
+
+For GPU DB, that argues against baking RDMA, GPUDirect Storage, or any
+future accelerator-fabric path into the correctness surface. A retained
+route can say "RDMA/local-NVMe/remote-storage fast path is currently
+valid"; it must also have a measured CPU/TCP/local fallback or an explicit
+overload/retry result when the fast path loses its proof.
+
+**Concrete mechanisms:**
+
+- Pangu organizes block storage around clients, BlockServers, ChunkServers,
+  and master metadata services. Virtual block-device segments are mapped to
+  BlockServers, split into blocks, and replicated to ChunkServers that own
+  local device management.
+- Storage RPCs can use multiple channels: RDMA, kernel TCP, user-space TCP,
+  or shared memory. This lets the storage system choose transport by
+  deployment domain and failure state rather than forcing one transport
+  everywhere.
+- RDMA is enabled only within a podset and among storage nodes, keeping the
+  failure domain smaller than a whole Clos fabric. Computing-to-storage
+  traffic uses a private user-space TCP path because compute hardware
+  changes rapidly and TCP is easier to upgrade and manage.
+- Node and network configuration are balanced so SSD throughput and network
+  bandwidth match. Example production configurations include 25 Gbps nodes
+  with 12 SSDs and 100 Gbps nodes with 14 SSDs, avoiding a storage node
+  that is permanently bottlenecked on either disks or network.
+- The hybrid service keeps TCP as the last-resort transport. If availability
+  or SLA is threatened, affected links can move from RDMA to TCP without
+  disrupting unaffected RDMA links.
+- Kernel TCP traffic initially caused many TX pause frames even when RDMA
+  and TCP were isolated by priority queues. The diagnosed cause was kernel
+  TCP creating too many partial writes on the NIC PCIe bus, slowing the NIC
+  receive pipeline. Mitigations included disabling LRO, NUMA-aware memory
+  access, larger RDMA buffers on the RNIC, and cacheline-aligned application
+  data.
+- In hybrid deployment tests with shifting RDMA/TCP traffic ratios, average
+  BlockServer throughput fell only minimally as the TCP share increased.
+  Average latency under all-RDMA traffic was roughly half of all-TCP
+  latency, and all-TCP tail latency was more than 10x worse than all-RDMA.
+- Pangu's user-space storage software stack bypasses kernel crossings and
+  uses polling for NVMe completions. The paper reports more than 5x average
+  CPU-efficiency improvement from the user-space storage platform and
+  4-10x IOPS improvement for its user-space SSD file-system layer compared
+  with Ext4 for tested block sizes.
+- The storage and RDMA stack uses a run-to-completion thread model: a server
+  thread polls the RPC framework, processes the ChunkServer operation, and
+  submits user-space NVMe work. Large I/O requests are split or auxiliary
+  formatting/CRC work is moved to non-I/O threads to preserve fast response
+  to I/O signals. Typical 4 KB storage requests are reported below 30 us.
+- Data is represented as I/O vectors and sent with scatter-gather DMA using
+  a single RDMA verb. RDMA semantics avoid ordinary serialization and copy
+  steps.
+- At 100 Gbps, memory bandwidth became the bottleneck rather than network or
+  SSD bandwidth. A measured workload used about 57 GB/s of memory bandwidth
+  against a 61 GB/s maximum under the reported read/write test, motivating
+  removal of copy and checksum traffic.
+- Pangu uses RNIC user-mode memory registration to place incoming data
+  directly into the storage format: 4 KB data, a 4 B CRC footer, and a 44 B
+  gap. CRC can also be offloaded to capable RNICs. The reported optimization
+  reduces memory bandwidth by more than 30% and improves single
+  ChunkServer-thread throughput by about 200% for 128 KB blocks.
+- Full-mesh queue-pair topology caused a queue-pair explosion. In the paper's
+  example, 100 storage nodes with 14 ChunkServer threads and 8 BlockServer
+  threads could create 22,176 QPs per node, stressing RNIC caches and
+  increasing pause behavior.
+- The shared-link mode assigns a correspondent destination thread for each
+  source thread. Destination threads dispatch to target threads through
+  single-producer/single-consumer lock-free queues. This adds about 0.3 us
+  latency in their test while sharply reducing QP count; shared groups trade
+  off more QPs for less dispatch pressure.
+- Pangu encountered both NIC-originated and switch-originated PFC storms.
+  Switch-originated storms invalidate solutions that only watch NIC TX
+  pauses because the NIC is receiving pauses from the switch and cannot stop
+  the source.
+- The availability rule is "escape as fast as possible." One workaround is
+  briefly shutting down affected NIC ports and relying on dual-home topology
+  to reconnect through another port. The preferred workaround switches
+  affected RDMA links to TCP links.
+- RDMA/TCP switching uses PingMesh-like probes. Every T ms, worker threads
+  ping peers over RDMA and TCP. If RDMA fails and TCP succeeds for more than
+  F times, traffic moves to TCP; if RDMA later succeeds enough times, traffic
+  returns to RDMA. With T = 10 ms and F = 3, bad RDMA links are detected in
+  roughly 10 seconds in a 100-storage-node podset, and throughput recovers to
+  more than 90% in less than one minute.
+- SLA maintenance combines storage and network telemetry: IOPS, latency,
+  slow I/O, queueing time, CNP counters, TX/RX pauses, RDMA errors, packet
+  loss, and configuration checks for PFC/ECN/QoS/DCQCN. The paper argues
+  storage-visible symptoms can identify failures that network counters alone
+  miss.
+- QP timeout tuning reduced reconnection action time by 4x in failover.
+  BlockMasters also collect slow/error I/O reports from clients and can
+  temporarily blacklist a small number of poorly serving BlockServers, giving
+  operators time to repair without exposing sustained slow I/O.
+- The paper's open/future issues include failover-specific congestion-control
+  tuning, slow RDMA READ processing from RNIC cache pressure, lossy RDMA with
+  selective repeat, and NVMe-over-Fabrics or custom hardware paths that let
+  NICs write received data directly into NVMe SSDs.
+
+**GPU DB mapping:** The immediate mapping is to treat future high-speed
+storage or gateway paths as route choices with health proofs. A GPU DB route
+certificate should be able to include transport class, tier location,
+expected movement bytes, queue depth, congestion/fallback health, and a
+timeout/failover policy. If the RDMA/GDS path fails its proof, the runtime
+should not hang a session behind an opaque fabric problem; it should reacquire
+a route, switch transport, fall back to CPU/local NVMe, or return a precise
+overload/transport-failed reason.
+
+The run-to-completion lesson maps to GPU execution owners and storage
+gateway workers. A fast retained read path should avoid bouncing a request
+through protocol, owner, storage, CUDA, and response threads unless a boundary
+is buying correctness. Small lookup batches and remote segment reads need
+clear owner-local hot loops with preallocated buffers; large work should be
+split or delegated so it does not block completion polling.
+
+The memory-bandwidth result is especially relevant before adding GPUDirect
+Storage or remote storage. At 100 Gbps, the network was no longer the only
+limit; CRC and copy traffic consumed enough DRAM bandwidth to become the
+bottleneck. GPU DB benchmarks should therefore measure host memory bandwidth,
+checksumming, encoding, D2H/H2D copy, and response formatting together, not
+just network line rate or CUDA kernel time.
+
+The queue-pair explosion maps cleanly to the 1M logical-session target. GPU DB
+cannot let every logical session own physical transport, CUDA, storage, or
+response resources. Logical sessions should multiplex onto bounded worker
+sets, shared links, rings, and correspondent owners, with telemetry for the
+latency cost of each indirection.
+
+Pangu's storage-level monitoring argues that transport health should be judged
+by database-visible symptoms too: slow query responses, route wait, queue
+saturation, fallback rate, stale resident-route rejection, and bytes moved per
+tier. NIC counters and TCP/RDMA counters are useful, but the user-visible SLA
+is at the SQL/session level.
+
+**Risks and mismatches:** Pangu is a cloud storage system, not a DBMS
+transaction engine or GPU execution runtime. Its block-service operations,
+replication model, and storage masters are not substitutes for WAL-before-
+visibility, MVCC snapshots, SQL plan routing, or query result correctness.
+The useful pattern is the operational fast-path/fallback contract and the
+measurement discipline, not an argument to put the database directly on RDMA.
+
+The paper assumes substantial operational control over topology, RNIC
+generations, switch parameters, and storage service code. GPU DB may run on
+single-node developer machines, ordinary cloud VMs, or commodity networks
+where PFC, RNIC offload, DCQCN tuning, or dual-home topology are unavailable.
+Any route design derived from this paper must degrade to TCP/local-NVMe/CPU
+paths and expose missing hardware capabilities explicitly.
+
+The evaluation is production-engineering evidence rather than a controlled
+database benchmark. Many exact workload distributions, tenant mixes, and
+failure-trigger thresholds are not public. Treat the reported latency and
+throughput gains as hypotheses to reproduce with GPU DB's own storage and
+session workloads.
+
+**Benchmark candidates:**
+
+- Build a transport-health route harness with two physical paths for cold or
+  remote segment access: "fast path" and "fallback path." Inject fast-path
+  stalls, timeouts, and queue saturation. Gate: requests either reacquire a
+  route, switch path, or fail with a precise reason; they must not wait
+  indefinitely behind a dead transport.
+- Add a 1M logical-session multiplexing simulation where sessions share a
+  small number of gateway/storage/CUDA workers and physical links. Compare
+  per-session physical resources, correspondent-thread dispatch, SPSC rings,
+  and direct full-mesh connections. Measure p50/p99 request latency, memory
+  footprint, queue depth, and resource count.
+- Measure host-memory bandwidth as a first-class bottleneck for retained read
+  routes: protocol decode, visibility filtering, checksum/hash, H2D/D2H copy,
+  result encoding, and optional compression. Failure condition: a "faster"
+  network or storage path only moves the bottleneck into DRAM copy traffic.
+- Prototype scatter-gather response and segment-transfer buffers that match
+  the target storage/pgwire/CUDA layout without intermediate repacking. Gate:
+  fewer bytes copied and lower p99 latency for 4 KB, 16 KB, and 128 KB route
+  payloads without weakening checksum or result correctness.
+- Add route-level fallback telemetry: transport class, queue wait, retry
+  count, timeout source, fallback reason, bytes moved, and SQL-visible
+  latency. Gate: an operator can distinguish storage hot-tier miss, transport
+  congestion, GPU queue saturation, route invalidation, and TCP/RDMA fallback.
+- Test fast-path failover with active retained snapshots. Pause or poison the
+  storage/gateway route after route acquisition but before response
+  publication. Gate: logical snapshot correctness survives route
+  reacquisition, and failed transport state does not mark the SQL snapshot
+  invalid unless the underlying visibility proof changed.
+- Compare run-to-completion versus staged execution for small retained
+  lookups and large cold-segment reads. The expected result is a threshold:
+  small work benefits from owner-local completion, while large work must be
+  split or offloaded so polling and response rings stay responsive.
