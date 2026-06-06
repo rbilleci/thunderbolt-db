@@ -81973,3 +81973,164 @@ candidate coverage for transaction scheduling and MVCC metadata, but the
 next few selections should keep alternating with networking/admission,
 query planning, and tier-placement papers so this does not become only a
 metadata-publication thread.
+
+### 2026-06-06 - Self-tuning scheduling makes route priority a measured control loop
+
+**Citation:** Benjamin Wagner, Andre Kohn, and Thomas Neumann.
+"Self-Tuning Query Scheduling for Analytical Workloads." SIGMOD 2021,
+pages 1879-1891. DOI: `https://doi.org/10.1145/3448016.3457260`.
+Retrieved 2026-06-06 from the TUM author PDF,
+`https://www-db.cs.tum.edu/~kohn/papers/query-scheduling-sigmod21.pdf`.
+
+**Category:** Query optimization / planning and runtime / session
+admission, with GPU execution scheduling relevance.
+
+**Relevance tags:** task-based execution; lock-free stride scheduler;
+thread-local scheduler state; resource groups; bounded active slots;
+adaptive morsels; self-tuning priorities; short-query latency; workload
+tracking; scheduler self-simulation; route admission; micro-batching
+latency ceilings; worker ownership.
+
+**Core idea:** The paper argues that once a database uses task-based
+parallelism, query scheduling should be a database-owned control loop
+instead of an operating-system side effect. Umbra breaks queries into
+task sets and morsels, schedules resource groups with a lock-free stride
+scheduler, normalizes task duration with adaptive morsel sizing, then
+periodically tunes priority-decay parameters by simulating the recent
+tracked workload.
+
+For GPU DB, the transferable idea is not the OLAP-only policy itself; it
+is the structure of the scheduler. A retained-read or GPU route should
+carry enough shape metadata for the runtime to schedule by observed
+latency, queue pressure, batch compatibility, and resource footprint.
+Priority knobs should be explicit and measurable, then tuned inside
+guardrails rather than hard-coded or delegated to thread scheduling.
+
+**Concrete mechanisms:**
+
+- Queries are represented as resource groups containing ordered task
+  sets. Task sets hold independent tasks, and tasks may contain one or
+  more morsels carved out at runtime.
+- The scheduler maintains a bounded global slot array for active
+  resource groups. New work waits before the scheduler when slots are
+  full, bounding memory and admitting overload explicitly.
+- Most stride-scheduler metadata is thread-local: active-slot bitmasks,
+  slot priorities, pass values, and global pass. Workers only read the
+  global slot array when picking work.
+- Global task-set changes are pushed to workers with atomic change and
+  return bitmasks. Workers incorporate updates with atomic exchange and
+  local bit operations, avoiding a shared scheduling lock on every pick.
+- Finished task sets are finalized by marking the global slot invalid
+  and tracking workers still pinned to the task set. The last pinned
+  worker runs the finalization step, which can activate the next task
+  set in the resource group.
+- Under high load, the scheduler reduces the number of workers notified
+  about each task set. When all slots are full, a task set is pushed to
+  only one worker, reducing intra-pipeline contention and update traffic.
+- Adaptive morsel execution targets a fixed task duration, 2 ms in the
+  Umbra implementation. Startup uses exponentially growing morsels to
+  estimate throughput; default execution chooses morsel size from the
+  latest throughput estimate; shutdown aims for a "photo finish" across
+  workers to reduce stragglers.
+- Priority decays after a resource group consumes CPU quanta. Parameters
+  include the decay start, decay factor, initial priority, and minimum
+  priority so long queries continue making progress.
+- The self-tuner tracks execution on one worker for a fixed window,
+  simulates alternative decay parameters over the tracked workload, and
+  periodically pushes new parameters to all workers.
+- The evaluated implementation uses 20-second tracking windows and
+  60-second refresh intervals. The paper reports tuning work of 20 ms to
+  100 ms on a 20-thread system, less than 0.01% of total processing time.
+- The evaluation uses mixed TPC-H workloads at scale factors 3 and 30.
+  Within Umbra, the self-tuning scheduler improves short-query geometric
+  mean latency by 2x over fair scheduling at full load and by more than
+  4.5x over Umbra's original scheduler.
+- The paper reports more than 10x improvement over FIFO for short
+  requests at load at least 0.95, scheduling overhead around 0.05% at
+  low core counts and about 0.02% at 120 cores, and substantially better
+  tail latencies than PostgreSQL and MonetDB in their comparison setup.
+
+**GPU DB mapping:** GPU DB's runtime already wants network IO workers,
+bounded command rings, read snapshot rings, GPU execution rings, and
+response rings. This paper suggests making each ring's scheduler a
+small database-owned policy object with local decision state, explicit
+admission slots, route-level pass/priority metadata, and telemetry that
+can be replayed through a cheap simulator.
+
+Adaptive morsel sizing maps to retained read and GPU micro-batches. A
+lookup or aggregate route should not use a fixed batch size forever. It
+should target a latency budget, estimate per-shape throughput, grow
+carefully during startup, and shrink near the end of a queue drain so
+stragglers do not inflate p99.
+
+Resource groups map to request classes or route families: foreground
+single-key lookups, analytical retained scans, refresh jobs, WAL-adjacent
+mutation maintenance, and response encoding can each own scheduling
+state while still sharing physical workers. Static priorities can remain
+available for privileged maintenance or latency-sensitive sessions, but
+the default policy should adapt from measured route behavior.
+
+The self-simulation loop is especially useful for GPU route choice. GPU
+DB can record recent batch sizes, queue waits, kernel durations,
+transfer bytes, fallback rates, and snapshot misses, then simulate a
+small set of priority and batch-drain parameters before changing live
+policy. That gives the planner/admission layer a way to tune without
+putting learned black-box decisions directly in the correctness path.
+
+**Risks and mismatches:** This is an analytical scheduling paper. It
+does not solve transaction conflicts, MVCC visibility, WAL ordering,
+snapshot retention, DDL invalidation, recovery, network protocol
+backpressure, CUDA stream scheduling, GPU memory residency, or
+multi-tenant fairness by itself.
+
+The objective favors short analytical queries under high load. GPU DB
+must ensure that short-query priority does not starve WAL flushes,
+resident refreshes, long scans holding valid snapshots, or maintenance
+needed to keep future reads correct.
+
+The paper assumes non-blocking CPU worker tasks in an in-memory OLAP
+setting. GPU DB has blocking and asynchronous boundaries: sockets,
+NVMe/object reads, pinned-buffer pressure, CUDA events, and WAL flushes.
+Those boundaries need explicit wait accounting rather than pretending
+all work is interchangeable CPU time.
+
+The self-tuner assumes the recent tracked workload is predictive enough
+for the next interval. Bursty OLTP, flash crowds, checkpoint spikes,
+long-running readers, and sudden GPU memory pressure may require faster
+fallback rules than a minute-scale refresh loop.
+
+Finally, a bounded active slot array is useful for memory control, but
+1M logical sessions cannot each become a scheduler resource group. The
+runtime should group logical sessions by active request, route family,
+tenant, or admission class and keep inactive sessions outside hot
+scheduling state.
+
+**Benchmark candidates:**
+
+- Build a route-scheduler simulator with FIFO, fair stride, static
+  priority stride, and self-tuned decay. Inputs: recorded or synthetic
+  foreground lookups, retained scans, refresh jobs, and mutation-owner
+  maintenance. Gate: p50/p99, throughput, starvation counters, queue
+  wait, and fallback reasons are reported per route class.
+- Prototype adaptive GPU lookup micro-batches with a target time budget
+  instead of fixed batch size. Expected result: better p99 at mixed load
+  without losing launch amortization when queue depth is high.
+- Add per-route execution telemetry suitable for self-simulation:
+  estimated base latency, queue wait, batch size, kernel duration,
+  transfer bytes, snapshot generation, fallback reason, and priority
+  state. Gate: a simulator can replay the last interval and predict
+  whether a candidate policy would violate SLO or starvation limits.
+- Compare active request groups versus per-session scheduling state for
+  1M logical sessions. Failure condition: inactive sessions consume hot
+  scheduler slots or force per-session priority updates.
+- Test bounded active route slots with explicit wait/reject behavior.
+  Gate: overload is visible at the narrowest ring, and short queries
+  improve without silently delaying WAL, invalidation, or snapshot
+  retirement work.
+- Evaluate priority decay guardrails: foreground reads may decay more
+  slowly than analytical scans, but WAL flush, invalidation, and
+  recovery-critical work retain minimum service budgets. Gate: no class
+  misses its configured progress floor under mixed pressure.
+- Simulate tuning intervals of 1 s, 5 s, 20 s, and 60 s under bursty
+  GPU memory pressure. Failure condition: the self-tuner chases stale
+  history while hard fallback rules would have protected p99.

@@ -105,14 +105,15 @@ read/write throughput, recovery, compaction, or tail-latency mechanisms.
   protocol-internal priority; useful for deciding whether GPU DB should learn
   route policies while keeping hot-path correctness and tail-priority rules
   explicit. Journal entry added 2026-06-06.
-- `queued` — **Deferred Runtime Pipelining for Contentious Multicore Software
+- `reviewed` — **Deferred Runtime Pipelining for Contentious Multicore Software
   Transactions**, Mu, Angel, and Shasha, EuroSys 2019.
   URL: `https://doi.org/10.1145/3302424.3303966`
   PDF: `https://www.cis.upenn.edu/~sga001/papers/drp-eurosys19.pdf`
   Why: PLOR contrasts runtime pipelining and transaction chopping with
   priority-based low-tail conflict handling; useful for evaluating whether GPU
   DB hot operations should pipeline sub-steps through owner queues without
-  requiring static read/write sets.
+  requiring static read/write sets. Journal entry already exists; this stale
+  duplicate was corrected from `queued` to `reviewed` on 2026-06-06.
 
 ### MVCC, snapshots, and visibility
 
@@ -337,12 +338,13 @@ Append new candidates here as each paper is processed.
   Why: Laser cites LSched as learned query scheduling related work; useful for
   comparing reinforcement-learning or workload-aware scheduling with explicit
   route-footprint scheduling for GPU DB. Journal entry added 2026-06-06.
-- `queued` — **Self-Tuning Query Scheduling for Analytical Workloads**,
+- `reviewed` — **Self-Tuning Query Scheduling for Analytical Workloads**,
   Wagner, Kohn, and Neumann, SIGMOD 2021.
-  URL: `https://doi.org/10.1145/3448016.3457290`
+  URL: `https://doi.org/10.1145/3448016.3457260`
   Why: Laser cites it as single-server analytical scheduling work; useful for
   deciding whether GPU DB's read runtime should tune queue order by observed
-  latency, cache locality, and short-query priority.
+  latency, cache locality, and short-query priority. Journal entry added
+  2026-06-06; the DOI was corrected to `10.1145/3448016.3457260`.
 - `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
   Learning**, Zhang, Marcus, Kleiman, and Papaemmanouil, arXiv 2020.
   URL: `https://arxiv.org/abs/2007.10568`
@@ -5286,12 +5288,13 @@ Append new candidates here as each paper is processed.
   Why: SwitchFS contrasts with metadata write-back caching; useful for
   comparing client-side delayed metadata visibility against database-owned
   route-cache, catalog, and cold-tier metadata publication rules.
-- `queued` — **Self-Tuning Query Scheduling for Analytical Workloads**,
+- `reviewed` — **Self-Tuning Query Scheduling for Analytical Workloads**,
   Wagner, Kohn, and Neumann, SIGMOD 2021.
   URL: `https://doi.org/10.1145/3448016.3457260`
   Why: Auto-WLM contrasts production admission and elasticity with
   self-tuned scheduling policies; useful for comparing low-overhead heuristic
-  tuning against route-specific GPU/CPU/NVMe scheduling knobs.
+  tuning against route-specific GPU/CPU/NVMe scheduling knobs. Duplicate
+  candidate marked reviewed after the 2026-06-06 journal entry.
 - `reviewed` — **LSched: A Workload-Aware Learned Query Scheduler for
   Analytical Database Systems**, Sabek, Ukyab, and Kraska, SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526158`
