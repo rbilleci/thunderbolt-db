@@ -80285,3 +80285,229 @@ object is still a valid route for a new read boundary.
 - Test route metadata with a type-preserving allocator versus ordinary free.
   Gate: stale handles either validate generation and type or fail cleanly;
   no benchmark relies on allocator behavior that production cannot support.
+
+### 2026-06-06 - ChainPaxos makes replication throughput a pipeline and membership problem
+
+**Citation:** Pedro Fouto, Nuno Preguica, and Joao Leitao. "High
+Throughput Replication with Integrated Membership Management." 2022 USENIX
+Annual Technical Conference, pages 575-592. Retrieved 2026-06-06 from
+USENIX `https://www.usenix.org/system/files/atc22-fouto.pdf`.
+
+**Category:** WAL / logging / read-write throughput, with runtime /
+session-scale relevance for replicated owners, route admission, and
+linearizable reads.
+
+**Relevance tags:** state machine replication; consensus; pipelined
+replication; chain topology; integrated membership; reconfiguration;
+linearizable local reads; read scalability; write throughput; fault handling;
+replicated WAL; owner domains; route fencing; geo replication.
+
+**Core idea:** ChainPaxos is a high-throughput state-machine replication
+protocol that keeps Paxos safety but changes the normal communication shape.
+Instead of a leader sending accept messages to many replicas and receiving a
+fan-in of acknowledgements, replicas are ordered in a chain. An accept message
+moves down the chain, accumulating accept acknowledgements as it goes. Once the
+message has crossed a majority position, that replica can decide and reply to
+the client; the tail sends an acknowledgement back to the head so earlier
+replicas can learn, execute, and garbage-collect decided instances.
+
+The paper's second important move is to make membership management part of the
+replicated protocol rather than outsourcing it to ZooKeeper or another
+coordination service. AddNode and RemoveNode are normal state-machine
+operations. During suspected failures, nodes mark failed successors, bypass
+marked nodes, and re-propagate not-yet-garbage-collected accepts so the chain
+keeps enough Paxos evidence to remain safe. This matters for GPU DB because a
+future replicated mutation owner or WAL owner cannot let a separate membership
+service become the hidden availability and safety boundary for writes.
+
+**Concrete mechanisms:**
+
+- ChainPaxos encodes Multi-Paxos accept and accept-ack information inside one
+  pipelined chain message per instance in the fault-free path.
+- Each replica tracks the chain order, next unmarked successor, supported
+  leader, marked nodes pending removal, Paxos instance metadata, submitted
+  client requests, pending leader requests, the highest acknowledged instance,
+  and the highest leader-started instance.
+- Requests can arrive at any replica and are redirected to the current leader.
+  The leader starts instances and sends the accept message to itself, then each
+  replica forwards it to the next unmarked replica.
+- The message carries instance id, leader id, prepare number, value, current
+  accept count, and the highest instance known to be accepted by all replicas.
+- A replica decides when the carried accept count reaches a quorum. Instances
+  up to the piggybacked `maxack` can be decided, executed, and removed from the
+  per-instance table.
+- If the tail receives the accept, it sends an accept-ack directly to the head.
+  The head then advances `maxack`, and following accept messages propagate that
+  garbage-collection boundary through the chain.
+- Fault detection uses successor keep-alives and gaps in accept-message flow.
+  Suspected nodes are not assumed crashed in the synchronous sense; they are
+  marked and removed because a slow or failed node can block a chain.
+- When a non-leader node is marked for removal, the previous node updates its
+  next unmarked successor and forwards all not-yet-garbage-collected accepts
+  between `maxack + 1` and the removal instance. This repairs the message flow
+  while preserving evidence for undecided instances.
+- Leader failure falls back to Paxos phase 1. A candidate sends prepare for
+  `maxack + 1`, collects a quorum of accepted instance state, then proposes
+  the highest-numbered accepted values for outstanding instances before normal
+  pipelined execution resumes.
+- Adding a replica is also a state-machine operation. Once decided, the new
+  node receives state transfer and joins the chain after the decided instance.
+- Linearizable reads can be served by any replica without adding a read
+  consensus instance. A replica registers the read as depending on the lowest
+  unseen consensus instance, waits until that following instance is
+  acknowledged, then executes the read against its local committed state.
+- Low-load read latency is bounded by periodic NoOP accepts from the head. If
+  the next instance does not arrive before a configurable timeout, a replica can
+  forward the read to the leader as a normal ordered operation.
+- The Java prototype uses a replicated key-value store and a ZooKeeper case
+  study, with YCSB clients, one replica per machine, and comparisons against
+  Multi-Paxos, a one-learner Multi-Paxos/Raft-like flow, EPaxos variants,
+  Ring Paxos, U-Ring Paxos, Chain Replication, Zab, and ZooKeeper backed by
+  ChainPaxos.
+- The paper reports that in CPU-bound and network-bound single-datacenter
+  tests, chain-shaped protocols make near-uniform use of replica CPU/network
+  resources while leader-fanout protocols degrade as replica count grows.
+- The paper reports that local linearizable reads scale with read ratio and
+  replica count because they impose no extra consensus traffic and distribute
+  read execution across replicas.
+- In the ZooKeeper case study, ChainPaxos improves write-only throughput over
+  Zab, and strong local reads scale much closer to weak reads than Zab's
+  sync-before-read approximation.
+- In geo-replicated tests, chain protocols keep higher throughput than
+  fanout-based protocols, but latency increases with chain length and
+  inter-site distance because each operation traverses the chain.
+- Reconfiguration experiments compare integrated ChainPaxos membership with
+  Chain Replication using ZooKeeper. ChainPaxos generally reconfigures faster
+  and avoids the extra external management machines, though leader failure can
+  take longer because it falls back to the regular Paxos leader-change path.
+
+**GPU DB mapping:** The strongest mapping is to future replicated mutation and
+WAL owner domains. A single leader that fans out every WAL record to all
+replicas is a natural bottleneck, especially if the GPU DB later replicates
+high-ingest COPY chunks, visibility-boundary records, route invalidations, or
+resident-refresh decisions. ChainPaxos suggests a pipelined replication lane:
+the mutation owner appends and orders a command, each replica/WAL follower
+verifies and forwards exactly one bounded message, and a quorum-position
+replica can make the client-visible decision while tail/head acknowledgements
+advance cleanup.
+
+For 1M logical sessions, the linearizable-read mechanism is a useful pattern
+even if the exact protocol is not adopted. A read can be local if it waits for
+a named freshness fence rather than contacting a quorum on every read. GPU DB
+already wants immutable retained read snapshots with source WAL boundaries. A
+replicated version could let any read owner serve a snapshot once it has seen a
+following replicated fence that proves its local state is at least as recent as
+the latest returned operation at read arrival.
+
+For P8, the protocol reinforces that membership, placement, and visibility are
+one correctness surface. Resident-route invalidation, replicated WAL
+membership, cold-tier ownership, and replica catch-up should not be informal
+background facts. If a replica, GPU owner, or warm-tier node is removed from the
+serving set, that removal should have a generation and a replayable ordering
+record just like a table invalidation or catalog change.
+
+The chain shape also maps to host/GPU data movement. A future replicated
+pipeline could treat the head as command admission, middle nodes as durability
+or validation witnesses, and tail/head acknowledgements as cleanup/publication
+signals. The benchmarkable idea is not "use ChainPaxos wholesale"; it is to
+compare fanout, quorum, and pipeline replication for WAL-bound owner domains
+under the same visibility and session-admission contract.
+
+**Risks and mismatches:** ChainPaxos is an SMR/consensus paper, not a database
+storage-engine paper. It does not specify WAL record layout, group commit,
+MVCC version storage, SQL transaction semantics, checkpoint/replay, or
+GPU-resident cache recovery.
+
+The chain topology trades throughput for latency. In local clusters the added
+latency is small for the tested settings, but geo-replicated or long chains can
+hurt p50/p99 commit latency. GPU DB should avoid putting every small local
+transaction through a long chain unless replication is actually required by the
+durability/SLO tier.
+
+The local-read scheme depends on a steady stream of accepted instances or NoOPs
+to release pending reads. Under very low write load, read latency becomes tied
+to NoOP cadence unless reads forward to the leader. That cadence would need to
+be part of route SLOs.
+
+The paper's evaluation is on a deterministic key-value store and a partial
+ZooKeeper adaptation, not a full SQL database with arbitrary stored procedures,
+large result sets, GPU kernels, or WAL-before-visibility publication between
+CPU and device state.
+
+Integrated membership reduces dependence on an external service, but it also
+makes consensus membership part of the database correctness implementation. A
+bug there could affect both availability and safety.
+
+**Benchmark candidates:**
+
+- Build a replicated WAL-owner simulator with three commit lanes: leader
+  fanout, quorum fanout, and chain-pipelined replication. Gate: throughput,
+  p50/p99 commit latency, CPU/network bytes per replica, and cleanup lag are
+  reported under identical WAL-before-visibility rules.
+- Add a local linearizable-read fence benchmark over replicated read snapshots:
+  serve from any read owner after observing a following WAL/replication fence,
+  then compare against quorum reads and leader-routed reads. Failure condition:
+  local reads are fast but can return a stale snapshot after membership or
+  invalidation changes.
+- Model 1M logical sessions over a bounded set of read owners and replicated
+  snapshot generations. Gate: freshness waiting scales with physical owners and
+  fences, not with logical session count.
+- Stress reconfiguration during COPY or hot-key write bursts. Gate:
+  membership changes, route invalidations, and WAL publication have named
+  generations and never let a removed replica/GPU owner serve a new retained
+  route.
+- Compare NoOP/fence cadence policies for low-write workloads. Gate: read p99
+  stays within budget without creating wasteful replication traffic.
+- Test geo or multi-tier replica placement with different chain orders:
+  latency-optimized, bandwidth-optimized, and failure-domain-optimized. Gate:
+  route admission can explain why a transaction chose local-only, replicated,
+  or deferred durability.
+
+### 2026-06-06 - Cross-paper synthesis: retirement, freshness, and replication all need explicit fences
+
+Everything is a Transaction, OneShotGC, Publish on Ping, and ChainPaxos
+converge on the same implementation discipline: background work becomes safe
+and fast only when it is attached to named fences. DAF gives physical
+maintenance a transaction timestamp; OneShotGC groups old versions into
+temporal retirement partitions; POP delays global reservation publication until
+reclamation pressure asks execution contexts to publish; ChainPaxos uses a
+following replicated instance as the freshness fence that lets any replica serve
+a linearizable local read.
+
+For GPU DB, this pushes the design away from ad hoc background cleanup and
+toward generation-bearing control records. Resident snapshot retirement, old
+MVCC delta cleanup, route metadata reclamation, DDL/catalog changes, replicated
+WAL membership, and local read routing should all answer the same questions:
+which generation/fence made this state visible, which later fence made it
+invalid for new readers, which physical execution contexts may still hold it,
+and which durable record lets recovery rebuild the same decision.
+
+The strongest design track is a fence-oriented owner runtime. Mutation owners
+publish WAL/visibility fences; residency owners publish route-generation
+fences; read owners wait for freshness fences before serving local snapshots;
+maintenance owners retire whole cohorts after reachability fences; and future
+replication owners make membership changes ordered data rather than external
+side conditions.
+
+Category gaps after this batch are durable replicated WAL integration and
+planner/runtime policy for choosing when a route needs local, replicated, or
+deferred durability. The loop has good pieces for MVCC cleanup and memory
+reachability, but still needs more end-to-end database recovery papers and
+production replication designs that tie log shipping, checkpointing,
+membership, and read routing together.
+
+Benchmark priorities:
+
+- Define a common fence record for WAL visibility, resident route generation,
+  snapshot retirement, metadata reclamation, and replicated membership. Gate:
+  every fast path logs the fence it depends on and every fallback names the
+  missing fence.
+- Run a retained-snapshot stress with POP-style owner publication and
+  OneShotGC-style cohort retirement. Gate: cleanup remains bounded under long
+  readers without adding global publication writes to every read.
+- Add a local-read freshness benchmark using following-fence waits. Gate: local
+  read throughput improves over leader/quorum reads while stale-generation
+  rejections catch invalidation and reconfiguration races.
+- Compare WAL replication shapes before any production replica work: fanout,
+  quorum fanout, and chain pipeline. Gate: route selection accounts for p99
+  commit latency, network bytes, replica count, and membership-change cost.

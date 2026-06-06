@@ -377,7 +377,7 @@ Append new candidates here as each paper is processed.
   transaction baseline; useful for contrasting low-latency remote access,
   RDMA-shaped transaction execution, and consistency guarantees with GPU DB's
   future warm/cold-tier and replicated-owner paths.
-- `queued` — **Everything is a Transaction: Unifying Logical Concurrency
+- `reviewed` — **Everything is a Transaction: Unifying Logical Concurrency
   Control and Physical Data Structure Maintenance in Database Management
   Systems**, Pavlo et al., CIDR 2021.
   URL: `https://www.cidrdb.org/cidr2021/papers/cidr2021_paper06.pdf`
@@ -386,7 +386,8 @@ Append new candidates here as each paper is processed.
   logical concurrency and physical maintenance; useful for folding index
   refresh, resident-cache invalidation, and cold-tier maintenance into
   transactional visibility instead of treating them as detached background
-  jobs.
+  jobs. Journal entry already exists; this stale duplicate was corrected from
+  `queued` to `reviewed` on 2026-06-06.
 
 ### Database file-system design, storage, and indexing
 
@@ -536,12 +537,13 @@ Append new candidates here as each paper is processed.
   useful for deciding whether GPU DB cold-tier value payloads should be routed
   by size, update frequency, and read/write interference rather than a single
   separation threshold.
-- `queued` — **High Throughput Replication with Integrated Membership
+- `reviewed` — **High Throughput Replication with Integrated Membership
   Management**, Fouto, Preguica, and Leitao, USENIX ATC 2022.
   URL: `https://www.usenix.org/conference/atc22/presentation/fouto`
   Why: PALF contrasts separate metadata/reconfiguration choices with integrated
   membership replication; useful for comparing future GPU DB replicated WAL
-  membership, failover, and availability tradeoffs.
+  membership, failover, and availability tradeoffs. Journal entry added
+  2026-06-06.
 - `queued` — **DistributedLog: A High Performance Replicated Log Service**,
   Guo, Dhamankar, and Stewart, ICDE 2017.
   URL: `https://doi.org/10.1109/ICDE.2017.172`
@@ -567,6 +569,21 @@ Append new candidates here as each paper is processed.
   testing whether GPU DB cold-tier segments should preserve a separate
   WAL/database split or collapse some persistent data into indexed log
   structures.
+
+- `queued` — **Atlas: Scalable and Available State Machine Replication**,
+  Enes et al., EuroSys 2020.
+  URL: `https://doi.org/10.1145/3342195.3387543`
+  Why: ChainPaxos compares against distributed-load SMR protocols and cites
+  Atlas as a planet-scale replication baseline; useful for contrasting
+  dependency-aware replica execution, geo latency, and conflict handling with
+  pipeline-shaped replicated WAL or future multi-owner commit routes.
+- `queued` — **Toward a Generic Fault Tolerance Technique for Partial Network
+  Partitioning**, Alfatafta et al., OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/alfatafta`
+  Why: ChainPaxos motivates integrated membership partly through partial
+  partition hazards in externally coordinated systems; useful for testing
+  whether GPU DB replicated owners, route membership, and cold-tier placement
+  remain safe under asymmetric partitions.
 
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
