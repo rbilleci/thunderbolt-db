@@ -5269,14 +5269,35 @@ Append new candidates here as each paper is processed.
   Elle is the complementary experiment-driven isolation checker for database
   implementations, useful for validating GPU DB isolation claims with generated
   workloads and concise anomaly witnesses.
-- `queued` — **Cobra: Making Transactional Key-Value Stores Verifiably
+- `reviewed` — **Cobra: Making Transactional Key-Value Stores Verifiably
   Serializable**, Tan, Zhao, Mu, and Walfish, OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/tan`
   PDF: `https://www.usenix.org/system/files/osdi20-tan.pdf`
   Why: Elle checks generated histories with traceable datatypes; Cobra is a
   continuous black-box serializability verifier for transactional key-value
   workloads, useful for comparing route-history checking against solver-backed
-  verification and transaction segmentation.
+  verification and transaction segmentation. Journal entry added 2026-06-06.
+- `queued` — **Vbox: Efficient Black-Box Serializability Verification**, Sun
+  and Zou, arXiv 2025.
+  URL: `https://arxiv.org/abs/2503.05163`
+  Why: discovered while reviewing Cobra; claims broader black-box
+  serializability checking with predicate database operations and more use of
+  transaction time information, directly relevant to moving GPU DB audit traces
+  beyond point-key histories.
+- `queued` — **Efficient Black-box Checking of Snapshot Isolation in
+  Databases**, PolySI, arXiv 2023.
+  URL: `https://arxiv.org/abs/2301.07313`
+  Why: discovered while reviewing Cobra's isolation-checking follow-up line;
+  useful for validating MVCC/snapshot routes when the engine intentionally
+  offers snapshot isolation or retained read snapshots rather than full
+  serializability.
+- `queued` — **Viper: A Fast Snapshot Isolation Checker**, Winter et al.,
+  EuroSys 2023.
+  URL: `https://doi.org/10.1145/3552326.3567492`
+  PDF: `https://mpaxos.com/pub/viper-eurosys23.pdf`
+  Why: discovered while reviewing Cobra; a fast SI checker is relevant to
+  building low-overhead benchmark witnesses for retained snapshots, range
+  reads, and MVCC route validation.
 - `queued` — **DynaMast: Adaptive Dynamic Mastering for Replicated Systems**,
   Abebe, Glasbergen, and Daudjee, ICDE 2020.
   URL: `https://doi.org/10.1109/ICDE48307.2020.00123`

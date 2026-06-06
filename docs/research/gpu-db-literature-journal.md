@@ -38,6 +38,191 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Cross-paper synthesis: route correctness needs external witnesses too
+
+The last three modern reviews converge on a useful split between
+execution freedom and publication proof. Sundial says a cached route is
+acceptable only when its logical lease covers the chosen serialization
+point. Predefined-order transactions say parallel work can be useful
+inside an ordered publication window, as long as abort dependencies never
+escape that window. Cobra adds the missing test harness angle: the engine
+should be able to emit enough history to let an independent verifier
+reconstruct whether the claimed order, reads, and writes were actually
+serializable.
+
+The design track is therefore "certified route execution": every fast
+path should have a compact route certificate, a publication frontier, and
+an optional external history record. For GPU DB, that means retained GPU
+reads, ordered write batches, and speculative route shortcuts should be
+measured not only by latency and throughput, but also by whether they
+produce small, replayable witnesses for visibility and route correctness.
+
+Category gaps remain around SQL-native predicate/range checking and
+large-result analytical verification. The next useful papers should keep
+balancing transaction/MVCC verification with tier-aware indexes and
+query-planning papers that expose route proof at operator boundaries.
+
+Benchmark priorities:
+
+- Add a route-history trace format for read/write tests: request id,
+  session id, route shape, snapshot/visibility boundary, keys or
+  predicate descriptor, read versions, written versions, WAL boundary,
+  and publication generation.
+- Run deterministic write-window benchmarks with a serial replay checker
+  before attempting solver-backed verification. Gate: the trace can
+  distinguish serial-order bugs from harmless physical execution
+  reordering.
+- Build a small black-box serializability workload for retained lookups
+  and hot-key writes. Failure condition: a GPU shortcut cannot emit the
+  read-from/write facts needed to audit its result.
+
+### 2026-06-06 - Cobra turns serializability into an off-path route-history check
+
+**Citation:** Cheng Tan, Changgeng Zhao, Shuai Mu, and Michael
+Walfish. "Cobra: Making Transactional Key-Value Stores Verifiably
+Serializable." OSDI 2020, pp. 63-80. Retrieved 2026-06-06 from the
+USENIX page, `https://www.usenix.org/conference/osdi20/presentation/tan`,
+and PDF, `https://www.usenix.org/system/files/osdi20-tan.pdf`.
+
+**Category:** MVCC / snapshot / visibility and transaction correctness
+verification, with secondary relevance to runtime / HFT / session scale
+and GPU-assisted graph processing.
+
+**Relevance tags:** black-box serializability checking; transaction
+history collection; read-from graph; polygraph constraints; SMT solver;
+MonoSAT; GPU reachability pruning; fence transactions; epochs; history
+garbage collection; strict serializability; route-history witnesses.
+
+**Core idea:** Cobra verifies whether a transactional key-value store's
+observed client history is serializable without trusting the database's
+internal schedule. It records transaction inputs and outputs, builds a
+graph of known read-from dependencies plus constraints for unknown
+version orders, prunes that graph aggressively, and asks a graph-aware
+SMT solver whether some acyclic serialization graph exists.
+
+The transferable point for GPU DB is not to put a solver in the hot
+path. It is to design fast routes so their effects can be audited from
+the outside. A retained GPU read, micro-batched lookup, ordered write
+window, or CPU fallback path should emit enough read/write/version facts
+that an off-path checker can confirm the visible behavior still matches
+the advertised isolation contract.
+
+**Concrete mechanisms:**
+
+- Cobra wraps client database libraries and records starts, commits,
+  aborts, reads, and writes. Values are made unique by embedding a unique
+  id in each write, so a later read can identify the transaction it read
+  from.
+- It models a history with transactions as graph nodes. Known edges are
+  read-dependencies from the transaction that wrote a value to the
+  transaction that read it.
+- Because the database's internal version order is hidden, each read of
+  a key generates constraints: every other writer of that key must be
+  ordered either before the writer that supplied the read value or after
+  the reader.
+- The basic polygraph problem is exponential in the number of binary
+  choices and has many constraints when many transactions read and write
+  the same keys.
+- Cobra reduces the search space by combining write chains around
+  read-modify-write transactions. If a transaction reads a key and writes
+  the same key, Cobra can infer consecutive write order for that key.
+- It coalesces constraints when many readers read from the same writer,
+  moving from per-read choices to chain-to-chain edge-set choices.
+- It computes reachability over the known graph and uses that transitive
+  closure to prune constraints whose one side would introduce a cycle.
+  The implementation accelerates this reachability work with GPU Boolean
+  matrix multiplication through cuBLAS/cuSPARSE, switching between sparse
+  and dense routines by observed matrix density.
+- Remaining constraints go to MonoSAT, which can reason about graph
+  acyclicity more directly than ordinary SAT encodings.
+- Strict serializability is checked by adding real-time precedence edges.
+  Cobra accounts for collector clock drift by treating transactions
+  inside the drift threshold as concurrent.
+- Continuous verification uses rounds plus epoch fences. Clients
+  periodically issue a fence transaction on a dedicated key, and session
+  order ties normal transactions to fence epochs.
+- Garbage collection is conservative. A transaction can be removed only
+  after it is superseded by the agreed epoch frontier and after a
+  constraint-expanded graph proves it is not needed to detect future
+  cycles.
+- Evaluation covers TPC-C-style, Twitter-like, RUBiS-like, and synthetic
+  blind-write workloads. Cobra reports at least 10x lower verification
+  cost than baselines in the studied cases, detects several published
+  serializability violations, and sustains about 2k transactions/second
+  of verification capacity on its tested workloads, roughly 170M
+  transactions/day.
+
+**GPU DB mapping:** GPU DB can use Cobra as a correctness-observability
+benchmark. The engine should emit route-history records for selected
+stress tests: session order, request id, route shape, chosen snapshot or
+visibility boundary, read versions, write versions, WAL boundary,
+publication generation, and fallback/retry events. That trace becomes a
+black-box check that retained GPU reads and ordered write batches are not
+silently violating the SQL-visible order.
+
+The GPU reachability step is directly relevant but should remain an
+offline tool. GPU DB already has GPU kernels and route batching; Cobra
+suggests using the GPU for large audit-graph pruning when testing high
+concurrency, not for serving ordinary queries.
+
+Fence transactions map to periodic audit frontiers. During benchmarks,
+the runtime can inject or mark lightweight fence boundaries at WAL,
+snapshot, or route-publication generations. These fences create
+bounded-history windows so a verifier does not need to keep the entire
+benchmark trace in memory.
+
+Write combining maps to hot-key route classes. If a stored procedure or
+COPY batch reads and writes the same key/row family, the route-history
+checker should exploit that shape rather than treating every write order
+as unknown. Conversely, blind writes are the hard case and deserve
+separate stress tests because Cobra's evaluation shows they leave more
+unresolved constraints.
+
+**Risks and mismatches:** Cobra verifies transactional key-value
+histories, not SQL with predicates, joins, aggregates, range scans,
+phantom protection, or GPU-resident indexes. SQL-native checking would
+need predicate and "not returned" facts, not only observed key reads.
+
+It detects violations after the fact; it does not prevent them. That is
+fine for a benchmark harness and CI stress tool, but not a production
+commit gate.
+
+The verifier has worst-case exponential behavior and is slow on workloads
+with many unconstrained blind writes. GPU DB should treat solver-backed
+checking as a sampled or focused stress-test lane, with simpler serial
+replay checks for deterministic routes first.
+
+Fence transactions add overhead and require preserved session order. A
+production pgwire workload cannot freely inject extra writes, so the
+benchmark harness should model fences as test-only operations or use
+existing WAL/publication generations as audit boundaries.
+
+The paper's history collectors and verifier are assumed fault-free. That
+is acceptable for local testing, but not a production compliance story
+without replicated collectors or durable audit logs.
+
+**Benchmark candidates:**
+
+- Add a route-history trace mode for transaction benchmarks. Gate:
+  traces include enough read-from/write facts to reconstruct a serial
+  history for point reads and hot-key writes.
+- Build a deterministic serial replay checker for ordered write windows
+  before integrating any SMT solver. Failure condition: replay cannot
+  distinguish route execution order from visibility publication order.
+- Prototype a Cobra-like graph checker on a small key-value subset of GPU
+  DB: point reads, blind writes, RMW writes, commit/abort, and session
+  order. Gate: it detects injected stale-read, disappearing-write, and
+  read-skew bugs.
+- Compare audit cost with and without route-shape facts such as RMW
+  markers, WAL generation, and snapshot generation. Expected result:
+  explicit route facts reduce verifier search space.
+- Add a blind-write stress profile. Failure condition: solver-backed
+  checking becomes the only way to validate ordinary CI workloads rather
+  than a targeted high-contention test.
+- Evaluate GPU-accelerated reachability only for offline traces large
+  enough to justify it. Gate: GPU audit pruning reduces verifier time
+  without affecting serving-path latency.
+
 ### 2026-06-06 - Predefined-order transactions forward values without giving up the commit order
 
 **Citation:** Mohamed M. Saad, Masoomeh Javidi Kishi, Shihao
