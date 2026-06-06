@@ -88613,3 +88613,191 @@ rejection correctly as data distributions, resident generations, queue depth,
 and memory pressure change. Each benchmark should pair latency/throughput with
 semantic oracles from TXBug-style small schedules, because a fast stale route
 is a correctness bug, not a performance win.
+
+### 2026-06-06 - Aeolus protects scheduled work by making speculation disposable
+
+**Citation:** Shuihai Hu, Wei Bai, Gaoxiong Zeng, Zilong Wang, Baochen
+Qiao, Kai Chen, Kun Tan, and Yi Wang. "Aeolus: A Building Block for
+Proactive Transport in Datacenters." SIGCOMM 2020, pages 422-434.
+DOI: `10.1145/3387514.3405878`. Retrieved 2026-06-06 from the author
+PDF at `https://www.cse.ust.hk/~kaichen/papers/aeolus-sigcomm20.pdf`;
+metadata checked against the HKUST publication page and DOI.
+
+**Category:** runtime / HFT / session scale, with high-concurrency
+networking, admission control, and response-ring backpressure relevance.
+
+**Relevance tags:** proactive transport; receiver credits; pre-credit
+phase; scheduled-packet-first; selective dropping; first RTT; DPDK;
+commodity switches; loss recovery; incast; queue protection; tail
+latency; bounded speculation.
+
+**Core idea:** Aeolus studies a gap in proactive datacenter transports:
+new flows need at least one round trip before receiver/controller credits
+arrive, but many modern short flows could finish in that first RTT. Waiting
+wastes spare bandwidth; blindly bursting first-RTT traffic can delay or
+drop already scheduled traffic and explode tail latency.
+
+The paper's transferable idea is to split work into protected scheduled
+traffic and disposable speculative traffic. Scheduled packets keep the
+deterministic credit contract. First-RTT unscheduled packets may use spare
+capacity aggressively, but switches selectively drop them as soon as they
+threaten the scheduled lane. Loss recovery is then simple because only the
+speculative lane should lose packets, and lost speculative packets can be
+resent later as scheduled packets.
+
+For GPU DB, this is a clean runtime/admission pattern. Already-admitted
+work with a valid snapshot, owner-ring slot, GPU execution credit, or WAL
+publication slot should have a protected path. Opportunistic work such as
+prefetch, refresh warmup, speculative route probing, cache promotion, and
+first-request micro-batch fill can burst only into spare capacity and must
+be cheap to drop, retry, or reschedule without delaying scheduled work.
+
+**Concrete mechanisms:**
+
+- Aeolus targets proactive transports where bandwidth is allocated with
+  credits and data sent after credits are scheduled packets. It focuses on
+  the one-RTT pre-credit phase before a new flow receives credits.
+- The paper observes that at high link rates, many production-workload
+  flows are small enough to finish within one RTT in principle. The exact
+  fraction is workload and link-speed dependent, but the motivating range
+  is large enough that wasting the pre-credit phase materially hurts
+  short-flow latency.
+- Aeolus combines two principles that appear in tension: new flows may
+  send unscheduled first-RTT packets at line rate to use spare bandwidth,
+  while scheduled packets must behave as if unscheduled packets were not
+  present.
+- The scheduled-packet-first rule is not implemented by simply putting
+  unscheduled packets in a lower priority queue. The paper argues that
+  priority queues create loss-detection ambiguity and can still consume
+  shared buffer space badly enough to hurt scheduled packets.
+- Aeolus uses selective dropping for unscheduled packets. When switch
+  buffer occupancy crosses a small threshold, unscheduled packets are
+  dropped, while scheduled packets are not subject to that low threshold.
+- The implementation can use commodity-switch AQM features. The paper
+  describes WRED/color marking and a RED/ECN-based implementation in which
+  unscheduled and scheduled packets are marked differently, then the switch
+  drops only the unscheduled class at the configured threshold.
+- Sender-side rate control has two phases. A pre-credit flow sends up to
+  an RTT worth of unscheduled packets aggressively; once credits arrive,
+  it becomes credit-induced and sends scheduled packets at the allocated
+  rate.
+- Loss recovery relies on the protected deterministic path. The sender uses
+  selective ACKs and a probe after the last unscheduled packet to identify
+  gaps in the pre-credit batch, then retransmits lost unscheduled packets
+  as scheduled traffic once credits arrive.
+- The retransmission priority order is loss-detected unscheduled packets
+  first, then unsent scheduled packets, then sent-but-unacknowledged
+  unscheduled packets. The goal is to fill receive-side gaps quickly
+  without creating redundant retransmissions.
+- The prototype uses DPDK with commodity switch hardware and is integrated
+  with ExpressPass and Homa; simulations also cover NDP. The physical
+  testbed described in the paper has 8 servers, a Mellanox SN2000 switch,
+  10 Gbps links, Intel 82599EB NICs, and a base RTT around 14 microseconds.
+- Evaluation claims include lower average FCT for ExpressPass by using
+  otherwise idle first-RTT capacity, dramatically lower Homa tail FCT by
+  avoiding scheduled-packet loss, and NDP-like behavior without NDP's switch
+  payload-cutting requirement. Exact gains vary by workload, testbed, and
+  simulator assumptions.
+- The paper explicitly notes limits: Aeolus is not trying to solve
+  congestion in oversubscribed cores for transports that assume a
+  congestion-free core, and too-small selective-dropping thresholds can
+  discard useful unscheduled traffic.
+
+**GPU DB mapping:** The first mapping is a protected-versus-speculative
+runtime lane. Scheduled GPU DB work includes mutation-owner commands whose
+WAL ordering has been accepted, read requests with a valid retained snapshot
+handle, GPU execution work with an issued stream/buffer credit, and response
+ring writes for admitted sessions. Speculative work includes prefetch,
+resident refresh warmup, cold-tier read-ahead, route-model exploration,
+opportunistic same-shape batch fill, and early parsing/planning for sessions
+that do not yet hold downstream capacity.
+
+The scheduled lane should have strict priority in terms of correctness and
+bounded latency, but the Aeolus lesson is more precise than "priority queue
+everything." Speculative work must have a bounded budget and a drop/retry
+contract. If a read-snapshot ring, GPU execution ring, response ring, pinned
+buffer pool, or residency queue approaches its low-water protection
+threshold, speculative entries should be canceled or demoted before they
+consume the capacity required by admitted work.
+
+The pre-credit phase maps to first-contact session/request handling. A new
+logical session or request may not yet know its route class, result size,
+snapshot compatibility, or GPU eligibility. GPU DB can still allow a small
+amount of speculative progress, such as parse, cheap route classification,
+or batch candidate registration, while withholding scarce credits such as
+GPU stream slots, pinned buffers, WAL slots, or response-ring reservation
+until the route is proven.
+
+The selective-dropping mechanism maps to typed queue admission rather than
+network packet loss. Queue entries should carry an admission class:
+scheduled, retry/repair, speculative, telemetry, warmup, or prefetch.
+Each bounded ring can expose a small threshold below which speculative work
+is accepted and above which speculative work is rejected, canceled, or
+converted into a scheduled retry only after a real credit is available.
+
+Aeolus's recovery model maps well to idempotent retry. Speculative GPU DB
+work must be safe to abandon: no externally visible rows, WAL records,
+visibility publication, session state transition, or route invalidation can
+depend on it. Once the system has capacity, the same logical work can be
+reintroduced through the scheduled path with a valid snapshot generation,
+route descriptor, and response reservation.
+
+The "scheduled packet first" warning also applies to micro-batching.
+Same-shape retained reads can wait a few microseconds to fill a batch only
+while that wait does not delay already scheduled response or GPU work beyond
+its SLO. Batch-fill requests should be treated as pre-credit/speculative
+participants until they obtain explicit batch capacity.
+
+**Risks and mismatches:** Aeolus is a datacenter transport design, not a
+database runtime, and packet dropping is not equivalent to dropping SQL
+work. GPU DB can only discard work that has no durable, visible, or
+session-contract side effects.
+
+The paper relies on proactive transport properties where scheduled packet
+delivery is effectively protected. GPU DB's scheduled lane still needs real
+proofs: bounded queues, backpressure, retry budgets, WAL-before-visibility,
+snapshot compatibility, and response-ring reservation. "Scheduled" cannot
+mean unbounded or impossible to reject.
+
+Switch AQM thresholds do not translate directly to DB queues. GPU DB needs
+thresholds per resource: command ring slots, response bytes, pinned buffers,
+GPU stream occupancy, HBM budget, owner mailbox depth, and network IO write
+backlog. A single global threshold would hide the narrow bottleneck.
+
+The evaluation is transport-centric and uses flow completion time, goodput,
+incast, and simulation/testbed configurations. It does not evaluate SQL
+isolation, MVCC visibility, GPU kernel launch overhead, WAL durability, or
+1M logical sessions. Those are GPU DB's proof obligations.
+
+**Benchmark candidates:**
+
+- Build a protected/speculative admission simulator for GPU DB rings. Model
+  scheduled reads, scheduled writes, response sends, refresh warmups, and
+  speculative batch-fill work. Gate: scheduled p99 queue wait does not
+  regress when speculative load is added up to overload.
+- Add per-resource low-threshold cancellation for speculative entries:
+  read-snapshot ring slots, GPU execution ring slots, response-ring bytes,
+  pinned buffers, and residency queue depth. Failure condition:
+  speculative work delays or drops scheduled work with a valid route credit.
+- Implement a "pre-credit request" harness for new sessions: parse and
+  classify may run before full route capacity exists, but GPU stream,
+  pinned-buffer, WAL, and response credits are acquired only after route
+  proof. Measure first-request latency, rejection rate, and scheduled-lane
+  tail latency.
+- Compare three policies under incast-like same-shape read bursts:
+  no speculation, blind speculative batching, and Aeolus-style bounded
+  speculative batch fill. Required measurements: p50/p99 latency, GPU batch
+  size, dropped speculative entries, response-ring saturation, and fallback
+  rate.
+- Add a correctness oracle for abandoned speculative work. Canceled prefetch,
+  refresh, or route-probe entries must leave no WAL record, visibility
+  change, session-visible result, retained-generation publication, or
+  invalidation side effect.
+- Test retry priority order for abandoned retained reads: expired snapshot
+  repair or loss-detected retry first, already scheduled requests second,
+  stale speculative candidates last. Gate: retry policy improves tail
+  latency without starving normal scheduled reads.
+- Expose telemetry mirroring Aeolus's key distinction: scheduled admitted
+  work, speculative accepted work, speculative canceled work, retries
+  promoted to scheduled, and resource-specific thresholds that caused each
+  cancellation.

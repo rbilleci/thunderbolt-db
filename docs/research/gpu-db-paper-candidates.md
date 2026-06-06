@@ -6788,12 +6788,23 @@ Append new candidates here as each paper is processed.
   traffic; useful for comparing tenant isolation, pull-based admission, and
   remote-memory access semantics against GPU DB's future storage or gateway
   fabric.
-- `queued` — **Aeolus: A Building Block for Proactive Transport in
+- `reviewed` — **Aeolus: A Building Block for Proactive Transport in
   Datacenters**, Hu et al., SIGCOMM 2020.
-  URL: `https://doi.org/10.1145/3387514.3405883`
+  URL: `https://doi.org/10.1145/3387514.3405878`
+  PDF: `https://www.cse.ust.hk/~kaichen/papers/aeolus-sigcomm20.pdf`
   Why: EQDS names Aeolus as a Homa-like proactive transport option; useful for
   comparing receiver-driven low-latency request/response transport with GPU
-  DB's command-ring credits and micro-batch admission.
+  DB's command-ring credits and micro-batch admission. Journal entry added
+  2026-06-06.
+- `queued` — **TFC: Token Flow Control in Data Center Networks**, Zhang, Ren,
+  Shu, and Cheng, EuroSys 2016.
+  URL:
+  `https://www.microsoft.com/en-us/research/publication/tfc-token-flow-control-in-data-center-networks/`
+  DOI: `https://doi.org/10.1145/2901318.2901336`
+  Why: Aeolus cites TFC as a proactive transport that explicitly allocates
+  link bandwidth using tokens at switches; useful for comparing switch-side
+  token allocation, zero-queueing goals, and highly concurrent flow control
+  with GPU DB's local ring credits and scheduled/speculative admission lanes.
 - `queued` — **Rogue: RDMA over Generic Unconverged Ethernet**, Le, Stephens,
   Singhvi, Akella, and Swift, SoCC 2018.
   URL: `https://doi.org/10.1145/3267809.3267828`
