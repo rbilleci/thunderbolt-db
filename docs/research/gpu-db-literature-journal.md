@@ -38,6 +38,151 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Eraser makes learned route choice prove its own reliability
+
+**Citation:** Lianggui Weng, Rong Zhu, Di Wu, Bolin Ding, Bolong
+Zheng, and Jingren Zhou. "Eraser: Eliminating Performance Regression
+on Learned Query Optimizer." PVLDB 17(5), 926-938, 2024. DOI:
+`10.14778/3641204.3641205`. Retrieved 2026-06-06 from the VLDB PDF:
+`https://www.vldb.org/pvldb/vol17/p926-zhu.pdf`.
+
+**Category:** query optimization / planning, with runtime admission,
+route fallback, and tail-latency relevance.
+
+**Relevance tags:** Eraser; learned query optimizer; performance
+regression; route guardrails; fallback selection; unseen feature
+filter; plan clustering; reliability interval; PostgreSQL; Spark;
+IMDB; STATS; TPC-H; TPC-DS.
+
+**Core idea:** Learned optimizers can improve average plan quality but
+occasionally choose plans that are much worse than the native
+optimizer. Eraser treats this as a production-safety problem rather
+than only a model-accuracy problem. It sits on top of an existing
+learned optimizer, estimates whether the learned model is trustworthy
+for each candidate plan, filters high-risk candidates, and chooses a
+plan that preserves most learned-optimizer benefit while reducing
+regression.
+
+For GPU DB, the transferable idea is that learned CPU/GPU route scoring
+must carry a reliability proof. A route model should not be allowed to
+send a query to GPU, a resident snapshot, a cold-tier path, or a
+micro-batch lane solely because the predicted latency is low. If the
+route features are out of distribution or the model's local accuracy is
+weak, the scheduler should fall back to deterministic eligibility,
+native CPU planning, or a conservative route.
+
+**Concrete mechanisms:**
+
+- Eraser assumes the learned optimizer generates a candidate plan set
+  and predicts plan cost or goodness. The native optimizer plan is kept
+  in the candidate set so there is always a conservative fallback.
+- The paper defines regression as the amount by which a selected
+  learned plan is slower than the traditional optimizer's plan, and
+  benefit as the amount by which it is faster. The goal is to reduce
+  regression with bounded loss of benefit, not to reject all risk.
+- Stage one is an unexpected-plan explorer. It removes highly risky
+  plans whose feature values are first-seen or outside the model's
+  observed training coverage.
+- Stage two is a segment model. It clusters plans more finely and
+  estimates prediction quality for each cluster, producing a reliability
+  interval rather than treating every model prediction equally.
+- Plan selection uses the reliability interval to decide which pairwise
+  plan comparisons are trustworthy. A plan that beats the most other
+  plans under trusted comparisons is selected.
+- Eraser is designed as an external plugin over learned optimizers
+  rather than a replacement optimizer. The evaluation applies it to
+  HyperQO, Lero, and PerfGuard.
+- The PostgreSQL evaluation uses IMDB, STATS, and TPC-H workloads; the
+  Spark evaluation uses TPC-DS. Dynamic experiments start from randomly
+  initialized models and retrain after batches of observed queries.
+- Reported results show that when the underlying learned optimizer is
+  worse than PostgreSQL, Eraser usually brings it back to comparable or
+  slightly better performance, while imposing little negative impact
+  when the learned optimizer is already beneficial.
+- The measured Eraser overhead is much smaller than the learned
+  optimizer overhead in the reported table, and the Eraser model size is
+  small relative to the underlying learned optimizer models.
+- The paper reports code and artifacts at
+  `https://github.com/duoyw/Eraser`.
+
+**GPU DB mapping:** GPU DB should treat learned route choice as a
+guarded overlay on deterministic routing. Deterministic checks still
+decide whether a query is legally eligible for a resident GPU snapshot:
+schema generation, visibility boundary, invalidation generation,
+predicate support, result shape, and memory budget. A learned scorer may
+rank eligible CPU, GPU, retained, cold-transfer, or fallback routes, but
+Eraser argues that the scorer needs a local reliability gate before it
+can override a conservative route.
+
+The unexpected-feature filter maps cleanly to route descriptors. If a
+query shape, predicate family, row-count band, resident-byte band,
+queue-depth band, GPU-memory-pressure band, or cold-tier locality state
+has not been observed, the runtime should avoid aggressive learned
+routes and collect telemetry instead.
+
+The segment model maps to per-route-family calibration. Same-shape
+retained lookups, bounded aggregates, cold transfers, CPU index probes,
+and refresh-adjacent reads should have separate reliability summaries.
+One global latency model is too coarse for production route admission.
+
+The native-plan fallback maps to the current CPU tuple/index path. Even
+if a learned model predicts a GPU route is faster, the runtime should be
+able to choose the conservative CPU path when the model's confidence is
+weak or the route family has recently regressed.
+
+Eraser's benefit/regression objective is also a useful benchmark metric.
+GPU DB should not only report average speedup from learned routing; it
+should report how many requests are worse than the deterministic
+baseline, by how much, and which reliability gate would have blocked
+them.
+
+**Risks and mismatches:** Eraser targets query plan selection, not
+transaction scheduling, MVCC visibility, GPU kernels, WAL ordering, or
+1M-session admission. It cannot be copied directly into the runtime
+without adding database-specific correctness features.
+
+The paper's safety guarantee is empirical, not a proof that regressions
+cannot happen. GPU DB must use Eraser-style gating only for performance
+choice; correctness eligibility must remain deterministic.
+
+The workloads are join-heavy analytical benchmarks. They do not cover
+pgwire fan-in, retained GPU snapshots, hot-key OLTP writes, cold-tier
+promotion, WAL flush stalls, or mixed read/write invalidation.
+
+The method assumes the native optimizer plan is available in the
+candidate set. GPU DB needs an analogous conservative route for every
+learned decision; otherwise a gate can reject the risky route without a
+safe place to go.
+
+The paper's feature-space filtering can be conservative. If GPU DB uses
+it too aggressively, new query shapes may never explore beneficial GPU
+routes. Exploration should happen under explicit sampling budgets and
+SLO caps.
+
+**Benchmark candidates:**
+
+- Add a route-regression benchmark for CPU-vs-GPU retained lookups,
+  aggregates, and cold transfers. Report average speedup, p99 latency,
+  regression count, and worst-regression ratio versus deterministic CPU
+  routing.
+- Prototype an Eraser-style reliability gate over route features:
+  query shape, snapshot generation age, resident bytes, estimated rows,
+  queue depth, GPU memory pressure, and cold-tier locality. Gate: unseen
+  feature buckets cannot force a GPU route.
+- Maintain per-route-family reliability intervals for same-shape lookup,
+  aggregate, cold-transfer, and CPU-index routes. Failure condition: a
+  high-regression route family continues to receive learned admissions
+  after local reliability drops below threshold.
+- Compare learned route selection with and without the conservative CPU
+  fallback included in the candidate set. Gate: every learned decision
+  must have an executable deterministic fallback.
+- Add online adaptation tests where data distribution, resident
+  generation, and queue depth shift mid-run. Measure how quickly the
+  reliability gate stops routing into newly bad GPU or cold-tier paths.
+- Track benefit/regression separately in benchmark output. A learned
+  route policy fails if average throughput improves while tail
+  regressions exceed an explicit SLO budget.
+
 ### 2026-06-06 - SpecPMT turns persistence ordering into early sequential logging
 
 **Citation:** Chencheng Ye, Yuanchao Xu, Xipeng Shen, Yan Sha,

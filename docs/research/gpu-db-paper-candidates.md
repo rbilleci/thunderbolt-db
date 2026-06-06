@@ -480,20 +480,29 @@ Append new candidates here as each paper is processed.
   Why: LIMAO cites LEON among learned optimizer systems that adapt to changing
   data; useful for comparing learned plan search or cost feedback against
   modular lifelong route-cost learning. Journal entry added 2026-06-06.
-- `queued` — **Eraser: Eliminating Performance Regression on Learned Query
+- `reviewed` — **Eraser: Eliminating Performance Regression on Learned Query
   Optimizer**, Weng et al., PVLDB 2024.
-  URL: `https://www.vldb.org/pvldb/vol17/p926-weng.pdf`
-  DOI: `https://doi.org/10.14778/3641204.3641218`
+  URL: `https://www.vldb.org/pvldb/vol17/p926-zhu.pdf`
+  DOI: `https://doi.org/10.14778/3641204.3641205`
   Why: LEON emphasizes stability and bounded regression for ML-aided
   optimizers; Eraser is a modern follow-up for checking guardrails,
   regression detection, and fallback strategies before GPU DB trusts learned
-  route scoring in production.
+  route scoring in production. Journal entry added 2026-06-06; the queued URL
+  and DOI were corrected to the PVLDB PDF metadata.
 - `queued` — **RankPQO: Learning-to-Rank for Parametric Query Optimization**,
   Mo et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p863-mo.pdf`
   Why: LEON's pairwise ranking objective is relevant to repeated same-shape
   routes; RankPQO may inform parameter-sensitive plan or route caching for
   pgwire prepared statements, retained lookups, and GPU/CPU fallback choices.
+- `queued` — **Learned Query Optimizer: What is New and What is Next**,
+  Zhu, Weng, Ding, and Zhou, SIGMOD Companion 2024.
+  URL: `https://doi.org/10.1145/3626246.3654692`
+  Author PDF: `https://bolinding.github.io/papers/sigmod24learnedqo.pdf`
+  Why: Eraser's authors cite this tutorial as broader learned-optimizer
+  deployment context; useful for checking which LQO pieces are mature enough
+  for GPU DB route scoring and which should remain guarded by deterministic
+  eligibility and fallback rules.
 - `queued` — **Adaptive Concurrent Query Execution Framework for an
   Analytical In-Memory Database System**, Deshmukh, Memisoglu, and Patel,
   IEEE BigData Congress 2017.
