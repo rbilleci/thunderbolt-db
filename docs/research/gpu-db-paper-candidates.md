@@ -6799,13 +6799,14 @@ Append new candidates here as each paper is processed.
   Why: discovered while reviewing Crystal's semantic-region caching; useful as
   a modern follow-up on compact semantic cache summaries, aggregate-result
   inference, and adaptive cache bounds for repeated OLAP-style routes.
-- `queued` — **Lance: Efficient Random Access in Columnar Storage through
+- `reviewed` — **Lance: Efficient Random Access in Columnar Storage through
   Adaptive Structural Encodings**, Pace et al., arXiv 2025.
   URL: `https://arxiv.org/abs/2504.15247`
   Why: ByteHouse stores persistent multimodal data in formats including Lance;
   useful for comparing random-access columnar layout, vector/metadata access,
   and GPU DB's cold-tier point lookup path before adopting a self-describing
-  file format for mixed scalar/text/vector columns.
+  file format for mixed scalar/text/vector columns. Journal entry added
+  2026-06-06 from the arXiv paper.
 - `queued` — **An Empirical Evaluation of Columnar Storage Formats**,
   Zeng et al., arXiv 2023.
   URL: `https://arxiv.org/abs/2304.05028`
@@ -6813,6 +6814,31 @@ Append new candidates here as each paper is processed.
   file layout; this modern evaluation is useful for comparing Parquet, ORC,
   Arrow, and GPU-decoding implications before GPU DB fixes its own
   HBM/DRAM/NVMe segment format.
+- `queued` — **Towards Functional Decomposition of Storage Formats**,
+  Prammer, Zeng, Meng, McKinney, Zhang, Pavlo, and Patel, CIDR 2025.
+  URL: `https://db.cs.cmu.edu/papers/2025/p19-prammer.pdf`
+  Why: Lance argues structural encoding should be configurable rather than
+  baked into one file format; this primary follow-up is useful for decomposing
+  GPU DB's cold/warm segment format into independently benchmarked layout,
+  metadata, compression, and access-method components.
+- `queued` — **The Five-Minute Rule for the Cloud: Caching in Analytics
+  Systems**, Duwe, Anadiotis, Lamb, Lersch, Leskes, Ritter, and Tozun,
+  CIDR 2025.
+  URL:
+  `https://vldb.org/cidrdb/2025/the-five-minute-rule-for-the-cloud-caching-in-analytics-systems.html`
+  PDF: `https://vldb.org/cidrdb/papers/2025/p4-duwe.pdf`
+  Why: Lance frames NVMe as a cache layer for cloud/object storage; this
+  follow-up is useful for deciding when GPU DB should keep hot/warm columnar
+  fragments in HBM, DRAM, NVMe, or object storage based on access frequency,
+  object-store latency, and cache cost.
+- `queued` — **Bullion: A Column Store for Machine Learning**, Liao, Liu,
+  Chen, and Abadi, CIDR 2025.
+  URL:
+  `https://vldb.org/cidrdb/2025/bullion-a-column-store-for-machine-learning.html`
+  PDF: `https://vldb.org/cidrdb/papers/2025/p26-liao.pdf`
+  Why: Lance highlights ML-style nested and wide-column workloads; Bullion is
+  a modern primary follow-up for comparing wide/nested column-store layout
+  against GPU DB's future vector/text/scalar segment design.
 - `queued` — **SyPer: Connecting the Pieces for Hybrid Transactional and
   Analytical Processing**, Wang et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p673-wang.pdf`

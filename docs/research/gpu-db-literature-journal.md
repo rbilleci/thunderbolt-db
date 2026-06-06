@@ -38,6 +38,181 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Lance makes random columnar access a structural-encoding problem
+
+**Citation:** Weston Pace, Chang She, Lei Xu, Will Jones, Albert
+Lockett, Jun Wang, and Raunak Shah. "Lance: Efficient Random
+Access in Columnar Storage through Adaptive Structural Encodings."
+arXiv:2504.15247v1, 2025. Retrieved 2026-06-06 from arXiv at
+`https://arxiv.org/abs/2504.15247` and PDF
+`https://arxiv.org/pdf/2504.15247`.
+
+**Category:** database file-system/storage/indexing and multi-tier
+cache/data placement, with secondary relevance to query route choice,
+GPU/CPU cold-tier execution, and P8 physical layout.
+
+**Relevance tags:** Lance; columnar storage; structural encoding;
+random access; NVMe; search cache; miniblock encoding; full-zip
+encoding; nested data; vector data; struct packing; Parquet; Arrow;
+read amplification; IOPS; cold-tier point lookup.
+
+**Core idea:** The paper argues that columnar formats are not
+intrinsically bad at random access; they become bad when their
+structural encoding scatters offsets, validity, repetition, and value
+buffers across too many independent reads or makes random access pay
+page-level read amplification. Lance separates structural encoding
+from compression and uses different encodings for small and large
+values so a file can support both sequential scans and unclustered
+point fetches from NVMe.
+
+For GPU DB, the strongest transferable idea is that P8 should treat
+physical layout as a route contract, not merely a storage format. A
+cold or warm columnar segment should publish the number of IOPS,
+expected read amplification, metadata-cache bytes, decompression
+shape, and GPU transfer bytes needed for a point lookup or retained
+scan. That route proof matters as much as the column bytes.
+
+**Concrete mechanisms:**
+
+- The paper defines structural encoding as the first-stage split of
+  nested arrays into disk buffers, separate from compressive encoding.
+  This split controls how many IOPS, phases, and bytes are required to
+  fetch one logical row value.
+- The evaluation treats small cached metadata as a "search cache."
+  The authors target roughly 0.1% of data size for this metadata and
+  benchmark warm searches where that metadata has already been loaded.
+- Arrow-style dense buffers are simple and good for memory, but a
+  nested or variable-width value can require multiple dependent IOPS:
+  for example list validity/offsets, string validity/offsets, then
+  string bytes.
+- Parquet can perform well for random access when configured with a
+  page offset index and small pages. The paper reports that an
+  optimized parquet-rs setup improved small-scalar random access from
+  about 5,500 rows/s with default settings to about 350,000 rows/s on
+  their test system.
+- Lance full-zip encoding is used for large values, with 128 bytes per
+  value as the paper's measured threshold. Repetition levels,
+  definition levels, and value bytes are placed in row-major order
+  inside one zipped buffer so a fixed-width value can be fetched with
+  at most one IOP.
+- For variable-width full-zip data, Lance adds a bit-packed repetition
+  index that maps top-level values to byte offsets. This can support
+  random access in at most two IOPS regardless of nesting depth,
+  although the index is not included in the small search-cache budget.
+- Lance miniblock encoding is used for smaller values. It keeps
+  vectorized buffer layout and chunk-level compression, aiming for
+  compressed chunks around one to two 4 KiB disk sectors. Chunk
+  metadata is compact, but retrieving a single value decodes the
+  whole miniblock.
+- Miniblock chunk metadata currently uses two bytes for chunk size,
+  with limits that keep chunks small and the search cache bounded.
+  The paper reports Lance search-cache metadata around 24 bytes per
+  chunk without a repetition index and 41 bytes with one.
+- Lance struct packing stores multiple struct fields together after
+  compressing each field individually. This trades single-field scan
+  speed for fewer IOPS when a random lookup needs several fields.
+- The experiments use a Samsung 970 EVO Plus NVMe drive and an
+  Intel i7-10700K. The independent disk benchmark reports about
+  850K random 4 KiB reads/s and 3,400 MiB/s sequential throughput.
+- The paper finds that both Parquet and Lance can effectively use
+  NVMe for random access when configured carefully, while Lance avoids
+  Parquet's large search-cache issue for large values and avoids a
+  single row-group-size choice across all columns.
+- The authors flag limitations and future work around disk-sector
+  alignment, `pread64` overhead, io_uring-style I/O, transparent
+  encodings for small values, row-storage via top-level struct packing,
+  and configurable structural encodings for future formats.
+
+**GPU DB mapping:** P8's first-slice row/MVCC source plus generated
+GPU column groups should not lock into one universal columnar layout.
+Hot GPU-resident scans, CPU warm point lookups, cold NVMe retrieval,
+and future vector/text columns need different structural encodings.
+The Lance result suggests a route descriptor should say whether a
+column group is scan-optimized, random-access-optimized, packed for
+multi-column lookup, or packed for GPU transfer.
+
+The search-cache idea maps directly to resident and warm-tier
+metadata budgets. GPU DB should budget and publish bytes for offset
+indexes, repetition indexes, row-id maps, min/max or predicate
+metadata, dictionaries, and route certificates separately from data
+bytes. A small metadata cache can make cold/warm point lookups viable,
+but it competes with pinned host buffers, CPU indexes, and retained
+snapshot descriptors.
+
+Full-zip style layout is especially interesting for large text,
+vector, image, or future embedding-like values: fetch the payload and
+its structural proof with one or two aligned reads, then transfer only
+the requested values or micro-batch of values. Miniblock style layout
+is more attractive for small scalar columns where scan vectorization
+and compression density matter more than single-value decode cost.
+
+Struct packing maps to common SQL route shapes. If a retained lookup
+usually returns `id, status, small_text` together, a packed warm-tier
+projection could reduce IOPS before GPU DB has a full resident index.
+The planner must price the opposite case too: scanning one field from
+a packed struct reads and transfers extra fields.
+
+The paper's warning about coalesced access is useful for benchmark
+design. GPU DB should not prove cold-tier lookup performance only on
+small datasets where OS page cache and overlapping random selections
+hide IOPS. Benchmarks need billion-row-equivalent address spaces,
+explicit cache warm/cold modes, and counters for read coalescing.
+
+**Risks and mismatches:** Lance targets columnar file access for AI,
+search, and lakehouse workloads, not a transactional SQL storage
+engine with WAL-before-visibility, MVCC version chains, DDL,
+recovery, or GPU-resident invalidation.
+
+The paper's evaluation is on one commodity NVMe drive and specific
+Rust file readers. The numbers are mechanism evidence, not expected
+GPU DB performance targets. Cloud storage, ZNS SSDs, CXL memory,
+GPUDirect Storage, and multi-GPU systems may move the break-even
+points.
+
+Full-zip requires transparent or per-value compression and can waste
+space for null fixed-width values. Miniblock random access pays
+decode/read amplification. GPU DB needs route-specific gates before
+using either shape broadly.
+
+Search-cache metadata is assumed warm in most random-access
+experiments. Under 1M logical sessions and many tables, metadata-cache
+admission, eviction, and rebuild latency become part of the real
+system design.
+
+The paper does not specify crash-consistent update protocols for file
+segments. GPU DB would need WAL/checkpoint publication records,
+segment-generation proofs, and recovery validation before a Lance-like
+layout could represent durable or semi-durable warm-tier state.
+
+**Benchmark candidates:**
+
+- Build a CPU-only cold-segment simulator with Arrow-style buffers,
+  Parquet-like small pages, Lance-like full-zip, and Lance-like
+  miniblocks. Measure IOPS, read amplification, metadata-cache bytes,
+  decode CPU, and p50/p99 lookup latency for scalar, text, vector, and
+  nested/list values.
+- Add a route-descriptor benchmark that exposes structural-encoding
+  facts to the planner: maximum IOPS per lookup, metadata bytes per
+  row/chunk, chunk size, decompression mode, pack width, and expected
+  GPU transfer bytes. Gate: route choice changes when metadata cache
+  or NVMe IOPS is constrained.
+- Compare packed versus unpacked retained lookup projections for
+  common SQL shapes. Failure condition: packing improves multi-column
+  point lookup but silently harms single-column scans without planner
+  accounting.
+- Test billion-row-equivalent random lookup workloads with explicit
+  warm search-cache, cold search-cache, OS page-cache constrained, and
+  coalesced-access counters. Gate: reported lookup throughput remains
+  explainable after disabling accidental page-cache wins.
+- Prototype aligned 4 KiB/8 KiB cold segment chunks and compare
+  `pread64` against batched or io_uring-style reads before involving
+  GPU kernels. Required measurement: queue depth, syscalls, disk
+  bandwidth, CPU decode time, and response-ring delay.
+- Evaluate large-value full-zip-style micro-batches where the CPU
+  fetches structural proof and payload ranges, then transfers only
+  selected values to GPU. Gate: H2D bytes and kernel launch overhead
+  are lower than scanning or refreshing a wider resident segment.
+
 ### 2026-06-06 - FaRM makes distributed commit a reservation-backed RDMA log protocol
 
 **Citation:** Aleksandar Dragojevic, Dushyanth Narayanan, Edmund B.
