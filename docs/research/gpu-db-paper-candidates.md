@@ -7282,12 +7282,26 @@ Append new candidates here as each paper is processed.
   work; useful for comparing bounded-garbage, wait-free, and memory-efficient
   retirement policies for route descriptors and lock-free CPU-side indexes.
   Journal entry added 2026-06-06.
-- `queued` — **Universal Wait-Free Memory Reclamation**, Nikolaev and
+- `reviewed` — **Universal Wait-Free Memory Reclamation**, Nikolaev and
   Ravindran, PPoPP 2020.
   URL: `https://doi.org/10.1145/3332466.3374540`
   Why: Crystalline compares against WFE as the prior general wait-free
   reclamation baseline; useful for deciding whether the full wait-free
   machinery is justified versus a bounded lock-free route-descriptor scheme.
+  Journal entry added 2026-06-07 from the author PDF and arXiv metadata.
+- `queued` — **Hazard Eras: Non-Blocking Memory Reclamation**,
+  Ramalhete and Correia, SPAA 2017.
+  URL: `https://doi.org/10.1145/3087556.3087588`
+  Author PDF: `https://github.com/pramalhe/ConcurrencyFreaks/raw/master/papers/hazarderas-2017.pdf`
+  Why: WFE extends Hazard Eras and inherits its bounded-retired-object safety
+  model; useful for deciding whether GPU DB route descriptors need the full
+  wait-free helper path or can use the simpler lock-free era baseline.
+- `queued` — **Fast and Robust Memory Reclamation for Concurrent Data
+  Structures**, Balmau, Guerraoui, Herlihy, and Zablotchi, SPAA 2016.
+  URL: `https://doi.org/10.1145/2935764.2935790`
+  Why: WFE contrasts QSense-style OS-scheduler/signal-assisted reclamation
+  with non-blocking manual schemes; useful for judging whether session-owner
+  cleanup should ever depend on runtime interruption of slow readers.
 - `queued` — **A Marriage of Pointer- and Epoch-Based Reclamation**, Kang
   and Jung, PLDI 2020.
   URL: `https://doi.org/10.1145/3385412.3386008`

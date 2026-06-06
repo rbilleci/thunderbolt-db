@@ -94745,3 +94745,171 @@ than assume `clwb`-like hints shape future CXL/NVM devices the same way.
 - Add a large-transaction overflow test for small commit windows. Failure
   condition: COPY, DDL, multi-index update, or refresh publication silently
   exceeds the window and loses idempotent recovery information.
+
+### 2026-06-07 - WFE bounds descriptor retirement with helper-assisted eras
+
+**Citation:** Ruslan Nikolaev and Binoy Ravindran. "Universal Wait-Free
+Memory Reclamation." PPoPP 2020, pages 130-143. Retrieved 2026-06-07 from
+the author PDF, arXiv metadata, and DOI page:
+`https://rusnikola.github.io/files/wfe-ppopp20.pdf`,
+`https://arxiv.org/abs/2001.01999`,
+`https://doi.org/10.1145/3332466.3374540`.
+
+**Category:** GC, reclamation, and in-memory DB state, with runtime /
+HFT / session scale and MVCC / snapshot / visibility relevance.
+
+**Relevance tags:** Wait-Free Eras; Hazard Eras; bounded memory
+reclamation; route descriptors; retained snapshots; reservation arrays;
+helper path; era clock; parent protection; retired metadata; p99 cleanup;
+1M logical sessions.
+
+**Core idea:** WFE turns Hazard Eras from a lock-free reclamation scheme into
+a wait-free one. Hazard Eras already bounds retired memory by tagging each
+allocated object with an allocation era, each retired object with a retire
+era, and each hazardous reader with the current era. The weak point is
+`get_protected()`: if the global era changes repeatedly while a reader is
+trying to protect a pointer, the loop is only lock-free. WFE adds a bounded
+slow path and requires allocation/retirement paths to help slow readers before
+advancing the era.
+
+For GPU DB, the transferable idea is not to make every structure wait-free.
+It is to make the lifetime of route descriptors, immutable snapshot handles,
+resident-segment metadata, and CPU-side lock-free indexes bounded even when a
+large number of logical sessions are slow, stalled, or preempted. Era-style
+reservation can turn "who might still see this descriptor?" into a compact
+scan over bounded per-worker state instead of a per-session reference-count
+storm.
+
+**Concrete mechanisms:**
+
+- Each retired object has an `alloc_era` and `retire_era`. A reader protects a
+  hazardous pointer by publishing an era reservation. A retired object cannot
+  be freed if any published reservation falls inside the object's lifetime.
+- The fast path is the Hazard Eras `get_protected()` loop: read the pointer,
+  read the global era, publish that era, and return once the era is stable.
+  WFE bounds this path with a fixed attempt count before entering the slow
+  path.
+- The slow path publishes a help request in per-thread state using an invalid
+  pointer sentinel plus a tag. Global counters track how many slow-path
+  requests have started and ended, allowing era-advancing threads to detect
+  pending help.
+- `alloc_block()` and `retire()` periodically call `increment_era()`.
+  Before the global era is incremented, `increment_era()` scans pending
+  slow-path requests and calls `help_thread()` for each one. This prevents
+  era advancement from repeatedly invalidating an unlucky reader's protection
+  attempt.
+- WFE uses wide compare-and-swap over adjacent words for paired values such as
+  `{pointer, era}` or `{era, tag}`. The paper assumes bounded thread count,
+  64-bit CPUs, wait-free fetch-and-add, and wide CAS on commodity x86_64 or
+  newer AArch64. Systems lacking those primitives can fall back to original
+  Hazard Eras and lose the wait-free guarantee.
+- The API extends `get_protected()` with a `parent` block. A helper first
+  reserves the parent block before reading the child pointer, so the container
+  holding the pointer cannot be reclaimed during help.
+- Cleanup uses an ordered scan discipline over normal reservations and two
+  helper-only special reservations. The order matters: parent-object safety
+  and handoff of the protected child pointer rely on matching reservation
+  publication order with reclamation scan order.
+- The proof bounds the main slow-path loop by the number of in-flight threads,
+  bounds the helper handoff loop by at most two iterations, and shows
+  `get_protected()`, `alloc_block()`, `retire()`, and cleanup are wait-free
+  bounded under the stated assumptions.
+- Evaluation used a 96-core, four-socket Intel Xeon E7-8890 v4 machine with
+  256 GB RAM, SMT disabled, pinned threads, g++ 8.3.0, jemalloc, 10-second
+  runs repeated five times, and lock-free/wait-free queues, linked lists,
+  hash maps, and Natarajan BSTs. WFE was generally close to Hazard Eras and
+  epoch/interval schemes in throughput while providing a stronger progress
+  guarantee. Hazard Pointers were often slower; EBR could be less memory
+  efficient under preemption.
+
+**GPU DB mapping:** The most direct mapping is a descriptor-era reclamation
+layer for runtime metadata. Network workers, read-snapshot workers, GPU
+execution owners, and mutation/residency owners would publish compact
+reservation eras for the descriptor generations they might dereference. Route
+descriptors, resident snapshot handles, command-ring slabs, and retired
+catalog/residency metadata can be freed only after no worker reservation
+intersects their lifetime.
+
+Era reservations should be per physical worker, not per logical session. A
+1M-session system cannot afford a hazard slot per session on the hot path.
+Logical sessions should borrow a small number of IO/read/GPU workers whose
+reservation state represents active dereference windows. Session state that is
+parked outside an active worker must hold stable logical ids or generation
+numbers, not raw reclaimable pointers.
+
+The helper-before-era-advance rule maps to owner-domain publication. Before a
+mutation owner, catalog owner, or residency owner advances a global descriptor
+generation and retires old metadata, it can help or force-complete bounded
+reader protection windows. This is a better p99 shape than letting stale
+generation cleanup wait indefinitely behind a preempted read worker.
+
+The parent-protection rule is important for nested metadata. A route family
+may point to a table descriptor, which points to resident segments, which point
+to GPU buffers or CPU staging slabs. Protecting only the child pointer is not
+enough if the parent descriptor can disappear while a helper follows it. GPU
+DB should model descriptor graphs explicitly and require protection order to
+match the pointer traversal order.
+
+Cleanup scan order maps to correctness of retired snapshot handles. If helper
+slots or handoff slots are introduced for slow read workers, the reclamation
+scan must know which slots protect parent descriptors and which protect child
+descriptors. Treating all slots as an unordered bag may be safe but slower; a
+too-clever reordered scan can free metadata during handoff.
+
+The evaluation suggests a useful engineering posture: start with a simple
+lock-free era scheme for descriptor/snapshot retirement, then benchmark a WFE
+slow path only if p99 cleanup or stalled readers threaten memory bounds. Full
+wait-freedom has complexity and hardware assumptions; it should be justified
+by measured tail risk, not adopted as aesthetic purity.
+
+**Risks and mismatches:** WFE is for manual memory reclamation in shared-memory
+concurrent data structures, not for SQL MVCC semantics. It does not decide
+which versions are visible, which WAL records are durable, when snapshots are
+logically safe to retire, or how PITR/replication retain history. It only
+addresses when memory for already-retired objects can be physically freed.
+
+The algorithm assumes a bounded set of participating threads. GPU DB's target
+is 1M logical sessions, so the design must map reservations to bounded worker
+domains and active dereference windows. If every session gets a reservation
+slot, scans and memory footprint become unacceptable.
+
+WFE requires wide CAS and wait-free fetch-and-add assumptions. Rust/C++ atomics
+and target hardware need careful validation before relying on the wait-free
+claim. A portable implementation may have to expose a downgraded lock-free
+mode and report it in telemetry.
+
+The paper's benchmarks are concurrent data-structure microbenchmarks, not
+database workloads. They do not include pgwire fan-in, WAL group commit,
+resident GPU buffers, CUDA stream ownership, MVCC long readers, catalog DDL,
+or NUMA/GPU memory pressure. Any adoption needs database-specific tests.
+
+Reference-counting may still be simpler for coarse immutable snapshots with
+few handoffs. WFE is most attractive for high-churn pointer-rich metadata or
+indexes where per-dereference increments would be too expensive.
+
+**Benchmark candidates:**
+
+- Prototype descriptor-era reclamation for route descriptors and retained
+  read snapshots. Compare reference counting, simple epoch reclamation,
+  Hazard-Era-style reservations, and WFE-style helper slow paths. Measure
+  read latency, retire latency, unreclaimed bytes, cleanup CPU, and p99 under
+  stalled worker injection.
+- Add a 1M-logical-session simulation where only bounded IO/read/GPU workers
+  publish reservation slots. Gate: reservation memory and cleanup scan time
+  scale with worker count, not session count.
+- Stress nested descriptor traversal: route family -> table generation ->
+  resident segment -> GPU buffer handle. Failure condition: parent descriptor
+  retirement can race a helper or reader that is protecting a child pointer.
+- Benchmark era advancement policy for mutation/catalog/residency owners:
+  advance-on-count, advance-on-bytes-retired, advance-on-time, and
+  help-before-advance. Measure publication latency, unreclaimed metadata,
+  stale-generation rejection rate, and tail latency under slow readers.
+- Add hardware/atomic capability gates for any WFE-like implementation:
+  x86_64 wide-CAS path, AArch64 path if available, and portable lock-free
+  fallback. Gate: the runtime reports whether reclamation is wait-free,
+  lock-free, or blocking, and tests verify fallback does not weaken SQL
+  visibility correctness.
+- Test whether simple refcounts beat era reservations for coarse immutable
+  table snapshots. Failure condition for WFE adoption: the helper/scan
+  machinery adds measurable p99 cost without reducing unreclaimed metadata
+  under realistic retained-read workloads.
