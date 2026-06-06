@@ -38,6 +38,215 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Cross-paper synthesis: route scheduling now needs logical, physical, and pressure proofs
+
+The recent Decibel, ROME, datacenter RDMA, and Laser reviews point
+to a shared scheduling problem: a query route is not ready merely
+because it is semantically legal. It also needs a physical placement
+proof and a pressure proof. Decibel supplies the generation/segment
+view of retained data, ROME adds bounded insurance when route
+choice is uncertain, the RDMA paper warns that incast and coarse
+backpressure can collapse otherwise fast paths, and Laser shows
+that routing by access footprint can preserve hot buffers.
+
+The strongest converging design track is a route certificate plus
+admission record. The certificate should prove logical visibility
+and physical compatibility: schema generation, snapshot boundary,
+resident generation, segment or dictionary identity, route shape,
+execution target, and response shape. The admission record should
+then prove resource fit: queue lane, GPU worker/stream, pinned
+buffer budget, resident bytes, response ring space, and fallback or
+delay policy. Fast retained reads should enter execution only when
+both proofs are available, or else take an explicit fallback/retry
+route.
+
+Category gaps remain around mixed write/read scheduling and
+cache-aware route placement under write freshness pressure. The
+journal now has enough isolated pieces for route selection,
+snapshots, transport backpressure, and buffer-aware scheduling; the
+next useful papers should emphasize write-path interaction,
+concurrency-control scheduling, or tiered/resident cache policies
+that survive invalidation and long readers.
+
+Benchmark priorities:
+
+- route certificates that combine SQL snapshot, resident generation,
+  segment footprint, and route shape
+- footprint-aware queueing versus FIFO/queue-depth-only scheduling
+  for retained GPU reads
+- bounded two-route insurance under uncertainty, with loser cleanup
+  and global resource accounting
+- incast tests where many sessions target one owner, resident
+  segment, or response lane
+- invalidation tests where learned or cached footprint state is
+  discarded on DML, DDL, eviction, dictionary rebuild, and refresh
+- per-route pressure proofs that explain delay, CPU fallback, GPU
+  execution, or overload rejection without a global stop-the-world
+  backpressure state
+
+### 2026-06-06 - Laser: Buffer-aware learned scheduling should route by residency footprint, not only load
+
+**Citation:** Yuwei Huang and Guoliang Li. "Laser: Buffer-Aware
+Learned Query Scheduling in Master-Standby Databases." PVLDB 18(3),
+2024, pp. 743-755. doi:10.14778/3712221.3712239. Retrieved
+2026-06-06 from `https://www.vldb.org/pvldb/vol18/p743-li.pdf`.
+
+**Category:** multi-tier cache / data placement, with query
+planning, scheduling, and HTAP routing relevance.
+
+**Relevance tags:** buffer-aware scheduling; learned access
+patterns; query-to-block prediction; replica routing; load balance;
+online model training; database-shift detection; queue
+re-allocation; hot resident pages; route admission; tier locality.
+
+**Core idea:** Laser observes that in a master-standby database,
+read routing should not only balance queue length or node load. If
+queries with similar physical access footprints are sent to the same
+replica and executed near each other, they can reuse database
+buffer-pool contents instead of repeatedly faulting the same blocks
+from storage. Laser therefore predicts each query's accessed block
+buckets, groups similar queries onto database nodes under load
+constraints, and reorders each node's local queue to favor both
+buffer hits and short-query priority.
+
+For GPU DB, the transferable idea is to make physical residency a
+first-class scheduling signal. A route that is logically valid under a
+snapshot is still not equally good on every worker, partition, GPU
+stream, or tier. The scheduler should know the query's expected
+segment/column/key-vector footprint and use that footprint to
+choose among resident GPU execution, warm CPU buffers, cold NVMe
+access, CPU fallback, or delayed batching with compatible work.
+
+**Concrete mechanisms:**
+
+- Laser sits as a proxy/JDBC/ODBC-style scheduling layer in front of
+  one master and multiple standby databases. Writes route to the
+  master; read queries can be assigned to any node.
+- Query encoding uses backend query plans rather than raw SQL text.
+  Laser extracts scan operators and encodes scan type, table name,
+  index name, join conditions, and range predicates, while ignoring
+  operators that do not affect scan footprint.
+- Access patterns are represented as fixed-length per-relation block
+  bucket vectors. A table's block bitmap is downsampled by recording
+  the fraction of accessed blocks in each bucket, keeping vector
+  length independent of table size.
+- The query model is a lightweight modular MLP with scan encoders,
+  buffer predictors, and table/index-specific prediction heads.
+  Position-wise max merges multiple scan predictions into a query
+  access vector.
+- Some scan types bypass learning with deterministic prior
+  knowledge, such as index-only scans not touching base-table blocks
+  or sequential scans touching a full relation.
+- Adaptive greedy allocation chooses the backend node with the best
+  weighted combination of access-pattern distance to that node's
+  current cluster center and relative load. The load weight rises
+  when nodes go idle while others still have pending work, and falls
+  when the system can refocus on buffer locality.
+- Each database connector maintains a local query queue and an
+  exponential-moving-average estimate of its buffer state. Query
+  selection chooses the queued query with the best combination of
+  distance to estimated buffer state and short-query priority.
+- Periodic query re-allocation collects pending work, recomputes
+  access patterns, and applies cost-bounded clustering so new
+  workload information can repair earlier online decisions.
+- Online training avoids per-query block tracing. The trainer samples
+  database buffer states before and after query execution, derives
+  approximate newly buffered or newly accessed blocks, filters to
+  relevant relations, and trains on a sliding window.
+- A database monitor detects DML and DDL shifts. DML updates table
+  block metadata and invalidates affected training data; DDL can add
+  or remove prediction heads without discarding the full model.
+- Evaluation uses PostgreSQL 15.3 on a three-node physical
+  replication setup with TPC-H, TPC-DS, JOB, Sysbench, and an HTAP
+  workload. The paper reports roughly 80% lower query completion
+  time than heuristic baselines in its experiments, with scheduling
+  overhead below 1% of average query execution time on JOB.
+- Benefits are strongest when buffer misses are expensive and when
+  enough concurrent or queued work exists to exploit scheduling.
+  With SSDs or near-serialized low-arrival workloads, the relative
+  benefit narrows but remains positive in the reported experiments.
+
+**GPU DB mapping:** GPU DB can generalize Laser's "query to block
+bucket" model into a "route to residency footprint" contract. A
+route certificate should expose table OID, partition, schema
+generation, snapshot boundary, column family, segment ids,
+dictionary/index identity, resident byte ranges, expected output
+shape, and route class. The runtime can then group compatible work
+by physical footprint instead of treating GPU queue depth as the
+only scheduling input.
+
+This fits P8's cache manager directly. A resident snapshot already
+knows valid table generations, resident bytes, supported columns,
+and fallback reasons. The missing benchmarkable step is to feed
+those facts into the high-throughput runtime so same-footprint reads
+land on workers with hot device buffers, pinned host buffers, route
+metadata, and response templates already warm. For over-resident
+queries, a predicted footprint can decide whether to prefetch a
+segment, use CPU warm-tier filtering, wait briefly for compatible
+micro-batch partners, or reject/fallback under pressure.
+
+Laser's online adaptation also maps to route telemetry. Instead of
+training from sampled PostgreSQL buffer pages, GPU DB can start
+with explicit observed facts: resident segment hits, CPU fallback
+bytes, H2D/D2H bytes, GPU queue wait, output rows, cold NVMe bytes,
+and invalidation/freshness misses. These facts can update a cheap
+route-affinity model without guessing what the engine touched.
+
+The scheduling shape is also useful for 1M logical sessions. Idle
+sessions should not own resident buffers, but active requests can
+carry compact footprint descriptors into bounded rings. Admission
+can then choose the narrowest saturated resource: route-class queue,
+GPU worker, pinned-buffer pool, resident segment budget, response
+ring, or cold-tier IO, rather than overloading one global read queue.
+
+**Risks and mismatches:** Laser targets master-standby replicated
+PostgreSQL instances and mostly query-level routing, not a single
+GPU-resident storage engine. Its read replicas hold full database
+copies, while GPU DB's tiers have different capacities, freshness,
+and execution capabilities. The paper does not address MVCC
+visibility, WAL-before-visibility, CUDA stream ownership, GPU memory
+eviction, response-ring correctness, or cancellation after launch.
+
+The model relies on backend `EXPLAIN` and buffer-state snapshots.
+GPU DB should prefer explicit planner and residency metadata when
+available before adding a learned model. Also, Laser's benefits
+depend on queued/concurrent work; simple point lookups under low
+arrival rate may not justify inference, clustering, or delayed
+execution. Any locality-aware scheduler must remain bounded by
+latency ceilings and must not starve writes, fresh reads, or
+non-resident fallback routes.
+
+**Benchmark candidates:**
+
+- Add a route-footprint descriptor to retained read requests:
+  relation, partition, snapshot generation, route shape, columns,
+  predicted resident segments, resident bytes, and response shape.
+  Gate: descriptors are produced for accepted and rejected resident
+  routes without changing SQL results.
+- Compare FIFO GPU read scheduling with footprint-aware scheduling
+  for mixed retained point/range/aggregate queries. Measure p50/p99,
+  throughput, GPU queue wait, kernel launches, resident hits, H2D/D2H
+  bytes, and starvation of unrelated routes.
+- Prototype same-footprint micro-batch grouping by segment set and
+  snapshot generation, not just query shape. Failure condition:
+  grouping improves throughput but violates latency ceilings or uses
+  a stale/invalid resident generation.
+- Add a warm-tier locality benchmark where queries can run on CPU
+  buffered segments, resident GPU segments, or cold transfer. Test
+  whether footprint-aware routing avoids cold reads more often than
+  queue-depth-only routing.
+- Feed observed route facts into a simple adaptive affinity score:
+  segment hits, fallback reason, queue wait, output rows, and transfer
+  bytes. Gate: the scheduler can explain why it chose resident GPU,
+  CPU warm-tier, cold fallback, delay, or rejection.
+- Add DML/DDL shift tests for any learned or cached footprint state.
+  Failure condition: route-affinity metadata survives table rewrite,
+  invalidation, schema change, dictionary rebuild, or eviction when
+  the route certificate no longer proves compatibility.
+- Measure scheduling overhead for short retained reads. Failure
+  condition: access-footprint prediction or queue scanning dominates
+  the saved execution time for single-row lookup workloads.
+
 ### 2026-06-06 - Query compiler architecture should preserve planner facts until code generation
 
 **Citation:** Ruby Y. Tahboub, Gregory M. Essertel, and Tiark Rompf.

@@ -255,6 +255,34 @@ read/write throughput, recovery, compaction, or tail-latency mechanisms.
 
 Append new candidates here as each paper is processed.
 
+- `reviewed` — **Laser: Buffer-Aware Learned Query Scheduling in
+  Master-Standby Databases**, Huang and Li, PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol18/p743-li.pdf`
+  DOI: `https://doi.org/10.14778/3712221.3712239`
+  Code: `https://github.com/hyw498169842/LASER`
+  Why: modern buffer-aware learned query scheduling discovered because the
+  current queued locality/scheduling candidates skewed older; useful for
+  routing retained reads by physical residency footprint, buffer/GPU locality,
+  and load balance. Journal entry added 2026-06-06.
+- `queued` — **LSched: A Workload-Aware Learned Query Scheduler for Analytical
+  Database Systems**, Sabek, Ukyab, and Kraska, SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526141`
+  Why: Laser cites LSched as learned query scheduling related work; useful for
+  comparing reinforcement-learning or workload-aware scheduling with explicit
+  route-footprint scheduling for GPU DB.
+- `queued` — **Self-Tuning Query Scheduling for Analytical Workloads**,
+  Wagner, Kohn, and Neumann, SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457290`
+  Why: Laser cites it as single-server analytical scheduling work; useful for
+  deciding whether GPU DB's read runtime should tune queue order by observed
+  latency, cache locality, and short-query priority.
+- `queued` — **Buffer Pool Aware Query Scheduling via Deep Reinforcement
+  Learning**, Zhang, Marcus, Kleiman, and Papaemmanouil, arXiv 2020.
+  URL: `https://arxiv.org/abs/2007.10568`
+  Why: Laser cites it as buffer-pool-aware scheduling; useful for contrasting
+  learned buffer reuse against deterministic residency metadata and route
+  certificates.
+
 ### Database file-system design, storage, and indexing
 
 - `queued` — **Native Cloud Object Storage in Db2 Warehouse: Implementing a
