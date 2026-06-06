@@ -5174,14 +5174,21 @@ Append new candidates here as each paper is processed.
   Epic is a modern deterministic MVCC OLTP design that uses GPU-parallel
   indexing/initialization to precompute direct version locations, avoid
   version-chain search, and reclaim epoch scratchpad versions wholesale.
-- `queued` — **Aria: A Fast and Practical Deterministic OLTP Database**,
+- `reviewed` — **Aria: A Fast and Practical Deterministic OLTP Database**,
   Lu et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p2047-lu.pdf`
   DOI: `https://doi.org/10.14778/3407790.3407808`
   Why: Epic compares against Aria's deterministic abort/fallback strategy;
   useful for deciding when GPU DB should prefer deterministic rerun,
   lock-based fallback, or owner-serialized execution for mispredicted
-  read/write sets.
+  read/write sets. Journal entry added 2026-06-06.
+- `queued` — **Fast Abort-Freedom for Deterministic Transactions**,
+  Chen, Wu, Zhong, and Eriksson, IPDPS 2024.
+  URL: `https://par.nsf.gov/servlets/purl/10548863`
+  Why: discovered while reviewing Aria; modern deterministic-transaction
+  follow-up focused on reducing aborts, useful for testing whether GPU DB can
+  keep batch/snapshot execution while avoiding retry amplification under
+  hot-key or dependency-heavy workloads.
 - `reviewed` — **Caracal: Contention Management with Deterministic
   Concurrency Control**, Qin, Demke Brown, and Goel, SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483591`

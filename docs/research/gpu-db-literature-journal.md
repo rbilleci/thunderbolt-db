@@ -91199,3 +91199,206 @@ resident GPU design.
   crash or cancel between merge, descriptor publish, and old-segment
   retirement. Recovery must expose either the old valid route or the
   new valid route, never a half-compacted descriptor.
+
+### 2026-06-06 - Aria makes deterministic OLTP a batch/snapshot conflict filter
+
+**Citation:** Yi Lu, Xiangyao Yu, Lei Cao, and Samuel Madden.
+"Aria: A Fast and Practical Deterministic OLTP Database." PVLDB
+13(11), 2047-2060, 2020. DOI:
+`https://doi.org/10.14778/3407790.3407808`. Retrieved 2026-06-06
+from the VLDB PDF:
+`https://www.vldb.org/pvldb/vol13/p2047-lu.pdf`.
+
+**Category:** transaction processing / write path, with MVCC/snapshot
+visibility and runtime batching relevance.
+
+**Relevance tags:** deterministic OLTP; batch execution; snapshot
+execution; conflict detection; deterministic reordering; fallback
+execution; replication by input; YCSB; TPC-C; hot-key contention;
+batch barriers.
+
+**Core idea:** Aria removes the usual deterministic-database
+requirement that read/write sets be known before execution. Each
+replica executes the same transaction batch against the same database
+snapshot, records the actual read and write sets, and then runs a
+deterministic commit phase that independently decides which transactions
+can commit while preserving serializability.
+
+For GPU DB, the strongest transferable idea is not "make all SQL
+deterministic." It is to treat a bounded batch as a visibility
+generation: execute compatible work optimistically against a fixed
+snapshot, collect precise conflict/admission facts, then publish only
+the subset that passes a deterministic commit rule. That maps naturally
+to owner-ring batch drains, GPU transaction kernels, and retained
+snapshot generation boundaries.
+
+**Concrete mechanisms:**
+
+- Aria processes input transactions in batches. A batch starts from one
+  database snapshot, executes transactions in parallel without blocking
+  on locks or precomputed dependencies, and then applies a commit phase
+  after all transactions in the batch finish execution.
+- During execution, reads and writes are recorded in reservation tables.
+  The commit phase uses those tables to classify conflicts between
+  transactions in the batch, especially write-after-write, read-after-
+  write, and write-after-read dependencies relative to transaction ids.
+- The basic commit rule aborts transactions whose observed dependencies
+  would violate the input order. Aborted transactions are retried in the
+  next batch.
+- Deterministic reordering relaxes the rule: a transaction can commit if
+  it has no write-after-write dependency on an earlier transaction and
+  does not simultaneously have write-after-read and read-after-write
+  dependencies against earlier transactions. The paper frames this as
+  transforming some RAW dependencies into WAR dependencies so more
+  transactions can commit under a serial order different from the input
+  order.
+- The reordering check is still parallel: each transaction's commit or
+  abort decision can be computed from its read/write set and reservation
+  tables without central coordination between replicas.
+- AriaFB adds a fallback path for high abort rates: non-conflicting
+  transactions commit normally, while conflicting transactions rerun
+  with a lock-based deterministic fallback. This helps when contention is
+  dominated by write/write conflicts that reordering cannot remove.
+- Replication ships the ordered input transactions rather than shipping
+  outputs or synchronizing every write. Replicas that receive the same
+  input batch and start from the same state independently produce the
+  same committed effects.
+- The implementation targets short, one-shot stored procedures written
+  in C++ and does not provide a SQL interface or multi-round interactive
+  transactions. Tables use primary hash tables and optional secondary
+  hash indexes; range queries are not supported in the reported system.
+- The paper reports that deterministic reordering does not materially
+  help under uniform low-conflict YCSB, but at skew factor 0.999 it gives
+  Aria about 3.0x higher throughput than Aria without deterministic
+  reordering.
+- Under very high skew, Aria's throughput drops because aborted
+  transactions are repeatedly rerun; the paper reports Aria at 39% of
+  its no-skew throughput at skew 0.999, while the fallback variant
+  behaves more like Calvin because many transactions use the lock-based
+  fallback.
+- For TPC-C, the paper reports that contended district `d_ytd` writes
+  hurt pure Aria when partition count is small, while AriaFB benefits
+  from committing non-conflicting transactions in the ordinary phase and
+  rerunning conflicts through fallback.
+- In distributed experiments on eight EC2 nodes, the paper reports Aria
+  outperforming Calvin by 1.6x-2.1x on YCSB and up to 1.7x on TPC-C,
+  with near-linear scaling to 16 nodes in the YCSB scaling experiment.
+- Batch barriers are a real cost. The paper's straggler experiment shows
+  about 81% slowdown when a single transaction in a 1K batch carries a
+  20 ms delay, while distributing the same delay across more than 100
+  transactions keeps slowdown below 20%.
+
+**GPU DB mapping:** The batch/snapshot split maps directly to command
+ring drains. A mutation owner or partition owner could group admitted
+short writes under one source snapshot and WAL reservation epoch,
+execute CPU or GPU conflict discovery in parallel, then publish a
+visibility generation for only the deterministic commit set.
+
+The reservation-table idea maps to GPU-friendly conflict metadata:
+per-batch key vectors, write bitmaps, read key summaries, and
+transaction ids can be built in contiguous buffers before commit
+publication. A GPU kernel can help sort, group, or detect conflicts, but
+the CPU owner should still own WAL-before-visibility and final
+generation publication.
+
+Deterministic reordering is especially relevant to hot retained routes
+with short stored-procedure-like write shapes. GPU DB could benchmark
+whether same-shape update batches can commit more work by allowing a
+serial order that differs from arrival order, while preserving per-client
+response ordering and explicit retry results.
+
+AriaFB suggests a practical admission rule: do not force every hot-key
+batch through the same optimistic route. When write/write contention or
+stragglers exceed a threshold, split the batch into a fast deterministic
+commit subset plus an owner-serialized or lock-based fallback lane.
+
+Replication-by-input is a useful future idea for remote accelerator or
+replica owners. If route descriptors, snapshot ids, and deterministic
+batch ids are stable, GPU DB can ship compact operation inputs to
+another owner or replica instead of shipping full materialized results.
+That is only safe for deterministic one-shot procedures, not arbitrary
+interactive SQL sessions.
+
+**Risks and mismatches:** Aria is not a general SQL engine. It assumes
+short one-shot stored procedures, no interactive multi-round
+transactions, no SQL parser/planner surface, hash-index access, and no
+range queries in the reported implementation.
+
+Batch barriers can damage tail latency. GPU DB's 1M logical-session
+runtime cannot let one slow transaction or H2D transfer hold a whole
+visibility generation hostage. Any Aria-like path needs small bounded
+batches, straggler ejection, and latency ceilings.
+
+Aria retries aborted transactions in later batches. That may be
+acceptable for closed stored procedures, but pgwire clients need precise
+SQL-visible success, serialization failure, overload, or retry behavior.
+Retrying inside the engine must not violate transaction boundaries,
+statement side effects, or client-visible ordering.
+
+The paper's deterministic reordering reduces RAW-driven aborts but does
+not remove WAW hot-key contention. GPU DB still needs hot-key admission,
+operation-specific commutativity, owner serialization, or fallback for
+increment-heavy and single-row-update-heavy workloads.
+
+The evaluation is YCSB/TPC-C and deterministic OLTP centered. It does
+not evaluate GPU execution, MVCC version-chain layouts, WAL flush cost,
+resident snapshot invalidation, or mixed analytical scans.
+
+**Benchmark candidates:**
+
+- Build an Aria-style batch simulator for GPU DB mutation owners. Vary
+  batch size, skew, read/write set size, and straggler duration. Measure
+  commit rate, p50/p99 latency, retry count, and visibility-generation
+  stall time. Gate: throughput gains cannot come with unbounded p99
+  spikes.
+- Prototype reservation-table conflict detection over fixed-shape
+  updates: CPU scalar, CPU SIMD/sort, and GPU sort/group kernels.
+  Measure conflict-detection time, transfer overhead, batch size
+  break-even, and final owner publication time.
+- Compare three hot-key policies: pure optimistic retry next batch,
+  deterministic reordering, and AriaFB-style fallback for conflicts.
+  Failure condition: fallback improves throughput but starves cold keys
+  or hides serialization failures from clients.
+- Add a "visibility generation batch" proof where WAL reservation,
+  conflict detection, resident invalidation, CPU MVCC publication, and
+  response emission are separated in telemetry. Gate: no committed
+  response can be emitted before WAL-before-visibility is satisfied.
+- Test deterministic reordering only for stored-procedure-like internal
+  routes with stable read/write declarations or recorded access sets.
+  Gate: arbitrary SQL statements remain outside the route until result
+  ordering, side effects, and retry semantics are explicit.
+- Evaluate batch barrier mitigation: maximum batch age, straggler
+  ejection to fallback, and partial commit publication. Measure owner
+  queue depth, session response latency, and abort/retry amplification.
+
+### 2026-06-06 - Cross-paper synthesis: batches need bounded credits and escape hatches
+
+Aria, Quickstep, and MatrixKV converge on the same operational lesson
+from different layers: large work must be cut into bounded units with
+explicit publication or scheduling facts. Quickstep makes query plans
+into schedulable work orders; MatrixKV makes compaction a bounded
+key-range column merge; Aria makes OLTP commits a batch/snapshot
+conflict decision.
+
+The design track for GPU DB should therefore treat every high-throughput
+route as a credited fragment with an escape hatch. Read fragments need
+snapshot generation, resident segment identity, buffer credits, and a
+pause/fallback policy. Write batches need WAL reservation, conflict
+metadata, invalidation scope, deterministic publish rules, and a fallback
+lane for hot keys or stragglers. Storage refreshes need bounded segment
+or key-range units, source WAL boundaries, and crash-safe descriptor
+publication.
+
+The current category gap is still not GPU analytics; that lane has
+enough coverage. The next strongest gaps are production-safe
+transactional write publication, MVCC/snapshot retention under long
+readers, and admission control that ties runtime queues to storage and
+visibility generations.
+
+Benchmark priority should move toward one end-to-end simulator that
+combines these three ideas: a retained-read workload, a mutation batch
+with deterministic conflict publication, and a bounded resident-refresh
+or cold-tier compaction lane. The key measurements are not just raw
+throughput, but p99 lookup latency during maintenance, write retry
+amplification under skew, and whether every visible result can be traced
+to an explicit WAL/visibility/snapshot boundary.
