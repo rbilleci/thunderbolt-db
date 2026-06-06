@@ -468,18 +468,36 @@ Append new candidates here as each paper is processed.
   key-value stores; useful for comparing ownership partitioning, adaptive
   caching, selective replication, and log-free indexing against GPU DB's
   warm/cold tier metadata and owner domains.
-- `queued` — **SkyStore: Cost-Optimized Object Storage Across Regions and
+- `reviewed` — **SkyStore: Cost-Optimized Object Storage Across Regions and
   Clouds**, Liu et al., PVLDB 2025.
   URL: `https://research.ibm.com/publications/skystore-cost-optimized-object-storage-across-regions-and-clouds`
+  PDF: `https://www.vldb.org/pvldb/vol18/p2084-liu.pdf`
+  DOI: `https://doi.org/10.14778/3734839.3734846`
   Why: follow-up object-storage placement work discovered during the Db2 native
   COS review; relevant to future cold-tier placement, replication, cost-aware
-  promotion, and region/cloud-aware object movement policy.
+  promotion, and region/cloud-aware object movement policy. Journal entry
+  added 2026-06-06.
 - `queued` — **ByteHouse: A Cloud-Native OLAP Engine with Incremental
   Computation and Multi-Modal Retrieval**, arXiv 2026.
   URL: `https://arxiv.org/abs/2602.08226`
   Why: modern cloud-native warehouse architecture with SSD-backed cache and a
   virtual file-system layer; useful as a contrast point for DB-owned NVMe
   caches, remote object layout, and local-access abstraction choices.
+- `queued` — **CloudCast: High-Throughput, Cost-Aware Overlay Multicast in the
+  Cloud**, Wooders et al., NSDI 2024.
+  URL: `https://www.usenix.org/conference/nsdi24/presentation/wooders`
+  Why: SkyStore builds on the Skyplane/SkyPilot cloud-placement ecosystem and
+  cites CloudCast for cost-aware cloud overlays; useful for comparing
+  multi-destination cold-tier replication, route fanout, transfer throughput,
+  and cost-aware object movement before GPU DB adopts remote object tiers.
+- `queued` — **Skyplane: Optimizing Transfer Cost and Throughput Using
+  Cloud-Aware Overlays**, Jain et al., NSDI 2023.
+  URL: `https://www.usenix.org/conference/nsdi23/presentation/jain`
+  arXiv: `https://arxiv.org/abs/2210.07259`
+  Why: SkyStore cites Skyplane as related intercloud transfer work; useful for
+  evaluating whether cold-tier promotion should use direct object reads,
+  staged transfer, or overlay routing when future GPU DB deployments span
+  regions, object stores, or disaggregated storage pools.
 
 ### WAL, logging, and read/write throughput
 

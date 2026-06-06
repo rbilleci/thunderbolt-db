@@ -38,6 +38,195 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - SkyStore makes cold-tier placement a per-object break-even decision
+
+**Citation:** Shu Liu, Xiangxi Mo, Moshik Hershcovitch, Henric
+Zhang, Audrey Cheng, Guy Girmonsky, Gil Vernik, Michael Factor,
+Tiemo Bang, Soujanya Ponnapalli, Natacha Crooks, Joseph E.
+Gonzalez, Danny Harnik, and Ion Stoica. "SkyStore: Cost-Optimized
+Object Storage Across Regions and Clouds." PVLDB 18(7), pp.
+2084-2096, 2025. DOI: `https://doi.org/10.14778/3734839.3734846`.
+Retrieved 2026-06-06 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol18/p2084-liu.pdf`, via the arXiv
+PDF, `https://arxiv.org/pdf/2502.20818`.
+
+**Category:** database file-system / storage / indexing and
+multi-tier cache / data placement, with secondary relevance to
+runtime admission and cold-tier cost telemetry.
+
+**Relevance tags:** object placement; cold-tier replicas; adaptive
+TTL; cost-aware caching; replicate-on-read; write-local placement;
+virtual buckets; metadata control plane; S3-compatible proxy;
+versioned objects; read-after-write consistency; multi-cloud
+storage; tier promotion/demotion.
+
+**Core idea:** SkyStore treats multi-region object placement as a
+cache problem where capacity is effectively unbounded, but every
+replica has an explicit storage cost and every miss has an explicit
+transfer cost. It writes objects locally, replicates on read, and
+evicts remote copies using adaptive TTLs learned from bucket-level
+access histograms.
+
+The useful GPU DB transfer is to make cold and warm tier placement
+economic and observable at the object, segment, or partition level.
+Instead of "keep hot data somewhere fast" as a vague cache rule,
+each replica should carry a break-even horizon: keep it only while
+the expected avoided transfer/rebuild cost exceeds its storage,
+memory, or residency cost.
+
+**Concrete mechanisms:**
+
+- SkyStore exposes virtual buckets and virtual objects while mapping
+  them to physical object-store locations across regions and clouds.
+- Writes use a write-local policy. In fixed-base mode, the first
+  write region becomes the non-evictable base location; in free
+  placement mode, any replica can be evicted as long as the minimum
+  replication requirement remains satisfied.
+- Reads choose the cheapest available source replica for the
+  requested region, fetch the object, and create a local replica to
+  avoid future remote transfer costs.
+- The two-region eviction model defines a break-even time
+  `T_even = network_egress_cost / storage_cost`. Keeping a replica
+  longer than that only pays if another read is likely before the
+  break-even horizon.
+- A simple `T_even` TTL policy is proven within 2x of a clairvoyant
+  future-knowing policy in the two-region model, and no policy can
+  beat that bound for all adversarial workloads.
+- SkyStore improves on static TTLs by building weighted histograms
+  of time between accesses. Histogram weight is object byte size, so
+  large objects influence TTL choice more than tiny objects.
+- It also tracks a "last access" histogram so objects with no future
+  re-read do not bias only the observed re-read distribution.
+- TTLs are chosen by enumerating possible TTL buckets and minimizing
+  expected network plus storage cost for hits, misses, and retained
+  last-access objects.
+- Histogram granularity is high for short TTLs and logarithmic for
+  longer windows. The paper reports about 800 cells covering nearly
+  two years while keeping adjacent TTL choices within about 2%
+  storage-cost difference.
+- In the multi-region case, the system models regions as a directed
+  graph and computes a TTL for each source-to-target edge from
+  target storage cost, source-to-target transfer cost, and target
+  access statistics.
+- An object's TTL in a region is the minimum relevant incoming-edge
+  TTL among regions that currently hold a replica, with filtering so
+  the local policy does not depend on a remote replica that would
+  expire first.
+- The architecture separates a metadata control plane from data
+  movement. The metadata server tracks object size, last-modified
+  time, entity tag, version id, physical locations, and placement
+  policy decisions; stateless S3 proxies perform actual object-store
+  operations.
+- Eviction is metadata-driven and runs periodically. SkyStore scans
+  for expired replicas and issues object-store delete requests; no
+  object data transfer is needed for eviction.
+- Consistency follows the underlying object stores. With versioning,
+  SkyStore can route reads to the newest known version for
+  read-after-write behavior; without versioning, the paper describes
+  last-writer-wins plus synchronous replication for fresh reads.
+- Writes use a two-phase metadata/object update protocol so
+  incomplete writes do not leave committed metadata pointing at
+  missing or corrupt object data.
+- Evaluation uses SNIA IBM object-store traces expanded into
+  multi-region and multi-cloud workloads. The paper reports up to
+  6x cost savings over baselines in real cloud deployment, 1.3x to
+  18.4x lower simulated cost than six baselines in a three-region
+  fixed-base setup, and average SkyStore cost within 14% of the
+  clairvoyant optimum in the two-region model. End-to-end T65
+  deployment shows comparable latency to always-store placement
+  and much lower cost than always-evict.
+
+**GPU DB mapping:** P8 can borrow SkyStore's break-even placement
+model for GPU HBM, host DRAM, NVMe, object storage, and future
+remote/disaggregated tiers. For each resident segment, warm host
+segment, compressed cold object, or remote replica, the cache
+manager should compute a retention horizon from expected future
+reads, rebuild/transfer cost, storage/memory cost, freshness risk,
+and route-latency value.
+
+The write-local and replicate-on-read split maps to mutation owners
+and read-route promotion. New writes should land first in the
+owner's durable local WAL/CPU truth. A read from another tier or
+device should promote a replica only after the read proves demand,
+and that replica should have an explicit TTL or demotion deadline
+instead of living forever because it was once useful.
+
+The weighted histogram idea maps directly to GPU DB telemetry.
+Bucket-level statistics become table, partition, segment, column
+group, or route-shape histograms. Weight should not be request
+count alone; bytes transferred, GPU rebuild time, decompression
+cost, and p99 route latency should all be candidate weights.
+
+The directed-edge model is useful for multi-tier placement. The cost
+from NVMe to host DRAM is not the same as host DRAM to HBM, HBM
+to host, remote object store to NVMe, or recompute from WAL to
+resident column segment. Each edge deserves its own transfer,
+stall, and eviction economics.
+
+SkyStore's metadata server maps to a residency/catalog control
+plane. GPU DB should keep data movement out of the metadata
+owner, but that owner should publish route-visible placement facts:
+which tier has each segment, version/freshness boundary, byte size,
+last access, TTL/demotion deadline, and cheapest valid source for
+promotion.
+
+**Risks and mismatches:** SkyStore optimizes monetary cloud cost,
+not microsecond query latency, GPU occupancy, WAL flush latency, or
+SQL-visible MVCC. GPU DB's "cost" function must include latency,
+freshness, memory pressure, rebuild work, and correctness fences,
+not only dollars.
+
+The paper is object-level and mostly blob-oriented. Database
+segments have predicates, indexes, MVCC visibility, compression
+layouts, and partial-column access. TTLs that are good for opaque
+objects may be too coarse for row groups, column groups, or hot key
+indexes.
+
+SkyStore's placement decisions are reactive. That is attractive for
+unknown workloads, but GPU DB may need proactive residency for
+known hot tables, prepared statements, maintenance windows, and
+latency-sensitive retained routes.
+
+The metadata server is centralized in the prototype. GPU DB can use
+a single owner initially, but 1M logical sessions and partitioned
+residency will require sharded metadata, read-mostly placement
+snapshots, or owner-local caches.
+
+The evaluation synthesizes multi-cloud workloads from single-region
+traces because public multi-cloud traces were not available. Treat
+the reported cost ratios as placement-policy evidence, not as a
+database workload forecast.
+
+**Benchmark candidates:**
+
+- Add a tier-placement simulator with directed edges among HBM,
+  pinned host memory, pageable DRAM, NVMe, and object storage.
+  Gate: each replica/demotion decision reports `T_even`-style
+  break-even time and expected miss versus retention cost.
+- Replace simple LRU-style resident segment eviction experiments
+  with byte-weighted and rebuild-time-weighted TTL histograms.
+  Expected result: fewer large-segment thrashes under bursty retained
+  lookup workloads.
+- Track per-route inter-arrival histograms by table/partition/column
+  group/query shape. Gate: histogram memory stays bounded and the
+  route owner can explain every promotion or eviction.
+- Test replicate-on-read for cold NVMe/object segments: first miss
+  serves from CPU/cold path, then promotes a GPU or host replica only
+  if the TTL model predicts reuse. Failure condition: reactive
+  promotion hurts p50 latency on known hot prepared statements.
+- Add a freshness-aware TTL variant where replica value decays when
+  mutations frequently invalidate the segment before the reuse
+  horizon. Gate: write-heavy partitions stop being promoted to HBM
+  unless measured read savings exceed refresh churn.
+- Evaluate directed-edge source choice during promotion: rebuild from
+  WAL, load host segment, copy NVMe object, or copy another device's
+  resident segment. Gate: planner chooses the cheapest valid source
+  and records the chosen edge in route telemetry.
+- Stress metadata ownership by simulating many sessions reading
+  placement snapshots while eviction and promotion update deadlines.
+  Failure condition: placement decisions serialize through one owner
+  on the read hot path.
+
 ### 2026-06-06 - Cross-paper synthesis: route correctness needs external witnesses too
 
 The last three modern reviews converge on a useful split between
