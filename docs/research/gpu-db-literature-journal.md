@@ -93923,3 +93923,145 @@ against immediate or near-immediate owner-local retirement under contention.
 - Track telemetry for retired objects by owner: live descriptors, retired
   descriptors, max retirement age, free-batch duration, retry count,
   validation-failure count, and bytes blocked by each protection class.
+
+### 2026-06-06 - Clobber-NVM makes durable metadata replay a deterministic-input problem
+
+**Citation:** Yi Xu, Joseph Izraelevitz, and Steven Swanson.
+"Clobber-NVM: Log Less, Re-execute More." ASPLOS 2021, 346-360.
+DOI: `https://doi.org/10.1145/3445814.3446730`. Retrieved
+2026-06-06 from the author PDF:
+`https://y4xu.github.io/clobber-nvm.pdf`.
+
+**Category:** WAL, logging, and read/write throughput; durable
+warm-tier metadata.
+
+**Relevance tags:** Clobber-NVM; persistent memory; failure atomicity;
+recovery-via-resumption; clobber logging; compiler-assisted logging;
+deterministic replay; PMDK; NVM; route metadata; checkpoint replay;
+WAL-before-visibility.
+
+**Core idea:** Clobber-NVM reduces persistent-memory transaction logging by
+combining undo logging with recovery-via-resumption. Instead of logging every
+old value that a transaction overwrites, it logs only transaction inputs that
+will be overwritten and separately preserves volatile inputs needed for
+reexecution. After a crash, recovery restores those inputs and reexecutes the
+transaction to completion.
+
+The transferable idea is not to replace SQL WAL with compiler replay. It is
+that some future warm-tier metadata updates may be made durable with a much
+smaller log if the engine can name a deterministic route function, preserve
+its inputs, and prove which inputs may be clobbered. For GPU DB, that points
+at route descriptors, resident-fragment directories, checkpoint-side indexes,
+and cold-tier manifests rather than arbitrary user transactions.
+
+**Concrete mechanisms:**
+
+- Clobber logging defines a clobbered input as a transaction input that may be
+  overwritten during the transaction. Recovery first restores clobbered
+  inputs from the `clobber_log`, restores volatile inputs from the `v_log`,
+  then reexecutes the transaction function from the beginning.
+- Transactions are programmer-marked failure-atomic regions. The system
+  expects deterministic transactions and conservative strong strict two-phase
+  locking: acquire locks in a fixed order before the transaction body and
+  hold them until commit.
+- The runtime keeps two logs. The `v_log` records the function name,
+  arguments, volatile non-local inputs supplied through `vlog_preserve`, and
+  an active bit for per-thread recovery. The `clobber_log` records the old
+  value for compiler-identified clobber writes.
+- Clobber-NVM is built over Intel PMDK 1.6 for persistent pool management and
+  uses PMDK's undo-log API for its clobber log, while replacing transaction,
+  allocation, and recovery management.
+- The compiler is LLVM-based. It identifies candidate input reads, then
+  candidate clobber writes that may overwrite those inputs. It refines the
+  conservative set by removing unexposed candidates and shadowed candidates,
+  including loop cases where only the first overwrite needs logging.
+- The compiler inserts callbacks before clobber writes, at memory accesses
+  for persistent-region pointer swizzling, and at transaction-function entry
+  to record function and argument metadata.
+- On recovery, each thread's active `v_log` entry identifies whether an
+  interrupted transaction must be reexecuted. The locking model makes
+  independent per-thread recovery valid because active transaction lock sets
+  are disjoint.
+- Evaluation used a dual-socket 48-core Intel Cascade Lake system with
+  1.5 TB Intel Optane DC Persistent Memory in App Direct mode, Ext4+DAX, and
+  comparisons to PMDK, Atlas, Mnemosyne, and an iDO-style compiler pass.
+- For the tested data structures, PMDK logged 1.1x to 42.6x more bytes than
+  Clobber-NVM and used 2.4x to 4.7x more ordering instructions such as flushes
+  and fences. The paper reports up to 2.5x improvement over Mnemosyne, 2.6x
+  over PMDK, and 8.1x over Atlas.
+- Recovery latency was similar to PMDK in the reported random-crash
+  experiments, because pool management dominated and reexecution was small for
+  those interrupted transactions.
+- Application experiments covered persistent memcached and STAMP
+  `vacation`/`yada`; benefits were larger for insert-heavy or logging-heavy
+  paths and smaller for compute-heavy paths where persistence logging was not
+  the dominant cost.
+
+**GPU DB mapping:** GPU DB's SQL-visible commit path still needs a canonical
+WAL-before-visibility record. Clobber-NVM is more useful for internal
+maintenance structures where the engine owns the code shape: resident route
+metadata, warm-tier index descriptors, checkpoint manifests, GPU-residency
+catalogs, and future CXL/NVM placement tables. These updates can be described
+as deterministic functions over a small input set and a known owner domain.
+
+The runtime architecture already names mutation, catalog, residency, and GPU
+execution owners. Clobber-NVM suggests a durable-metadata API where an owner
+publishes a typed update function, a stable argument block, and a clobber set.
+Crash recovery can then choose between replaying the canonical WAL and
+reexecuting owner-local metadata repairs, rather than logging every byte of a
+descriptor rewrite.
+
+The compiler analysis maps to route-code generation. If route maintenance is
+generated from a small IR, the engine may know which fields are inputs,
+outputs, and clobbers without relying on arbitrary C++ alias analysis. That is
+safer than trying to infer durable write sets from general engine code.
+
+The paper also reinforces that persist barriers, not only bytes, matter. GPU
+DB should measure log record count, flush/fence count, and dirty-line
+ordering for route metadata, not just total WAL bytes. A smaller descriptor
+log can still lose if it introduces extra serialized fences on a hot owner.
+
+**Risks and mismatches:** Clobber-NVM is a persistent-memory library paper,
+not a DBMS WAL design. Its transactions are programmer-marked, deterministic,
+and protected by strong strict 2PL; arbitrary SQL transactions, external
+side effects, nondeterministic functions, sequence allocation, lock waits, and
+user-visible errors do not automatically fit recovery-via-resumption.
+
+The design assumes byte-addressable persistent memory and uses PMDK-style
+persistent pools. GPU DB's current durable authority is WAL/checkpoint/archive
+storage, and GPU memory is not durable. The idea should not weaken durable
+commit ordering or make resident GPU state authoritative after a crash.
+
+Compiler alias analysis can over-identify clobber writes. That is safe but can
+erase the benefit. For GPU DB, the likely production shape is generated
+metadata update functions with explicit clobber declarations and tests, not
+whole-engine compiler inference.
+
+Reexecution must be idempotent or must restore every clobbered input first.
+Metadata operations involving allocation, file/object creation, external
+catalog publication, or replica communication need separate idempotence tokens
+or must remain in ordinary WAL/redo paths.
+
+**Benchmark candidates:**
+
+- Add a durable route-metadata microbenchmark with three strategies:
+  conventional redo/undo records, copy-on-write descriptor publication, and
+  clobber-style input preservation plus deterministic reexecution. Measure
+  bytes persisted, flush/fence count, commit p50/p99, and recovery time.
+- Model a resident-fragment directory update as a deterministic owner-local
+  function. Gate: after crash injection at every persist point, recovery
+  restores a directory matching canonical WAL replay and never publishes a
+  resident route before its durable boundary.
+- Compare generated explicit clobber sets against conservative inferred sets
+  for route descriptors. Failure condition: conservative logging approaches
+  ordinary undo logging cost or generated clobber declarations miss a crash
+  case.
+- Add a persist-barrier accounting benchmark for checkpoint manifest updates:
+  count not only bytes but cache-line flushes, fences, active-log writes, and
+  owner stall time.
+- Test replay only for internal metadata, not user transactions: route maps,
+  snapshot descriptors, warm-tier index roots, and cold-tier object manifests.
+  Gate: SQL-visible commit, sequence, and error semantics still come from the
+  canonical WAL path.
+- Inject nondeterminism deliberately into a metadata function and verify the
+  clobber/reexecution path rejects it or falls back to redo logging.

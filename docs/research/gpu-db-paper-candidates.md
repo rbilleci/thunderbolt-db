@@ -646,13 +646,15 @@ Append new candidates here as each paper is processed.
   overhead before GPU DB considers persistent warm-tier metadata. Journal entry
   added 2026-06-06 from the author PDF after direct curl of the seeded NCSU
   PDF URL returned an HTML page.
-- `queued` — **Clobber-NVM: Log Less, Re-execute More**, Xu,
+- `reviewed` — **Clobber-NVM: Log Less, Re-execute More**, Xu,
   Izraelevitz, and Swanson, ASPLOS 2021.
-  URL: `https://doi.org/10.1145/3445814.3446748`
+  URL: `https://doi.org/10.1145/3445814.3446730`
+  PDF: `https://y4xu.github.io/clobber-nvm.pdf`
   Why: SpecPMT compares with re-execution and log-reduction approaches;
   useful for checking whether deterministic re-execution can reduce durable
   metadata for GPU DB route maintenance, checkpoint replay, or warm-tier
-  updates without weakening SQL-visible side effects.
+  updates without weakening SQL-visible side effects. Journal entry added
+  2026-06-06; the queued DOI was corrected from `.3446748` to `.3446730`.
 - `queued` — **ASAP: A Speculative Approach to Persistence**, Yadalam,
   Shah, Yu, and Swift, HPCA 2022.
   URL: `https://doi.org/10.1109/HPCA53966.2022.00070`
@@ -667,6 +669,14 @@ Append new candidates here as each paper is processed.
   durable data structures; useful for deriving minimal persist dependencies
   for route descriptors, resident metadata, and future CXL/NVM warm-tier
   structures.
+- `queued` — **iDO: Compiler-Directed Failure Atomicity for Nonvolatile
+  Memory**, Lee et al., MICRO 2018.
+  URL: `https://doi.org/10.1109/MICRO.2018.00051`
+  Author PDF: `https://sekwonlee.github.io/files/micro18_ido.pdf`
+  Why: Clobber-NVM compares against iDO's idempotent-region
+  recovery-via-resumption design; useful for isolating when compiler-marked
+  deterministic replay regions beat conventional undo/redo logging for future
+  warm-tier metadata or route-publication records.
 
 ### Database file-system design, storage, and indexing
 
