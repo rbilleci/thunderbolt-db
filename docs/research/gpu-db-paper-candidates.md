@@ -1192,12 +1192,31 @@ Append new candidates here as each paper is processed.
   restart, restore, and log-history access; useful for comparing indexed-log
   storage with a more conservative WAL design that opens quickly and performs
   redo/undo work lazily.
-- `queued` — **Can Applications Recover from fsync Failures?**, Rebello,
-  Patel, Alagappan, Chidambaram, and Arpaci-Dusseau, USENIX ATC 2020.
+- `reviewed` — **Can Applications Recover from fsync Failures?**, Rebello,
+  Patel, Alagappan, A. Arpaci-Dusseau, and R. Arpaci-Dusseau, USENIX ATC 2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/rebello`
   Why: TL4x explicitly calls out `msync()` failure handling; useful for
   checking how GPU DB should surface, retry, or quarantine failed flushes in
   WAL, checkpoint, resident-image, and cold-tier manifest publication paths.
+  Journal entry added 2026-06-07 from the USENIX page and PDF.
+- `queued` — **Finding Crash-Consistency Bugs with Bounded Black-Box Crash
+  Testing**, Mohan et al., OSDI 2018.
+  URL: `https://www.usenix.org/conference/osdi18/presentation/mohan`
+  Why: the fsync-failure paper contrasts transient block-write failures with
+  crash-consistency testing; useful for designing a bounded crash/fault matrix
+  over GPU DB WAL, checkpoint, manifest, and route-publication states.
+- `queued` — **Application Crash Consistency and Performance with CCFS**,
+  Pillai et al., FAST 2017.
+  URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/pillai`
+  Why: cited by the fsync-failure paper as application-level crash-consistency
+  support; useful for comparing file-system assistance, consistency contracts,
+  and performance overhead before GPU DB builds DB-owned durable publication
+  checks.
+- `skipped` — **On the Complexity of Crafting Crash-Consistent Applications**,
+  Pillai et al., OSDI 2014.
+  URL: `https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai`
+  Why: pre-2015 historical source cited by the fsync paper; skipped by the
+  2015-present selection policy.
 - `queued` — **TIPS: Making Volatile Index Structures Persistent with
   DRAM-NVMM Tiering**, Ramanathan et al., USENIX ATC 2021.
   URL: `https://www.usenix.org/conference/atc21/presentation/krishnan`

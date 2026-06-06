@@ -95463,3 +95463,191 @@ fallback storms, or p99 latency is a failure for this engine.
   retained OLTP lookups, and HTAP workloads with invalidation churn.
   Failure condition: a model that looks good on analytical joins chooses
   poor routes under write-heavy retained snapshots or memory pressure.
+
+### 2026-06-07 - fsync failures make durability a failure-state contract
+
+**Citation:** Anthony Rebello, Yuvraj Patel, Ramnatthan Alagappan,
+Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. "Can
+Applications Recover from fsync Failures?" USENIX ATC 2020, pages
+753-767. Retrieved 2026-06-07 from the USENIX page and PDF:
+`https://www.usenix.org/conference/atc20/presentation/rebello`,
+`https://www.usenix.org/system/files/atc20-rebello.pdf`.
+
+**Category:** WAL, logging, and read/write throughput; database
+file-system/storage correctness.
+
+**Relevance tags:** fsync; EIO; page cache; WAL; checkpointing;
+recovery; direct IO; ext4; XFS; Btrfs; CuttleFS; fault injection;
+durability boundary; checkpoint truncation; cold-tier manifests.
+
+**Core idea:** The paper studies what actually happens when `fsync`
+fails below data-intensive applications. Its uncomfortable finding is
+that applications cannot treat a failed `fsync` as a simple retryable
+event. On Linux file systems tested by the authors, failed data pages
+are marked clean; on ext4 and XFS the clean page can still contain the
+new contents even though disk does not. Recovery code that reads the
+page cache can therefore observe state that is not durable.
+
+For GPU DB, the transferable idea is that WAL-before-visibility needs a
+failure-state contract, not just a happy-path flush call. Every durable
+publication path should specify what happens after a failed flush:
+which bytes may be trusted, which volatile cache state must be
+discarded, which manifest or WAL range remains authoritative, and how
+the engine avoids using page-cache, resident GPU, or route-cache data as
+evidence of durability.
+
+**Concrete mechanisms:**
+
+- The file-system study injects single transient write faults below
+  ext4, XFS, and Btrfs using a device-mapper target. The workloads model
+  in-place file updates and append-plus-`fsync` log writes.
+- For ext4 ordered mode and XFS, data-block `fsync` failures mark the
+  page clean while keeping the latest in-memory contents. Disk may still
+  contain the old or non-overwritten block, so application reads can
+  succeed until cache eviction or restart exposes stale on-disk state.
+- Btrfs also marks pages clean, but copy-on-write behavior reverts the
+  in-memory page and metadata to a previous consistent state. This is
+  less corruption-prone, but append workloads can still create holes
+  because file-descriptor offsets advance even though the failed append
+  did not persist.
+- None of the tested file systems retry data-block or journal-block
+  writes after the failure. XFS retries some metadata writes; journal or
+  log-tree failures make the file system unavailable.
+- Failure reporting is not uniform. ext4 data-journaling mode can delay
+  the reported failure to a later `fsync`, so the application cannot
+  assume the error belongs to the most recent logical operation.
+- The authors build CuttleFS, a FUSE fault injector with its own
+  user-space page cache, to emulate post-`fsync` failure characteristics:
+  mark failed pages clean or dirty, keep latest content or revert, report
+  immediately or on a later `fsync`, and evict clean pages.
+- The application study tests Redis, LMDB, LevelDB, SQLite rollback,
+  SQLite WAL, and PostgreSQL. All show some insufficient failure
+  behavior under at least one emulated file-system reaction: old values,
+  false failures, key/value corruption, missing keys, or lost existing
+  data after cache eviction and restart.
+- PostgreSQL's post-bug-fix strategy crashes on checkpoint `fsync`
+  failure to avoid truncating WAL, but the paper still finds
+  false-failure and delayed-error cases under page-cache and ext4 data
+  mode behavior. Direct IO on the WAL avoids some page-cache false
+  failures, but table-file checkpoint writes can still suffer delayed
+  failure issues.
+- The paper's main lessons are that applications should not retry
+  failed `fsync` blindly, should not run recovery from possibly
+  incorrect page-cache contents, and should test recovery with low-level
+  block faults rather than only mocked system-call errors or crash-only
+  tests.
+
+**GPU DB mapping:** The mutation owner should treat any WAL or
+checkpoint flush error as a boundary failure that quarantines the
+affected durable range. Retrying `fsync` on the same dirty state is not
+enough, because the OS may have already marked the page clean. The next
+design pass should distinguish append admission, flush completion,
+visibility publication, checkpoint manifest publication, and WAL
+truncation as separate steps with explicit failure transitions.
+
+Recovery should prefer durable reads that bypass untrusted volatile
+state. After a failed WAL, checkpoint, or manifest flush, startup and
+repair should rebuild from verified disk/NVMe/object contents, checksums,
+and timestamp-last manifests, not from a warm OS page cache, resident GPU
+snapshot, pinned host staging buffer, or in-memory route table.
+
+The paper also strengthens the P8 rule that resident GPU data is
+performance state. A resident generation cannot prove durability simply
+because the GPU or CPU page cache still contains the new rows. It needs
+an independently verified WAL/checkpoint boundary, and any failed flush
+must invalidate or quarantine dependent resident generations until the
+durable authority is known.
+
+For cold-tier manifests, Btrfs-like copy-publish-revert behavior is the
+right shape: write new payloads and metadata out of place, verify them,
+then publish a compact manifest last. If publication or flush fails, the
+older manifest remains authoritative. Append offsets, segment lengths,
+and WAL truncation must not advance irrevocably until that manifest
+boundary is proven.
+
+The CuttleFS method maps cleanly to benchmark design. GPU DB needs
+fault-injection tests that fail WAL block writes, checkpoint page writes,
+manifest writes, and cold-tier object uploads at block or segment
+granularity. The test should then exercise continued operation, cache
+eviction, restart, replay, and resident-route warmup, not just immediate
+process crash.
+
+**Risks and mismatches:** The paper studies Linux file systems and
+userspace applications, not a custom DB-owned storage stack or GPU
+runtime. Specific ext4/XFS/Btrfs behavior may change across kernel
+versions, mount options, storage devices, and direct-IO paths.
+
+The evaluation focuses on single inserted or updated key-value pairs and
+small relational rows. It does not cover large multi-segment checkpoints,
+replication, object storage, NVMe atomic-write features, io_uring/SPDK
+paths, GPU direct storage, or SQL transaction isolation beyond durability
+effects.
+
+The paper does not provide a complete recipe for perfect recovery.
+Instead, it shows that common strategies are insufficient. GPU DB still
+needs its own manifest, checksum, WAL, checkpoint, and replay protocol
+with well-defined error states.
+
+Direct IO is not a silver bullet. It can reduce page-cache false
+recovery on WAL files, but GPU DB still has to handle device write
+failure, delayed error reporting, table/checkpoint writes, filesystem
+metadata, and object-tier publication failures.
+
+**Benchmark candidates:**
+
+- Add block-fault injection around WAL append and flush. Gate: an
+  acknowledged commit is never lost; an unacknowledged or failed commit
+  is either absent or explicitly reported as ambiguous, and failed WAL
+  bytes are never trusted from cache.
+- Add checkpoint-failure tests with WAL truncation pressure. Fail a
+  checkpoint data or manifest write, then continue operation, evict page
+  cache, restart, and recover. Failure condition: WAL is truncated past a
+  durable checkpoint boundary or recovery reads a page-cache-only image.
+- Prototype timestamp-last manifest publication for resident images and
+  cold-tier segments. Gate: payload failure, manifest failure, and delayed
+  flush error all recover to either the previous complete generation or a
+  verified newer generation.
+- Test direct-IO WAL versus buffered WAL under injected fsync failures.
+  Measure commit latency, throughput, ambiguous/error outcomes, and
+  whether recovery can avoid false success from cached log contents.
+- Add route invalidation on durable-boundary failure. If a WAL,
+  checkpoint, or manifest flush fails, all resident GPU generations and
+  route descriptors depending on that boundary must be rejected until a
+  verified durable authority is rebuilt.
+- Extend the chaos harness beyond crash-only tests: keep running after a
+  failed flush, perform more writes and reads, evict clean pages, restart,
+  and then run isolation/durability witnesses over the resulting history.
+
+### 2026-06-07 - Cross-paper synthesis: correctness needs external witnesses plus failure states
+
+PolySI, Learned Query Optimizer, and fsync-failure recovery converge on
+one design track: fast routes should be allowed to optimize, but they
+must leave behind enough proof to audit both correctness and failure
+state. PolySI says snapshot behavior needs external histories that can
+produce counterexamples. Learned Query Optimizer says route ranking can
+be learned only after deterministic eligibility gates have excluded
+unsafe routes. The fsync paper says even a basic durability primitive has
+post-failure states that cannot be inferred from a successful retry or a
+warm cache read.
+
+The resulting GPU DB track is route evidence. Every admitted route should
+carry a compact proof envelope: snapshot/visibility boundary, resident or
+storage generation, deterministic eligibility decision, durable WAL or
+manifest boundary, and failure/quarantine state. Learned models and
+micro-batches can choose among legal envelopes, but they cannot invent
+visibility, durability, or residency proof.
+
+The current category gap is less about finding another optimizer paper
+and more about proving the write/recovery/runtime path under injected
+faults and pressure. The next high-value papers should favor WAL
+recovery, checkpointing, durable metadata publication, high-concurrency
+runtime admission, or GPU execution resource control with explicit
+failure and fallback behavior.
+
+Benchmark priority: combine three witnesses in one stress loop. First,
+run route-audit histories for snapshot correctness. Second, inject WAL
+and manifest failures while continuing work and evicting caches. Third,
+record route eligibility, learned/adaptive ranking choices, and
+fallback/quarantine reasons. Passing throughput only counts if the
+history proves snapshot correctness and the recovery log proves no
+acknowledged durable commit was lost.
