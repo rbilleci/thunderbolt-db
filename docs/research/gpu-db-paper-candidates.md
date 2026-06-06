@@ -876,13 +876,14 @@ Append new candidates here as each paper is processed.
   write amplification, memory pressure, and read/write jitter; useful for GPU
   DB cold-tier ingest and compaction policy.
   Journal entry added 2026-06-06.
-- `queued` — **MatrixKV: Reducing Write Stalls and Write Amplification in
+- `reviewed` — **MatrixKV: Reducing Write Stalls and Write Amplification in
   LSM-tree Based KV Stores with Matrix Container**, Yao et al., USENIX ATC
   2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/yao`
   Why: BVLSM contrasts NVM-oriented key-value separation and write-stall
   reduction approaches; useful for comparing explicit DRAM/NVM/NVMe tiered
-  value placement and write-stall smoothing.
+  value placement and write-stall smoothing. Journal entry added 2026-06-06
+  from the USENIX page and PDF.
 - `queued` — **Differentiated Key-Value Storage Management for Balanced I/O
   Performance**, Li et al., USENIX ATC 2021.
   URL: `https://www.usenix.org/conference/atc21/presentation/li-yongkun`
@@ -890,14 +891,30 @@ Append new candidates here as each paper is processed.
   useful for deciding whether GPU DB cold-tier value payloads should be routed
   by size, update frequency, and read/write interference rather than a single
   separation threshold.
-- `queued` — **Taurus: Lightweight Parallel Logging for In-Memory Database
+- `queued` — **Redesigning LSMs for Nonvolatile Memory with NoveLSM**,
+  Kannan, Bhat, Gavrilovska, Arpaci-Dusseau, and Arpaci-Dusseau, USENIX
+  ATC 2018.
+  URL: `https://www.usenix.org/conference/atc18/presentation/kannan`
+  Why: MatrixKV's main NVM-LSM baseline; useful for comparing large
+  persistent MemTables against bounded matrix-container compaction before GPU
+  DB adopts a warm NVM/NVMe write-staging tier.
+- `queued` — **SLM-DB: Single-Level Key-Value Store with Persistent Memory**,
+  Kaiyrakhmet et al., USENIX FAST 2019.
+  URL: `https://www.usenix.org/conference/fast19/presentation/kaiyrakhmet`
+  Why: MatrixKV cites SLM-DB as an NVM/SSD LSM alternative that collapses
+  levels; useful for comparing single-level persistent-memory indexing against
+  MatrixKV-style bounded first-tier compaction and P8 cold-tier segment
+  refresh.
+- `reviewed` — **Taurus: Lightweight Parallel Logging for In-Memory Database
   Management Systems**, Xia, Yu, Pavlo, and Devadas, SIGMOD/PACMMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389713`
   PDF: `https://db.cs.cmu.edu/papers/2020/p677-xia.pdf`
   Why: modern parallel logging design that tracks transaction dependencies
   across multiple log streams; useful follow-up to NVWAL's single-writer
   persistent-memory protocol when GPU DB evaluates partition-owned mutation
-  logs, group commit, and parallel recovery.
+  logs, group commit, and parallel recovery. Journal entry already exists
+  under the PVLDB 2020 metadata; this stale duplicate was corrected from
+  `queued` to `reviewed` on 2026-06-06.
 - `reviewed` — **High Throughput Replication with Integrated Membership
   Management**, Fouto, Preguica, and Leitao, USENIX ATC 2022.
   URL: `https://www.usenix.org/conference/atc22/presentation/fouto`

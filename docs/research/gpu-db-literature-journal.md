@@ -90303,3 +90303,168 @@ invalidation cost.
   for the first `int4` equality and aggregate routes. Failure condition:
   specialization improves best-case throughput but creates too many route
   variants for stable planning and cache residency.
+
+### 2026-06-06 - MatrixKV makes write stalls a compaction-granularity problem
+
+**Citation:** Ting Yao, Yiwen Zhang, Jiguang Wan, Qiu Cui, Liu
+Tang, Hong Jiang, Changsheng Xie, and Xubin He. "MatrixKV:
+Reducing Write Stalls and Write Amplification in LSM-tree Based
+KV Stores with a Matrix Container in NVM." USENIX ATC 2020,
+17-31. Retrieved 2026-06-06 from the USENIX page and PDF:
+`https://www.usenix.org/conference/atc20/presentation/yao`.
+
+**Category:** WAL, logging, and read/write throughput, with
+multi-tier cache/data placement and storage-compaction relevance.
+
+**Relevance tags:** MatrixKV; LSM tree; write stalls; write
+amplification; NVM; Optane DC PMM; matrix container; RowTable;
+column compaction; flattened levels; cross-row hint search;
+RocksDB; multi-tier DRAM/NVM/SSD storage.
+
+**Core idea:** MatrixKV argues that random-write tail latency in
+LSM-based KV stores is dominated by the large all-to-all `L0` to
+`L1` compaction caused by overlapping `L0` files. The paper moves
+`L0` into byte-addressable NVM, stores flushed memtables as rows
+inside a matrix container, and compacts only small key-range
+columns from NVM into SSD-backed `L1`.
+
+For GPU DB, the strongest transferable idea is to make cold-tier
+write smoothing an explicit granularity choice. If a resident or
+cold segment refresh requires one huge merge, then background
+maintenance will periodically steal the same CPU, IO, memory, and
+route credits needed by foreground sessions. A tiered write path
+should expose bounded compaction and refresh units before it claims
+predictable latency.
+
+**Concrete mechanisms:**
+
+- MatrixKV keeps DRAM memtables for write batching, then flushes
+  immutable memtables into NVM as `RowTable` rows. Each row stores
+  sorted key/value data plus metadata containing key, page number,
+  page offset, and a forward pointer for cross-row search.
+- The NVM `matrix container` has a receiver and compactor. The
+  receiver appends flushed rows; when it reaches a configured size
+  limit and no compactor is active, it logically becomes the
+  compactor and a new receiver is created without migrating data.
+- `Column compaction` selects a key range from `L1`, fetches keys in
+  that range from multiple NVM rows in parallel, expands the range
+  until the compaction data is between configured lower and upper
+  bounds, merges it with overlapping `L1` SSTables, and writes the
+  regenerated SSTables back to SSD.
+- Freed NVM pages from compacted columns are returned to a free list.
+  Because compaction rotates through key ranges, at most one page per
+  row is partially fragmented according to the paper.
+- MatrixKV widens levels to reduce LSM depth and write
+  amplification. In ordinary RocksDB this would worsen `L0` to `L1`
+  stalls, but MatrixKV's fine-grained column compaction makes the
+  first-level compaction mostly independent of level width.
+- Cross-row hint search adds a 4-byte forward pointer from each key
+  metadata entry to the first not-smaller key in the previous row,
+  similar to fractional cascading. Lookup starts at the newest row
+  and uses hints to narrow earlier-row binary searches.
+- Crash consistency reuses RocksDB's manifest/versioning model. The
+  paper records RowTable state in the manifest and uses lazy deletion
+  so stale columns are not removed until the new version is durable.
+- The implementation is about 4,117 lines on top of RocksDB and uses
+  PMDK for NVM plus POSIX IO for SSDs.
+- The evaluation uses two 24-core Intel CPUs, 32 GB DRAM, an 800 GB
+  Intel SSD, and 256 GB Optane DC PMM. With 8 GB NVM on an 80 GB
+  workload, MatrixKV reports 3.6x higher 4 KiB random-write
+  throughput than RocksDB-L0-NVM and 2.6x higher than NoveLSM.
+- On YCSB-A tail latency, MatrixKV reports 99th percentile latency
+  of 405 us versus 11,055 us for RocksDB-SSD, 2,080 us for NoveLSM,
+  and 786 us for RocksDB-L0-NVM.
+- In the 80 GB random-write compaction analysis, MatrixKV performs
+  many more but smaller `L0` to `L1` compactions: 467 column
+  compactions at about 0.33 GB each, versus 52 RocksDB-SSD
+  compactions averaging 3.1 GB. The reported write amplification is
+  3.43x for MatrixKV versus 8.78x for RocksDB-SSD.
+- The authors report cross-row hint search improving NVM-resident
+  random read throughput from 9 MB/s for RocksDB-L0-NVM to
+  157.9 MB/s for MatrixKV in their isolated `L0` read experiment.
+
+**GPU DB mapping:** P8 currently treats GPU-resident data as a
+rebuildable acceleration tier, with WAL/checkpoint/replay and CPU
+MVCC state as truth. MatrixKV suggests that any future durable or
+semi-durable warm tier should separate the flush/admission unit from
+the merge/refresh unit. COPY or mutation owners can publish bounded
+row/segment batches, while maintenance compacts or refreshes only a
+small key or segment range at a time.
+
+The matrix-container pattern maps to a possible CPU/NVMe/NVM staging
+lane: recently flushed mutation chunks remain in a fast appendable
+warm tier, while the cold SSD/object tier is updated through bounded
+column or range merges. For GPU DB, those chunks should carry table
+OID, schema generation, source WAL boundary, visibility boundary,
+key-range summaries, and resident-route invalidation state.
+
+Column compaction also maps to resident refresh. Instead of rebuilding
+a whole table after each invalidation burst, the cache manager could
+measure segment-range refresh units: compact or rebuild only the
+route ranges that cross a staleness threshold, while unrelated
+segments remain valid for new reads.
+
+The forward-hint idea is useful for warm-tier lookup metadata. GPU DB
+does not need MatrixKV's exact row pointer layout, but it may need
+cheap cross-chunk hints so point lookups and prefix/range checks avoid
+probing every recently flushed chunk before deciding CPU, warm-tier,
+or resident GPU route eligibility.
+
+MatrixKV's manifest use reinforces a P8 rule: derived warm/resident
+structures need publication facts, not trust. A compacted or refreshed
+segment should become route-visible only after its source WAL boundary,
+visibility boundary, and descriptor state are durably or atomically
+published.
+
+**Risks and mismatches:** MatrixKV is a KV-store storage-engine paper,
+not a SQL transaction engine. It does not solve SQL MVCC visibility,
+secondary indexes, joins, query planning, GPU execution, pgwire fan-in,
+or WAL-before-visibility across relational operators.
+
+The design assumes byte-addressable persistent memory. On the current
+GPU DB hardware, the near-term analogue is DRAM/NVMe staging or future
+CXL/NVM tiers, not a requirement that Optane-style PMEM exists.
+
+MatrixKV's read path is still LSM/KV lookup oriented. Cross-row hints
+may not carry enough selectivity or visibility information for SQL
+predicates, joins, aggregates, or retained GPU snapshots. GPU DB would
+need route descriptors and snapshot boundaries around any similar hint
+structure.
+
+Fine-grained compaction improves stalls but can increase metadata,
+threading, and scheduling overhead. GPU DB should benchmark whether
+smaller cold-tier merges reduce p99 latency without creating too many
+tiny route fragments or starving large sequential throughput.
+
+The evaluation is RocksDB/YCSB/db_bench centered. Reported gains are
+strong evidence for LSM write smoothing, but they are not direct
+latency or throughput predictions for P8's current row/MVCC plus
+resident GPU design.
+
+**Benchmark candidates:**
+
+- Build a cold-tier ingest simulator with three policies: ordinary
+  large `L0` to `L1` merge, MatrixKV-style bounded key-range merges,
+  and pure append with later full rebuild. Measure p50/p99 write
+  latency, read fallback latency, bytes rewritten, and foreground
+  queue starvation.
+- Add a P8 maintenance benchmark that refreshes resident segments by
+  bounded key or row ranges after mutation bursts. Gate: unrelated
+  retained routes stay valid, and p99 retained lookup latency does not
+  spike during refresh beyond a fixed SLO budget.
+- Prototype a warm-tier chunk descriptor containing source WAL
+  boundary, visibility boundary, key min/max, row count, byte count,
+  and cross-chunk hint offsets. Failure condition: route eligibility
+  still requires scanning every warm chunk.
+- Compare compaction/refresh unit sizes: 16 MiB, 64 MiB, 256 MiB, and
+  route-adaptive ranges. Measure write throughput, p99 latency,
+  metadata overhead, NVMe bandwidth, and GPU resident invalidation
+  duration.
+- Test a "flattened cold levels" layout where larger levels reduce
+  long-term write amplification only if first-tier compaction units
+  remain bounded. Gate: lower write amplification cannot come at the
+  cost of periodic foreground stalls.
+- Add a publication-safety check for derived compacted segments:
+  crash or cancel between merge, descriptor publish, and old-segment
+  retirement. Recovery must expose either the old valid route or the
+  new valid route, never a half-compacted descriptor.
