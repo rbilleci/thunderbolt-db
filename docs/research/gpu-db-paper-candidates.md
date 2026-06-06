@@ -2681,13 +2681,21 @@ Append new candidates here as each paper is processed.
   Why: priority-based distributed transaction handling cited by Bonspiel;
   relevant to deciding whether GPU DB should prioritize long/remote or
   expensive route classes without wounding short local work.
-- `queued` — **Carousel: Low-Latency Transaction Processing for
+- `reviewed` — **Carousel: Low-Latency Transaction Processing for
   Globally-Distributed Data**, Yan et al., SIGMOD 2018.
   URL: `https://doi.org/10.1145/3183713.3196912`
   PDF: `https://www.cs.cornell.edu/~hongbo/files/carousel-sigmod-2018.pdf`
   Why: Natto's base protocol; useful for evaluating fixed-set interactive
   transactions that overlap read/prepare, commit, and replication phases,
   which maps to GPU DB route descriptors with predeclared read/write sets.
+  Journal entry added 2026-06-06.
+- `queued` — **Consus: Taming the Paxi**, Escriva and van Renesse,
+  arXiv 2016.
+  URL: `https://arxiv.org/abs/1612.03457`
+  Why: Carousel contrasts Consus as a geographically replicated transaction
+  protocol that reaches consensus on commit outcome across datacenters; useful
+  for comparing fixed-footprint route overlap with commit-decision consensus
+  when GPU DB eventually has replicated owners or remote accelerator pools.
 
 - `queued` — **Data Partitioning for In-Memory Systems: Myths, Challenges,
   and Opportunities**, Zhang, Deshmukh, and Patel, CIDR 2019.

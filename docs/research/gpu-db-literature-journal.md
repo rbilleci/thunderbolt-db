@@ -38,6 +38,209 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Carousel overlaps read, prepare, commit, and replication when the route shape is known
+
+**Citation:** Xinan Yan, Linguan Yang, Hongbo Zhang, Xiayue Charles
+Lin, Bernard Wong, Kenneth Salem, and Tim Brecht. "Carousel:
+Low-Latency Transaction Processing for Globally-Distributed Data."
+SIGMOD 2018. doi:10.1145/3183713.3196912. Retrieved 2026-06-06 from
+author PDF `https://www.cs.cornell.edu/~hongbo/files/carousel-sigmod-2018.pdf`.
+
+**Category:** transaction processing, write path, and runtime admission, with
+future replicated-owner and multi-partition commit relevance.
+
+**Relevance tags:** fixed read/write sets; interactive transactions; 2PC;
+consensus; replication; serializability; optimistic concurrency control;
+prepare-before-commit; read/prepare overlap; local replica reads; read-only
+fast path; commit latency; cross-owner transactions; route descriptors.
+
+**Core idea:** Carousel targets 2-round Fixed-set Interactive transactions:
+all read keys and write keys are known when the transaction starts, but write
+values may depend on the read results. That restriction lets the system start
+participant prepare work during the read round, instead of waiting until the
+client computes writes and calls commit. The paper's broader lesson is that a
+transaction route with a known footprint can overlap otherwise sequential
+stages without weakening serializability.
+
+For GPU DB, the strongest transferable idea is to make route shape a first
+class admission fact. If a stored procedure, prepared statement, or bounded
+write batch can declare table/partition/key-range read and write sets before
+execution, the runtime can preflight owner queues, residency validity, WAL lane
+dependencies, and GPU/CPU fallback while reads are still running. The commit
+path then waits on concrete prepared facts rather than discovering conflicts
+after every expensive stage has already run.
+
+**Concrete mechanisms:**
+
+- Carousel exposes a client transaction interface with `Begin`,
+  `ReadAndPrepare(readKeySet, writeKeySet)`, buffered `Write`, `Commit`, and
+  `Abort`. The fixed key sets are explicit in `ReadAndPrepare`.
+- Data is partitioned and replicated across datacenters. Each partition is
+  stored by a consensus group, with one participant leader and followers.
+  Carousel uses OCC with monotonically increasing record versions to detect
+  read-write and write-write conflicts.
+- A transaction chooses a local coordinator when possible. Unlike client-only
+  coordinators, Carousel coordinators are replicated through their consensus
+  groups, so coordinator state can be recovered after failure.
+- The basic protocol has Read, Commit, Writeback, and concurrent Prepare
+  phases. Read requests fetch values from participant leaders. Commit sends
+  writes to the coordinator, which replicates the write data before replying.
+  Writeback asynchronously distributes the decision and updates to participants.
+- Prepare starts with the read round. The client piggybacks prepare requests
+  containing the transaction's partition-local read and write sets. Participant
+  leaders compare those sets with pending transactions, replicate prepare or
+  abort decisions to their consensus groups, and report to the coordinator.
+- The coordinator commits only after its write data is replicated and all
+  participant leaders report prepared. If any participant fails to prepare, the
+  transaction aborts. After write replication, the coordinator may not
+  unilaterally abort.
+- Carousel Prepare Consensus adds a Fast-Paxos-like fast path. Prepare requests
+  are sent to every participant leader and follower. If the coordinator sees
+  the same decision from a supermajority that includes the participant leader,
+  it can accept that partition's decision in one WAN round trip; otherwise it
+  waits for the leader's slow-path replicated decision.
+- CPC runs fast and slow paths concurrently rather than starting the slow path
+  only after fast-path timeout. This reduces common-case latency without making
+  the slow path absent.
+- On participant leader failure, the new leader receives pending-transaction
+  lists during extended Raft leader election, completes partially replicated
+  slow-path entries, identifies transactions that could have been fast-path
+  prepared, filters them for conflicts and stale versions, and replicates the
+  resulting prepare decisions before serving buffered requests.
+- Carousel can read from local followers. The commit request carries the read
+  versions returned by the follower, and participant leaders return their
+  current read versions; the coordinator aborts if the client read stale data.
+- Read-only transactions avoid a coordinator. Participant leaders validate
+  against pending writes and return data or abort, allowing one network
+  roundtrip when validation succeeds.
+- The prototype is about 3,500 lines of Go protocol code over an in-memory
+  key-value store and gRPC, extending an open-source Raft implementation. The
+  prototype evaluation does not implement full fault tolerance.
+- EC2 experiments use five regions, five partitions, replication factor three,
+  15 servers, 10 million keys, Zipf 0.75, Retwis and YCSB+T workloads, and a
+  TAPIR baseline. Retwis at 200 tps reports median latency of 232 ms for
+  Carousel Fast, 290 ms for Carousel Basic, and 334 ms for TAPIR. YCSB+T reports
+  259 ms for Carousel Fast and 337 ms for TAPIR.
+- Local-cluster throughput experiments with simulated 5 ms inter-datacenter
+  latency show TAPIR failing to meet target throughput above about 5,000 tps,
+  Carousel Basic staying effective until about 8,000 tps and continuing upward
+  at 10,000 tps, and Carousel Fast leveling near 8,000 tps because its
+  concurrent fast and slow paths send more messages.
+- Carousel Fast's abort rate was higher than Basic under load because local
+  replica reads can be stale; at an 8,000 tps target, the paper reports about
+  9% aborts for Fast and 7% for Basic.
+
+**GPU DB mapping:** GPU DB should treat a known transaction footprint as a
+route certificate that can start work before all values are known. For
+single-node operation, that means a prepared statement or stored procedure can
+declare key ranges, affected resident generations, WAL dependency lanes, and
+GPU route families at admission. Mutation owners can then validate conflicts,
+reserve WAL/payload space, and pre-invalidate candidate resident routes while
+CPU reads or GPU lookups are still running.
+
+The ReadAndPrepare idea maps especially well to same-shape session
+micro-batches. A batch of `WHERE key = ?` updates, fixed key-range writes, or
+known partition COPY chunks can carry read/write footprint metadata into the
+runtime rings. The engine can preflight capacity, owner affinity, and conflict
+state before enqueuing expensive GPU work, lowering abort-after-transfer cases.
+
+Carousel's CPC is also a useful warning: reducing latency by sending more
+messages can lower throughput or increase aborts when the route reads from
+possibly stale replicas. GPU DB should benchmark any "parallel preflight" route
+against its extra message, queue, and validation cost. A fast path that probes
+multiple owners, storage queues, or GPU workers must have a clear slow path and
+a bounded fallback when proofs disagree.
+
+For future replicated or multi-owner GPU DB, Carousel suggests splitting the
+commit proof into named facts: participant prepared, write data durably
+recorded, participant decision replicated, writeback pending, and stale-read
+abort. Those facts should become observable state in route telemetry rather
+than a single opaque "committing" flag.
+
+**Risks and mismatches:** Carousel is geo-distributed key-value transaction
+work, not a GPU database runtime. It assumes fixed key sets, record-level OCC,
+partial replication, WAN latency dominance, and key-value operations. It does
+not address SQL planning, MVCC version chains, WAL file layout, GPU residency,
+CUDA streams, cold-tier placement, or result encoding.
+
+The 2FI restriction excludes dependent reads and writes. The paper proposes a
+reconnaissance transaction for secondary-index style dependencies, but GPU DB
+should not assume all SQL can be made fixed-footprint without cost. The first
+transferable slice is prepared statements or stored procedures with bounded,
+declared route footprints.
+
+The prototype evaluation does not include full fault-tolerance implementation,
+and Carousel Fast pays higher bandwidth and abort costs under load. Treat the
+latency wins as evidence for route-overlap benchmarks, not as proof that every
+fast path should broadcast to all owners or read stale replicas.
+
+**Benchmark candidates:**
+
+- Add a fixed-footprint transaction benchmark where the client declares read
+  keys, write keys, affected partitions, and route families before execution.
+  Compare late validation against read-and-prepare overlap. Gate: identical
+  serializable outcomes and WAL-before-visibility behavior.
+- Prototype admission-time route preflight for prepared statements: owner queue
+  capacity, residency generation, WAL dependency lane, and GPU worker budget.
+  Measure abort-after-GPU-work rate, p50/p99 latency, and queue wait.
+- Compare one slow deterministic path with a parallel preflight path that probes
+  multiple owners or route certificates concurrently. Failure condition: the
+  fast path improves median latency but increases p99 latency, aborts, or queue
+  saturation beyond the slow-path baseline.
+- Build a stale-read simulation for retained snapshots and local replicas.
+  Gate: reads that race an invalidation either abort/restart with a precise
+  reason or finish on a valid immutable generation; they must not silently use a
+  newer write with an older route certificate.
+- Add commit-state telemetry with separate counters for prepared, write-durable,
+  visibility-published, writeback-pending, stale-read-abort, and conflict-abort.
+  Gate: operators can distinguish validation conflicts from durability waits
+  and route invalidations.
+- Measure fixed-footprint micro-batching for same-shape updates. Expected win:
+  admission and prepare work amortize by partition and WAL lane, while each
+  request still receives an individual commit or abort result.
+- Test the reconnaissance-pattern cost for secondary-index writes. Compare a
+  two-step route-discovery transaction against a normal dependent SQL path.
+  Failure condition: fixed-footprint conversion saves commit latency but loses
+  overall latency or correctness under high churn.
+
+### 2026-06-06 - Cross-paper synthesis: route overlap needs proof-shaped admission
+
+Recent reviews now converge on a route contract that is more than a fast path.
+Pangu says a transport route needs explicit fast-path and fallback state. BVLSM
+says bulky payload bytes should be separated from correctness metadata at WAL
+admission. DEX says remote range routes need logical owners, fence keys,
+coalesced misses, and cache/offload boundaries. Carousel adds that transaction
+work can overlap read, prepare, commit, and replication only when the route
+footprint is declared early enough to validate.
+
+The design track is therefore "proof-shaped admission": before expensive work
+enters a hot ring, the request should carry the smallest proof that makes the
+route legal. For reads, that proof includes snapshot generation, route
+generation, resident/cold tier, fence or predicate range, and fallback policy.
+For writes, it includes read/write footprint, WAL dependency lane, payload
+durability requirement, invalidation scope, and conflict class. For remote or
+future-tier work, it includes transport health, queue budget, miss-coalescing
+state, and retry/reacquire rules.
+
+Category gaps remain in SQL-level optimizer integration and in long-reader
+MVCC cleanup under these richer route proofs. The next high-value papers should
+favor transaction scheduling, optimizer route certificates, isolation checking,
+or tier-aware MVCC reclamation rather than another pure GPU scan paper.
+
+Benchmark priorities:
+
+- Implement one fixed-footprint admission harness that can run both read-only
+  retained lookups and update transactions through the same proof structure.
+- Track wasted work explicitly: GPU work after doomed validation, payload bytes
+  written before abort, route misses duplicated by many sessions, and
+  durability waits hidden inside one commit state.
+- Compare deterministic single-owner admission with parallel preflight across
+  owners, storage queues, and GPU workers. The useful result is not only median
+  latency; it is the crossover where extra probes hurt p99 or conflict rate.
+- Make fallback reasons part of benchmark output: stale route, missing fence,
+  invalid snapshot, saturated GPU queue, WAL lane wait, payload not durable,
+  and transport fallback.
+
 ### 2026-06-06 - DecLog: independent writes should not wait behind one global WAL sequence
 
 **Citation:** Bolong Zheng, Yongyong Gao, Jingyi Wan, Lingsen Yan,
