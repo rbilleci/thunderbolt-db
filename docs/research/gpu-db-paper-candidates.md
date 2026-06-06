@@ -285,14 +285,15 @@ Append new candidates here as each paper is processed.
 
 ### Database file-system design, storage, and indexing
 
-- `queued` — **Native Cloud Object Storage in Db2 Warehouse: Implementing a
+- `reviewed` — **Native Cloud Object Storage in Db2 Warehouse: Implementing a
   Fast and Cost-Efficient Cloud Storage Architecture**, Kalmuk et al.,
   SIGMOD/PODS Companion 2024.
   URL: `https://research.ibm.com/publications/native-cloud-object-storage-in-db2-warehouse-implementing-a-fast-and-cost-efficient-cloud-storage-architecture`
+  DOI: `https://doi.org/10.1145/3626246.3653393`
   Why: modern production DBMS storage architecture over durable object storage;
   relevant to separating database-owned storage metadata, page/object layout,
   cache hierarchy, and read throughput from conventional local file-system
-  assumptions.
+  assumptions. Journal entry added 2026-06-06.
 - `queued` — **Vortex: A Stream-oriented Storage Engine For Big Data
   Analytics**, Lamb et al., SIGMOD/PODS Companion 2024.
   URL: `https://research.google/pubs/vortex-a-stream-oriented-storage-engine-for-big-data-analytics/`
@@ -312,6 +313,18 @@ Append new candidates here as each paper is processed.
   relevant to deciding when GPU DB should maintain compact auxiliary indexes
   over cold segments instead of relying only on full scans or B-tree-like
   access paths.
+- `queued` — **SkyStore: Cost-Optimized Object Storage Across Regions and
+  Clouds**, Liu et al., PVLDB 2025.
+  URL: `https://research.ibm.com/publications/skystore-cost-optimized-object-storage-across-regions-and-clouds`
+  Why: follow-up object-storage placement work discovered during the Db2 native
+  COS review; relevant to future cold-tier placement, replication, cost-aware
+  promotion, and region/cloud-aware object movement policy.
+- `queued` — **ByteHouse: A Cloud-Native OLAP Engine with Incremental
+  Computation and Multi-Modal Retrieval**, arXiv 2026.
+  URL: `https://arxiv.org/abs/2602.08226`
+  Why: modern cloud-native warehouse architecture with SSD-backed cache and a
+  virtual file-system layer; useful as a contrast point for DB-owned NVMe
+  caches, remote object layout, and local-access abstraction choices.
 
 ### WAL, logging, and read/write throughput
 

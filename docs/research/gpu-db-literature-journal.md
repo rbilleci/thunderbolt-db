@@ -76360,3 +76360,236 @@ WAL/MVCC visibility first, physical descriptor freshness second.
   validation, and owner-serialized descriptor slots. Failure condition:
   version validation costs more than simpler owner-ring generation reuse
   at the target queue depth.
+
+### 2026-06-06 - Db2 native COS keeps database pages by moving the storage contract underneath them
+
+**Citation:** David Kalmuk, Christian Garcia-Arellano, Ronald
+Barber, Richard Sidle, Kostas Rakopoulos, Hamdi Roumani, William
+Minor, Alexander Cheung, Robert C. Hooper, Matthew Emmerton, Zach
+Hoggard, Scott Walkty, Patrick Perez, Aleksandrs Santars, Michael
+Chen, Matthew Olan, Daniel C. Zilio, Imran Sayyid, Humphrey Li,
+Ketan Rampurkar, Krishna K. Ramachandran, and Yiren Shen. "Native
+Cloud Object Storage in Db2 Warehouse: Implementing a Fast and
+Cost-Efficient Cloud Storage Architecture." SIGMOD/PODS Companion
+2024, pp. 188-200. doi:10.1145/3626246.3653393. Retrieved
+2026-06-06 from IBM Research
+`https://research.ibm.com/publications/native-cloud-object-storage-in-db2-warehouse-implementing-a-fast-and-cost-efficient-cloud-storage-architecture`.
+The ACM DOI/PDF endpoint returned a Cloudflare challenge in this worker,
+so mechanism details below are cross-checked against IBM documentation and
+IBM/IDUG technical posts by the Db2 native COS team.
+
+**Category:** database file-system design, storage, and indexing, with
+multi-tier cache/data placement and write-throughput relevance.
+
+**Relevance tags:** cloud object storage; local NVMe cache; tiered LSM
+storage; SST files; page-preserving storage; write buffers; storage-layer
+WAL; manifest metadata; clustering keys; page cleaners; direct bottom-level
+ingest; cache warmup; compaction avoidance; read/write amplification;
+object-size amortization; DB-owned storage tiers.
+
+**Core idea:** Db2 Warehouse moved a mature page-based database onto cloud
+object storage without rewriting the whole kernel around a new lake format.
+The key move is to insert a tiered LSM storage layer below the buffer pool
+and tablespace layers. Existing Db2 pages remain the upper-layer contract,
+while the new layer translates page reads and writes into large, clustered
+objects, manages a local NVMe cache, persists latency-sensitive metadata on
+block storage, and uses LSM write buffers, SSTs, manifests, and compaction to
+make high-latency object storage usable.
+
+For GPU DB, the strongest transferable idea is that a future cold tier does
+not have to leak raw filesystem or object-store behavior into the query
+runtime. The database can preserve a stable logical page/segment contract
+above the storage boundary while making the physical tier policy private:
+local NVMe cache, object/SST grouping, manifest publication, clustering keys,
+and direct bulk ingest become measurable implementation choices under a route
+certificate.
+
+**Concrete mechanisms:**
+
+- The production architecture has at least three storage roles: remote cloud
+  object storage for table-space data, local attached NVMe as a volatile cache
+  and write staging area, and local persistent/block storage for latency-
+  sensitive files such as the tiered LSM WAL and metadata.
+- The tiered LSM storage layer replaces the lower I/O access layer used by
+  page reads/writes while preserving upper Db2 buffer-pool and table-space
+  behavior. That choice keeps SQL compatibility and decades of existing
+  page-format optimizations above the new storage layer.
+- Object storage's request latency and preferred transfer size are very
+  different from block storage. The IBM technical writeup cites object-store
+  requests as roughly 100-300 ms versus roughly 10-30 ms for the compared
+  block-storage regime, motivating tens-of-MB transfer units instead of
+  kilobyte page-sized operations.
+- A naive "one extent equals one object" design would have required expanding
+  Db2 extents from 128 KB to around 32 MB in the discussed example. The team
+  rejected that as a general answer because it would worsen locality, small
+  ingest, updates, deletes, read amplification, and write amplification.
+- Normal writes create a batch in the tiered LSM layer, write pages to a
+  storage-layer WAL on block storage, and insert pages into in-memory write
+  buffers in the Db2 heap. The write buffers become immutable while flushing
+  and are eventually written as sorted SST files.
+- Write buffers are written through the local NVMe caching tier before cloud
+  object storage. A manifest file on block storage is updated to publish the
+  generated SST into the LSM metadata.
+- Level 0 SST files can overlap in key range, preserving ingest speed.
+  Background compaction moves data into lower non-overlapping levels for
+  better read performance and better object-size/layout behavior.
+- Some write paths avoid the tiered LSM WAL because durability is already
+  covered by the Db2 transaction log. Bulk paths can write pre-sorted SST
+  files directly into the bottom of the LSM tree, reducing compaction and
+  write amplification.
+- Direct bottom-level ingest requires strictly increasing clustering keys in
+  a batch and low overlap with existing key ranges or concurrent write-buffer
+  data. Db2 exploits append-only column-organized page patterns and assigns
+  page cleaners contiguous insert ranges so they can build ordered SSTs in
+  parallel.
+- During bulk ingest, page cleaners build SST files asynchronously in the
+  local caching tier and upload them to object storage. Final flush-at-commit
+  waits for pending SST uploads, while manifest metadata integration remains a
+  serialized step.
+- Reads first consult the Db2 buffer pool. On a miss, the storage layer checks
+  SSTs in the local NVMe cache. If absent, it fetches the corresponding SST
+  file or files from object storage into the caching tier, then returns the
+  requested page to the buffer pool.
+- A clustering mapping table lets pages be stored under storage keys different
+  from the page identifiers used by the Db2 engine. For column-organized
+  tables, column group and insert range are included in the storage clustering
+  key so related pages land in separate, ordered SST files that cooperate with
+  buffer-pool prefetch.
+- IBM's public benchmark writeup reports a 4x end-to-end improvement for a
+  16-client mixed analytic workload against the previous generation, with a
+  213 minute versus 51 minute elapsed-time comparison. The setup uses two AWS
+  EC2 nodes, 24 database partitions, 48 cores and 768 GB memory per node, a
+  25 Gbps network interface, and four NVMe drives per node with 60% allocated
+  to on-disk cache.
+- The same writeup reports a 1.75x single-stream TPC-DS power-test speedup
+  at 10 TB and a 4.5x average per-query speedup once the NVMe cache is warm.
+  IBM also reports 34x lower storage cost from object storage compared with
+  SSD-based block storage pricing in that context.
+- The IDUG bulk-ingest writeup reports an 82% elapsed-time reduction for a
+  bulk optimized `INSERT FROM SUBSELECT` populating TPC-DS `STORE_SALES` at
+  5 TB scale, about 14.4B rows and 2.3 TB uncompressed. It reports 98% fewer
+  bytes written to the local persistent tier, 99% fewer compaction bytes to
+  object storage, and 85% fewer caching-tier bytes written versus the
+  pre-optimized path.
+
+**GPU DB mapping:** P8 already treats GPU memory as an acceleration tier
+rather than durable truth. Db2 native COS suggests applying the same discipline
+below CPU truth: define a stable logical storage segment above the tier layer,
+then let the tier manager decide whether the physical representation is
+resident HBM columns, CPU DRAM chunks, local NVMe SST-like objects, or remote
+objects. Query routes should see a certified segment identity, freshness
+frontier, supported predicate families, cache location, and expected movement
+cost, not ad hoc file paths.
+
+The storage-layer WAL plus manifest publication pattern maps well to GPU DB's
+WAL-before-visibility rule. A cold-tier or over-resident write path can stage
+large GPU-friendly or NVMe-friendly segments, persist a recovery record or
+reuse the main transaction log, then publish a small manifest/generation record
+last. New read routes should become eligible only after the manifest and
+visibility frontier agree.
+
+The clustering-key mechanism is directly relevant to resident layout. GPU DB
+should not simply store cold segments by tuple id or insertion order if queries
+need column-family scans, key lookups, or prefix/range predicates. A storage
+key can include table, partition, column family, insert range, MVCC generation,
+and route shape, while a mapping table lets the logical row/tuple identity
+remain stable above it.
+
+The read path argues for a two-level cache contract beyond the current
+resident GPU cache: an in-memory buffer or decoded segment cache, plus a local
+NVMe cache of large cold objects or prebuilt column groups. GPU routes can then
+differentiate "already in HBM", "warm on local NVMe and batchable", "remote
+object fetch required", and "CPU fallback cheaper" with explicit telemetry.
+
+Direct bottom-level ingest gives a concrete benchmark for COPY/append-heavy
+workloads. If a COPY chunk naturally forms monotonically ordered key ranges,
+GPU DB can build large sorted cold-tier segments directly and avoid later
+compaction. If trickle updates or hot keys dominate, it should fall back to a
+write-buffer/WAL path and measure compaction debt instead of pretending all
+ingest can be batch-perfect.
+
+**Risks and mismatches:** This is a warehouse/object-storage architecture,
+not an OLTP MVCC paper or a GPU execution paper. Db2's design preserves a
+traditional page contract; GPU DB's first P8 slice uses CPU MVCC tuples plus
+generated GPU column groups, so adopting the idea literally could keep a
+suboptimal page format too long. The useful lesson is the under-layer tier
+contract, not a requirement to store every GPU DB structure as 32 KB pages.
+
+The public full paper was not accessible through ACM in this worker, so some
+implementation details and exact evaluation methodology remain unknown. The
+reported benchmark numbers come from IBM product/technical posts and should be
+treated as production evidence to reproduce with our own workload gates, not
+as an independent academic comparison. The workload is analytics-heavy, and
+object storage economics do not directly answer p50 OLTP commit latency,
+hot-key updates, serializable MVCC, or 1M-session admission behavior.
+
+**Benchmark candidates:**
+
+- Add a CPU/NVMe cold-tier prototype with DB-owned large segment objects and a
+  small manifest/generation publication record. Gate: crash/restart can
+  rebuild cache metadata from WAL plus manifest without trusting stale local
+  NVMe cache files.
+- Compare four physical clustering keys for cold/resident segments:
+  tuple-id order, append-range order, column-family plus insert-range order,
+  and predicate-family order. Measure remote/local read amplification, GPU
+  H2D bytes, cache warmup time, p99 query latency, and compaction/write debt.
+- Build a COPY direct-ingest benchmark that forms sorted segment objects at
+  admission time versus a write-buffer plus later compaction path. Gate:
+  WAL-before-visibility remains intact and bottom-level publication is visible
+  only after durable segment/manifest completion.
+- Add a two-level route-cost model for "HBM resident", "host-memory warm",
+  "local NVMe warm", and "remote object cold". A retained route certificate
+  should include location, movement bytes, freshness frontier, and fallback
+  reason.
+- Measure manifest publication as a serialized bottleneck. Compare one global
+  manifest owner, partition-local manifests, and append-only manifest deltas
+  under many COPY/page-cleaner-like producers. Failure condition: faster
+  segment creation is hidden behind a single metadata publication queue.
+- Add cache-warmup experiments that separate cold-start, first-touch
+  population, background warmup, and steady warm-cache performance. Report
+  time-to-first-correct-read, time-to-route-ready, p50/p99 latency, bytes
+  fetched from each tier, and cache eviction churn.
+- Test trickle ingest versus bulk ingest. The direct-ingest path should win
+  only when batches are ordered and low-overlap; otherwise the system should
+  choose a WAL/write-buffer path and expose compaction debt, not silently
+  amplify writes.
+
+### 2026-06-06 - Cross-paper synthesis: route proof now spans publication, reclamation, and storage placement
+
+The last three reviewed papers converge on one design track: a route is only
+safe when three independent proofs line up. FPTree gives a physical
+publication proof: durable leaves or segment payloads can be published with a
+small validity bit or generation while volatile routing is rebuilt. VBR gives
+a memory-lifetime proof: a reader can validate that the descriptor it touched
+was not recycled out from under it, instead of letting stalled sessions pin
+old metadata forever. Db2 native COS adds a placement proof: a logical page or
+segment can stay stable above the storage layer while the lower layer maps it
+to NVMe cache, SST/object layout, manifest state, and remote object storage.
+
+For GPU DB, the converging route certificate should therefore include:
+logical visibility frontier, physical descriptor generation, durable
+publication/manifest generation, tier location, movement estimate, and
+retirement/reacquisition rule. The same SQL snapshot may remain logically
+valid while a physical route descriptor is recycled or a cold segment moves
+from local NVMe to remote object storage; route selection must be able to
+restart or fall back without confusing those events with MVCC visibility
+changes.
+
+Category gaps remain around production-grade high-concurrency networking and
+direct GPU update/OLTP mechanisms, but the storage and reclamation lane is now
+strong enough to drive a concrete CPU-only benchmark before the new GPU
+arrives.
+
+Benchmark priorities:
+
+- Build a route-certificate harness with separate fields for SQL snapshot,
+  descriptor generation, manifest/publication generation, and tier location.
+  Inject descriptor reuse, manifest publication, eviction, and refresh while
+  reads are preparing routes.
+- Extend P8 residency telemetry so a route rejection names the exact proof
+  that failed: logical visibility, physical freshness, durable publication,
+  memory lifetime, tier budget, or estimated movement cost.
+- Prototype NVMe-backed cold segments with manifest-last publication and
+  version-tagged route descriptors. Gate: old readers can finish or restart
+  safely, new readers cannot observe unpublished segments, and restart can
+  rebuild volatile route metadata.
