@@ -38,6 +38,218 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - ShiftLock turns hot remote locks into handoff queues
+
+**Citation:** Jian Gao, Qing Wang, and Jiwu Shu. "ShiftLock:
+Mitigate One-sided RDMA Lock Contention via Handover." 23rd USENIX
+Conference on File and Storage Technologies, FAST 2025, pages
+355-372. Retrieved 2026-06-06 from
+`https://www.usenix.org/conference/fast25/presentation/gao` and PDF
+`https://www.usenix.org/system/files/fast25-gao.pdf`.
+
+**Category:** runtime / HFT / session scale, with secondary relevance
+to transaction processing / write path and database file-system /
+storage / indexing for future remote-tier lock authorities.
+
+**Relevance tags:** RDMA locks; one-sided verbs; client-to-client
+handover; reader-writer locks; MCS-style queueing; high contention;
+RNIC inbound IOPS; dynamic connection; starvation freedom; lease-based
+failure recovery; two-phase locking; TATP; TPC-C; remote-tier metadata.
+
+**Core idea:** ShiftLock attacks the failure mode of one-sided RDMA
+locks under high contention: everyone retries against the same lock
+server RNIC, so failed acquisitions consume inbound IOPS and raise tail
+latency. Instead of treating backoff as the answer, ShiftLock queues
+writers and hands lock ownership directly from client to client, letting
+waiters wait locally instead of repeatedly hitting the lock table.
+
+For GPU DB, the transferable idea is broader than RDMA locks. Hot
+remote or shared authorities should not expose a retry storm as their
+contention API. When a metadata key, resident-fragment lease, remote
+index page, or future disaggregated-tier object becomes hot, the engine
+should convert contention into an explicit waiter/owner handoff shape
+with bounded admission and telemetry.
+
+**Concrete mechanisms:**
+
+- ShiftLock keeps the lock entry on a server and still uses one-sided
+  RDMA for lock-table manipulation, but uses two-sided RDMA Send/Recv
+  for direct client-to-client notifications such as `Successor`,
+  `Handover`, and `ModeChanged`.
+- It avoids full client-pair connection state with RDMA dynamic
+  connection. Each client maintains a DC initiator and target, and lock
+  entries store compact routing information as a 16-bit node id plus a
+  24-bit DCT QP number instead of full GID/LID/RKey metadata.
+- A writer queue follows the MCS-lock idea. A new writer atomically
+  swaps itself into the tail and notifies its predecessor; the current
+  owner later hands the lock to its successor rather than making the
+  successor poll the lock entry.
+- Because standard RDMA lacks fetch-and-store, ShiftLock uses extended
+  compare-and-swap with a zero compare mask to implement a one-roundtrip
+  fetch-and-store-like enqueue operation.
+- Reader-writer semantics are packed into a 128-bit lock entry. The
+  lock stores a tail pointer, a 23-bit active-reader counter, a release
+  counter, and a one-bit epoch. Extended fetch-and-add updates selected
+  fields without corrupting the others.
+- A writer that observes preceding readers waits for the release
+  counter to reach the value implied by the current reader count. Once a
+  writer enters the queue, new readers are blocked, making the design
+  write-preferring under mixed contention.
+- To avoid reader starvation, writers hand the lock back to waiting
+  readers after a bounded number of consecutive writer handovers. The
+  implementation uses a threshold of 16 consecutive writers; the paper
+  reports this as a good balance between goodput and latency.
+- The epoch bit lets a writer transfer ownership to readers without
+  adding an explicit lock-mode round trip in the uncontended case.
+  Waiting readers observe the epoch change; the next queued writer uses
+  the release counter target carried by `ModeChanged` to regain the lock
+  after those readers drain.
+- Failure handling uses leases. If the release counter does not change
+  for a timeout in the same era, clients ask the server CPU to recover
+  the lock. The server increments an era and resets the lock entry while
+  advancing the release counter by a huge offset so waiters can detect
+  recovery and restart.
+- The server-mediated recovery path avoids an ABA problem that can occur
+  with purely one-sided client recovery. The paper treats failures as
+  rare and accepts CPU involvement off the normal path.
+- Evaluation uses one lock server and five client machines, each with
+  two 24-core Xeon E5-2650v4 CPUs, 128 GiB DRAM, and a Mellanox
+  ConnectX-5 100 Gbps RNIC, for 240 client cores total.
+- Microbenchmarks use 10 million locks and uniform or Zipfian-0.99
+  access under write-intensive, read-intensive, and read-only mixes.
+  Reported results show up to 3.62x higher goodput and up to 76.6%
+  lower p99 latency than evaluated RDMA lock baselines under high
+  contention.
+- Hardware-counter analysis reports that ShiftLock lowers lock-table
+  traffic. In one write-intensive comparison against RMA-RW it reduces
+  0.94 atomics and 1.25 reads per acquisition/release cycle.
+- Transaction experiments use 2PL over TATP and TPC-C traces from the
+  FissLock tooling. The paper reports 1.25x to 2.85x better TATP
+  goodput versus other RDMA locks and 1.09x to 2.14x better TPC-C
+  goodput with comparable latencies.
+- A Redis-backed SmallBank-style application reports 36.55 Kops/s with
+  ShiftLock versus 5.56 Kops/s with RedLock, with lower median and p99
+  latency. This is a useful application signal, though not a database
+  engine benchmark.
+
+**GPU DB mapping:** For current single-node GPU DB, ShiftLock is a
+warning about future hot authority boundaries. If GPU DB later adds
+remote warm tiers, disaggregated indexes, replicated owners, or gateway
+level metadata locks, a CAS/backoff protocol can turn hot keys into
+RNIC or gateway queue collapse. The runtime should expose "handoff
+eligible" contention states for hot metadata rather than treating every
+missed lock or lease as another retry.
+
+The same shape applies without RDMA. Mutation-owner admission,
+resident-snapshot invalidation, cache-lineage locks, and cold-tier
+object leases can use explicit owner-to-waiter transfer. A hot route
+should know who owns the next grant, how many waiters are queued, when
+readers will be admitted, and when the route should reject or fall back
+instead of spinning on shared state.
+
+The write-preferring reader-writer policy maps to WAL-before-visibility
+and resident invalidation. Once a writer needs a resident fragment,
+catalog descriptor, or cold-tier index page, new stale readers should
+not extend the old generation indefinitely. But the epoch-style transfer
+also says readers need a bounded return path: after enough writer
+handoffs, the system should admit a reader cohort or report pressure
+rather than starving retained reads.
+
+The compact lock-entry lesson is useful for route descriptors. A future
+remote-tier or multi-owner lock should carry only the fields required to
+prove the next action: tail/owner identity, reader count or lease count,
+release generation, mode/epoch bit, and recovery era. Full connection or
+resource metadata belongs in worker-local caches or owner tables, not in
+every hot lock entry.
+
+Failure recovery maps to lease and generation recovery for remote
+owners. Purely client-side reset is tempting, but ABA-like state reuse is
+dangerous for route metadata, resident snapshots, and WAL-dependent
+locks. Recovery should go through a small authority that can bump an era
+and force waiters to restart from a clean generation.
+
+**Risks and mismatches:** ShiftLock is a distributed lock paper, not a
+SQL concurrency-control, MVCC, WAL, GPU execution, or recovery design.
+It does not decide whether a transaction should lock, validate, use
+MVCC, or schedule deterministically.
+
+The design assumes RDMA extended atomics, dynamic connection, RNIC
+timestamps, reliable client-to-client delivery, and carefully managed
+registered memory. Those assumptions may not hold on ordinary Ethernet,
+cloud fabrics, or the first GPU DB deployment.
+
+The evaluation is on a six-machine RDMA cluster with one lock server.
+It does not measure 1M logical sessions, pgwire framing, GPU queues,
+CUDA buffers, NVMe cold-tier traffic, or mixed local/remote placement.
+
+ShiftLock lowers retry pressure but still centralizes lock entries on a
+lock server RNIC. For GPU DB future tiers, hot metadata may need
+partitioned authorities, lock fission, or owner-local scheduling before
+a single remote lock table becomes the bottleneck.
+
+Lease-based recovery uses a 10 ms lease in the implementation and a
+3x-lease timeout before recovery. That is far above many target query
+latencies. GPU DB would need shorter owner-specific failure detectors or
+route-level fallback so lock recovery does not become visible p99
+latency for ordinary reads.
+
+**Benchmark candidates:**
+
+- Build a contention-admission simulator for hot route metadata:
+  CAS/backoff, centralized FIFO owner queue, MCS-style handoff, and
+  writer-preferring reader-writer handoff. Measure retries, queue wait,
+  owner traffic, p99 latency, and starvation under skew.
+- Add a "resident fragment lease" microbenchmark: many read routes and
+  occasional invalidating writers contend for a fragment-generation
+  lease. Gate: writers block new stale readers quickly, but reader
+  cohorts still receive bounded service.
+- Model handoff state as compact route metadata: owner/tail id, reader
+  count, release generation, epoch bit, and recovery era. Failure
+  condition: the lock descriptor grows with client count or stores
+  connection-heavy metadata on the hot path.
+- Compare retry storm versus explicit handoff for future remote-tier
+  index-page access. Expected result: handoff lowers remote authority
+  IOPS under Zipfian hot keys while preserving low uncontended latency.
+- Stress failure recovery with ABA-like state reuse. A stalled waiter
+  should not reset a newer generation, and all waiters should observe an
+  era bump before retrying.
+- Evaluate a writer-cohort threshold analogous to ShiftLock's
+  consecutive-writer limit. Sweep thresholds for write p99, read p99,
+  and throughput under mixed retained reads and invalidating writes.
+
+### 2026-06-06 - Cross-paper synthesis: adaptive routes need local caches, reusable learning, and handoff under contention
+
+ShiftLock, ByteHouse, and LIMAO converge on one route-design rule:
+fast paths need explicit state about where work should run, why that
+choice remains valid, and what happens when the chosen authority is
+busy or stale. ByteHouse makes storage locality visible through SSD
+chunk caches and mode selection. LIMAO says adaptive route knowledge
+should be modular and reusable across workload shifts. ShiftLock shows
+that a hot remote authority should turn retry pressure into handoff
+queues instead of making every waiter hammer the same shared object.
+
+**Converging design tracks:** First, route descriptors should carry
+physical facts: resident tier, chunk locality, snapshot generation,
+transfer bytes, and queue pressure. Second, adaptive learning should
+operate over route fragments such as resident lookup, cold transfer,
+decompression, and GPU execution, while deterministic eligibility still
+guards visibility. Third, contention needs a transfer protocol: when a
+metadata key, resident fragment, or future remote-tier index is hot, the
+runtime should publish who owns the next grant and when readers or
+writers will be admitted.
+
+**Category gaps:** The queue remains healthy on optimizer and
+storage/tiering work. The next high-value lane should tilt toward WAL,
+transaction scheduling, or high-concurrency networking unless a newer
+MVCC/snapshot paper directly improves retained snapshot lifetime.
+
+**Benchmark priorities:** Combine the three papers into one
+route-pressure benchmark: hot/cold chunk locality, modular route-cost
+feedback, and handoff-style contention on resident-fragment leases.
+The proof gate should include correct snapshot generation checks,
+bounded retry traffic, route explanation records, and p50/p99 latency
+under skewed read/write pressure.
+
 ### 2026-06-06 - ByteHouse makes disaggregated storage local through SSD chunks and route modes
 
 **Citation:** Yuxing Han et al. "ByteHouse: ByteDance's Cloud-Native

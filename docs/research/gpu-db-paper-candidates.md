@@ -612,13 +612,27 @@ Append new candidates here as each paper is processed.
   priority scheduling with local/remote cohort locking when GPU DB future tiers
   mix local CPU accesses and remote/disaggregated-memory accesses. Journal
   entry added 2026-06-06.
-- `queued` — **ShiftLock: Mitigate One-sided RDMA Lock Contention via
+- `reviewed` — **ShiftLock: Mitigate One-sided RDMA Lock Contention via
   Handover**, Gao, Wang, and Shu, USENIX FAST 2025.
   URL: `https://www.usenix.org/conference/fast25/presentation/gao`
   Why: DecLock compares directly against ShiftLock's MCS-style handover for
   RDMA reader-writer locks; useful for isolating whether GPU DB future-tier
   locks need centralized waiter queues, predecessor handoff, or phase-fair
-  reader batching under hot remote indexes.
+  reader batching under hot remote indexes. Journal entry added 2026-06-06
+  from the USENIX page and PDF.
+- `queued` — **Citron: Distributed Range Lock Management with One-sided
+  RDMA**, Gao, Lu, Xie, Wang, and Shu, USENIX FAST 2023.
+  URL: `https://www.usenix.org/conference/fast23/presentation/gao`
+  Why: ShiftLock cites Citron as one-sided RDMA range-lock work; useful for
+  comparing point-lock handoff against range-lock metadata, interval conflicts,
+  and future remote-tier range/index ownership.
+- `queued` — **Distributed Lock Management with RDMA: Decentralization without
+  Starvation**, Yoon, Chowdhury, and Mozafari, SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3196890`
+  Why: ShiftLock contrasts DSLR as a decentralized RDMA reader-writer lock
+  baseline; useful for comparing starvation-free reader-writer semantics,
+  backoff, release counters, and lock-table traffic before adopting handoff
+  queues for GPU DB remote-tier metadata.
 - `reviewed` — **Fast and Scalable In-Network Lock Management using Lock
   Fission**, Zhang, Cheng, Chen, and Chen, OSDI 2024.
   URL: `https://www.usenix.org/conference/osdi24/presentation/zhang-hanze`
