@@ -851,14 +851,15 @@ Append new candidates here as each paper is processed.
   comparing owner-local log buffers, NVM/SSD flush behavior, and write
   throughput under massive append pressure.
   Journal entry added 2026-06-06.
-- `queued` — **NVWAL: Exploiting NVRAM in Write-Ahead Logging**,
+- `reviewed` — **NVWAL: Exploiting NVRAM in Write-Ahead Logging**,
   Kim et al., ASPLOS 2016.
   URL: `https://doi.org/10.1145/2872362.2872392`
   Metadata: `https://dblp.org/rec/conf/asplos/KimKBNW16`
   Why: DecLog contrasts NVM WAL designs that use persistent-memory ordering
   and consolidated flushing; useful for comparing hardware-shaped WAL records,
   NVRAM log placement, and SQLite-style transactional durability with GPU DB's
-  future NVM/CXL-tier WAL options.
+  future NVM/CXL-tier WAL options. Journal entry added 2026-06-06 from the
+  KAIST OS Lab PDF mirror.
 - `reviewed` — **Improving database performance by leveraging network-assisted
   logging**, Future Generation Computer Systems 2025.
   URL: `https://www.sciencedirect.com/science/article/pii/S0167739X25000809`
@@ -889,6 +890,14 @@ Append new candidates here as each paper is processed.
   useful for deciding whether GPU DB cold-tier value payloads should be routed
   by size, update frequency, and read/write interference rather than a single
   separation threshold.
+- `queued` — **Taurus: Lightweight Parallel Logging for In-Memory Database
+  Management Systems**, Xia, Yu, Pavlo, and Devadas, SIGMOD/PACMMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3389713`
+  PDF: `https://db.cs.cmu.edu/papers/2020/p677-xia.pdf`
+  Why: modern parallel logging design that tracks transaction dependencies
+  across multiple log streams; useful follow-up to NVWAL's single-writer
+  persistent-memory protocol when GPU DB evaluates partition-owned mutation
+  logs, group commit, and parallel recovery.
 - `reviewed` — **High Throughput Replication with Integrated Membership
   Management**, Fouto, Preguica, and Leitao, USENIX ATC 2022.
   URL: `https://www.usenix.org/conference/atc22/presentation/fouto`

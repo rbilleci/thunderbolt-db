@@ -38,6 +38,169 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - NVWAL makes durable logging a byte-granular persistent-memory protocol
+
+**Citation:** Wook-Hee Kim, Jinwoong Kim, Woongki Baek, Beomseok
+Nam, and Youjip Won. "NVWAL: Exploiting NVRAM in Write-Ahead
+Logging." ASPLOS 2016, pages 385-398. DOI:
+`10.1145/2872362.2872392`. Retrieved 2026-06-06 from the KAIST OS
+Lab PDF mirror:
+`https://oslab.kaist.ac.kr/wp-content/uploads/esos_files/publication/conferences/international/p385-kim.pdf`.
+
+**Category:** WAL, logging, and read/write throughput, with secondary
+relevance to future NVM/CXL tiers, transaction publication, and
+checkpoint/recovery design.
+
+**Relevance tags:** NVWAL; SQLite; write-ahead logging; NVRAM;
+byte-granularity differential logging; lazy synchronization; commit
+mark; cache-line flush; persist barrier; user-level heap; checkpointing;
+failure atomicity; future CXL/NVM WAL.
+
+**Core idea:** NVWAL argues that putting a legacy WAL file on fast
+persistent memory leaves too much block/file-system overhead in the
+path. If the log medium is byte-addressable, the DBMS should shape log
+records, persistence ordering, and allocator state around transaction
+semantics rather than page writes. The paper applies this to SQLite by
+logging only dirty byte ranges, delaying cache-line flushes until the
+transaction boundary, and managing persistent log blocks with a
+user-level heap.
+
+For GPU DB, the strongest transferable idea is to make WAL publication
+a route-specific persistence protocol instead of a generic append. The
+mutation owner should know which bytes, cache lines, durability
+barriers, invalidation records, response slots, and checkpoint metadata
+must be made persistent before visibility. Hardware tiers can change,
+but the commit proof should stay explicit and minimal.
+
+**Concrete mechanisms:**
+
+- Stock SQLite WAL logs whole 4 KiB B-tree pages. NVWAL stores a
+  32-byte WAL-frame header plus an arbitrary-sized dirty byte range
+  containing page number, in-page offset, frame size, checksum,
+  checkpoint id, and commit flag.
+- Byte-granularity differential logging compares the dirty page with
+  the existing WAL frame and truncates clean prefix/suffix regions so
+  small logical updates do not force whole-page persistent writes.
+- The transaction-aware persistency protocol separates a logging phase
+  from a commit phase. It copies all dirty WAL frames first, flushes
+  the frames as a group, uses barriers to ensure persistence, then
+  writes and flushes the commit mark.
+- The key ordering invariant is only that the commit mark reaches
+  persistent memory after all log frames for that transaction. The
+  paper intentionally allows reordering among log-frame writes within
+  the same transaction.
+- The implementation on ARM uses a `cache_line_flush()` system call
+  built from `dccmvac`, plus data memory barriers and an emulated
+  persist barrier. The paper notes that future strict and relaxed
+  persistency models could remove or simplify explicit flush calls.
+- The commit mark is one bit in the frame header. The authors assume
+  NVRAM provides 8-byte atomic writes; if only cache-line atomicity is
+  available, padding would be needed to avoid flushing unrelated data.
+- NVWAL includes an asynchronous checksum variant that writes log
+  records, commit mark, and checksum without explicit ordering. The
+  authors use it as a performance comparison point and flag the small
+  but real corruption risk from checksum collision.
+- Persistent log storage is managed as large NVRAM blocks rather than
+  one persistent allocation per frame. Blocks have `free`, `pending`,
+  and `in-use` states so recovery can reclaim partially allocated
+  blocks after a crash.
+- Checkpointing reconstructs dirty pages by combining byte-range log
+  frames with original database pages, writes them back to the
+  database file with `fsync()`, and only then truncates persistent log
+  blocks.
+- On their Tuna NVRAM emulator, lazy synchronization reduces ordering
+  overhead by roughly 2-23% versus eager per-log-entry synchronization.
+  The cache flush and barrier overhead is reported as 0.8-4.6% of
+  transaction execution time for their SQLite insert experiments.
+- Differential logging reduces bytes written to NVRAM by 73-84% for
+  inserts, 29-85% for updates, and 49-69% for deletes in the reported
+  microbenchmarks.
+- On a Nexus 5 emulation setup, optimized flash WAL reaches 541 insert
+  transactions/s, while NVWAL with user-level heap, lazy
+  synchronization, and differential logging reaches 5,812 insert
+  transactions/s when emulated NVRAM write latency is 2 microseconds.
+
+**GPU DB mapping:** GPU DB's WAL-before-visibility rule should remain
+the authority, but NVWAL suggests making the physical WAL record
+smaller and more semantic. Insert/update/delete routes can publish
+redo records whose payloads are dirty column ranges, row-version deltas,
+resident invalidation descriptors, or checkpoint-fragment deltas rather
+than whole synthetic pages.
+
+The lazy synchronization invariant maps directly to mutation-owner
+commit groups. Within one transaction or deterministic admission
+batch, the engine may reorder or combine durable byte writes as long as
+the final visibility/commit marker cannot persist before all required
+redo, invalidation, and recovery metadata. This is a better target than
+blindly flushing each sub-record as soon as it is generated.
+
+The user-level persistent heap maps to future CXL/NVM WAL chunks and
+route metadata slabs. A mutation owner can reserve a slab, mark it
+pending, link it into a durable log chain, persist the link, then mark
+it in-use. Recovery can reclaim pending chunks and ignore uncommitted
+frames without consulting GPU cache state.
+
+Differential logging is useful for P8 because current row/MVCC truth
+will eventually generate resident column groups and cold-tier segments.
+For small updates, durable records should capture enough information to
+replay CPU truth and invalidate or refresh resident fragments without
+rewriting or flushing whole segments.
+
+Checkpointing should preserve the same shape: reconstruct canonical
+CPU state first, then rebuild or refresh GPU-resident acceleration
+state. A byte-granular WAL can make checkpoint IO smaller, but it also
+requires stronger segment-generation and checksum proofs so recovery
+can tell exactly which resident/cold fragments are valid.
+
+**Risks and mismatches:** NVWAL is built for SQLite's single-writer
+model on mobile hardware, not a multi-session server DBMS with many
+concurrent writers, MVCC readers, GPU-resident snapshots, or distributed
+replication. It does not solve group commit across partitions, parallel
+log streams, logical decoding, replica acknowledgement, or SQL
+transaction scheduling.
+
+The paper assumes byte-addressable NVRAM and discusses hardware
+persist barriers that were not available in the evaluated system.
+Modern persistent-memory availability, CXL memory semantics, kernel
+support, and deployment economics may differ substantially.
+
+Byte-range logging can complicate recovery and validation. GPU DB
+should not adopt differential WAL records unless replay, checksums,
+page/segment reconstruction, and corruption detection remain simpler
+than the IO saved.
+
+The headline 10x comparison is against SQLite WAL on flash/eMMC, with
+SQLite-specific EXT4 journaling overhead. It is mechanism evidence for
+removing block/file-system overhead, not a predicted speedup for GPU DB.
+
+The asynchronous checksum variant is intentionally unsafe for a
+database that promises durable commit. GPU DB should treat it only as a
+measurement upper bound, not as an implementation option.
+
+**Benchmark candidates:**
+
+- Build a WAL-record-shape simulator with whole-row, whole-page,
+  byte-range, and column-delta records. Measure WAL bytes, checksum
+  cost, replay cost, checkpoint write amplification, and p99 commit
+  latency for insert/update/delete mixes.
+- Add a mutation-owner persistence-order benchmark with eager
+  per-record flush, transaction-lazy flush, and group-lazy flush.
+  Gate: a crash injector never observes a durable commit marker without
+  all required redo and invalidation records.
+- Prototype persistent WAL slab states: free, pending, linked, in-use,
+  committed, checkpointed. Failure condition: injected crashes leak
+  unbounded slabs or replay an uncommitted frame.
+- Compare differential WAL against resident-fragment invalidation.
+  Required measurement: bytes logged, bytes invalidated, refresh cost,
+  replay time, and false invalidation rate for small row updates inside
+  large resident column groups.
+- Benchmark checkpoint reconstruction from byte-range records versus
+  physiological page records. Gate: smaller WAL writes do not move the
+  bottleneck into CPU replay or checksum verification.
+- Keep an unsafe checksum-only async path as a test-only upper bound.
+  Failure condition for production eligibility: any collision or stale
+  partial frame can be interpreted as committed after crash injection.
+
 ### 2026-06-06 - Lance makes random columnar access a structural-encoding problem
 
 **Citation:** Weston Pace, Chang She, Lei Xu, Will Jones, Albert
