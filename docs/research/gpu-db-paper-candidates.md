@@ -526,12 +526,28 @@ Append new candidates here as each paper is processed.
   Why: Vortex relies on Big Metadata for large-scale column properties and
   partition pruning; useful for GPU DB's route metadata, resident-fragment
   pruning, snapshot-safe metadata publication, and metadata compaction.
-- `queued` — **Pravega: A Tiered Storage System for Data Streams**,
+- `reviewed` — **Pravega: A Tiered Storage System for Data Streams**,
   Gracia-Tinedo et al., Middleware 2023.
   URL: `https://doi.org/10.1145/3590140.3629113`
   Why: Vortex compares against Pravega's stream/tier abstraction; useful for
   studying stream-oriented tiering, truncation, transactions, and data
-  placement across hot and cold storage.
+  placement across hot and cold storage. Journal entry added 2026-06-06 from
+  DBLP/DOI metadata and the accessible Middleware 2023 PDF mirror after the
+  ACM DOI page was blocked by a Cloudflare challenge.
+- `queued` — **Virtual Log-Structured Storage for High-Performance
+  Streaming**, Marcu, Costan, Nicolae, and Antoniu, IEEE CLUSTER 2021.
+  URL: `https://doi.org/10.1109/Cluster48925.2021.00025`
+  Why: Pravega cites this as evidence that too many parallel storage writes can
+  saturate underlying drives; useful for comparing segment multiplexing,
+  virtualized log structure, and cold-tier write coalescing for GPU DB ingest.
+- `queued` — **Data Ingestion for the Connected World**, Meehan, Aslantas,
+  Zdonik, Tatbul, and Du, CIDR 2017.
+  URL:
+  `https://www.cidrdb.org/cidr2017/papers/p47-meehan-cidr17.pdf`
+  Why: Pravega identifies this as one of the few storage-focused treatments of
+  tail and historical stream ingestion; useful for comparing ingestion
+  semantics, stream/table boundaries, and storage contracts for retained
+  GPU-readable histories.
 - `reviewed` — **ALock: Asymmetric Lock Primitive for RDMA Systems**, Baran,
   Nelson-Slivon, Tseng, and Palmieri, SPAA 2024.
   URL: `https://doi.org/10.1145/3626183.3659977`

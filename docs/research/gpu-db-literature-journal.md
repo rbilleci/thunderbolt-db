@@ -85665,3 +85665,201 @@ committing to one policy.
 - Split retrieval weights into CPU, NVMe, H2D, GPU rebuild, and queue
   occupancy components. Measure whether a byte-optimal policy differs
   from a latency-optimal policy under mixed reads and writes.
+
+### 2026-06-06 - Pravega makes stream tiering an append contract, not a cache afterthought
+
+**Citation:** Raul Gracia-Tinedo, Flavio Junqueira, Tom Kaitchuck, and
+Sachin Joshi. "Pravega: A Tiered Storage System for Data Streams."
+Middleware 2023, pages 165-177. DOI: `10.1145/3590140.3629113`.
+Retrieved 2026-06-06 from DBLP/DOI metadata and an accessible
+Middleware 2023 PDF mirror at
+`https://gbouloukakis.com/files/csc7321_f24/pravega.pdf`; the ACM DOI
+landing page returned a Cloudflare challenge to `curl`.
+
+**Category:** multi-tier cache / data placement, with WAL/logging,
+runtime/session scale, and database file-system/storage relevance.
+
+**Relevance tags:** tiered stream storage; append-only segments; routing-key
+ordering; segment auto-scaling; segment containers; WAL plus long-term
+storage; server-side batching; read index; cache generation; historical
+reads; stream truncation; retention policy; cold-tier catch-up.
+
+**Core idea:** Pravega treats unbounded streams as a storage primitive with a
+hot durable append tier and a cold long-term storage tier. The key design
+move is not just adding an object-store archive behind a log. It defines
+stream segments as the durable, ordered unit, maps those segments to
+containers, appends through a replicated WAL for low-latency durability, and
+then migrates sealed or aged bytes to long-term storage while preserving the
+same stream abstraction for tail and historical readers.
+
+For GPU DB, the transferable idea is to make tier movement visible in the
+logical storage contract. Hot writes should enter a small number of owned,
+append-friendly authorities; cold placement should be automatic and
+recoverable; readers should address a stable logical history without knowing
+whether bytes are in HBM, DRAM, NVMe, or object storage.
+
+**Concrete mechanisms:**
+
+- Streams are append-only, unbounded byte sequences organized into scopes and
+  split into segments. Segments support append, truncate, seal, merge, and
+  delete, but not update. Multiple active segments allow parallel ingestion.
+- Routing keys select segments by hashing over a key space. Events with the
+  same routing key retain ordering even as the stream scales through segment
+  split and merge operations.
+- The control plane owns stream lifecycle, policies, metadata requests,
+  truncation, and scale-up/scale-down decisions. Stream management is
+  partitioned across controller instances, and stream metadata is stored in
+  Pravega-backed key-value tables rather than making ZooKeeper the metadata
+  bottleneck.
+- The data plane consists of segment stores. Segment stores are agnostic to
+  streams and operate on segments. Segments are mapped for their lifetime to
+  segment containers by a stateless uniform hash, and containers are assigned
+  across segment store instances.
+- Each segment container multiplexes operations for many segments into one
+  dedicated WAL log. This avoids allocating physical WAL resources per
+  segment and is presented as essential for supporting many segments.
+- The write path has multiple batching layers. Writers send event batches
+  while data is still arriving, using a heuristic based on server round-trip
+  feedback and a max batch size. Segment containers aggregate operations into
+  WAL data frames, with a delay that grows with recent WAL latency and shrinks
+  as average frame fill approaches the maximum. BookKeeper adds another
+  journal aggregation layer underneath.
+- The WAL is Apache BookKeeper; once a write is acknowledged, Pravega treats
+  it as durably replicated. Segment stores asynchronously migrate data to
+  long-term storage such as S3, NFS, or EFS, then truncate corresponding WAL
+  data once migration makes it unnecessary for recovery.
+- The read path uses a read index that exposes a complete segment view across
+  WAL, in-memory cache, and long-term storage. A read iterator may return
+  cached data, fetch from long-term storage and populate cache, or wait on a
+  future if the request reaches the current segment tail.
+- Recovery uses metadata checkpoints plus subsequent WAL operations. If a
+  segment store fails, segment containers are reassigned; a metadata epoch
+  mechanism prevents two instances from concurrently operating the same
+  container.
+- Evaluation compares Pravega 0.9.0, Kafka 2.6.0, and Pulsar 2.6.0 on AWS.
+  The paper reports that Pravega maintains consistent throughput as producer
+  and segment counts vary, while preserving ordering and durability. It also
+  reports that historical readers can consume a 100GB backlog from long-term
+  storage while writers continue appending, and that auto-scaling from one
+  segment distributes load across segment stores and lowers latency.
+
+**GPU DB mapping:** Segment containers map cleanly to GPU DB owner domains.
+Instead of letting every table partition, resident fragment, or retained
+snapshot own an independent log, GPU DB can multiplex many logical fragments
+through a bounded number of mutation/residency owners and WAL streams. That
+preserves ordering and durability while avoiding per-fragment file, queue, or
+flush overhead.
+
+The stream split/merge model maps to hot-key and hot-partition routing. A
+resident table or ingest stream can begin with one route range, split hot key
+ranges when write or read pressure rises, and later merge cold adjacent ranges.
+The important invariant is that a split seals the old generation for new
+writes before children become active, so per-key ordering and snapshot
+lineage remain explainable.
+
+The read-index idea maps to retained snapshots across tiers. A GPU DB read
+route should ask for a logical generation/range and receive a plan over HBM,
+DRAM cache, NVMe, WAL replay, or cold object storage without the SQL layer
+knowing the physical source. Unlike Pravega's byte streams, GPU DB also needs
+visibility predicates, schema generations, and row/index identities in the
+index entry.
+
+The dynamic data-frame delay is a concrete benchmarkable batching policy for
+WAL and refresh admission. If recent WAL flush latency is high and frames are
+underfilled, wait briefly for more operations; if frames are already full,
+flush without extra delay. GPU DB can apply the same form to COPY admission,
+resident refresh deltas, response rings, and H2D staging batches, with
+microsecond caps to protect p50 latency.
+
+Pravega's tail-plus-history abstraction is also a strong fit for the P8
+storage goal. WAL and CPU truth are the tail authority; resident GPU
+snapshots are hot derived views; NVMe/object segments are historical backing.
+The logical read contract should span all of them, but the placement policy
+must expose enough telemetry for route choice and fallback.
+
+**Risks and mismatches:** Pravega is a streaming storage system, not an SQL
+database. It does not support mutable rows, secondary indexes, joins, MVCC
+tuple visibility, SQL predicates, or WAL-before-visibility for relational
+updates. GPU DB can borrow its append/tiering and segment authority design,
+but must add database visibility and index correctness.
+
+The paper's read index returns byte stream data. GPU DB needs structured
+metadata: row id ranges, column groups, predicate descriptors, visibility
+masks, schema generation, and resident layout identity. A byte offset alone is
+not enough to prove SQL-visible correctness.
+
+Pravega's ordering guarantee is per routing key. GPU DB transactions may touch
+multiple keys, indexes, and tables, so split/merge or route scaling must
+coordinate with transaction commit order, write-write conflicts, and snapshot
+publication, not only event order.
+
+The evaluation uses AWS EFS for Pravega long-term storage and AWS S3 for
+Pulsar in the described setup, so some reported differences include storage
+backend effects. Treat the exact throughput numbers as system-specific; the
+more durable lesson is the shape of WAL/container batching, read indexing, and
+segment scaling.
+
+**Benchmark candidates:**
+
+- Implement a segment-container WAL admission model: many logical table
+  fragments or route ranges multiplex into a smaller number of owner-local WAL
+  streams. Measure write throughput, p99 commit latency, frame fill ratio, and
+  recovery replay time versus one WAL stream per fragment.
+- Compare fixed WAL flush delay against Pravega-style adaptive data-frame
+  delay using recent flush latency and average frame fill. Gate: throughput
+  improves under sustained ingest without violating a configured p50/p99
+  latency ceiling.
+- Build a logical read index for one retained table generation that can return
+  data from GPU resident buffers, DRAM cached column groups, NVMe segments, or
+  WAL replay. Failure condition: the SQL route cannot explain which physical
+  tier satisfied each range and which visibility boundary it used.
+- Add hot-range split/merge simulation for retained lookups and writes.
+  Measure load balance, route invalidation cost, per-key ordering, and
+  snapshot lineage complexity when a hot key range is split while readers hold
+  old generations.
+- Stress long historical catch-up reads while COPY/INSERT continues appending.
+  Expected result: cold-tier scan throughput does not starve WAL admission or
+  resident refresh queues; if it does, admission reports the saturated tier.
+- Compare client-side batching, owner-side batching, and two-level batching
+  for COPY plus small OLTP inserts. Gate: owner-side batching reduces queue and
+  WAL overhead without requiring clients to wait for full batches.
+
+### 2026-06-06 - Cross-paper synthesis: tiered histories need one logical address space
+
+Recent reviews now connect three related tracks: Vbox for auditably compact
+transaction histories, dataset versioning for costed retention frontiers, and
+Pravega for append-ordered tiered stream storage. The shared design pressure is
+that GPU DB should not let each tier invent its own identity model. A query,
+snapshot, route, or recovery path needs one logical address space that can be
+mapped to HBM buffers, DRAM segments, NVMe files, WAL ranges, deltas, or cold
+objects with explicit proofs.
+
+**Converging design tracks:**
+
+- Route histories should be compact by construction. Use server-side begin/end
+  stamps, WAL frontiers, route generations, and overlap windows so correctness
+  audits do not require dense per-session graphs.
+- Retention should choose full materializations and delta edges together. A
+  retained GPU snapshot, DRAM segment, visibility mask, WAL replay shortcut, or
+  cold object is an object in a version graph, not just a cache entry.
+- Tier movement should preserve append and publication fences. Sealing an old
+  segment/generation before split, migration, truncation, or eviction is the
+  storage analogue of publishing a new snapshot generation.
+- Read routing should go through a logical read index. The index must expose
+  physical tier, visibility boundary, schema generation, reconstruction path,
+  and fallback reason, rather than hiding cold reads behind opaque cache misses.
+
+**Category gaps:** query optimization has fewer recent follow-ups than
+transaction scheduling, MVCC, runtime/RDMA, and storage tiering. The next few
+runs should prefer optimizer/route-choice candidates or metadata/index papers
+unless a much stronger modern OLTP/MVCC paper appears.
+
+**Benchmark priorities:**
+
+- Version-graph retention benchmark across HBM, DRAM, NVMe, and WAL replay.
+- Logical read-index prototype that records proof metadata for every physical
+  source used by a retained query.
+- Adaptive owner-side batching benchmark for WAL admission and resident
+  refresh, with latency ceilings and explicit overload/fallback reasons.
+- Split/merge route-generation simulation under long readers, hot writes, and
+  cold-tier eviction.
