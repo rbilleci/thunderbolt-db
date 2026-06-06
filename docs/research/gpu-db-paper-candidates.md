@@ -1009,13 +1009,14 @@ Append new candidates here as each paper is processed.
   by size, update frequency, and read/write interference rather than a single
   separation threshold. Journal entry added 2026-06-06 from the USENIX page
   and PDF.
-- `queued` — **SILK: Preventing Latency Spikes in Log-Structured Merge
+- `reviewed` — **SILK: Preventing Latency Spikes in Log-Structured Merge
   Key-Value Stores**, Balmau et al., USENIX ATC 2019.
   URL: `https://www.usenix.org/conference/atc19/presentation/balmau`
   Why: DiffKV's balanced-write/read/scan design still leaves foreground
   compaction and merge interference as a tail-latency question; SILK is a
   focused follow-up for scheduler-level compaction smoothing and latency-spike
-  control in LSM-style cold/warm tiers.
+  control in LSM-style cold/warm tiers. Journal entry added 2026-06-06 from
+  the USENIX page and PDF.
 - `queued` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
   Stores**, Conway et al., USENIX ATC 2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/conway`
@@ -1037,6 +1038,31 @@ Append new candidates here as each paper is processed.
   levels; useful for comparing single-level persistent-memory indexing against
   MatrixKV-style bounded first-tier compaction and P8 cold-tier segment
   refresh.
+- `queued` — **Monkey: Optimal Navigable Key-Value Store**, Dayan,
+  Athanassoulis, and Idreos, SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3064054`
+  Author PDF: `https://stratos.seas.harvard.edu/files/stratos/files/monkeykeyvaluestore.pdf`
+  Why: SILK contrasts scheduler-level smoothing with LSM parameter tuning;
+  Monkey is a primary modern source for analytically assigning Bloom-filter
+  memory and LSM shape, useful for separating cold-tier layout tuning from
+  maintenance admission control.
+- `queued` — **Dostoevsky: Better Space-Time Trade-Offs for LSM-Tree Based
+  Key-Value Stores via Adaptive Removal of Superfluous Merging**, Dayan and
+  Idreos, SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3196927`
+  Author PDF: `https://stratos.seas.harvard.edu/files/stratos/files/dostoevskykvstore.pdf`
+  Why: SILK cites LSM tuning and reduced internal work as complementary but
+  insufficient for tails; Dostoevsky is useful for comparing lazy-leveling and
+  fluid LSM layouts against explicit compaction scheduling under GPU DB
+  write/read SLOs.
+- `queued` — **WiscKey: Separating Keys from Values in SSD-conscious
+  Storage**, Lu et al., USENIX FAST 2016.
+  URL: `https://www.usenix.org/conference/fast16/technical-sessions/presentation/lu`
+  PDF: `https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf`
+  Why: SILK's related work contrasts key-value separation as a throughput and
+  write-amplification technique; WiscKey is a foundational post-2015 primary
+  source for deciding when GPU DB should separate keys, medium payloads, and
+  large values across NVMe-friendly tiers.
 - `reviewed` — **Taurus: Lightweight Parallel Logging for In-Memory Database
   Management Systems**, Xia, Yu, Pavlo, and Devadas, SIGMOD/PACMMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389713`

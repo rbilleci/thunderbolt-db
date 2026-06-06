@@ -92530,3 +92530,201 @@ and refresh pressure rather than relying only on GC origin.
   groups reduce H2D scatter and improve range/prefix scan kernels versus
   unsorted logs, especially for 100-key, 1K-key, and 10K-key scan
   windows.
+
+### 2026-06-06 - SILK makes compaction a foreground SLO scheduling problem
+
+**Citation:** Oana Balmau, Florin Dinu, Willy Zwaenepoel, Karan
+Gupta, Ravishankar Chandhiramoorthi, and Diego Didona. "SILK:
+Preventing Latency Spikes in Log-Structured Merge Key-Value
+Stores." USENIX ATC 2019. Retrieved 2026-06-06 from the USENIX
+page and PDF:
+`https://www.usenix.org/conference/atc19/presentation/balmau`.
+
+**Category:** WAL/logging and read/write throughput, with
+database storage/indexing, runtime scheduling, and multi-tier
+data-placement relevance.
+
+**Relevance tags:** LSM tree; tail latency; compaction scheduling;
+flush scheduling; write stalls; dynamic bandwidth allocation;
+internal-operation priority; compaction preemption; RocksDB;
+TRIAD; production workload; p99 latency; cold-tier maintenance;
+write admission.
+
+**Core idea:** SILK argues that reducing total compaction work is
+not enough for latency-sensitive LSM stores. Even optimized LSM
+variants still execute internal flush and compaction work, and
+foreground writes can stall when that internal work interferes with
+client load. The paper therefore treats LSM maintenance as an
+explicit I/O scheduling problem rather than as a detached background
+task.
+
+The transferable idea for GPU DB is that cold-tier maintenance,
+resident-refresh rebuilds, value-segment merges, and MVCC cleanup
+must compete under foreground SLOs. A maintenance policy that
+improves average throughput can still be wrong if it creates p99
+write, lookup, or refresh stalls. Maintenance work needs credits,
+urgency, and preemption points tied to route validity and admission,
+not just a background queue.
+
+**Concrete mechanisms:**
+
+- SILK is derived from RocksDB and implements an I/O scheduler for
+  LSM internal operations while preserving the standard LSM shape of
+  memory component, disk levels, SSTables, and optional commit log.
+- The paper identifies interference among client writes, flushes,
+  and compactions as the root cause of write-tail spikes. If flushes
+  slow down while the memory component fills, client writes can block;
+  if low levels fill, flushes can be blocked by missing compaction
+  progress.
+- SILK dynamically allocates I/O bandwidth between client and
+  internal work. It gives more bandwidth to internal work during
+  low-load valleys so the tree catches up before the next write peak,
+  and pulls bandwidth back when foreground load needs it.
+- SILK prioritizes internal operations that are closer to blocking
+  foreground progress. Flushes and lower-level compactions receive
+  urgency over large deep-level compactions because L0/L1 pressure is
+  more likely to stall new writes.
+- SILK preempts less critical compactions. This is important because
+  large compactions can otherwise monopolize resources while urgent
+  flush or low-level maintenance waits behind them.
+- The paper evaluates RocksDB, RocksDB with autotuned rate limiting,
+  TRIAD, and SILK-derived variants. It uses both a Nutanix production
+  workload and synthetic burst workloads with read/write mixes.
+- The USENIX page and abstract report up to two orders of magnitude
+  lower 99th percentile latency than RocksDB and TRIAD, without
+  significant negative effects on throughput or average latency.
+- The breakdown experiment reports that dynamic bandwidth allocation
+  alone and priority/preemption alone are each insufficient: the
+  former can still slow urgent internal work during larger
+  compactions, while the latter can still create interference when
+  bandwidth is uncontrolled.
+- The long-peak synthetic experiment shows the limit of scheduling:
+  under high, long write peaks, SILK eventually degrades because
+  there is not enough resource headroom for internal work. In the
+  reported setup, degradation starts earlier for a 90:10 write:read
+  workload than for a 50:50 workload.
+- SILK's related-work discussion frames key-value separation, LSM
+  parameter tuning, and fragmented LSMs as complementary ways to
+  reduce internal work, but not substitutes for avoiding foreground
+  interference while internal work executes.
+
+**GPU DB mapping:** P8 treats WAL/checkpoint/archive plus CPU MVCC
+state as durable truth, with GPU resident state as rebuildable
+acceleration. SILK maps to the maintenance plane below and beside
+that resident tier: WAL segment recycling, cold/warm segment merge,
+old-version cleanup, resident refresh, invalid-byte cleanup,
+descriptor compaction, and future NVMe/object-tier movement.
+
+The first design transfer is an explicit maintenance scheduler with
+foreground-route credits. Work items should declare table or
+partition, source WAL boundary, visibility generation, affected
+resident routes, estimated bytes, preemption points, and stall risk
+if deferred. The scheduler should then choose among refresh, cleanup,
+merge, and cold-tier movement by urgency, not FIFO arrival.
+
+SILK's lower-level priority maps to GPU DB's "closest to blocking
+visibility" work. A flush that must happen before WAL/archive
+truncation, a refresh needed to restore a hot resident route, or an
+MVCC cleanup needed to bound retained old versions should outrank a
+deep cold-tier value merge that mostly improves future scan locality.
+
+Preemption maps cleanly to segment-sized and generation-sized
+maintenance. Long compactions, resident rebuilds, and value-segment
+merges should publish progress only at crash-safe boundaries, but
+they should be decomposed so urgent work can run between chunks.
+This reinforces the DiffKV and TB-Collect direction: maintenance
+units need descriptor-level identities and safe cut points.
+
+The dynamic bandwidth idea maps to admission rather than only disk
+I/O. GPU DB should treat NVMe bandwidth, CPU owner time, pinned host
+memory, GPU copy engines, CUDA streams, and response rings as shared
+credits. Maintenance can spend more credits during quiet periods, but
+foreground reads and writes should see explicit ceilings and overload
+signals instead of hidden background interference.
+
+**Risks and mismatches:** SILK is a KV-store paper, not a SQL,
+MVCC, or GPU database paper. It does not address query planning,
+SQL-visible snapshots, CUDA kernels, pgwire session multiplexing,
+resident HBM layouts, or WAL-before-visibility across relational
+catalog changes.
+
+The paper preserves RocksDB-style storage assumptions. GPU DB should
+not blindly adopt LSM levels or RocksDB tunables; the useful piece is
+the maintenance-scheduling control loop and the tail-latency failure
+analysis.
+
+Preemption is only safe at well-defined boundaries. GPU DB must not
+interrupt a maintenance step after publishing a partial descriptor,
+partially retiring an MVCC block, or invalidating a resident route
+without a recoverable replacement.
+
+The long-peak result matters: scheduling cannot create capacity. If
+foreground write load continuously exceeds maintenance headroom, GPU
+DB needs admission, degraded route choices, or explicit overload, not
+an ever-growing hidden maintenance backlog.
+
+**Benchmark candidates:**
+
+- Build a maintenance-scheduler simulator with foreground writes,
+  retained reads, resident refreshes, MVCC cleanup, and cold-tier
+  compaction. Compare FIFO, fixed-rate background, SILK-style dynamic
+  credits, and urgency plus preemption. Measure p50/p99 foreground
+  latency, maintenance lag, retained bytes, invalid resident routes,
+  and throughput.
+- Add route-visible maintenance urgency classes: visibility-blocking,
+  residency-restoring, space-reclaiming, scan-locality-improving, and
+  cold-placement-optimizing. Gate: no class can starve WAL,
+  visibility, or snapshot-retirement safety.
+- Prototype chunked cold-tier merges with preemption points at
+  descriptor-safe segment boundaries. Crash tests must recover either
+  the old descriptor set or the new descriptor set, never a partial
+  merge.
+- Stress bursty writes plus retained GPU reads. During valleys, allow
+  maintenance to catch up; during peaks, cap maintenance credits.
+  Failure condition: p99 write or read latency spikes because refresh
+  or compaction keeps consuming owner/GPU/NVMe resources.
+- Compare DiffKV-style lazy value merges under three scheduling
+  policies: immediate invalid-byte threshold, low-load catch-up, and
+  urgent-only cleanup. Measure write amplification, scan locality,
+  owner-queue wait, and resident-refresh bytes.
+- Add a "capacity cannot be scheduled away" gate: when sustained load
+  exceeds configured maintenance headroom, the system must emit
+  overload or route-degradation telemetry before hidden backlog can
+  violate snapshot retention or recovery budgets.
+
+### 2026-06-06 - Cross-paper synthesis: maintenance needs credits, generations, and preemption
+
+The recent Quickstep, MatrixKV, Aria, TB-Collect, DiffKV, and SILK
+entries converge on one design track: high throughput comes from
+turning large work into explicit schedulable units, but correctness
+comes from publishing those units at generation boundaries. Quickstep
+turns plans into block work orders; Aria turns OLTP execution into
+batch/snapshot conflict phases; MatrixKV, TB-Collect, DiffKV, and
+SILK turn storage maintenance into tier-shaped units that must not
+surprise foreground latency.
+
+For GPU DB, the common mechanism is a route work descriptor. It
+should carry operation kind, table/partition, snapshot or visibility
+generation, source WAL boundary, byte estimate, route impact,
+preemption boundary, and credit class. The same descriptor vocabulary
+can cover retained read batches, mutation batches, resident refresh,
+old-version cleanup, cold-tier compaction, and value-segment movement.
+
+The main category gap remains modern MVCC/snapshot visibility and
+session-scale networking. The queue has strong storage and optimizer
+follow-ups; the next balancing paper should preferably come from
+transaction scheduling/concurrency, MVCC retention/visibility, or
+runtime/session admission unless a storage paper is needed to close a
+specific P8 design question.
+
+Benchmark priorities:
+
+- Measure a shared credit scheduler across reads, writes, refresh,
+  cleanup, and cold-tier merge rather than benchmarking each plane in
+  isolation.
+- Add crash-safe generation publication tests for every maintenance
+  chunk that can be preempted.
+- Compare deterministic batches against online conflict/admission
+  policies under hot-key and mixed long-reader workloads.
+- Track p99 latency, retained bytes, invalid route age, and backlog
+  age together; a throughput win that hides backlog is not a win.
