@@ -791,8 +791,8 @@ Append new candidates here as each paper is processed.
   strong 2023-present full paper in transaction scheduling; directly relevant
   to hot-key admission, abort/fallback reduction, and route ordering under
   contention.
-- `queued` — **Intelligent Transaction Scheduling to Enhance Concurrency in
-  High-Contention Workloads**, Chen and Wu, Applied Sciences 2025.
+- `reviewed` — **Intelligent Transaction Scheduling to Enhance Concurrency in
+  High-Contention Workloads**, Chen, Shen, and Wu, Applied Sciences 2025.
   URL: `https://www.mdpi.com/2076-3417/15/11/6341`
   DOI: `https://doi.org/10.3390/app15116341`
   Why: discovered while reviewing OCC batching/reordering; useful as a modern
@@ -800,6 +800,16 @@ Append new candidates here as each paper is processed.
   fine-grained operation scheduling, and learned scheduling under high
   contention. Lower priority than SIGMOD/VLDB/OSDI transaction papers, but
   relevant if the queue needs more recent contention-scheduling contrasts.
+  Journal entry added 2026-06-06 from accessible HTML/DOAJ metadata after the
+  MDPI PDF endpoint returned HTTP 403.
+- `queued` — **ForeSight: A Predictive-Scheduling Deterministic Database**,
+  Huang et al., arXiv 2025.
+  URL: `https://arxiv.org/abs/2508.17375`
+  DOI: `https://doi.org/10.48550/arXiv.2508.17375`
+  Why: discovered while reviewing DCoS; useful as a newer transaction
+  scheduling follow-up that predicts conflicts without pre-obtained read/write
+  sets, integrates MVCC-style fallback, and generates conflict-aware
+  deterministic schedules under skew.
 - `reviewed` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
   Cao et al., PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3603164`

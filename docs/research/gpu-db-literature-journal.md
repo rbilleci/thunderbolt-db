@@ -84427,3 +84427,208 @@ not in importing the reported throughput numbers.
   buffer reuse, resident generation invalidation, and DDL. Gate:
   generation and buffer-token checks reject all delayed work before
   it writes into a recycled target or reports a stale result.
+
+### 2026-06-06 - DCoS schedules hot transaction pieces without making every transaction fine-grained
+
+**Citation:** Shuhan Chen, Congqi Shen, and Chunming Wu.
+"Intelligent Transaction Scheduling to Enhance Concurrency in
+High-Contention Workloads." Applied Sciences 15(11), 6341, 2025.
+Retrieved 2026-06-06 from DOI metadata and open article mirrors,
+`https://doi.org/10.3390/app15116341`,
+`https://doaj.org/article/bc888511a1f24939b727956fdaac9596`, and
+`https://www.mdpi.com/2076-3417/15/11/6341`. The MDPI PDF endpoint
+returned HTTP 403 during this run, so mechanism details are based on
+the accessible HTML/search-rendered article text and DOAJ metadata.
+
+**Category:** transaction processing / write path and runtime / HFT /
+session scale.
+
+**Relevance tags:** high-contention OLTP; transaction scheduling;
+transaction decomposition; hot data detection; dual-granularity
+queues; dependency-aware scheduling; DRL executor; one-shot
+transactions; stored procedures; abort reduction; hot-key admission;
+owner rings; route priority.
+
+**Core idea:** DCoS treats contention management as an execution-order
+problem above the base concurrency-control protocol. Transactions are
+first partitioned around hot data items so conflict-free clusters can
+run cheaply. Only residual cross-hot-item work is decomposed into
+transaction pieces and fed to a fine-grained scheduler. The design goal
+is to pay expensive dependency-aware scheduling only where contention
+would otherwise serialize progress or cause aborts.
+
+For GPU DB, the transferable idea is a dual-granularity admission
+policy for hot writes and refresh-side effects. Most requests should
+stay as whole route commands on owner rings. Only routes that touch hot
+keys, cross partitions, or hold scarce visibility/residency resources
+should be split into pieces with explicit dependency and priority
+metadata.
+
+**Concrete mechanisms:**
+
+- DCoS assumes a one-shot transaction model in which transaction inputs
+  and access patterns are available before execution. It points to
+  H-Store, Calvin, and Silo-style stored-procedure execution as similar
+  contexts where scheduling can use declared access information.
+- A conflict-free partitioning phase builds batches around high-contention
+  data items. The partitioning function divides a batch into conflict-free
+  clusters and a residual transaction set bounded by a threshold parameter.
+- Hot data is detected probabilistically by sampling transactions. The
+  sampled items seed hot clusters; remaining transactions are merged into a
+  cluster when they touch at most one hot cluster, while transactions that
+  span multiple hot clusters stay in the residual set.
+- When the residual set grows beyond the configured threshold, DCoS
+  triggers hot-cluster merging to trade less concurrency-control
+  synchronization against lower thread-level parallelism.
+- The execution phase uses two queues. A cold queue holds conflict-free
+  transactions or pieces that can use coarse-grained assignment. A hot queue
+  holds contention-intensive pieces that need fine-grained scheduling.
+- Cross-partition transactions are decomposed into pieces using a runtime
+  pipelining model. DCoS preserves intra-transaction dependencies and uses
+  locks from the underlying runtime-pipelining framework to enforce earlier
+  pieces releasing before later dependent pieces acquire.
+- Hot-queue scheduling is priority-oriented. Hot work gets first chance,
+  but if no hot piece can proceed because of dependency constraints, workers
+  execute cold-queue work instead of idling.
+- The fine-grained scheduler is a deep-reinforcement-learning executor. The
+  paper formulates scheduling as an MDP and encodes operations, dependencies,
+  and partition-to-core placement through an Adaptive Placement Graph.
+- The APG contains directed arcs for precedence and transformed arcs for
+  conflict choices. A graph neural embedding plus worker-state embedding feed
+  action decoders that select both the next operation and the target worker.
+  Invalid operations or incompatible workers are masked before softmax
+  selection.
+- DCoS is explicitly positioned as a scheduling layer, not a replacement for
+  correctness enforcement. It assumes an underlying CC/runtime-pipelining
+  mechanism provides serializability while DCoS changes execution order to
+  reduce conflict and waiting.
+- Reported evaluation uses synthetic high-contention workloads plus extended
+  TPC-C/TPC-E-style macrobenchmarks. The article reports up to 3x throughput
+  over state-of-the-art CC protocols under high contention. In one TPC-C
+  configuration with 32 worker threads and one warehouse, DCoS is reported as
+  3x Silo and 1.5x IC3; under Zipf skew theta=4 it reports about 0.6 M
+  transactions/s versus Silo around 0.35 M. At 32 threads with theta=3, it
+  reports 1.63x Silo, 1.48x NoWait, and 1.94x IC3.
+
+**GPU DB mapping:** GPU DB should keep the default write path as a
+coarse owner-ring command with WAL-before-visibility handled by the
+mutation owner. DCoS argues for adding a second path only for hot
+residual work: decompose the route into lock/validate/log/invalidate/
+publish pieces when the scheduler can prove the pieces expose useful
+parallelism without weakening visibility.
+
+The hot/cold queue split maps to route admission. Cold whole
+transactions, retained reads, and refreshes should keep cheap FIFO or
+priority-ring behavior. Hot writes that repeatedly collide on the same
+key set should enter a contention lane that has richer metadata:
+conflict class, touched partition/key vector, dependency rank, priority,
+and retry budget.
+
+DCoS also suggests a practical boundary for learned scheduling. A
+learned or adaptive policy can choose among ready hot pieces and worker
+lanes, but it should not own correctness. The mutation owner, MVCC
+visibility checks, WAL durability frontier, and invalidation generation
+remain hard gates. The scheduler can only reorder among operations whose
+dependencies and route certificates already permit execution.
+
+For 1M logical sessions, the useful shape is cohort scheduling rather
+than per-session cleverness. Sessions whose requests map to the same hot
+key, partition, or dependency class can be represented by a compact
+admission batch. The expensive fine-grained state should be per hot
+piece or per conflict cohort, not per dormant connection.
+
+The residual-threshold mechanism maps to an overload control knob. If
+the hot residual lane grows, GPU DB can merge conflict classes, lower
+parallelism, or switch to deterministic serial owner execution rather
+than letting retries, aborts, and response queues explode.
+
+**Risks and mismatches:** DCoS depends on known access patterns and a
+one-shot execution model. Ad hoc SQL, triggers, secondary-index
+predicates, DDL, and dynamic plans may not reveal enough dependency
+information before execution.
+
+The paper uses a DRL executor with offline training. GPU DB should treat
+that as a research comparison, not an immediate hot-path dependency.
+Deterministic heuristics over conflict class, queue age, priority, and
+observed aborts are easier to validate first.
+
+The available source during this run was not a full retrieved PDF. Some
+implementation details, training costs, and exact benchmark setup remain
+unknown beyond the accessible article text. Those should be verified
+from the PDF if access becomes available.
+
+DCoS assumes a base runtime-pipelining/locking layer enforces
+serializability. GPU DB's current design leans on WAL/MVCC generation
+publication and immutable snapshots, so any decomposition must preserve
+WAL-before-visibility, range/predicate dependencies, index invalidation,
+and retained GPU snapshot safety.
+
+The reported evaluation is CPU in-memory OLTP, not GPU execution, pgwire
+session multiplexing, NVMe tiering, or retained snapshot refresh. The
+claim to transfer is the scheduling shape, not the absolute throughput.
+
+**Benchmark candidates:**
+
+- Build a hot/cold transaction-admission simulator. Whole commands run
+  on the cold owner ring; only cross-hot-key residual work is decomposed
+  into pieces. Gate: p99 latency, abort/retry count, and owner queue depth
+  improve under hot-key skew without hurting low-contention throughput by
+  more than a small fixed overhead.
+- Compare three hot-lane schedulers: deterministic FIFO by dependency
+  rank, priority plus queue age, and an offline learned policy. Failure
+  condition: learned scheduling improves mean throughput but worsens p99
+  latency, starvation, or correctness proof complexity.
+- Add a residual-threshold benchmark for hot cluster merging. Measure
+  when merging conflict classes beats preserving parallelism under 1, 2,
+  4, and 8 hot partitions.
+- Test route-piece certificates: each decomposed piece carries conflict
+  class, dependency rank, WAL frontier requirement, snapshot generation,
+  and invalidation target. Gate: stale or out-of-order pieces are rejected
+  before log publication or resident invalidation.
+- Run a TPC-C-like hot warehouse write workload through coarse owner,
+  deterministic hot lane, and decomposed hot/cold lanes. Expected result:
+  decomposition helps only when contention dominates owner idle time or
+  aborts; otherwise whole-command execution should win.
+- Stress 1M logical sessions with only a small active hot cohort. Gate:
+  scheduler state scales with active hot pieces/cohorts rather than total
+  dormant sessions.
+
+### 2026-06-06 - Cross-paper synthesis: hot paths need compact authorities and schedulable residuals
+
+The last cluster combines remote-lock factoring, RDMA connection-state
+compression, partial WAL frontiers, and contention-aware transaction
+scheduling. A common design track is emerging: keep the fast authority tiny,
+then move only residual complexity into richer queues or side structures.
+
+For GPU DB, the authority-visible state should usually be a compact grant,
+generation, durable frontier, route certificate, or active-credit bit. Heavy
+state such as waiter lists, retry history, lost packets, learned scheduling
+features, per-session response state, and decomposed transaction pieces should
+live in local runtime domains where it can be bounded, observed, and reclaimed.
+
+The second converging track is frontier specificity. Poplar shows that durable
+commit need not wait for unrelated log streams; SRNIC shows that rare loss
+state need not sit on the fast datapath; DCoS shows that only the contentious
+residual needs fine-grained scheduling. GPU DB should therefore benchmark
+route-local frontiers and conflict cohorts before adopting global minima,
+global queues, or global learned policies.
+
+Category gaps after this cluster: MVCC/snapshot semantics need another modern
+paper focused on long-reader visibility or serializable snapshots; query
+optimization still needs a non-analytics route-choice paper; and storage
+tiering needs more write-path work that connects WAL, compaction, and cold
+placement rather than only scan caches.
+
+Benchmark priorities:
+
+- Fast-authority benchmark: compact grant/frontier cells plus local waiter
+  queues versus owner-visible per-session waiters.
+- Frontier-specific WAL benchmark: lane-local durable generations and
+  per-route dependency vectors versus one global LSN/CSN.
+- Residual scheduling benchmark: whole-command owner execution versus
+  hot/cold decomposition under TPC-C-style skew.
+- Descriptor safety benchmark: delayed grants, stale completions, reused
+  response buffers, and invalidated resident generations must be rejected by
+  generation and buffer-token checks.
+- 1M-session active-set benchmark: memory and p99 admission latency should
+  track active cohorts, not total logical sessions.
