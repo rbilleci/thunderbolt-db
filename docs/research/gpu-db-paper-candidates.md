@@ -441,13 +441,25 @@ Append new candidates here as each paper is processed.
   Why: PALF compares CSN-style database ordering with replicated log services;
   useful for deciding whether GPU DB should keep WAL bundled with mutation
   owners or expose an independent replicated log service.
-- `queued` — **Rethinking Logging, Checkpoints, and Recovery for
+- `reviewed` — **Rethinking Logging, Checkpoints, and Recovery for
   High-Performance Storage Engines**, Haubenschild, Sauer, Neumann, and Leis,
   SIGMOD/PACMMOD 2020.
-  URL: `https://doi.org/10.1145/3318464.3380593`
+  URL: `https://doi.org/10.1145/3318464.3389716`
+  PDF: `https://db.in.tum.de/~leis/papers/rethinkingLogging.pdf`
   Why: cited by ITLogging as a modern high-performance logging and recovery
   baseline; useful for comparing edge-staged request logs with canonical
   command/physiological logging, checkpoint boundaries, and recovery latency.
+  Journal entry added 2026-06-06; the previously queued DOI was corrected to
+  the SIGMOD 2020 paper metadata.
+- `queued` — **FineLine: Log-structured Transactional Storage and Recovery**,
+  Sauer, Graefe, and Haerder, PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p2249-sauer.pdf`
+  DOI: `https://doi.org/10.14778/3275366.3275373`
+  Why: the LeanStore recovery paper contrasts FineLine's single-storage,
+  log-structured recovery design with page-based WAL/checkpointing; useful for
+  testing whether GPU DB cold-tier segments should preserve a separate
+  WAL/database split or collapse some persistent data into indexed log
+  structures.
 
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.

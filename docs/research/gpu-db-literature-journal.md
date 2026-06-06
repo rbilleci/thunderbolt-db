@@ -38,6 +38,211 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - LeanStore recovery makes WAL a sharded, tiered, and checkpoint-bounded pipeline
+
+**Citation:** Michael Haubenschild, Caetano Sauer, Thomas Neumann, and
+Viktor Leis. "Rethinking Logging, Checkpoints, and Recovery for
+High-Performance Storage Engines." SIGMOD 2020, pp. 877-892. DOI:
+`https://doi.org/10.1145/3318464.3389716`. Retrieved 2026-06-06 from the
+TUM author PDF, `https://db.in.tum.de/~leis/papers/rethinkingLogging.pdf`.
+
+**Category:** WAL, logging, checkpointing, and read/write throughput, with
+secondary relevance to multi-tier storage placement and runtime owner
+partitioning.
+
+**Relevance tags:** WAL; distributed logging; persistent memory; NVMe;
+remote flush avoidance; continuous checkpointing; bounded recovery; page
+provisioning; LeanStore; per-thread log partitions; GSN ordering; steal
+buffer management; writeback buffers; recovery parallelism; owner-local log
+buffers.
+
+**Core idea:** This paper targets the gap between traditional ARIES and
+pure in-memory logging. ARIES keeps rich recovery features but pays a
+centralized log and checkpointing cost; in-memory approaches scale well but
+often assume memory-resident data and weak or coarse checkpointing. The
+LeanStore design keeps page-based recovery, steal, fuzzy/incremental
+checkpointing, and index recovery while replacing the global log with
+per-worker logs, a persistent-memory first stage, SSD/archive later stages,
+remote-flush avoidance, and WAL-volume-driven continuous checkpointing.
+
+For GPU DB, the strongest transferable idea is that WAL throughput should
+not be treated as one queue behind the mutation owner. It should be a
+sharded pipeline with explicit dependency proofs, durable staging tiers, and
+checkpoint progress tied to generated WAL volume. That gives a cleaner
+baseline against the recent network-assisted logging review: edge request
+logging may reduce admission cost, but canonical recovery still needs a
+bounded, replayable, checkpoint-aware WAL protocol.
+
+**Concrete mechanisms:**
+
+- Each worker thread owns a log partition; a transaction is pinned to one
+  worker so all of its log records go to one log, avoiding a centralized
+  append latch.
+- Log records include type, page id, transaction id, global sequence number
+  (GSN), and before/after change images. Per-page GSN ordering lets recovery
+  gather records from all partitions and apply a page's records in GSN order.
+- The log has three stages: small circular chunks in persistent memory or
+  battery-backed DRAM, per-log WAL writer staging to SSD, and a log archive
+  for media recovery.
+- With persistent memory, commit requires flushing CPU caches for the local
+  log chunk, not waiting for the chunk to move to SSD. Without persistent
+  memory, the design can still use group commit with the same partitioned
+  logs.
+- Remote Flush Avoidance (RFA) tracks, per page, the log partition that made
+  the latest modification, a transaction-start `GSN_flushed`, and a
+  `needsRemoteFlush` flag. A transaction skips remote log flushes when the
+  page's previous changes are already globally flushed or come from the same
+  log partition.
+- RFA and group commit are orthogonal. With persistent memory, the paper
+  argues for RFA without group commit for lower latency; without persistent
+  memory, RFA reduces group-commit waiting for transactions that only need
+  their own log persisted.
+- Continuous checkpointing partitions the buffer pool into shards. Whenever
+  `1/S` of the configured WAL limit reaches the second log stage, the
+  checkpointer writes dirty pages from the next shard and records the minimum
+  current GSN across logs for that shard.
+- The minimum checkpointed GSN across shards, limited by the oldest active
+  transaction GSN, determines how far WAL can be pruned or archived. This
+  couples recovery-time control to generated WAL volume instead of to a
+  timer.
+- Page provisioning treats the buffer manager as a closed system with hot
+  swizzled pages, cool unswizzled pages, and a small free list. A dedicated
+  page provider unswizzles pages, writes dirty pages at the latest useful
+  moment, and restores free-list equilibrium outside worker critical paths.
+- Dirty page writeback copies pages into local writeback buffers, removes
+  swizzled pointers from the persisted copy, uses asynchronous `O_DIRECT`
+  writes and `fdatasync`, and updates persisted page GSNs only after writes
+  are flushed.
+- The design uses steal and WAL before-images. Transaction aborts run the
+  logical inverse operations through normal access paths and write new log
+  records; abort records are cheap to find because a transaction's records
+  live in one log partition.
+- Recovery has parallel analysis, redo, and undo phases. Analysis scans log
+  partitions, separates winner/loser transactions, and partitions records by
+  page id. Redo workers merge records for page-id ranges, sort by page id and
+  GSN, then replay page by page. Undo reverts loser transactions logically.
+- Implementation details include DAX-mapped persistent-memory log chunks,
+  non-temporal persistent-memory copies, per-record checksums to find the
+  last valid log record after a crash, and simple log-volume compression that
+  reuses prior insert/update metadata within chunk boundaries.
+- The evaluation uses LeanStore with TPC-C, B+-tree pages of 16 KB, an Intel
+  Xeon Gold 6212U, 192 GB DRAM, 768 GB Optane persistent memory, and NVMe SSD.
+  The benchmark driver is linked into the engine, so network cost is excluded.
+- Reported in-memory TPC-C throughput is 41k txn/s with one thread and 857k
+  txn/s peak around 40 threads for the full approach. The paper reports about
+  850k txn/s with checkpointing enabled, versus 1.4M txn/s with no logging,
+  and 66k instructions per transaction for the full recovery component path.
+- With a 100 GB WAL limit, the system reports sustained 850k txn/s, about
+  1.7 GB/s WAL writes, and over 1 GB/s of checkpoint page writes while keeping
+  WAL volume bounded. In an out-of-memory 40 GB buffer-pool case, it reports
+  about 300k txn/s while writing 2 GB/s and reading 700 MB/s.
+- Recovery from a 100 GB WAL limit takes 38 seconds using 40 threads in the
+  reported setup, corresponding to about 2.6 GB/s of recovered WAL. The paper
+  notes the system is effectively cache-warmed after recovery.
+- Limitations visible in the paper: the experiments effectively run in read
+  uncommitted mode because the system did not yet implement full transaction
+  isolation, and the benchmark driver bypasses network/protocol overhead.
+
+**GPU DB mapping:** The current runtime design already has owner domains,
+bounded rings, and WAL-before-visibility ordering. This paper suggests making
+WAL itself an owner-partitioned subsystem: each mutation owner, partition
+owner, or write-admission lane can own a local durable log buffer, while a
+global visibility boundary is published only when dependency and flush rules
+prove the relevant log records are durable.
+
+RFA maps to a route-certificate-style durability proof. A write batch should
+not flush every log partition just because global sequence numbers advance.
+It should know whether its touched pages, row groups, resident segments, or
+index pages depend on unflushed records from other owners. For append-only
+COPY chunks and partition-local writes, most dependencies should be local; for
+hot-key updates or cross-partition index maintenance, the system should expose
+remote-flush counters and route the batch through a more conservative commit
+lane.
+
+Continuous checkpointing maps directly to P8's tier model. Instead of
+checkpointing only on time or shutting down read throughput with bursty dirty
+page writes, GPU DB can tie CPU canonical checkpoint progress, cold-tier
+segment persistence, and resident-snapshot invalidation backlog to generated
+WAL bytes. A WAL limit becomes a recovery-time budget, not only a disk-space
+budget. GPU-resident buffers remain rebuildable, but their CPU truth and
+route metadata need the same bounded recovery frontier.
+
+The page-provisioning idea also matters for GPU memory and pinned host
+buffers. The system should keep small ready lists of free command descriptors,
+pinned buffers, resident segment slots, and response buffers, with dedicated
+providers restoring equilibrium outside request critical paths. Under memory
+pressure, the provider should demote or evict at the latest safe moment while
+preserving persisted GSN/checkpoint proofs.
+
+Finally, the recovery structure suggests a benchmarkable path for parallel
+rebuild: partition WAL records by page/segment/table, merge by generation or
+GSN, replay CPU truth first, and only then rebuild GPU resident snapshots and
+route metadata. Recovery should report not just "WAL replay complete" but the
+frontier at which CPU truth, derived CPU indexes, cold-tier metadata, and GPU
+resident acceleration state become safe to serve.
+
+**Risks and mismatches:** The design is tied to LeanStore's buffer manager,
+pointer swizzling, page ids, B+-tree pages, and persistent-memory/NVMe
+hardware assumptions. GPU DB may use append-only segments, column groups,
+MVCC tuple chains, or resident device buffers rather than swizzled page
+frames, so the page-level mechanisms need translation.
+
+The evaluation excludes network overhead and runs effectively at read
+uncommitted isolation. GPU DB's target includes pgwire admission, SQL-visible
+MVCC semantics, retained read snapshots, DDL invalidation, and
+WAL-before-visibility, so the throughput numbers are not directly comparable
+to an end-to-end SQL service.
+
+RFA is attractive for independent writes, but hot rows, secondary indexes,
+catalog metadata, global dictionaries, or shared resident segment descriptors
+can drive remote flushes back up. The system needs explicit dependency
+tracking at the right granularity; page-level `L_last` may be too coarse for
+columnar segments and too fine for large COPY chunks.
+
+Persistent memory as a first-stage log may not be available on the target
+machine, and Optane-class hardware is no longer a safe product assumption.
+The design should therefore be benchmarked with DRAM+NVMe, battery-backed
+storage, CXL/NVDIMM-like future tiers, and edge-staged request logging rather
+than assuming PMem commits.
+
+Continuous checkpointing can smooth writes, but it may fight with GPU
+resident refresh, cold-tier compaction, or NVMe reads unless IO budgets are
+jointly scheduled. A WAL-volume trigger is not enough by itself; it needs
+latency SLOs, tier IO pressure, dirty-page age, and recovery-time telemetry.
+
+**Benchmark candidates:**
+
+- Prototype per-owner WAL partitions for the mutation path. Gate: a write is
+  not acknowledged until its local records and any proven remote dependencies
+  are durable under the chosen device policy.
+- Add RFA-like dependency telemetry at P8 granularity: table/segment/index
+  last-log owner, start durable frontier, remote-flush-required flag, and
+  remote-flush reason. Expected result: append-only partition-local COPY avoids
+  most remote flushes; hot secondary-index updates expose the opposite case.
+- Compare three commit paths: global WAL append, per-owner WAL with mandatory
+  all-owner flush, and per-owner WAL with dependency-aware remote flush
+  avoidance. Measure write throughput, p50/p99 commit latency, instructions
+  or CPU cycles per transaction, WAL bytes, and remote flush rate.
+- Build a WAL-volume-driven checkpoint simulator for CPU canonical segments
+  and P8 cold-tier files. Gate: configured WAL budget predicts recovery time
+  within an acceptable bound under steady ingest.
+- Add crash points around checkpoint increments: before page copy, after page
+  copy, before storage flush, after storage flush, before persisted GSN update,
+  after WAL prune/archive, and during active transactions. Failure condition:
+  any run prunes WAL needed to reconstruct CPU truth.
+- Test page-provider-style ready lists for pinned host buffers, command
+  descriptors, response buffers, and resident segment slots. Expected result:
+  request workers avoid synchronous eviction/provisioning except under explicit
+  overload.
+- Recovery benchmark: replay a bounded WAL into CPU truth, rebuild derived CPU
+  indexes, publish empty/stale GPU caches, then warm selected resident
+  snapshots. Report time to first correct CPU service, time to first retained
+  GPU route, and time to full warm policy.
+- Compare canonical WAL recovery with edge-staged request logging from the
+  ITLogging review. Gate: edge logging can reduce admission copies or owner
+  CPU time, but cannot publish visibility unless canonical WAL/checkpoint
+  recovery or a fully deterministic replay proof covers the write.
+
 ### 2026-06-06 - ITLogging turns WAL overhead into an admission-boundary problem
 
 **Citation:** Hwajung Kim. "Improving database performance by leveraging
