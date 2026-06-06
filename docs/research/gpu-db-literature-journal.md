@@ -86716,3 +86716,149 @@ model.
   completed fragments per kernel launch. Expected result: at least one
   reward signal predicts winning route families better than static row
   count alone.
+
+### 2026-06-06 - Big Metadata makes pruning metadata a queryable data product
+
+**Citation:** Pavan Edara and Mosha Pasumansky. "Big Metadata: When
+Metadata is Big Data." PVLDB 14(12):3083-3095, 2021. DOI:
+`10.14778/3476311.3476385`. Retrieved 2026-06-06 from the PVLDB PDF at
+`https://www.vldb.org/pvldb/vol14/p3083-edara.pdf` via browser fetch;
+direct `curl` to the same URL timed out from the cron worker.
+
+**Category:** database file-system/storage/indexing and query optimization,
+with multi-tier cache / data placement relevance.
+
+**Relevance tags:** metadata-as-data; block pruning; column metadata;
+system tables; CMETA; distributed metadata scan; falsifiable expressions;
+block locators; metadata materialized view; metadata-of-metadata; dry-run cost;
+materialized-view choice; interleaved dispatch; route certificates.
+
+**Core idea:** BigQuery's CMETA design treats fine-grained table metadata as
+a distributed columnar system table, not as small catalog state or as hidden
+per-file footer data. Query planning and execution can scan the metadata table
+with the same distributed machinery used for ordinary data, then use the
+resulting block locators and column properties to prune the real data scan.
+
+For GPU DB, the transferable idea is that resident-fragment metadata should
+be a first-class, queryable data product. Route choice should not depend only
+on a small in-memory catalog or on opening every cold/warm segment to inspect
+footers. It should be able to scan compact metadata columns for row ranges,
+visibility boundaries, min/max values, dictionary or encoding facts,
+resident-tier identity, and reconstruction cost before committing GPU memory,
+NVMe reads, or H2D transfer.
+
+**Concrete mechanisms:**
+
+- CMETA stores block-level and column-level metadata for arbitrarily large
+  tables as system tables. The paper contrasts this with formats such as
+  Parquet/ORC where verbose block metadata is colocated with data and often
+  requires opening many blocks during query execution.
+- The query coordinator derives the table, requested columns, and pushed-down
+  predicates from the logical plan, then resolves physical metadata while
+  constructing the physical plan.
+- For pruning, BigQuery builds falsifiable expressions over metadata columns.
+  A data block can be skipped when metadata such as min/max proves that no row
+  in the block can satisfy the predicate.
+- CMETA rows contain block locators and column properties. Query execution can
+  use the output of the metadata scan to dispatch only the relevant table
+  partitions to workers.
+- Metadata scanning is distributed and columnar. The paper's main design
+  choice is to keep rich metadata scalable by processing it like data instead
+  of forcing all metadata through a centralized in-memory service.
+- The system supports time-aware metadata using creation and deletion
+  timestamps. For the common current-version case, BigQuery maintains a
+  periodically refreshed CMETA materialized view that filters to currently
+  visible metadata rows.
+- CMETA has its own metadata. For very large tables, the paper says CMETA can
+  itself be hundreds of GBs, so BigQuery clusters CMETA by the max values of
+  the original table's partitioning and clustering columns and stores a small
+  centralized summary of CMETA block locators and min/max values.
+- Query execution may interleave CMETA scans with the main data scan. Instead
+  of collecting every block locator at the coordinator before starting work,
+  the system dispatches main-table partitions as metadata rows arrive.
+- CMETA also supports dry-run cost estimation and materialized-view choice by
+  estimating the bytes a candidate plan or materialized view would scan.
+- Evaluation on a 1PB table with roughly three million columnar blocks reports
+  a highly selective `SELECT *` query running in 2.5 seconds with CMETA versus
+  120 seconds without it, where the non-CMETA path spends most time finding the
+  blocks to scan. The paper also reports 30000x slot-second reduction for the
+  most selective 1PB query and 5x-10x runtime improvement on 10TB tables,
+  depending on selectivity.
+
+**GPU DB mapping:** GPU DB should model P8 route metadata as CMETA-like
+columns over retained fragments and cold segments. Candidate columns include
+relation id, schema generation, snapshot/visibility boundary, row-id range,
+key min/max, text prefix summaries, null counts, encoding kind, compression
+group, resident HBM handle, DRAM/NVMe/object locator, invalidation generation,
+refresh cost, and expected H2D bytes.
+
+The planner can then ask a route-metadata scan to produce a certificate: which
+fragments are eligible, which were pruned, which tier each surviving fragment
+lives in, which visibility boundary is being used, and why a CPU/GPU/cold
+route was chosen. This fits the current architecture's requirement that read
+workers execute only against compatible immutable snapshots and that fallback
+reasons be explicit.
+
+Interleaved processing maps to over-resident GPU execution. For a large cold
+table, GPU DB should not wait for a complete metadata pass before beginning
+all work. It can stream eligible fragment descriptors into NVMe read queues,
+H2D staging buffers, GPU execution rings, or CPU fallback workers as soon as
+route certificates are produced, with queue backpressure deciding how far
+metadata can run ahead.
+
+The metadata-of-metadata idea is important for 1M logical sessions. A small
+centralized catalog should contain only enough route-summary information to
+find and prune metadata stripes quickly. Detailed per-fragment facts can live
+in columnar metadata segments and be cached by hot metadata columns rather
+than by whole table descriptors.
+
+The current-version materialized view maps to retained route snapshots. Most
+queries want the newest compatible generation, so GPU DB can maintain a compact
+current-fragment view while keeping historical metadata rows for long readers,
+time travel, recovery, or replay. Publication still needs WAL-before-visibility
+and DDL invalidation; CMETA's timestamp filters are not enough by themselves.
+
+**Risks and mismatches:** Big Metadata is built for BigQuery-scale analytical
+warehousing. It does not describe OLTP point updates, row-level MVCC version
+chains, PostgreSQL protocol sessions, GPU kernels, WAL-before-visibility, or
+low-latency single-row transactions.
+
+The system relies on distributed query execution to process large metadata
+tables. GPU DB's first slice is single-node and latency-sensitive, so a
+metadata scan that takes hundreds of milliseconds is acceptable only for large
+over-resident or planning-heavy routes, not for hot point lookups.
+
+CMETA uses min/max and other column properties for pruning. GPU DB will need
+metadata that includes visibility masks, resident layout identity, fragment
+checksums, route-family support, and GPU memory pressure. A block locator alone
+cannot prove correctness.
+
+The paper's materialized current-view is refreshed periodically. GPU DB cannot
+let a stale current-fragment view survive a mutation or DDL event that should
+invalidate a resident generation; publication and invalidation have to be tied
+to the mutation owner and WAL boundary.
+
+**Benchmark candidates:**
+
+- Build a route-metadata table for one retained relation with per-fragment
+  min/max, row-id range, visibility boundary, schema generation, tier locator,
+  encoding kind, and expected H2D bytes. Gate: every retained route can explain
+  included, pruned, and ineligible fragments.
+- Compare segment-footer discovery against CMETA-style metadata scans for
+  selective predicates over many NVMe/cold fragments. Measure planning
+  latency, opened files/segments, bytes read before first result, and p99
+  route latency.
+- Prototype interleaved metadata/data dispatch: stream eligible fragment
+  descriptors into CPU scan, NVMe read, H2D staging, and GPU execution queues
+  as metadata rows arrive. Failure condition: metadata outruns saturated
+  downstream queues without backpressure or produces work for an invalidated
+  generation.
+- Add a metadata-of-metadata summary in the catalog for metadata stripes.
+  Measure whether route planning can prune metadata stripes without loading
+  every fragment descriptor.
+- Maintain a current-fragment metadata view plus historical metadata rows for
+  long readers. Gate: a mutation invalidates or republishes the current view
+  before new readers can observe stale resident fragments.
+- Use metadata scans for dry-run route budgets: estimate HBM bytes, DRAM/NVMe
+  bytes, H2D transfer, and GPU queue load before admission. Gate: admission can
+  reject or choose CPU fallback with a concrete cost reason.

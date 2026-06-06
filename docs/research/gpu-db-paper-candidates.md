@@ -567,13 +567,15 @@ Append new candidates here as each paper is processed.
   decentralized priority lock queues against a newer design that reduces
   memory-node NIC contention by decoupling lock ownership transfer from
   centralized lock-state maintenance. Journal entry added 2026-06-06.
-- `queued` — **Big Metadata: When Metadata is Big Data**, Edara and
+- `reviewed` — **Big Metadata: When Metadata is Big Data**, Edara and
   Pasumansky, PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p3083-edara.pdf`
-  DOI: `https://doi.org/10.14778/3476311.3476383`
+  DOI: `https://doi.org/10.14778/3476311.3476385`
   Why: Vortex relies on Big Metadata for large-scale column properties and
   partition pruning; useful for GPU DB's route metadata, resident-fragment
   pruning, snapshot-safe metadata publication, and metadata compaction.
+  Journal entry added 2026-06-06 from the PVLDB PDF via browser fetch after
+  direct `curl` to the same URL timed out.
 - `reviewed` — **Pravega: A Tiered Storage System for Data Streams**,
   Gracia-Tinedo et al., Middleware 2023.
   URL: `https://doi.org/10.1145/3590140.3629113`
@@ -596,6 +598,12 @@ Append new candidates here as each paper is processed.
   tail and historical stream ingestion; useful for comparing ingestion
   semantics, stream/table boundaries, and storage contracts for retained
   GPU-readable histories.
+- `queued` — **Delta Lake: High-Performance ACID Table Storage over Cloud
+  Object Stores**, Armbrust et al., PVLDB 2020.
+  URL: `https://doi.org/10.14778/3415478.3415560`
+  Why: Big Metadata compares with Delta Lake's transaction-log-to-columnar
+  metadata compaction model; useful for GPU DB cold-tier manifests, ACID object
+  storage metadata, checkpoint compaction, and metadata-as-data contrasts.
 - `reviewed` — **ALock: Asymmetric Lock Primitive for RDMA Systems**, Baran,
   Nelson-Slivon, Tseng, and Palmieri, SPAA 2024.
   URL: `https://doi.org/10.1145/3626183.3659977`
