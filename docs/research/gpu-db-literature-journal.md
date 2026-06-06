@@ -82938,3 +82938,198 @@ Benchmark priorities:
 - Stress long readers against descriptor reclamation. The pass condition
   is bounded memory growth with explicit fallback or retry reasons, not
   only high mean throughput.
+
+### 2026-06-06 - DecLock moves hot remote-lock handoff off the memory-node NIC
+
+**Citation:** Hanze Zhang, Ke Cheng, Rong Chen, Xingda Wei, and
+Haibo Chen. "DecLock: A Case of Decoupled Locking for Disaggregated
+Memory." arXiv:2505.17641, 2025. Retrieved 2026-06-06 from
+`https://arxiv.org/abs/2505.17641` and PDF
+`https://arxiv.org/pdf/2505.17641`.
+
+**Category:** database file-system/storage/indexing and runtime /
+HFT / session scale, with transaction-processing and future-tier
+concurrency relevance.
+
+**Relevance tags:** disaggregated memory; RDMA locks; reader-writer
+locks; remote indexes; memory-node NIC contention; owner handoff;
+cooperative queue-notify locking; timestamp fairness; hierarchical
+locks; bounded retries; hot-key admission; future CXL/RDMA tiers.
+
+**Core idea:** DecLock observes that locks stored beside data in
+disaggregated memory can consume the same memory-node NIC IOPS needed
+for the actual data accesses. Under high contention, spin-style RDMA
+locks repeatedly poll or CAS the memory node, so lock acquisition
+traffic can dominate the remote tier and inflate both lock and data
+access latency.
+
+The paper's central move is to decouple lock state maintenance from
+lock ownership transfer. A compact centralized queue at the memory node
+records waiter order and lock mode, but handoff happens by
+compute-node-to-compute-node notifications. The memory node is still
+the fairness and state authority, yet the retry storm is moved out of
+the narrow memory-node NIC path.
+
+For GPU DB, the most transferable idea is not "use RDMA locks"; it is
+"do not make the scarce tier that stores hot data also absorb every
+retry and handoff." If future GPU DB tiers include RDMA memory, CXL
+memory pools, remote NVMe services, or gateway-owned hot indexes, the
+coordination path should keep state facts at the authoritative tier
+while moving waiter wakeups, retries, and local batching to owner or
+gateway domains.
+
+**Concrete mechanisms:**
+
+- Cooperative queue-notify locking stores a CQL lock in memory-node
+  memory. The lock has an 8-byte atomic header plus a circular array of
+  queue entries.
+- The header is updated with RDMA fetch-and-add, not repeated CAS
+  retries. It encodes queue head, queue size, writer count, and a reset
+  identifier. The queue head is placed in the high bits because it may
+  grow without a fixed bound.
+- Lock acquisition performs one remote FAA to enqueue the requester and
+  update writer count if needed. If the requester cannot take ownership
+  immediately, it writes its queue entry and waits for a notification
+  from a compute node.
+- Lock release performs a remote FAA to advance the queue, piggybacks a
+  queue read, and sends a notification to the next writer or the next
+  group of adjacent readers. This makes ownership transfer a CN-CN
+  message rather than another MN-NIC polling loop.
+- The queue entry data plane is non-atomic. DecLock uses per-entry
+  versions derived from circular queue traversal count to detect stale
+  entries from reuse, read/write races, or shared readers that did not
+  populate an entry.
+- If queue entries are overwritten, entry versions overflow, or a
+  compute node fails while holding a lock, DecLock resets the lock. A
+  reset sets the reset id with CAS, broadcasts reset signals to clients,
+  waits for surviving clients, reinitializes the queue and header, and
+  uses reset counters to ignore expired notifications.
+- The hierarchical design keeps one CQL waiter per compute node and
+  resolves same-node contention through local lock metadata. This
+  reduces memory-node queue capacity and queue-read bandwidth from
+  client count toward compute-node count.
+- To preserve fairness across local and remote waiters, DecLock records
+  acquisition timestamps in both memory-node queue entries and local
+  wait queues. On release, a holder compares local and remote timestamps
+  before deciding whether to keep ownership local or release the CQL
+  lock for a remote waiter.
+- DecLock supports task-fair and phase-fair policies. Phase-fair mode
+  allows more reader batching but can trade strict fairness for
+  concurrency; task-fair mode is closer to exact acquisition order.
+- Compute nodes synchronize timestamp epochs through a memory-node
+  counter. The implementation uses 16-bit microsecond timestamps after
+  synchronization; the paper states occasional timestamp-order mistakes
+  affect fairness, not mutual exclusion.
+- Failure handling depends on a reliable coordinator for failure
+  detection and network partitions. DecLock preserves mutual exclusion
+  across CN/MN/network failures but does not guarantee strong liveness
+  while a memory node or partitioned network is unavailable.
+- Evaluation uses machines with dual 24-core Intel CPUs, 128 GB RAM,
+  and ConnectX-4 100 Gbps RDMA NICs. The default microbenchmark uses
+  8 compute nodes, 1 memory node, 256 clients, 100K locks, Zipfian
+  alpha 0.99, and a 50% read ratio.
+- In the paper's microbenchmarks, DecLock avoids the throughput
+  collapse shown by CAS-based RDMA spinlocks as client count rises.
+  It reports up to 43.37x higher throughput than spinlocks and up to
+  1.81x over MCS-style locks, depending on fairness mode and workload.
+- In an object-store trace and Sherman disaggregated B+-tree, DecLock
+  improves high-contention throughput by up to 35.60x and 2.31x,
+  respectively, and reduces 99th-percentile latency by up to 98.8% and
+  82.1%. In Sherman search-mostly workloads, the benefit is small
+  because searches are already lock-free.
+- The paper reports that reset is rare in its experiments; at most
+  0.0014% of acquisitions reset in the reported microbenchmark runs.
+
+**GPU DB mapping:** The immediate GPU DB mapping is future-tier lock
+admission for remote or pooled memory indexes. A GPU DB range index,
+resident-segment manifest, cold-tier extent map, or disaggregated
+object directory may have an authoritative metadata cell in a scarce
+tier. DecLock argues that the scarce tier should store only the minimal
+serialized facts: waiter order, mode, generation, and reset epoch. The
+actual retry budget and wakeup path should live in CPU owner domains,
+gateway workers, or per-node local queues.
+
+This also maps to hot-key write admission even before RDMA memory
+exists. The mutation owner should not receive repeated "try again"
+messages from every session waiting on a hot key. A better shape is a
+central authoritative order plus local wait queues and direct wakeups:
+network IO workers or partition owners enqueue one compact waiter,
+batch local compatible readers, and wake only the next admitted request
+when the publication fence advances.
+
+DecLock's hierarchical queue is a useful model for 1M logical sessions.
+The remote or global authority should usually see one waiter per active
+runtime domain, not one waiter per logical client. Local workers can
+maintain per-session queues, phase compatible reads, and collapse many
+waiting clients into a small number of authoritative entries.
+
+For GPU-resident metadata, the reset counter pattern maps to generation
+stamps on route notifications. If a residency, catalog, or lock reset
+occurs while an old wakeup is in flight, the wakeup must carry the
+generation it belongs to and be ignored by newer waiters.
+
+The timestamp fairness mechanism is most useful as a scheduling
+vocabulary. GPU DB can compare local queue age against remote or owner
+queue age when deciding whether to keep work local, drain a reader
+phase, or yield to a write/refresh request. The comparison should feed
+admission policy; correctness still needs WAL, visibility, and
+generation fences.
+
+**Risks and mismatches:** DecLock is an arXiv systems paper for
+RDMA-style disaggregated memory. It is not a database transaction
+protocol, SQL isolation design, WAL design, or GPU execution scheduler.
+It serializes critical sections through locks; it does not prove MVCC
+snapshot visibility, serializability, recovery, or durability.
+
+The design assumes RDMA-like one-sided operations, compute nodes that
+can notify each other directly, and a reliable coordinator for failure
+detection and partition handling. GPU DB should not import these
+assumptions into a single-node CPU/GPU runtime or ordinary NVMe path
+without measuring whether the remote-tier bottleneck exists.
+
+Phase-fair reader batching can starve or delay writers compared with
+task-fair ordering. For GPU DB, read batching must not block WAL flush,
+resident invalidation, snapshot retirement, or DDL publication past SLO
+budgets.
+
+The timestamp mechanism depends on bounded clock skew and encodes
+fairness in microsecond timestamps. For a database, fairness mistakes
+may be acceptable for queue order, but not for transaction order,
+visibility order, or durability order.
+
+Lock reset aborts waiters and weakens fairness during failures. GPU DB
+would need an explicit retry/error contract so resets cannot duplicate
+committed writes, lose a WAL-visible mutation, or wake a request against
+an obsolete route certificate.
+
+**Benchmark candidates:**
+
+- Build a hot-key admission simulator with 1M logical sessions and a
+  small number of active runtime domains. Compare per-session owner
+  retries, one authoritative waiter per domain, and DecLock-style local
+  wait queues. Gate: owner queue traffic, p99 wakeup latency, and memory
+  per waiting session are reported.
+- Prototype a future-tier metadata lock with a compact remote header and
+  local domain queues. Measure remote operations per acquisition,
+  remote-tier IOPS consumed by coordination, and data-operation latency
+  under Zipfian hot metadata updates.
+- Add a reader-phase benchmark for retained read snapshots. Compare
+  task-fair and phase-fair draining when read batches compete with WAL
+  invalidation, refresh, and DDL publication. Failure condition: reader
+  batching violates write/refresh SLO floors.
+- Require wakeups and route notifications to carry a generation/reset
+  counter. Stress delayed wakeups across invalidation and reset events.
+  Gate: old notifications are ignored without leaking buffers or waking
+  stale route work.
+- Test local-compatible request collapsing: many logical sessions
+  waiting on the same key, partition, or resident segment should become
+  one owner-visible waiter plus local response scattering after
+  admission. Measure throughput, tail latency, and response fairness.
+- Compare lock-based remote index updates against MVCC/versioned-root
+  publication for resident or disaggregated indexes. Expected result:
+  locks are useful only for short metadata critical sections; long GPU
+  reads should hold immutable/versioned route handles instead.
+- Model reset behavior as a production contract: timeout, abort, retry,
+  or explicit overload. Failure condition: reset can affect an already
+  durable WAL record, an externally acknowledged response, or a visible
+  snapshot generation.

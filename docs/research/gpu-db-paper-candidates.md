@@ -501,13 +501,13 @@ Append new candidates here as each paper is processed.
   checking whether FORD's one-sided, rollback-oriented commit path has been
   superseded by newer localized-validation or hybrid-RDMA designs. Journal
   entry added 2026-06-06.
-- `queued` — **DecLock: A Case of Decoupled Locking for Disaggregated
+- `reviewed` — **DecLock: A Case of Decoupled Locking for Disaggregated
   Memory**, Zhang, Cheng, Chen, Wei, and Chen, arXiv 2025.
   URL: `https://arxiv.org/abs/2505.17641`
   Why: discovered while reviewing HDTX; useful for comparing HDTX's
   decentralized priority lock queues against a newer design that reduces
   memory-node NIC contention by decoupling lock ownership transfer from
-  centralized lock-state maintenance.
+  centralized lock-state maintenance. Journal entry added 2026-06-06.
 - `queued` — **ALock: Asymmetric Lock Primitive for RDMA Systems**, Baran,
   Nelson-Slivon, Tseng, and Palmieri, SPAA 2024.
   URL: `https://doi.org/10.1145/3626183.3659977`
@@ -515,6 +515,19 @@ Append new candidates here as each paper is processed.
   Why: HDTX cites ALock as modern RDMA lock related work; useful for comparing
   priority scheduling with local/remote cohort locking when GPU DB future tiers
   mix local CPU accesses and remote/disaggregated-memory accesses.
+- `queued` — **ShiftLock: Mitigate One-sided RDMA Lock Contention via
+  Handover**, Gao, Wang, and Shu, USENIX FAST 2025.
+  URL: `https://www.usenix.org/conference/fast25/presentation/gao`
+  Why: DecLock compares directly against ShiftLock's MCS-style handover for
+  RDMA reader-writer locks; useful for isolating whether GPU DB future-tier
+  locks need centralized waiter queues, predecessor handoff, or phase-fair
+  reader batching under hot remote indexes.
+- `queued` — **Fast and Scalable In-Network Lock Management using Lock
+  Fission**, Zhang, Cheng, Chen, and Chen, OSDI 2024.
+  URL: `https://www.usenix.org/conference/osdi24/presentation/zhang-hanze`
+  Why: DecLock contrasts software lock handoff with in-network lock
+  management; useful as a foil before GPU DB assumes switch/NIC assistance for
+  gateway, remote-tier, or disaggregated-memory lock coordination.
 - `queued` — **The Case for Distributed Shared-Memory Databases with
   RDMA-Enabled Memory Disaggregation**, Zhou et al., arXiv 2022.
   URL: `https://arxiv.org/abs/2207.03027`
