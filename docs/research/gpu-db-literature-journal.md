@@ -78907,3 +78907,198 @@ Benchmark priorities:
   Pangu-style transport, BVLSM-style payload movement, DEX-style remote
   indexes, and GPU OLTP kernels. Gate: a faster device path must not merely
   move p99 latency into copies, checksums, or pgwire formatting.
+
+### 2026-06-06 - OneShotGC makes MVCC cleanup a partition-publication problem
+
+**Citation:** Aunn Raza, Periklis Chrysogelos, Angelos Christos Anadiotis,
+and Anastasia Ailamaki. "One-shot Garbage Collection for In-memory OLTP
+through Temporality-aware Version Storage." Proceedings of the ACM on
+Management of Data 1(1), Article 19, 2023. DOI:
+`https://doi.org/10.1145/3588699`. Retrieved 2026-06-06 from EPFL
+Infoscience `https://infoscience.epfl.ch/record/305174/files/3588699.pdf`.
+
+**Category:** MVCC / snapshot / visibility, with transaction write-path and
+retained-snapshot reclamation relevance.
+
+**Relevance tags:** MVCC; snapshot isolation; garbage collection; version
+chains; temporal partitioning; one-shot reclamation; tagged pointers; partition
+tags; delta storage; chain consolidation; long readers; CH-benCHmark-style
+mixed workload; YCSB; TPC-C; Proteus; retained snapshot retirement; old-delta
+compaction.
+
+**Core idea:** OneShotGC attacks a familiar MVCC scaling problem: garbage
+collection that must walk long version chains, unlink individual obsolete
+versions, and free many small allocations becomes random-access work on the
+transaction path. The paper's central move is to make version storage temporal.
+Versions created by transactions that start at about the same time are placed
+into contiguous delta partitions, and the collector treats a whole partition as
+one large version with a visibility interval. When no active transaction can
+read that interval, the system resets the partition in one operation instead of
+discovering and freeing versions one by one.
+
+The transferable idea for GPU DB is that old-version cleanup should be designed
+like publication and retirement of immutable generations, not as a background
+walk over arbitrary per-row chains. If retained GPU snapshots, CPU MVCC deltas,
+or warm-tier old payloads are grouped by visibility boundary and expected
+retirement time, a maintenance tick can retire whole groups after readers drain.
+That maps much better to owner rings, cache budgets, and GPU-resident snapshot
+handles than pointer-chasing through row-local history under load.
+
+**Concrete mechanisms:**
+
+- OneShotGC assumes delta-storage MVCC: the newest version is in the main
+  storage, while older versions live in transient version storage linked from
+  tuple metadata.
+- The version storage is a circular buffer of delta partitions. Each partition
+  owns a contiguous memory chunk and acts as a linear allocator with an atomic
+  allocation cursor.
+- Each partition tracks a maximum active transaction timestamp, minimum version
+  timestamp, active transaction count, allocation cursor, and monotonically
+  increasing partition tag.
+- Record-version next pointers are tagged pointers. The paper's implementation
+  packs partition id, partition tag, and memory offset into a 64-bit value.
+  Dereferencing checks the current partition tag before forming a physical
+  pointer.
+- Transactions that create versions register with a delta partition and
+  deregister when they finish. The default policy assigns batches of
+  transactions to partitions incrementally in round-robin order; the paper
+  notes that the number of transactions per partition, partition size, and
+  assignment policy are tunable.
+- Writers allocate version memory from the assigned partition, initialize the
+  version and timestamp, set the next tagged pointer to the old chain head, and
+  update the in-place version head in record metadata.
+- Garbage collection locks an inactive partition, checks whether the global
+  minimum active transaction is beyond that partition's maximum transaction
+  timestamp, increments the partition tag, and resets the partition allocation
+  cursor. Old tagged pointers then fail tag validation without per-version
+  unlinking.
+- The collector complexity is framed around number of partitions rather than
+  number of versions when a whole partition is unreadable.
+- For long-running readers, OneShotGC supports partition-level consolidation.
+  It can reclaim a middle partition whose visibility interval is unreadable by
+  any active transaction, then bridge version-chain gaps with per-partition hash
+  tables containing the most recent version of each record in that partition.
+- Cross-partition traversal checks tag validity. If a pointer crosses into a
+  reclaimed partition, the reader probes partition hash tables in reverse order
+  to find the next usable version-chain head for that record.
+- Partition-level consolidation trades some read-side indirection and writer
+  hash-table maintenance for less GC traversal and shorter chains under mixed
+  workloads with long readers.
+- The prototype is implemented in Proteus with MV2PL and snapshot isolation.
+  The OLTP storage layout is columnar; an index stores transaction timestamps,
+  tagged delta pointers, and row identifiers.
+- Experiments compare against Steam GC, implemented in the same Proteus
+  prototype. Workloads include YCSB, TPC-C, and mixed workloads with an
+  OLAP-style scan/aggregate reader.
+- Hardware was a two-socket Intel Xeon Gold 6132 server with 28 physical cores,
+  56 logical threads, and 1.5 TB DRAM. Most experiments pin one worker per
+  physical thread and avoid hyperthreads.
+- The paper reports that turning on traversal-based GC can reduce YCSB
+  throughput materially versus a no-GC infinite-memory baseline; its motivating
+  experiment reports a 36% throughput degradation for Steam GC.
+- With 28 threads, OneShotGC reports roughly 30% and 25% gains over Steam on
+  YCSB read-write and write-only variants, respectively.
+- On TPC-C NewOrder/Payment and full TPC-C mixes, OneShotGC scales better
+  across the socket boundary because only the last worker leaving a partition
+  pays the partition GC check and the actual collection avoids version-chain
+  traversal.
+- In the paper's mixed workload, a long-running scan can block regular tail
+  GC. Partition consolidation keeps analytical throughput comparable while
+  avoiding Steam-style per-version pruning work on transaction updates.
+- Tuning experiments keep total delta-storage size fixed and vary partition
+  count. The paper reports that short-lived transactional workloads can work
+  with as few as two partitions, while mixed workloads with long readers benefit
+  from more partition spread for in-middle consolidation.
+- The paper is explicit about trade-offs: OneShotGC gives up per-version GC
+  precision inside a partition, pays transaction registration and
+  deregistration atomics, adds tagged-pointer checks to traversal, and needs
+  partition sizing/assignment policies that fit the workload.
+
+**GPU DB mapping:** The first direct mapping is retained snapshot retirement.
+GPU DB already wants immutable read snapshots tied to visibility boundaries,
+resident layout identity, and route generations. OneShotGC suggests that the
+CPU MVCC side should also group old deltas and snapshot side structures by
+retirement cohort. A snapshot generation, resident visible-row bitmap, old text
+payload extent, or compacted version array should have a partition-level
+readability interval and retire as a unit when no reader can legally need it.
+
+For the P8 storage design, temporal partitions are a useful shape for refresh
+and invalidation metadata. Instead of letting updates create arbitrary old
+versions that later require per-row cleanup, the mutation owner could append
+old images, visibility maps, or variable-width payload descriptors into
+visibility-bounded delta chunks. The chunk can carry `min_version`,
+`max_writer`, active-reader count, tag/generation, byte budget, and route
+membership facts. That is close to P8's existing state-machine language:
+`Valid`, `Invalidated`, `Refreshing`, `Evicting`, and retired generations can
+be backed by chunks that are reset only after reader reachability says yes.
+
+For 1M logical sessions, the important pattern is bounded reclamation work.
+Logical sessions should not multiply old-version cleanup into per-session
+chain walks or per-version frees. A maintenance owner should perform a small
+number of partition checks, publish precise "not retired because reader X /
+boundary Y still exists" facts, and reset entire chunks when eligible. The
+partition-tag idea maps naturally to route generation checks: a stale retained
+route or old visible-row pointer must fail generation validation instead of
+silently dereferencing recycled memory.
+
+OneShotGC also clarifies a benchmark split for GPU-resident MVCC experiments.
+Naive version-chain traversal on GPU is unattractive not merely because GPU
+pointer chasing is slow, but because cleanup and consolidation can become
+random access in the same structures. A better experiment is to compare:
+row-local chains, visibility-bounded old-version arrays, and temporally grouped
+delta partitions whose visible rows are materialized into compact bitmaps or
+key vectors for retained reads.
+
+**Risks and mismatches:** OneShotGC is evaluated in an in-memory CPU OLTP/HTAP
+prototype, not a GPU database with WAL replay, device memory residency,
+PostgreSQL protocol overhead, or NVMe/object cold tiers. Its partitions are
+transient memory, while GPU DB must keep WAL/checkpoint/archive state as the
+durable truth and make resident GPU state rebuildable.
+
+The default assignment policy assumes many transactions have similar lifetimes.
+That is plausible for short OLTP transactions but weaker for interactive SQL,
+large scans, multi-statement sessions, and mixed latency classes. GPU DB would
+need route-aware partition assignment, not just round-robin batches.
+
+Partition-level reclamation reduces precision. A single still-readable version
+can hold a whole partition live unless consolidation can reclaim the middle
+partition safely. For GPU DB, oversized chunks could create memory-pressure
+tails where resident snapshots stay pinned too long.
+
+Tagged-pointer invalidation is a memory-safety pattern, not a full visibility
+protocol. GPU DB still needs explicit snapshot compatibility, WAL-before-
+visibility, DDL/catalog generation checks, and safe replay semantics before a
+retained route can observe data.
+
+**Benchmark candidates:**
+
+- Build a CPU MVCC delta-retirement simulator with row-local chains versus
+  temporal delta partitions. Gate: cleanup work scales with partition count,
+  not obsolete-version count, while snapshot correctness remains unchanged.
+- Add a retained-snapshot retirement benchmark where each resident generation
+  owns old visible-row bitmaps, payload descriptors, and route metadata under a
+  generation tag. Gate: stale readers fail generation checks after retirement
+  rather than dereferencing reused buffers.
+- Compare chunk sizes for old-version partitions under read-heavy, write-heavy,
+  and CH-benCHmark-style mixed workloads. Failure condition: larger chunks
+  improve GC throughput but keep too many dead bytes pinned under one long
+  reader.
+- Prototype partition-level consolidation for old MVCC deltas: reclaim a
+  middle chunk and bridge version traversal with a compact per-chunk record-id
+  table. Gate: long-reader p99 improves without adding unacceptable writer
+  overhead.
+- Measure GPU-visible snapshot formats against CPU cleanup cost: row chains,
+  compact visible-version arrays, and visibility-bounded delta partitions that
+  emit resident bitmaps/key vectors. Gate: GPU read speedups must not be bought
+  by worse CPU MVCC cleanup tails.
+- Add route-generation tags to resident metadata pointers and visible-row
+  handles. Gate: after invalidation, refresh, eviction, and retirement, every
+  old handle returns a named invalid-generation reason.
+- Stress 1,000 to 100,000 logical readers holding old snapshots while writes
+  append old deltas. Measure bytes pinned, cleanup work, route rejection
+  reasons, and p99 write latency. Failure condition: retained readers force
+  per-version cleanup on the mutation path.
+- Evaluate transaction-to-delta-partition assignment policies: round-robin
+  batch, owner-domain, route class, table/partition id, and latency class.
+  Gate: assignment improves reclaimability without weakening visibility or
+  starving cold routes.

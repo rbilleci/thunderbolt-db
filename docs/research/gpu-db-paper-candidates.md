@@ -3935,13 +3935,28 @@ Append new candidates here as each paper is processed.
   Why: ERMIA uses Serial Safety Net as its serializability certifier; useful
   for deciding whether GPU DB can layer bounded dependency validation over
   snapshot-friendly read execution without falling back to pessimistic locks.
-- `queued` — **One-shot Garbage Collection for In-memory OLTP through
+- `reviewed` — **One-shot Garbage Collection for In-memory OLTP through
   Temporality-aware Version Storage**, Raza et al., SIGMOD 2023.
-  URL: `https://doi.org/10.1145/3589273`
+  URL: `https://doi.org/10.1145/3588699`
+  PDF: `https://infoscience.epfl.ch/record/305174/files/3588699.pdf`
   Why: SSN and recent MVCC scan/storage reviews point to version-chain and
   reader-retention costs as a write-path bottleneck; useful for comparing
   temporal clustering and one-shot reclamation with GPU DB retained-snapshot
-  retirement and old-delta compaction.
+  retirement and old-delta compaction. Journal entry added 2026-06-06.
+- `queued` — **TB-Collect: Efficient Garbage Collection for Non-Volatile
+  Memory Online Transaction Processing Engines**, Wei et al., 2025.
+  URL: `https://www.mdpi.com/2079-9292/14/10/2080`
+  DOI: `https://doi.org/10.3390/electronics14102080`
+  Why: discovered while reviewing OneShotGC; applies block-level MVCC garbage
+  collection ideas to NVM OLTP engines, useful for comparing future NVM/CXL
+  version storage against GPU DB's DRAM/NVMe retained-delta cleanup.
+- `queued` — **A Version-aware Data Layout for Heterogeneous Workloads in
+  In-Memory Database Systems**, Zhang et al., Research Square preprint 2024.
+  URL:
+  `https://assets-eu.researchsquare.com/files/rs-4105094/v1_covered_cd54b494-1a7d-4e7d-86f8-cde2a6c17356.pdf`
+  Why: discovered through vWeaver/OneShotGC related work; useful for comparing
+  version-centric layouts, index-only version searches, and epoch/range
+  partitioning against GPU DB visible-row maps and retained snapshot arrays.
 - `queued` — **RABIT: Efficient Range Queries with Bitmap Indexing**,
   Wang, Xiao, and Athanassoulis, PACMMOD 2025.
   URL: `https://cs-people.bu.edu/mathan/publications/pacmmod25-wang.pdf`
