@@ -427,13 +427,29 @@ Append new candidates here as each paper is processed.
   useful for write-optimized remote index layouts, RDMA command coalescing,
   hierarchical locks, and entry/node versioning before GPU DB adopts
   disaggregated range indexes. Journal entry added 2026-06-06.
-- `queued` — **FORD: Fast One-sided RDMA-based Distributed Transactions for
+- `reviewed` — **FORD: Fast One-sided RDMA-based Distributed Transactions for
   Disaggregated Persistent Memory**, Zhang et al., FAST 2022.
-  URL: `https://www.usenix.org/conference/fast22/presentation/zhang-mingxing`
+  URL: `https://www.usenix.org/conference/fast22/presentation/zhang-ming`
+  PDF: `https://www.usenix.org/system/files/fast22-zhang-ming.pdf`
   Why: Sherman references FORD as a disaggregated persistent-memory
   transaction direction; useful for comparing one-sided RDMA transaction
   ordering, persistence, and remote metadata updates against GPU DB's future
-  warm/cold-tier transaction and index routes.
+  warm/cold-tier transaction and index routes. Journal entry added
+  2026-06-06; the previously queued USENIX URL was corrected.
+- `queued` — **Fast Distributed Transactions for RDMA-based Disaggregated
+  Memory**, Lu et al., USENIX ATC 2025.
+  URL: `https://www.usenix.org/conference/atc25/presentation/lu`
+  Why: modern follow-up that compares against FORD and targets faster
+  distributed transactions over RDMA-based disaggregated memory; useful for
+  checking whether FORD's one-sided, rollback-oriented commit path has been
+  superseded by newer localized-validation or hybrid-RDMA designs.
+- `queued` — **The Case for Distributed Shared-Memory Databases with
+  RDMA-Enabled Memory Disaggregation**, Zhou et al., arXiv 2022.
+  URL: `https://arxiv.org/abs/2207.03027`
+  Why: FORD assumes disaggregated persistent memory as a transaction substrate;
+  this database-focused position paper is useful for deciding which DB
+  components should treat RDMA memory as shared state versus an explicit
+  remote tier with owner-mediated publication.
 - `reviewed` — **SMART: A High-Performance Adaptive Radix Tree for
   Disaggregated Memory**, Luo et al., OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/luo`

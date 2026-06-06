@@ -38,6 +38,208 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - FORD makes remote durable transactions a round-trip budget
+
+**Citation:** Ming Zhang, Yu Hua, Pengfei Zuo, and Lurong Liu.
+"FORD: Fast One-sided RDMA-based Distributed Transactions for
+Disaggregated Persistent Memory." FAST 2022, pages 51-68. Retrieved
+2026-06-06 from the USENIX paper page,
+`https://www.usenix.org/conference/fast22/presentation/zhang-ming`,
+and official PDF,
+`https://www.usenix.org/system/files/fast22-zhang-ming.pdf`.
+
+**Category:** transaction processing / write path and database
+file-system/storage/indexing, with WAL / logging / read-write
+throughput relevance.
+
+**Relevance tags:** one-sided RDMA; disaggregated persistent memory;
+remote transactions; primary-backup replication; hitchhiked locking;
+coalescent commit; parallel undo logging; visibility control; selective
+remote flush; backup reads; coroutine coordinators; remote address
+cache; future warm tier; WAL-before-visibility.
+
+**Core idea:** FORD targets a disaggregated persistent-memory pool where
+compute nodes run transactions and memory nodes provide weak compute
+only for setup, not per-transaction logic. The paper argues that simply
+porting RDMA transaction systems to this setting burns too many network
+round trips, overloads primary persistent-memory bandwidth, and ignores
+remote persistence. FORD therefore keeps transaction logic on compute
+nodes but collapses remote operations into fewer one-sided RDMA request
+rounds: read-write objects are locked while they are read, all replicas
+are committed together, undo logging is overlapped with execution,
+read-only traffic can hit backups, and persistence flushes are issued
+selectively.
+
+For GPU DB, the transferable lesson is to treat every future remote
+tier operation as a round-trip budget with a correctness certificate.
+If a route crosses NVMe, CXL, RDMA, object storage, or replica owners,
+then lock/acquire, read, validate, publish visibility, persist, and
+release steps need to be explicitly counted and batched without
+weakening WAL-before-visibility.
+
+**Concrete mechanisms:**
+
+- FORD's run path bypasses remote memory-node CPUs. Compute-side
+  coordinators use one-sided RDMA against memory-pool tables after an
+  initialization phase has registered memory, exchanged index metadata,
+  and assigned primary/backup roles.
+- Hitchhiked locking batches an RDMA compare-and-swap lock operation
+  followed by RDMA read using the RNIC doorbell mechanism. For
+  read-write objects, this combines read and lock into one round trip
+  and removes the later lock/validate round for those objects.
+- Read-only objects remain optimistic. They are read without locks and
+  are version-validated before commit. If a transaction has no read-only
+  objects, the validation phase is eliminated.
+- Hitchhiked locking depends on known remote addresses. FORD caches
+  remote object addresses at coordinators; on a stale-address or key
+  mismatch, the coordinator rereads the bucket and refreshes the cache.
+- Coalescent commit updates primaries and backups in place in one
+  replica commit round. A transaction commits only after ACKs from all
+  replicas; missing ACKs cause abort and rollback.
+- Because in-place backup updates can leave partial remote state after a
+  crash, FORD writes undo logs to all replicas before overwriting data.
+  Undo logs are generated after old values are read and are sent in
+  parallel with transaction execution. The coordinator checks that undo
+  log ACKs arrived before committing replicas.
+- Visibility control prevents readers from seeing partial updates.
+  FORD packs a 1-bit invisibility flag and 63-bit lock value into an
+  8-byte `VLock`. Commit batches a CAS that marks data invisible with
+  the write that updates the object; after commit or rollback, a
+  background release clears the lock and visibility flag.
+- The release phase is not on the client commit critical path. The
+  paper models clearing visibility as at most half an RTT because other
+  coordinators can proceed once the remote RNIC receives the CAS; readers
+  that encounter invisible data reread until visible.
+- Backup-enabled reads route read-only accesses to backup replicas as
+  well as primaries. Because backups are updated in place during
+  coalescent commit, they can serve current read-only data after commit
+  instead of waiting for redo-log installation.
+- Selective remote flush reduces persistence overhead. Rather than
+  flushing every write to every replica, FORD flushes after the final
+  write and only to backups, relying on primary-backup replication to
+  recover from at most `f` failed replicas.
+- Because RDMA FLUSH was not generally available in the implementation,
+  the prototype uses one-sided RDMA read-after-write as the flush
+  mechanism and batches write+read to avoid an extra read round trip.
+- The end-to-end protocol has execution, optional validation, commit,
+  and release phases. Read-write transactions need 2 RTTs without
+  read-only data or 3 RTTs with read-only data, compared with the paper's
+  4-5 RTT baselines.
+- FORD uses coroutines inside compute threads so coordinators yield
+  while waiting for RDMA ACKs. One coroutine polls ACKs; ready
+  transaction coroutines resume when their remote operations complete.
+- The evaluation uses one compute-pool machine, two Optane PM machines,
+  100 Gbps Mellanox networking, 2-way replication, KVS microbenchmarks,
+  and TATP, SmallBank, and TPC-C macrobenchmarks. Reported headline
+  results include up to 2.3x higher transaction throughput and up to
+  74.3% lower latency versus the evaluated FaRM/DrTM+H-style baselines
+  adapted to disaggregated PM.
+- Microbenchmarks report backup reads improving throughput by up to 1.5x
+  and reducing 50th/99th percentile latency by up to 31.7%/35.3% under
+  read-heavy mixes. Selective flush improves throughput by about
+  28.7-29.5% and reduces median/tail latency versus full flush in the
+  tested setup.
+
+**GPU DB mapping:** GPU DB should not copy FORD as a direct OLTP engine:
+its first durable authority is local WAL/checkpoint/replay, and GPU
+resident state is a performance cache. The useful mapping is the shape of
+remote-tier transaction certificates.
+
+For future warm/cold tiers, remote metadata updates should declare which
+steps are on the client critical path: acquire/lock, read, validate,
+persist, publish visibility, invalidate resident GPU state, and release.
+FORD's strongest idea is that some steps can be coalesced or moved off the
+critical path only when the proof boundary remains visible. GPU DB can use
+the same discipline for resident refresh publication, remote index
+updates, and replicated WAL experiments.
+
+Hitchhiked locking maps to "acquire while fetching" for route metadata:
+when a route needs a mutable cold-tier descriptor, index leaf, or
+placement entry, the engine should test whether a single remote operation
+can both validate the generation and acquire the right to update it.
+Read-only snapshot routes should remain optimistic and validate
+generation counters rather than taking locks.
+
+Coalescent commit maps to grouped publication. A mutation-owner batch
+could prepare undo/rollback descriptors, encode resident invalidation
+records, and stage remote tier updates before the visibility boundary,
+then publish all affected placement/index records under one explicit
+generation. The local WAL-before-visibility rule still wins: no GPU
+snapshot, remote index, or backup-read route can become visible before the
+durable authority says the mutation committed.
+
+Backup-enabled reads are relevant to read scaling and 1M logical
+sessions. Future read replicas, warm-tier mirrors, or object-cache copies
+can absorb read-only traffic only if their freshness is in-place and
+generation-checkable. GPU DB should avoid backup paths that require hidden
+redo installation before they become current.
+
+Selective flush maps to durable boundary minimization. If GPU DB adds
+remote durable logs, persistent-memory tiers, or replicated cold metadata,
+it should benchmark "flush every write" against "flush once per replica
+batch at the proof boundary." The benchmark must report what failures are
+actually tolerated, not just mean throughput.
+
+Coroutine coordinators map directly to the high-throughput runtime:
+network IO workers and owner rings should keep many logical requests in
+flight while waiting for remote tier, WAL, or CUDA events, but with
+bounded active state and explicit latency ceilings.
+
+**Risks and mismatches:** FORD assumes a disaggregated persistent-memory
+pool with one-sided RDMA and primary-backup replication. GPU DB does not
+currently have that deployment target, and ordinary NVMe/object storage
+does not expose the same CAS/read/write/flush semantics.
+
+The paper's serializability proof relies on locks and version validation,
+not MVCC snapshot reads with long-running retained GPU snapshots. Mapping
+FORD to GPU DB must not turn invisible flags into a substitute for
+versioned visibility or snapshot-safe route certificates.
+
+Coalescent commit chooses low common-case latency by rolling back on
+replica failure during commit rather than using a roll-forward redo-log
+path. That may or may not fit GPU DB's future replicated WAL design,
+especially if external SQL clients have already observed commit success.
+
+Backup reads help only if backups are current in place and validate
+correctly. A stale warm-tier object cache or eventually consistent object
+store should not be treated like a FORD backup.
+
+The evaluation is a small 3-machine testbed. Reported gains are useful
+mechanism evidence, but they do not prove behavior under large replica
+sets, mixed analytical GPU reads, long snapshot retention, DDL, joins,
+wide rows, recovery storms, or cloud object tiers.
+
+**Benchmark candidates:**
+
+- Build a remote-tier transaction simulator with phases for acquire,
+  read, validate, undo/rollback logging, commit write, persistence flush,
+  visibility publication, and release. Compare baseline separate phases
+  with FORD-style coalescing. Gate: p50/p99 latency, abort rate, remote
+  operations, round trips, and tolerated failure model are all reported.
+- Prototype a generation-validate-and-acquire primitive for cold-tier
+  metadata updates. Expected result: one remote proof step replaces a
+  separate fetch plus lock for mutable descriptors; failure condition:
+  stale-address recovery or false conflicts dominate p99.
+- Compare full flush versus boundary flush for future replicated WAL or
+  remote metadata writes. Gate: every benchmark variant names whether it
+  tolerates primary failure, backup failure, coordinator failure, and
+  post-ACK crash.
+- Add a "backup-readable only with current generation" route in the
+  planner simulator. Expected result: read-only traffic can be steered to
+  mirrors/caches without overloading the primary owner; failure condition:
+  freshness validation costs more than the primary bottleneck it avoids.
+- Stress invisible/publication windows against retained snapshots. Gate:
+  a reader either sees a complete old snapshot, a complete new snapshot,
+  or a clear retry/fallback reason; it never spins indefinitely on a
+  hot invisible record.
+- Test coroutine or async active-request counts for remote-tier waits:
+  1, 2, 4, 8, 16, and 32 in-flight route continuations per worker. Gate:
+  throughput improves without unbounded active memory or p99 collapse.
+- For future disaggregated-memory indexes, compare cached remote-address
+  hits, stale-address repair, and pointer traversal misses separately.
+  Failure condition: an address cache improves means but creates a high
+  stale-repair tail under updates.
+
 ### 2026-06-06 - PULSE moves pointer traversal to the future memory tier
 
 **Citation:** Yupeng Tang, Seung-seob Lee, Abhishek Bhattacharjee,
