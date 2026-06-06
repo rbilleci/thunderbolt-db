@@ -38,6 +38,236 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - FissLock splits fast grant facts from heavy waiter state
+
+**Citation:** Hanze Zhang, Ke Cheng, Rong Chen, and Haibo Chen.
+"Fast and Scalable In-network Lock Management Using Lock Fission."
+OSDI 2024. Retrieved 2026-06-06 from the USENIX paper page,
+`https://www.usenix.org/conference/osdi24/presentation/zhang-hanze`,
+and official PDF,
+`https://www.usenix.org/system/files/osdi24-zhang-hanze.pdf`.
+
+**Category:** runtime / HFT / session scale and transaction
+processing / write path, with future-tier lock-coordination relevance.
+
+**Relevance tags:** programmable switches; lock fission; distributed
+locks; fixed-size grant metadata; asynchronous participant maintenance;
+agent migration; million-scale locks; reader-writer locks; queueing
+delay; incarnation checks; remote-tier admission; hot-key coordination.
+
+**Core idea:** FissLock observes that a centralized lock manager does
+two different jobs. The grant decision needs to be synchronous and
+depends only on small fixed metadata such as the lock mode. Participant
+maintenance, including holders, wait queues, fairness, and policy, is
+large and variable-size, but can be updated asynchronously after the
+decision. The paper calls this split "lock fission": put the small grant
+decider in a programmable switch and keep migratable per-lock agents on
+servers.
+
+For GPU DB, the transferable idea is not "put SQL locks in a switch."
+It is that fast-path admission should expose the minimal fact needed to
+decide whether work may proceed, while heavier per-session and
+per-waiter state stays in owner-local memory. That maps directly to
+1M logical sessions: the mutation, residency, or future-tier authority
+should not see every waiting session as heavyweight state when a compact
+generation/mode/admission fact plus local wait queues can preserve the
+same ordering boundary.
+
+**Concrete mechanisms:**
+
+- FissLock stores only fixed-size lock decision state on the switch:
+  free/held, read/write mode, agent machine id, and an incarnation
+  counter. Holders and wait queues live in server-side lock agents.
+- The paper reports an 18-bit on-switch footprint per lock by storing
+  mode in two 1-bit register arrays and using 1-byte arrays for machine
+  id and incarnation. On the evaluated Tofino switch, that supports
+  about 1.68 million on-switch locks.
+- Lock acquire packets first go to the switch decider. If the lock is
+  free, or if a shared request can join a shared lock, the switch grants
+  immediately and routes or multicasts the packet to the agent so holder
+  state catches up.
+- If the request cannot be granted, the switch forwards it to the
+  current agent, which appends the requester to a FIFO wait queue.
+- Release goes through the decider and agent. When the last holder
+  releases, the agent either frees the lock or transfers the agent with a
+  grant packet to the next holder.
+- Agents migrate on demand to the holder's machine or the next waiter's
+  machine. This reduces release-path distance and balances participant
+  maintenance across servers without requiring prior hotspot profiling.
+- The programmable-switch decider is implemented as a six-stage P4
+  pipeline for MAU selection, incarnation check, free bit update, read
+  or write mode update, machine-id update, and destination selection.
+- Packet anomalies are handled outside the hot switch logic where
+  possible. Failed out-of-order packets are routed back to the decider
+  and then to the latest agent. Delayed shared-acquire packets are
+  detected with per-lock incarnation checks.
+- Switch-initiated grant packet loss is handled by client timeout:
+  timed-out clients release and retry. Server-to-switch retransmission
+  uses sequence numbers so duplicate packets do not corrupt switch
+  metadata.
+- The paper sketches recovery from switch and server failures through an
+  external coordinator: surviving servers pause, aggregate agent and
+  client state, repair inconsistent server state, and rebuild switch
+  state from surviving agents. Availability requires separate
+  replication and is not the paper's main guarantee.
+- Read-preferring locks can add a 1-bit state to prevent writer
+  starvation; write-preferring locks require an extra 1-bit write-waiter
+  state. Fairness policy remains in agents, such as FIFO waiter queues.
+- Evaluation uses four machines, 100 Gbps ConnectX-5 NICs, an Intel
+  Tofino switch, 160 clients for TATP, and 1,200 clients for TPC-C. The
+  paper reports up to 79.1% lower median grant time versus NetLock,
+  90th percentile grant time under 9.42 us for all 1M-lock
+  microbenchmarks, up to 4.99x lock-request throughput versus NetLock,
+  and transaction-throughput improvements of 1.76x on TATP and 2.28x on
+  TPC-C versus NetLock.
+- A dynamic-hotspot experiment changes the hotspot every 300 ms over
+  1M locks. FissLock stays above 6M lock requests/s in the reported run,
+  while NetLock fluctuates because only part of its lock set is
+  switch-resident.
+- At 10M locks, out-of-range locks fall back to server lock managers, but
+  the paper still reports lower grant-time percentiles than ParLock
+  because roughly 10% of requests continue to be offloaded to the switch.
+
+**GPU DB mapping:** GPU DB's runtime should treat "can this request
+enter the fast route?" as a small, explicitly published decision fact.
+For retained reads that could be a snapshot generation, route mode, and
+residency validity bit. For hot writes it could be a partition owner,
+conflict class, WAL admission window, or backpressure state. The
+per-session holders, retry queues, response handles, and fairness policy
+should remain in CPU-owned runtime domains where they can be rich and
+observable.
+
+The lock-fission split maps well to future-tier metadata. A cold-tier
+index root, placement record, or remote segment does not need to carry a
+full waiter queue in remote memory. It can expose a compact grant or
+generation cell, while local runtime domains hold waiters and route
+callbacks. This is especially relevant before adopting RDMA, CXL, or
+switch/NIC assistance: benchmark whether the remote authority needs to
+decide only a fixed-size fact, not manage every participant.
+
+Agent migration maps to owner-local wait queues. If a hot partition,
+resident segment, or remote index has a current local holder, release and
+wakeup work should often stay local and notify the authority only at the
+publication boundary. For 1M logical sessions, this implies one compact
+authority-visible waiter per active worker or partition lane, plus local
+fanout to many sessions after the route is admitted.
+
+The incarnation counter is directly useful for stale route notifications.
+Every wakeup, grant, residency-refresh completion, and invalidation
+message should carry the generation it was based on. Delayed completions
+from GPU kernels, remote-tier operations, or old admission windows must
+be rejected without reviving obsolete route state.
+
+FissLock also provides a hardware-assistance boundary. If future GPU DB
+deployments use programmable switches or NICs, the assisted path should
+only own small decision metadata and packet routing. Fairness,
+starvation policy, WAL-before-visibility, MVCC visibility, and recovery
+must remain in database-owned code unless a full correctness proof moves
+with them.
+
+**Risks and mismatches:** FissLock is a distributed lock service, not a
+database isolation or durability protocol. It does not prove MVCC,
+snapshot isolation, serializability, WAL ordering, or SQL-visible
+transaction recovery.
+
+The design assumes programmable-switch hardware and a data-plane
+pipeline with register arrays. GPU DB should not depend on this hardware
+for its first runtime; the immediate lesson is metadata factoring, not a
+deployment requirement.
+
+The paper explicitly does not target high availability. Its failure
+model expires granted locks and aborts pending acquisitions on failed
+servers. A database cannot let an expired lock silently stand in for
+transaction rollback or durable commit recovery.
+
+Immediate shared grants plus asynchronous holder maintenance require
+careful anomaly handling. In GPU DB, any analogous fast path must prove
+that delayed grants, duplicate packets, stale CUDA completions, and
+retry messages cannot publish stale reads or duplicate writes.
+
+Reader-writer locks are a poor direct fit for long retained GPU reads if
+they block writes or snapshot retirement. Immutable snapshots and MVCC
+generations should remain the first design choice for read scaling;
+lock-like grant cells are better for short metadata critical sections
+and admission.
+
+**Benchmark candidates:**
+
+- Build a "fissioned admission" simulator for 1M logical sessions:
+  compact authority-visible grant cells plus local per-worker wait
+  queues versus per-session owner waiters. Gate: owner-visible state,
+  admission latency, wakeup fanout, and memory per waiting session.
+- Add generation/incarnation checks to route wakeups in a stress test
+  with delayed GPU completions, delayed refresh publication, and stale
+  retry messages. Failure condition: an old completion can wake or serve
+  work against a newer invalidation generation.
+- Prototype compact future-tier metadata cells for placement/index
+  admission: mode, generation, owner id, and pressure bits only. Measure
+  remote operations and local waiter traffic under hot metadata updates.
+- Compare local wait-queue fanout against owner-visible per-session
+  retries for hot writes and hot retained reads. Expected result: the
+  authority sees bounded active lanes while local workers preserve
+  session fairness.
+- Test read-preferring versus write-preferring retained-route admission
+  with hard WAL/refresh service floors. Failure condition: shared-read
+  batching improves throughput while writer invalidation or snapshot
+  retirement violates p99 targets.
+- If switch/NIC assistance is ever considered, benchmark a minimal
+  packet-routing/grant-cell prototype against a pure software owner-ring
+  design before moving any fairness, durability, or visibility policy
+  into hardware.
+
+### 2026-06-06 - Cross-paper synthesis: route authorities should publish small facts and keep heavy state local
+
+The last five modern reviews sharpen the same design track from
+different angles. SmartQueue says route scheduling needs explicit
+physical-footprint and residency facts. FORD says remote-tier and
+replica operations need counted round-trip and durability boundaries.
+DecLock and FissLock say coordination authorities should avoid holding
+every participant as heavyweight remote state. Viper says the resulting
+fast paths need external begin/commit/read/write witnesses, because
+fast admission is not correctness by itself.
+
+Converging design tracks:
+
+- **Compact authority cells:** route, lock, residency, and placement
+  authorities should publish small cells: generation, mode, owner or
+  agent id, pressure state, and durability or visibility boundary.
+  Holders, waiters, response handles, retry queues, and fairness policy
+  should stay in local runtime domains unless measurements prove a
+  stronger centralization is needed.
+- **Generation-carrying wakeups:** every fast completion should carry
+  the generation or incarnation it belongs to. This applies to GPU kernel
+  completions, remote-tier replies, cache-aware scheduler decisions,
+  lock grants, refresh publication, and stale fallback retries.
+- **Route-footprint scheduling with service floors:** cache-aware or
+  learned schedulers should rank bounded active windows by physical
+  footprint, but they must respect hard floors for WAL, invalidation,
+  refresh, snapshot retirement, and foreground read latency.
+- **External correctness witnesses:** retained GPU reads and micro-batch
+  scatter paths should emit enough route-history data for Viper-style
+  or generation-window isolation checking in CI and stress tests.
+
+Current category gaps: the queue now has strong recent coverage for
+remote locks, future-tier indexes, and learned scheduling. The next
+highest-value gap is WAL/recovery or transaction scheduling that ties
+publication boundaries to durable commit, followed by non-analytics
+session/runtime work that can be evaluated without specialized switch
+hardware.
+
+Benchmark priorities:
+
+- Implement a compact route-cell simulator with local wait queues and
+  generation-carrying wakeups under 1M logical sessions.
+- Add route-history audit traces around retained GPU reads, refreshes,
+  invalidations, and CPU fallback, then verify sampled histories against
+  an SI-compatible checker.
+- Compare cache-aware scheduling policies only under explicit service
+  floors for writes, refresh, and snapshot retirement.
+- Measure whether future-tier metadata updates need lock-like grant
+  cells, MVCC/versioned-root publication, or owner-mediated queues under
+  hot remote index workloads.
+
 ### 2026-06-06 - SmartQueue treats cache residency as scheduler state
 
 **Citation:** Chi Zhang, Ryan Marcus, Anat Kleiman, and Olga

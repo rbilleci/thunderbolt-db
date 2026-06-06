@@ -532,12 +532,22 @@ Append new candidates here as each paper is processed.
   RDMA reader-writer locks; useful for isolating whether GPU DB future-tier
   locks need centralized waiter queues, predecessor handoff, or phase-fair
   reader batching under hot remote indexes.
-- `queued` — **Fast and Scalable In-Network Lock Management using Lock
+- `reviewed` — **Fast and Scalable In-Network Lock Management using Lock
   Fission**, Zhang, Cheng, Chen, and Chen, OSDI 2024.
   URL: `https://www.usenix.org/conference/osdi24/presentation/zhang-hanze`
+  PDF: `https://www.usenix.org/system/files/osdi24-zhang-hanze.pdf`
   Why: DecLock contrasts software lock handoff with in-network lock
   management; useful as a foil before GPU DB assumes switch/NIC assistance for
-  gateway, remote-tier, or disaggregated-memory lock coordination.
+  gateway, remote-tier, or disaggregated-memory lock coordination. Journal
+  entry added 2026-06-06.
+- `queued` — **NetLock: Fast, Centralized Lock Management Using
+  Programmable Switches**, Chen et al., SIGCOMM 2020.
+  URL: `https://doi.org/10.1145/3387514.3405857`
+  Code: `https://github.com/netx-repo/NetLock/`
+  Why: FissLock's main in-network lock-management baseline; useful if GPU DB
+  needs a direct comparison between full on-switch participant state and
+  fissioned compact grant metadata before considering NIC/switch-assisted
+  route admission.
 - `queued` — **The Case for Distributed Shared-Memory Databases with
   RDMA-Enabled Memory Disaggregation**, Zhou et al., arXiv 2022.
   URL: `https://arxiv.org/abs/2207.03027`
