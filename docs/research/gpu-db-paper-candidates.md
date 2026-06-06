@@ -3035,14 +3035,15 @@ Append new candidates here as each paper is processed.
   adaptation, and workload-distribution shifts; useful for deciding whether
   GPU DB should start with interpretable conflict-history admission before
   heavier learned schedulers.
-- `queued` — **Design Principles for Scaling Multi-core OLTP Under High
+- `reviewed` — **Design Principles for Scaling Multi-core OLTP Under High
   Contention**, Ren, Faleiro, and Abadi, SIGMOD 2016.
   URL: `https://doi.org/10.1145/2882903.2882955`
   PDF: `http://www.cs.umd.edu/~abadi/papers/orthrus-sigmod16.pdf`
   Why: TSkd contrasts with Orthrus-style separation of transaction logic and
   concurrency-control cores; useful for deciding whether GPU DB mutation
   owners, read-snapshot workers, and conflict/admission workers should be
-  separated under hot-key contention.
+  separated under hot-key contention. Journal entry added 2026-06-06; DOI
+  corrected in the journal citation to `10.1145/2882903.2882958`.
 - `queued` — **Self-Driving Database Management Systems**, Pavlo et al.,
   CIDR 2017.
   URL: `https://www.cidrdb.org/cidr2017/papers/p42-pavlo-cidr17.pdf`
@@ -4072,13 +4073,14 @@ Append new candidates here as each paper is processed.
   buffer paper; useful as a DB-external contrast for per-application logs,
   performance isolation, and when DB-owned tiering should bypass the file
   system.
-- `queued` — **Design Principles for Scaling Multi-core OLTP Under High
+- `reviewed` — **Design Principles for Scaling Multi-core OLTP Under High
   Contention**, Ren et al., SIGMOD 2016 / arXiv 2015.
   URL: `https://arxiv.org/abs/1512.06168`
   Why: ORTHRUS-style separation of transaction execution stages and advanced
   transaction planning is a direct follow-up for FOEDUS's many-core OCC
   scaling limits under high contention, and may inform GPU DB mutation-owner
-  admission and partitioned write lanes.
+  admission and partitioned write lanes. Journal entry added 2026-06-06 from
+  the SIGMOD 2016 author PDF.
 - `queued` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
   Stores**, Conway et al., USENIX ATC 2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/conway`

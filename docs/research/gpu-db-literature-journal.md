@@ -38,6 +38,184 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - Orthrus separates conflict ownership from transaction execution
+
+**Citation:** Kun Ren, Jose M. Faleiro, and Daniel J. Abadi. "Design
+Principles for Scaling Multi-core OLTP Under High Contention." SIGMOD 2016,
+pp. 1583-1598. DOI: `https://doi.org/10.1145/2882903.2882958`.
+Retrieved 2026-06-06 from the author PDF,
+`http://www.cs.umd.edu/~abadi/papers/orthrus-sigmod16.pdf`.
+
+**Category:** transaction processing / write path and concurrency control,
+with runtime / HFT / session-scale relevance.
+
+**Relevance tags:** OLTP; high contention; partitioned functionality;
+message passing; concurrency-control threads; execution threads; lock
+ownership; deadlock avoidance; planned access; OLLP; single-writer metadata;
+queue locality; owner domains; hot-key admission; stored procedures.
+
+**Core idea:** Orthrus argues that contended OLTP cannot scale linearly for
+fundamental isolation reasons, but many multicore engines perform far worse
+than necessary because the same worker thread mixes transaction logic with
+concurrency-control metadata manipulation. That makes hot logical records also
+become hot physical cache lines, lock tables, and deadlock-management state.
+Orthrus splits responsibilities: execution threads run transaction logic, while
+concurrency-control threads own disjoint database-object metadata and service
+lock requests through explicit messages.
+
+The strongest transferable idea for GPU DB is that owner domains are not only
+a correctness simplification; they are a way to keep conflict metadata from
+moving between cores. A hot tuple, partition, resident route, or future GPU
+write-batch conflict class should have one narrow authority for admission and
+publication decisions, while execution workers keep doing useful work instead
+of spinning on shared lock state.
+
+**Concrete mechanisms:**
+
+- Orthrus targets main-memory OLTP and creates one pinned thread per physical
+  core. Threads are assigned narrow roles rather than all running the same
+  multipurpose transaction loop.
+- Concurrency-control threads own disjoint sets of database objects. Each one
+  maintains the lock metadata for its objects, similar in logical content to a
+  centralized lock manager, but without sharing that metadata with execution
+  threads or other CC threads.
+- Execution threads run transaction logic and request locks by sending messages
+  to the CC thread responsible for the relevant objects. They do not directly
+  read or mutate lock-manager data structures.
+- To avoid turning message queues into new contention points, each CC thread has
+  a separate physical input queue per execution thread. Each queue is single
+  writer / single reader and implemented as a latch-free circular buffer, except
+  for the rare full-queue case.
+- A CC thread drains its logical input queues, inserts lock requests for locally
+  owned objects, and replies only when the requested local locks are granted.
+  Lock releases can be acknowledged immediately because they are satisfied
+  immediately.
+- Because one CC thread owns all lock metadata for a given object, lock lists do
+  not bounce between cores. Contended records produce queueing at their owner
+  instead of cache-coherence traffic across all execution threads.
+- Orthrus uses planned data access for deadlock avoidance. An execution thread
+  must know a transaction's complete lock request set before acquiring locks,
+  then acquire from CC threads in a well-defined order by CC-thread id.
+- Requests to multiple CC threads are sequential for deadlock freedom. The next
+  CC thread is contacted only after locks from the previous CC thread have been
+  granted.
+- When a transaction's access set depends on data, Orthrus uses the OLLP
+  technique from Calvin: run a reconnaissance pass without locks or writes to
+  estimate the access footprint, annotate the transaction, then run the real
+  transaction after acquiring the estimated locks. If execution discovers a
+  missing lock, the estimate is updated and the transaction aborts/restarts.
+- The paper explicitly calls out the tradeoff: acquiring all locks before
+  transaction execution can increase lock hold time, especially if a hot record
+  is only needed late in the transaction. The bet is that avoiding deadlock
+  detection, false aborts, and shared metadata movement can more than repay
+  that extra hold time under high contention.
+- Orthrus reduces asynchronous message overhead by letting CC threads forward a
+  transaction's lock-acquisition message to the next CC thread in order. This
+  changes multi-CC acquisition from roughly two messages per CC thread to
+  `Ncc + 1` messages.
+- The evaluated prototype compares against deadlock-free locking, 2PL with
+  wait-die, wait-for graph detection, dreadlocks, and partitioned-store
+  baselines.
+- Experiments use an 80-core machine for most reported results, plus smaller
+  core counts for scalability comparisons. The paper uses synthetic hot-record
+  workloads and TPC-C NewOrder/Payment stored procedures; the TPC-C setup uses
+  10% remote NewOrder and 15% remote Payment transactions, so about 12.5% of
+  transactions need two CC partitions.
+- In a hot-record benchmark on 80 cores, deadlock-free locking beats dynamic
+  deadlock handling. At the highest contention point shown, it is reported as
+  2.2x faster than wait-die and 5.5x faster than dreadlocks or wait-for graph
+  detection.
+- In TPC-C with 16 warehouses while scaling core count, Orthrus continues to
+  scale under contention and at 80 cores reports roughly 2x the throughput of
+  deadlock-free locking and nearly an order of magnitude over 2PL with
+  dreadlocks.
+- With more warehouses and lower contention, Orthrus still reports an advantage
+  over locking baselines, attributed to reduced instruction/data cache footprint
+  from partitioned functionality. The advantage shrinks as contention drops.
+- Orthrus is weaker when a workload is perfectly partitionable and all
+  transactions stay within one partition: shared-nothing partitioned-store can
+  avoid concurrency control entirely for that case. Orthrus is positioned for
+  workloads with enough cross-partition or non-oracle access that pure
+  partitioning is not enough.
+
+**GPU DB mapping:** Orthrus reinforces the current owner-domain runtime
+direction. The mutation owner, catalog owner, residency owner, GPU execution
+owners, and optional partition owners should not be treated as incidental
+threads. They are the mechanism that keeps hot metadata local: WAL frontier,
+visibility generation, resident route state, invalidation flags, and hot-key
+conflict queues should be mutated by one authority at a time.
+
+The message-passing design maps directly to bounded command rings. GPU DB
+should prefer single-writer/single-reader rings where possible, especially
+between network IO workers and owner domains or between owner domains and GPU
+execution workers. A hot route should create observable owner queueing, not
+unbounded shared-memory spinning across many session workers.
+
+Planned data access is most applicable to stored procedures, prepared
+same-shape writes, COPY batches, and future GPU write kernels. Before routing a
+batch to GPU, the system should have a route certificate naming the intended
+partition/key ranges, owner-domain order, conflict class, WAL dependency, and
+fallback if the footprint estimate is wrong. For ad hoc SQL, a reconnaissance
+or preflight pass may be too expensive, but a lighter route-shape estimate can
+still prevent launching GPU work that will later be doomed by a missing lock,
+invalid snapshot, or saturated owner.
+
+Orthrus also warns against creating a separate "CC service" without measuring
+message overhead. Its benefit comes from narrow ownership and queue locality;
+if GPU DB sends every point lookup, retained read, or low-conflict update
+through multiple owners, the cross-owner messages can dominate. The right
+benchmark is the crossover: owner-local optimistic validation for ordinary
+work, planned owner-ordered admission for hot or fixed-shape work, and explicit
+rejection/fallback when the footprint is unknown.
+
+**Risks and mismatches:** Orthrus is a CPU main-memory prototype using
+pessimistic locking. It does not include GPU execution, WAL flush cost,
+MVCC-retained snapshots, SQL parser/planner overhead, pgwire session scale, or
+NVMe/cold-tier recovery.
+
+The design assumes transaction access can often be planned. That fits stored
+procedures and fixed templates better than arbitrary interactive SQL. OLLP's
+reconnaissance pass reads without consistency guarantees and is only an
+estimate, so GPU DB would need strict route-contract rules for what can be
+preflighted safely.
+
+Sequential acquisition across CC threads avoids deadlocks but can extend lock
+hold time and add cross-owner latency. In GPU DB, that interacts with
+WAL-before-visibility and retained snapshot publication; an owner-ordered
+route must not hold resident invalidation or WAL publication barriers longer
+than necessary.
+
+The paper's results are strongest under high contention. Under low contention
+or perfectly partitionable transactions, simpler owner-local execution can win.
+GPU DB should therefore treat Orthrus as a hot-route strategy, not a universal
+path for every transaction.
+
+**Benchmark candidates:**
+
+- Add a hot-key owner-admission simulator with three paths: shared lock/atomic
+  metadata, single-owner conflict queue, and owner-ordered planned acquisition
+  across two partitions. Gate: hot metadata stays local and p99 wait is visible.
+- Build a route-preflight benchmark for prepared write templates: estimate
+  owner domains and key ranges, acquire owner admission in deterministic order,
+  then execute. Failure condition: preflight overhead hurts low-conflict
+  throughput more than it helps hot-key p99.
+- Compare per-session direct metadata access with SPSC ingress rings into a
+  partition owner. Measure cache misses, queue wait, abort/retry count, and
+  response latency under 1,000 to 100,000 logical sessions.
+- For future GPU write batches, require the batch descriptor to include
+  owner-domain order and conflict footprint. Gate: no GPU batch launches before
+  the CPU owners can prove the batch's publication order or fallback path.
+- Add a two-owner transaction benchmark where one owner is hot and the other is
+  cold. Gate: deterministic owner ordering avoids deadlock without pinning the
+  cold owner behind long hot-owner waits.
+- Measure reconnaissance/preflight for ad hoc SQL separately from stored
+  procedures. Failure condition: a route-shape probe reads inconsistent state
+  and then publishes a result or write without a later snapshot/visibility
+  proof.
+- Track "metadata movement avoided" as an implementation metric: hot route
+  state should be mutated by one owner, and other workers should communicate by
+  messages, immutable snapshots, or published handles.
+
 ### 2026-06-06 - Plor makes tail latency a conflict-priority problem, not only a lock-cost problem
 
 **Citation:** Youmin Chen, Xiangyao Yu, Paraschos Koutris, Andrea C.
