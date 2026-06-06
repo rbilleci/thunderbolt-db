@@ -38,6 +38,184 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - PULSE moves pointer traversal to the future memory tier
+
+**Citation:** Yupeng Tang, Seung-seob Lee, Abhishek Bhattacharjee,
+and Anurag Khandelwal. "pulse: Accelerating Distributed
+Pointer-Traversals on Disaggregated Memory." ASPLOS 2025, pp.
+858-875. DOI: `https://doi.org/10.1145/3669940.3707253`.
+Retrieved 2026-06-06 from the arXiv extended-version PDF,
+`https://arxiv.org/pdf/2305.02388`; author PDF:
+`https://www.cs.yale.edu/homes/abhishek/ytang-asplos25.pdf`.
+
+**Category:** multi-tier cache / data placement and database
+storage/indexing, with secondary runtime / HFT / session-scale
+relevance.
+
+**Relevance tags:** disaggregated memory; pointer traversal;
+near-memory processing; remote indexes; future memory tier; CXL;
+programmable switch; hierarchical address translation; iterator
+offload; scratchpad continuation; bounded traversal; remote B+Tree;
+cache-unfriendly access; route placement.
+
+**Core idea:** PULSE argues that CPU-side caches and prefetchers are
+not enough for pointer-heavy structures on disaggregated memory.
+Linked indexes, trees, lists, and graph traversals still pay serial
+remote-memory round trips when the next address is known only after
+reading the current node. PULSE therefore pushes a restricted,
+iterator-shaped traversal program close to the memory node and lets a
+programmable switch route the continuation when the next pointer lives
+on another memory node.
+
+For GPU DB, the transferable idea is a warning and a design option:
+future cold/warm tiers should not assume that caching or prefetching
+will make pointer-heavy metadata cheap. Range indexes, MVCC chains,
+resident-segment directories, and cold-tier object maps either need
+placement that avoids long remote pointer chains, or a narrow
+offloaded traversal contract with explicit continuation state and
+fallback.
+
+**Concrete mechanisms:**
+
+- The paper targets rack-scale disaggregated memory where CPU nodes
+  have limited local DRAM as cache and access network-attached memory
+  pools with much higher latency than local cache/DRAM. It notes CXL
+  memory as a related future tier with roughly hundreds of nanoseconds
+  of access latency in cited measurements.
+- The programming model is an iterator abstraction with developer
+  supplied `init`, `next`, and `end` functions. `init` runs on the CPU;
+  `next` and `end` are compiled for the PULSE accelerator.
+- Traversal state is limited to `cur_ptr` plus a fixed-size
+  `scratch_pad`. That state acts as a continuation and is returned to
+  the CPU or forwarded to another memory node.
+- Each offloaded request has a maximum iteration count. A long
+  traversal returns partial state so the CPU can issue a continuation,
+  preventing one request from monopolizing the accelerator.
+- The dispatch engine compiles iterator code to a restricted
+  RISC-V-like ISA with loads, stores, ALU operations, branches, and
+  special `RETURN` / `NEXT_ITER` instructions.
+- Offload is admitted only when per-iteration compute time is small
+  relative to memory-access time: the paper uses a threshold
+  `t_c <= eta * t_d`, with `eta <= 1`, to keep the accelerator focused
+  on memory-centric traversal rather than general compute.
+- The accelerator disaggregates memory pipelines from logic pipelines.
+  Because each iteration fetches a node and then computes the next
+  pointer, tightly coupled CPU-like cores leave either memory or logic
+  idle. PULSE provisions asymmetric pipeline counts and multiplexes many
+  iterator requests across them.
+- Local memory nodes maintain local address translation and protection
+  metadata. The network switch keeps coarser global address-range to
+  memory-node mappings.
+- When a memory node discovers that the next pointer is remote, it sends
+  the request back to the programmable switch. The switch inspects
+  `cur_ptr`, forwards the request to the responsible memory node, and
+  the next node resumes with the same `scratch_pad`.
+- The design deliberately does not offload synchronization. The CPU-side
+  application or data-structure logic must acquire and release locks or
+  otherwise provide concurrency safety before issuing an offloaded
+  traversal.
+- The prototype uses commodity servers, 100 Gbps Mellanox NICs, FPGA
+  SmartNICs, and a 6.4 Tbps Tofino programmable switch. The evaluation
+  includes WebService hash-table access, WiredTiger B+Tree range
+  requests, and BTrDB time-series B+Tree aggregation.
+- The paper reports that PULSE is 9-34x lower latency and 28-171x
+  higher throughput than cache-only disaggregated-memory baselines on
+  its real-world workloads, while using 4.5-5x less energy per operation
+  than CPU-RPC offload schemes.
+- For distributed traversals, in-network continuation cuts latency
+  overhead by 33-98% relative to returning to the CPU on every remote
+  pointer hop, and the paper reports 1.1-1.36x higher throughput than
+  RPC in those cases.
+
+**GPU DB mapping:** The P8 storage target currently treats GPU memory
+as an explicit performance tier and leaves future tiers open. PULSE
+suggests that if GPU DB later adds CXL memory, RDMA memory pools, or
+object/NVMe metadata served through a storage gateway, the indexing
+layout must be evaluated by remote pointer-hop count, not just bytes.
+
+For cold and warm indexes, prefer structures whose route can be proved
+with a small number of bounded remote reads: cache-line-sized fence
+keys, compact page directories, segment manifests, or learned/range
+summaries. When a true pointer traversal is unavoidable, require a
+PULSE-like contract: fixed continuation state, bounded iteration
+budget, explicit memory-node routing, and CPU-owned synchronization.
+
+For MVCC, the warning is sharper. Long tuple-version chains or
+catalog/residency descriptor chains are tolerable in local DRAM, but
+can become p99 disasters if each link crosses a future memory tier.
+Retained snapshots and route metadata should therefore expose
+chain-depth and remote-hop telemetry, and compaction should prioritize
+hot chains that cross tiers.
+
+For GPU execution, PULSE is not a direct GPU-kernel design. It is a
+pre-GPU or sidecar-tier design: resolve remote pointer-heavy metadata
+near the tier, return compact row ids, page ids, key vectors, or segment
+handles, then let GPU workers operate on dense resident buffers. That
+keeps general synchronization and SQL correctness with CPU owners while
+avoiding repeated CPU round trips for cold metadata walks.
+
+For runtime admission, the `t_c <= eta * t_d` rule maps to a route
+admission guard. Offload only traversals that are memory-bound, bounded,
+and continuation-safe. If the route needs arbitrary SQL evaluation,
+unbounded loops, locks inside the accelerator, or broad side effects,
+fall back to the canonical CPU owner path.
+
+**Risks and mismatches:** PULSE is a hardware/software co-design for
+disaggregated memory, not a DBMS isolation, WAL, recovery, or SQL
+execution protocol. It explicitly leaves synchronization to CPU-side
+application logic, so it cannot by itself make MVCC reads or index
+updates safe.
+
+The accelerator ISA and programmable-switch routing are not available
+on ordinary deployments. Treat this as a future-tier design constraint
+and simulator target before assuming specialized hardware.
+
+The evaluated B+Tree paths are WiredTiger/BTrDB-style workloads, not
+GPU DB's exact row format, snapshot visibility, route certificates, or
+write-heavy OLTP indexes. The reported throughput gains may not apply
+when remote traversal is only a small fraction of query time.
+
+Bounded traversal is both a strength and a limitation. Returning
+continuation state protects fairness, but it also means long range
+queries or deep chains may still require multiple requests and careful
+latency accounting.
+
+Pushing traversal near memory can make debugging and correctness
+harder. GPU DB should not move visibility, lock acquisition, or
+WAL-before-visibility logic into a memory-side accelerator unless the
+proof boundary is much stronger than PULSE's iterator contract.
+
+**Benchmark candidates:**
+
+- Add a future-tier pointer-hop simulator for B+Tree/range-index,
+  MVCC-chain, catalog-route, and resident-segment metadata traversals.
+  Gate: report remote hops, continuation count, p50/p99 latency, and
+  CPU-owner round trips separately from payload bytes.
+- Compare three cold-index layouts: pointer-heavy tree, compact
+  directory plus dense page scan, and offloaded iterator traversal.
+  Expected result: pointer-heavy trees lose when cache misses cross the
+  future tier; failure condition: compact summaries are too imprecise and
+  create excessive GPU/CPU scan work.
+- Prototype a bounded route-continuation API in the simulator:
+  `cur_ptr`, fixed scratchpad, max iterations, route generation, and
+  fallback reason. Gate: no offloaded route can acquire locks, change
+  visibility, or hide an unbounded traversal.
+- Track MVCC/version-chain remote-hop depth as a retention and
+  compaction signal. Expected result: hot snapshots with remote chains
+  are materialized or compacted before they dominate p99.
+- Evaluate a "near-tier metadata resolver" that returns dense row ids,
+  page ids, or segment ids for GPU workers. Gate: resolver output is tied
+  to a visibility/categorization generation and is invalidated before
+  stale GPU execution can use it.
+- Stress admission with memory-bound and compute-heavy traversals.
+  Gate: only routes passing an `eta`-style memory-bound test are sent to
+  the near-tier offload path; compute-heavy or SQL-expression-heavy work
+  falls back cleanly.
+- Compare switch/in-network continuation with CPU-return continuation in
+  a model of disaggregated storage nodes. Failure condition: in-network
+  routing improves mean latency but creates hidden reorder, security, or
+  tenant-isolation problems.
+
 ### 2026-06-06 - Forerunner turns speculative work into constraint-checked fast paths
 
 **Citation:** Yang Chen, Zhongxin Guo, Runhuai Li, Shuo Chen,

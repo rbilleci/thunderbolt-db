@@ -452,13 +452,24 @@ Append new candidates here as each paper is processed.
   over resident, warm, or cold segments instead of relying only on full scans
   or B-tree-like access paths. Journal entry added 2026-06-06; the previously
   queued title/venue wording was corrected to the PACMMOD paper metadata.
-- `queued` — **PULSE: Accelerating Distributed Pointer-Traversals on
-  Disaggregated Memory**, Zuo et al., arXiv 2023.
+- `reviewed` — **PULSE: Accelerating Distributed Pointer-Traversals on
+  Disaggregated Memory**, Tang et al., ASPLOS 2025.
   URL: `https://arxiv.org/abs/2305.02388`
+  DOI: `https://doi.org/10.1145/3669940.3707253`
   Why: SMART shows that remote pointer traversal saturates memory-side IOPS;
   PULSE explores pushing pointer traversal work closer to disaggregated memory,
   a useful future-tier contrast before GPU DB puts more range-index logic in
-  remote memory or storage-side execution.
+  remote memory or storage-side execution. Journal entry added 2026-06-06; the
+  previously queued author/year metadata was corrected to the ASPLOS 2025
+  paper.
+- `queued` — **AIFM: High-Performance, Application-Integrated Far Memory**,
+  Ruan et al., OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/ruan`
+  PDF: `https://www.usenix.org/system/files/osdi20-ruan.pdf`
+  Why: PULSE compares against AIFM as a data-structure-aware far-memory cache;
+  useful for deciding whether GPU DB future-tier placement should expose
+  application/route semantics to the memory manager before adopting
+  accelerator-side pointer traversal.
 - `queued` — **Rethinking the Encoding of Integers for Scans on Skewed Data**,
   Prammer and Patel, SIGMOD/PACMMOD 2023.
   URL: `https://doi.org/10.1145/3626751`
