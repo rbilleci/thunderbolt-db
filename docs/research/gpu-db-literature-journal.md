@@ -38,6 +38,181 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-06 - PALF: Replicated WAL should return file-like commit facts, not just consensus progress
+
+**Citation:** Fusheng Han, Hao Liu, Bin Chen, Debin Jia, Jianfeng
+Zhou, Xuwang Teng, Chuanhui Yang, Huafeng Xi, Wei Tian, Shuning
+Tao, Sen Wang, Quanqing Xu, and Zhenkun Yang. "PALF: Replicated
+Write-Ahead Logging for Distributed Databases." PVLDB 17(12),
+2024, pp. 3745-3758. doi:10.14778/3685800.3685803. Retrieved
+2026-06-06 from `https://www.vldb.org/pvldb/vol17/p3745-xu.pdf`.
+
+**Category:** WAL, logging, and read/write throughput, with
+transaction processing, recovery, and future replication relevance.
+
+**Relevance tags:** replicated WAL; append-only log files; explicit
+commit/failure callbacks; WAL-before-visibility; leader election;
+pending follower; change sequence number; follower reads; physical
+standby; mirrored log groups; adaptive group commit; lock-free log
+sequencing; distributed recovery.
+
+**Core idea:** PALF argues that distributed databases should not
+have to treat consensus as an opaque replicated state machine when
+their transaction engine really needs WAL-like behavior. OceanBase
+4.0 applies writes to its in-memory storage engine, generates redo
+records, and appends them to PALF as an append-only replicated log.
+PALF then gives the transaction engine file-like append, read, tail,
+trim, and role callbacks while hiding Paxos replication behind that
+boundary.
+
+The transferable point for GPU DB is that the durability boundary
+must return database-shaped facts. A mutation owner cannot safely
+publish visibility just because work entered a log buffer or a
+consensus instance is in progress. It needs an explicit success or
+failure result for the commit record, a durable log position, an
+ordering token usable by read snapshots, and a recovery/replay path
+that can decide the fate of in-flight writes after leader or owner
+transition.
+
+**Concrete mechanisms:**
+
+- PALF exposes `append`, `mirror`, `read`, `locate`, `monitor_tail`,
+  `monitor_role`, and `trim` interfaces. `append` is asynchronous:
+  it returns a log sequence number after reservation and later calls
+  exactly one success or failure callback when replication outcome is
+  known.
+- Log sequence numbers are physical offsets in append-only log
+  blocks. Each log entry also carries a change sequence number (CSN)
+  that is monotonic within a PALF group and is used by OceanBase to
+  track transaction order across groups.
+- PALF decouples leader election from log replication so database
+  priorities can influence leader placement. Before a candidate acts
+  as leader, log reconfirmation runs a Basic Paxos-style phase to
+  learn the longest accepted logs in a majority.
+- A previous leader that loses leadership enters a pending-follower
+  state instead of immediately becoming an ordinary follower. When it
+  receives logs from the new leader, it can classify pending local
+  logs as committed or truncated and notify the transaction engine.
+- Explicit replication results let the transaction engine commit when
+  a commit record is durably replicated, or roll back if a pending log
+  is truncated. The paper excludes direct notification when the leader
+  crashes and loses in-memory state; recovery then relies on replay.
+- CSN is persisted with log entries. OceanBase uses a transaction
+  timestamp as a reference CSN, waits until the timestamp oracle has
+  advanced past the returned CSN before replying, and can serve
+  follower reads after replaying all logs up to a requested CSN.
+- PALF group mirrors replicate already-committed log entries from a
+  primary PALF group into an independent Paxos group for physical
+  standby databases and restore. The mirror reuses LSN and CSN while
+  replacing group-local consensus header fields.
+- Primary and mirror access modes are switched by a small Paxos
+  protocol and stored in metadata. Reconfiguration metadata is kept
+  outside the normal data log so standby/mirror groups can be
+  reconfigured independently.
+- Independent metadata requires safety fences. PALF attaches a log
+  barrier to reconfiguration so followers refuse a new configuration
+  until they have flushed logs before the barrier, and uses config
+  version as the chief election priority to avoid stale-membership
+  leadership.
+- Performance mechanisms include pipelined replication, an in-memory
+  sliding window for consensus state, adaptive group replication that
+  switches between low-latency feedback flushing and periodic grouped
+  replication, and a lock-free write path.
+- The lock-free sequencer reserves LSN ranges with atomic
+  compare-and-swap. After reservation, appending threads fill distinct
+  offsets in the group buffer, so the shared buffer is not a
+  write-contention point.
+- The closed-loop evaluation uses three replicas on 10 GbE. The paper
+  reports 478K 512-byte appends/s at 1500 clients and 1.48M appends/s
+  at 8000 clients. Reported latency is about 2 ms below 1500 clients
+  and about 4.8 ms at 8000 clients. OceanBase three-replica OLTP
+  benchmarks show about 8.8% average performance reduction versus
+  stand-alone in the tested setup.
+
+**GPU DB mapping:** GPU DB's current WAL-before-visibility rule maps
+directly to PALF's explicit result contract. Even before distributed
+replication exists, the mutation owner should treat the WAL append
+as an asynchronous reservation followed by a durable outcome. A
+commit record should publish visibility only after a callback/future
+records success, and failure should drive rollback or retry without
+leaving resident snapshots, route certificates, or CPU indexes in an
+ambiguous state.
+
+PALF's LSN/CSN split is a useful design pattern for local GPU DB.
+The storage layer needs byte/segment positions for replay and
+trimming, but snapshots and retained routes need a comparable
+visibility generation. A future design could keep a physical WAL LSN
+for recovery, plus a commit visibility sequence used by route
+certificates, resident generations, follower/read-replica eligibility,
+and cache invalidation.
+
+The pending-follower idea maps to owner failover and maintenance
+handoff. If GPU DB later splits mutation owners by partition or adds
+replicated owners, the old owner must not simply drop in-flight
+append state on role loss. It should enter a draining classification
+state where every reserved commit record becomes success, failure,
+or unknown-crash-replay, and only then can route metadata and
+sessions be advanced.
+
+Adaptive group replication also maps to write admission. COPY,
+INSERT, and small transaction commits can share one durability or
+replication round under a latency ceiling, but the policy should
+change with concurrency. At low concurrency, flush promptly. Under
+high concurrency, let natural queue depth form group commits,
+because grouping is what makes one log owner absorb many sessions
+without requiring one replication group per partition.
+
+For future cold-tier and standby work, PALF group mirrors are a
+reminder that physical log streams are also data-placement streams.
+GPU DB may eventually need checkpoint archive, replica warmup,
+remote cold-tier rebuild, or analytical standby refresh. Mirroring
+committed WAL with stable visibility order is cleaner than inventing
+separate ad hoc copy protocols for every downstream tier.
+
+**Risks and mismatches:** PALF is a distributed database WAL system
+inside OceanBase, not a single-node GPU storage engine. It assumes
+networked replicas, Paxos groups, follower replay, and OceanBase's
+transaction/storage architecture. The paper does not address CUDA
+streams, resident GPU cache invalidation, pgwire response rings,
+GPU memory budgets, or SQL planner route certificates.
+
+The reported latencies are millisecond-scale because the system is
+replicating over network and disk. GPU DB's local commit path may
+need lower p50 latency for retained reads and small writes, so PALF's
+grouping policy should be adapted with tighter local latency gates.
+The CSN design also depends on coordination with a timestamp oracle;
+GPU DB should start with a simpler local monotonic visibility
+generation before importing distributed timestamp machinery.
+
+**Benchmark candidates:**
+
+- Add an explicit WAL-append outcome probe around the mutation owner:
+  reserved LSN, commit visibility generation, success/failure state,
+  and post-callback visibility publication. Gate: no transaction
+  becomes visible before durable success is recorded.
+- Compare immediate fsync, fixed-interval group commit, and adaptive
+  queue-depth group commit for small INSERT/COPY batches. Measure
+  write throughput, p50/p99 commit latency, WAL bytes, batch size,
+  and read-route invalidation delay.
+- Prototype a local `commit_visibility_sequence` separate from WAL
+  byte offset. Gate: retained route certificates and CPU MVCC reads
+  use the same comparable boundary while replay still uses physical
+  WAL positions.
+- Add owner-transition simulation for in-flight commit records:
+  success, truncated/failure, and crash-before-callback. Failure
+  condition: a session, resident generation, CPU index, or route
+  certificate observes an ambiguous write as committed.
+- Add WAL tail callbacks for residency maintenance. A refresh worker
+  should subscribe to committed tail advancement and invalidation
+  ranges instead of polling table state blindly.
+- Benchmark COPY admission with group commit plus resident
+  invalidation. Gate: batching improves writes without delaying
+  invalidation past post-commit visibility or starving retained reads.
+- Define a future replica/archive experiment that replays committed
+  WAL into a standby CPU truth and rebuilds resident GPU snapshots
+  from that stream. Failure condition: replay order diverges from the
+  visibility generation used by primary route certificates.
+
 ### 2026-06-06 - Cross-paper synthesis: route scheduling now needs logical, physical, and pressure proofs
 
 The recent Decibel, ROME, datacenter RDMA, and Laser reviews point

@@ -315,13 +315,14 @@ Append new candidates here as each paper is processed.
 
 ### WAL, logging, and read/write throughput
 
-- `queued` — **PALF: Replicated Write-Ahead Logging for Distributed
+- `reviewed` — **PALF: Replicated Write-Ahead Logging for Distributed
   Databases**, Xu et al., PVLDB 2024.
   PDF: `https://www.vldb.org/pvldb/vol17/p3745-xu.pdf`
   DOI: `https://doi.org/10.14778/3685800.3685803`
   Why: production distributed WAL design from OceanBase with append-only log
   files, replication, recovery, and read/write performance implications;
   directly relevant to GPU DB WAL-before-visibility and future replica paths.
+  Journal entry added 2026-06-06.
 - `queued` — **DecLog: Decentralized Logging in Non-Volatile Memory for Time
   Series Database Systems**, Zheng et al., PVLDB 2023.
   PDF: `https://www.vldb.org/pvldb/vol17/p1-zheng.pdf`
@@ -341,6 +342,18 @@ Append new candidates here as each paper is processed.
   Why: WAL-time key-value separation links write-ahead logging directly to LSM
   write amplification, memory pressure, and read/write jitter; useful for GPU
   DB cold-tier ingest and compaction policy.
+- `queued` — **High Throughput Replication with Integrated Membership
+  Management**, Fouto, Preguica, and Leitao, USENIX ATC 2022.
+  URL: `https://www.usenix.org/conference/atc22/presentation/fouto`
+  Why: PALF contrasts separate metadata/reconfiguration choices with integrated
+  membership replication; useful for comparing future GPU DB replicated WAL
+  membership, failover, and availability tradeoffs.
+- `queued` — **DistributedLog: A High Performance Replicated Log Service**,
+  Guo, Dhamankar, and Stewart, ICDE 2017.
+  URL: `https://doi.org/10.1109/ICDE.2017.172`
+  Why: PALF compares CSN-style database ordering with replicated log services;
+  useful for deciding whether GPU DB should keep WAL bundled with mutation
+  owners or expose an independent replicated log service.
 
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
