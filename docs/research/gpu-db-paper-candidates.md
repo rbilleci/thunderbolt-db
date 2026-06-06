@@ -301,12 +301,28 @@ Append new candidates here as each paper is processed.
   Why: recent high-throughput storage-engine design for streaming and batch
   analytics; useful for GPU DB ingestion, scan throughput, file layout,
   indexing metadata, and bounded freshness tradeoffs.
-- `queued` — **DEX: Scalable Range Indexing on Disaggregated Memory**, VLDB
+- `reviewed` — **DEX: Scalable Range Indexing on Disaggregated Memory**, VLDB
   2024.
   URL: `https://www.microsoft.com/en-us/research/publication/dex-scalable-range-indexing-on-disaggregated-memory/`
   Why: modern scalable B+-tree/range-index design for a remote/disaggregated
   memory tier; useful for comparing GPU DB cold/warm range indexes, remote
-  placement metadata, and read-path latency under tiered storage.
+  placement metadata, and read-path latency under tiered storage. Journal entry
+  added 2026-06-06.
+- `queued` — **Sherman: A Write-Optimized Distributed B+Tree Index on
+  Disaggregated Memory**, Wang, Lu, and Shu, SIGMOD 2022.
+  URL: `https://arxiv.org/abs/2112.07320`
+  DOI: `https://doi.org/10.1145/3514221.3526054`
+  Why: DEX compares against Sherman as a one-sided RDMA B+-tree baseline;
+  useful for write-optimized remote index layouts, RDMA command coalescing,
+  hierarchical locks, and entry/node versioning before GPU DB adopts
+  disaggregated range indexes.
+- `queued` — **SMART: A High-Performance Adaptive Radix Tree for
+  Disaggregated Memory**, Le et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p3323-le.pdf`
+  DOI: `https://doi.org/10.14778/3611540.3611545`
+  Why: DEX compares against SMART as a trie/radix-tree disaggregated-memory
+  index baseline; useful for contrasting B+-tree range routing with adaptive
+  radix indexing and limited compute-side cache coherence.
 - `queued` — **Cabin: A Practical Scan Index for Data Lakes**, SIGMOD 2024.
   URL: `https://2024.sigmod.org/toc-2-1.html`
   Why: recent scan-index design for file-backed/lake-style analytical storage;

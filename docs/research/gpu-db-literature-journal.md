@@ -76963,3 +76963,211 @@ less detailed than GPU DB would need for production.
   much throughput is gained when visibility is delayed until durable payload
   completion versus when durability is relaxed; report the correctness tradeoff
   explicitly instead of mixing the modes.
+
+### 2026-06-06 - DEX keeps remote range indexes scalable with logical ownership
+
+**Citation:** Baotong Lu, Kaisong Huang, Chieh-Jan Mike Liang, Tianzheng
+Wang, and Eric Lo. "DEX: Scalable Range Indexing on Disaggregated Memory."
+PVLDB 17(10):2603-2616, 2024. DOI:
+`https://doi.org/10.14778/3675034.3675050`. Retrieved 2026-06-06 from PVLDB
+`https://www.vldb.org/pvldb/vol17/p2603-lu.pdf`. Microsoft Research page:
+`https://www.microsoft.com/en-us/research/publication/dex-scalable-range-indexing-on-disaggregated-memory/`.
+Artifact: `https://github.com/baotonglu/dex`.
+
+**Category:** database file-system/storage/indexing and multi-tier data
+placement, with runtime/admission relevance for remote memory or future CXL/RDMA
+tiers.
+
+**Relevance tags:** disaggregated memory; range index; B+-tree; RDMA;
+logical partitioning; compute-side cache; path-aware caching; leaf caching;
+randomized cooling map; pointer swizzling; cost-aware offload; memory-side
+compute; fence keys; optimistic lock coupling; logical repartitioning;
+remote-index route proof; tier-aware range lookups.
+
+**Core idea:** DEX argues that a range index cannot become scalable on
+disaggregated memory by simply moving B+-tree pages behind RDMA. Remote memory
+has a much smaller latency gap from local DRAM than SSD has from DRAM, so cache
+maintenance overhead becomes visible; memory-side compute is scarce, so
+offload must be selective; and combining compute-side caches with memory-side
+updates creates too many consistency surfaces if ownership is shared
+everywhere.
+
+DEX's transferable idea is to make the remote index look shared in address
+space but mostly partition-owned in execution. Each compute server logically
+owns a key range, caches complete hot paths including leaves, and offloads
+only subtrees that are dedicated to one compute/memory-server pair and predicted
+to be faster than one-sided RDMA traversal. For GPU DB, that suggests cold or
+warm range indexes should not be generic remote structures touched equally by
+all workers. Route metadata should assign key ranges, resident partitions, or
+remote index shards to bounded owners, then make cache/offload/fallback choices
+inside that ownership boundary.
+
+**Concrete mechanisms:**
+
+- DEX stores normal B+-tree nodes across memory servers but groups subtrees
+  rooted at a configured level `M` on one memory server. This makes an
+  offloaded traversal stay local to one memory server instead of chasing
+  pointers across several remote nodes.
+- Pointers use tagged 64-bit addresses containing a swizzled bit, memory-server
+  id, and local address. Cached child pointers are swizzled to compute-local
+  addresses, while the memory pool keeps global addresses.
+- Logical partitioning assigns each compute server a disjoint key range.
+  Leaf nodes are exclusively owned by one logical partition, so leaf lookups
+  and updates avoid cross-compute cache coherence and RDMA-based distributed
+  locking in the common case.
+- Nodes that cross partition boundaries, such as high inner nodes near the
+  root, still require remote synchronization when fetched or updated. DEX uses
+  RDMA-based optimistic reads for shared nodes and writes updates for shared
+  inner nodes back to the memory pool.
+- Stale cached inner nodes are detected with fence keys. If a search lands in a
+  child whose fence-key range does not cover the search key, the traversal
+  refreshes from the remote root and invalidates stale cached path nodes.
+- Logical repartitioning changes key-range boundaries without physically
+  moving B+-tree data. The involved compute servers flush dirty cache pages and
+  adjust routing boundaries, which the evaluation reports finishing within
+  seconds for tested cache sizes.
+- The compute-side cache stores both inner and leaf nodes. A mapping table maps
+  global node ids to compute-local pages, and an `I/O` marker prevents many
+  threads from issuing duplicate RDMA fetches for the same missing node.
+- Cache replacement uses randomized cooling. When a worker needs a free page,
+  it samples cached nodes, unswizzles selected nodes from parents, writes dirty
+  pages back, and marks them cooling. If a cooling page is touched again, it is
+  restored to cached state.
+- DEX replaces a centralized FIFO cooling list with a cooling map: a concurrent
+  hash table whose buckets contain cacheline-sized FIFO arrays. This spreads
+  eviction metadata updates across buckets and avoids one hot head/tail pair.
+- Path-aware cooling preserves consecutive cached paths from root toward lower
+  levels. Inner-node cooling is delegated to swizzled children until the end of
+  the cached path, which also means a cache miss at a node tends to imply the
+  remaining subtree path is not cached.
+- Leaf admission is selective. The implementation admits inner nodes with
+  probability 1 but admits leaf nodes with an empirically chosen probability
+  around 0.1, avoiding eviction of proven-hot pages for one-off leaf accesses.
+- Offload is considered only on a cache miss for a non-shared node at or below
+  the subtree grouping level `M`. Range queries and operations that would cause
+  structural modification beyond the local subtree fall back to the normal
+  compute-side path.
+- The offload decision compares estimated one-sided RDMA traversal latency
+  `(L + 1) * (RDMA_READ_latency + local_search_latency) * c` against a moving
+  average for memory-side offload latency. A small contrary-action probability
+  keeps the estimates fresh as workload and resource state change.
+- To keep compute-cache and memory-side offload coherent, DEX pins the missed
+  node's parent, inserts an `I/O` marker for the missed node, lets concurrent
+  compute threads restart from root, and invalidates any cached copies of nodes
+  updated by successful offload.
+- Inserts use eager split on dedicated nodes but refresh shared path nodes from
+  memory before propagating splits into shared inner nodes. Deletes use similar
+  caution for merges.
+- Range scans do not use leaf links in this design. DEX decomposes scans into
+  multiple lookups using fence keys; after the first lookup, subsequent paths
+  are usually cached.
+- The evaluation uses a four-server RDMA cluster where each server acts as one
+  compute and one memory server, with 144 compute threads and 16 memory-side
+  threads in the default setup. Workloads are YCSB-like over 200 million
+  key-value records with Zipfian and uniform variants.
+- Reported results include DEX outperforming Sherman, SMART, and partitioned
+  variants by 2.5-8.2x on read-intensive workloads and 4.4-9.6x on
+  write-intensive workloads. For skewed read-only at 144 threads, DEX reports
+  far fewer RDMA operations per index operation than the baselines.
+- Ablations report that logical partitioning alone helps but then hits network
+  bottlenecks, adding caching improves throughput substantially, and adding
+  opportunistic offload improves constrained-cache throughput further. The
+  cooling map contributes the largest cache-design win in their skewed
+  read-intensive cache experiment.
+- Sensitivity experiments show that larger caches help read-intensive skewed
+  workloads, but overly large caches can hurt skewed write-intensive workloads
+  because local optimistic-lock contention and NUMA effects become bottlenecks.
+- Increasing memory-side offload threads reduces one-sided and two-sided RDMA
+  operations per request and improves throughput in the constrained-cache
+  experiment, but the paper explicitly frames offload as beneficial only while
+  memory-side compute has spare capacity.
+
+**GPU DB mapping:** DEX is a strong pattern for future warm/cold range indexes
+where index pages or route metadata may live outside the primary CPU owner:
+NVMe-backed host tiers, CXL memory, RDMA memory, or a remote storage/index
+service. The key transfer is not "use RDMA." It is "make the route owner,
+cached path, and offload boundary explicit." A retained route certificate for a
+range lookup should name the key-range owner, index generation, fence-key range,
+tier location, cache residency, and fallback path.
+
+For the P8 storage design, DEX suggests that range indexes over cold or
+over-resident segments should be partition-owned even if the durable segment
+namespace is globally addressable. Mutations should route through the owner
+that owns the key range, while reads should use cached immutable index paths
+when their fence keys and generation match the SQL snapshot. Shared high-level
+route nodes need version/fence validation; leaf-level or partition-local state
+should avoid global locks.
+
+The cooling-map result maps directly to resident metadata and warm-tier index
+caches. If GPU DB caches remote index pages, resident key-vector pages, or
+route descriptors, a single global LRU/FIFO queue is a likely hot spot at high
+session counts. A per-worker or bucketed randomized cooling design is a better
+first benchmark than a centralized replacement list.
+
+DEX's offload decision is also a useful route-choice template. GPU DB should
+not blindly push a lookup into GPU, storage, RDMA, CXL, or future memory-side
+compute. The route decision should compare observed local traversal, remote
+fetch, GPU kernel, and offload latency, include device/queue load, and keep a
+small exploration path so stale measurements do not lock the engine into a bad
+route.
+
+For 1M logical sessions, logical partitioning and offload constraints are more
+important than the raw RDMA numbers. Logical sessions should multiplex onto
+bounded range owners, and a cache miss should not fan out into duplicate remote
+fetches by many sessions. The `I/O` marker pattern maps to route-miss
+coalescing: one worker fetches or refreshes a missing index/segment path while
+other compatible requests restart, wait on a bounded promise, or fall back.
+
+**Risks and mismatches:** DEX is an index microbenchmark, not a full DBMS
+transaction engine. It does not cover SQL MVCC visibility, WAL-before-
+visibility, recovery ordering, DDL, predicate semantics beyond key/range
+operations, or GPU execution. GPU DB cannot let DEX-style cache invalidation
+replace tuple-version visibility or resident snapshot publication.
+
+The evaluation uses 8-byte keys and values over synthetic YCSB-like workloads.
+The value can represent a pointer to a record, but the paper does not measure
+full row fetch, columnar segment access, variable-width payloads, SQL result
+encoding, or interactions with GPU H2D/D2H transfers. GPU DB must test whether
+remote-index wins survive the rest of the query pipeline.
+
+The design assumes RDMA-like remote memory and enough control to place subtrees
+and run memory-side offload threads. Commodity NVMe, object storage, ordinary
+TCP, and cloud CXL/far-memory offerings may expose different semantics. Treat
+DEX as an ownership/cache/offload pattern, not as a portability guarantee.
+
+DEX's path-aware caching deliberately complicates eviction and offload
+coherence. That may be too much machinery for the first GPU DB range-index
+slice. A simpler owner-local immutable range-index snapshot plus versioned
+refresh may be the right first implementation, with DEX-style remote cache and
+offload added only after measurements show remote index traversal is the
+bottleneck.
+
+**Benchmark candidates:**
+
+- Build a partition-owned range-index simulator with globally addressable
+  index pages but owner-routed key ranges. Gate: range lookups avoid global
+  locks for leaf-level state, and logical repartitioning changes route
+  boundaries without physically rebuilding the index.
+- Compare three warm/cold range lookup paths: CPU owner traversal, cached
+  remote-index page traversal, and subtree offload. Measure p50/p99 latency,
+  remote bytes, cache hit rate, queue wait, and stale-route retries.
+- Prototype route-miss coalescing with an `I/O` marker for missing resident
+  index pages or cold segment descriptors. Gate: 1,000 concurrent same-range
+  misses create one fetch/refresh instead of a thundering herd.
+- Replace a centralized metadata-cache eviction queue with a bucketed cooling
+  map for route descriptors or warm index pages. Gate: higher throughput and
+  lower cacheline contention under many IO/read workers without breaking
+  deterministic invalidation.
+- Add fence-key and generation checks to a retained range route. Failure
+  condition: a stale cached inner route can send a read to the wrong key range
+  after split, repartition, refresh, or DDL.
+- Test offload route choice using moving averages for CPU traversal, remote
+  fetch, and GPU/storage offload. Gate: route choice adapts when memory-side
+  compute or GPU queues saturate, instead of blindly pushing all misses to the
+  remote/device path.
+- Measure cache-size sensitivity for skewed read and write workloads. Failure
+  condition: a larger metadata or index cache improves hit rate but worsens
+  p99 latency because local lock/NUMA contention dominates.
+- Stress snapshot correctness under logical repartitioning. A retained reader
+  holding an old range-route generation must either finish on a valid immutable
+  route or restart with a precise route-invalid reason after boundaries change.
