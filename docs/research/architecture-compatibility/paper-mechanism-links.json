@@ -876,8 +876,8 @@
             "matched_terms": [
               "admission"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The next few papers should bias toward MVCC validation, OLTP transaction scheduling, WAL/checkpoint/replay, or session admission that is closer to database request semantics than cluster-job scheduling.",
             "support_reason": "Matched journal terms (admission) to Vector-credit admission."
           },
@@ -1105,8 +1105,8 @@
               "backpressure",
               "congestion"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Otherwise GPU admission, RDMA gateway load, pinned-buffer staging, and response queues may chase latency problems caused by hidden host interconnect degradation.",
             "support_reason": "Matched journal terms (admission, backpressure, congestion) to Vector-credit admission."
           },
@@ -1468,8 +1468,8 @@
             "matched_terms": [
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Those access shapes make ordinary Parquet/ORC-style metadata, delete, and encoding choices expensive even before query execution begins.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
@@ -1631,8 +1631,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "HostCC says hidden host resources need fast local pressure signals. veDB-HTAP says acceleration must sit behind semantic routing, freshness alignment, and fallback.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -4341,8 +4341,8 @@
               "multi-version",
               "visibility generation"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "GPU DB has SQL expressions, secondary indexes, ad hoc queries, WAL, MVCC snapshots, DDL, crash recovery, replication concerns, and client-visible result sets.",
             "support_reason": "Matched journal terms (snapshot, multi-version, visibility generation) to Snapshot frontier vectors."
           },
@@ -7053,8 +7053,8 @@
               "conflict",
               "tpc-c"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "HTM provides atomic visibility and conflict detection; hardware-generated redo records provide atomic durability. - Each thread gets a private transaction log area and an overflow list, allocated and tracked by the OS.",
             "support_reason": "Matched journal terms (conflict, tpc-c) to GPU OLTP conflict ordering."
           },
@@ -7555,8 +7555,8 @@
               "owner",
               "ring"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "If the log medium is byte-addressable, the DBMS should shape log records, persistence ordering, and allocator state around transaction semantics rather than page writes.",
             "support_reason": "Matched journal terms (owner, ring) to Owner-ring bundling."
           },
@@ -7758,8 +7758,8 @@
               "kernel launch",
               "coalesced"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Full-zip style layout is especially interesting for large text, vector, image, or future embedding-like values: fetch the payload and its structural proof with one or two aligned reads, then transfer only the requested values or micro-batch of values.",
             "support_reason": "Matched journal terms (micro-batch, kernel launch, coalesced) to Same-shape micro-batching."
           },
@@ -9514,8 +9514,8 @@
             "matched_terms": [
               "jitter"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper's TPC-C result also emphasizes stability: throughput is not enough if jitter, forced rollbacks, or inconsistency appear under long stress runs.",
             "support_reason": "Matched journal terms (jitter) to Deficit fairness."
           },
@@ -9825,8 +9825,8 @@
               "contention",
               "retry"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "ShiftLock shows that a hot remote authority should turn retry pressure into handoff queues instead of making every waiter hammer the same shared object.",
             "support_reason": "Matched journal terms (deterministic, contention, retry) to Deterministic hot-write templates."
           },
@@ -12004,8 +12004,8 @@
             "matched_terms": [
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "PULSE suggests that if GPU DB later adds CXL memory, RDMA memory pools, or object/NVMe metadata served through a storage gateway, the indexing layout must be evaluated by remote pointer-hop count, not just bytes.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
@@ -14851,8 +14851,8 @@
             "matched_terms": [
               "priority"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "...enough; Plor shows that even high-throughput OCC can have terrible p99.9 latency if an unlucky transaction keeps losing priority.",
             "support_reason": "Matched journal terms (priority) to Deficit fairness."
           },
@@ -15926,8 +15926,8 @@
               "handle",
               "pointer"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A radix tree reduces leaf read/write amplification, but only if the implementation also handles remote locking, redundant concurrent reads/writes from compute nodes, and validation of cached tree nodes whose parent/child links or node types can change.",
             "support_reason": "Matched journal terms (handle, pointer) to Stable handle indirection."
           },
@@ -17620,8 +17620,8 @@
               "priority",
               "tenant"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "At 800G-class links, high message rates, AI/HPC collectives, storage traffic, microservice incast, and multi-tenant deployment make those assumptions increasingly costly.",
             "support_reason": "Matched journal terms (priority, tenant) to Deficit fairness."
           },
@@ -17815,8 +17815,8 @@
               "model",
               "bao"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It asks the underlying optimizer for alternative plans by issuing `EXPLAIN` under different optimizer flag settings such as enabling or disabling join and scan operator families. - Candidate plans are modeled primarily by join trees and the intermediate results they produce.",
             "support_reason": "Matched journal terms (model, bao) to Learned optimizer advisor."
           },
@@ -18647,8 +18647,8 @@
               "batching",
               "kernel launch"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The IO stage can dedicate a subset of warps to BaM request submission and completion polling, while all threads participate in decompression and operator work. - Kernel launch configuration is tuned per query.",
             "support_reason": "Matched journal terms (batching, kernel launch) to Same-shape micro-batching."
           },
@@ -18695,8 +18695,8 @@
               "generation",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The transferable direction is a route descriptor that can generate a single fused retained kernel for a stable query family: load key or predicate vectors if needed, touch resident column groups, evaluate visibility/predicate logic, reduce or scatter results, and write compact per-request output buffers.",
             "support_reason": "Matched journal terms (generation, route descriptor) to Immutable route roots."
           },
@@ -19039,8 +19039,8 @@
               "snapshot",
               "multi-version"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The approach also does not address DDL, snapshot retirement, recovery replay, or GPU cache invalidation.",
             "support_reason": "Matched journal terms (snapshot, multi-version) to Snapshot frontier vectors."
           },
@@ -19551,8 +19551,8 @@
             "matched_terms": [
               "tpc-c"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Its experiments disable WAL and use the lowest isolation levels in competitor systems, so the reported TPC-C-like throughput is not a direct transactional durability result.",
             "support_reason": "Matched journal terms (tpc-c) to GPU OLTP conflict ordering."
           },
@@ -22257,8 +22257,8 @@
               "promotion",
               "demotion"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Measure start latency, p99/p999, service share, and deferred non-preemptible spans. - Value-aware resource admission benchmark: retained lookups, COPY chunks, refresh builders, and long scans compete for pinned memory, response buffers, and execution-memory chunks under explicit SLA penalties. - Priority-aware conflict benchmark: hot-key updates with retr...",
             "support_reason": "Matched journal terms (tier, tiering, buffer, promotion) to Multi-tier placement policy."
           },
@@ -24413,8 +24413,8 @@
               "abort",
               "occ"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- **Batch publication over per-request churn:** hot write paths should publish WAL, CPU visibility, resident invalidation, and route generations at explicit owner boundaries when latency budgets permit. - **Local conflict graphs before global scheduling:** start with owner-local metadata graphs over keys, partitions, resident generations, and active phase...",
             "support_reason": "Matched journal terms (hot write, contention, abort, occ) to Deterministic hot-write templates."
           },
@@ -24974,8 +24974,8 @@
               "template",
               "aria"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "...warps check more frequently; when few are idle, they check less often to avoid unnecessary overhead. - To avoid a single contended global queue, Themis uses a hierarchical bitmap to find idle warps and a dedicated global-memory buffer per warp.",
             "support_reason": "Matched journal terms (hot key, contention, contended, template) to Deterministic hot-write templates."
           },
@@ -25728,8 +25728,8 @@
               "learned",
               "model"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A model may learn that a CPU prefilter should be required before GPU execution, that a cold transfer is too risky under current PCIe pressure, or that a hot transaction fragment should be ordered rather than retried.",
             "support_reason": "Matched journal terms (learned, model) to Learned optimizer advisor."
           },
@@ -25974,8 +25974,8 @@
               "scheduler",
               "scheduling"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Shinjuku separates network processing from request scheduling, funnels request work through centralized dispatcher state, and uses virtualization-assisted interrupts to preempt running request contexts every 5 to 15 microseconds when needed.",
             "support_reason": "Matched journal terms (scheduler, scheduling) to Resource-DAG scheduling."
           },
@@ -25998,8 +25998,8 @@
               "micro-batch",
               "same-shape"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "GPU DB probably cannot interrupt a running CUDA kernel cheaply, so the production analog is smaller bounded chunks, separate queues by route class, latency ceilings for micro-batches, and explicit yield points before long transfers or multi-partition scans.",
             "support_reason": "Matched journal terms (micro-batch, same-shape) to Same-shape micro-batching."
           },
@@ -27904,8 +27904,8 @@
               "contention",
               "occ"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Its cleanest command-logging path assumes deterministic stored-procedure style replay, which is narrower than ad hoc SQL.",
             "support_reason": "Matched journal terms (deterministic, contention, occ) to Deterministic hot-write templates."
           },
@@ -32637,8 +32637,8 @@
               "multi-version",
               "visibility generation"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The first implementation can still use ordinary Linux while preserving a clean replacement boundary. - **Correctness metadata must travel with performance handles.** Fast I/O paths are unsafe unless every buffer and cache line carries enough database state: session/request id, table/partition/column identity, snapshot or WAL boundary, visibility generatio...",
             "support_reason": "Matched journal terms (snapshot, multi-version, visibility generation) to Snapshot frontier vectors."
           },
@@ -34018,8 +34018,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "MosaicDB's dual hot/cold queues separate storage-latency hiding from hot OLTP work.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -34257,8 +34257,8 @@
               "handle",
               "forwarding"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper's \"user-bypass\" design keeps the Linux TCP/IP stack and socket semantics, but pushes a small amount of DBMS protocol logic into safe kernel-resident eBPF handlers.",
             "support_reason": "Matched journal terms (handle, forwarding) to Stable handle indirection."
           },
@@ -34843,8 +34843,8 @@
               "gpu oltp",
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Tigger reduces protocol/proxy crossing, CARPO ranks candidate plans as a context-aware set, WeBridge collapses repeated dependent SQL paths into stored-route programs, and gCCTB shows that GPU write protocols should be selected by conflict shape and launch economics.",
             "support_reason": "Matched journal terms (gpu oltp, conflict) to GPU OLTP conflict ordering."
           },
@@ -35100,8 +35100,8 @@
               "forwarding",
               "remote memory"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Data movement can also be zero-copy: the card reads from userspace buffers rather than forcing extra send-side copies. - RDMA and cloud derivatives blur local/remote memory access, but they differ materially.",
             "support_reason": "Matched journal terms (handle, forwarding, remote memory) to Stable handle indirection."
           },
@@ -35991,8 +35991,8 @@
             "matched_terms": [
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "If WAL flushes, checkpoint writes, cold-partition reads, refresh reads, and large result spills all compete for the same buffer pool, queue, or NVMe lane, a foreground retained read or cold-page route can inherit the latency of an unrelated write.",
             "support_reason": "Matched journal terms (nvm) to Log-structured warm tier."
           },
@@ -36877,8 +36877,8 @@
               "htap",
               "fresh"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The CIDR paper focuses more on scan-oriented OLAP and HTAP than pure high-contention OLTP, so GPU DB should transfer the queue and tiering mechanics rather than treat NVMe as a substitute for resident OLTP memory.",
             "support_reason": "Matched journal terms (htap, fresh) to HTAP freshness router."
           },
@@ -37054,8 +37054,8 @@
               "generation",
               "publish"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Prioritized transactions need conditional fronts so expensive work can prepare without publishing unsafe visibility.",
             "support_reason": "Matched journal terms (generation, publish) to Immutable route roots."
           },
@@ -37869,8 +37869,8 @@
             "matched_terms": [
               "same-shape"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Same-shape requests against the same snapshot and join graph should be able to join an existing filter-build phase rather than each session independently scanning key columns and building equivalent Bloom filters.",
             "support_reason": "Matched journal terms (same-shape) to Same-shape micro-batching."
           },
@@ -38414,8 +38414,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- **Safe-frontier scheduling.** Concord's cooperative yield points, Query Fresh's WAL/replay boundaries, and Predicate Transfer's filter-build phase all create places where work can pause, fan out, or replan without corrupting correctness.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -38749,8 +38749,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For skewed point lookups, a full resident partition may be overkill; a hot-key resident tier keyed by table, partition, snapshot generation, and predicate shape could keep only the records that drive most traffic in HBM, while colder records remain in host or NVMe-backed structures.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -40221,8 +40221,8 @@
               "same-shape",
               "prepared"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It does not address MVCC visibility, SQL transaction ordering, WAL-before-visibility, DDL barriers, prepared statements, cursors, or pgwire's session semantics.",
             "support_reason": "Matched journal terms (micro-batch, batching, same-shape, prepared) to Same-shape micro-batching."
           },
@@ -41259,8 +41259,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "FOEDUS, Caracal, and PrismDB converge on the same design pressure from three different directions: mutable work can be fast only when it has a scoped owner, but read throughput comes from immutable generations that can be built, published, and retired with explicit costs.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -42100,8 +42100,8 @@
               "generation",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Define a typed route descriptor for simple reads and writes, then reject any undeclared side effect from the accelerated path. - Measure exact-response and retained-snapshot fast paths against injected validation cost, not only against best-case cache hits. - Compare global mutation order with owner-local sequence fronts for declared writes, while prese...",
             "support_reason": "Matched journal terms (generation, route descriptor) to Immutable route roots."
           },
@@ -42124,8 +42124,8 @@
               "owner",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The shared GPU DB track is therefore request descriptors with hard fields: touched owner set, snapshot or generation boundary, route candidates, protocol shape, memory budget, active credits, and fallback authority.",
             "support_reason": "Matched journal terms (owner, queue) to Owner-ring bundling."
           },
@@ -43469,8 +43469,8 @@
             "matched_terms": [
               "old version"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The MVGC paper separates needed old versions from merely old versions by tracking the exact timestamp intervals covered by active snapshots.",
             "support_reason": "Matched journal terms (old version) to MVCC garbage-collection frontiers."
           },
@@ -43888,8 +43888,8 @@
               "admission",
               "queueing"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper models each remote check or steal as a cross-core communication cost and uses 100 ns as the canonical simulation value. - Work shedding moves tasks after an overloaded core detects excess queueing delay and notifies another core.",
             "support_reason": "Matched journal terms (credit, admission, queueing) to Vector-credit admission."
           },
@@ -46945,8 +46945,8 @@
               "pruning",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Build a descriptor-first retained route prototype before broadening GPU join or compression kernels. - Add tier miss classes that distinguish descriptor hit, HBM segment hit, host promotion, NVMe fetch, compressed-vector partial decode, full decode, stale generation fallback, and CPU fallback. - Measure \"bytes avoided\" and \"queue slots avoided\" alongsid...",
             "support_reason": "Matched journal terms (join, pruning, metadata) to Cost-based route optimizer."
           },
@@ -47094,8 +47094,8 @@
             "matched_terms": [
               "retained"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For 1M logical sessions, the useful analogue is not \"put INT in Ethernet ACKs.\" It is \"make every response completion carry the narrowest saturated boundary.\" A retained read response could carry read-ring wait, GPU queue wait, response ring occupancy, output bytes, route class, and fallback reason back to the IO worker.",
             "support_reason": "Matched journal terms (retained) to Retained GPU snapshots."
           },
@@ -47315,8 +47315,8 @@
               "predicate",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "This paper suggests a sharper intermediate tier: host-memory columnar blocks that remain close enough to the GPU/resident layout to avoid full rebuilds, but still carry update-friendly metadata and MVCC side state.",
             "support_reason": "Matched journal terms (predicate, metadata) to Cost-based route optimizer."
           },
@@ -59817,8 +59817,8 @@
               "resident",
               "snapshot route"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A route descriptor should first answer: is this snapshot visible, is this write omittable, is this resident layout compatible, is this CPU/GPU split mergeable, and is fallback allowed?",
             "support_reason": "Matched journal terms (resident, snapshot route) to Retained GPU snapshots."
           },
@@ -77083,8 +77083,8 @@
               "route choice",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "PRICE says a route needs portable cardinality and fanout features plus local calibration.",
             "support_reason": "Matched journal terms (cardinality, route choice, metadata) to Cost-based route optimizer."
           },
@@ -112850,8 +112850,8 @@
               "retained",
               "resident"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Add route certificates that include placement, event-delivery policy, execution shape, target batch size, and latency ceiling. - Compare fused versus staged CPU fallback for warm-tier lookup and hash-probe paths before asserting GPU speedups. - Add priority response-ring tests where short retained reads and cancellations remain bounded while cold scans,...",
             "support_reason": "Matched journal terms (retained, resident) to Retained GPU snapshots."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4230,
-      "weak_direct": 441
+      "direct": 4279,
+      "weak_direct": 392
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 68,
+      "snippet contains matched mechanism term plus visible aliases": 117,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 435,
+      "substantive snippet contains only one matched mechanism term": 386,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
