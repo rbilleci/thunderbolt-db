@@ -1,13 +1,13 @@
 {
   "description": "Generated traceability from literature journal entries to architecture mechanisms. Review low-confidence and fallback links before making architectural commitments.",
   "mechanism_counts": {
-    "bounded_descriptor_reclamation": 512,
+    "bounded_descriptor_reclamation": 507,
     "cost_based_route_optimizer": 255,
     "cpu_fallback_policy": 166,
     "db_owned_cold_objects": 52,
     "deficit_fairness": 66,
     "dependency_witnesses": 122,
-    "deterministic_hot_write_templates": 210,
+    "deterministic_hot_write_templates": 209,
     "effective_session_counting": 174,
     "gpu_oltp_conflict_ordering": 129,
     "htap_freshness_router": 95,
@@ -13552,24 +13552,14 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "object",
             "lance"
           ],
           "link_basis": "keyword",
           "mechanism_id": "db_owned_cold_objects",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Object hit rate and lower-tier access are benchmark signals, though the entry mainly argues for request-shaped routing metrics.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -13581,8 +13571,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Residency and GPU execution owners consume the same compact route descriptor to admit, prefetch, split, or reject work.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -13593,8 +13584,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "same_shape_microbatching",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry explicitly tests whether fixed micro-batching is sufficient or work-aware batch splitting is required.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -13605,8 +13597,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot and companion generations are named route-descriptor fields used to make admission and publication decisions.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -13960,8 +13953,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Learned advice is constrained by deterministic route validity and hot transaction fragments may be ordered rather than retried.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -13974,8 +13968,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The route descriptor carries resident components, companion columns, expected transfer, and cold-transfer risk under PCIe pressure.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -13987,8 +13982,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Owner domains and queue budgets are part of the descriptor, but the entry is mostly about learned restriction boundaries.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -14805,25 +14801,14 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era",
-            "retire"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "resident",
             "hbm"
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Residency owners use access, skew, invalidation, refresh-cost, and HBM-residency summaries to decide retained segments.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -14834,8 +14819,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "GPU execution summaries include queue wait, bytes moved, batch size, scratch buffers, and admitted/deferred choices.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -15689,8 +15675,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deficit_fairness",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry makes hot-key conflict priority and tail-latency winners explicit after correctness gates.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -16925,8 +16912,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Retirement and dependency metadata appear through Rebirth-Retire, but the synthesis mainly addresses explicit control paths.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -16938,8 +16926,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Generation allocation, publication slots, checksums, and completion rings are explicit control-plane responsibilities.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -17706,8 +17695,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Reusable buffers and generation-tagged cache descriptors need lifetime boundaries, but reclamation is not the entry's main point.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -18428,20 +18418,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Resident-built work and retained reads are named route classes protected by explicit owner fronts.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         },
         {
           "confidence": "low",
@@ -18451,8 +18431,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry classifies work by resource fronts and owner fences, but does not require a full DAG scheduler.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -18463,8 +18444,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Durable and SQL-visible fronts remain required before client-visible reads and writes.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -18894,26 +18876,15 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era",
-            "route descriptor"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "deterministic",
             "template",
             "abort"
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Known-template writes, deterministic preprocessing, conflict density, and abort cost are the entry's immediate benchmark target.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -18924,8 +18895,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "isolation_trace_oracle",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The proposed write-admission lab must prove isolation and WAL publication with event traces.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -18937,8 +18909,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Owner entries saved, queue pressure, and route-conflict economics are part of the resource half of the route descriptor.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -19276,8 +19249,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Mutation lanes explicitly preserve WAL-before-visibility and pgwire-visible ordering across runtime lanes.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -19288,19 +19262,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "occ"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Each lane names ordering requirements, completion frontiers, owner state, and proof boundaries.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -19311,8 +19275,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Lane contracts carry snapshot frontiers and completion frontier telemetry for retained reads and responses.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -19694,8 +19659,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry budgets active resources and I/O lanes, though it does not require DAG-shaped scheduling.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -20461,17 +20427,6 @@
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
         }
       ],
       "relevance_tags": [],
@@ -21206,8 +21161,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "mvcc_gc_frontiers",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry explicitly calls for version cleanup and WAL-safe invalidation under paced hot placement.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -21219,8 +21175,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "HBM hot-key tiers, resident route validity, and paced retained reads are central benchmark targets.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -21231,8 +21188,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Socket/protocol credits, response queue budgets, and named rejection or delay reasons are explicit admission surfaces.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -74686,29 +74644,29 @@
   "summary": {
     "confidence_counts": {
       "high": 3059,
-      "low": 290,
+      "low": 284,
       "medium": 1365
     },
     "entries": 787,
     "linked_entries": 787,
-    "links_requiring_review": 268,
-    "low_confidence_links": 290,
+    "links_requiring_review": 236,
+    "low_confidence_links": 284,
     "mechanisms_with_links": 25,
     "mechanisms_without_links": 0,
     "paper_entries": 610,
-    "pending_low_confidence_links": 268,
-    "removed_low_confidence_links": 5,
+    "pending_low_confidence_links": 236,
+    "removed_low_confidence_links": 11,
     "review_priority_counts": {
-      "none": 4446,
-      "normal": 268
+      "none": 4472,
+      "normal": 236
     },
     "review_status_counts": {
       "auto_accepted": 4424,
-      "pending_low_confidence_review": 268,
-      "reviewed_supported": 19,
-      "reviewed_weak_signal": 3
+      "pending_low_confidence_review": 236,
+      "reviewed_supported": 39,
+      "reviewed_weak_signal": 9
     },
-    "reviewed_low_confidence_links": 22,
+    "reviewed_low_confidence_links": 48,
     "synthesis_entries": 177,
     "unlinked_entries": 0
   },

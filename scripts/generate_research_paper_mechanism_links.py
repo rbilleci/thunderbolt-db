@@ -609,6 +609,262 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "The freshness term describes descriptor validity, not HTAP freshness routing.",
     },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-and-scheduling-need-request-shaped-metrics",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry uses descriptors and generations as route metadata, but does not discuss descriptor lifetime or reclamation.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-and-scheduling-need-request-shaped-metrics",
+        "db_owned_cold_objects",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Object hit rate and lower-tier access are benchmark signals, though the entry mainly argues for request-shaped routing metrics.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-and-scheduling-need-request-shaped-metrics",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Residency and GPU execution owners consume the same compact route descriptor to admit, prefetch, split, or reject work.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-and-scheduling-need-request-shaped-metrics",
+        "same_shape_microbatching",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry explicitly tests whether fixed micro-batching is sufficient or work-aware batch splitting is required.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-and-scheduling-need-request-shaped-metrics",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot and companion generations are named route-descriptor fields used to make admission and publication decisions.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-learned-advice-needs-hard-route-boundaries",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Learned advice is constrained by deterministic route validity and hot transaction fragments may be ordered rather than retried.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-learned-advice-needs-hard-route-boundaries",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The route descriptor carries resident components, companion columns, expected transfer, and cold-transfer risk under PCIe pressure.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-learned-advice-needs-hard-route-boundaries",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Owner domains and queue budgets are part of the descriptor, but the entry is mostly about learned restriction boundaries.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-visibility-contention-and-placement-need-distribution-summaries",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The reclamation signal comes from MVCC version retirement, not descriptor reclamation.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-visibility-contention-and-placement-need-distribution-summaries",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Residency owners use access, skew, invalidation, refresh-cost, and HBM-residency summaries to decide retained segments.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-visibility-contention-and-placement-need-distribution-summaries",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "GPU execution summaries include queue wait, bytes moved, batch size, scratch buffers, and admitted/deferred choices.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-explicit-winners",
+        "deficit_fairness",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry makes hot-key conflict priority and tail-latency winners explicit after correctness gates.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-control-planes-should-stay-explicit",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Retirement and dependency metadata appear through Rebirth-Retire, but the synthesis mainly addresses explicit control paths.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-control-planes-should-stay-explicit",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Generation allocation, publication slots, checksums, and completion rings are explicit control-plane responsibilities.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-devices-require-explicit-service-ownership",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Reusable buffers and generation-tagged cache descriptors need lifetime boundaries, but reclamation is not the entry's main point.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-expensive-attempts-need-protected-fronts",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Resident-built work and retained reads are named route classes protected by explicit owner fronts.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-expensive-attempts-need-protected-fronts",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The protected-front discussion does not provide evidence for descriptor reclamation.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-expensive-attempts-need-protected-fronts",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "The entry classifies work by resource fronts and owner fences, but does not require a full DAG scheduler.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-expensive-attempts-need-protected-fronts",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Durable and SQL-visible fronts remain required before client-visible reads and writes.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-gpu-writes-need-classed-conflict-lanes",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Route descriptors are central, but the entry does not discuss descriptor reclamation or lifetime.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-gpu-writes-need-classed-conflict-lanes",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Known-template writes, deterministic preprocessing, conflict density, and abort cost are the entry's immediate benchmark target.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-gpu-writes-need-classed-conflict-lanes",
+        "isolation_trace_oracle",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The proposed write-admission lab must prove isolation and WAL publication with event traces.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-gpu-writes-need-classed-conflict-lanes",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Owner entries saved, queue pressure, and route-conflict economics are part of the resource half of the route descriptor.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-runtime-lanes-need-measurable-preemption-points",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Mutation lanes explicitly preserve WAL-before-visibility and pgwire-visible ordering across runtime lanes.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-runtime-lanes-need-measurable-preemption-points",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Each lane names ordering requirements, completion frontiers, owner state, and proof boundaries.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-runtime-lanes-need-measurable-preemption-points",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The OCC term is incidental; this synthesis is about runtime lanes and preemption, not deterministic hot-write templates.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-runtime-lanes-need-measurable-preemption-points",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Lane contracts carry snapshot frontiers and completion frontier telemetry for retained reads and responses.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-logical-scale-needs-active-resource-budgets",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "The entry budgets active resources and I/O lanes, though it does not require DAG-shaped scheduling.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-i-o-lanes-need-ownership-contracts",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Descriptors appear as storage-lane identifiers, not as evidence for reclamation mechanics.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-placement-still-needs-paced-fronts",
+        "mvcc_gc_frontiers",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry explicitly calls for version cleanup and WAL-safe invalidation under paced hot placement.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-placement-still-needs-paced-fronts",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "HBM hot-key tiers, resident route validity, and paced retained reads are central benchmark targets.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-placement-still-needs-paced-fronts",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Socket/protocol credits, response queue budgets, and named rejection or delay reasons are explicit admission surfaces.",
+    },
 }
 
 
