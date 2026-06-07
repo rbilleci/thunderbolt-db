@@ -2892,25 +2892,33 @@ def evidence_snippet(body: str, terms: list[str]) -> str:
     return best
 
 
-def evidence_quality(link: dict) -> str:
+def evidence_quality_details(link: dict) -> tuple[str, str]:
     span = link["evidence_span"]
     snippet = span.get("snippet", "")
     snippet_lower = snippet.lower()
     if link["link_basis"] == "fallback":
-        return "fallback_review"
+        return "fallback_review", "fallback link requires manual evidence review"
     if snippet_lower.startswith(METADATA_SNIPPET_PREFIXES):
-        return "metadata_only"
+        return "metadata_only", "snippet came from journal metadata"
     matched_terms = [term for term in span.get("matched_terms", []) if term != "category fallback"]
     snippet_term_hits = sum(1 for term in matched_terms if term.lower() in snippet_lower)
     if snippet_lower.startswith(STRONG_SNIPPET_PREFIXES) and snippet_term_hits >= 1:
-        return "direct"
+        return "direct", "strong journal section contains matched mechanism terms"
     if len(snippet) < 80:
         if link["confidence"] == "high" and snippet_term_hits >= 1:
-            return "direct"
-        return "short_snippet"
+            return "direct", "concise high-confidence snippet contains matched mechanism terms"
+        return "short_snippet", "snippet is too short for strong generated evidence"
     if snippet_term_hits >= 2 or link["confidence"] == "high":
-        return "direct"
-    return "weak_direct"
+        if snippet_term_hits >= 2:
+            return "direct", "snippet contains multiple matched mechanism terms"
+        return "direct", "high-confidence link has a substantive journal snippet"
+    if snippet_term_hits == 1:
+        return "weak_direct", "substantive snippet contains only one matched mechanism term"
+    return "weak_direct", "substantive snippet has no matched mechanism terms"
+
+
+def evidence_quality(link: dict) -> str:
+    return evidence_quality_details(link)[0]
 
 
 def evidence_support_reason(link: dict, mechanism_name: str) -> str:
@@ -2929,7 +2937,9 @@ def attach_evidence_span(entry: dict, link: dict, mechanism_name: str) -> None:
         "snippet": evidence_snippet(entry.get("body", ""), link["evidence_terms"]),
         "support_reason": evidence_support_reason(link, mechanism_name),
     }
-    link["evidence_span"]["quality"] = evidence_quality(link)
+    quality, reason = evidence_quality_details(link)
+    link["evidence_span"]["quality"] = quality
+    link["evidence_span"]["quality_reason"] = reason
 
 
 def fallback_mechanisms(category: str, text: str) -> list[str]:
@@ -3009,6 +3019,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     confidence_counts: Counter = Counter()
     evidence_span_counts: Counter = Counter()
     evidence_quality_counts: Counter = Counter()
+    evidence_quality_reason_counts: Counter = Counter()
     review_status_counts: Counter = Counter()
     review_priority_counts: Counter = Counter()
     type_counts: Counter = Counter()
@@ -3033,6 +3044,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             if link["evidence_span"]["support_reason"]:
                 evidence_span_counts["links_with_support_reason"] += 1
             evidence_quality_counts[link["evidence_span"]["quality"]] += 1
+            evidence_quality_reason_counts[link["evidence_span"]["quality_reason"]] += 1
             review_status_counts[link["review_status"]] += 1
             review_priority_counts[link["review_priority"]] += 1
         type_counts[entry["entry_type"]] += 1
@@ -3051,8 +3063,8 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
 
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v2",
-        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans. Review low-confidence and fallback links before making architectural commitments.",
+        "schema": "gpu-db-research-paper-mechanism-links-v3",
+        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans and evidence quality reasons. Review low-confidence and fallback links before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
         "summary": {
@@ -3066,6 +3078,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "confidence_counts": dict(sorted(confidence_counts.items())),
             "evidence_span_counts": dict(sorted(evidence_span_counts.items())),
             "evidence_quality_counts": dict(sorted(evidence_quality_counts.items())),
+            "evidence_quality_reason_counts": dict(sorted(evidence_quality_reason_counts.items())),
             "review_status_counts": dict(sorted(review_status_counts.items())),
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
@@ -3093,6 +3106,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     confidence_counts = index["summary"]["confidence_counts"]
     evidence_span_counts = index["summary"]["evidence_span_counts"]
     evidence_quality_counts = index["summary"]["evidence_quality_counts"]
+    evidence_quality_reason_counts = index["summary"]["evidence_quality_reason_counts"]
     review_status_counts = index["summary"]["review_status_counts"]
     review_priority_counts = index["summary"]["review_priority_counts"]
     records = index["records"]
@@ -3156,6 +3170,10 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     lines.append("Evidence quality counts:")
     for quality, count in sorted(evidence_quality_counts.items()):
         lines.append(f"- {quality}: {count}")
+    lines.append("")
+    lines.append("Evidence quality reason counts:")
+    for reason, count in sorted(evidence_quality_reason_counts.items()):
+        lines.append(f"- {reason}: {count}")
 
     lines.extend(["", "## Evidence Span Quality Audit", ""])
     if evidence_quality_audit:
@@ -3163,7 +3181,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
             span = link["evidence_span"]
             snippet = span["snippet"].replace("|", "\\|")
             lines.append(
-                f"- `{record['id']}` -> {link['mechanism_id']}:{span['quality']}: {snippet}"
+                f"- `{record['id']}` -> {link['mechanism_id']}:{span['quality']} ({span['quality_reason']}): {snippet}"
             )
         if len(evidence_quality_audit) > 80:
             lines.append(f"- ... {len(evidence_quality_audit) - 80} more")
