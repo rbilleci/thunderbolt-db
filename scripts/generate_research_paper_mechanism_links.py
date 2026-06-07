@@ -2971,6 +2971,8 @@ def evidence_quality_details(link: dict) -> tuple[str, str]:
         if snippet_term_hits >= 2:
             return "direct", "snippet contains multiple matched mechanism terms"
         return "direct", "high-confidence link has a substantive journal snippet"
+    if snippet_term_hits == 1 and link.get("review_status") == "reviewed_supported":
+        return "direct", "reviewed-supported link has a substantive matched snippet"
     if snippet_term_hits == 1:
         return "weak_direct", "substantive snippet contains only one matched mechanism term"
     return "weak_direct", "substantive snippet has no matched mechanism terms"

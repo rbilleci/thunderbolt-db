@@ -3397,8 +3397,8 @@
               "witness",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A retained route should have a visibility frontier, a publication/recovery witness, an active-holder cleanup horizon, and a placement budget that states why the route deserves HBM, DRAM, NVMe, or colder storage.",
             "support_reason": "Matched journal terms (witness, proof) to Dependency witnesses."
           },
@@ -3421,8 +3421,8 @@
             "matched_terms": [
               "cleanup"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A retained route should have a visibility frontier, a publication/recovery witness, an active-holder cleanup horizon, and a placement budget that states why the route deserves HBM, DRAM, NVMe, or colder storage.",
             "support_reason": "Matched journal terms (cleanup) to MVCC garbage-collection frontiers."
           },
@@ -4711,8 +4711,8 @@
               "mvcc garbage",
               "cleanup"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Descriptor lifetime should be bounded by generation, reference count, or snapshot epoch, but cleanup cannot be allowed to block short retained reads or hide unbounded backlog.",
             "support_reason": "Matched journal terms (mvcc garbage, cleanup) to MVCC garbage-collection frontiers."
           },
@@ -4736,8 +4736,8 @@
               "crash",
               "failure"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "TIPS, fsync-failure handling, host-interconnect credits, and deferred reference counting converge on one design track: do not let fast metadata publication become an invisible pile of debt.",
             "support_reason": "Matched journal terms (crash, failure) to Semantic crash oracle."
           },
@@ -6877,8 +6877,8 @@
             "matched_terms": [
               "fallback"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "For GPU DB, the next design track should be a route publication record that unifies WAL reservation, resident invalidation, descriptor generation, response/idempotence slot, and fallback state.",
             "support_reason": "Matched journal terms (fallback) to CPU fallback policy."
           },
@@ -6900,8 +6900,8 @@
             "matched_terms": [
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "NVWAL, DHTM, DrTM, and NV-HALT converge on the same implementation hypothesis: the fast path is only trustworthy when it turns durability and visibility into small explicit proofs.",
             "support_reason": "Matched journal terms (proof) to Dependency witnesses."
           },
@@ -7403,8 +7403,8 @@
               "fallback",
               "stale"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A fragment needs a source WAL boundary, visibility boundary, generation/incarnation proof, buffer credits, fallback policy, and recovery or cancellation rule.",
             "support_reason": "Matched journal terms (fallback, stale) to CPU fallback policy."
           },
@@ -8979,8 +8979,8 @@
               "fallback",
               "stale"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Second, query admission should consume a certificate: relation id, schema generation, visibility boundary, source WAL boundary, tier path, stripe set, and fallback reason.",
             "support_reason": "Matched journal terms (fallback, stale) to CPU fallback policy."
           },
@@ -17470,8 +17470,8 @@
               "retained",
               "resident"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "- route certificate validation under DDL, refresh, eviction, dictionary rebuild, and descriptor reuse - generated CPU fallback versus interpreted CPU versus retained GPU for the same certified route shape - compilation-cache invalidation and warmup cost for hot prepared query shapes - stale-reader tests that force physical descriptor reuse while SQL snaps...",
             "support_reason": "Matched journal terms (retained, resident) to Retained GPU snapshots."
           },
@@ -19344,8 +19344,8 @@
               "pruning",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "- **Descriptor-first execution:** retained reads, over-resident scans, and write fragments should all carry explicit demand/dependency metadata before admission. - **Boundary-preserving batching:** micro-batches and fused GPU kernels are attractive only when every request in the batch shares a compatible snapshot, route shape, and visibility boundary. - *...",
             "support_reason": "Matched journal terms (predicate, pruning, metadata) to Cost-based route optimizer."
           },
@@ -19369,8 +19369,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The modern reviewed set now covers three complementary design tracks: DPF pushes fused GPU data paths for resident and over-resident reads, the 2025 hybrid CPU/GPU paper pushes CPU prefiltering plus compressed transfer before a GPU compute tail, and MV3C pushes dependency-aware validation so conflicts repair only the affected transaction fragments.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -23754,8 +23754,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The recent reviewed papers now converge on a sharper architecture track: keep mutable hot paths owner-local, expose queue and movement pressure explicitly, and admit shared or accelerated tiers only when a route descriptor can prove the generation, bytes, and conflict class.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -25070,8 +25070,8 @@
               "bundle",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The residency owner can use that descriptor to decide whether to promote, query a lower tier directly, prefetch a companion generation, or reject.",
             "support_reason": "Matched journal terms (owner, bundle, queue) to Owner-ring bundling."
           },
@@ -25121,8 +25121,8 @@
               "generation",
               "publish"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "NOMAD says movement between tiers should be transactional, non-exclusive when useful, and validated at publish time.",
             "support_reason": "Matched journal terms (generation, publish) to Immutable route roots."
           },
@@ -25777,8 +25777,8 @@
               "template",
               "aria"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The restriction language names what the planner is not allowed to do for that request or template.",
             "support_reason": "Matched journal terms (deterministic, template, aria) to Deterministic hot-write templates."
           },
@@ -25805,8 +25805,8 @@
               "buffer",
               "cold"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A model may learn that a CPU prefilter should be required before GPU execution, that a cold transfer is too risky under current PCIe pressure, or that a hot transaction fragment should be ordered rather than retried.",
             "support_reason": "Matched journal terms (tier, placement, buffer, cold) to Multi-tier placement policy."
           },
@@ -27380,8 +27380,8 @@
               "credit",
               "admission"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "- generation-level MVCC/resident retirement with chain-length and index-maintenance telemetry - hot-key or hot-bucket routing driven by measured conflict heat - distribution-aware residency admission with warm-state anti-thrash behavior - sub-segment versus full-segment placement under skewed lookups and uniform scans - a logical-session memory probe that...",
             "support_reason": "Matched journal terms (credit, admission) to Vector-credit admission."
           },
@@ -28970,8 +28970,8 @@
             "matched_terms": [
               "priority"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Plor makes conflict priority explicit at commit instead of letting repeated aborts decide tail latency accidentally.",
             "support_reason": "Matched journal terms (priority) to Deficit fairness."
           },
@@ -34043,8 +34043,8 @@
               "retained",
               "resident"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The shared implementation hypothesis is a multi-front owner protocol: `validated`, `durable`, `resident-built`, `pending-visible`, and `SQL-visible` should be explicit states, not comments in the code.",
             "support_reason": "Matched journal terms (retained, resident) to Retained GPU snapshots."
           },
@@ -35594,8 +35594,8 @@
               "ordering",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "RDMA, user-bypass proxies, unikernels, NVMe queues, and user-mode interrupts are all ways to avoid generic kernel paths, but each only helps if the database first names the work class, ownership boundary, ordering requirement, and completion frontier.",
             "support_reason": "Matched journal terms (ordering, proof) to Dependency witnesses."
           },
@@ -39108,8 +39108,8 @@
               "cleanup",
               "bounded memory"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The queue has many strong tiering and runtime papers, but the next few reviews should keep pulling from logging, recovery, transaction-cache, and snapshot-GC work so paced hot reads do not outrun WAL-before-visibility or version cleanup.",
             "support_reason": "Matched journal terms (cleanup, bounded memory) to MVCC garbage-collection frontiers."
           },
@@ -40552,8 +40552,8 @@
               "wal",
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "For GPU DB, the promising track is a typed route envelope that carries both request admission and tier-admission metadata: snapshot generation, route family, deadline, response destination, selected worker, HBM budget, pinned buffer budget, host warm-segment policy, NVMe streaming policy, and fallback permission.",
             "support_reason": "Matched journal terms (wal, nvm) to WAL-before-visibility boundary."
           },
@@ -42846,8 +42846,8 @@
               "route choice",
               "predicate"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "First, route choice should rank valid CPU/GPU/tier candidates under runtime state rather than produce routes from a black box.",
             "support_reason": "Matched journal terms (route choice, predicate) to Cost-based route optimizer."
           },
@@ -43516,8 +43516,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The MVGC paper separates needed old versions from merely old versions by tracking the exact timestamp intervals covered by active snapshots.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -43540,8 +43540,8 @@
               "generation",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Every performance copy should name both its tier intent and its visibility interval: read-only retained generation, write-only refresh destination, volatile scratch, tombstone side entry, cold locator chunk, or durable CPU truth.",
             "support_reason": "Matched journal terms (generation, publication) to Immutable route roots."
           },
@@ -44850,8 +44850,8 @@
               "scheduler",
               "scheduling"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The scheduler can then choose between immediate execution, micro-batch growth, fallback, pacing, or rejection using declared boundaries instead of global concurrency guesses.",
             "support_reason": "Matched journal terms (scheduler, scheduling) to Resource-DAG scheduling."
           },
@@ -47616,8 +47616,8 @@
             "matched_terms": [
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "- Route descriptor proof: every retained route reports physical encoding, visibility generation, side structures, queue wait, and fallback reason. - Build-amortization proof: side indexes, compressed layouts, or BVHs are admitted only when refresh cost is paid back over measured query reuse. - Response-carried feedback proof: queue/tier saturation observe...",
             "support_reason": "Matched journal terms (proof) to Dependency witnesses."
           },
@@ -51942,8 +51942,8 @@
             "matched_terms": [
               "retained"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "GPU DB should measure logical sessions separately from runnable requests, split short retained reads, long scans, refreshes, and write batches into bounded lanes, and expose freshness or visibility generation on every retained read.",
             "support_reason": "Matched journal terms (retained) to Retained GPU snapshots."
           },
@@ -54187,8 +54187,8 @@
               "credit",
               "backpressure"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Client protocol redesign says result delivery needs bounded columnar chunks and response credits.",
             "support_reason": "Matched journal terms (credit, backpressure) to Vector-credit admission."
           },
@@ -54237,8 +54237,8 @@
               "generation",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The common requirement is not a single page size; it is explicit ownership, visibility-generation tags, byte budgets, and backpressure telemetry.",
             "support_reason": "Matched journal terms (generation, publication) to Immutable route roots."
           },
@@ -54882,8 +54882,8 @@
               "immutable",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Visibility class states whether the route reads immutable snapshots, compact latest-visible summaries, direct MVCC chains, or CPU-owned truth.",
             "support_reason": "Matched journal terms (immutable, publication) to Immutable route roots."
           },
@@ -56440,8 +56440,8 @@
               "retained",
               "resident"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "- Extend the route descriptor prototype with physical layout fields: encoding family, decoded lane width, vector order, row-id mapping, and operator-on-compressed support. - Build a no-GPU benchmark matrix that crosses contention and layout: owner-serialized writes, deterministic epoch planning, dense retained reads, compressed retained reads, and one lon...",
             "support_reason": "Matched journal terms (retained, resident) to Retained GPU snapshots."
           },
@@ -57148,8 +57148,8 @@
               "frontier",
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "GPU joins/group-by, DBOS, and robust external aggregation converge on one design track: route descriptors need to describe the temporary state they will create, not only the table or snapshot they read.",
             "support_reason": "Matched journal terms (frontier, snapshot) to Snapshot frontier vectors."
           },
@@ -57172,8 +57172,8 @@
             "matched_terms": [
               "join"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "GPU joins/group-by, DBOS, and robust external aggregation converge on one design track: route descriptors need to describe the temporary state they will create, not only the table or snapshot they read.",
             "support_reason": "Matched journal terms (join) to Cost-based route optimizer."
           },
@@ -57835,8 +57835,8 @@
               "template",
               "occ"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "RePMILA says mixed visibility choices are safe only when they are attached to transaction templates, not improvised per request.",
             "support_reason": "Matched journal terms (template, occ) to Deterministic hot-write templates."
           },
@@ -57859,8 +57859,8 @@
             "matched_terms": [
               "generation"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "HopsFS says metadata operations scale only when authority is partitioned and route hints are generation-checked.",
             "support_reason": "Matched journal terms (generation) to Immutable route roots."
           },
@@ -59188,8 +59188,8 @@
               "fallback",
               "stale"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Bolt says the control signal for a saturated or soon-to-free budget must arrive before the queue state is stale.",
             "support_reason": "Matched journal terms (fallback, stale) to CPU fallback policy."
           },
@@ -59841,8 +59841,8 @@
               "fallback",
               "split route"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A route descriptor should first answer: is this snapshot visible, is this write omittable, is this resident layout compatible, is this CPU/GPU split mergeable, and is fallback allowed?",
             "support_reason": "Matched journal terms (fallback, split route) to CPU fallback policy."
           },
@@ -59865,8 +59865,8 @@
             "matched_terms": [
               "route choice"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "NWR helps a narrow blind-write class, while the planner and aggregation papers mostly improve read-side route choice.",
             "support_reason": "Matched journal terms (route choice) to Cost-based route optimizer."
           },
@@ -59889,8 +59889,8 @@
               "deterministic",
               "aria"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "DACE can correct planner residuals, but only after the deterministic planner has proved a route is legal.",
             "support_reason": "Matched journal terms (deterministic, aria) to Deterministic hot-write templates."
           },
@@ -59913,8 +59913,8 @@
             "matched_terms": [
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A route descriptor should first answer: is this snapshot visible, is this write omittable, is this resident layout compatible, is this CPU/GPU split mergeable, and is fallback allowed?",
             "support_reason": "Matched journal terms (route descriptor) to Immutable route roots."
           },
@@ -62826,8 +62826,8 @@
               "placement",
               "buffer"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Eigen, GaccO, No False Negatives, and Robust Co-Processor Query Processing converge on a common design track: the engine should separate durable truth, execution placement, and transient execution capacity.",
             "support_reason": "Matched journal terms (placement, buffer) to Multi-tier placement policy."
           },
@@ -62875,8 +62875,8 @@
             "matched_terms": [
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The next GPU DB route descriptor should therefore carry four typed contracts: truth boundary, visibility/conflict boundary, resident-input boundary, and temporary-state boundary.",
             "support_reason": "Matched journal terms (route descriptor) to Immutable route roots."
           },
@@ -63770,8 +63770,8 @@
               "join",
               "predicate"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Distributed GPU joins point toward accelerator throughput from large, shape-compatible batches; Spooky argues that maintenance and refresh should use stable boundary groups; CCaaS separates conflict resolution from execution and storage; Strife shows that high-contention OLTP can be made more predictable when each batch exposes its actual conflict graph.",
             "support_reason": "Matched journal terms (planning, join, predicate) to Cost-based route optimizer."
           },
@@ -65850,8 +65850,8 @@
               "generation",
               "publish"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "RTIndeX keeps GPU point lookups fast only when the resident index is read-mostly, batched, and rebuilt at generation boundaries.",
             "support_reason": "Matched journal terms (generation, publish) to Immutable route roots."
           },
@@ -66584,8 +66584,8 @@
               "template",
               "aria"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Write routes should expose transaction template, conflict mode, and WAL publication stage.",
             "support_reason": "Matched journal terms (deterministic, template, aria) to Deterministic hot-write templates."
           },
@@ -67259,8 +67259,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "It also needs typed state for conflict temperature, recovery debt, and physical placement.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -67943,8 +67943,8 @@
               "generation",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The cold tier should expose typed service capabilities, the GPU index should expose generation and update contracts, and the mutation path should expose conflict metadata before work enters the owner.",
             "support_reason": "Matched journal terms (generation, publication) to Immutable route roots."
           },
@@ -67992,8 +67992,8 @@
             "matched_terms": [
               "cold tier"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The cold tier should expose typed service capabilities, the GPU index should expose generation and update contracts, and the mutation path should expose conflict metadata before work enters the owner.",
             "support_reason": "Matched journal terms (cold tier) to DB-owned cold objects."
           },
@@ -69445,8 +69445,8 @@
             "matched_terms": [
               "fallback"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A route should state what it supports, what it costs to build, what batch depth or predictability it needs, what invalidates it, and what fallback is allowed.",
             "support_reason": "Matched journal terms (fallback) to CPU fallback policy."
           },
@@ -69493,8 +69493,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "For indexes, the envelope should include the index family, source snapshot boundary, key semantics, duplicate handling, build/rebuild cost, memory footprint, expected probes or traversal depth, and observed hit/miss behavior.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -70148,8 +70148,8 @@
               "scheduling",
               "resource"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Towards Optimal Transaction Scheduling says conflicting hot-key writes should be ordered before they create aborts, retries, or owner-queue stalls.",
             "support_reason": "Matched journal terms (scheduling, resource) to Resource-DAG scheduling."
           },
@@ -70789,8 +70789,8 @@
               "resident",
               "hbm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "It is a reservation over snapshot generation, HBM bytes, pinned buffers, GPU stream time, IO-submission lanes, completion lanes, NVMe queues, response buffers, filesystem metadata operations, and mutation/WAL publication.",
             "support_reason": "Matched journal terms (retained, resident, hbm) to Retained GPU snapshots."
           },
@@ -71866,8 +71866,8 @@
               "cardinality",
               "pruning"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Robust cardinality estimation argued that learned route advice should be anchored to fresh deterministic statistics.",
             "support_reason": "Matched journal terms (cardinality, pruning) to Cost-based route optimizer."
           },
@@ -72517,8 +72517,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "STOv2 shows that write-path routes need semantic conflict boundaries such as commit-time updates and timestamp groups.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -73235,8 +73235,8 @@
               "dependency",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Transaction Healing says a failed optimistic transaction does not always need a full restart if the engine knows the command's dependency graph.",
             "support_reason": "Matched journal terms (dependency, proof) to Dependency witnesses."
           },
@@ -73259,8 +73259,8 @@
             "matched_terms": [
               "template"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The view/conflict-robustness paper says RC/SI/SSI route templates should be certified with conflict-robustness; view-robustness is not a hidden extra shortcut for this MVCC family.",
             "support_reason": "Matched journal terms (template) to Deterministic hot-write templates."
           },
@@ -75408,8 +75408,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Snapshot reconstruction says a route should also publish its visibility and physical reconstruction plan.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -75433,8 +75433,8 @@
               "cardinality",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "...admission should also account for measured interference and buffer fragmentation. - Visibility correctness remains outside the optimizer's discretion: a fast measured route can be used only if its snapshot certificate proves the requested read boundary.",
             "support_reason": "Matched journal terms (optimizer, cardinality, metadata) to Cost-based route optimizer."
           },
@@ -75459,8 +75459,8 @@
               "generation",
               "publish"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Concurrent GPU query processing says a route should publish a resource shape before admission.",
             "support_reason": "Matched journal terms (generation, publish) to Immutable route roots."
           },
@@ -76443,8 +76443,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "X-SSD says storage devices can expose fast-tier durability as counters and credits; Correct Remote Persistence says those counters are only correct if they name the actual persistence domain and ordering recipe; Serval says hot deterministic writes should be staged locally and summarized compactly before they touch the global visibility structure.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -76494,8 +76494,8 @@
               "generation",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "**Converging design tracks:** GPU DB's mutation path should separate four frontiers: local pending-version staging, durable WAL/replica certification, CPU MVCC visibility publication, and GPU resident-snapshot refresh.",
             "support_reason": "Matched journal terms (generation, publication) to Immutable route roots."
           },
@@ -79283,8 +79283,8 @@
               "hot key",
               "template"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The certificate now needs static isolation safety, physical tier state, freshness clocks, and scheduling intent for hot keys or hot segments.",
             "support_reason": "Matched journal terms (hot key, template) to Deterministic hot-write templates."
           },
@@ -79332,8 +79332,8 @@
             "matched_terms": [
               "ordering"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The design track is a bounded active-request window rather than global reordering.",
             "support_reason": "Matched journal terms (ordering) to Dependency witnesses."
           },
@@ -79930,8 +79930,8 @@
             "matched_terms": [
               "queue position"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Each entry should carry route class, key or segment hash, snapshot or visibility boundary, priority class, estimated service time, queue position, and fallback/defer counters.",
             "support_reason": "Matched journal terms (queue position) to Deterministic hot-write templates."
           },
@@ -79976,8 +79976,8 @@
             "matched_terms": [
               "admission"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The benchmark priority is now a single admission simulator that can compare edge classification, priority, runtime-conflict scheduling, and bounded deferment under the same workload and latency gates.",
             "support_reason": "Matched journal terms (admission) to Vector-credit admission."
           },
@@ -80636,8 +80636,8 @@
             "matched_terms": [
               "cpu route"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The next high-value reviews should lean toward tiered indexes, storage placement, or GPU/CPU route execution unless a newer MVCC paper directly sharpens snapshot publication.",
             "support_reason": "Matched journal terms (cpu route) to CPU fallback policy."
           },
@@ -82232,8 +82232,8 @@
               "immutable",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The system can then choose among at least four lanes: immutable retained read, single-owner write, conflict-free scheduled write cluster, and residual/generic validation.",
             "support_reason": "Matched journal terms (generation, immutable, publication) to Immutable route roots."
           },
@@ -82889,8 +82889,8 @@
               "retained",
               "resident"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "- Route-certificate schema bench: generate certificates for CPU truth, compressed warm segment, GPU resident segment, and forwarded-value active-window routes; assert each route can explain freshness, ownership, codec/decode cost, and fallback reason. - Commit-to-readable-plus-decode bench: measure write visibility, segment invalidation, compressed refres...",
             "support_reason": "Matched journal terms (retained, resident) to Retained GPU snapshots."
           },
@@ -82913,8 +82913,8 @@
             "matched_terms": [
               "fallback"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "...applicable, tier location, codec chain, decode target, compressed/decompressed byte estimates, queue/decode resource class, and fallback reason.",
             "support_reason": "Matched journal terms (fallback) to CPU fallback policy."
           },
@@ -82937,8 +82937,8 @@
               "dependency",
               "ordered"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Aurora says durability and freshness must be expressed as ordered redo/consistency boundaries rather than implicit page state.",
             "support_reason": "Matched journal terms (dependency, ordered) to Dependency witnesses."
           },
@@ -83797,8 +83797,8 @@
             "matched_terms": [
               "fallback"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Together, they point to a stricter route certificate: a request should declare freshness boundary, scheduling lane, touched relation/key set where known, data tier, access mode, and fallback behavior.",
             "support_reason": "Matched journal terms (fallback) to CPU fallback policy."
           },
@@ -87948,8 +87948,8 @@
               "generation",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "WALTZ moves WAL allocation serialization into a ZNS append path but still requires reserved zones and durable append results before visibility publication.",
             "support_reason": "Matched journal terms (generation, publication) to Immutable route roots."
           },
@@ -88579,8 +88579,8 @@
               "join",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Count-sketch multi-join estimation says a route certificate needs live budget estimates, AMAC says a hot CPU-side route needs calibrated stall-hiding slots, and Block-STM says a speculative write window needs dependency evidence instead of blind retry.",
             "support_reason": "Matched journal terms (cardinality, join, metadata) to Cost-based route optimizer."
           },
@@ -88631,8 +88631,8 @@
             "matched_terms": [
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A window should name the route shape, snapshot or publication boundary, resource budget, expected cardinality or touched-key envelope, and the dependency signal that lets workers stop wasting work.",
             "support_reason": "Matched journal terms (publication) to Immutable route roots."
           },
@@ -89301,8 +89301,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Immutable retained snapshots remain the preferred read surface, but the live indirection points that choose those snapshots need small validation cells: relation-to-generation pointers, segment-map roots, session-credit buckets, and hot CPU fallback index buckets.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -89959,8 +89959,8 @@
               "fallback",
               "stale"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "ICE adds that cardinality estimates must have their own generation and update path; otherwise the planner may confidently route from stale statistics.",
             "support_reason": "Matched journal terms (fallback, stale) to CPU fallback policy."
           },
@@ -92194,8 +92194,8 @@
               "abort",
               "retry"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "It is a certificate that ties a workload shape to resource ownership, data layout, retry policy, visibility, and proof obligations.",
             "support_reason": "Matched journal terms (deterministic, template, abort, retry) to Deterministic hot-write templates."
           },
@@ -92271,8 +92271,8 @@
               "learned",
               "model"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Second, LMSFC shows that a resident layout needs its own workload and packing certificate, because learned physical order can be correct but stale as a performance route.",
             "support_reason": "Matched journal terms (learned, model) to Learned optimizer advisor."
           },
@@ -93124,8 +93124,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The last set of reviews converges on one design rule: every fast route needs evidence about who can move its ordering, placement, isolation, and estimate state.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -93150,8 +93150,8 @@
               "replay",
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "HDCC shows that mixed deterministic and optimistic write lanes need explicit cross-lane ordering and replay evidence.",
             "support_reason": "Matched journal terms (replay, nvm) to WAL-before-visibility boundary."
           },
@@ -94630,8 +94630,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Gria makes deterministic batches adaptive and multi-versioned; Horae separates durable control order from parallel data writes; Electrode keeps tiny protocol fast paths near the kernel while leaving semantic authority in user space; and GenericVC argues that conflict detection and reconciliation should be explicit validation work.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -94683,8 +94683,8 @@
               "deterministic",
               "abort"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Gria makes deterministic batches adaptive and multi-versioned; Horae separates durable control order from parallel data writes; Electrode keeps tiny protocol fast paths near the kernel while leaving semantic authority in user space; and GenericVC argues that conflict detection and reconciliation should be explicit validation work.",
             "support_reason": "Matched journal terms (deterministic, abort) to Deterministic hot-write templates."
           },
@@ -95323,8 +95323,8 @@
             "matched_terms": [
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "MindPalace says a route may be semantically mergeable only after a predicate/value proof.",
             "support_reason": "Matched journal terms (proof) to Dependency witnesses."
           },
@@ -95346,8 +95346,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Skeena says independent engines or tiers need an explicit snapshot mapping and atomic publication protocol before one SQL transaction can safely cross them.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -95394,8 +95394,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The design track is becoming: make semantic validity, placement policy, and cross-tier freshness separate fields instead of hiding them behind \"GPU route eligible.\" A retained read or write route should carry its conflict proof or fallback reason, its placement/promotion reason, and its mapped generation across mutation, catalog, residency, and cold-tier...",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -99036,8 +99036,8 @@
               "priority",
               "tenant"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "- Route certificates should include semantic pressure and resource pressure: fan-out, tenant/partition, read/write intent, snapshot generation, expected GPU work, output bytes, retry age, and whether the route may wound, wait, fallback, or reject. - Retained reads should remain invisible on the common path, but repeated freshness or invalidation conflicts...",
             "support_reason": "Matched journal terms (priority, tenant) to Deficit fairness."
           },
@@ -101533,8 +101533,8 @@
               "fallback",
               "stale"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The pressure proof names destination owner, queue budget, latency budget, setup cost, expected work size, response shape, fallback lane, and timeout condition.",
             "support_reason": "Matched journal terms (fallback, stale) to CPU fallback policy."
           },
@@ -103559,8 +103559,8 @@
               "ordering",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "SLOG says cross-owner work should be represented by compact ordering records, not by dragging full execution state through every owner.",
             "support_reason": "Matched journal terms (ordering, proof) to Dependency witnesses."
           },
@@ -104191,8 +104191,8 @@
               "resident",
               "htap"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "**Converging design tracks:** Hermes, Page As You Go, and ROF all argue for the same missing middle layer between \"fully resident fused route\" and \"fallback to owner CPU path.\" Hermes supplies freshness-bounded main plus delta generations.",
             "support_reason": "Matched journal terms (retained, resident, htap) to Retained GPU snapshots."
           },
@@ -104267,8 +104267,8 @@
               "join",
               "predicate"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "ROF supplies cache-resident stage vectors that make selective predicates, random probes, and prefetching explicit.",
             "support_reason": "Matched journal terms (join, predicate) to Cost-based route optimizer."
           },
@@ -107171,8 +107171,8 @@
               "join",
               "route choice"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Hardware-conscious GPU joins argued that partitioning, placement, and skew must be explicit route traits.",
             "support_reason": "Matched journal terms (join, route choice) to Cost-based route optimizer."
           },
@@ -107195,8 +107195,8 @@
             "matched_terms": [
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "FITing-Tree adds the missing index-memory knob: a route can spend bytes to shrink proof/refinement work, or accept wider last-mile search when memory is the bottleneck.",
             "support_reason": "Matched journal terms (proof) to Dependency witnesses."
           },
@@ -108580,8 +108580,8 @@
               "hot write",
               "abort"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A retained GPU read, hot write, refresh, or cold-tier fallback should not be admitted only because its data is resident or its predicted cost is low.",
             "support_reason": "Matched journal terms (hot write, abort) to Deterministic hot-write templates."
           },
@@ -109292,8 +109292,8 @@
             "matched_terms": [
               "predicate"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "CPU scan variants need a code-shape frontier: selectivity, predicate count, aggregate work, and whether branchy, predicated, SIMD, GPU, or warm-tier execution is currently justified.",
             "support_reason": "Matched journal terms (predicate) to Cost-based route optimizer."
           },
@@ -109955,8 +109955,8 @@
               "publish",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "F1 Lightning says HTAP acceleration should publish the freshness window it can serve and fall back cleanly when the requested snapshot is outside that window.",
             "support_reason": "Matched journal terms (generation, publish, publication) to Immutable route roots."
           },
@@ -109981,8 +109981,8 @@
               "tier",
               "cache"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The route selector can then choose GPU resident, warm CPU columnar, CPU tuple/index, restore-on-demand, or explicit rejection without letting hidden cache state decide correctness.",
             "support_reason": "Matched journal terms (tier, cache) to Multi-tier placement policy."
           },
@@ -110672,8 +110672,8 @@
               "tier",
               "cache"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "TiDB says a retained analytical route is serviceable only when it can prove its timestamp, schema, and replay frontier.",
             "support_reason": "Matched journal terms (tier, cache) to Multi-tier placement policy."
           },
@@ -113712,8 +113712,8 @@
               "frontier",
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Flowcut says ordered response movement needs a drain frontier; RUM says resident access methods must declare read/update/memory costs; NeurCC says hot conflict policy can be selected from cheap route state; STO says the correct conflict predicate often belongs to the datatype or route rather than a universal tuple validator.",
             "support_reason": "Matched journal terms (frontier, snapshot) to Snapshot frontier vectors."
           },
@@ -114185,8 +114185,8 @@
             "matched_terms": [
               "admission"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "TAOBench, LithOS, SAP HANA NVM, and SGDRC converge on a broader runtime track: admission is no longer just \"is there a worker thread free?\" It must budget correlated request fan-out, storage-tier placement, and accelerator interference before work is admitted.",
             "support_reason": "Matched journal terms (admission) to Vector-credit admission."
           },
@@ -117704,8 +117704,8 @@
             "matched_terms": [
               "cold tier"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "GPU, CPU warm tier, NVMe/cold tier, and mutation owners can then cooperate without letting a fast lower tier silently erase MVCC, WAL, or serializability obligations.",
             "support_reason": "Matched journal terms (cold tier) to DB-owned cold objects."
           },
@@ -119028,8 +119028,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "EQDS says overloaded resources should be receiver-clocked, with queueing kept at explicit edges rather than hidden inside shared cores.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -119054,8 +119054,8 @@
               "optimizer",
               "predicate"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The biggest category gap after this batch is still not \"more GPU operators\"; it is tying optimizer estimates to runtime pressure without making either one authoritative alone.",
             "support_reason": "Matched journal terms (optimizer, predicate) to Cost-based route optimizer."
           },
@@ -119079,8 +119079,8 @@
               "placement",
               "buffer"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A retained read should carry not only snapshot and resident-generation proof, but also private-format proof, credit proof, and execution-shape proof: which base/delta interval is safe, which owner granted buffer/stream or response capacity, and why the selected fused, staged, bitmap, CPU, or GPU route is expected to win for the current selectivity and pla...",
             "support_reason": "Matched journal terms (placement, buffer) to Multi-tier placement policy."
           },
@@ -120481,8 +120481,8 @@
               "session",
               "staR"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "VBR gives a memory-lifetime proof: a reader can validate that the descriptor it touched was not recycled out from under it, instead of letting stalled sessions pin old metadata forever.",
             "support_reason": "Matched journal terms (session, staR) to Effective session counting."
           },
@@ -124246,8 +124246,8 @@
               "isolation",
               "viper"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "DecLock, Viper, and ALock converge on one design track: fast remote or retained routes should keep the authoritative shared fact small, move heavy waiter/execution state local, and produce enough history to check that the fast path did not outrun its correctness contract.",
             "support_reason": "Matched journal terms (isolation, viper) to Isolation trace oracle."
           },
@@ -124943,8 +124943,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "For GPU DB, the authority-visible state should usually be a compact grant, generation, durable frontier, route certificate, or active-credit bit.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -124967,8 +124967,8 @@
               "conflict",
               "tpc-c"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "GPU DB should therefore benchmark route-local frontiers and conflict cohorts before adopting global minima, global queues, or global learned policies.",
             "support_reason": "Matched journal terms (conflict, tpc-c) to GPU OLTP conflict ordering."
           },
@@ -125667,8 +125667,8 @@
               "deterministic",
               "template"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Template robustness, Vortex, and ForeSight converge on one design track: fast routes need a certificate before they run, and a bounded fallback when the certificate is missing or stale.",
             "support_reason": "Matched journal terms (deterministic, template) to Deterministic hot-write templates."
           },
@@ -128523,8 +128523,8 @@
               "tenant",
               "slo"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "- **Scheduled core plus disposable speculation:** admitted route work gets protected credits; speculative warmup, prefetch, batch fill, and migration can be canceled before it delays scheduled work. - **Typed pressure and retry signals:** overload must identify the saturated resource so pacing and fallback can react locally rather than slowing the entire...",
             "support_reason": "Matched journal terms (tenant, slo) to Deficit fairness."
           },
@@ -128547,8 +128547,8 @@
             "matched_terms": [
               "resource"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The recent Aeolus, MTM, and 1RMA reviews converge on a runtime design track where work is admitted only with explicit resource proofs, and where policy loops operate at the right time scale.",
             "support_reason": "Matched journal terms (resource) to Resource-DAG scheduling."
           },
@@ -128570,8 +128570,8 @@
             "matched_terms": [
               "generation"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "The shared GPU DB design hypothesis is that each route request should carry a compact credit certificate: session/tenant budget, snapshot-generation eligibility, response bytes, pinned or GPU staging bytes, route-object residency state, and retry or revocation generation.",
             "support_reason": "Matched journal terms (generation) to Immutable route roots."
           },
@@ -131440,8 +131440,8 @@
               "predicate",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A route asset can be a resident fragment, predicate bitmap, decoded dictionary, route descriptor, warm-tier index root, checkpoint manifest, or response-shape buffer.",
             "support_reason": "Matched journal terms (optimizer, planning, predicate, metadata) to Cost-based route optimizer."
           },
@@ -131467,8 +131467,8 @@
               "learned",
               "lemo"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Conditional Access, Clobber-NVM, and Lemo converge on the same architectural pressure from different directions: hot paths want to reuse or retire shared state aggressively, but correctness depends on making the lifetime contract explicit.",
             "support_reason": "Matched journal terms (learned, lemo) to Learned optimizer advisor."
           },
@@ -132723,8 +132723,8 @@
               "snapshot",
               "long reader"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "A route is eligible only when all three agree: the data is correct for the requested snapshot, cannot be reclaimed during execution, and is in the intended tier or has an admitted fetch/offload path.",
             "support_reason": "Matched journal terms (snapshot, long reader) to Snapshot frontier vectors."
           },
@@ -134159,8 +134159,8 @@
               "manifest",
               "publish"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Bandwidth counters alone do not prove a route is healthy; reference ownership alone does not prove retired descriptors are bounded; and \"the database restarted\" alone does not prove durable state was published safely.",
             "support_reason": "Matched journal terms (generation, manifest, publish) to Immutable route roots."
           },
@@ -134185,8 +134185,8 @@
               "owner",
               "ring"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "Host-interconnect credits, deferred descriptor reclamation, and B3-style crash testing converge on the same engineering track: GPU DB needs explicit contracts around hidden system state.",
             "support_reason": "Matched journal terms (owner, ring) to Owner-ring bundling."
           },
@@ -136368,8 +136368,8 @@
               "era",
               "retire"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "reviewed-supported link has a substantive matched snippet",
             "snippet": "HostCC says the runtime needs local pressure witnesses before host resources overload. veDB-HTAP says accelerated routes need semantic freshness witnesses before secondary execution. vWeaver says MVCC scans need searchable visibility witnesses before they touch payload data.",
             "support_reason": "Matched journal terms (era, retire) to Bounded descriptor reclamation."
           },
@@ -137577,14 +137577,15 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4044,
-      "weak_direct": 627
+      "direct": 4162,
+      "weak_direct": 509
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
+      "reviewed-supported link has a substantive matched snippet": 118,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 621,
+      "substantive snippet contains only one matched mechanism term": 503,
       "substantive snippet has no matched mechanism terms": 6
     },
     "evidence_span_counts": {
