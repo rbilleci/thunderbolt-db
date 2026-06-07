@@ -38,6 +38,164 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Firmament makes global admission cheap enough to keep centralized
+
+**Citation:** Ionel Gog, Malte Schwarzkopf, Adam Gleave,
+Robert N. M. Watson, and Steven Hand. "Firmament: Fast,
+Centralized Cluster Scheduling at Scale." OSDI 2016, 99-115.
+Retrieved 2026-06-07 from the USENIX page and author PDF:
+`https://www.usenix.org/conference/osdi16/technical-sessions/presentation/gog`,
+`https://pdos.csail.mit.edu/papers/firmament:osdi16.pdf`.
+
+**Category:** runtime / HFT / session scale; high-concurrency
+admission; scheduler and route placement.
+
+**Relevance tags:** centralized scheduling; min-cost max-flow;
+incremental optimization; global placement; admission control;
+rescheduling; queue wait; fallback solver; route advisor; GPU worker
+placement; bounded latency; 1M logical sessions.
+
+**Core idea:** Firmament argues that centralized scheduling does not
+have to mean slow scheduling. It keeps a global view of all tasks and
+machines, represents placement as a min-cost max-flow problem, and
+continuously reschedules the workload. The key engineering claim is
+that a high-quality centralized policy can still reach sub-second
+placement latency if the solver matches the structure of the problem,
+the graph is updated incrementally, and edge-case solver behavior has a
+bounded fallback.
+
+For GPU DB, the transferable idea is a tiered scheduler shape: keep the
+hot owner rings simple and local, but let a centralized route/admission
+advisor periodically solve a richer placement problem over GPU streams,
+resident snapshots, CPU fallback capacity, memory pressure, pinned
+buffers, and queue depth. The advisor should publish compact policy
+snapshots; per-request execution should read those snapshots rather
+than run a heavyweight optimizer in the hot path.
+
+**Concrete mechanisms:**
+
+- Firmament models scheduling as a flow network whose costs encode the
+  scheduling policy. Workload, cluster topology, task metadata, and
+  monitoring data update the graph; the min-cost max-flow solver
+  produces an optimal flow, and placements are extracted from that flow.
+- Unlike one-task-at-a-time queue schedulers, flow-based scheduling can
+  reconsider the entire workload, support rescheduling, and amortize
+  decision work over many tasks.
+- The paper rejects early solver termination as a primary latency
+  control because approximate partial solutions produced poor and
+  volatile placements in its experiments.
+- It compares min-cost max-flow algorithms and finds that relaxation,
+  despite looking unattractive in general, fits Firmament's scheduling
+  graph well in common cases.
+- It uses incremental re-optimization as a fallback path for cost
+  scaling. Incremental relaxation is not always safe as a universal
+  win; the paper observes cases where carrying over a near-optimal
+  state makes relaxation slower because large zero-reduced-cost trees
+  must be traversed repeatedly.
+- Firmament runs two solver algorithms concurrently, using relaxation
+  for the common fast path and incremental cost scaling to bound
+  difficult cases. The paper prefers this over a heuristic selector
+  because solver choice depends on policy and utilization.
+- Problem-specific heuristics exploit graph structure. Arc
+  prioritization biases relaxation toward arcs that reach demand nodes,
+  and efficient task-node removal reduces cost-scaling work after tasks
+  disappear.
+- Before each solver run, Firmament updates the large flow graph with
+  two breadth-first traversals: one pass propagates resource statistics
+  from machine-adjacent nodes, and another lets the policy update node,
+  arc, cost, and capacity fields from task nodes.
+- After solving, Firmament extracts placements by traversing backward
+  from machine nodes and propagating flow destinations; the paper says
+  the common case extracts task mappings in one graph pass.
+- Evaluation uses a Google workload trace scaled to a 12,500-machine
+  cluster, a 40-machine real cluster, and stress cases such as
+  oversubscription and large incoming jobs. The paper reports a 20x
+  placement-latency improvement over Quincy on the Google trace, more
+  than 10,000 machines at sub-second placement latency, comparable
+  latency to distributed schedulers for short-task workloads, and up to
+  6x shorter batch task response time than four other schedulers on the
+  real cluster.
+
+**GPU DB mapping:** Treat global route placement as a slow-changing
+policy snapshot, not as per-query control flow. A route advisor can
+maintain a graph over resident snapshot generations, GPU execution
+owners, stream slots, CPU read workers, mutation-owner capacity,
+NVMe/cold-tier bandwidth, and pinned-buffer budgets. Costs encode
+latency, transfer bytes, queue depth, refresh risk, SLO class, and
+fallback quality.
+
+The runtime should still admit requests through bounded rings. The
+Firmament-style solver belongs beside the rings, periodically publishing
+admission classes such as "GPU now", "GPU micro-batch only", "CPU
+fallback", "wait for refresh", or "reject/overload". Network IO workers
+and read workers consume the published class cheaply.
+
+The paper's rejection of early approximate solutions is important for
+database correctness. GPU DB should not let a half-solved advisor choose
+routes that cannot prove visibility, residency validity, or
+WAL-before-visibility ordering. If the route advisor misses a budget,
+the fallback should be a conservative existing policy, not an
+approximate route with weaker proof fields.
+
+The dual-solver lesson maps to policy generation. Keep a simple,
+deterministic threshold policy as the always-available fallback, while
+experimenting with a richer flow/LP/learned advisor offline or in a
+sidecar. The richer advisor is only allowed to publish if it completes
+inside its latency budget and produces route certificates that the hot
+path can validate.
+
+Firmament also suggests a benchmark vocabulary for 1M logical
+sessions: distinguish request queue wait, scheduling/admission runtime,
+placement extraction time, execution time, and response write time.
+Those phases should be separate telemetry in GPU DB rather than one
+opaque query-latency number.
+
+**Risks and mismatches:** Firmament schedules cluster tasks, not SQL
+queries, transaction commits, MVCC snapshots, or GPU kernels. Its
+objective is placement quality and batch response time, not
+WAL-before-visibility, serializable reads, or crash recovery.
+
+The evaluation's sub-second scheduling target is much slower than the
+per-request budget for many database queries. Directly invoking a
+min-cost max-flow solver on every query would be a design error. The
+safe adaptation is periodic policy publication, batch admission, or
+background route planning.
+
+Firmament assumes tasks can often be rescheduled or migrated. GPU DB
+cannot freely migrate an already admitted mutation, a response tied to a
+pgwire session, or a retained snapshot whose generation was chosen for
+visibility. Rescheduling must stop at database invariant boundaries.
+
+The paper's cluster resources differ from GPU DB's resource bottlenecks.
+HBM residency, PCIe/NVLink transfer, pinned host buffers, CUDA stream
+occupancy, MVCC retention, WAL flush latency, and row visibility windows
+need a different cost model.
+
+**Benchmark candidates:**
+
+- Build a route-advisor simulator over synthetic 1M-session traces. Feed
+  it queue depth, GPU stream slots, CPU fallback workers, resident
+  snapshot generations, pinned-buffer budgets, and refresh states.
+  Compare deterministic thresholds, greedy per-request routing, and
+  periodic global optimization by p50/p99 latency, overload rejects,
+  GPU utilization, and stale-route prevention.
+- Prototype policy snapshots with route certificates. Gate: the hot
+  path can validate `{snapshot_generation, visibility_boundary,
+  residency_generation, fallback_class}` without calling the advisor.
+- Add telemetry phases mirroring Firmament's decomposition: network
+  queue wait, admission decision time, route-placement extraction,
+  execution wait, kernel/CPU execution, and response-ring wait.
+- Stress the fallback contract. Force the advanced advisor to miss its
+  budget or return no solution; the system must continue with the
+  deterministic policy and preserve route correctness.
+- Evaluate micro-batch placement as a global decision. Compare batching
+  same-shape reads greedily at each GPU worker versus placing a whole
+  time-slice of compatible reads across GPU streams and CPU fallback
+  workers.
+- Failure condition: a smarter advisor improves average GPU utilization
+  while worsening p99, increasing overload ambiguity, or admitting a
+  query to a route whose snapshot and residency proof is invalid.
+
 ### 2026-06-07 - DURINN turns visibility-vs-durability gaps into adversarial tests
 
 **Citation:** Xinwei Fu, Dongyoon Lee, and Changwoo Min.

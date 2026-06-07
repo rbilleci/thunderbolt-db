@@ -452,7 +452,7 @@ Append new candidates here as each paper is processed.
   physical-plan features; useful as a control point for what should remain
   outside GPU DB's hot scheduler when learned policies are evaluated. Journal
   entry added 2026-06-07 from the author PDF.
-- `queued` — **Firmament: Fast, Centralized Cluster Scheduling at Scale**,
+- `reviewed` — **Firmament: Fast, Centralized Cluster Scheduling at Scale**,
   Gog, Schwarzkopf, Gleave, Watson, and Hand, OSDI 2016.
   URL: `https://www.usenix.org/conference/osdi16/technical-sessions/presentation/gog`
   PDF: `https://pdos.csail.mit.edu/papers/firmament:osdi16.pdf`
@@ -460,6 +460,7 @@ Append new candidates here as each paper is processed.
   Firmament is a modern scalable centralized scheduler useful for comparing
   flow-network placement, scheduler latency, and global admission decisions
   against GPU DB's local owner rings and route-advisor policy snapshots.
+  Journal entry added 2026-06-07 from the USENIX page and author PDF.
 - `queued` — **Graphene: Packing and Dependency-Aware Scheduling for
   Data-Parallel Clusters**, Grandl et al., OSDI 2016.
   URL: `https://www.usenix.org/conference/osdi16/technical-sessions/presentation/grandl`
@@ -476,6 +477,19 @@ Append new candidates here as each paper is processed.
   Why: Decima and Graphene both point at plan-ahead scheduling; TetriSched is
   useful for comparing reservation-aware choices between preferred GPU-like
   resources and fallback resources under deadlines and mis-estimated runtimes.
+- `queued` — **Hawk: Hybrid Datacenter Scheduling**, Delgado, Dinu,
+  Kermarrec, and Zwaenepoel, USENIX ATC 2015.
+  URL: `https://www.usenix.org/conference/atc15/technical-session/presentation/delgado`
+  Why: Firmament contrasts centralized, distributed, and hybrid schedulers;
+  Hawk is a post-2015 hybrid design useful for comparing which GPU DB
+  admission decisions should be handled by a global advisor versus a fast
+  distributed/local owner policy.
+- `queued` — **Bistro: Scheduling Data-Parallel Jobs Against Live Production
+  Systems**, Goder, Spiridonov, and Wang, USENIX ATC 2015.
+  URL: `https://www.usenix.org/conference/atc15/technical-session/presentation/goder`
+  Why: Firmament's related work includes production-aware scheduling; Bistro is
+  useful for comparing route/admission choices that must coexist with live
+  foreground traffic instead of optimizing benchmark-only GPU utilization.
 - `reviewed` — **Simple Adaptive Query Processing vs. Learned Query
   Optimizers: Observations and Analysis**, Zhang et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2962-zhang.pdf`
