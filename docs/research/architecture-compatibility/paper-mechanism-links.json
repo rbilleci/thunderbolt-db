@@ -15,7 +15,7 @@
     "isolation_trace_oracle": 34,
     "learned_optimizer_advisor": 72,
     "log_structured_warm_tier": 49,
-    "multi_tier_placement": 506,
+    "multi_tier_placement": 505,
     "mvcc_gc_frontiers": 62,
     "owner_ring_bundling": 452,
     "resource_dag_scheduling": 100,
@@ -41748,8 +41748,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot generation, dirty frontier coverage, freshness requirement, and stale-snapshot rejection are core certificate fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -41760,8 +41761,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fallback and stale-snapshot rejection must be explainable from recorded route certificate fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -42522,8 +42524,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry explicitly compares CPU fallback, GPU stable-only execution, and GPU-plus-delta merge under refresh lag.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -42535,8 +42538,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Published resident generations must belong to clean durable prefixes or be rejected before serving reads.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -42547,8 +42551,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Retained GPU reads and resident publication boundaries are the main freshness-certificate consumers.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -42893,8 +42898,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Bounded active windows carry route templates, key classes, predicted conflicts, and legal scheduling order.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -42905,8 +42911,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Freshness clocks are certificate inputs, though the entry mainly targets scheduling intent rather than HTAP routing.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -42916,8 +42923,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Isolation certificates, resident/local boundaries, and optional scheduling order are explicit proof fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -43238,25 +43246,13 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "tier",
-            "placement",
-            "cache"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "queue position"
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Hot-work active-window state includes key or segment hash, priority class, queue position, and defer/fallback decisions.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -43266,8 +43262,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The slice is about bounded admission and scheduling state, not a full DAG scheduler.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -43277,8 +43274,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Owner-local admission records queue position, service estimate, priority, fallback counters, and bounded deferment.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -43622,8 +43620,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Certified generations include visibility, resident, invalidation, and freshness boundaries for retained reads.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -43633,8 +43632,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Out-of-distribution route models and unsuitable generations must fall back conservatively.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -43645,8 +43645,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Older retained snapshots may bypass owners only when their certified freshness and isolation contract is sufficient.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -44007,8 +44008,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Queue wait, accepted/rejected decisions, and admission facts are tracked, but vector credits are not the main subject.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -44019,8 +44021,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The certificate records estimator confidence, OOD reason, accepted/rejected state, and fallback choice.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -44491,8 +44494,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fast lanes must emit snapshot generation, WAL/invalidation boundary, and visibility-bound certificate telemetry.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -44845,8 +44849,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "GPU resident segments and certified decoded generations are first-class route certificate targets.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -44856,8 +44861,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fallback reason is an explicit field when codec, freshness, decode, or ownership facts do not support the route.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -44868,8 +44874,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Schedule, dependency, pushed-value handles, and ownership facts are part of the certificate proof.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -45308,8 +45315,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "effective_session_counting",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Active memory leases require idle logical sessions to reserve no tier payload memory.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -45320,8 +45328,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Hot control state and scheduling lanes are local-owner concerns, though owner rings are not specified directly.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -45331,8 +45340,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Route certificates must declare fallback behavior when freshness, access mode, or tier placement is unsuitable.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -45343,8 +45353,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Batch write scheduler simulation is a relevant follow-up, but the entry's primary focus is tier-locality contracts.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -74499,29 +74510,29 @@
   "summary": {
     "confidence_counts": {
       "high": 3059,
-      "low": 264,
+      "low": 263,
       "medium": 1365
     },
     "entries": 787,
     "linked_entries": 787,
-    "links_requiring_review": 129,
-    "low_confidence_links": 264,
+    "links_requiring_review": 104,
+    "low_confidence_links": 263,
     "mechanisms_with_links": 25,
     "mechanisms_without_links": 0,
     "paper_entries": 610,
-    "pending_low_confidence_links": 129,
-    "removed_low_confidence_links": 31,
+    "pending_low_confidence_links": 104,
+    "removed_low_confidence_links": 32,
     "review_priority_counts": {
-      "none": 4559,
-      "normal": 129
+      "none": 4583,
+      "normal": 104
     },
     "review_status_counts": {
       "auto_accepted": 4424,
-      "pending_low_confidence_review": 129,
-      "reviewed_supported": 107,
-      "reviewed_weak_signal": 28
+      "pending_low_confidence_review": 104,
+      "reviewed_supported": 126,
+      "reviewed_weak_signal": 33
     },
-    "reviewed_low_confidence_links": 135,
+    "reviewed_low_confidence_links": 159,
     "synthesis_entries": 177,
     "unlinked_entries": 0
   },

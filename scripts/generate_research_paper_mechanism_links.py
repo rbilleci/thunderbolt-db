@@ -1721,6 +1721,206 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "Named certificate and generation counters define which publication boundary is safe.",
     },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot generation, dirty frontier coverage, freshness requirement, and stale-snapshot rejection are core certificate fields.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback and stale-snapshot rejection must be explainable from recorded route certificate fields.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry explicitly compares CPU fallback, GPU stable-only execution, and GPU-plus-delta merge under refresh lag.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Published resident generations must belong to clean durable prefixes or be rejected before serving reads.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Retained GPU reads and resident publication boundaries are the main freshness-certificate consumers.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-scheduling-intent",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Bounded active windows carry route templates, key classes, predicted conflicts, and legal scheduling order.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-scheduling-intent",
+        "htap_freshness_router",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Freshness clocks are certificate inputs, though the entry mainly targets scheduling intent rather than HTAP routing.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-scheduling-intent",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Isolation certificates, resident/local boundaries, and optional scheduling order are explicit proof fields.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-admission-needs-active-window-state",
+        "multi_tier_placement",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Tier placement appears only as a future category gap, not as evidence for the active-window admission model.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-admission-needs-active-window-state",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Hot-work active-window state includes key or segment hash, priority class, queue position, and defer/fallback decisions.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-admission-needs-active-window-state",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "The slice is about bounded admission and scheduling state, not a full DAG scheduler.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-admission-needs-active-window-state",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Owner-local admission records queue position, service estimate, priority, fallback counters, and bounded deferment.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publish-certified-generations-not-mutable-shortcuts",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Certified generations include visibility, resident, invalidation, and freshness boundaries for retained reads.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publish-certified-generations-not-mutable-shortcuts",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Out-of-distribution route models and unsuitable generations must fall back conservatively.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publish-certified-generations-not-mutable-shortcuts",
+        "htap_freshness_router",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Older retained snapshots may bypass owners only when their certified freshness and isolation contract is sufficient.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-estimate-provenance",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Queue wait, accepted/rejected decisions, and admission facts are tracked, but vector credits are not the main subject.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-estimate-provenance",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The certificate records estimator confidence, OOD reason, accepted/rejected state, and fallback choice.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fast lanes must emit snapshot generation, WAL/invalidation boundary, and visibility-bound certificate telemetry.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "GPU resident segments and certified decoded generations are first-class route certificate targets.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback reason is an explicit field when codec, freshness, decode, or ownership facts do not support the route.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Schedule, dependency, pushed-value handles, and ownership facts are part of the certificate proof.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts",
+        "effective_session_counting",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Active memory leases require idle logical sessions to reserve no tier payload memory.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Hot control state and scheduling lanes are local-owner concerns, though owner rings are not specified directly.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Route certificates must declare fallback behavior when freshness, access mode, or tier placement is unsuitable.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Batch write scheduler simulation is a relevant follow-up, but the entry's primary focus is tier-locality contracts.",
+    },
 }
 
 

@@ -23,30 +23,30 @@ python3 scripts/generate_research_paper_mechanism_links.py
 ## Link Confidence
 
 - high: 3059
-- low: 264
+- low: 263
 - medium: 1365
 
 ## Review Triage
 
-- links requiring review: 129
-- low-confidence links: 264
-- pending low-confidence links: 129
-- reviewed low-confidence links: 135
-- removed low-confidence links: 31
+- links requiring review: 104
+- low-confidence links: 263
+- pending low-confidence links: 104
+- reviewed low-confidence links: 159
+- removed low-confidence links: 32
 
 Review status counts:
 - auto_accepted: 4424
-- pending_low_confidence_review: 129
-- reviewed_supported: 107
-- reviewed_weak_signal: 28
+- pending_low_confidence_review: 104
+- reviewed_supported: 126
+- reviewed_weak_signal: 33
 
 Review priority counts:
-- none: 4559
-- normal: 129
+- none: 4583
+- normal: 104
 
 ## Mechanism Coverage
 
-- `multi_tier_placement` (Multi-tier placement policy): 506
+- `multi_tier_placement` (Multi-tier placement policy): 505
 - `bounded_descriptor_reclamation` (Bounded descriptor reclamation): 498
 - `retained_gpu_snapshots` (Retained GPU snapshots): 488
 - `owner_ring_bundling` (Owner-ring bundling): 452
@@ -78,15 +78,6 @@ Review priority counts:
 
 ## Entries With Pending Low-Confidence Links
 
-- `2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc` -> snapshot_frontier_vectors, cpu_fallback_policy
-- `2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension` -> cpu_fallback_policy, immutable_route_roots, retained_gpu_snapshots
-- `2026-06-04-cross-paper-synthesis-route-certificates-now-need-scheduling-intent` -> deterministic_hot_write_templates, htap_freshness_router, dependency_witnesses
-- `2026-06-04-cross-paper-synthesis-admission-needs-active-window-state` -> multi_tier_placement, deterministic_hot_write_templates, resource_dag_scheduling, vector_credit_admission
-- `2026-06-04-cross-paper-synthesis-publish-certified-generations-not-mutable-shortcuts` -> snapshot_frontier_vectors, cpu_fallback_policy, htap_freshness_router
-- `2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-estimate-provenance` -> vector_credit_admission, cpu_fallback_policy
-- `2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane` -> immutable_route_roots
-- `2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts` -> retained_gpu_snapshots, cpu_fallback_policy, dependency_witnesses
-- `2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts` -> effective_session_counting, owner_ring_bundling, cpu_fallback_policy, resource_dag_scheduling
 - `2026-06-05-cross-paper-synthesis-gpu-htap-routes-need-freshness-frontiers-plus-resource-contracts` -> effective_session_counting
 - `2026-06-05-cross-paper-synthesis-future-routes-need-calibrated-movement-windows` -> immutable_route_roots
 - `2026-06-05-cross-paper-synthesis-active-windows-need-dependency-evidence` -> cost_based_route_optimizer, wal_before_visibility, deficit_fairness, immutable_route_roots
@@ -194,6 +185,15 @@ Review priority counts:
 - `2026-06-04-cross-paper-synthesis-route-safety-needs-workload-shaped-proof-repair-and-latency-gates` -> dependency_witnesses:reviewed_supported, deterministic_hot_write_templates:reviewed_supported
 - `2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops` -> resource_dag_scheduling:reviewed_supported, snapshot_frontier_vectors:reviewed_supported, cost_based_route_optimizer:reviewed_supported, immutable_route_roots:reviewed_supported
 - `2026-06-04-cross-paper-synthesis-publication-certificates-need-local-staging-and-explicit-durability-clocks` -> owner_ring_bundling:reviewed_supported, snapshot_frontier_vectors:reviewed_supported, immutable_route_roots:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc` -> snapshot_frontier_vectors:reviewed_supported, cpu_fallback_policy:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension` -> cpu_fallback_policy:reviewed_supported, immutable_route_roots:reviewed_supported, retained_gpu_snapshots:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-route-certificates-now-need-scheduling-intent` -> deterministic_hot_write_templates:reviewed_supported, htap_freshness_router:reviewed_weak_signal, dependency_witnesses:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-admission-needs-active-window-state` -> deterministic_hot_write_templates:reviewed_supported, resource_dag_scheduling:reviewed_weak_signal, vector_credit_admission:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-publish-certified-generations-not-mutable-shortcuts` -> snapshot_frontier_vectors:reviewed_supported, cpu_fallback_policy:reviewed_supported, htap_freshness_router:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-estimate-provenance` -> vector_credit_admission:reviewed_weak_signal, cpu_fallback_policy:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane` -> immutable_route_roots:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts` -> retained_gpu_snapshots:reviewed_supported, cpu_fallback_policy:reviewed_supported, dependency_witnesses:reviewed_supported
+- `2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts` -> effective_session_counting:reviewed_supported, owner_ring_bundling:reviewed_weak_signal, cpu_fallback_policy:reviewed_supported, resource_dag_scheduling:reviewed_weak_signal
 
 ## Paper Entries
 
@@ -638,7 +638,7 @@ Review priority counts:
 - `2026-06-04-price-separates-portable-cardinality-priors-from-database-specific-tuning` (paper): cost_based_route_optimizer:high:auto_accepted, learned_optimizer_advisor:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, effective_session_counting:medium:auto_accepted
 - `2026-06-04-adaptive-htap-makes-freshness-a-resource-scheduling-input` (paper): htap_freshness_router:high:auto_accepted, resource_dag_scheduling:high:auto_accepted, cpu_fallback_policy:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, snapshot_frontier_vectors:high:auto_accepted, multi_tier_placement:high:auto_accepted
 - `2026-06-04-cd-search-makes-gpu-co-scheduling-a-classified-resource-partition-problem` (paper): resource_dag_scheduling:high:auto_accepted, owner_ring_bundling:high:auto_accepted, htap_freshness_router:high:auto_accepted, effective_session_counting:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, multi_tier_placement:medium:auto_accepted
-- `2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc` (synthesis): htap_freshness_router:medium:auto_accepted, cost_based_route_optimizer:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, resource_dag_scheduling:medium:auto_accepted, snapshot_frontier_vectors:low:pending_low_confidence_review, cpu_fallback_policy:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc` (synthesis): htap_freshness_router:medium:auto_accepted, cost_based_route_optimizer:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, resource_dag_scheduling:medium:auto_accepted, snapshot_frontier_vectors:low:reviewed_supported, cpu_fallback_policy:low:reviewed_supported
 - `2026-06-04-leanstore-2024-treats-nvme-as-a-first-class-transactional-tier` (paper): multi_tier_placement:high:auto_accepted, wal_before_visibility:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, owner_ring_bundling:high:auto_accepted, log_structured_warm_tier:high:auto_accepted, snapshot_frontier_vectors:high:auto_accepted
 - `2026-06-04-d-rdma-makes-fragmented-database-transfer-a-nic-scheduling-problem` (paper): bounded_descriptor_reclamation:high:auto_accepted, multi_tier_placement:high:auto_accepted, same_shape_microbatching:high:auto_accepted, immutable_route_roots:high:auto_accepted, owner_ring_bundling:medium:auto_accepted, retained_gpu_snapshots:medium:auto_accepted
 - `2026-06-04-mako-decouples-fast-speculative-certification-from-slow-durable-replication` (paper): wal_before_visibility:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, snapshot_frontier_vectors:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, immutable_route_roots:high:auto_accepted
@@ -646,37 +646,37 @@ Review priority counts:
 - `2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem` (paper): multi_tier_placement:high:auto_accepted, wal_before_visibility:high:auto_accepted, owner_ring_bundling:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, gpu_oltp_conflict_ordering:high:auto_accepted, effective_session_counting:high:auto_accepted
 - `2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract` (paper): wal_before_visibility:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, log_structured_warm_tier:high:auto_accepted, multi_tier_placement:high:auto_accepted, snapshot_frontier_vectors:high:auto_accepted, immutable_route_roots:high:auto_accepted
 - `2026-06-04-topsi-makes-fresh-local-snapshots-converge-to-scalar-global-history` (paper): multi_tier_placement:high:auto_accepted, snapshot_frontier_vectors:high:auto_accepted, isolation_trace_oracle:high:auto_accepted, htap_freshness_router:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, wal_before_visibility:high:auto_accepted
-- `2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension` (synthesis): multi_tier_placement:medium:auto_accepted, wal_before_visibility:medium:auto_accepted, htap_freshness_router:medium:auto_accepted, cpu_fallback_policy:low:pending_low_confidence_review, immutable_route_roots:low:pending_low_confidence_review, retained_gpu_snapshots:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension` (synthesis): multi_tier_placement:medium:auto_accepted, wal_before_visibility:medium:auto_accepted, htap_freshness_router:medium:auto_accepted, cpu_fallback_policy:low:reviewed_supported, immutable_route_roots:low:reviewed_supported, retained_gpu_snapshots:low:reviewed_supported
 - `2026-06-04-mvrc-robustness-turns-route-isolation-into-a-static-template-property` (paper): deterministic_hot_write_templates:high:auto_accepted, cost_based_route_optimizer:high:auto_accepted, gpu_oltp_conflict_ordering:high:auto_accepted, retained_gpu_snapshots:medium:auto_accepted, snapshot_frontier_vectors:medium:auto_accepted, dependency_witnesses:medium:auto_accepted
 - `2026-06-04-three-tree-makes-intermediate-memory-a-first-class-buffer-tier` (paper): multi_tier_placement:high:auto_accepted, stable_handle_indirection:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, wal_before_visibility:medium:auto_accepted, immutable_route_roots:medium:auto_accepted, cost_based_route_optimizer:medium:auto_accepted
 - `2026-06-04-schedule-first-oltp-turns-hot-key-conflict-order-into-an-admission-primitive` (paper): deterministic_hot_write_templates:high:auto_accepted, gpu_oltp_conflict_ordering:high:auto_accepted, owner_ring_bundling:high:auto_accepted, resource_dag_scheduling:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, effective_session_counting:medium:auto_accepted
-- `2026-06-04-cross-paper-synthesis-route-certificates-now-need-scheduling-intent` (synthesis): multi_tier_placement:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, resource_dag_scheduling:medium:auto_accepted, deterministic_hot_write_templates:low:pending_low_confidence_review, htap_freshness_router:low:pending_low_confidence_review, dependency_witnesses:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-route-certificates-now-need-scheduling-intent` (synthesis): multi_tier_placement:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, resource_dag_scheduling:medium:auto_accepted, deterministic_hot_write_templates:low:reviewed_supported, htap_freshness_router:low:reviewed_weak_signal, dependency_witnesses:low:reviewed_supported
 - `2026-06-04-dint-keeps-frequent-transaction-steps-inside-the-kernel-datapath` (paper): owner_ring_bundling:high:auto_accepted, effective_session_counting:high:auto_accepted, cpu_fallback_policy:medium:auto_accepted, vector_credit_admission:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted
 - `2026-06-04-polaris-adds-priority-without-abandoning-optimistic-execution` (paper): deficit_fairness:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, gpu_oltp_conflict_ordering:high:auto_accepted, effective_session_counting:high:auto_accepted, cpu_fallback_policy:medium:auto_accepted, retained_gpu_snapshots:medium:auto_accepted
 - `2026-06-04-runtime-conflicts-make-transaction-order-a-measurable-resource` (paper): gpu_oltp_conflict_ordering:high:auto_accepted, owner_ring_bundling:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, resource_dag_scheduling:medium:auto_accepted, wal_before_visibility:medium:auto_accepted
-- `2026-06-04-cross-paper-synthesis-admission-needs-active-window-state` (synthesis): deficit_fairness:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, multi_tier_placement:low:pending_low_confidence_review, deterministic_hot_write_templates:low:pending_low_confidence_review, resource_dag_scheduling:low:pending_low_confidence_review, vector_credit_admission:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-admission-needs-active-window-state` (synthesis): deficit_fairness:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, deterministic_hot_write_templates:low:reviewed_supported, resource_dag_scheduling:low:reviewed_weak_signal, vector_credit_admission:low:reviewed_supported
 - `2026-06-04-cardood-treats-route-estimator-drift-as-a-first-class-optimizer-risk` (paper): cost_based_route_optimizer:high:auto_accepted, learned_optimizer_advisor:high:auto_accepted, cpu_fallback_policy:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted
 - `2026-06-04-cockroachdb-makes-transaction-routing-an-ownership-problem` (paper): retained_gpu_snapshots:high:auto_accepted, owner_ring_bundling:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, immutable_route_roots:high:auto_accepted, wal_before_visibility:high:auto_accepted, htap_freshness_router:high:auto_accepted
 - `2026-06-04-geogauss-batches-replica-consistency-without-per-transaction-coordination` (paper): snapshot_frontier_vectors:high:auto_accepted, immutable_route_roots:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, gpu_oltp_conflict_ordering:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted
-- `2026-06-04-cross-paper-synthesis-publish-certified-generations-not-mutable-shortcuts` (synthesis): immutable_route_roots:high:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, snapshot_frontier_vectors:low:pending_low_confidence_review, cpu_fallback_policy:low:pending_low_confidence_review, htap_freshness_router:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-publish-certified-generations-not-mutable-shortcuts` (synthesis): immutable_route_roots:high:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, snapshot_frontier_vectors:low:reviewed_supported, cpu_fallback_policy:low:reviewed_supported, htap_freshness_router:low:reviewed_supported
 - `2026-06-04-cxl-memory-should-be-placed-by-object-behavior-not-by-capacity-alone` (paper): multi_tier_placement:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, wal_before_visibility:high:auto_accepted, immutable_route_roots:high:auto_accepted, effective_session_counting:high:auto_accepted
 - `2026-06-04-q-store-turns-transaction-execution-into-ordered-operation-queues` (paper): owner_ring_bundling:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, immutable_route_roots:high:auto_accepted, dependency_witnesses:high:auto_accepted
 - `2026-06-04-grasp-makes-imperfect-route-logs-useful-for-cardinality-estimates` (paper): cost_based_route_optimizer:high:auto_accepted, learned_optimizer_advisor:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, cpu_fallback_policy:high:auto_accepted
-- `2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-estimate-provenance` (synthesis): multi_tier_placement:medium:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, learned_optimizer_advisor:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, vector_credit_admission:low:pending_low_confidence_review, cpu_fallback_policy:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-estimate-provenance` (synthesis): multi_tier_placement:medium:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, learned_optimizer_advisor:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, vector_credit_admission:low:reviewed_weak_signal, cpu_fallback_policy:low:reviewed_supported
 - `2026-06-04-quecc-turns-hot-transactions-into-planned-priority-queues` (paper): owner_ring_bundling:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, wal_before_visibility:high:auto_accepted, gpu_oltp_conflict_ordering:high:auto_accepted, cost_based_route_optimizer:high:auto_accepted, deficit_fairness:high:auto_accepted
 - `2026-06-04-cxl-memory-needs-workload-shaped-placement-not-capacity-only-tiering` (paper): multi_tier_placement:high:auto_accepted, effective_session_counting:high:auto_accepted, owner_ring_bundling:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, db_owned_cold_objects:medium:auto_accepted, wal_before_visibility:medium:auto_accepted
 - `2026-06-04-orthrus-separates-contention-control-from-transaction-execution` (paper): owner_ring_bundling:high:auto_accepted, cost_based_route_optimizer:high:auto_accepted, effective_session_counting:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, gpu_oltp_conflict_ordering:medium:auto_accepted
 - `2026-06-04-strife-turns-contention-into-batch-time-conflict-free-lanes` (paper): gpu_oltp_conflict_ordering:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, same_shape_microbatching:high:auto_accepted, owner_ring_bundling:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, wal_before_visibility:high:auto_accepted
-- `2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane` (synthesis): owner_ring_bundling:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, db_owned_cold_objects:medium:auto_accepted, gpu_oltp_conflict_ordering:medium:auto_accepted, retained_gpu_snapshots:medium:auto_accepted, immutable_route_roots:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane` (synthesis): owner_ring_bundling:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, db_owned_cold_objects:medium:auto_accepted, gpu_oltp_conflict_ordering:medium:auto_accepted, retained_gpu_snapshots:medium:auto_accepted, immutable_route_roots:low:reviewed_supported
 - `2026-06-04-aurora-makes-the-redo-log-the-distributed-storage-contract` (paper): retained_gpu_snapshots:high:auto_accepted, multi_tier_placement:high:auto_accepted, wal_before_visibility:high:auto_accepted, htap_freshness_router:high:auto_accepted, effective_session_counting:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted
 - `2026-06-04-t-part-partitions-transactions-then-pushes-writes-forward` (paper): multi_tier_placement:high:auto_accepted, owner_ring_bundling:high:auto_accepted, deterministic_hot_write_templates:high:auto_accepted, wal_before_visibility:high:auto_accepted, dependency_witnesses:high:auto_accepted, same_shape_microbatching:medium:auto_accepted
 - `2026-06-04-btrblocks-chooses-compression-per-block-by-measured-decode-value` (paper): multi_tier_placement:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, owner_ring_bundling:high:auto_accepted, immutable_route_roots:medium:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, htap_freshness_router:medium:auto_accepted
-- `2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts` (synthesis): htap_freshness_router:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, retained_gpu_snapshots:low:pending_low_confidence_review, cpu_fallback_policy:low:pending_low_confidence_review, dependency_witnesses:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts` (synthesis): htap_freshness_router:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, multi_tier_placement:medium:auto_accepted, retained_gpu_snapshots:low:reviewed_supported, cpu_fallback_policy:low:reviewed_supported, dependency_witnesses:low:reviewed_supported
 - `2026-06-04-fpsi-makes-freshness-a-first-contact-snapshot-policy` (paper): snapshot_frontier_vectors:high:auto_accepted, htap_freshness_router:high:auto_accepted, effective_session_counting:high:auto_accepted, isolation_trace_oracle:high:auto_accepted, owner_ring_bundling:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted
 - `2026-06-04-lads-makes-single-threaded-owners-dynamic-per-batch` (paper): owner_ring_bundling:high:auto_accepted, dependency_witnesses:high:auto_accepted, wal_before_visibility:high:auto_accepted, gpu_oltp_conflict_ordering:high:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, retained_gpu_snapshots:medium:auto_accepted
 - `2026-06-04-memory-centric-databases-make-pooled-memory-a-query-route-resource` (paper): multi_tier_placement:high:auto_accepted, effective_session_counting:high:auto_accepted, wal_before_visibility:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, cost_based_route_optimizer:medium:auto_accepted
 - `2026-06-04-cxl-pooling-is-a-costed-route-not-transparent-memory` (paper): multi_tier_placement:high:auto_accepted, owner_ring_bundling:high:auto_accepted, stable_handle_indirection:high:auto_accepted, wal_before_visibility:high:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, cost_based_route_optimizer:medium:auto_accepted
-- `2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts` (synthesis): multi_tier_placement:high:auto_accepted, htap_freshness_router:medium:auto_accepted, effective_session_counting:low:pending_low_confidence_review, owner_ring_bundling:low:pending_low_confidence_review, cpu_fallback_policy:low:pending_low_confidence_review, resource_dag_scheduling:low:pending_low_confidence_review
+- `2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts` (synthesis): multi_tier_placement:high:auto_accepted, htap_freshness_router:medium:auto_accepted, effective_session_counting:low:reviewed_supported, owner_ring_bundling:low:reviewed_weak_signal, cpu_fallback_policy:low:reviewed_supported, resource_dag_scheduling:low:reviewed_weak_signal
 - `2026-06-04-demystifying-cxl-memory-with-genuine-cxl-ready-systems-and-devices` (paper): multi_tier_placement:high:auto_accepted, stable_handle_indirection:medium:auto_accepted, bounded_descriptor_reclamation:medium:auto_accepted, owner_ring_bundling:medium:auto_accepted, wal_before_visibility:medium:auto_accepted, effective_session_counting:medium:auto_accepted
 - `2026-06-04-homa-makes-receiver-admission-a-latency-control-surface` (paper): owner_ring_bundling:high:auto_accepted, deficit_fairness:high:auto_accepted, effective_session_counting:high:auto_accepted, vector_credit_admission:high:auto_accepted, multi_tier_placement:high:auto_accepted, retained_gpu_snapshots:high:auto_accepted
 - `2026-06-04-octopus-uses-semantic-fast-paths-with-gpu-dag-fallback` (paper): deterministic_hot_write_templates:high:auto_accepted, bounded_descriptor_reclamation:high:auto_accepted, wal_before_visibility:high:auto_accepted, cpu_fallback_policy:medium:auto_accepted, gpu_oltp_conflict_ordering:medium:auto_accepted, resource_dag_scheduling:medium:auto_accepted
