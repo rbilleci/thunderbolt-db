@@ -7607,14 +7607,34 @@ Append new candidates here as each paper is processed.
   indexing for cloud warehouses; useful for deciding when GPU DB should
   materialize predicate-specific warm fragments or on-the-fly indexes instead
   of caching whole cold-tier objects.
-- `queued` — **Bullion: A Column Store for Machine Learning**, Liao, Liu,
+- `reviewed` — **Bullion: A Column Store for Machine Learning**, Liao, Liu,
   Chen, and Abadi, CIDR 2025.
   URL:
   `https://vldb.org/cidrdb/2025/bullion-a-column-store-for-machine-learning.html`
   PDF: `https://vldb.org/cidrdb/papers/2025/p26-liao.pdf`
   Why: Lance highlights ML-style nested and wide-column workloads; Bullion is
   a modern primary follow-up for comparing wide/nested column-store layout
-  against GPU DB's future vector/text/scalar segment design.
+  against GPU DB's future vector/text/scalar segment design. Journal entry
+  added 2026-06-07 from the CIDR page and author PDF.
+- `queued` — **Frequency-Store: Scaling Image AI by A Column-Store for
+  Images**, Sirin, Kauffman, Saluja, Klein, Hsu, and Idreos, CIDR 2025.
+  URL:
+  `https://vldb.org/cidrdb/2025/frequency-store-scaling-image-ai-by-a-column-store-for-images.html`
+  PDF: `https://vldb.org/cidrdb/papers/2025/p27-sirin.pdf`
+  Why: Bullion's multimodal layout raises the question of whether media
+  objects should remain external or be decomposed into route-readable
+  components; Frequency-Store is a modern primary follow-up for comparing
+  columnar image/media decomposition, shared data movement, and compression
+  against GPU DB's future multimodal or vector-adjacent storage tiers.
+- `queued` — **Shared Foundations: Modernizing Meta's Data Lakehouse**,
+  Chattopadhyay et al., CIDR 2023.
+  URL:
+  `https://www.vldb.org/cidrdb/2023/shared-foundations-modernizing-metas-data-lakehouse.html`
+  PDF: `https://www.cidrdb.org/cidr2023/papers/p77-chattopadhyay.pdf`
+  Why: Bullion contrasts Meta's Alpha format for ML wide-table projection,
+  feature flattening, feature reordering, and coalesced reads; useful for
+  comparing direct-access metadata and column/feature layout before GPU DB
+  fixes a resident or cold-tier format for very wide route descriptors.
 - `queued` — **SyPer: Connecting the Pieces for Hybrid Transactional and
   Analytical Processing**, Wang et al., PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p673-wang.pdf`

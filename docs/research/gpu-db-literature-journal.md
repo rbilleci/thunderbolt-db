@@ -38,6 +38,196 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Bullion makes column layout follow access shape, compliance, and precision
+
+**Citation:** Gang Liao, Ye Liu, Jianjun Chen, and Daniel J.
+Abadi. "Bullion: A Column Store for Machine Learning." CIDR 2025.
+Retrieved 2026-06-07 from the CIDR proceedings and author PDF:
+`https://vldb.org/cidrdb/2025/bullion-a-column-store-for-machine-learning.html`,
+`https://www.cs.umd.edu/~abadi/papers/bullion-cidr.pdf`.
+
+**Category:** database file-system/storage/indexing; multi-tier cache /
+data placement; GPU execution data layout.
+
+**Relevance tags:** columnar storage; wide tables; sparse features;
+deletion compliance; page-local physical erasure; Merkle checksums;
+feature projection; compact metadata footer; feature quantization;
+multimodal layout; quality-aware ordering; cascading encodings; vector
+and embedding storage; GPU resident segment format.
+
+**Core idea:** Bullion argues that ML-oriented columnar storage has drifted
+away from classic warehouse assumptions. Production feature tables can have
+tens of thousands of sparse and nested feature columns, frequent feature
+churn, strict physical-deletion requirements, vector embeddings, and
+multimodal records where training reads only a quality-selected subset.
+Those access shapes make ordinary Parquet/ORC-style metadata, delete, and
+encoding choices expensive even before query execution begins.
+
+The strongest transferable idea for GPU DB is to make physical segment
+layout an access-shape contract rather than a universal column-store
+default. A GPU-resident or warm-tier segment should choose footer metadata,
+column grouping, deletion representation, quantized numeric encoding, and
+row/column ordering based on the route family that will read it. This is
+especially relevant before adding future vector, text, nested, or
+multimodal columns to the P8 storage design.
+
+**Concrete mechanisms:**
+
+- Bullion combines deletion vectors with page-local in-place data masking or
+  rewriting. The footer records deleted rows plus row-group and page offsets,
+  allowing the system to update only affected pages when the post-update page
+  size does not exceed the original page size.
+- The deletion path is encoding-aware. Bit-packed values can be masked in
+  place; varints keep continuation bits and mask payload bits; RLE uses a
+  deletion vector when direct masking would expand the encoding; dictionary
+  encoding adds a default mask-value dictionary entry; FOR-delta and nested
+  encodings remain compatible when the page-size bound is preserved.
+- Page checksums are maintained with a Merkle-tree-like hierarchy: page hash,
+  row-group checksum, then file checksum. Updating a deleted page propagates
+  only the affected hashes instead of recomputing a monolithic whole-file
+  checksum.
+- The paper defines three compatibility/compliance levels: ordinary Parquet
+  or ORC behavior, deletion-vector filtering, and deletion vectors plus
+  in-place physical removal. The point is configurable compliance rather
+  than one fixed delete cost for all data.
+- For sparse recommendation features, Bullion extends delta encoding to long
+  sequence vectors such as `list<int64>`. A base vector is stored, then later
+  vectors encode overlap ranges plus head and tail deltas, matching sliding
+  window patterns in user-event histories.
+- Wide-table projection uses a compact binary footer with arrays such as
+  row counts, page compression types, row/page/group offsets, column sizes,
+  column offsets, deletion vectors, checksums, and schema. The paper reports
+  that extracting one column from a 10,000-feature file takes 52 ms for
+  Parquet metadata parsing versus 1.2 ms for Bullion in its experiment.
+- Feature quantization stores reduced-precision feature and embedding values
+  such as FP16, BF16, or FP8 when model quality allows it. The paper also
+  discusses a dual-column FP32-as-two-FP16 strategy for business-critical
+  models that need reconstruction while other models read lower precision.
+- For multimodal training, Bullion stores structured metadata and selected
+  reduced-resolution/high-quality media features in the columnar meta table,
+  with external video lookup used only for rare full-size access. Rows can be
+  presorted by quality score so selected training samples are contiguous.
+- For recommendation workloads, it contrasts row quality ordering with
+  column reordering: when training commonly touches only about 10% of many
+  feature columns, frequently accessed columns should be stored contiguously
+  within row groups to reduce random IO.
+- The cascading encoding discussion calls for modular, independently
+  composable encoders rather than tightly coupling RLE, varint, fixed-width,
+  dictionary, bit shuffle, FSST, Gorilla/Chimp, ALP, zstd chunks, and bitmap
+  formats inside one hard-coded codec path.
+
+**GPU DB mapping:** P8's first slice currently targets `int4` and `text`
+column-group snapshots generated from CPU MVCC truth. Bullion suggests the
+next storage design step should keep the same principle but add
+route-specific physical contracts: compact direct-access metadata for
+resident projections, page or segment checksums that can be updated after
+small invalidations, and encoded columns whose deletion or tombstone state
+can be applied without rebuilding an entire cold object.
+
+For write throughput, the page-local deletion idea maps to segment-local
+repair after deletes or compliance-driven purges. GPU DB still needs
+WAL-before-visibility, so the useful pattern is not "modify the resident
+file directly"; it is "log the delete, update CPU truth, invalidate or repair
+only affected resident/warm pages, and publish a new generation with updated
+checksum witnesses."
+
+For read throughput, the compact footer is a strong fit for route
+certificates. A retained GPU route should avoid parsing a huge schema or
+format descriptor on every request. It should dereference fixed arrays for
+column offsets, codec ids, row counts, delete masks, checksums, and resident
+device handles, then enqueue kernels with a small immutable descriptor.
+
+For future vector and embedding support, storage quantization should be a
+planner-visible physical property. A route that reads quantized embeddings
+needs a precision certificate and a model/query tolerance rule. Ordinary SQL
+numeric semantics, indexes, WAL records, and recovery should remain tied to
+canonical CPU values unless the type itself is declared approximate.
+
+For multi-tier placement, Bullion's row/column reordering distinction is a
+good benchmark input. Some routes want contiguous hot columns; others want
+contiguous high-quality rows or top-ranked samples. GPU DB should not assume
+one row-group ordering serves OLTP lookups, retained aggregates, vector
+filters, and multimodal training-style scans equally well.
+
+**Risks and mismatches:** Bullion is a CIDR design paper with preliminary
+experiments, not a full OLTP storage engine. It targets ML training,
+recommendation, embeddings, and multimodal data, not SQL transaction
+processing, MVCC version chains, WAL recovery, or GPU kernels over mutable
+relational tables.
+
+The deletion-compliance mechanism assumes page-local rewriting is possible
+without growing the encoded page. GPU DB must handle cases where masking
+breaks codec assumptions, indexes still point at old values, replicas have
+already consumed WAL records, or retained snapshots need the pre-delete
+version. Physical erasure cannot bypass visibility rules or snapshot pins.
+
+The metadata speed comparison focuses on wide projection parsing, not
+end-to-end query latency, cache behavior, kernel-launch overhead, or
+concurrent sessions. The 52 ms versus 1.2 ms result is still a useful
+warning: format metadata can become the route bottleneck before scan
+throughput matters.
+
+Feature quantization is only safe when the consumer semantics permit
+approximation. It should not leak into exact SQL types, primary keys,
+visibility metadata, checksums, or WAL replay.
+
+**Benchmark candidates:**
+
+- Build a compact resident-segment footer prototype for P8 with fixed arrays
+  for column offsets, codec ids, row counts, delete masks, checksum roots, and
+  generation witnesses. Gate: route descriptor construction stays sub-10 us
+  for thousands of columns and does not allocate per request.
+- Compare full resident rebuild versus page/segment-local repair after delete
+  or tombstone batches. Measure WAL-to-invalidated-generation latency,
+  repaired bytes, checksum update cost, retained-reader correctness, and
+  rebuild fallback rate.
+- Add a wide-table projection benchmark: 1,000, 10,000, and 20,000 logical
+  columns with 1%, 10%, and 50% projection rates. Compare metadata parse time,
+  route certificate size, GPU kernel descriptor build time, and p99 latency.
+- Prototype route-visible quantized embedding columns separately from exact
+  SQL columns. Gate: approximate routes carry explicit precision metadata and
+  exact SQL queries never read quantized values accidentally.
+- Test row-group ordering policies: key order for OLTP lookups, hot-column
+  order for feature-style projections, quality/sample order for top-k scans,
+  and update-local order for repair. Failure condition: one layout silently
+  becomes the default without a measured route win.
+- Benchmark cascading codec selection with a small codec catalog over `int4`,
+  text-prefix, sparse integer-vector, and embedding-like columns. Report
+  compressed bytes, decode CPU time, GPU transfer bytes, GPU decode cost if
+  any, and route-level p99.
+
+### 2026-06-07 - Cross-paper synthesis: format metadata is now route metadata
+
+**Converging tracks:** HostCC, veDB-HTAP, and Bullion all point to the same
+control-plane lesson from different layers. HostCC says hidden host resources
+need fast local pressure signals. veDB-HTAP says acceleration must sit behind
+semantic routing, freshness alignment, and fallback. Bullion says the storage
+format itself needs direct metadata, compliance levels, encoding choices, and
+layout choices that match the consumer.
+
+For GPU DB, the converging design track is **route certificates as compact
+cross-layer metadata**. A fast retained route should carry semantic proof
+fields from the database, physical proof fields from the segment format, and
+resource proof fields from the runtime: visibility generation, catalog
+generation, resident layout id, codec ids, precision mode, delete-mask
+generation, checksum root, owner/resource budget, and fallback reason.
+
+**Category gaps:** Recent reviews have covered runtime pressure, HTAP routing,
+WAL/warm-tier movement, and storage layout. The next few papers should bias
+toward transaction scheduling/concurrency control, MVCC snapshot validation,
+or high-concurrency admission before taking another pure analytics format
+paper.
+
+**Benchmark priorities:**
+
+- A route-certificate benchmark that builds and validates semantic, physical,
+  and resource fields without parsing heavyweight metadata in the hot path.
+- A mixed-freshness benchmark where the planner chooses CPU fallback, bounded
+  wait, GPU resident execution, or segment repair using explicit certificate
+  fields.
+- A wide-table/resident-segment benchmark that treats metadata parse time,
+  descriptor size, and delete-mask generation as first-class p99 inputs.
+
 ### 2026-06-07 - Adaptive HTAP treats freshness as a resource-scheduling input
 
 **Citation:** Aunn Raza, Periklis Chrysogelos, Angelos Christos
