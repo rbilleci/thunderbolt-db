@@ -42,7 +42,7 @@ Evidence quality reason counts:
 - snippet contains multiple matched mechanism terms: 3098
 - strong journal section contains matched mechanism terms: 506
 - substantive snippet contains only one matched mechanism term: 503
-- substantive snippet has no matched mechanism terms: 6
+- substantive snippet contains visible mechanism aliases: 6
 
 ## Evidence Span Quality Audit
 
@@ -53,7 +53,7 @@ Evidence quality reason counts:
 - `2026-06-07-cross-paper-synthesis-format-metadata-is-now-route-metadata` -> cost_based_route_optimizer:weak_direct (substantive snippet contains only one matched mechanism term): Bullion says the storage format itself needs direct metadata, compliance levels, encoding choices, and layout choices that match the consumer.
 - `2026-06-07-cross-paper-synthesis-format-metadata-is-now-route-metadata` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): HostCC says hidden host resources need fast local pressure signals. veDB-HTAP says acceleration must sit behind semantic routing, freshness alignment, and fallback.
 - `2026-06-07-firmament-makes-global-admission-cheap-enough-to-keep-centralized` -> immutable_route_roots:weak_direct (substantive snippet contains only one matched mechanism term): A route advisor can maintain a graph over resident snapshot generations, GPU execution owners, stream slots, CPU read workers, mutation-owner capacity, NVMe/cold-tier bandwidth, and pinned-buffer budgets.
-- `2026-06-07-rapidlane-turns-hot-shared-counters-into-deferred-commit-time-deltas` -> deterministic_hot_write_templates:weak_direct (substantive snippet has no matched mechanism terms): **Core idea:** RapidLane observes that some apparent read-write conflicts on hot shared objects do not need to be conflicts during transaction execution.
+- `2026-06-07-rapidlane-turns-hot-shared-counters-into-deferred-commit-time-deltas` -> deterministic_hot_write_templates:weak_direct (substantive snippet contains visible mechanism aliases): **Core idea:** RapidLane observes that some apparent read-write conflicts on hot shared objects do not need to be conflicts during transaction execution.
 - `2026-06-07-rapidlane-turns-hot-shared-counters-into-deferred-commit-time-deltas` -> snapshot_frontier_vectors:weak_direct (substantive snippet contains only one matched mechanism term): GPU DB has SQL expressions, secondary indexes, ad hoc queries, WAL, MVCC snapshots, DDL, crash recovery, replication concerns, and client-visible result sets.
 - `2026-06-07-rapidlane-turns-hot-shared-counters-into-deferred-commit-time-deltas` -> dependency_witnesses:weak_direct (substantive snippet contains only one matched mechanism term): For GPU DB, the transferable idea is a narrow semantic fast path for hot-key write windows: do not send every hot increment, bounded decrement, or monotone counter update through a fully serialized read-modify-write path if the SQL operation can be expressed as a typed deferred delta with an explicit precondition and commit-time proof.
 - `2026-06-06-dhtm-treats-durability-as-part-of-the-transaction-fast-path` -> gpu_oltp_conflict_ordering:weak_direct (substantive snippet contains only one matched mechanism term): HTM provides atomic visibility and conflict detection; hardware-generated redo records provide atomic durability. - Each thread gets a private transaction log area and an overflow list, allocated and tracked by the OS.

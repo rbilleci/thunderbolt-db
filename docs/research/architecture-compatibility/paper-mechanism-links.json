@@ -4314,7 +4314,7 @@
               "aria"
             ],
             "quality": "weak_direct",
-            "quality_reason": "substantive snippet has no matched mechanism terms",
+            "quality_reason": "substantive snippet contains visible mechanism aliases",
             "snippet": "**Core idea:** RapidLane observes that some apparent read-write conflicts on hot shared objects do not need to be conflicts during transaction execution.",
             "support_reason": "Matched journal terms (deterministic, hot write, contention, retry) to Deterministic hot-write templates."
           },
@@ -44707,7 +44707,7 @@
               "cpu fallback"
             ],
             "quality": "weak_direct",
-            "quality_reason": "substantive snippet has no matched mechanism terms",
+            "quality_reason": "substantive snippet contains visible mechanism aliases",
             "snippet": "For network IO workers, mutation owners, read-snapshot workers, residency refresh queues, GPU execution workers, pinned-buffer pools, and response rings, the scheduler should distinguish \"large but draining\" from \"small but accelerating.\" That distinction matters when deciding whether to admit more retained reads, grow a micro-batch, force a drain, use CP...",
             "support_reason": "Matched journal terms (fallback, cpu fallback) to CPU fallback policy."
           },
@@ -72223,7 +72223,7 @@
               "cold"
             ],
             "quality": "weak_direct",
-            "quality_reason": "substantive snippet has no matched mechanism terms",
+            "quality_reason": "substantive snippet contains visible mechanism aliases",
             "snippet": "**Core idea:** The paper asks whether learned indexes become a better match for GPUs than traditional branch-heavy indexes.",
             "support_reason": "Matched journal terms (tier, placement, cache, hbm) to Multi-tier placement policy."
           },
@@ -92221,7 +92221,7 @@
               "cost model"
             ],
             "quality": "weak_direct",
-            "quality_reason": "substantive snippet has no matched mechanism terms",
+            "quality_reason": "substantive snippet contains visible mechanism aliases",
             "snippet": "Benchmark priority should therefore move from \"does the fast route win\" to \"does the fast route still win after carrying its proof\": measure retained GPU reads, deterministic write batches, and selective serializable fallback with route-certificate creation, trace capture, offline anomaly analysis, and replayable minimized witnesses included in the cost m...",
             "support_reason": "Matched journal terms (cost model) to Cost-based route optimizer."
           },
@@ -118177,7 +118177,7 @@
               "fresh"
             ],
             "quality": "weak_direct",
-            "quality_reason": "substantive snippet has no matched mechanism terms",
+            "quality_reason": "substantive snippet contains visible mechanism aliases",
             "snippet": "**Core idea:** UpBit targets the awkward middle ground where bitmap indexes are useful for selective reads, but ordinary compressed bitvectors are expensive to update.",
             "support_reason": "Matched journal terms (freshness, htap, fresh) to HTAP freshness router."
           },
@@ -118228,7 +118228,7 @@
               "buffer"
             ],
             "quality": "weak_direct",
-            "quality_reason": "substantive snippet has no matched mechanism terms",
+            "quality_reason": "substantive snippet contains visible mechanism aliases",
             "snippet": "**Core idea:** UpBit targets the awkward middle ground where bitmap indexes are useful for selective reads, but ordinary compressed bitvectors are expensive to update.",
             "support_reason": "Matched journal terms (tier, placement, cache, buffer) to Multi-tier placement policy."
           },
@@ -137586,7 +137586,7 @@
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
       "substantive snippet contains only one matched mechanism term": 503,
-      "substantive snippet has no matched mechanism terms": 6
+      "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
       "links_with_evidence_snippet": 4671,

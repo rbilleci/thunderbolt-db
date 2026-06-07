@@ -28,6 +28,37 @@ STRONG_SNIPPET_PREFIXES = (
     "**risks and mismatches:**",
 )
 
+VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
+    "cost_based_route_optimizer": [
+        "cost model",
+        "fast route",
+        "proof",
+        "route-certificate",
+    ],
+    "cpu_fallback_policy": [
+        "drain",
+        "overload",
+        "reject",
+    ],
+    "deterministic_hot_write_templates": [
+        "commit-time",
+        "deferred",
+        "read-write conflicts",
+    ],
+    "htap_freshness_router": [
+        "selective reads",
+        "updates accumulate",
+    ],
+    "multi_tier_placement": [
+        "bitmap indexes",
+        "gpu memory",
+        "gpus",
+        "resident",
+        "transfer",
+        "update state",
+    ],
+}
+
 
 MECHANISM_TERMS: dict[str, list[str]] = {
     "wal_before_visibility": [
@@ -2961,6 +2992,14 @@ def evidence_quality_details(link: dict) -> tuple[str, str]:
         return "metadata_only", "snippet came from journal metadata"
     matched_terms = [term for term in span.get("matched_terms", []) if term != "category fallback"]
     snippet_term_hits = sum(1 for term in matched_terms if term.lower() in snippet_lower)
+    if snippet_term_hits == 0:
+        snippet_term_hits = sum(
+            1
+            for term in VISIBLE_EVIDENCE_ALIASES.get(link["mechanism_id"], [])
+            if term in snippet_lower
+        )
+        if snippet_term_hits:
+            return "weak_direct", "substantive snippet contains visible mechanism aliases"
     if snippet_lower.startswith(STRONG_SNIPPET_PREFIXES) and snippet_term_hits >= 1:
         return "direct", "strong journal section contains matched mechanism terms"
     if len(snippet) < 80:
