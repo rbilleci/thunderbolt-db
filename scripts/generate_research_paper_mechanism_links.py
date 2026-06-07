@@ -392,6 +392,226 @@ REVIEW_PRIORITY_BY_CONFIDENCE = {
 }
 
 
+REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
+    (
+        "2026-06-07-cross-paper-synthesis-route-admission-now-needs-three-witnesses",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The synthesis explicitly requires valid snapshot/catalog/resident generations and safe descriptor publication.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-route-admission-now-needs-three-witnesses",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Plan-ahead admission and route-class resource proof touch route optimization, but the entry is mainly about admission witnesses.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-learned-route-control-needs-deterministic-envelopes",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry names validation restore, native fallback, overload rejection, and fallback causes as required route controls.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-learned-route-control-needs-deterministic-envelopes",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Learned outputs are constrained to immutable policy generations published for cheap worker evaluation.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-placement-needs-price-proof-and-cleanup-horizons",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The retained-route contract includes visibility frontiers, publication/recovery witnesses, and crash-safe derived metadata publication.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-placement-needs-price-proof-and-cleanup-horizons",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Publication/recovery witness tables and proof fields are central to the route contract described by the entry.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-placement-needs-price-proof-and-cleanup-horizons",
+        "mvcc_gc_frontiers",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Active-holder cleanup horizons and bounded retained-generation cleanup are explicit benchmark priorities.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-placement-needs-price-proof-and-cleanup-horizons",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry is specifically about retained routes and resident derived state with measured demotion/admission rules.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-persistent-metadata-needs-overlay-replay-and-witnesses",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The synthesis proposes a tiered metadata owner spanning DRAM overlays, warm/cold indexes, resident manifests, and future CXL/NVM directories.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-persistent-metadata-needs-overlay-replay-and-witnesses",
+        "mvcc_gc_frontiers",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Descriptor lifetime is bounded by generation, reference count, or snapshot epoch, with cleanup backlog made visible.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-persistent-metadata-needs-overlay-replay-and-witnesses",
+        "semantic_crash_oracle",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Crash-state matrices and failure-survival witnesses are named as proof gates for derived metadata.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-durable-metadata-needs-recoverable-shape",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The only optimizer signal is a future category-gap suggestion, not evidence for a mechanism link.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-durable-publication-needs-small-proofs-with-bounded-fallback",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Retired metadata bytes and descriptor generation are explicit fields in the proposed publication-token harness.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-durable-publication-needs-small-proofs-with-bounded-fallback",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback state, reader fallback, and rejected half-published states are part of the publication record and benchmark.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-durable-publication-needs-small-proofs-with-bounded-fallback",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry frames durability and visibility as small explicit proofs consumed by readers, recovery, and fault injection.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Quickstep-style query plans, work orders, route fragments, and shared admission vocabulary support route planning.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Work-order scheduling and route-fragment ownership are relevant, though the entry does not prescribe owner rings directly.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback policy and stale-generation rejection are required before enqueue, GPU launch, or response publication.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Freshness is not the mechanism under discussion; the entry focuses on route proof and cancellation safety.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-cold-tier-movement-needs-route-certificates-not-background-mystery-copies",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The hazard term is incidental; the entry is about route certificates and tier movement, not reclamation.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-cold-tier-movement-needs-route-certificates-not-background-mystery-copies",
+        "db_owned_cold_objects",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Cold/warm data placement, stripes, waypoints, storage movement, and owner-validated tier paths are the main subject.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-cold-tier-movement-needs-route-certificates-not-background-mystery-copies",
+        "htap_freshness_router",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Freshness budgets and stale-hint rejection are explicit proof gates for route certificates.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-cold-tier-movement-needs-route-certificates-not-background-mystery-copies",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The route certificate includes fallback reasons and rejects routes that cannot prove WAL-before-visibility.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-correctness-needs-external-witnesses-too",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Predicate descriptors and operator-boundary route proof give a weak but useful route-planning signal.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-correctness-needs-external-witnesses-too",
+        "multi_tier_placement",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Tier-aware indexes appear only as a category-gap direction, not evidence for this mechanism link.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-semantic-certificates-reusable-descriptors-and-generation",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Retained reads, resident buffer generation, and stale-reader tests directly support retained GPU snapshots.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-semantic-certificates-reusable-descriptors-and-generation",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The freshness term describes descriptor validity, not HTAP freshness routing.",
+    },
+}
+
+
 def slugify(value: str) -> str:
     value = value.lower()
     value = re.sub(r"`([^`]+)`", r"\1", value)
@@ -509,6 +729,20 @@ def link_entry(entry: dict, mechanism_ids: set[str]) -> list[dict]:
     ]
 
 
+def apply_review_overrides(entry: dict, links: list[dict]) -> list[dict]:
+    reviewed: list[dict] = []
+    for link in links:
+        override = REVIEW_OVERRIDES.get((entry["id"], link["mechanism_id"]))
+        if override:
+            link["review_status"] = override["review_status"]
+            link["review_priority"] = override["review_priority"]
+            link["review_note"] = override["review_note"]
+            if override["review_status"] == "removed_low_confidence_noise":
+                continue
+        reviewed.append(link)
+    return reviewed
+
+
 def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanism_ids = {item["id"] for item in mechanisms["mechanisms"]}
     records: list[dict] = []
@@ -521,14 +755,16 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
 
     for entry in entries:
         links = link_entry(entry, mechanism_ids)
-        if not links:
-            unlinked.append(entry["id"])
         for link in links:
             confidence = link["confidence"]
             link["review_status"] = REVIEW_STATUS_BY_CONFIDENCE[confidence]
             link["review_priority"] = REVIEW_PRIORITY_BY_CONFIDENCE[confidence]
+        links = apply_review_overrides(entry, links)
+        if not links:
+            unlinked.append(entry["id"])
+        for link in links:
             mechanism_counts[link["mechanism_id"]] += 1
-            confidence_counts[confidence] += 1
+            confidence_counts[link["confidence"]] += 1
             review_status_counts[link["review_status"]] += 1
             review_priority_counts[link["review_priority"]] += 1
         type_counts[entry["entry_type"]] += 1
@@ -565,6 +801,14 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
             + review_status_counts["manual_review_required"],
             "low_confidence_links": confidence_counts["low"],
+            "pending_low_confidence_links": review_status_counts["pending_low_confidence_review"],
+            "reviewed_low_confidence_links": review_status_counts["reviewed_supported"]
+            + review_status_counts["reviewed_weak_signal"],
+            "removed_low_confidence_links": sum(
+                1
+                for override in REVIEW_OVERRIDES.values()
+                if override["review_status"] == "removed_low_confidence_noise"
+            ),
         },
         "mechanism_counts": dict(sorted(mechanism_counts.items())),
         "mechanisms_without_links": mechanisms_without_links,
@@ -585,10 +829,15 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
         for record in records
         if any(link["confidence"] == "needs_review" for link in record["mechanism_links"])
     ]
-    low_confidence_records = [
+    pending_low_confidence_records = [
         record
         for record in records
-        if any(link["confidence"] == "low" for link in record["mechanism_links"])
+        if any(link["review_status"] == "pending_low_confidence_review" for link in record["mechanism_links"])
+    ]
+    reviewed_low_confidence_records = [
+        record
+        for record in records
+        if any(link["review_status"].startswith("reviewed_") for link in record["mechanism_links"])
     ]
 
     lines = [
@@ -623,6 +872,9 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     lines.extend(["", "## Review Triage", ""])
     lines.append(f"- links requiring review: {index['summary']['links_requiring_review']}")
     lines.append(f"- low-confidence links: {index['summary']['low_confidence_links']}")
+    lines.append(f"- pending low-confidence links: {index['summary']['pending_low_confidence_links']}")
+    lines.append(f"- reviewed low-confidence links: {index['summary']['reviewed_low_confidence_links']}")
+    lines.append(f"- removed low-confidence links: {index['summary']['removed_low_confidence_links']}")
     lines.append("")
     lines.append("Review status counts:")
     for status, count in sorted(review_status_counts.items()):
@@ -650,17 +902,31 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     else:
         lines.append("- none")
 
-    lines.extend(["", "## Entries With Low-Confidence Links", ""])
-    if low_confidence_records:
-        for record in low_confidence_records[:200]:
+    lines.extend(["", "## Entries With Pending Low-Confidence Links", ""])
+    if pending_low_confidence_records:
+        for record in pending_low_confidence_records[:200]:
             links = ", ".join(
                 link["mechanism_id"]
                 for link in record["mechanism_links"]
-                if link["confidence"] == "low"
+                if link["review_status"] == "pending_low_confidence_review"
             )
             lines.append(f"- `{record['id']}` -> {links}")
-        if len(low_confidence_records) > 200:
-            lines.append(f"- ... {len(low_confidence_records) - 200} more")
+        if len(pending_low_confidence_records) > 200:
+            lines.append(f"- ... {len(pending_low_confidence_records) - 200} more")
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Reviewed Low-Confidence Links", ""])
+    if reviewed_low_confidence_records:
+        for record in reviewed_low_confidence_records[:200]:
+            links = ", ".join(
+                f"{link['mechanism_id']}:{link['review_status']}"
+                for link in record["mechanism_links"]
+                if link["review_status"].startswith("reviewed_")
+            )
+            lines.append(f"- `{record['id']}` -> {links}")
+        if len(reviewed_low_confidence_records) > 200:
+            lines.append(f"- ... {len(reviewed_low_confidence_records) - 200} more")
     else:
         lines.append("- none")
 
