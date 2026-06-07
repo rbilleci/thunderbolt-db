@@ -1,7 +1,7 @@
 {
   "description": "Generated traceability from literature journal entries to architecture mechanisms. Review low-confidence and fallback links before making architectural commitments.",
   "mechanism_counts": {
-    "bounded_descriptor_reclamation": 496,
+    "bounded_descriptor_reclamation": 493,
     "cost_based_route_optimizer": 254,
     "cpu_fallback_policy": 166,
     "db_owned_cold_objects": 52,
@@ -10,7 +10,7 @@
     "deterministic_hot_write_templates": 209,
     "effective_session_counting": 173,
     "gpu_oltp_conflict_ordering": 129,
-    "htap_freshness_router": 91,
+    "htap_freshness_router": 89,
     "immutable_route_roots": 340,
     "isolation_trace_oracle": 34,
     "learned_optimizer_advisor": 72,
@@ -52737,17 +52737,6 @@
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "fresh"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
         }
       ],
       "relevance_tags": [],
@@ -53594,24 +53583,14 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "priority",
             "tenant"
           ],
           "link_basis": "keyword",
           "mechanism_id": "deficit_fairness",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Retry age, priority contracts, and bounded entry for short retained reads directly support fairness-aware admission.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -54957,8 +54936,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The pressure proof explicitly includes fallback lane and timeout conditions as route-admission fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -55325,19 +55305,6 @@
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "freshness",
-            "htap",
-            "fresh"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         }
       ],
       "relevance_tags": [],
@@ -55716,17 +55683,6 @@
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "lock-free"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         }
       ],
       "relevance_tags": [],
@@ -56065,8 +56021,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Tier resource readiness, pinned resources, and admission before owner lock hold time directly support credit-style preflight.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -56077,8 +56034,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The route certificate has explicit ownership/order proof and compact cross-owner ordering records.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -56088,8 +56046,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "mvcc_gc_frontiers",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Old-version GC appears as a stale-certificate benchmark, but the entry mainly centers ownership and tier preflight.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -56420,8 +56379,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Freshness-bounded main plus delta generations and staged GPU inputs are central to the retained-route contract.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -56433,8 +56393,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry budgets execution-stage state, but does not specify owner-ring handoff as the primary mechanism.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -56444,8 +56405,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Page handles and pin/unpin contracts imply bounded staged-state lifetimes, though reclamation is not the main topic.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 2
         },
         {
@@ -56456,8 +56418,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Best-CPU-staged baselines and visible temporary route budgets are explicit inputs to route choice.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 2
         }
       ],
@@ -56827,8 +56790,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Durable decisions, resident generations, and cleanup-lag boundaries form a recoverable route-publication artifact.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -58025,8 +57989,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The resident proof index provides segment statistics, refinement width, and fallback inputs for CPU/GPU route choice.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -58036,8 +58001,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Freshness boundaries, delete/delta summaries, and expected refinement width act as compact proof fields for route safety.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -58049,8 +58015,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The proof-index layer is attached to immutable resident generations with explicit freshness boundaries.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -58780,24 +58747,14 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "hot write",
             "abort"
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Conflict shape, hot queues, and conflict lanes are explicit proof fields before hot-write admission.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -58808,8 +58765,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "CAS-sized route-publication cells carry generation and validity state for route boundaries.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -59167,8 +59125,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Retained reads, serviceable frontiers, and rebuildable derived tiers are explicit route-certificate fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -59178,8 +59137,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Code-shape choice, route selector rejection, CPU calibration, and fallback reasons directly support costed route choice.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 2
         }
       ],
@@ -59538,8 +59498,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Resident generation, safe window, recovery frontier, and route-certificate trace fields define immutable publication inputs.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -59550,8 +59511,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The route selector chooses among GPU resident, warm CPU columnar, CPU tuple/index, restore-on-demand, or rejection tiers.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -74503,29 +74465,29 @@
   "summary": {
     "confidence_counts": {
       "high": 3059,
-      "low": 260,
+      "low": 255,
       "medium": 1365
     },
     "entries": 787,
     "linked_entries": 787,
-    "links_requiring_review": 74,
-    "low_confidence_links": 260,
+    "links_requiring_review": 50,
+    "low_confidence_links": 255,
     "mechanisms_with_links": 25,
     "mechanisms_without_links": 0,
     "paper_entries": 610,
-    "pending_low_confidence_links": 74,
-    "removed_low_confidence_links": 35,
+    "pending_low_confidence_links": 50,
+    "removed_low_confidence_links": 40,
     "review_priority_counts": {
-      "none": 4610,
-      "normal": 74
+      "none": 4629,
+      "normal": 50
     },
     "review_status_counts": {
       "auto_accepted": 4424,
-      "pending_low_confidence_review": 74,
-      "reviewed_supported": 147,
-      "reviewed_weak_signal": 39
+      "pending_low_confidence_review": 50,
+      "reviewed_supported": 163,
+      "reviewed_weak_signal": 42
     },
-    "reviewed_low_confidence_links": 186,
+    "reviewed_low_confidence_links": 205,
     "synthesis_entries": 177,
     "unlinked_entries": 0
   },

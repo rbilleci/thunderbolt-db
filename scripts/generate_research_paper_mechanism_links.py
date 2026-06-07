@@ -2161,6 +2161,198 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "Accelerator metadata requires publication safety for WAL, snapshot, resident generation, and route eligibility.",
     },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-fallback-lanes-and-gpu-route-contracts",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "HTAP appears only as a category gap; the entry focuses on generic frontiers, fallback lanes, and GPU execution shape.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-tail-contracts-need-age-fan-out-and-accelerator-budget",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry discusses route pressure, chunking, and conflict age, not descriptor lifetime or reclamation.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-tail-contracts-need-age-fan-out-and-accelerator-budget",
+        "deficit_fairness",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Retry age, priority contracts, and bounded entry for short retained reads directly support fairness-aware admission.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-metadata-must-prove-both-correctness-and-pressure-shape",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The pressure proof explicitly includes fallback lane and timeout conditions as route-admission fields.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-schedulers-need-class-proof-and-completion-locality",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Integrated HTAP freshness is listed as a category gap, not as evidence for the scheduler contract in this entry.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-htap-freshness-and-modular-transaction-lanes-are-converging",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Stable load-unit metadata supports placement, but the entry does not discuss descriptor retirement or reclamation.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-must-preflight-both-ownership-and-tiers",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Tier resource readiness, pinned resources, and admission before owner lock hold time directly support credit-style preflight.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-must-preflight-both-ownership-and-tiers",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The route certificate has explicit ownership/order proof and compact cross-owner ordering records.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-must-preflight-both-ownership-and-tiers",
+        "mvcc_gc_frontiers",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Old-version GC appears as a stale-certificate benchmark, but the entry mainly centers ownership and tier preflight.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-staged-route-boundaries-should-be-budgeted-first-class-state",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Freshness-bounded main plus delta generations and staged GPU inputs are central to the retained-route contract.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-staged-route-boundaries-should-be-budgeted-first-class-state",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "The entry budgets execution-stage state, but does not specify owner-ring handoff as the primary mechanism.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-staged-route-boundaries-should-be-budgeted-first-class-state",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Page handles and pin/unpin contracts imply bounded staged-state lifetimes, though reclamation is not the main topic.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-staged-route-boundaries-should-be-budgeted-first-class-state",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Best-CPU-staged baselines and visible temporary route budgets are explicit inputs to route choice.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-commit-decisions-need-a-recoverable-visibility-contract",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Durable decisions, resident generations, and cleanup-lag boundaries form a recoverable route-publication artifact.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-freshness-windows-need-compact-proof-indexes",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The resident proof index provides segment statistics, refinement width, and fallback inputs for CPU/GPU route choice.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-freshness-windows-need-compact-proof-indexes",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Freshness boundaries, delete/delta summaries, and expected refinement width act as compact proof fields for route safety.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-freshness-windows-need-compact-proof-indexes",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The proof-index layer is attached to immutable resident generations with explicit freshness boundaries.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-boundaries-need-primitive-budgets",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Primitive-budget accounting and publication cells are discussed, but descriptor lifetime and reclamation are not.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-boundaries-need-primitive-budgets",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Conflict shape, hot queues, and conflict lanes are explicit proof fields before hot-write admission.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-boundaries-need-primitive-budgets",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "CAS-sized route-publication cells carry generation and validity state for route boundaries.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-fallback-tiering-and-recovery-all-need-route-frontiers",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Retained reads, serviceable frontiers, and rebuildable derived tiers are explicit route-certificate fields.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-fallback-tiering-and-recovery-all-need-route-frontiers",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Code-shape choice, route selector rejection, CPU calibration, and fallback reasons directly support costed route choice.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-serviceable-snapshots-beat-invisible-acceleration",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Resident generation, safe window, recovery frontier, and route-certificate trace fields define immutable publication inputs.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-serviceable-snapshots-beat-invisible-acceleration",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The route selector chooses among GPU resident, warm CPU columnar, CPU tuple/index, restore-on-demand, or rejection tiers.",
+    },
 }
 
 
