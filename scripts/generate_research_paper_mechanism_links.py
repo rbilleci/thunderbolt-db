@@ -14,6 +14,20 @@ TAGS_RE = re.compile(r"^\*\*Relevance tags:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 CITATION_RE = re.compile(r"^\*\*Citation:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`])")
 
+METADATA_SNIPPET_PREFIXES = (
+    "**citation:**",
+    "**category:**",
+    "category:",
+    "**relevance tags:**",
+)
+
+STRONG_SNIPPET_PREFIXES = (
+    "**core idea:**",
+    "**concrete mechanisms:**",
+    "**gpu db mapping:**",
+    "**risks and mismatches:**",
+)
+
 
 MECHANISM_TERMS: dict[str, list[str]] = {
     "wal_before_visibility": [
@@ -2823,6 +2837,18 @@ def compact_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def non_metadata_sentences(paragraphs: list[str]) -> list[str]:
+    sentences: list[str] = []
+    for paragraph in paragraphs:
+        if paragraph.lower().startswith(METADATA_SNIPPET_PREFIXES):
+            continue
+        for sentence in SENTENCE_RE.split(paragraph):
+            sentence = compact_whitespace(sentence)
+            if sentence:
+                sentences.append(sentence)
+    return sentences
+
+
 def evidence_snippet(body: str, terms: list[str]) -> str:
     paragraphs = [compact_whitespace(part) for part in body.split("\n\n")]
     paragraphs = [part for part in paragraphs if part]
@@ -2831,21 +2857,56 @@ def evidence_snippet(body: str, terms: list[str]) -> str:
     best = ""
     best_score = -1
     for paragraph in paragraphs:
+        paragraph_lower = paragraph.lower()
+        metadata_penalty = 6 if paragraph_lower.startswith(METADATA_SNIPPET_PREFIXES) else 0
+        section_bonus = 2 if paragraph_lower.startswith(STRONG_SNIPPET_PREFIXES) else 0
         for sentence in SENTENCE_RE.split(paragraph):
             sentence = compact_whitespace(sentence)
             if not sentence:
                 continue
             haystack = sentence.lower()
-            score = sum(1 for term in term_lowers if term in haystack)
+            term_hits = sum(1 for term in term_lowers if term in haystack)
+            if term_lowers and term_hits == 0:
+                continue
+            length_bonus = 1 if len(sentence) >= 80 else 0
+            score = (term_hits * 4) + section_bonus + length_bonus - metadata_penalty
             if score > best_score:
                 best = sentence
                 best_score = score
 
-    if not best and paragraphs:
-        best = paragraphs[0]
+    if (not best or best.lower().startswith(METADATA_SNIPPET_PREFIXES)) and paragraphs:
+        fallback_sentences = non_metadata_sentences(paragraphs)
+        strong_fallbacks = [
+            sentence
+            for sentence in fallback_sentences
+            if sentence.lower().startswith(STRONG_SNIPPET_PREFIXES) or len(sentence) >= 80
+        ]
+        if strong_fallbacks:
+            best = strong_fallbacks[0]
+        elif fallback_sentences:
+            best = fallback_sentences[0]
+        elif not best:
+            best = paragraphs[0]
     if len(best) > 360:
         best = best[:357].rstrip() + "..."
     return best
+
+
+def evidence_quality(link: dict) -> str:
+    span = link["evidence_span"]
+    snippet = span.get("snippet", "")
+    snippet_lower = snippet.lower()
+    if link["link_basis"] == "fallback":
+        return "fallback_review"
+    if snippet_lower.startswith(METADATA_SNIPPET_PREFIXES):
+        return "metadata_only"
+    if len(snippet) < 80:
+        return "short_snippet"
+    matched_terms = [term for term in span.get("matched_terms", []) if term != "category fallback"]
+    snippet_term_hits = sum(1 for term in matched_terms if term.lower() in snippet_lower)
+    if snippet_term_hits >= 2 or link["confidence"] == "high":
+        return "direct"
+    return "weak_direct"
 
 
 def evidence_support_reason(link: dict, mechanism_name: str) -> str:
@@ -2864,6 +2925,7 @@ def attach_evidence_span(entry: dict, link: dict, mechanism_name: str) -> None:
         "snippet": evidence_snippet(entry.get("body", ""), link["evidence_terms"]),
         "support_reason": evidence_support_reason(link, mechanism_name),
     }
+    link["evidence_span"]["quality"] = evidence_quality(link)
 
 
 def fallback_mechanisms(category: str, text: str) -> list[str]:
@@ -2942,6 +3004,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanism_counts: Counter = Counter()
     confidence_counts: Counter = Counter()
     evidence_span_counts: Counter = Counter()
+    evidence_quality_counts: Counter = Counter()
     review_status_counts: Counter = Counter()
     review_priority_counts: Counter = Counter()
     type_counts: Counter = Counter()
@@ -2965,6 +3028,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
                 evidence_span_counts["links_with_evidence_snippet"] += 1
             if link["evidence_span"]["support_reason"]:
                 evidence_span_counts["links_with_support_reason"] += 1
+            evidence_quality_counts[link["evidence_span"]["quality"]] += 1
             review_status_counts[link["review_status"]] += 1
             review_priority_counts[link["review_priority"]] += 1
         type_counts[entry["entry_type"]] += 1
@@ -2997,6 +3061,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "mechanisms_without_links": len(mechanisms_without_links),
             "confidence_counts": dict(sorted(confidence_counts.items())),
             "evidence_span_counts": dict(sorted(evidence_span_counts.items())),
+            "evidence_quality_counts": dict(sorted(evidence_quality_counts.items())),
             "review_status_counts": dict(sorted(review_status_counts.items())),
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
@@ -3023,6 +3088,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     mechanism_counts = Counter(index["mechanism_counts"])
     confidence_counts = index["summary"]["confidence_counts"]
     evidence_span_counts = index["summary"]["evidence_span_counts"]
+    evidence_quality_counts = index["summary"]["evidence_quality_counts"]
     review_status_counts = index["summary"]["review_status_counts"]
     review_priority_counts = index["summary"]["review_priority_counts"]
     records = index["records"]
@@ -3040,6 +3106,12 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
         record
         for record in records
         if any(link["review_status"].startswith("reviewed_") for link in record["mechanism_links"])
+    ]
+    evidence_quality_audit = [
+        (record, link)
+        for record in records
+        for link in record["mechanism_links"]
+        if link["evidence_span"]["quality"] != "direct"
     ]
 
     lines = [
@@ -3076,6 +3148,23 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     lines.append(f"- links with evidence span: {evidence_span_counts.get('links_with_evidence_span', 0)} / {total_links}")
     lines.append(f"- links with evidence snippet: {evidence_span_counts.get('links_with_evidence_snippet', 0)} / {total_links}")
     lines.append(f"- links with support reason: {evidence_span_counts.get('links_with_support_reason', 0)} / {total_links}")
+    lines.append("")
+    lines.append("Evidence quality counts:")
+    for quality, count in sorted(evidence_quality_counts.items()):
+        lines.append(f"- {quality}: {count}")
+
+    lines.extend(["", "## Evidence Span Quality Audit", ""])
+    if evidence_quality_audit:
+        for record, link in evidence_quality_audit[:80]:
+            span = link["evidence_span"]
+            snippet = span["snippet"].replace("|", "\\|")
+            lines.append(
+                f"- `{record['id']}` -> {link['mechanism_id']}:{span['quality']}: {snippet}"
+            )
+        if len(evidence_quality_audit) > 80:
+            lines.append(f"- ... {len(evidence_quality_audit) - 80} more")
+    else:
+        lines.append("- none")
 
     lines.extend(["", "## Review Triage", ""])
     lines.append(f"- links requiring review: {index['summary']['links_requiring_review']}")
