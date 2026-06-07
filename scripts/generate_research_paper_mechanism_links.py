@@ -12,6 +12,7 @@ HEADING_RE = re.compile(r"^### (?P<date>\d{4}-\d{2}-\d{2}) - (?P<title>.+)$", re
 CATEGORY_RE = re.compile(r"^\*\*Category:\*\*\s*(?P<value>.+)$|^Category:\s*(?P<plain>.+)$", re.MULTILINE)
 TAGS_RE = re.compile(r"^\*\*Relevance tags:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 CITATION_RE = re.compile(r"^\*\*Citation:\*\*\s*(?P<value>.+)$", re.MULTILINE)
+SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`])")
 
 
 MECHANISM_TERMS: dict[str, list[str]] = {
@@ -2818,6 +2819,53 @@ def score_terms(text: str, terms: list[str]) -> tuple[int, list[str]]:
     return score, matched[:8]
 
 
+def compact_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def evidence_snippet(body: str, terms: list[str]) -> str:
+    paragraphs = [compact_whitespace(part) for part in body.split("\n\n")]
+    paragraphs = [part for part in paragraphs if part]
+    term_lowers = [term.lower() for term in terms if term != "category fallback"]
+
+    best = ""
+    best_score = -1
+    for paragraph in paragraphs:
+        for sentence in SENTENCE_RE.split(paragraph):
+            sentence = compact_whitespace(sentence)
+            if not sentence:
+                continue
+            haystack = sentence.lower()
+            score = sum(1 for term in term_lowers if term in haystack)
+            if score > best_score:
+                best = sentence
+                best_score = score
+
+    if not best and paragraphs:
+        best = paragraphs[0]
+    if len(best) > 360:
+        best = best[:357].rstrip() + "..."
+    return best
+
+
+def evidence_support_reason(link: dict, mechanism_name: str) -> str:
+    terms = [term for term in link["evidence_terms"] if term != "category fallback"]
+    if terms:
+        term_text = ", ".join(terms[:4])
+        return f"Matched journal terms ({term_text}) to {mechanism_name}."
+    return f"Category fallback mapped this journal entry to {mechanism_name}; review before relying on the link."
+
+
+def attach_evidence_span(entry: dict, link: dict, mechanism_name: str) -> None:
+    link["evidence_span"] = {
+        "journal_entry_id": entry["id"],
+        "journal_anchor": f"### {entry['date']} - {entry['title']}",
+        "matched_terms": link["evidence_terms"],
+        "snippet": evidence_snippet(entry.get("body", ""), link["evidence_terms"]),
+        "support_reason": evidence_support_reason(link, mechanism_name),
+    }
+
+
 def fallback_mechanisms(category: str, text: str) -> list[str]:
     haystack = f"{category}\n{text[:3000]}".lower()
     result: list[str] = []
@@ -2889,9 +2937,11 @@ def apply_review_overrides(entry: dict, links: list[dict]) -> list[dict]:
 
 def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanism_ids = {item["id"] for item in mechanisms["mechanisms"]}
+    mechanism_names = {item["id"]: item["name"] for item in mechanisms["mechanisms"]}
     records: list[dict] = []
     mechanism_counts: Counter = Counter()
     confidence_counts: Counter = Counter()
+    evidence_span_counts: Counter = Counter()
     review_status_counts: Counter = Counter()
     review_priority_counts: Counter = Counter()
     type_counts: Counter = Counter()
@@ -2907,8 +2957,14 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
         if not links:
             unlinked.append(entry["id"])
         for link in links:
+            attach_evidence_span(entry, link, mechanism_names.get(link["mechanism_id"], link["mechanism_id"]))
             mechanism_counts[link["mechanism_id"]] += 1
             confidence_counts[link["confidence"]] += 1
+            evidence_span_counts["links_with_evidence_span"] += 1
+            if link["evidence_span"]["snippet"]:
+                evidence_span_counts["links_with_evidence_snippet"] += 1
+            if link["evidence_span"]["support_reason"]:
+                evidence_span_counts["links_with_support_reason"] += 1
             review_status_counts[link["review_status"]] += 1
             review_priority_counts[link["review_priority"]] += 1
         type_counts[entry["entry_type"]] += 1
@@ -2927,8 +2983,8 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
 
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v1",
-        "description": "Generated traceability from literature journal entries to architecture mechanisms. Review low-confidence and fallback links before making architectural commitments.",
+        "schema": "gpu-db-research-paper-mechanism-links-v2",
+        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans. Review low-confidence and fallback links before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
         "summary": {
@@ -2940,6 +2996,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "mechanisms_with_links": len(mechanism_counts),
             "mechanisms_without_links": len(mechanisms_without_links),
             "confidence_counts": dict(sorted(confidence_counts.items())),
+            "evidence_span_counts": dict(sorted(evidence_span_counts.items())),
             "review_status_counts": dict(sorted(review_status_counts.items())),
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
@@ -2965,6 +3022,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     names = {item["id"]: item["name"] for item in mechanisms["mechanisms"]}
     mechanism_counts = Counter(index["mechanism_counts"])
     confidence_counts = index["summary"]["confidence_counts"]
+    evidence_span_counts = index["summary"]["evidence_span_counts"]
     review_status_counts = index["summary"]["review_status_counts"]
     review_priority_counts = index["summary"]["review_priority_counts"]
     records = index["records"]
@@ -3012,6 +3070,12 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     ]
     for confidence, count in sorted(confidence_counts.items()):
         lines.append(f"- {confidence}: {count}")
+
+    lines.extend(["", "## Evidence Spans", ""])
+    total_links = sum(confidence_counts.values())
+    lines.append(f"- links with evidence span: {evidence_span_counts.get('links_with_evidence_span', 0)} / {total_links}")
+    lines.append(f"- links with evidence snippet: {evidence_span_counts.get('links_with_evidence_snippet', 0)} / {total_links}")
+    lines.append(f"- links with support reason: {evidence_span_counts.get('links_with_support_reason', 0)} / {total_links}")
 
     lines.extend(["", "## Review Triage", ""])
     lines.append(f"- links requiring review: {index['summary']['links_requiring_review']}")

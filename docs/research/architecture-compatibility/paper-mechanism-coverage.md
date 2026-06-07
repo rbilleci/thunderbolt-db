@@ -26,6 +26,12 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - low: 247
 - medium: 1365
 
+## Evidence Spans
+
+- links with evidence span: 4671 / 4671
+- links with evidence snippet: 4671 / 4671
+- links with support reason: 4671 / 4671
+
 ## Review Triage
 
 - links requiring review: 0
