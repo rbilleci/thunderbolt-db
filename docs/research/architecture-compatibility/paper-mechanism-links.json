@@ -1,20 +1,20 @@
 {
   "description": "Generated traceability from literature journal entries to architecture mechanisms. Review low-confidence and fallback links before making architectural commitments.",
   "mechanism_counts": {
-    "bounded_descriptor_reclamation": 503,
+    "bounded_descriptor_reclamation": 498,
     "cost_based_route_optimizer": 254,
     "cpu_fallback_policy": 166,
     "db_owned_cold_objects": 52,
     "deficit_fairness": 66,
     "dependency_witnesses": 122,
     "deterministic_hot_write_templates": 209,
-    "effective_session_counting": 174,
+    "effective_session_counting": 173,
     "gpu_oltp_conflict_ordering": 129,
-    "htap_freshness_router": 92,
+    "htap_freshness_router": 91,
     "immutable_route_roots": 340,
     "isolation_trace_oracle": 34,
     "learned_optimizer_advisor": 72,
-    "log_structured_warm_tier": 50,
+    "log_structured_warm_tier": 49,
     "multi_tier_placement": 506,
     "mvcc_gc_frontiers": 62,
     "owner_ring_bundling": 452,
@@ -36016,8 +36016,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Write routes expose transaction template, conflict mode, staged execution, and deterministic fallback priorities.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -36381,8 +36382,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "gpu_oltp_conflict_ordering",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Conflict temperature and hot-key write promotion are explicit route-state fields for write safety.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -36394,8 +36396,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Lease and owner state are sampled by owners, but the entry does not prescribe owner-ring bundling directly.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -36405,8 +36408,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Budgeted route descriptors are central, but immutable publication roots are not the entry's main mechanism.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -36746,24 +36750,14 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "generation",
             "publication"
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot generation, ordering, and publication safety are required fields in the typed route metadata.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -36774,8 +36768,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The synthesis calls for query planning that combines latency risk with resource budgets, but only as a category gap.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -36785,8 +36780,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "db_owned_cold_objects",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Cold-tier service capabilities and cold-tier pushdown costs are explicit parts of the route contract.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -37154,18 +37150,6 @@
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "session",
-            "logical session"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "effective_session_counting",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
         }
       ],
       "relevance_tags": [],
@@ -37575,20 +37559,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The resident route envelope names source snapshot boundaries, invalidation causes, and queries served per generation.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 2
         },
         {
           "confidence": "low",
@@ -37597,8 +37571,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fallback allowance and fallback reason are required telemetry fields for accelerated resident routes.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 2
         },
         {
@@ -37609,8 +37584,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Hybrid CPU/GPU scheduling appears as a next-paper direction, while the entry mainly covers resident envelopes.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 2
         },
         {
@@ -37620,8 +37596,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Source snapshot boundaries and immutable resident snapshots are central to the index route envelope.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 2
         }
       ],
@@ -37970,24 +37947,14 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "scheduling",
             "resource"
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Pre-admission pricing classifies route resources and chooses wait, batch ordering, spill, fallback, or overload.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -38333,20 +38300,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The mixed-route stress harness explicitly combines short retained lookups with long cold scans and HBM budgets.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         },
         {
           "confidence": "low",
@@ -38356,20 +38313,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "append",
-            "nvm"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "log_structured_warm_tier",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot generation and mutation/WAL publication are explicit correctness dimensions in the route envelope.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -38923,20 +38869,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Mixed OLTP/OLAP freshness and fallback decisions are explicit route-placement concerns.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         },
         {
           "confidence": "low",
@@ -38946,8 +38882,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Robust cardinality, deterministic statistics, pruning fragments, and fallback ranking support route optimization.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -39298,8 +39235,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "gpu_oltp_conflict_ordering",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Semantic write conflict boundaries and conflict-splitting benchmarks are core to the hot-route contract.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -39311,8 +39249,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Owner lookup and route-cache queue accounting matter, but the synthesis does not directly require owner rings.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -39323,8 +39262,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Resident indexes, retained route validity, and visibility boundaries are central to the descriptor.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -39683,8 +39623,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The descriptor attaches isolation proof, dependency scope, and conflict/repair contracts before route admission.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -39694,8 +39635,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Certified route templates and unsafe-template fallback are explicit benchmark priorities.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -40846,8 +40788,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Route certificates name kernel DAGs, resource shapes, measured co-run compatibility, and scheduling gates.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -40857,8 +40800,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot generation, delta overlays, tombstones, and requested read boundaries are explicit certificate fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -40870,8 +40814,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Static cost estimates are checked against live route-class telemetry before route choice is trusted.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -40882,8 +40827,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Certified snapshot generations are required before measured fast routes can be selected.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -41416,8 +41362,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Owner-local pending arrays and local staging are named write-path publication surfaces.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -41428,21 +41375,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The write path separates local staging, WAL durability, MVCC visibility, and GPU resident-snapshot refresh frontiers.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "freshness",
-            "fresh"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         },
         {
           "confidence": "low",
@@ -41452,8 +41388,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Named certificate and generation counters define which publication boundary is safe.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -74562,29 +74499,29 @@
   "summary": {
     "confidence_counts": {
       "high": 3059,
-      "low": 272,
+      "low": 264,
       "medium": 1365
     },
     "entries": 787,
     "linked_entries": 787,
-    "links_requiring_review": 165,
-    "low_confidence_links": 272,
+    "links_requiring_review": 129,
+    "low_confidence_links": 264,
     "mechanisms_with_links": 25,
     "mechanisms_without_links": 0,
     "paper_entries": 610,
-    "pending_low_confidence_links": 165,
-    "removed_low_confidence_links": 23,
+    "pending_low_confidence_links": 129,
+    "removed_low_confidence_links": 31,
     "review_priority_counts": {
-      "none": 4531,
-      "normal": 165
+      "none": 4559,
+      "normal": 129
     },
     "review_status_counts": {
       "auto_accepted": 4424,
-      "pending_low_confidence_review": 165,
-      "reviewed_supported": 84,
-      "reviewed_weak_signal": 23
+      "pending_low_confidence_review": 129,
+      "reviewed_supported": 107,
+      "reviewed_weak_signal": 28
     },
-    "reviewed_low_confidence_links": 107,
+    "reviewed_low_confidence_links": 135,
     "synthesis_entries": 177,
     "unlinked_entries": 0
   },

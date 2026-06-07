@@ -1433,6 +1433,294 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "Hot point state, colder log-shaped records, and resident GPU indexes are deliberately separated by placement contract.",
     },
+    (
+        "2026-06-04-synthesis-staged-writes-and-bounded-movement-routes-converge",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Write routes expose transaction template, conflict mode, staged execution, and deterministic fallback priorities.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-placement-and-write-safety-both-need-budgeted-route-state",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Conflict temperature and hot-key write promotion are explicit route-state fields for write safety.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-placement-and-write-safety-both-need-budgeted-route-state",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Lease and owner state are sampled by owners, but the entry does not prescribe owner-ring bundling directly.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-placement-and-write-safety-both-need-budgeted-route-state",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Budgeted route descriptors are central, but immutable publication roots are not the entry's main mechanism.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-typed-service-and-conflict-contracts",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry discusses route metadata and cold tiers, but not descriptor lifetime or reclamation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-typed-service-and-conflict-contracts",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot generation, ordering, and publication safety are required fields in the typed route metadata.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-typed-service-and-conflict-contracts",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "The synthesis calls for query planning that combines latency risk with resource budgets, but only as a category gap.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-typed-service-and-conflict-contracts",
+        "db_owned_cold_objects",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Cold-tier service capabilities and cold-tier pushdown costs are explicit parts of the route contract.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-execution-and-publication-frontiers",
+        "effective_session_counting",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Many logical sessions appear only as a category gap, not as evidence for session-counting mechanics.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-resident-indexes-need-route-envelopes-and-rebuild-economics",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The resident route envelope names source snapshot boundaries, invalidation causes, and queries served per generation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-resident-indexes-need-route-envelopes-and-rebuild-economics",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry talks about route-envelope facts and warm-state economics, not descriptor reclamation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-resident-indexes-need-route-envelopes-and-rebuild-economics",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback allowance and fallback reason are required telemetry fields for accelerated resident routes.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-resident-indexes-need-route-envelopes-and-rebuild-economics",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Hybrid CPU/GPU scheduling appears as a next-paper direction, while the entry mainly covers resident envelopes.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-resident-indexes-need-route-envelopes-and-rebuild-economics",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Source snapshot boundaries and immutable resident snapshots are central to the index route envelope.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-admission-must-price-contention-memory-and-allocation-before-work-enters-h",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The matched arena/allocation language is about temporary memory, not descriptor retirement.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-admission-must-price-contention-memory-and-allocation-before-work-enters-h",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Pre-admission pricing classifies route resources and chooses wait, batch ordering, spill, fallback, or overload.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-storage-routes-need-hidden-contention-budgets",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The mixed-route stress harness explicitly combines short retained lookups with long cold scans and HBM budgets.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-storage-routes-need-hidden-contention-budgets",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The route-envelope discussion names shared state, but not descriptor lifetime or reclamation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-storage-routes-need-hidden-contention-budgets",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot generation and mutation/WAL publication are explicit correctness dimensions in the route envelope.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-storage-routes-need-hidden-contention-budgets",
+        "log_structured_warm_tier",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "WAL appends and NVM route budgets are mentioned, but not a log-structured warm-tier mechanism.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-placement-needs-stable-pressure-before-movement",
+        "htap_freshness_router",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Mixed OLTP/OLAP freshness and fallback decisions are explicit route-placement concerns.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-placement-needs-stable-pressure-before-movement",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The pressure ledger uses descriptors, but does not discuss descriptor retirement or reclamation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-placement-needs-stable-pressure-before-movement",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Robust cardinality, deterministic statistics, pruning fragments, and fallback ranking support route optimization.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-semantic-boundaries-before-caches-scale",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Semantic write conflict boundaries and conflict-splitting benchmarks are core to the hot-route contract.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-semantic-boundaries-before-caches-scale",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Owner lookup and route-cache queue accounting matter, but the synthesis does not directly require owner rings.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-semantic-boundaries-before-caches-scale",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Resident indexes, retained route validity, and visibility boundaries are central to the descriptor.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-needs-workload-shaped-proof-repair-and-latency-gates",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The descriptor attaches isolation proof, dependency scope, and conflict/repair contracts before route admission.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-needs-workload-shaped-proof-repair-and-latency-gates",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Certified route templates and unsafe-template fallback are explicit benchmark priorities.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Route certificates name kernel DAGs, resource shapes, measured co-run compatibility, and scheduling gates.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot generation, delta overlays, tombstones, and requested read boundaries are explicit certificate fields.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Static cost estimates are checked against live route-class telemetry before route choice is trusted.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Certified snapshot generations are required before measured fast routes can be selected.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publication-certificates-need-local-staging-and-explicit-durability-clocks",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Owner-local pending arrays and local staging are named write-path publication surfaces.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publication-certificates-need-local-staging-and-explicit-durability-clocks",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The write path separates local staging, WAL durability, MVCC visibility, and GPU resident-snapshot refresh frontiers.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publication-certificates-need-local-staging-and-explicit-durability-clocks",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "GPU freshness is a publication frontier here, not evidence for HTAP freshness routing.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publication-certificates-need-local-staging-and-explicit-durability-clocks",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Named certificate and generation counters define which publication boundary is safe.",
+    },
 }
 
 
