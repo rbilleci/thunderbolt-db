@@ -7813,7 +7813,7 @@ Append new candidates here as each paper is processed.
   comparing receiver-driven low-latency request/response transport with GPU
   DB's command-ring credits and micro-batch admission. Journal entry added
   2026-06-06.
-- `queued` — **TFC: Token Flow Control in Data Center Networks**, Zhang, Ren,
+- `reviewed` — **TFC: Token Flow Control in Data Center Networks**, Zhang, Ren,
   Shu, and Cheng, EuroSys 2016.
   URL:
   `https://www.microsoft.com/en-us/research/publication/tfc-token-flow-control-in-data-center-networks/`
@@ -7822,6 +7822,8 @@ Append new candidates here as each paper is processed.
   link bandwidth using tokens at switches; useful for comparing switch-side
   token allocation, zero-queueing goals, and highly concurrent flow control
   with GPU DB's local ring credits and scheduled/speculative admission lanes.
+  Journal entry added 2026-06-07 from the Microsoft Research page and
+  Tsinghua author PDF.
 - `queued` — **Rogue: RDMA over Generic Unconverged Ethernet**, Le, Stephens,
   Singhvi, Akella, and Swift, SoCC 2018.
   URL: `https://doi.org/10.1145/3267809.3267828`

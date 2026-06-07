@@ -101792,3 +101792,140 @@ and where route eligibility remains explicit.
 - For future CXL/NVM experiments, measure traffic reductions from body-write
   coalescing and obsolete-write dropping separately from latency. Gate:
   reduced traffic does not change the external WAL-before-visibility contract.
+
+### 2026-06-07 - TFC makes credits the queueing boundary
+
+**Citation:** Jiao Zhang, Fengyuan Ren, Ran Shu, and Peng Cheng.
+"TFC: Token Flow Control in Data Center Networks." EuroSys 2016.
+DOI: `https://doi.org/10.1145/2901318.2901336`. Retrieved 2026-06-07
+from the Microsoft Research page and Tsinghua author PDF:
+`https://www.microsoft.com/en-us/research/publication/tfc-token-flow-control-in-data-center-networks/`,
+`https://nns.cs.tsinghua.edu.cn/paper/eurosys16_jz.pdf`.
+
+**Category:** Runtime scale, HFT-style mechanics, and admission;
+high-concurrency networking; local ring credits and zero-queueing policy.
+
+**Relevance tags:** token flow control; explicit credits; zero queueing;
+effective flows; incast; micro-bursts; on/off flows; fast convergence;
+packet delay; admission control; bounded rings; session multiplexing;
+GPU command credits; pinned-buffer credits; response-ring pressure.
+
+**Core idea:** TFC argues that datacenter transports suffer when end hosts
+implicitly probe capacity and let switch buffers become part of the flow
+pipeline. Its alternative is explicit window allocation: represent link
+capacity in a time slot as tokens, count the number of effective flows that
+will inject full windows in that slot, and allocate only bufferless pipeline
+capacity. The goal is high utilization without persistent queues, while still
+handling short flows, intermittent silent flows, micro-bursts, and incast.
+
+The strongest transferable idea for GPU DB is **credits should be the
+queueing boundary, not the queue itself**. A runtime ring, GPU stream,
+pinned-buffer pool, mutation owner, response writer, or cold-tier fetch lane
+should expose a measurable token budget for the next admission interval.
+Requests that do not fit should wait, fallback, or be rejected before hidden
+queues accumulate tail latency.
+
+**Concrete mechanisms:**
+
+- TFC defines `Token` as the amount of data a link can transmit during a
+  time slot, computed from link bandwidth and slot duration. Tokens represent
+  bandwidth resource available for allocation.
+- It defines the number of effective flows as the number of full-window
+  consumers expected in the slot. Silent or bottlenecked flows should not keep
+  consuming allocation indefinitely.
+- The time slot is tied to round-trip time for fast convergence, but TFC
+  decouples the RTT used for token computation from the RTT used for effective
+  flow counting. End hosts mark the first packet in a round so switches can
+  estimate these values.
+- Switches allocate congestion windows by dividing token capacity among
+  effective consumers, rather than letting senders increase until queues or
+  drops reveal overload.
+- A window-acquisition phase handles micro-burst traffic after flow
+  establishment, so newly active flows do not all inject blindly into buffers.
+- When the computed congestion window is smaller than one MSS under very high
+  fan-in, TFC adds a switch-side packet-delay function instead of forcing each
+  active flow to send at least one packet immediately.
+- The design avoids per-flow switch state as a core requirement. It targets
+  fast convergence, near-zero queueing, and rare packet loss with explicit
+  resource accounting.
+- Evaluation combines a small NetFPGA-based testbed and ns-2 simulations. The
+  paper reports high throughput, near-zero queueing, fast convergence, and
+  rare packet loss across bursty, highly concurrent, and on/off traffic
+  scenarios. Exact deployment generality is limited by the experimental scale.
+
+**GPU DB mapping:** TFC maps directly to the production runtime described in
+`11-high-throughput-query-runtime.md`: network IO workers, bounded command
+rings, owner domains, GPU execution workers, and response rings. Each boundary
+needs an explicit budget for the next scheduling interval: command slots,
+bytes, pinned-buffer pages, GPU stream capacity, mutation WAL slots, resident
+snapshot references, and response bytes.
+
+For 1M logical sessions, the "effective flow" idea is more useful than
+connection count. A million mostly idle sessions should not reserve a million
+hot-path slots. Admission should count effective work: sessions with a ready
+frontend message, a retained-read route, a pending write, a response waiting
+for socket readiness, or a retry whose dependency is now satisfiable.
+
+For GPU execution, token allocation can become per-route family budgeting.
+Same-shape retained lookups, aggregates, refreshes, and cold-tier transfers
+should receive tokens by resource class. If a batch would overflow pinned
+buffers, response rings, or a latency ceiling, it should wait at admission
+instead of letting downstream queues absorb it.
+
+For write throughput, mutation owners can expose WAL-chunk and visibility
+publication credits. COPY or INSERT admission can spend a bounded number of
+tokens per interval, while read-refresh work receives separate credits so
+maintenance cannot silently create queue debt that later hurts reads.
+
+For read latency, TFC reinforces the need for zero-queueing goals at narrow
+runtime boundaries. GPU DB does not need literal switch tokens, but it should
+measure whether command rings, GPU queues, and response rings hold standing
+backlogs. Persistent backlog is a signal that admission tokens are too high
+or too coarsely assigned.
+
+**Risks and mismatches:** TFC is a datacenter transport paper, not a SQL
+runtime, database scheduler, or GPU execution system. It assumes switch and
+host protocol changes that GPU DB should not require for pgwire correctness.
+
+The paper focuses on network link capacity, while GPU DB resources are more
+heterogeneous: WAL durability, MVCC visibility, resident snapshot validity,
+GPU stream occupancy, HBM, host DRAM, pinned buffers, NVMe, and socket
+writeability. A single scalar token would hide the real bottleneck; GPU DB
+needs vector credits or per-boundary budgets.
+
+TFC's fairness target is transport fairness, not transaction semantics.
+GPU DB must preserve WAL-before-visibility, snapshot correctness, DDL
+invalidation, and tenant/session SLOs even when credits favor larger batches
+or same-shape route packing.
+
+The evaluation is from 2016 and uses a small hardware testbed plus simulation.
+It is valuable as a mechanism, but it should be benchmarked locally against
+modern CPU/GPU/runtime bottlenecks rather than treated as a network-throughput
+claim for the database.
+
+**Benchmark candidates:**
+
+- Add an "effective work" admission simulator for 1M logical sessions. Count
+  only sessions with ready requests or blocked responses as effective flows.
+  Gate: idle sessions add near-zero queue debt and memory overhead, while
+  active sessions receive bounded p99 queue wait.
+- Prototype per-boundary token budgets for network ingress, mutation owner,
+  retained-read workers, GPU execution, residency refresh, and response rings.
+  Compare FIFO/unbounded admission against token admission on throughput,
+  p50/p99 latency, dropped/rejected work, and standing queue depth.
+- Build a vector-credit retained-read benchmark: `{request_count,
+  pinned_bytes, H2D_bytes, D2H_bytes, response_bytes, latency_budget}`. Gate:
+  the scheduler rejects or delays work before any downstream resource exceeds
+  its budget.
+- Add a micro-burst acquisition test for a large fan-in of sessions becoming
+  active at once. Expected result: a small initial allowance avoids cold-start
+  stalls, but follow-on requests require explicit credits before they enter
+  GPU or response queues.
+- Measure "window smaller than one request" behavior for saturated resources:
+  if a resource cannot admit one request per active route class in the current
+  interval, test delay, class rotation, CPU fallback, and explicit overload.
+  Failure condition: every class sends one request anyway and creates standing
+  backlog.
+- Track zero-queueing telemetry per runtime boundary. Gate: sustained queue
+  depth above one scheduling interval triggers lower tokens, fallback, or
+  admission rejection instead of silently increasing tail latency.
