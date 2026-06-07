@@ -1,7 +1,7 @@
 {
   "description": "Generated traceability from literature journal entries to architecture mechanisms. Review low-confidence and fallback links before making architectural commitments.",
   "mechanism_counts": {
-    "bounded_descriptor_reclamation": 505,
+    "bounded_descriptor_reclamation": 503,
     "cost_based_route_optimizer": 254,
     "cpu_fallback_policy": 166,
     "db_owned_cold_objects": 52,
@@ -16,8 +16,8 @@
     "learned_optimizer_advisor": 72,
     "log_structured_warm_tier": 50,
     "multi_tier_placement": 506,
-    "mvcc_gc_frontiers": 63,
-    "owner_ring_bundling": 454,
+    "mvcc_gc_frontiers": 62,
+    "owner_ring_bundling": 452,
     "resource_dag_scheduling": 100,
     "retained_gpu_snapshots": 488,
     "same_shape_microbatching": 66,
@@ -10472,8 +10472,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry compares CPU-only, CPU-prefilter-plus-GPU-tail, and full GPU routes under explicit route descriptors.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -10483,8 +10484,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "gpu_oltp_conflict_ordering",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Mutation conflict attribution and dependency-aware repair are explicit benchmark priorities for write fragments.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -11333,17 +11335,6 @@
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
         }
       ],
       "relevance_tags": [],
@@ -12480,8 +12471,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Repeated route choice across CPU, GPU, and tier placement under resident validity uncertainty is central to the entry.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -12857,8 +12849,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "gpu_oltp_conflict_ordering",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Hot-key scheduling, conflict-aware admission, and route-risk penalties are explicitly tied to write admission.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -29681,8 +29674,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The resource class prices HBM, DRAM, L2, transfer, setup, and placement behavior for accelerated routes.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -29693,19 +29687,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "version chain"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "mvcc_gc_frontiers",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Visibility class explicitly distinguishes immutable snapshots and compact latest-visible summaries from CPU-owned truth.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -29715,8 +29699,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Launch parameters and overload semantics imply scheduling concerns, but the entry does not require DAG-shaped resources.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -30546,8 +30531,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The route descriptor carries visibility boundaries, row/version locations, and published-generation state for retained reads.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -30558,8 +30544,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "same_shape_microbatching",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Write batches and vector-order descriptors touch batch shape, though the entry mainly focuses on physical intent.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -30926,8 +30913,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot generation is a first-class field in the budgeted route descriptor before admission.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -30937,8 +30925,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Operator choice and temporary-state budgets are routed before admission rather than left to opaque execution.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -31295,8 +31284,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Template class, write footprint, owner frontiers, and conflict intent are named route-contract fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -31306,8 +31296,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot, route-hint, and residency generations must be explainable before accepted requests proceed.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -32012,8 +32003,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Admission consumes lane-specific credits and rejects deterministically when resident, temporary, or response budgets are exhausted.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -32024,20 +32016,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "ring",
-            "queue"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fallback legality and fallback bypass prevention are explicit fields and pass conditions for the route-budget contract.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -32049,8 +32030,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Resident bytes are budgeted, but retained snapshot semantics are secondary to temporary and response credits.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -32061,8 +32043,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The pass condition explicitly forbids adaptive route hints from bypassing WAL or visibility fallback.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -32389,20 +32372,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fallback permission is part of semantic route eligibility before adaptive ranking may choose a split route.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "route descriptor"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         },
         {
           "confidence": "low",
@@ -32411,8 +32384,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Deterministic route legality is separated from residual cost correction and fragment-proportion ranking.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -32423,8 +32397,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Write omission and coalescing are allowed only for explicitly non-visible blind-write classes.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -32434,8 +32409,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot visibility and resident layout compatibility are deterministic gates before split routes are accepted.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -33560,18 +33536,6 @@
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "owner",
-            "queue"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
         }
       ],
       "relevance_tags": [],
@@ -34019,8 +33983,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Truth, execution placement, resident inputs, and scratch capacity are explicitly separated as route contracts.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -34031,8 +33996,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "same_shape_microbatching",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry cites same-shape GPU batching as one of the contracts that must be admitted explicitly.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -34042,8 +34008,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Durable truth and visibility boundaries are explicit prerequisites for resident and temporary execution contracts.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -34512,8 +34479,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Owner-local serialization, conflict-free lanes, and stable boundary ids are named routing choices.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -34525,8 +34493,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Typed route planning chooses among retained reads, owner serialization, validation, GPU batches, and CPU fallback.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -34609,8 +34578,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "same_shape_microbatching",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "RTScan benefits from grouped conjunctive predicate shapes, though the entry is primarily about resident indexing.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -35269,8 +35239,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "effective_session_counting",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "A metadata-cache microbenchmark must prove route lookup does not scale with logical session count.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -35281,8 +35252,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Freshness mode and cheaper snapshot reads are required fields in the ordered route metadata contract.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -35634,8 +35606,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fence waits and generation boundaries provide dependency signals, but the entry is broader than witness construction.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -35646,8 +35619,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Resident-index routes are tied to explicit MVCC generations and truth boundaries before they may serve point lookups.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -35659,8 +35633,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Hot point state, colder log-shaped records, and resident GPU indexes are deliberately separated by placement contract.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -74587,29 +74562,29 @@
   "summary": {
     "confidence_counts": {
       "high": 3059,
-      "low": 277,
+      "low": 272,
       "medium": 1365
     },
     "entries": 787,
     "linked_entries": 787,
-    "links_requiring_review": 202,
-    "low_confidence_links": 277,
+    "links_requiring_review": 165,
+    "low_confidence_links": 272,
     "mechanisms_with_links": 25,
     "mechanisms_without_links": 0,
     "paper_entries": 610,
-    "pending_low_confidence_links": 202,
-    "removed_low_confidence_links": 18,
+    "pending_low_confidence_links": 165,
+    "removed_low_confidence_links": 23,
     "review_priority_counts": {
-      "none": 4499,
-      "normal": 202
+      "none": 4531,
+      "normal": 165
     },
     "review_status_counts": {
       "auto_accepted": 4424,
-      "pending_low_confidence_review": 202,
-      "reviewed_supported": 57,
-      "reviewed_weak_signal": 18
+      "pending_low_confidence_review": 165,
+      "reviewed_supported": 84,
+      "reviewed_weak_signal": 23
     },
-    "reviewed_low_confidence_links": 75,
+    "reviewed_low_confidence_links": 107,
     "synthesis_entries": 177,
     "unlinked_entries": 0
   },

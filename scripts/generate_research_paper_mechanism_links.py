@@ -1137,6 +1137,302 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "Warm mini-segments and response chunks must carry visibility-generation tags and publication boundaries.",
     },
+    (
+        "2026-06-02-first-modern-batch-synthesis",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry compares CPU-only, CPU-prefilter-plus-GPU-tail, and full GPU routes under explicit route descriptors.",
+    },
+    (
+        "2026-06-02-first-modern-batch-synthesis",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Mutation conflict attribution and dependency-aware repair are explicit benchmark priorities for write fragments.",
+    },
+    (
+        "2026-06-02-third-modern-batch-synthesis",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry discusses stable identity and tier movement, but does not provide descriptor lifetime or reclamation evidence.",
+    },
+    (
+        "2026-06-03-sixth-modern-batch-synthesis",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Repeated route choice across CPU, GPU, and tier placement under resident validity uncertainty is central to the entry.",
+    },
+    (
+        "2026-06-03-owner-local-first-shared-only-when-measured",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Hot-key scheduling, conflict-aware admission, and route-risk penalties are explicitly tied to write admission.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-gpu-routes-need-separate-resource-conflict-and-visibility-classes",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The resource class prices HBM, DRAM, L2, transfer, setup, and placement behavior for accelerated routes.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-gpu-routes-need-separate-resource-conflict-and-visibility-classes",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Visibility class explicitly distinguishes immutable snapshots and compact latest-visible summaries from CPU-owned truth.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-gpu-routes-need-separate-resource-conflict-and-visibility-classes",
+        "mvcc_gc_frontiers",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "MVCC-version retirement appears only as a remaining proof-gate gap, not as evidence for GC-frontier mechanics.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-gpu-routes-need-separate-resource-conflict-and-visibility-classes",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Launch parameters and overload semantics imply scheduling concerns, but the entry does not require DAG-shaped resources.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-write-batches-snapshots-and-compressed-routes-all-need-explicit-physical-i",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The route descriptor carries visibility boundaries, row/version locations, and published-generation state for retained reads.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-write-batches-snapshots-and-compressed-routes-all-need-explicit-physical-i",
+        "same_shape_microbatching",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Write batches and vector-order descriptors touch batch shape, though the entry mainly focuses on physical intent.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-budgeted-temporary-state-not-just-resident-data",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot generation is a first-class field in the budgeted route descriptor before admission.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-budgeted-temporary-state-not-just-resident-data",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Operator choice and temporary-state budgets are routed before admission rather than left to opaque execution.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-should-be-a-typed-contract-not-an-owner-thread-habit",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Template class, write footprint, owner frontiers, and conflict intent are named route-contract fields.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-should-be-a-typed-contract-not-an-owner-thread-habit",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot, route-hint, and residency generations must be explainable before accepted requests proceed.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-budgets-need-fast-typed-feedback",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Admission consumes lane-specific credits and rejects deterministically when resident, temporary, or response budgets are exhausted.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-budgets-need-fast-typed-feedback",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback legality and fallback bypass prevention are explicit fields and pass conditions for the route-budget contract.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-budgets-need-fast-typed-feedback",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry focuses on typed budgets and feedback timing, not owner-ring structure or ownership bundling.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-budgets-need-fast-typed-feedback",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Resident bytes are budgeted, but retained snapshot semantics are secondary to temporary and response credits.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-budgets-need-fast-typed-feedback",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The pass condition explicitly forbids adaptive route hints from bypassing WAL or visibility fallback.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-split-routes-need-semantic-gates-before-learned-correction",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback permission is part of semantic route eligibility before adaptive ranking may choose a split route.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-split-routes-need-semantic-gates-before-learned-correction",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The descriptor is used for eligibility, but the entry does not discuss descriptor lifetime or reclamation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-split-routes-need-semantic-gates-before-learned-correction",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Deterministic route legality is separated from residual cost correction and fragment-proportion ranking.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-split-routes-need-semantic-gates-before-learned-correction",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Write omission and coalescing are allowed only for explicitly non-visible blind-write classes.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-split-routes-need-semantic-gates-before-learned-correction",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot visibility and resident layout compatibility are deterministic gates before split routes are accepted.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-leases-turn-placement-into-a-validity-interval",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The route descriptor carries placement leases and queue class, but does not discuss owner-ring bundling.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-separate-truth-residency-and-scratch-contracts",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Truth, execution placement, resident inputs, and scratch capacity are explicitly separated as route contracts.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-separate-truth-residency-and-scratch-contracts",
+        "same_shape_microbatching",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry cites same-shape GPU batching as one of the contracts that must be admitted explicitly.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-separate-truth-residency-and-scratch-contracts",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Durable truth and visibility boundaries are explicit prerequisites for resident and temporary execution contracts.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-conflict-shape-should-drive-routing-not-just-protocol-choice",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Owner-local serialization, conflict-free lanes, and stable boundary ids are named routing choices.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-conflict-shape-should-drive-routing-not-just-protocol-choice",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Typed route planning chooses among retained reads, owner serialization, validation, GPU batches, and CPU fallback.",
+    },
+    (
+        "2026-06-04-rtscan-maps-conjunctive-filters-onto-ray-tracing-cores",
+        "same_shape_microbatching",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "RTScan benefits from grouped conjunctive predicate shapes, though the entry is primarily about resident indexing.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-metadata-should-be-cached-ordered-and-explainable",
+        "effective_session_counting",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "A metadata-cache microbenchmark must prove route lookup does not scale with logical session count.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-metadata-should-be-cached-ordered-and-explainable",
+        "htap_freshness_router",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Freshness mode and cheaper snapshot reads are required fields in the ordered route metadata contract.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-write-point-state-and-resident-index-contracts",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Fence waits and generation boundaries provide dependency signals, but the entry is broader than witness construction.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-write-point-state-and-resident-index-contracts",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Resident-index routes are tied to explicit MVCC generations and truth boundaries before they may serve point lookups.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-write-point-state-and-resident-index-contracts",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Hot point state, colder log-shaped records, and resident GPU indexes are deliberately separated by placement contract.",
+    },
 }
 
 
