@@ -2849,6 +2849,34 @@ def non_metadata_sentences(paragraphs: list[str]) -> list[str]:
     return sentences
 
 
+def truncate_evidence_snippet(snippet: str, terms: list[str], limit: int = 360) -> str:
+    if len(snippet) <= limit:
+        return snippet
+
+    term_lowers = [term.lower() for term in terms if term != "category fallback"]
+    snippet_lower = snippet.lower()
+    term_positions = [
+        snippet_lower.find(term)
+        for term in term_lowers
+        if snippet_lower.find(term) >= 0
+    ]
+    if not term_positions or min(term_positions) < limit - 3:
+        return snippet[: limit - 3].rstrip() + "..."
+
+    first_term = min(term_positions)
+    context_start = max(0, first_term - 120)
+    if context_start > 0:
+        boundary = snippet.rfind(" ", 0, context_start)
+        if boundary >= 0:
+            context_start = boundary + 1
+    truncated = snippet[context_start : context_start + limit - 3].rstrip()
+    if context_start > 0:
+        truncated = "..." + truncated
+    if context_start + len(truncated.lstrip(".")) < len(snippet):
+        truncated = truncated[: limit - 3].rstrip() + "..."
+    return truncated
+
+
 def evidence_snippet(body: str, terms: list[str]) -> str:
     paragraphs = [compact_whitespace(part) for part in body.split("\n\n")]
     paragraphs = [part for part in paragraphs if part]
@@ -2887,9 +2915,7 @@ def evidence_snippet(body: str, terms: list[str]) -> str:
             best = fallback_sentences[0]
         elif not best:
             best = paragraphs[0]
-    if len(best) > 360:
-        best = best[:357].rstrip() + "..."
-    return best
+    return truncate_evidence_snippet(best, terms)
 
 
 def evidence_quality_details(link: dict) -> tuple[str, str]:
