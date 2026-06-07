@@ -38,6 +38,168 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Version-aware layout makes MVCC visibility a search key
+
+**Citation:** Qian Zhang, Jianhao Wei, Shichen Zhang, Hao Luan, and
+Xueqing Gong. "A Version-aware Data Layout for Heterogeneous Workloads
+in In-Memory Database Systems." Research Square preprint, 2024. DOI:
+`https://doi.org/10.21203/rs.3.rs-4105094/v1`. Retrieved 2026-06-07
+from the Research Square PDF:
+`https://assets-eu.researchsquare.com/files/rs-4105094/v1_covered_cd54b494-1a7d-4e7d-86f8-cde2a6c17356.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing and
+write path; hybrid HTAP storage layout.
+
+**Relevance tags:** version-aware layout; MVCC; long version chains;
+index-organized latest versions; range-partitioned versions;
+epoch-partitioned versions; thread-local partitions; index-only
+visibility checks; retained snapshots; visible-row maps; GPU resident
+delta layout.
+
+**Core idea:** The paper argues that traditional row or column layouts
+are version-unaware: the primary index finds a tuple identity or latest
+version pointer, then a reader still walks a long per-tuple version
+chain to find the version visible at its read timestamp. Under mixed
+short update transactions and long read-only queries, that turns MVCC
+from a nonblocking visibility design into a random-memory traversal
+problem.
+
+The proposed layout makes version visibility part of physical search.
+Current tuple versions live directly in a version B+-tree, while older
+versions are grouped into timestamp-aware range or epoch partitions.
+Short transactions normally get an index-only latest-version read, and
+older retained reads can skip whole version groups before checking
+individual versions.
+
+**Concrete mechanisms:**
+
+- The version B+-tree stores latest tuple versions in leaf nodes, not
+  just key-to-chain pointers. Leaf blocks use a slotted-page layout with
+  a tuple-header array, unsorted insert buffer, contiguous tuple-version
+  storage, cache-line-aligned nodes, and per-version headers containing
+  validity, latest commit timestamp, version-store pointer, and tuple
+  length.
+- The version store keeps older versions separately. Range partitioning
+  groups each tuple's old versions by timestamp interval and records a
+  min/max visibility window, so a read timestamp can skip partitions
+  whose windows cannot contain the requested version.
+- Epoch partitioning places committed versions into epoch partitions.
+  Each tuple keeps an epoch-partition queue, letting a reader map its
+  read timestamp to a maximum readable epoch and traverse at epoch
+  granularity before falling back to per-version checks.
+- Inserts write only into the version B+-tree. Non-key updates append
+  the previous version into the version store and update the current
+  version in the tree. Key updates locate and invalidate the current
+  tree version, then insert a new tree tuple.
+- Deletes mark the current tree version invalid and defer physical
+  cleanup to later node-split or reclamation work, reducing immediate
+  structural churn.
+- Visibility checking first tests the indexed latest version. If its
+  commit timestamp is older than the read timestamp and the version is
+  valid, the read can complete from the tree. Otherwise the reader
+  probes version partitions until it finds a begin/end timestamp window
+  containing the read timestamp.
+- Validation rechecks only what needs rechecking. If a transaction read
+  an older partitioned version, the duplicate latest-version check can
+  be bypassed; if it read the latest indexed version, the latest commit
+  timestamp must still be below the commit timestamp.
+- The design adds thread-local partitioning to reduce global partition
+  lock contention. Each worker appends versions into its local active
+  partition, while an access table bridges the local partition sets so
+  readers can still find the correct version across workers.
+- The tuning model treats version partition size as a read/write
+  tradeoff: larger range partitions skip more partition probes but cost
+  more maintenance and within-partition traversal; larger epoch
+  thresholds reduce epoch count but can increase hash conflicts under
+  skew.
+- Evaluation is implemented in DBx1000 with a B+-tree index and Hekaton
+  scheme, comparing against Peloton-like and DBx1000 layouts on YCSB,
+  TPC-C, and TPC-CH-style mixed workloads. The paper reports 1.67x
+  read-only YCSB improvement, 2x scan improvement, 33% read-mostly
+  improvement, 1.6x-2x write-intensive YCSB improvement in the shown
+  setup, and lower long-query latency when TPC-C NewOrder threads
+  coexist with a CH-Q2-style query.
+
+**GPU DB mapping:** GPU DB should not keep visibility as an afterthought
+behind a resident row id. A retained CPU/GPU snapshot should publish
+visibility-search metadata with the physical layout: latest-generation
+tree or map for hot point reads, plus older-generation partitions for
+long retained readers and GPU-resident deltas.
+
+The strongest near-term mapping is a visible-row or visible-delta map
+per resident route generation. For short reads, the route should prove
+that the latest resident generation is visible and avoid scanning old
+deltas. For long snapshots, old deltas should be grouped by generation
+or epoch interval so kernels can skip whole groups rather than branch
+through version chains row by row.
+
+Range and epoch partitioning map naturally to the runtime's immutable
+snapshot generations. A retained snapshot already carries a visibility
+boundary; the storage engine can publish per-segment `{min_generation,
+max_generation}` windows and per-row latest-generation headers. GPU
+kernels can then filter partitions before touching HBM or pinned host
+buffers, while CPU fallback uses the same witness to avoid stale reads.
+
+Thread-local partitioning is relevant to mutation owner and partition
+owner design. Each owner can append old versions or invalidation deltas
+to owner-local buffers without a global lock, then publish a compact
+access table or partition directory for readers. The access table must
+be immutable by generation and reclaimed with snapshot-holder horizons.
+
+The layout also suggests a benchmarkable split between logical MVCC WAL
+history and physical visibility accelerators. WAL and tuple chains
+remain authoritative for recovery, but derived version partitions,
+visible-row maps, and resident delta directories can be rebuilt,
+evicted, or demoted like other P8 cache structures.
+
+**Risks and mismatches:** This is a Research Square preprint, not a
+conference-published version. Some details need caution: the paper does
+not provide a production recovery story, and its diagrams/text appear to
+contain minor inconsistencies around range min/max ordering.
+
+The evaluation is CPU in-memory DBx1000 on one 20-core server. It does
+not evaluate GPU execution, HBM/DRAM/NVMe placement, WAL durability,
+crash recovery, DDL, secondary indexes, SQL semantics beyond the tested
+transactions, or 1M logical sessions.
+
+Storing latest full tuples in a B+-tree leaf can be expensive for wide
+rows and text values. GPU DB should not copy this literally for all row
+shapes; the safer adaptation is a compact latest-visibility/header map
+plus column/delta payloads selected by route family.
+
+Thread-local partitions reduce write contention but introduce a global
+read directory. If that directory is mutable or expensive to probe, it
+could move the bottleneck rather than remove it. GPU DB needs generation
+publication and reclamation rules for any access table.
+
+**Benchmark candidates:**
+
+- Add a CPU prototype of generation-windowed MVCC delta partitions for
+  one hot table. Compare latest-generation retained reads, long-snapshot
+  reads, and owner fallback against the current tuple-chain baseline.
+  Gate: results match the existing MVCC visibility model under concurrent
+  inserts, updates, deletes, and retained readers.
+- Build a GPU visible-row-map benchmark: latest-generation bitset or row
+  map, plus older generation-partition directories. Measure point lookup,
+  prefix filter, and scan latency with long retained snapshots and hot
+  updates. Failure condition: GPU filtering saves traversal but increases
+  invalidation or refresh cost enough to lose p99.
+- Compare range-size and epoch-size policies under skewed YCSB-A plus
+  long YCSB-C-style reads. Report read p50/p99, write throughput,
+  partition maintenance cost, retired bytes, and snapshot cleanup lag.
+- Prototype owner-local old-version buffers with immutable access-table
+  publication. Gate: readers never need a global mutation lock, and old
+  access tables retire when the last snapshot holder releases them.
+- Test latest-version index-only visibility as a planner route. A route
+  can bypass owner/MVCC chain traversal only when the resident latest
+  header proves `{valid, commit_generation <= read_generation}`.
+  Failure condition: a stale latest header survives a WAL-applied
+  invalidation or DDL generation change.
+- Add crash/recovery tests that rebuild version partitions from WAL and
+  CPU truth. Derived visibility accelerators must be discardable; after
+  crash, no retained route may trust a partition directory without a
+  matching generation witness.
+
 ### 2026-06-07 - Decima learns DAG-aware admission but belongs outside hot owners
 
 **Citation:** Hongzi Mao, Malte Schwarzkopf, Shaileshh Bojja

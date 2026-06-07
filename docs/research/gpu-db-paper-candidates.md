@@ -4964,13 +4964,29 @@ Append new candidates here as each paper is processed.
   collection ideas to NVM OLTP engines, useful for comparing future NVM/CXL
   version storage against GPU DB's DRAM/NVMe retained-delta cleanup. Journal
   entry added 2026-06-06.
-- `queued` — **A Version-aware Data Layout for Heterogeneous Workloads in
+- `reviewed` — **A Version-aware Data Layout for Heterogeneous Workloads in
   In-Memory Database Systems**, Zhang et al., Research Square preprint 2024.
   URL:
   `https://assets-eu.researchsquare.com/files/rs-4105094/v1_covered_cd54b494-1a7d-4e7d-86f8-cde2a6c17356.pdf`
   Why: discovered through vWeaver/OneShotGC related work; useful for comparing
   version-centric layouts, index-only version searches, and epoch/range
   partitioning against GPU DB visible-row maps and retained snapshot arrays.
+  Journal entry added 2026-06-07 from the Research Square PDF.
+- `queued` — **MV-PBT: Multi-Version Index for Large Datasets and HTAP
+  Workloads**, Riegger et al., arXiv 2019.
+  URL: `https://arxiv.org/abs/1910.08023`
+  Why: cited by the version-aware layout paper as a multi-version index line;
+  useful for comparing partitioned B-tree version search structures with
+  GPU DB's visible-row maps, retained snapshot directories, and long-snapshot
+  range reads.
+- `queued` — **Polynesia: Enabling Effective Hybrid Transactional/Analytical
+  Databases with Specialized Hardware/Software Co-Design**, Boroumand et al.,
+  arXiv 2021.
+  URL: `https://arxiv.org/abs/2103.00798`
+  Why: cited by the version-aware layout paper around HTAP storage layouts;
+  useful for comparing hardware/software co-design ideas against GPU DB's
+  CPU/GPU resident layout, MVCC visibility metadata, and hybrid read/write
+  route selection.
 - `reviewed` — **Falcon: Fast OLTP Engine for Persistent Cache and
   Non-Volatile Memory**, Ji et al., SOSP 2023.
   URL:
