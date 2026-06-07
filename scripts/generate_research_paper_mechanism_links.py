@@ -865,6 +865,278 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "Socket/protocol credits, response queue budgets, and named rejection or delay reasons are explicit admission surfaces.",
     },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-tier-aware-memory-fronts",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "The route envelope names response destination, selected worker, and bounded slots, but not owner rings directly.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-tier-aware-memory-fronts",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The benchmark pass condition explicitly preserves WAL/MVCC correctness while tier and route admission change.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-tier-aware-memory-fronts",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The proposed route envelope carries fallback permission and reports why requests stayed on CPU, waited, or were rejected.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-needs-costed-generations",
+        "db_owned_cold_objects",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Cold-segment overlap and tier movement are tracked as generation costs, though the entry is mainly about generation accounting.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-paths-need-declared-boundaries",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Declared write boundaries must compare global mutation order with owner-local sequence fronts while preserving WAL-before-visibility replay equivalence.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-paths-need-declared-boundaries",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback authority, confidence fallback, stale-generation prevention, and overload rejection are first-class route descriptor results.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-declared-boundaries-need-schedulable-budgets",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Route choice ranks already-valid CPU/GPU/tier candidates under runtime state and records correctness predicates and outcomes.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-declared-boundaries-need-schedulable-budgets",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "HTAP appears only as a future placement category gap, not evidence for freshness routing in this entry.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-data-needs-interval-ownership",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry centers read-only retained generations and resident copies with explicit tier intent and visibility intervals.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-data-needs-interval-ownership",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Active snapshot intervals decide admission, eviction, GC, and refresh safety for old versions and retained generations.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-data-needs-interval-ownership",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The freshness signal is stale-route prevention for interval ownership, not HTAP read routing.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-data-needs-interval-ownership",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Visibility intervals and publication boundaries make retained generations immutable route inputs.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-schedulers-need-level-and-slope",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The scheduler chooses among execution, batching, fallback, pacing, or rejection using route pressure fields.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-schedulers-need-level-and-slope",
+        "wal_before_visibility",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "WAL, checkpoint, and recovery are named as future category gaps rather than evidence for this mechanism.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-schedulers-need-level-and-slope",
+        "deficit_fairness",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Pacing and rejection under pressure imply admission tradeoffs, but the entry does not specify a fairness algorithm.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-schedulers-need-level-and-slope",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "HTAP is mentioned as a future literature gap, not as support for freshness routing.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-schedulers-need-level-and-slope",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Retained routes, mutation batches, refresh jobs, and response writes carry explicit runtime pressure fields for scheduling.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-tiers-need-semantic-units",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The matched term is incidental; the entry does not discuss descriptor lifetime or reclamation.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-tiers-need-semantic-units",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Semantic hot-tier admission can choose GPU, CPU, host, or cold fallback without weakening WAL-before-visibility.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-tiers-need-semantic-units",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Contention and retry policy tables touch hot-write templates, though the entry mainly addresses placement units.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-tiers-need-semantic-units",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Runtime pressure fields guide admission, but the entry does not require vectorized credit accounting.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-specialized-data-paths-need-declared-shape-contracts",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The route descriptor proof and visibility-preserving segment proof make dependencies explicit before specialized execution.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-specialized-data-paths-need-declared-shape-contracts",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Queue or tier budget ownership appears in the descriptor, but the entry is broader than owner-ring bundling.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-simple-queues-need-stable-memory-contracts",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Scheduling rank and memory contracts expose resource consequences, but the proposed harness is not DAG-specific.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-adaptive-scheduling-must-choose-a-shared-clock",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The optimizer signal comes from future category guidance, not from this entry's adaptive scheduling design track.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-adaptive-scheduling-must-choose-a-shared-clock",
+        "htap_freshness_router",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Hermes-style freshness windows and snapshot generation are part of the route envelope for HTAP-like replicas.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-visibility-metadata-wants-planned-routes",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Route descriptors are discussed as metadata carriers, not as evidence for descriptor reclamation.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-frontier-metrics-make-tradeoffs-visible",
+        "effective_session_counting",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry explicitly separates logical sessions from runnable requests in the admission plane.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-frontier-metrics-make-tradeoffs-visible",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Short retained reads and visible freshness or visibility generation are central to the mixed-frontier benchmark.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-frontier-metrics-make-tradeoffs-visible",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Bounded lanes and queue attribution are relevant, though the entry frames them as classed admission rather than owner rings.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-warm-state-should-be-bounded-semantic-and-visible",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "WAL/visibility publication is one of the named saturated boundaries the mixed workload must identify.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-warm-state-should-be-bounded-semantic-and-visible",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Response credits, fixed-byte pools, queue-depth limits, and backpressure telemetry are explicit warm-state controls.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-warm-state-should-be-bounded-semantic-and-visible",
+        "deficit_fairness",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Slow clients and competing owner pools imply fairness pressure, but no deficit policy is specified.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-warm-state-should-be-bounded-semantic-and-visible",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Warm mini-segments and response chunks must carry visibility-generation tags and publication boundaries.",
+    },
 }
 
 

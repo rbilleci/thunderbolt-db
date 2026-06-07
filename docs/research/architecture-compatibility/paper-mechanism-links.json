@@ -1,8 +1,8 @@
 {
   "description": "Generated traceability from literature journal entries to architecture mechanisms. Review low-confidence and fallback links before making architectural commitments.",
   "mechanism_counts": {
-    "bounded_descriptor_reclamation": 507,
-    "cost_based_route_optimizer": 255,
+    "bounded_descriptor_reclamation": 505,
+    "cost_based_route_optimizer": 254,
     "cpu_fallback_policy": 166,
     "db_owned_cold_objects": 52,
     "deficit_fairness": 66,
@@ -10,7 +10,7 @@
     "deterministic_hot_write_templates": 209,
     "effective_session_counting": 174,
     "gpu_oltp_conflict_ordering": 129,
-    "htap_freshness_router": 95,
+    "htap_freshness_router": 92,
     "immutable_route_roots": 340,
     "isolation_trace_oracle": 34,
     "learned_optimizer_advisor": 72,
@@ -25,7 +25,7 @@
     "snapshot_frontier_vectors": 215,
     "stable_handle_indirection": 39,
     "vector_credit_admission": 80,
-    "wal_before_visibility": 411
+    "wal_before_visibility": 410
   },
   "mechanisms_without_links": [],
   "records": [
@@ -21926,8 +21926,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The route envelope names response destination, selected worker, and bounded slots, but not owner rings directly.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         },
         {
@@ -21938,8 +21939,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The benchmark pass condition explicitly preserves WAL/MVCC correctness while tier and route admission change.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -21950,8 +21952,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The proposed route envelope carries fallback permission and reports why requests stayed on CPU, waited, or were rejected.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -22345,8 +22348,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "db_owned_cold_objects",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Cold-segment overlap and tier movement are tracked as generation costs, though the entry is mainly about generation accounting.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -22800,8 +22804,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Declared write boundaries must compare global mutation order with owner-local sequence fronts while preserving WAL-before-visibility replay equivalence.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -22812,8 +22817,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fallback authority, confidence fallback, stale-generation prevention, and overload rejection are first-class route descriptor results.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -23174,21 +23180,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Route choice ranks already-valid CPU/GPU/tier candidates under runtime state and records correctness predicates and outcomes.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "htap",
-            "fresh"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         }
       ],
       "relevance_tags": [],
@@ -23536,8 +23531,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry centers read-only retained generations and resident copies with explicit tier intent and visibility intervals.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -23547,20 +23543,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Active snapshot intervals decide admission, eviction, GC, and refresh safety for old versions and retained generations.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "fresh"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         },
         {
           "confidence": "low",
@@ -23570,8 +23556,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Visibility intervals and publication boundaries make retained generations immutable route inputs.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -24256,22 +24243,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "wal",
-            "checkpoint",
-            "nvm",
-            "recovery"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The scheduler chooses among execution, batching, fallback, pacing, or rejection using route pressure fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -24282,20 +24256,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deficit_fairness",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "htap",
-            "fresh"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Pacing and rejection under pressure imply admission tradeoffs, but the entry does not specify a fairness algorithm.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -24306,8 +24269,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Retained routes, mutation batches, refresh jobs, and response writes carry explicit runtime pressure fields for scheduling.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -24648,17 +24612,6 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "wal",
             "replay",
             "visibility",
@@ -24666,8 +24619,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Semantic hot-tier admission can choose GPU, CPU, host, or cold fallback without weakening WAL-before-visibility.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -24679,8 +24633,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Contention and retry policy tables touch hot-write templates, though the entry mainly addresses placement units.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -24690,8 +24645,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Runtime pressure fields guide admission, but the entry does not require vectorized credit accounting.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -25808,8 +25764,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The route descriptor proof and visibility-preserving segment proof make dependencies explicit before specialized execution.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -25819,8 +25776,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Queue or tier budget ownership appears in the descriptor, but the entry is broader than owner-ring bundling.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -26192,8 +26150,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "resource_dag_scheduling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Scheduling rank and memory contracts expose resource consequences, but the proposed harness is not DAG-specific.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -27405,26 +27364,15 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "pruning",
-            "metadata"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "freshness",
             "htap",
             "fresh"
           ],
           "link_basis": "keyword",
           "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Hermes-style freshness windows and snapshot generation are part of the route envelope for HTAP-like replicas.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -27803,18 +27751,6 @@
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era",
-            "route descriptor"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
         }
       ],
       "relevance_tags": [],
@@ -28155,8 +28091,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "effective_session_counting",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry explicitly separates logical sessions from runnable requests in the admission plane.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -28166,8 +28103,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Short retained reads and visible freshness or visibility generation are central to the mixed-frontier benchmark.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -28178,8 +28116,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Bounded lanes and queue attribution are relevant, though the entry frames them as classed admission rather than owner rings.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -29364,8 +29303,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "WAL/visibility publication is one of the named saturated boundaries the mixed workload must identify.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -29376,8 +29316,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Response credits, fixed-byte pools, queue-depth limits, and backpressure telemetry are explicit warm-state controls.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -29388,8 +29329,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deficit_fairness",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Slow clients and competing owner pools imply fairness pressure, but no deficit policy is specified.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 2
         },
         {
@@ -29400,8 +29342,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Warm mini-segments and response chunks must carry visibility-generation tags and publication boundaries.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 2
         }
       ],
@@ -74644,29 +74587,29 @@
   "summary": {
     "confidence_counts": {
       "high": 3059,
-      "low": 284,
+      "low": 277,
       "medium": 1365
     },
     "entries": 787,
     "linked_entries": 787,
-    "links_requiring_review": 236,
-    "low_confidence_links": 284,
+    "links_requiring_review": 202,
+    "low_confidence_links": 277,
     "mechanisms_with_links": 25,
     "mechanisms_without_links": 0,
     "paper_entries": 610,
-    "pending_low_confidence_links": 236,
-    "removed_low_confidence_links": 11,
+    "pending_low_confidence_links": 202,
+    "removed_low_confidence_links": 18,
     "review_priority_counts": {
-      "none": 4472,
-      "normal": 236
+      "none": 4499,
+      "normal": 202
     },
     "review_status_counts": {
       "auto_accepted": 4424,
-      "pending_low_confidence_review": 236,
-      "reviewed_supported": 39,
-      "reviewed_weak_signal": 9
+      "pending_low_confidence_review": 202,
+      "reviewed_supported": 57,
+      "reviewed_weak_signal": 18
     },
-    "reviewed_low_confidence_links": 48,
+    "reviewed_low_confidence_links": 75,
     "synthesis_entries": 177,
     "unlinked_entries": 0
   },
