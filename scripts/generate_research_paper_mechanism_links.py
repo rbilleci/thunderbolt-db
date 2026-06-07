@@ -149,6 +149,11 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "resident layout identity",
         "bandwidth-class metadata",
         "gpu memory management",
+        "compact roots",
+        "explicit resource proofs",
+        "generation markers",
+        "relation generation",
+        "what recovery may trust",
     ],
     "cost_based_route_optimizer": [
         "access shapes",
@@ -419,6 +424,8 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "compact witness generation",
         "semantic freshness witnesses",
         "searchable visibility witnesses",
+        "correctness and failure state",
+        "leave behind enough proof",
     ],
     "gpu_oltp_conflict_ordering": [
         "cold data blocks",
@@ -708,6 +715,8 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "dictionary encoding",
         "nested structures",
         "route metadata should be published",
+        "batch/snapshot conflict decision",
+        "bounded key-range column merge",
         "volatile whenever recovery can rebuild",
     ],
     "resource_dag_scheduling": [
@@ -809,6 +818,7 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "retained analytical route",
         "replay frontier",
         "base resident snapshot",
+        "base resident snapshot with deltas",
         "write admission",
         "merge a base resident snapshot with deltas",
         "retained point lookup",
@@ -863,6 +873,7 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "partial wal frontiers",
         "costed retention frontiers",
         "append-ordered tiered stream storage",
+        "base resident snapshot with deltas",
     ],
     "stable_handle_indirection": [
         "mutable state transitions",
@@ -907,6 +918,9 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "mapping publication",
         "deterministic eligibility gates",
         "physical warm-tier movement",
+        "per-fragment metadata scan",
+        "semantic freshness witnesses",
+        "searchable visibility witnesses",
     ],
     "vector_credit_admission": [
         "admission lane",

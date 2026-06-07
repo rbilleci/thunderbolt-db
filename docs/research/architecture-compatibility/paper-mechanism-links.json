@@ -113202,8 +113202,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A log-structured mutation buffer may keep write admission fast while forcing retained reads to merge a base resident snapshot with deltas.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -118343,8 +118343,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "First, a route certificate should declare the relation generation, snapshot boundary, resident or warm-tier format, predicate family, expected selectivity, required buffers, merge mode, and fallback path.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -127065,8 +127065,8 @@
               "visibility",
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Route-certificate benchmark: per-fragment metadata scan produces included/pruned/ineligible fragments, selected tier, visibility boundary, and fallback reason. - Bounded route exploration benchmark: deterministic planner versus microsecond-capped adaptive probing for CPU index, GPU resident scan, GPU lookup, and cold-transfer routes. - Version-tree plac...",
             "support_reason": "Matched journal terms (wal, logging, checkpoint, visibility) to WAL-before-visibility boundary."
           },
@@ -128500,8 +128500,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The recent Aeolus, MTM, and 1RMA reviews converge on a runtime design track where work is admitted only with explicit resource proofs, and where policy loops operate at the right time scale.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -129271,8 +129271,8 @@
               "queue",
               "work order"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Quickstep makes query plans into schedulable work orders; MatrixKV makes compaction a bounded key-range column merge; Aria makes OLTP commits a batch/snapshot conflict decision.",
             "support_reason": "Matched journal terms (ring, queue, work order) to Owner-ring bundling."
           },
@@ -133418,8 +133418,8 @@
               "witness",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "PolySI, Learned Query Optimizer, and fsync-failure recovery converge on one design track: fast routes should be allowed to optimize, but they must leave behind enough proof to audit both correctness and failure state.",
             "support_reason": "Matched journal terms (witness, proof) to Dependency witnesses."
           },
@@ -136344,8 +136344,8 @@
               "wal",
               "visibility"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "HostCC says the runtime needs local pressure witnesses before host resources overload. veDB-HTAP says accelerated routes need semantic freshness witnesses before secondary execution. vWeaver says MVCC scans need searchable visibility witnesses before they touch payload data.",
             "support_reason": "Matched journal terms (wal, visibility) to WAL-before-visibility boundary."
           },
@@ -137145,8 +137145,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Durable state needs compact roots or generation markers that prove what recovery may trust.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4621,
-      "weak_direct": 50
+      "direct": 4629,
+      "weak_direct": 42
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 459,
+      "snippet contains matched mechanism term plus visible aliases": 467,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 44,
+      "substantive snippet contains only one matched mechanism term": 36,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {

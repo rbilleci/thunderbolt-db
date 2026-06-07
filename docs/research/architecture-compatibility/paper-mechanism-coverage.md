@@ -33,16 +33,16 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - links with support reason: 4671 / 4671
 
 Evidence quality counts:
-- direct: 4621
-- weak_direct: 50
+- direct: 4629
+- weak_direct: 42
 
 Evidence quality reason counts:
 - high-confidence link has a substantive journal snippet: 440
 - reviewed-supported link has a substantive matched snippet: 118
-- snippet contains matched mechanism term plus visible aliases: 459
+- snippet contains matched mechanism term plus visible aliases: 467
 - snippet contains multiple matched mechanism terms: 3098
 - strong journal section contains matched mechanism terms: 506
-- substantive snippet contains only one matched mechanism term: 44
+- substantive snippet contains only one matched mechanism term: 36
 - substantive snippet contains visible mechanism aliases: 6
 
 ## Evidence Span Quality Audit
@@ -79,7 +79,6 @@ Evidence quality reason counts:
 - `2026-06-05-cross-paper-synthesis-staged-route-boundaries-should-be-budgeted-first-class-state` -> owner_ring_bundling:weak_direct (substantive snippet contains only one matched mechanism term): **Converging design tracks:** Hermes, Page As You Go, and ROF all argue for the same missing middle layer between "fully resident fused route" and "fallback to owner CPU path." Hermes supplies freshness-bounded main plus delta generations.
 - `2026-06-05-cross-paper-synthesis-staged-route-boundaries-should-be-budgeted-first-class-state` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): **Converging design tracks:** Hermes, Page As You Go, and ROF all argue for the same missing middle layer between "fully resident fused route" and "fallback to owner CPU path." Hermes supplies freshness-bounded main plus delta generations.
 - `2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof` -> learned_optimizer_advisor:weak_direct (substantive snippet contains only one matched mechanism term): HANA NSE makes placement a byte- or API-compatible load-unit policy; SKQ makes event delivery a schedulable resource; Kersten et al. make execution model a route-shape choice rather than a one-time engine identity.
-- `2026-06-05-access-methods-should-be-rum-budgeted-route-components` -> snapshot_frontier_vectors:weak_direct (substantive snippet contains only one matched mechanism term): A log-structured mutation buffer may keep write admission fast while forcing retained reads to merge a base resident snapshot with deltas.
 - `2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof` -> cost_based_route_optimizer:weak_direct (substantive snippet contains only one matched mechanism term): Flowcut says ordered response movement needs a drain frontier; RUM says resident access methods must declare read/update/memory costs; NeurCC says hot conflict policy can be selected from cheap route state; STO says the correct conflict predicate often belongs to the datatype or route rather than a universal tuple validator.
 - `2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof` -> multi_tier_placement:weak_direct (substantive snippet contains only one matched mechanism term): Flowcut says ordered response movement needs a drain frontier; RUM says resident access methods must declare read/update/memory costs; NeurCC says hot conflict policy can be selected from cheap route state; STO says the correct conflict predicate often belongs to the datatype or route rather than a universal tuple validator.
 - `2026-06-05-deadlock-safety-needs-packet-level-pressure-not-just-cycle-detection` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): The transferable idea for GPU DB is that "there is a cycle" and "the system is deadlocked" are different claims.
@@ -88,15 +87,8 @@ Evidence quality reason counts:
 - `2026-06-05-cross-paper-synthesis-route-choice-needs-staged-proof` -> wal_before_visibility:weak_direct (substantive snippet contains only one matched mechanism term): GPU DB should treat a route as a sequence of measurable stages: admission, cheap metadata/predicate filter, visibility check, decode or payload fetch, transfer, GPU execution, response encoding, and completion feedback.
 - `2026-06-06-upbit-keeps-bitmap-filters-mutable-by-separating-sparse-update-state` -> htap_freshness_router:weak_direct (substantive snippet contains visible mechanism aliases): **Core idea:** UpBit targets the awkward middle ground where bitmap indexes are useful for selective reads, but ordinary compressed bitvectors are expensive to update.
 - `2026-06-06-upbit-keeps-bitmap-filters-mutable-by-separating-sparse-update-state` -> multi_tier_placement:weak_direct (substantive snippet contains visible mechanism aliases): **Core idea:** UpBit targets the awkward middle ground where bitmap indexes are useful for selective reads, but ordinary compressed bitvectors are expensive to update.
-- `2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-plus-publication-proof` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): First, a route certificate should declare the relation generation, snapshot boundary, resident or warm-tier format, predicate family, expected selectivity, required buffers, merge mode, and fallback path.
-- `2026-06-06-cross-paper-synthesis-route-decisions-need-explainable-metadata-bounded-exploration-and-version-` -> wal_before_visibility:weak_direct (substantive snippet contains only one matched mechanism term): - Route-certificate benchmark: per-fragment metadata scan produces included/pruned/ineligible fragments, selected tier, visibility boundary, and fallback reason. - Bounded route exploration benchmark: deterministic planner versus microsecond-capped adaptive probing for CPU index, GPU resident scan, GPU lookup, and cold-transfer routes. - Version-tree plac...
-- `2026-06-06-cross-paper-synthesis-resource-credits-should-travel-with-route-work` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): The recent Aeolus, MTM, and 1RMA reviews converge on a runtime design track where work is admitted only with explicit resource proofs, and where policy loops operate at the right time scale.
-- `2026-06-06-cross-paper-synthesis-batches-need-bounded-credits-and-escape-hatches` -> owner_ring_bundling:weak_direct (substantive snippet contains only one matched mechanism term): Quickstep makes query plans into schedulable work orders; MatrixKV makes compaction a bounded key-range column merge; Aria makes OLTP commits a batch/snapshot conflict decision.
 - `2026-06-06-cross-paper-synthesis-maintenance-needs-credits-generations-and-preemption` -> owner_ring_bundling:weak_direct (substantive snippet contains only one matched mechanism term): Quickstep turns plans into block work orders; Aria turns OLTP execution into batch/snapshot conflict phases; MatrixKV, TB-Collect, DiffKV, and SILK turn storage maintenance into tier-shaped units that must not surprise foreground latency.
-- `2026-06-07-cross-paper-synthesis-correctness-needs-external-witnesses-plus-failure-states` -> dependency_witnesses:weak_direct (substantive snippet contains only one matched mechanism term): PolySI, Learned Query Optimizer, and fsync-failure recovery converge on one design track: fast routes should be allowed to optimize, but they must leave behind enough proof to audit both correctness and failure state.
 - `2026-06-07-cross-paper-synthesis-correctness-needs-external-witnesses-plus-failure-states` -> cost_based_route_optimizer:weak_direct (substantive snippet contains only one matched mechanism term): PolySI, Learned Query Optimizer, and fsync-failure recovery converge on one design track: fast routes should be allowed to optimize, but they must leave behind enough proof to audit both correctness and failure state.
-- `2026-06-07-cross-paper-synthesis-freshness-needs-explicit-search-metadata` -> wal_before_visibility:weak_direct (substantive snippet contains only one matched mechanism term): HostCC says the runtime needs local pressure witnesses before host resources overload. veDB-HTAP says accelerated routes need semantic freshness witnesses before secondary execution. vWeaver says MVCC scans need searchable visibility witnesses before they touch payload data.
-- `2026-06-07-cross-paper-synthesis-schedulers-need-witnesses-too` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): Durable state needs compact roots or generation markers that prove what recovery may trust.
 
 ## Review Triage
 
