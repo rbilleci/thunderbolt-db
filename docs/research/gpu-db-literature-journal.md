@@ -38,6 +38,158 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Adaptive HTAP treats freshness as a resource-scheduling input
+
+**Citation:** Aunn Raza, Periklis Chrysogelos, Angelos Christos
+Anadiotis, and Anastasia Ailamaki. "Adaptive HTAP through Elastic
+Resource Scheduling." SIGMOD 2020, 2043-2054. DOI:
+`https://doi.org/10.1145/3318464.3389783`. Retrieved 2026-06-07 from
+arXiv, EPFL Infoscience, DBLP/DOI metadata, and the Proteus project page:
+`https://arxiv.org/abs/2004.05437`,
+`https://infoscience.epfl.ch/entities/publication/8c86d244-7413-4030-803b-e73483007bf2`,
+`https://dblp.org/rec/conf/sigmod/RazaCAA20`,
+`https://proteusdb.com/publications/SIGMOD2020-htap/`.
+
+**Category:** Hybrid HTAP; runtime/admission scheduling; MVCC/snapshot
+freshness and multi-tier data placement.
+
+**Relevance tags:** HTAP freshness; elastic resource scheduling; OLTP/OLAP
+interference; Resource and Data Exchange; snapshot switching; split access;
+fresh-data locality; NUMA locality; batch ETL; controlled OLTP slowdown;
+retained snapshot refresh; GPU resident refresh scheduling.
+
+**Core idea:** The paper reframes HTAP design as a runtime scheduling problem
+rather than a fixed choice between unified fresh storage and decoupled ETL.
+Freshness demands vary by query and workload, so a single static design either
+hurts OLTP with shared snapshot access or hurts OLAP with repeated data
+transfer. Their system models HTAP as three pieces: an OLTP engine, an OLAP
+engine, and a Resource and Data Exchange (RDE) engine that reallocates CPU,
+memory placement, and data access mode at query time.
+
+The strongest transferable idea for GPU DB is to make freshness a first-class
+route input. A retained GPU snapshot route should not be chosen only because
+data is resident or because the GPU is idle. It should compare how much fresh
+data the query needs, how stale the resident generation is, what refresh or
+delta-read cost is required, and how much OLTP/write-path capacity can be
+borrowed without breaking latency or durability budgets.
+
+**Concrete mechanisms:**
+
+- The paper defines fresh data as OLTP modifications not yet present in the
+  OLAP private storage when an analytical query arrives. It uses a
+  query-level freshness-rate metric over the tuples relevant to the query.
+- The architecture has separate OLTP and OLAP engines plus an RDE layer. The
+  RDE owns exchangeable CPU and memory resources, assigns them to engines,
+  and chooses whether fresh data is copied, read remotely, or read with
+  borrowed compute near the OLTP memory.
+- The OLTP storage manager keeps two columnar instances plus multiversion
+  storage. One instance is active for OLTP writes; on request, the OLTP engine
+  switches active instances and exposes the inactive instance as a consistent
+  snapshot for OLAP-side access.
+- Updates set per-record indication bits and hierarchical schema/relation/
+  column update flags. The RDE uses those flags to detect fresh columns and
+  copy only changed records when synchronizing instances or performing ETL.
+- Inserts are pushed to both instances but become available through the
+  inactive instance only after a switch. Updates write the active instance at
+  commit and push old versions to versioned storage.
+- The OLAP engine, based on Proteus, uses plugins for access paths over
+  contiguous or partitioned memory regions and can generate code specialized
+  to the data location and query plan.
+- The RDE exposes three states: `S1` co-located OLTP/OLAP sharing sockets and
+  reading the inactive OLTP instance; `S2` isolated OLTP/OLAP with ETL into
+  the OLAP local instance; and `S3` hybrid, where OLAP reads only required
+  fresh data from the OLTP side either remotely or by borrowing OLTP-local
+  CPUs.
+- The scheduling heuristic compares `Nfq`, fresh data needed by the query, to
+  `Nft`, fresh data in the database, with an ETL sensitivity parameter
+  `alpha`. If the query touches a small fraction of fresh data, it favors
+  hybrid/split access; if enough fresh data or a query batch makes transfer
+  amortizable, it moves to isolated ETL.
+- Elasticity is bounded by administrator thresholds for minimum OLTP sockets
+  and CPUs per socket. The paper explicitly treats OLTP slowdown as a
+  controlled tradeoff rather than an accidental side effect.
+- Evaluation uses CH-benCHmark on a 2-socket, 56-hardware-thread server with
+  1.5 TB DRAM. Reported results include up to 50% OLAP query-sequence
+  improvement over static schedules for 100 query sequences while keeping the
+  OLTP throughput drop small and controlled. The paper also reports about
+  10 ms to synchronize roughly 1 million modified tuples in a database over
+  1.8 billion records in its setup.
+
+**GPU DB mapping:** Treat retained GPU residency as one point in a larger HTAP
+scheduling spectrum. A query can use an already-valid GPU snapshot, trigger a
+refresh, read a delta through CPU/owner state, execute fully on CPU, or wait
+for a batch refresh. The decision should be driven by per-query fresh-byte or
+fresh-row estimates, route class, current write pressure, and transfer cost,
+not just by a static "GPU if available" rule.
+
+The RDE role maps to a residency/admission coordinator between mutation
+owners, retained read workers, GPU execution owners, and cold/warm storage. It
+should publish route decisions with explicit witnesses: source WAL frontier,
+visibility generation, resident generation, dirty-column/segment flags, and
+refresh cost. This keeps the hot path deterministic while allowing runtime
+adaptation.
+
+The split-access state is especially relevant to P8. A retained query over a
+mostly-current GPU segment may only need a small CPU-side delta or a small
+fresh segment scan. Benchmark this against full resident refresh and full CPU
+fallback. If the fresh fraction is low and the reduction factor is high, it may
+be cheaper to run part of the query near the mutation/CPU owner and send a
+partial result to the GPU/OLAP route than to refresh all resident buffers.
+
+The paper's warning about memory-bandwidth interference maps to host/GPU
+tiers. Refreshing GPU resident data, copying deltas, encoding responses, and
+serving OLTP writes compete for CPU memory bandwidth, PCIe/NVLink, pinned
+buffers, and cache locality. Resource borrowing must have hard floors for WAL,
+visibility publication, and mutation admission.
+
+**Risks and mismatches:** The evaluated design is CPU/NUMA in-memory HTAP,
+not a GPU database. The OLAP engine has GPU-related heritage through Proteus,
+but this paper's evaluation treats CPUs as the available compute device.
+GPU-specific costs such as kernel launches, HBM residency, device memory
+pressure, pinned-buffer contention, and D2H result transfer are not measured.
+
+The two-instance OLTP design is a research prototype mechanism. GPU DB cannot
+blindly duplicate large tables or expose inactive copies without accounting
+for MVCC version retention, WAL-before-visibility, DDL invalidation, snapshot
+pins, and recovery. The useful abstraction is generation switching with dirty
+metadata, not necessarily the exact twin-instance storage layout.
+
+The scheduler assumes full scans and leaves index/auxiliary structure
+maintenance as future work. GPU DB's retained routes will often use key
+vectors, scan indexes, predicates, and compressed segments, so `Nfq/Nft` must
+be refined into fresh bytes per route, affected columns, predicate selectivity,
+and result reduction.
+
+The paper controls interference with coarse CPU/socket thresholds. GPU DB
+needs finer policy for write owners, WAL flush, response rings, GPU copy
+engines, NVMe queues, and pinned buffers. Borrowing resources from OLTP cannot
+delay commit durability or snapshot invalidation.
+
+**Benchmark candidates:**
+
+- Add a freshness-aware route simulator for retained GPU snapshots. Inputs:
+  `{fresh_rows, fresh_bytes_by_column, resident_generation_age, dirty_segments,
+  write_queue_depth, refresh_bytes, GPU_queue_depth}`. Compare GPU refresh,
+  CPU fallback, split CPU-delta/GPU-base execution, and wait-for-batch-refresh.
+- Prototype split-access retained lookup or aggregate execution: GPU processes
+  a valid base snapshot while CPU owner processes fresh delta rows for the
+  same visibility boundary, then merge results deterministically. Gate: result
+  equality with full CPU MVCC execution for inserts, updates, deletes, and
+  long retained readers.
+- Benchmark ETL sensitivity thresholds for resident refresh. Vary fresh
+  fraction, query batch size, update rate, and reduction factor. Report
+  throughput, p99 latency, refresh bytes, stale-route fallback rate, and write
+  owner slowdown.
+- Add dirty-column and dirty-segment flags to route telemetry. Gate: the
+  planner can tell whether a query touches dirty resident data before enqueueing
+  GPU work.
+- Stress resource borrowing under mixed writes and retained reads. Failure
+  condition: a refresh or split-access route improves OLAP latency but delays
+  WAL flush, visibility publication, or mutation p99 beyond budget.
+- Compare static HTAP modes against adaptive scheduling: always GPU-resident
+  refresh, always CPU fallback, periodic batch refresh, and freshness-aware
+  adaptive route choice.
+
 ### 2026-06-07 - DoppelGanger++ makes dependency ordering a streaming state problem
 
 **Citation:** Wonseok Lee, Jaehyun Ha, Wook-Shin Han, Changgyoo

@@ -3000,12 +3000,15 @@ Append new candidates here as each paper is processed.
   Why: ByteHTAP cites real-time LSM-tree work in the HTAP freshness ecosystem;
   useful for evaluating whether GPU DB cold/warm tiers should expose
   LSM-style freshness windows, merge pressure, and snapshot-aware compaction.
-- `queued` — **Adaptive HTAP through Elastic Resource Scheduling**, Raza,
+- `reviewed` — **Adaptive HTAP through Elastic Resource Scheduling**, Raza,
   Chrysogelos, Anadiotis, and Ailamaki, SIGMOD 2020.
-  URL: `https://doi.org/10.1145/3318464.3389723`
+  URL: `https://doi.org/10.1145/3318464.3389783`
   Why: ByteHTAP compares against elastic HTAP scheduling; useful for deciding
   when GPU DB should shift resources between mutation, refresh, and retained
-  read owners instead of fixing static OLTP/OLAP resource splits.
+  read owners instead of fixing static OLTP/OLAP resource splits. Journal
+  entry added 2026-06-07 from arXiv, EPFL Infoscience, DBLP/DOI metadata, and
+  the Proteus project page; the queued DOI was corrected to the ACM/DBLP
+  metadata value.
 - `reviewed` — **An Empirical Evaluation of Columnar Storage Formats**,
   Zeng et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol17/p148-zeng.pdf`
@@ -3375,6 +3378,13 @@ Append new candidates here as each paper is processed.
   Why: L-Store cites DL-Store as a distributed hybrid OLTP/OLAP follow-up;
   useful for comparing lineage-style single-node base/tail publication with
   distributed partitioning, freshness, and analytical routing.
+- `queued` — **A Survey on Hybrid Transactional and Analytical Processing**,
+  Li et al., VLDB Journal 2024.
+  URL: `https://doi.org/10.1007/s00778-024-00858-9`
+  Why: discovered while reviewing Adaptive HTAP; useful for checking modern
+  HTAP taxonomy, freshness/consistency vocabulary, and cloud-native elastic
+  scheduling context before GPU DB turns retained GPU snapshots into an HTAP
+  route family.
 
 - `reviewed` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
   Control Schemes**, arXiv 2024.
