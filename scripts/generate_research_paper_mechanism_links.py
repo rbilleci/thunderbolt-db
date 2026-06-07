@@ -154,6 +154,7 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "generation markers",
         "relation generation",
         "what recovery may trust",
+        "system is deadlocked",
     ],
     "cost_based_route_optimizer": [
         "access shapes",
@@ -3891,8 +3892,12 @@ def evidence_quality_details(link: dict) -> tuple[str, str]:
         for term in VISIBLE_EVIDENCE_ALIASES.get(link["mechanism_id"], [])
         if term in snippet_lower
     )
+    if link.get("review_status") == "reviewed_weak_signal":
+        return "reviewed_weak_signal", "reviewed weak-signal link has substantive retained evidence"
     if snippet_term_hits == 0:
         if visible_alias_hits:
+            if link["confidence"] != "low" or link.get("review_status") == "reviewed_supported":
+                return "direct", "snippet contains visible mechanism aliases"
             return "weak_direct", "substantive snippet contains visible mechanism aliases"
     if snippet_lower.startswith(STRONG_SNIPPET_PREFIXES) and snippet_term_hits >= 1:
         return "direct", "strong journal section contains matched mechanism terms"
@@ -4125,7 +4130,13 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
         (record, link)
         for record in records
         for link in record["mechanism_links"]
-        if link["evidence_span"]["quality"] != "direct"
+        if link["evidence_span"]["quality"] not in ("direct", "reviewed_weak_signal")
+    ]
+    reviewed_weak_signal_records = [
+        (record, link)
+        for record in records
+        for link in record["mechanism_links"]
+        if link["evidence_span"]["quality"] == "reviewed_weak_signal"
     ]
 
     lines = [
@@ -4181,6 +4192,19 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
             )
         if len(evidence_quality_audit) > 80:
             lines.append(f"- ... {len(evidence_quality_audit) - 80} more")
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Reviewed Weak-Signal Evidence", ""])
+    if reviewed_weak_signal_records:
+        for record, link in reviewed_weak_signal_records[:80]:
+            span = link["evidence_span"]
+            snippet = span["snippet"].replace("|", "\\|")
+            lines.append(
+                f"- `{record['id']}` -> {link['mechanism_id']}:{span['quality']} ({span['quality_reason']}): {snippet}"
+            )
+        if len(reviewed_weak_signal_records) > 80:
+            lines.append(f"- ... {len(reviewed_weak_signal_records) - 80} more")
     else:
         lines.append("- none")
 
