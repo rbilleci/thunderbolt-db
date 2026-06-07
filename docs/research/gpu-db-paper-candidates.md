@@ -6712,14 +6712,23 @@ Append new candidates here as each paper is processed.
   contention before GPU DB treats HBM, PCIe/NVLink, CXL, NIC, storage, and
   host-memory movement as independent route resources. Journal entry added
   2026-06-07 from the ACM/author PDF.
-- `queued` — **Host Congestion Control**, Agarwal, Krishnamurthy, and
+- `reviewed` — **Host Congestion Control**, Agarwal, Krishnamurthy, and
   Agarwal, SIGCOMM 2023.
   URL: `https://doi.org/10.1145/3603269.3604878`
   PDF: `https://homes.cs.washington.edu/~arvind/papers/hcc.pdf`
   Why: Understanding the Host Network names hostCC as a direction for
   host-network resource allocation; useful for deciding whether GPU DB should
   expose host-interconnect pressure as local credits before NIC, storage, or
-  GPU data movers saturate shared memory-controller domains.
+  GPU data movers saturate shared memory-controller domains. Journal entry
+  added 2026-06-07 from the ACM/author PDF.
+- `queued` — **Understanding Host Interconnect Congestion**, Agarwal et al.,
+  HotNets 2022.
+  URL: `https://dl.acm.org/doi/10.1145/3563766.3564095`
+  Why: Host Congestion Control cites this production Google study as the
+  motivating evidence for host-side drops and queueing; useful as a follow-up
+  for validating whether GPU DB's gateway, NIC, NVMe, GPU copy, and CPU
+  memory traffic need production-style host-network diagnostics beyond the
+  hostCC control loop.
 - `queued` — **Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA
   Servers**, Liu et al., NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/liu-kefei`

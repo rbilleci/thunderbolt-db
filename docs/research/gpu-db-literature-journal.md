@@ -98997,3 +98997,173 @@ HTAP snapshot routing before taking another persistent-memory logging paper.
   eligibility gates.
 - A crash/recovery benchmark that proves physical warm-tier movement never
   outruns the logical WAL and visibility witnesses.
+
+### 2026-06-07 - HostCC makes host congestion a local control loop
+
+**Citation:** Saksham Agarwal, Arvind Krishnamurthy, and Rachit
+Agarwal. "Host Congestion Control." ACM SIGCOMM 2023, 13 pages.
+DOI: `https://doi.org/10.1145/3603269.3604878`. Retrieved 2026-06-07
+from the DOI page and author PDF:
+`https://homes.cs.washington.edu/~arvind/papers/hcc.pdf`.
+
+**Category:** Runtime scale, HFT-style mechanics, and admission;
+high-concurrency networking; multi-tier cache/data placement.
+
+**Relevance tags:** host congestion; host network; IIO occupancy;
+PCIe credits; NIC queueing; ECN; DCTCP; sub-RTT control;
+memory-bandwidth allocation; DDIO; host-local backpressure;
+resource credits; 1M logical sessions; gateway admission; GPU
+staging; pinned buffers; NVMe/GPU/NIC interference.
+
+**Core idea:** HostCC argues that congestion control should not stop at
+the NIC. Modern datacenter hosts can suffer congestion inside the host
+network that connects NIC, PCIe, IIO, memory controllers, caches, and
+CPU cores. Under host congestion, packets queue and drop at the NIC even
+though the underlying bottleneck is elsewhere in the host and the
+network fabric may be healthy.
+
+The paper's architecture adds host-local congestion signals and a
+host-local response loop. HostCC measures host-side congestion at
+sub-microsecond granularity, uses a sub-RTT control action to allocate
+host resources between network traffic and local CPU/memory traffic, and
+echoes host congestion into the ordinary network congestion-control loop
+at RTT granularity.
+
+For GPU DB, the strongest transferable idea is a two-level admission
+controller. A gateway or query route needs fast local resource throttles
+for host-domain pressure, while slower end-to-end flow control adapts
+session/request arrival. Queue depth alone is too late if the hidden
+bottleneck is PCIe credit replenishment, memory-controller write queues,
+DDIO eviction, pinned-buffer DMA, NVMe traffic, or GPU result copies.
+
+**Concrete mechanisms:**
+
+- HostCC uses IIO buffer occupancy as the main host congestion signal.
+  The paper models PCIe throughput as limited by the slower of NIC-to-IIO
+  latency and IIO-to-memory latency. When memory-controller delay grows,
+  IIO occupancy rises, PCIe credits replenish more slowly, PCIe becomes
+  underutilized, and packets queue at the NIC.
+- It also computes PCIe bandwidth utilization from IIO insertion-rate
+  counters. Together, IIO occupancy and insertion rate tell HostCC
+  whether network traffic is meeting a target bandwidth and whether the
+  host is congested.
+- The implementation reads Intel MSR counters for cumulative IIO
+  occupancy and insertions. The authors report sub-microsecond signal
+  collection, with TSC reads below 2 ns and the relevant MSR read below
+  about 600 ns on their servers.
+- HostCC smooths the signals with EWMA. The default weights are `1/8`
+  for IIO occupancy and `1/256` for PCIe bandwidth utilization, trading
+  fast reaction against overreaction to short bursts.
+- The host-local response has four regimes based on host congestion
+  (`I_S > I_T`) and whether network traffic has met target bandwidth
+  (`B_S > B_T`). Depending on the regime, HostCC either gives more host
+  resources to local traffic, backpressures local traffic, echoes host
+  congestion to network CC, or waits for network traffic to ramp up.
+- On the receiver, HostCC's local response tries to drain NIC queues at
+  roughly the packet-arrival rate. On the sender, the local response
+  prevents network traffic from being starved by local CPU/memory work.
+- The Linux prototype uses Intel Memory Bandwidth Allocation to
+  backpressure host-local CPU cores and separates network cores from
+  local-memory traffic cores with class-of-service settings.
+- For network resource allocation, HostCC marks ACKs with ECN when host
+  congestion is detected, allowing an existing ECN-based protocol such as
+  Linux DCTCP to reduce send rate without modifying applications, NICs,
+  switches, or the transport implementation.
+- The reported Linux implementation is a loadable kernel module of about
+  800 lines. It uses `B_T = 80Gbps` and IIO occupancy thresholds such as
+  `70` with DDIO disabled and `50` with DDIO enabled in the reported
+  experiments.
+- In the baseline host-congestion setup, Linux DCTCP sees as much as
+  about 35-55% throughput degradation, around 0.3-1% packet drops in
+  reported scenarios, and 120-5000x tail-latency inflation. The authors
+  attribute p99 inflation mainly to NIC queueing and CPU memory-delay
+  inflation, and p99.9 inflation to retransmission timeout behavior.
+- With HostCC, the evaluation reports target network throughput near the
+  configured target, packet drops reduced by orders of magnitude, and
+  minimal tail-latency inflation for small RPCs under high host
+  congestion. In one 128B RPC case, p99 inflation is reported around
+  13 microseconds compared with no host congestion.
+- The paper's ablation shows that all three pieces matter. Echoing host
+  congestion without host-local response lowers drops but can reduce
+  throughput sharply; host-local response without network-resource
+  feedback preserves throughput but still permits high drops; using both
+  keeps throughput high and drops low.
+
+**GPU DB mapping:** Treat gateway, storage, GPU-copy, and CPU response
+paths as competing host-network tenants. The current runtime design has
+bounded rings for network ingress, mutation, read snapshots, residency,
+GPU execution, and responses. HostCC says those rings also need a
+host-local control loop that measures route-class pressure and changes
+admission before NIC queues, PCIe credits, pinned buffers, or memory
+controllers hit a bad regime.
+
+For 1M logical sessions, the useful analogy is not ECN itself but
+separation of timescales. A sub-RTT local loop should throttle cold NVMe
+prefetch, CPU response encoding, large result materialization, or GPU
+copy traffic when retained-read latency is being hurt by shared host
+resources. A slower session/request loop can then reduce admission,
+batch size, or client-visible send rate. Waiting for end-to-end timeout
+or TCP backoff is too slow for a database tail-latency target.
+
+The route planner should expose a target per resource class, similar to
+HostCC's `B_T`: maximum response-ring writeback bytes, GPU copy bytes,
+NVMe read bytes, network egress bytes, and CPU metadata-read pressure per
+time window. When observed local pressure exceeds a threshold, the
+runtime should choose among smaller GPU batches, CPU fallback, cold-route
+deferral, explicit overload, or reduced session credits.
+
+HostCC also reinforces topology-aware ownership. Network IO workers,
+GPU workers, pinned host slabs, NVMe queues, and CPU metadata scanners
+should be grouped by NUMA/root-complex locality where possible. A route
+that crosses sockets may consume hidden host-network capacity even if the
+logical queue length is low.
+
+**Risks and mismatches:** HostCC is a networking paper, not a database or
+GPU execution paper. It evaluates Linux DCTCP with synthetic network and
+memory applications, not SQL, MVCC, WAL, CUDA kernels, GPUDirect Storage,
+RDMA-based database protocols, or PostgreSQL wire sessions.
+
+The concrete counters and controls are platform-specific. IIO occupancy,
+Intel MBA, DDIO behavior, ECN marking through NetFilter, and the chosen
+thresholds may not transfer to AMD, ARM, Grace Hopper, PCIe switches,
+CXL memory, cloud VMs, containers, or GPU-direct paths. The design
+principle transfers; the measured thresholds do not.
+
+The local response mechanism is coarse. The paper reports about 22
+microseconds to write the MBA control MSR and notes non-linear MBA
+levels, including an emulated level that pauses the competing memory
+application. GPU DB should not assume OS/hardware controls are precise
+enough to enforce a production latency SLO without local measurement.
+
+Backpressuring local CPU/memory work can harm useful database work. A GPU
+DB adaptation needs priority and correctness rules: WAL flush, visibility
+publication, and recovery work cannot be starved simply to preserve
+network throughput.
+
+**Benchmark candidates:**
+
+- Build a host-local pressure controller around runtime rings. Inputs:
+  pinned-buffer waits, copy-engine time, PCIe/NVLink bytes, NVMe queue
+  delay, response-ring backlog, LLC misses, and uncore counters when
+  available. Gate: the controller reduces retained-read p99 under mixed
+  network, GPU-copy, and cold-transfer pressure.
+- Compare one-level admission against HostCC-style two-level admission.
+  One-level uses only session/request queue depth; two-level adds fast
+  local route throttles plus slower client/request credit reduction.
+  Measure p50/p99/p99.9 latency, throughput, drops/rejections, and
+  fairness between retained reads and cold routes.
+- Stress 1M logical sessions with a small fraction of large responses or
+  cold NVMe/GPU transfers. Failure condition: tiny retained reads suffer
+  large p99 inflation while aggregate CPU, GPU, and DRAM bandwidth appear
+  below peak.
+- Add per-route `target_resource_rate` knobs for network egress,
+  response encoding, GPU result copy, storage prefetch, and CPU metadata
+  reads. Benchmark static thresholds, EWMA thresholds, and adaptive
+  thresholds under bursty arrivals.
+- Test whether throttling cold prefetch or result materialization protects
+  WAL/visibility and retained-read paths. Gate: correctness-critical
+  mutation and recovery work remain admitted even when best-effort routes
+  are backpressured.
+- Record topology effects by moving NIC, GPU, NVMe, pinned host buffers,
+  and IO workers across NUMA/root-complex placements. Gate: admission
+  telemetry can explain latency changes that queue depth alone misses.
