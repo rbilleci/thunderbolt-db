@@ -96989,3 +96989,177 @@ administrative reads may tolerate explicit generation waits.
   buffers. Failure condition: a dry run can starve real commits, exceed pinned
   memory budgets, or admit a transaction that later blocks under locks on cold
   IO.
+
+### 2026-06-07 - Pathfinder makes crash testing semantic, not exhaustive
+
+**Citation:** Yile Gu, Ian Neal, Jiexiao Xu, Shaun Christopher Lee, Ayman
+Said, Musa Haydar, Jacob Van Geffen, Rohan Kadekodi, Andrew Quinn, and Baris
+Kasikci. "Scalable and Accurate Application-Level Crash-Consistency Testing
+via Representative Testing." PACMPL/OOPSLA 2025. Retrieved 2026-06-07 from
+`https://arxiv.org/pdf/2503.01390`.
+
+**Category:** WAL, logging, storage recovery, and read/write throughput;
+database file-system/storage testing.
+
+**Relevance tags:** crash-state pruning, representative testing, persistence
+graph, update behaviors, POSIX fsync ordering, MMIO persistence, DPOR,
+application recovery oracle, WAL/checkpoint/manifest witnesses.
+
+**Core idea:** Pathfinder attacks the same crash-state explosion problem as
+B3, but from the application side rather than from block traces alone. Its key
+claim is that many crash states are not identical yet are correlated because
+they exercise the same persistence-ordering mistake. Instead of enumerating
+every possible partial durability state, it groups semantically related update
+behaviors and tests representative behaviors that contain a superset of
+updates with no more persistence dependencies than the represented behavior.
+
+This is especially relevant after CCFS and Chardonnay. CCFS says durability
+ordering should be partitioned into semantic streams; Chardonnay says
+visibility frontiers and pinned read sets need explicit validation. Pathfinder
+adds the testing counterpart: the crash witness should be grouped by the
+database operation that owns the durable invariant, not by raw filesystem
+blocks or arbitrary trace length.
+
+**Concrete mechanisms:**
+
+- Pathfinder traces program operations, builds a persistence graph, derives
+  update-behavior subgraphs, groups those subgraphs by a representative
+  relation, then model-checks representative crash states with DPOR and an
+  application-specific recovery oracle.
+- The persistence graph represents durable updates as nodes and
+  happens-before persistence constraints as edges. POSIX traces use syscalls
+  such as `write`, `rename`, `unlink`, `fdatasync`, and `fsync`; MMIO traces
+  use stores, flushes, and fences.
+- The representative relation is conservative in shape: one behavior can
+  represent another when it has equivalent or superset update nodes and a
+  subset of equivalent dependency edges among the represented nodes. That
+  makes the representative behavior expose at least as many relevant crash
+  schedules.
+- For POSIX applications, update behavior derivation uses backtraces. Adjacent
+  operations sharing a longest common call-stack prefix are grouped, then child
+  function subgraphs can be merged into parent function behaviors. DBSCAN is
+  used to split temporally distant behaviors under the same function.
+- For MMIO applications, update behavior derivation groups operations by data
+  type and object instance, then splits instance subgraphs into epochs. Epoch
+  boundaries are inferred when previous updates to an instance have been
+  persisted and a field is updated again, or when updates to another instance
+  are fully persisted between operations.
+- The implementation uses Intel Pin for POSIX syscall and mmap-store tracing,
+  pmemcheck/Valgrind for MMIO memory operations, LLVM debug/type information
+  for instance grouping, and application recovery/checker code as the oracle.
+- Evaluation reports 18 bugs across eight production-ready systems, including
+  seven new bugs, with targets including LevelDB, RocksDB, WiredTiger, HSE,
+  persistent-memory Redis and memcached, and mmap-write variants. The paper
+  reports that Pathfinder found all eight POSIX bugs within a two-hour limit
+  while ALICE found two, and found substantially more MMIO bugs than Jaaru or
+  a DPOR-only baseline under the same time budget.
+- The dominant production bug class in their result table is ordering: nine
+  of eighteen production bugs. Other classes are atomicity, unpersisted data,
+  and failure-recovery bugs.
+
+**GPU DB mapping:** Treat each durable GPU DB operation as an update behavior
+with a named recovery invariant: WAL append plus visibility publish, checkpoint
+install, object manifest rewrite, resident snapshot invalidation, route
+descriptor publication, segment-id reuse, and cold-tier compaction commit. The
+crash tester should not only generate low-level crash points; it should group
+them by these operation families and pick representative traces that maximize
+updates while minimizing enforced ordering.
+
+The persistence graph maps to a database-level durability graph. Nodes should
+include WAL record writes and flushes, checkpoint table writes, manifest object
+puts, descriptor-generation writes, invalidation records, segment free/reuse
+records, and any future PM/CXL cacheline flushes. Edges should encode
+WAL-before-visibility, invalidation-before-publication, checkpoint-before-log
+truncation, manifest-parent-before-child, and free-before-reuse retirement
+rules.
+
+The representative-behavior idea can keep crash testing tractable for
+multi-owner designs. For example, one large COPY flush with WAL chunks,
+resident invalidation, checkpoint watermark, and manifest update can represent
+smaller COPY flushes that touch the same durable structures with stronger
+ordering. Similarly, a route migration that updates owner interval, resident
+generation, and cold-tier manifest can represent a simpler generation-only
+route publish.
+
+The POSIX backtrace heuristic suggests a practical first implementation for
+the Rust codebase: instrument named durability functions or structured
+operation spans rather than trying to infer all behavior from block writes.
+The MMIO type/epoch heuristic maps to future persistent descriptors: group
+crash states by descriptor type and instance, then split epochs when a
+descriptor is fully persisted and later updated again.
+
+**Risks and mismatches:** Pathfinder tests application-level crash
+consistency, not SQL isolation or MVCC visibility. A recovery oracle that only
+checks file integrity could miss wrong SQL-visible histories, stale route
+descriptors, invalid resident generations, or broken snapshot reads.
+
+Its representative relation is heuristic. The paper explicitly notes false
+negative risks when an operation trace does not contain the buggy behavior or
+when a representative group fails to cover a behavior that matters. GPU DB
+should treat representative testing as a prioritization layer over oracle-rich
+crash testing, not as proof of correctness.
+
+Pathfinder does not systematically detect bugs caused by thread
+synchronization interleavings. That matters for GPU DB because mutation
+owners, IO workers, GPU workers, checkpoint installers, and residency owners
+will create cross-thread and cross-device ordering. Durable interleaving tools
+such as DURINN or custom schedule control are needed for that dimension.
+
+The implementation assumes debug symbols, tracing overhead, and
+application-specific checkers. GPU DB needs a build-time fault-injection mode
+and compact declarative recovery oracles before this can become a routine CI
+gate.
+
+**Benchmark candidates:**
+
+- Build a database-level persistence graph recorder for WAL, checkpoint,
+  manifest, invalidation, route descriptor, and free/reuse events. Gate: every
+  durable publication path emits typed nodes and explicit ordering edges.
+- Add representative crash testing for three operation families: small INSERT
+  commit, COPY chunk flush, and cold-tier manifest publish. Compare exhaustive
+  bounded crash states, B3-style witness generation, and representative
+  behavior pruning on bug-finding coverage and runtime.
+- Define SQL-aware recovery oracles: replayed table contents, MVCC visibility
+  at retained snapshots, route descriptor authority intervals, manifest
+  reachability, and resident-cache invalidation state must match a reference
+  model after each generated crash.
+- Test whether a large representative COPY/manifest operation safely covers
+  smaller operations. Failure condition: a small operation has a distinct
+  crash outcome that the representative behavior did not exercise.
+- Add thread-schedule adversaries around mutation owner, checkpoint installer,
+  and residency invalidator handoffs. Use Pathfinder-style persistence
+  pruning only after the schedule dimension is fixed or separately explored.
+- Track crash-test coverage by durable invariant rather than by number of
+  crash images. Report which invariants have representative witnesses and
+  which still need exhaustive or targeted tests.
+
+### 2026-06-07 - Cross-paper synthesis: recovery needs semantic state spaces
+
+B3, CCFS, Chardonnay, and Pathfinder converge on the same design track:
+correctness state spaces become tractable when the system exposes semantic
+boundaries. B3 gives bounded black-box witnesses, CCFS separates durability
+streams, Chardonnay makes epoch frontiers and pinned sets explicit, and
+Pathfinder groups crash states by update behavior instead of raw state count.
+
+The GPU DB direction is to make every durable and visible transition carry a
+typed witness: owner stream, generation interval, WAL frontier, invalidation
+frontier, manifest object set, descriptor type, and free/reuse retirement
+horizon. Crash testing can then sample representative transitions without
+pretending that all byte-level reorderings are equally meaningful.
+
+Category gaps after this cluster: modern MVCC garbage collection under long
+retained snapshots, autonomous/NVMe commit latency, and GPU/runtime admission
+under mixed short reads and long refreshes remain higher priority than more
+application-crash-testing papers in the next few runs.
+
+Benchmark priorities:
+
+- First, add a compact durability witness schema for WAL, checkpoint,
+  manifest, descriptor publication, and free/reuse events.
+- Second, build representative crash tests over INSERT/COPY/manifest publish
+  paths with SQL-aware recovery oracles.
+- Third, add epoch/generation interval validation to retained snapshots and
+  route descriptors so recovery tests can detect stale authority, not just
+  corrupted bytes.
+- Fourth, measure whether semantic stream separation reduces hot-commit p99
+  when background checkpoint or cold-tier compaction is active.

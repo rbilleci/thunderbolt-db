@@ -1166,7 +1166,7 @@ Append new candidates here as each paper is processed.
   Why: PALF compares CSN-style database ordering with replicated log services;
   useful for deciding whether GPU DB should keep WAL bundled with mutation
   owners or expose an independent replicated log service.
-- `queued` — **Moving on From Group Commit: Autonomous Commit Enables High
+- `reviewed` — **Moving on From Group Commit: Autonomous Commit Enables High
   Throughput and Low Latency on NVMe SSDs**, Nguyen, Alhomssi, Ziegler, and
   Leis, PACMMOD/SIGMOD 2025.
   URL: `https://doi.org/10.1145/3725328`
@@ -1174,7 +1174,9 @@ Append new candidates here as each paper is processed.
   Why: discovered while reviewing Chardonnay's fast 2PC and pipelined WAL
   assumptions; useful for comparing per-worker small log writes and parallel
   commit acknowledgement against group commit when GPU DB tries to keep
-  WAL-before-visibility latency low on modern NVMe.
+  WAL-before-visibility latency low on modern NVMe. Journal entry already
+  exists; this stale duplicate was corrected from `queued` to `reviewed` on
+  2026-06-07.
 - `reviewed` — **Rethinking Logging, Checkpoints, and Recovery for
   High-Performance Storage Engines**, Haubenschild, Sauer, Neumann, and Leis,
   SIGMOD/PACMMOD 2020.
@@ -1283,13 +1285,37 @@ Append new candidates here as each paper is processed.
   Why: discovered while reviewing B3; useful for comparing black-box witness
   generation with storage code synthesis and crash-consistency-by-construction
   for future WAL/checkpoint/manifest state machines.
-- `queued` — **Scalable and Accurate Application-Level Crash-Consistency
-  Testing via Representative Testing**, arXiv 2025.
+- `reviewed` — **Scalable and Accurate Application-Level Crash-Consistency
+  Testing via Representative Testing**, Gu et al., PACMPL/OOPSLA 2025.
   URL: `https://arxiv.org/abs/2503.01390`
+  DOI: `https://doi.org/10.1145/3720431`
   Why: modern application-level crash-testing follow-up discovered from the
   B3 line; useful for deriving representative crash states for GPU DB's
   database-level WAL, checkpoint, object-manifest, and route-publication
-  operations without enumerating every low-level storage state.
+  operations without enumerating every low-level storage state. Journal entry
+  added 2026-06-07 from the arXiv PDF and ACM metadata.
+- `queued` — **DURINN: Adversarial Memory and Thread Interleaving for
+  Detecting Durable Linearizability Bugs**, Fu, Lee, and Min, OSDI 2022.
+  URL: `https://www.usenix.org/conference/osdi22/presentation/fu`
+  Why: Pathfinder explicitly does not systematically explore thread
+  synchronization interleavings; DURINN is a primary follow-up for combining
+  durable persistence ordering with adversarial concurrency schedules before
+  GPU DB trusts crash witnesses for multi-owner WAL, catalog, and resident
+  metadata updates.
+- `queued` — **Agamotto: How Persistent is your Persistent Memory
+  Application?**, Neal et al., OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/neal`
+  Why: Pathfinder contrasts pattern-based and symbolic/fuzzing approaches
+  with representative testing; useful for checking whether persistent-memory
+  route descriptors, warm-tier indexes, or future CXL metadata need
+  symbolic path generation in addition to representative crash-state pruning.
+- `queued` — **Witcher: Systematic Crash Consistency Testing for Non-Volatile
+  Memory Key-Value Stores**, Fu et al., SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483556`
+  Why: Pathfinder compares against Witcher's guardian-pattern pruning for
+  MMIO key-value structures; useful for deciding whether GPU DB should encode
+  expected durability protocols as explicit bug patterns, representative
+  update behaviors, or both.
 
 - `queued` — **Atlas: Scalable and Available State Machine Replication**,
   Enes et al., EuroSys 2020.
