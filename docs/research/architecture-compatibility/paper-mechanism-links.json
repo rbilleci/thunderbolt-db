@@ -9162,8 +9162,8 @@
               "gpu memory",
               "hbm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A future table archive, checkpoint, segment replica, or cold resident snapshot should carry a movement certificate: source tier, target tier, bytes, required freshness boundary, allowed destinations, observed throughput, expected cost, and the chosen route.",
             "support_reason": "Matched journal terms (resident, gpu memory, hbm) to Retained GPU snapshots."
           },
@@ -9876,8 +9876,8 @@
               "retained",
               "resident"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "**Converging design tracks:** First, route descriptors should carry physical facts: resident tier, chunk locality, snapshot generation, transfer bytes, and queue pressure.",
             "support_reason": "Matched journal terms (retained, resident) to Retained GPU snapshots."
           },
@@ -11472,8 +11472,8 @@
               "owner",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Implement a compact route-cell simulator with local wait queues and generation-carrying wakeups under 1M logical sessions. - Add route-history audit traces around retained GPU reads, refreshes, invalidations, and CPU fallback, then verify sampled histories against an SI-compatible checker. - Compare cache-aware scheduling policies only under explicit se...",
             "support_reason": "Matched journal terms (owner, queue) to Owner-ring bundling."
           },
@@ -15412,8 +15412,8 @@
               "admission",
               "backpressure"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Large incoming request bodies are already present at ingress; an edge log could avoid copying the same bytes through multiple owner-local buffers before durable admission.",
             "support_reason": "Matched journal terms (token, admission, backpressure) to Vector-credit admission."
           },
@@ -15686,8 +15686,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Lifetime proves the descriptor, index node, parent/prior link, and reusable buffer still belong to the same generation the reader intends to use.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -17394,8 +17394,8 @@
               "generation",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It should identify the SQL-visible snapshot and the physical route: table/schema generation, layout generation, resident buffer generation, dictionary/index identity, response shape, execution shape, and physical descriptor version.",
             "support_reason": "Matched journal terms (generation, publication) to Immutable route roots."
           },
@@ -24386,8 +24386,8 @@
               "resident",
               "htap"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- **Batch publication over per-request churn:** hot write paths should publish WAL, CPU visibility, resident invalidation, and route generations at explicit owner boundaries when latency budgets permit. - **Local conflict graphs before global scheduling:** start with owner-local metadata graphs over keys, partitions, resident generations, and active phase...",
             "support_reason": "Matched journal terms (retained, resident, htap) to Retained GPU snapshots."
           },
@@ -29833,8 +29833,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Same-template lane benchmark for retained lookups, aggregates, and one deterministic write template, with queue wait and batch drain telemetry. - Visibility-fenced GPU write-batch proof that refuses to publish before WAL, invalidation, and CPU validation complete. - Tier-aware route admission test that rejects when HBM/host headroom or resident generati...",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -33419,8 +33419,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "GPU DB should publish visibility as an explicit generation only after WAL, invalidation, and validation descriptors are complete. - **Descriptors are the common currency.** WAL fragments, cold page fetches, and MVCC validation can all use sealed descriptors carrying owner id, table/partition, generation, touched columns, key/predicate range, buffer owners...",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -34868,8 +34868,8 @@
               "route descriptor",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The first half is semantic eligibility: catalog generation, snapshot/visibility boundary, WAL requirements, transaction boundary, read/write-set knowledge, result shape, and fallback legality.",
             "support_reason": "Matched journal terms (generation, route descriptor, publication) to Immutable route roots."
           },
@@ -52649,8 +52649,8 @@
             "matched_terms": [
               "generation"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A retained or over-resident route should declare its visibility boundary, source WAL boundary, placement generation, chunk or overlay metadata generation, response-release watermark, and fallback reason.",
             "support_reason": "Matched journal terms (generation) to Immutable route roots."
           },
@@ -56416,8 +56416,8 @@
               "owner",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Extend the route descriptor prototype with physical layout fields: encoding family, decoded lane width, vector order, row-id mapping, and operator-on-compressed support. - Build a no-GPU benchmark matrix that crosses contention and layout: owner-serialized writes, deterministic epoch planning, dense retained reads, compressed retained reads, and one lon...",
             "support_reason": "Matched journal terms (owner, queue) to Owner-ring bundling."
           },
@@ -61241,8 +61241,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The design track for GPU DB should make route descriptors the shared language across these mechanisms.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -65070,8 +65070,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Together they argue for a typed route descriptor as the central object between planner, runtime, and cache manager.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -66509,8 +66509,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For GPU DB, the common track is a route descriptor that declares shape, ownership, budget, and publication boundary.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -71544,8 +71544,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "GPU+CPU workers schedule asynchronous GPU probes when streams are free, do CPU work while the GPU runs, and place completed probe results into a queue that any worker can consume for post-GPU join work. - Device-specific morsel sizes are part of the design, not an implementation accident.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -72466,8 +72466,8 @@
               "route descriptor",
               "publish"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Each retained route should publish its truth boundary, visibility boundary, semantic write or read scope, resident/index/scratch budget, batch threshold, and coherence mode: central lookup, per-worker cache, or replicated descriptor.",
             "support_reason": "Matched journal terms (route descriptor, publish) to Immutable route roots."
           },
@@ -73161,8 +73161,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The converging design is a retained route descriptor with three attached contracts: an isolation proof or fallback class, a conflict/repair scope, and a workload-shape tag.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -74711,8 +74711,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For GPU DB, the emerging route descriptor should now name four proof classes: isolation proof, residency proof, conflict/owner proof, and access-method proof.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -77885,8 +77885,8 @@
               "generation",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Define a first route-certificate struct for benchmarks, even if it is not a production API: relation id, partition id, physical layout id, tier source, snapshot generation, durable visibility boundary, selected columns, row-id vector or bitmap, and fallback reason. - Add one cross-layer trace for each request: admission decision, owner queue, visibility...",
             "support_reason": "Matched journal terms (generation, publication) to Immutable route roots."
           },
@@ -90648,8 +90648,8 @@
               "generation",
               "publish"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "First, route certificates should be compact handles containing visibility boundary, schema generation, resident generation, estimator generation, and movement or tier state.",
             "support_reason": "Matched journal terms (generation, publish) to Immutable route roots."
           },
@@ -91313,8 +91313,8 @@
               "retire",
               "lock-free"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It is a compact certificate over several frontiers: durable WAL boundary, schema/catalog generation, resident or warm segment generation, route-metadata publication sequence, and resource lifetime.",
             "support_reason": "Matched journal terms (era, retire, lock-free) to Bounded descriptor reclamation."
           },
@@ -96700,8 +96700,8 @@
               "resident",
               "gpu memory"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Combine GaccO-style same-shape write batching with FlexMem-style adaptive residency: hot write/read templates should earn resident GPU placement only when recent batches and failed admissions justify the memory they displace. - Add a route-certificate log for every GPU execution or residency decision: side-effect class, batch shape, snapshot generation,...",
             "support_reason": "Matched journal terms (retained, resident, gpu memory) to Retained GPU snapshots."
           },
@@ -99012,8 +99012,8 @@
               "owner",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "...should remain invisible on the common path, but repeated freshness or invalidation conflicts should promote them into an owner-visible lane with explicit priority. - Long GPU work, refresh jobs, and decompression should be chunked so short retained reads and urgent invalidations can enter within a measured bound. - Hot-write lanes should preserve retry...",
             "support_reason": "Matched journal terms (owner, queue) to Owner-ring bundling."
           },
@@ -121378,8 +121378,8 @@
               "publication",
               "checksum"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A route should name the visibility boundary, owner domain, resident or tier location, queue class, transport/storage health, metadata generation, conflict/admission shape, and fallback reason.",
             "support_reason": "Matched journal terms (generation, immutable, publication, checksum) to Immutable route roots."
           },
@@ -127117,8 +127117,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "SkinnerDB says uncertain route choices can be explored under bounded budgets; Big Metadata says pruning/route metadata should be stored and scanned as a first-class columnar data product; CHEX says version reuse and checkpoint placement should be optimized over a bounded version tree instead of keeping or dropping generations naively.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4173,
-      "weak_direct": 498
+      "direct": 4199,
+      "weak_direct": 472
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 11,
+      "snippet contains matched mechanism term plus visible aliases": 37,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 492,
+      "substantive snippet contains only one matched mechanism term": 466,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {

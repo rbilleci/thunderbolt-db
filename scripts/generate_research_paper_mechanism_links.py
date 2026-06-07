@@ -29,6 +29,12 @@ STRONG_SNIPPET_PREFIXES = (
 )
 
 VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
+    "bounded_descriptor_reclamation": [
+        "descriptor",
+        "lifetime",
+        "reusable buffer",
+        "reuse",
+    ],
     "cost_based_route_optimizer": [
         "cost model",
         "fast route",
@@ -49,6 +55,12 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "selective reads",
         "updates accumulate",
     ],
+    "immutable_route_roots": [
+        "catalog generation",
+        "route certificate",
+        "schema generation",
+        "visibility boundary",
+    ],
     "multi_tier_placement": [
         "bitmap indexes",
         "gpu memory",
@@ -56,6 +68,26 @@ VISIBLE_EVIDENCE_ALIASES: dict[str, list[str]] = {
         "resident",
         "transfer",
         "update state",
+    ],
+    "owner_ring_bundling": [
+        "lane",
+        "local wait",
+        "queue wait",
+        "service ownership",
+        "worker",
+    ],
+    "retained_gpu_snapshots": [
+        "freshness boundary",
+        "resident generation",
+        "resident validity",
+        "snapshot generation",
+    ],
+    "vector_credit_admission": [
+        "budget",
+        "capacity",
+        "ingress",
+        "pressure",
+        "resource proof",
     ],
 }
 
