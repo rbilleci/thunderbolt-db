@@ -1921,6 +1921,246 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "Batch write scheduler simulation is a relevant follow-up, but the entry's primary focus is tier-locality contracts.",
     },
+    (
+        "2026-06-05-cross-paper-synthesis-gpu-htap-routes-need-freshness-frontiers-plus-resource-contracts",
+        "effective_session_counting",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Request assignment and completion capacity are relevant, but the synthesis focuses on route tokens rather than explicit logical-session counting.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-future-routes-need-calibrated-movement-windows",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Movement certificates include visibility generation, owner/placement targets, publication boundaries, and fallback behavior.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-active-windows-need-dependency-evidence",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Active-window certificates carry route shape, resource estimates, cardinality bounds, and admitted route estimates.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-active-windows-need-dependency-evidence",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The proof gate requires replay-equivalent WAL, deterministic visibility, and publication-order evidence.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-active-windows-need-dependency-evidence",
+        "deficit_fairness",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The p99 and bounded-window discussion is about correctness and admission, not tenant fairness or deficit scheduling.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-active-windows-need-dependency-evidence",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot and publication boundaries are explicit certificate fields for admitted active windows.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-metadata-needs-read-mostly-validation-cells",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Owner-domain ordering is named as future semantic work, while the main evidence is read-mostly route metadata validation.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-metadata-needs-read-mostly-validation-cells",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Versioned publication cells and generation validation directly support snapshot/frontier route checks.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-estimate-freshness-and-tier-freshness",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry tracks freshness frontiers and telemetry generations, not descriptor lifetime or reclamation.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-estimate-freshness-and-tier-freshness",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Stale visibility, placement, or estimator frontiers cause fallback, refresh, exact probe, or explicit overload reasons.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-isolation-evidence-not-just-performance-evidence",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Hot write-conflict routes require explicit batch order, staged retry policy, and prefix publication.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-isolation-evidence-not-just-performance-evidence",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Route certificates include workload shape, data layout, route shape, touched column families, and planning evidence.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-isolation-evidence-not-just-performance-evidence",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Schema generation, transaction frontier, snapshot boundary, and compact published ids are certificate fields.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-isolation-evidence-not-just-performance-evidence",
+        "learned_optimizer_advisor",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Learned physical order is treated as a route certificate that can be correct but stale as a performance route.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-influence-control",
+        "isolation_trace_oracle",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Elle, IsoDiff, generated histories, and isolation evidence are explicit proof gates for route safety.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-influence-control",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The certificate records the owner lane and cross-lane ordering state that made a route acceptable.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-influence-control",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Mixed deterministic/OCC write lanes require explicit ordering and replay evidence before fast-route publication.",
+    },
+    (
+        "2026-06-05-hpcc-uses-precise-in-flight-telemetry-instead-of-queue-depth-guessing",
+        "deficit_fairness",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "HPCC targets low latency and stable headroom, but it is not primarily a fairness or deficit-scheduling mechanism.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-needs-pressure-shaped-contracts-across-rings-io-and-hot-keys",
+        "effective_session_counting",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The benchmark priority explicitly holds many logical sessions idle while active work consumes bounded route resources.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-semantic-conflict-shape-not-only-resource-shape",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Conflict policy, validation work, reconciliation, and identical committed results are central proof gates.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-semantic-conflict-shape-not-only-resource-shape",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Durable frontier, deterministic replay, and no exposure of non-public batch versions are required.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-semantic-conflict-shape-not-only-resource-shape",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The active-window harness includes fixed-capacity hot conflict policy and deterministic repair/fallback behavior.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-semantic-conflict-shape-not-only-resource-shape",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Storage-tier sources are noted as route-certificate inputs, but semantic conflict shape is the entry's main focus.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-semantic-conflict-shape-not-only-resource-shape",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Fixed-capacity completion cells relate to owner-local work control, but owner rings are not specified directly.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-now-need-tier-merge-and-snapshot-contracts",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Semantic mergeability depends on predicate/value proof and explicit cross-tier contract fields.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-now-need-tier-merge-and-snapshot-contracts",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Cross-tier snapshot mapping and generation registries are explicit certificate fields.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-now-need-tier-merge-and-snapshot-contracts",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry discusses mapped generations and tier contracts, not descriptor retirement or reclamation.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-now-need-tier-merge-and-snapshot-contracts",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Placement policy and route-certificate switches influence route choice, though the entry is not primarily about optimization.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-now-need-tier-merge-and-snapshot-contracts",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Semantic conflict proof and identical SQL-visible results are explicit simulator switches and proof gates.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-accelerator-metadata-needs-affinity-publication-and-skew-gates",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Accelerator metadata requires publication safety for WAL, snapshot, resident generation, and route eligibility.",
+    },
 }
 
 

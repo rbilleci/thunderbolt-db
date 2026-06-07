@@ -1,11 +1,11 @@
 {
   "description": "Generated traceability from literature journal entries to architecture mechanisms. Review low-confidence and fallback links before making architectural commitments.",
   "mechanism_counts": {
-    "bounded_descriptor_reclamation": 498,
+    "bounded_descriptor_reclamation": 496,
     "cost_based_route_optimizer": 254,
     "cpu_fallback_policy": 166,
     "db_owned_cold_objects": 52,
-    "deficit_fairness": 66,
+    "deficit_fairness": 65,
     "dependency_witnesses": 122,
     "deterministic_hot_write_templates": 209,
     "effective_session_counting": 173,
@@ -46822,8 +46822,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "effective_session_counting",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Request assignment and completion capacity are relevant, but the synthesis focuses on route tokens rather than explicit logical-session counting.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -47585,8 +47586,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Movement certificates include visibility generation, owner/placement targets, publication boundaries, and fallback behavior.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -47928,8 +47930,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Active-window certificates carry route shape, resource estimates, cardinality bounds, and admitted route estimates.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -47941,21 +47944,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The proof gate requires replay-equivalent WAL, deterministic visibility, and publication-order evidence.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "priority",
-            "slo"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "deficit_fairness",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 2
         },
         {
           "confidence": "low",
@@ -47964,8 +47956,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot and publication boundaries are explicit certificate fields for admitted active windows.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 2
         }
       ],
@@ -48315,8 +48308,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Owner-domain ordering is named as future semantic work, while the main evidence is read-mostly route metadata validation.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -48326,8 +48320,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Versioned publication cells and generation validation directly support snapshot/frontier route checks.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -48677,24 +48672,14 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "fallback",
             "stale"
           ],
           "link_basis": "keyword",
           "mechanism_id": "cpu_fallback_policy",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Stale visibility, placement, or estimator frontiers cause fallback, refresh, exact probe, or explicit overload reasons.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -49899,8 +49884,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Hot write-conflict routes require explicit batch order, staged retry policy, and prefix publication.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -49910,8 +49896,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Route certificates include workload shape, data layout, route shape, touched column families, and planning evidence.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -49923,8 +49910,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Schema generation, transaction frontier, snapshot boundary, and compact published ids are certificate fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -49935,8 +49923,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "learned_optimizer_advisor",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Learned physical order is treated as a route certificate that can be correct but stale as a performance route.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -50382,8 +50371,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "isolation_trace_oracle",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Elle, IsoDiff, generated histories, and isolation evidence are explicit proof gates for route safety.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -50395,8 +50385,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The certificate records the owner lane and cross-lane ordering state that made a route acceptable.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -50407,8 +50398,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Mixed deterministic/OCC write lanes require explicit ordering and replay evidence before fast-route publication.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -50497,8 +50489,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deficit_fairness",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "HPCC targets low latency and stable headroom, but it is not primarily a fairness or deficit-scheduling mechanism.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -50784,8 +50777,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "effective_session_counting",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The benchmark priority explicitly holds many logical sessions idle while active work consumes bounded route resources.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -51210,8 +51204,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "gpu_oltp_conflict_ordering",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Conflict policy, validation work, reconciliation, and identical committed results are central proof gates.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -51224,8 +51219,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Durable frontier, deterministic replay, and no exposure of non-public batch versions are required.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -51236,8 +51232,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The active-window harness includes fixed-capacity hot conflict policy and deterministic repair/fallback behavior.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -51247,8 +51244,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Storage-tier sources are noted as route-certificate inputs, but semantic conflict shape is the entry's main focus.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -51259,8 +51257,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Fixed-capacity completion cells relate to owner-local work control, but owner rings are not specified directly.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 2
         }
       ],
@@ -51582,8 +51581,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Semantic mergeability depends on predicate/value proof and explicit cross-tier contract fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -51593,20 +51593,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Cross-tier snapshot mapping and generation registries are explicit certificate fields.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 2
         },
         {
           "confidence": "low",
@@ -51616,8 +51606,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Placement policy and route-certificate switches influence route choice, though the entry is not primarily about optimization.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 2
         },
         {
@@ -51627,8 +51618,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "gpu_oltp_conflict_ordering",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Semantic conflict proof and identical SQL-visible results are explicit simulator switches and proof gates.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 2
         }
       ],
@@ -52010,8 +52002,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Accelerator metadata requires publication safety for WAL, snapshot, resident generation, and route eligibility.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -74510,29 +74503,29 @@
   "summary": {
     "confidence_counts": {
       "high": 3059,
-      "low": 263,
+      "low": 260,
       "medium": 1365
     },
     "entries": 787,
     "linked_entries": 787,
-    "links_requiring_review": 104,
-    "low_confidence_links": 263,
+    "links_requiring_review": 74,
+    "low_confidence_links": 260,
     "mechanisms_with_links": 25,
     "mechanisms_without_links": 0,
     "paper_entries": 610,
-    "pending_low_confidence_links": 104,
-    "removed_low_confidence_links": 32,
+    "pending_low_confidence_links": 74,
+    "removed_low_confidence_links": 35,
     "review_priority_counts": {
-      "none": 4583,
-      "normal": 104
+      "none": 4610,
+      "normal": 74
     },
     "review_status_counts": {
       "auto_accepted": 4424,
-      "pending_low_confidence_review": 104,
-      "reviewed_supported": 126,
-      "reviewed_weak_signal": 33
+      "pending_low_confidence_review": 74,
+      "reviewed_supported": 147,
+      "reviewed_weak_signal": 39
     },
-    "reviewed_low_confidence_links": 159,
+    "reviewed_low_confidence_links": 186,
     "synthesis_entries": 177,
     "unlinked_entries": 0
   },
