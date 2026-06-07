@@ -461,7 +461,7 @@ Append new candidates here as each paper is processed.
   flow-network placement, scheduler latency, and global admission decisions
   against GPU DB's local owner rings and route-advisor policy snapshots.
   Journal entry added 2026-06-07 from the USENIX page and author PDF.
-- `queued` — **Graphene: Packing and Dependency-Aware Scheduling for
+- `reviewed` — **Graphene: Packing and Dependency-Aware Scheduling for
   Data-Parallel Clusters**, Grandl et al., OSDI 2016.
   URL: `https://www.usenix.org/conference/osdi16/technical-sessions/presentation/grandl`
   PDF:
@@ -469,7 +469,7 @@ Append new candidates here as each paper is processed.
   Why: Decima uses Graphene-style DAG-aware scheduling as a baseline; useful
   for comparing deterministic troublesome-node and packing heuristics with
   learned route-DAG scheduling before GPU DB adds any learned admission
-  advisor.
+  advisor. Journal entry added 2026-06-07 from the USENIX PDF.
 - `queued` — **TetriSched: Global Rescheduling with Adaptive Plan-ahead in
   Dynamic Heterogeneous Clusters**, Tumanov et al., EuroSys 2016.
   URL: `https://doi.org/10.1145/2901318.2901355`
@@ -490,6 +490,13 @@ Append new candidates here as each paper is processed.
   Why: Firmament's related work includes production-aware scheduling; Bistro is
   useful for comparing route/admission choices that must coexist with live
   foreground traffic instead of optimizing benchmark-only GPU utilization.
+- `queued` — **C3: Cutting Tail Latency in Cloud Data Stores via Adaptive
+  Replica Selection**, Suresh et al., NSDI 2015.
+  URL: `https://www.usenix.org/conference/nsdi15/technical-sessions/presentation/suresh`
+  Why: Graphene applies its DAG scheduling idea to request-response workflows
+  and cites C3 as a tail-latency workflow source; useful for GPU DB's
+  response-ring admission, replica/fallback route selection, and p99-aware
+  session scheduling.
 - `reviewed` — **Simple Adaptive Query Processing vs. Learned Query
   Optimizers: Observations and Analysis**, Zhang et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2962-zhang.pdf`

@@ -100483,3 +100483,194 @@ forced ordering points in the commit-critical path.
 - For future CXL/NVM tiers, simulate ordered persist barriers separately from
   bytes written. Gate: batching unordered body writes behind one root-publish
   barrier improves commit latency without increasing recovery ambiguity.
+
+### 2026-06-07 - Graphene schedules scarce resources by troublesome work first
+
+**Citation:** Robert Grandl, Srikanth Kandula, Sriram Rao, Aditya Akella, and
+Janardhan Kulkarni. "Graphene: Packing and Dependency-Aware Scheduling for
+Data-Parallel Clusters." OSDI 2016. Retrieved 2026-06-07 from the USENIX
+open-access PDF:
+`https://www.usenix.org/system/files/conference/osdi16/osdi16-grandl-graphene.pdf`.
+
+**Category:** Runtime scale, HFT-style mechanics, and admission; query
+scheduling and route choice.
+
+**Relevance tags:** DAG scheduling; dependency-aware packing; heterogeneous
+resources; admission control; scarce GPU resources; fairness; bounded
+unfairness; queue drain order; route DAGs; resource fragmentation; p99
+latency; online scheduler.
+
+**Core idea:** Graphene addresses jobs whose tasks form large dependency DAGs
+and whose tasks consume heterogeneous resources such as CPU, memory, disk, and
+network. Its transferable idea is to avoid pure local queue greediness: first
+build a preferred schedule for each job by placing the work that is most likely
+to damage the schedule, then let an online scheduler softly enforce that order
+while still packing available machine resources and bounding unfairness.
+
+For GPU DB, the important lesson is **make problematic route fragments first
+class in the scheduler**. A route that owns a scarce GPU stream, a pinned host
+buffer, a warm-tier read window, a large transfer, or a long-running kernel can
+create resource holes if the runtime only schedules currently runnable
+requests. The scheduler should know which pieces are long, hard to pack, or
+dependency-unlocking, and should drain rings in an order that avoids stranding
+short compatible work behind them.
+
+**Concrete mechanisms:**
+
+- Graphene splits scheduling into an offline per-DAG component and an online
+  cluster component. The offline component constructs a preferred schedule for
+  one DAG; the online component matches runnable tasks to machines while
+  considering preferred order, packing, shortest remaining work, and fairness.
+- The offline planner identifies "troublesome" tasks using two signals:
+  long-running tasks and tasks from stages that are difficult to pack. It then
+  takes a closure over paths between troublesome tasks so the important
+  dependency structure is preserved.
+- After selecting troublesome tasks `T`, Graphene divides the remaining DAG
+  into parent, child, and sibling subsets. It places `T` first in a virtual
+  resource-time space, then tries only subset orders that avoid dead ends and
+  respect dependencies.
+- Within subsets, Graphene greedily packs tasks either forward or backward in
+  dependency order, choosing the more compact placement. The paper argues that
+  the selected subset orders are the feasible orders that start with the
+  troublesome set.
+- The online scheduler converts each per-DAG preferred schedule into a task
+  priority score based on scheduled start order, combines it with a packing
+  score against the currently available machine-resource vector, and subtracts
+  a shortest-remaining-processing-time term to favor shorter jobs.
+- Fairness is bounded with deficit counters. If unfairness is below a threshold
+  the scheduler picks the best performance-scored task globally; once a group
+  exceeds the threshold, it picks from the most unfairly treated group.
+- Graphene uses bundling in the online matching loop: examine pending tasks
+  once, keep a bundle of potentially schedulable tasks, then allocate multiple
+  tasks from that bundle. This amortizes matching overhead and admits
+  non-greedy choices.
+- The implementation extends Apache YARN and Tez, with task annotations for
+  duration and resource demand. The paper reports that Graphene improved median
+  job completion by roughly 19-31% across evaluated workloads and improved
+  makespan or cluster throughput by about 25-30% in its experiments. It also
+  reports robustness to modest duration/resource-estimation error.
+
+**GPU DB mapping:** GPU DB should treat a parsed multi-fragment query, retained
+read micro-batch, refresh, or bulk mutation as a small resource DAG rather than
+only as independent queue entries. Dependencies might include WAL publish
+before visibility, catalog generation before route eligibility, H2D transfer
+before kernel execution, GPU kernel before result scatter, and response-ring
+credits before encoding.
+
+The first scheduler feature should not be a complex global optimizer. A
+Graphene-inspired route planner can assign compact per-fragment annotations:
+estimated duration, GPU stream need, pinned-buffer bytes, H2D/D2H bytes,
+resident partition, output size, and dependency-unlocking role. The runtime can
+then identify troublesome fragments: long kernels, large transfers, hot
+partition locks, refresh work that unlocks many reads, and fragments that
+consume scarce pinned buffers or response credits.
+
+For read throughput, retained same-shape queries can use a preferred order over
+the route DAG: run dependency-unlocking refresh or visibility checks first,
+then place long GPU kernels or large transfers so short compatible lookups can
+fill the resource holes. For write throughput, COPY or mutation batches can
+reserve WAL, visibility, index-refresh, and residency-refresh slots as a
+dependency chain instead of letting later GPU refresh work surprise the read
+scheduler.
+
+For 1M logical sessions, Graphene's bounded unfairness is a useful admission
+shape. GPU DB can temporarily favor a batch that improves packing or unlocks a
+hot snapshot, but session classes or tenants need deficit counters so low-rate
+interactive sessions are not starved by high-throughput retained reads.
+
+The bundling mechanism maps directly to owner rings. Instead of scoring the
+entire backlog on every wakeup, an owner can inspect a bounded bundle from
+ingress, read-snapshot, GPU, or response rings, choose a compact set, and record
+why skipped requests were left queued. That keeps scheduling telemetry
+observable without making the queue-drain path allocate heavily.
+
+**Risks and mismatches:** Graphene is a cluster scheduler, not a database
+transaction scheduler. It does not address isolation, WAL-before-visibility,
+MVCC garbage collection, SQL planner correctness, or GPU kernel execution
+details. GPU DB must treat dependency-aware scheduling as an admission and
+latency mechanism layered under database invariants.
+
+The paper assumes useful estimates for task duration and resource demand.
+GPU DB will need conservative online estimates for kernel time, transfer bytes,
+result cardinality, and response size; unknown or unstable estimates should
+fall back to simple deterministic policies before a learned or history-based
+advisor can interfere with correctness.
+
+Offline schedule construction taking seconds is acceptable for large recurring
+cluster jobs but not for OLTP point queries. GPU DB should apply the idea to
+prepared statement families, recurring route shapes, refresh DAGs, and bulk
+operations, while keeping single-shot small queries on a lightweight online
+path.
+
+Graphene intentionally trades short-term fairness for throughput. That is
+reasonable only with explicit caps, queue wait telemetry, and overload
+behavior. In GPU DB, starvation or invisible queueing would be a correctness
+and SLO problem for interactive sessions.
+
+**Benchmark candidates:**
+
+- Build a route-DAG scheduler simulator with CPU-only, GPU-resident lookup,
+  refresh, H2D transfer, kernel, and response-scatter nodes. Compare FIFO,
+  shortest-job-first, packing-only, and troublesome-first scheduling on p50,
+  p99, GPU occupancy, pinned-buffer occupancy, and response-ring backlog.
+- Add a bounded-bundle owner-drain benchmark. Gate: selecting from a bounded
+  bundle improves same-shape lookup throughput or p99 latency without adding
+  per-request allocation or unbounded scoring cost.
+- Prototype "troublesome fragment" annotations for prepared route families:
+  long kernel, large transfer, scarce pinned buffer, hot partition, and
+  dependency-unlocking refresh. Failure condition: annotation errors make p99
+  worse than FIFO under mixed point lookup and refresh workloads.
+- Test deficit-counter fairness across session classes while allowing short
+  bursts of packing-favorable retained reads. Gate: throughput improves while
+  low-rate interactive sessions stay within a configured queue-wait SLO.
+- Measure refresh-plus-read ordering: run resident refresh work early enough to
+  unlock many reads, but cap refresh admission so it cannot starve already
+  valid snapshot reads.
+- Compare per-route preferred schedules for recurring prepared statements
+  against fully online scheduling. Gate: reused route schedules improve
+  throughput or p99 only when route shape is stable; unstable shapes must
+  degrade to deterministic online scheduling.
+
+### 2026-06-07 - Cross-paper synthesis: schedulers need witnesses too
+
+Recent papers moved from durable publication to runtime scheduling:
+**Zen** separates volatile concurrency metadata from durable tuple evidence,
+**MOD** publishes durable metadata through compact ordered roots, and
+**Graphene** schedules dependent heterogeneous work by identifying troublesome
+fragments before online matching.
+
+The converging design track is **witnessed publication plus witnessed
+admission**. Durable state needs compact roots or generation markers that prove
+what recovery may trust. Runtime state needs compact route and queue witnesses
+that prove why a request was admitted, delayed, batched, rejected, or routed to
+CPU/GPU. Without those witnesses, the engine can look fast in benchmarks while
+making recovery, stale-route rejection, or p99 analysis opaque.
+
+Concrete tracks for GPU DB:
+
+- Route metadata should be published as immutable bodies plus compact roots:
+  catalog generation, WAL boundary, visibility generation, layout id, checksum,
+  and residency handle.
+- Hot-path counters, pins, and queue scores should remain volatile whenever
+  recovery can rebuild them from committed roots and WAL boundaries.
+- Admission should produce bounded queue evidence: selected bundle size,
+  skipped request count, scarce resource, deficit counter, snapshot generation,
+  and overload/fallback reason.
+- Persistent or future warm-tier metadata should minimize ordered barriers at
+  publication points, while runtime scheduling minimizes fragmentation by
+  draining dependency-unlocking and scarce-resource fragments deliberately.
+
+Category gaps after this synthesis: more work is still needed on modern
+network/session admission, RDMA or in-network transaction paths, and
+HTAP-specific freshness routing. The queue has enough candidates in those
+lanes; the next review should prefer a networking/session or transaction
+concurrency paper over another persistent-memory/storage paper unless the
+queue balance changes.
+
+Benchmark priorities:
+
+- Crash-safe route-root publication with old-or-new recovery semantics.
+- Volatile route-counter rebuild after restart.
+- Bounded-bundle queue draining for retained reads and GPU kernels.
+- Deficit-counter fairness under 1M logical-session simulation.
+- Refresh/read co-scheduling with explicit stale-route and overload witnesses.
