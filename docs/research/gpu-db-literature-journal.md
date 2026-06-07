@@ -99642,3 +99642,179 @@ network throughput.
 - Record topology effects by moving NIC, GPU, NVMe, pinned host buffers,
   and IO workers across NUMA/root-complex placements. Gate: admission
   telemetry can explain latency changes that queue depth alone misses.
+
+### 2026-06-07 - veDB-HTAP aligns freshness before routing to acceleration
+
+**Citation:** Jianjun Chen, Li Zhang, Yu Xie, Wei Ding, Lixun Cao,
+Ye Liu, Yonghua Ding, Fangshi Li, Ke Wu, Haibo Xiu, Kui Wei, Le Cai,
+Rui Chang, Yuxiang Chen, Yuanjin Lin, Shangyu Luo, Jianfeng Qian, Xu
+Wang, Zikang Wang, Jian Zhang, Mingyi Zhang, Shicai Zeng, Jason Sun,
+Lei Zhang, Rui Shi, and Pengwei Zhao. "veDB-HTAP: a Highly Integrated,
+Efficient and Adaptive HTAP System." PVLDB 18(12):4896-4909, 2025.
+DOI: `https://doi.org/10.14778/3750601.3750614`. Retrieved 2026-06-07
+from the PVLDB PDF:
+`https://www.vldb.org/pvldb/vol18/p4896-chen.pdf`.
+
+**Category:** Hybrid HTAP; MVCC / snapshot / visibility; query
+optimization / planning; runtime admission and resource isolation.
+
+**Relevance tags:** HTAP; read committed; snapshot alignment; logical
+LSN; secondary engine; OLTP/OLAP routing; fallback routing; adaptive
+runtime filters; adaptive spill; predicate pushdown; resource groups;
+fresh analytical reads; multi-tenant isolation; retained GPU snapshots;
+route certificates.
+
+**Core idea:** veDB-HTAP is ByteDance's newer production HTAP design,
+evolving from ByteHTAP's proxy-routed OLTP/Flink split toward tighter
+integration through a MySQL secondary-engine extension. The key shift is
+that user queries first enter the OLTP engine, where parsing, semantic
+compatibility, read-committed snapshot assignment, and route choice can
+be coordinated before eligible work is sent to the OLAP engine.
+
+That matters for GPU DB because acceleration should be a route beneath
+the database's semantic authority, not a parallel endpoint with its own
+freshness contract. A GPU-resident route can be fast only after the
+engine can prove that its snapshot boundary, route grammar, fallback
+behavior, and resource budget match the request.
+
+The paper also makes route adaptability concrete. Its design combines a
+cost-based smart router, an ML-routing prototype, adaptive runtime
+statistics, adaptive hash-table choice, runtime-filter selection,
+adaptive disk spill, predicate pushdown based on storage CPU pressure,
+and data-server resource groups. For GPU DB, this is a useful HTAP
+control-plane model: correctness gates first, then adaptive placement and
+execution knobs.
+
+**Concrete mechanisms:**
+
+- ByteHTAP assigned OLAP queries a read LSN from a globally committed LSN
+  so queries operated on consistent snapshots, but the separate OLAP
+  engine could observe older snapshots than the OLTP engine and could
+  differ in SQL dialect support.
+- veDB-HTAP routes queries to the OLTP/MySQL side first. A proprietary
+  secondary-engine plugin reuses the MySQL parser/analyzer, translates
+  eligible OLTP logical plans to OLAP logical plans, and retries through
+  the OLTP engine when the OLAP engine cannot support a query.
+- To provide read-committed semantics across engines, an OLAP query must
+  read only data committed before its arrival at the OLTP engine. The
+  plugin assigns a logical-log LSN as the read snapshot and aligns it
+  with the OLTP read view on read-only nodes using a new physical log
+  record.
+- If the OLAP side has not yet received the required snapshot, execution
+  may wait. The paper reports production extra latency for read-committed
+  snapshot waiting below 200 ms in the shown 12-hour workload.
+- The system uses unified disaggregated storage with OLTP storage, OLAP
+  column storage, logical logs, WAL, base/delta stores, and a replication
+  framework that feeds the OLAP engine.
+- A centralized cluster manager creates and updates resource groups among
+  OLAP data servers, with min/max CPU and memory. Data servers can be
+  added or removed from a group while workloads change, although the
+  paper says full automation remains future work.
+- The smart query router is cost-based in production, and the paper
+  describes a machine-learning prototype. The router's purpose is not
+  only speed; it must avoid sending unsupported syntax or bad plans to
+  the wrong engine.
+- Adaptive execution collects runtime statistics on demand. In the
+  TPC-H 1 TB experiment, running all 22 queries with on-demand stats
+  reduced completion time from 1415 seconds for the completed no-stats
+  queries to 417 seconds, then 379 seconds when the stats were cached.
+- Adaptive hash-table selection chooses between hash-table
+  implementations based on estimated NDV and memory/performance tradeoffs.
+  The reported examples show that neither high-load nor low-load designs
+  are uniformly best.
+- Runtime filters and predicate pushdown are applied selectively because
+  they reduce disaggregated storage transfer but add CPU overhead to data
+  servers and storage nodes. On TPC-H Q5 at 1 TB, adaptive runtime
+  filtering improves over forcing filters on every join by avoiding a
+  low-value filter.
+- Adaptive disk spill distinguishes queries that must spill from smaller
+  concurrent queries that can stay in memory. The shown mixed Q9
+  experiment reports improvements over spilling every query after a soft
+  limit.
+- Adaptive predicate pushdown protects stateful storage nodes under CPU
+  pressure. In the mixed workload shown, enabling adaptive pushdown raises
+  average storage-scan QPS by about 20% and reduces variation.
+
+**GPU DB mapping:** GPU DB should treat resident GPU execution as the
+equivalent of veDB-HTAP's secondary engine. A request should enter the
+database semantic path first, receive a visibility boundary, check SQL
+support, choose a route, and only then execute from a GPU snapshot if the
+snapshot generation is compatible. The planner should never let the GPU
+route invent its own freshness or dialect semantics.
+
+The read-committed LSN alignment maps directly to retained snapshot
+publication. A GPU route certificate should include the source WAL or
+transaction boundary, catalog generation, visibility generation, resident
+layout generation, and support matrix. If the required generation is not
+resident yet, the runtime should choose among bounded wait, CPU fallback,
+explicit overload, or asynchronous refresh rather than silently using an
+older resident copy.
+
+The secondary-engine fallback rule is especially transferable. GPU DB's
+route planner can speculatively choose GPU acceleration for supported
+fragments, but fallback must return through CPU truth with identical SQL
+semantics. Unsupported expressions, stale resident segments, memory
+pressure, or overloaded GPU queues are route outcomes, not correctness
+exceptions.
+
+Adaptive execution suggests concrete route knobs beyond "GPU or CPU":
+runtime filter on/off, predicate pushdown location, hash-table layout,
+spill target, batch size, and resource group. In GPU DB terms these become
+resident-filter construction, storage-side prefiltering, CPU/GPU join
+split, HBM versus host spill, and per-tenant GPU/CPU/NVMe credits.
+
+Resource groups map to owner-domain capacity. High-priority tenants or
+latency-critical retained reads may get dedicated GPU streams, pinned
+buffer slabs, IO queues, or CPU response workers, while best-effort
+analytical refresh work uses shared pools. The paper's lack of full
+automation is a warning: expose the control plane first, then benchmark
+adaptive policies.
+
+**Risks and mismatches:** veDB-HTAP is an industrial HTAP system, not a GPU
+database. Its OLAP engine is a distributed MPP engine over disaggregated
+storage, not CUDA kernels over GPU-resident snapshots. Its snapshot delay,
+storage pushdown, resource-group behavior, and MySQL compatibility
+engineering may not predict GPU HBM pressure, PCIe/NVLink transfer costs,
+kernel launch overhead, or pinned-buffer contention.
+
+The paper reports selected experiments and production observations but not
+all internal implementation details. Thresholds, cost-model features, ML
+training details, and replication mechanics are not fully specified, so
+GPU DB should treat the mechanisms as design patterns and remeasure them
+locally.
+
+Read-committed alignment can add wait time. For GPU DB, waiting for the
+latest resident snapshot may be wrong for p99 latency if a CPU route can
+answer immediately. Freshness, latency, and route cost must be made
+explicit per request.
+
+Adaptive pushdown can move CPU pressure between storage, execution, and
+response paths. A GPU adaptation must avoid starving WAL flush,
+visibility publication, recovery, or invalidation work while protecting
+analytical throughput.
+
+**Benchmark candidates:**
+
+- Build a route-certificate benchmark for retained GPU reads. Inputs:
+  SQL support, visibility generation, catalog generation, resident layout
+  generation, memory budget, and GPU queue state. Gate: a stale or
+  unsupported GPU route always falls back or rejects without changing
+  result semantics.
+- Compare three freshness policies for read-heavy HTAP workloads:
+  immediate CPU fallback, bounded wait for resident refresh, and stale-read
+  disallowance with explicit overload. Measure p50/p99 latency,
+  freshness lag, throughput, and fallback rate.
+- Add a secondary-engine style fallback test where the planner attempts a
+  GPU route for a mixed query, rejects unsupported fragments, and returns
+  through CPU truth with identical rows and error semantics.
+- Prototype adaptive runtime filters for GPU/CPU split joins. Measure
+  transfer bytes, GPU kernel time, filter-build CPU cost, storage/prefetch
+  CPU cost, and end-to-end latency under high- and low-selectivity joins.
+- Test adaptive predicate pushdown under storage or CPU pressure: storage
+  prefilter, CPU prefilter, GPU filter, and no prefilter. Gate: the chosen
+  policy improves QPS or p99 without violating visibility or starving
+  mutation/recovery owners.
+- Model resource groups as per-tenant budgets over GPU streams, pinned
+  host slabs, response workers, and cold-tier IO. Failure condition:
+  best-effort analytical refresh or large scans inflate retained-read p99
+  for a protected tenant beyond the configured SLO.

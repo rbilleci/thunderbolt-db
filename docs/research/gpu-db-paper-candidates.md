@@ -2393,6 +2393,23 @@ Append new candidates here as each paper is processed.
   Why: Hermes directly compares its delta/main-store merge strategy with
   ByteHTAP; useful for evaluating shared-storage HTAP, freshness thresholds,
   delete bitmaps, and storage-layer pushdown against GPU DB retained snapshots.
+- `reviewed` — **veDB-HTAP: a Highly Integrated, Efficient and Adaptive HTAP
+  System**, Chen et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p4896-chen.pdf`
+  DOI: `https://doi.org/10.14778/3750601.3750614`
+  Why: selected after recent reviews skewed runtime/logging and the remaining
+  queued HTAP candidates were older; useful for mapping read-committed snapshot
+  alignment, secondary-engine route fallback, adaptive runtime filters, and
+  multi-tenant resource groups to GPU DB retained snapshot routing. Journal
+  entry added 2026-06-07.
+- `queued` — **Two Birds With One Stone: Designing a Hybrid Cloud Storage
+  Engine for HTAP**, Zhou et al., PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p3290-zhou.pdf`
+  DOI: `https://doi.org/10.14778/3681954.3682001`
+  Why: discovered while looking for modern HTAP follow-ups to veDB-HTAP;
+  useful for comparing unified storage-engine choices, fresh analytics, and
+  transactional storage costs against GPU DB's row/MVCC truth plus resident
+  column snapshots.
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
