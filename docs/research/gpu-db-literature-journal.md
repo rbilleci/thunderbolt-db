@@ -38,6 +38,151 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Hostping makes host interconnect health a route precondition
+
+**Citation:** Kefei Liu, Zhuo Jiang, Jiao Zhang, Haoran Wei,
+Xiaolong Zhong, Lizhuang Tan, Tian Pan, and Tao Huang. "Hostping:
+Diagnosing Intra-host Network Bottlenecks in RDMA Servers." NSDI 2023.
+Retrieved 2026-06-07 from the USENIX open-access PDF:
+`https://www.usenix.org/system/files/nsdi23-liu-kefei.pdf`.
+
+**Category:** runtime / HFT / session scale; high-concurrency
+networking and admission; GPU/storage data-placement observability.
+
+**Relevance tags:** RDMA servers; intra-host network; PCIe; UPI/xGMI;
+memory channels; GPUDirect RDMA; host bottleneck diagnosis; loopback
+probing; pause frames; packet drops; ACS/ATS configuration; topology-aware
+routing; gateway health; route preconditions.
+
+**Core idea:** Hostping argues that fast datacenter networking is no
+longer only an inter-host problem. As RNIC line rates reach hundreds of
+Gb/s while PCIe, CPU root ports, memory channels, inter-socket buses, and
+GPU paths grow more complex, a single host-side bottleneck can throttle
+RDMA traffic, trigger packet drops or PFC pause frames, and make an
+application look like it has a network problem.
+
+The transferable GPU DB idea is that host fabric health must be a route
+input, not only an ops dashboard. A GPU DB route that moves data across
+NIC, CPU memory, NVMe, PCIe, GPU HBM, or future CXL tiers should prove
+that the selected intra-host path is healthy enough for the route class.
+Otherwise GPU admission, RDMA gateway load, pinned-buffer staging, and
+response queues may chase latency problems caused by hidden host
+interconnect degradation.
+
+**Concrete mechanisms:**
+
+- Hostping runs active loopback tests between RNICs and intra-host
+  endpoints such as memory nodes and GPUs. The RNIC reads from a registered
+  endpoint memory region and writes back to another region on the same
+  endpoint, so the measurement exercises the host path without involving
+  the external network.
+- The system uses small-message loopback latency to detect latency growth
+  and large-message loopback behavior to estimate available intra-host
+  bandwidth. The reported implementation uses 1-byte and 128 KiB messages
+  for 200 Gb/s RNICs.
+- The Hostping agent has a hardware monitor, probing engine, and analyzer.
+  The monitor periodically checks RNIC throughput, GPU activity, packet
+  drops, and Tx pause-frame duration. It runs full probing frequently only
+  when hosts are idle, and triggers immediate diagnosis when abnormal RNIC
+  metrics appear under load.
+- The engine registers endpoint memory with RDMA verbs, posts a write WQE,
+  doorbells the RNIC, polls completion, and records loopback latency and
+  bandwidth. It can probe RNIC-to-memory-node and RNIC-to-GPU paths and
+  monitor bus utilization across PCIe links, inter-socket buses, and memory
+  channels.
+- The analyzer compares path bandwidth and latency against baselines for
+  hosts with the same topology. It uses a binary-tomography-style path/link
+  inference algorithm: normal paths mark their links normal; abnormal paths
+  mark uncertain links abnormal; repeated gray paths identify flapping links.
+- When hosts are busy, service traffic can distort absolute bandwidth
+  readings. Hostping therefore focuses on affinitive RNIC/endpoint paths
+  and idle RNICs where available, then combines path abnormalities with bus
+  utilization to separate link failures, misconfiguration, and traffic
+  contention.
+- Reported root causes include RNIC and GPU PCIe link failures, CPU root
+  port failures, memory channel flapping, UPI overload, ACS enabled on PCIe
+  bridges, ATS disabled in virtualization, and RNIC slow-start or Tx-window
+  misconfiguration.
+- Evaluation deployed Hostping on more than 300 RDMA servers in a
+  distributed machine-learning system. The paper reports that it found
+  known bottlenecks and six previously unnoticed ones, including CPU root
+  port failures and memory channel flapping.
+
+**GPU DB mapping:** Treat each high-throughput route as bound to a host
+fabric certificate: device id, NUMA node, PCIe/root-port path, memory
+channel or inter-socket dependency, GPU peer distance, measured bandwidth
+class, latency class, and recent abnormal metrics. IO workers, residency
+owners, and GPU execution owners should use that certificate before
+choosing RDMA ingress, pinned host staging, CPU fallback, GPU direct
+transfer, NVMe reads, or response-ring placement.
+
+For 1M logical sessions, Hostping suggests a cheap health layer below
+ordinary queue telemetry. If a gateway sees pause frames, packet drops, or
+unexpected completion latency, it should not blindly raise backpressure
+everywhere. It should distinguish network congestion from host-path
+degradation, then degrade only affected route classes: remote-socket
+staging, cross-root GPU copies, RDMA receive into a contested memory node,
+or GPU-direct paths behind a misconfigured bridge.
+
+For P8 residency, resident snapshot placement should prefer healthy local
+paths. A segment that is resident on a GPU reached through a degraded PCIe
+path may be logically valid but physically bad for latency. Route selection
+should expose "valid but path-degraded" as a fallback reason distinct from
+stale generation, unsupported predicate, or GPU queue saturation.
+
+For write throughput, Hostping's pause-frame and packet-drop trigger maps
+to admission gates around COPY, WAL shipping, replicated log traffic, and
+future remote-tier movement. If inbound RDMA writes are backing up behind a
+memory-channel or inter-socket bottleneck, mutation admission should slow
+or reroute before the RNIC turns local pressure into fabric-wide PFC
+storms.
+
+**Risks and mismatches:** Hostping targets RDMA servers for distributed
+machine-learning traffic, not a SQL database engine. Its root-cause model
+is path health and configuration, not MVCC visibility, WAL durability,
+planner correctness, or query semantics.
+
+Active probing consumes bandwidth and endpoint memory. GPU DB should not
+run full-mesh probes on the request hot path. The right adaptation is a
+background health service that publishes compact route-health generations
+and trigger-driven probes when RNIC/GPU/storage telemetry changes.
+
+The analyzer depends on topology knowledge and comparable baselines for
+the same host type. A portable GPU DB runtime must handle incomplete
+topology, mixed GPUs/NICs, cloud instances, and future CXL/NVMe fabrics
+with conservative unknown-path states.
+
+Hostping diagnoses bottlenecks but does not automatically fix them. GPU DB
+still needs admission and fallback policy after a path is marked degraded:
+CPU fallback, local NUMA staging, alternate GPU route, lower COPY rate,
+or explicit overload.
+
+**Benchmark candidates:**
+
+- Build a route-health simulator with PCIe/root-port, memory-channel,
+  inter-socket, NIC, GPU, and NVMe path classes. Inject degraded bandwidth,
+  added latency, pause frames, packet drops, and misconfiguration flags.
+  Gate: route selection explains host-path degradation separately from
+  queue saturation or stale snapshots.
+- Add a background host-fabric certificate prototype for benchmark runs:
+  NUMA locality, GPU/NIC affinity, PCIe path, observed transfer bandwidth,
+  observed latency, and abnormal metric counters. Gate: hot routing reads a
+  compact immutable certificate without probing or allocation.
+- Compare RDMA/COPY admission with and without host-path triggers. Measure
+  p99 latency, write throughput, RNIC pause/drop counters, response-ring
+  backlog, and recovery after the degraded path clears.
+- Test GPU-resident reads where the resident snapshot is valid but the GPU
+  path is degraded. Expected result: route advisor either uses CPU fallback,
+  another resident partition, or explicit delay/reject instead of treating
+  residency as sufficient.
+- Add a 1M-logical-session gateway stress that introduces remote-socket
+  memory placement and PCIe path degradation. Failure condition: global
+  backpressure hides the local bottleneck or starves unaffected session
+  classes.
+- Validate trigger-driven probing cadence: idle full-mesh probing plus
+  abnormal-metric triggered focused probing. Gate: diagnostic overhead stays
+  bounded while catching injected path degradation within the configured SLO.
+
 ### 2026-06-07 - TetriSched plans scarce accelerators in space and time
 
 **Citation:** Alexey Tumanov, Timothy Zhu, Jun Woo Park, Michael A.

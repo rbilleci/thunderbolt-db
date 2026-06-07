@@ -6828,14 +6828,15 @@ Append new candidates here as each paper is processed.
   for validating whether GPU DB's gateway, NIC, NVMe, GPU copy, and CPU
   memory traffic need production-style host-network diagnostics beyond the
   hostCC control loop.
-- `queued` — **Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA
+- `reviewed` — **Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA
   Servers**, Liu et al., NSDI 2023.
   URL: `https://www.usenix.org/conference/nsdi23/presentation/liu-kefei`
   PDF: `https://www.usenix.org/system/files/nsdi23-liu-kefei.pdf`
   Why: Understanding the Host Network compares against intra-host bottleneck
   diagnosis work; useful for a GPU DB observability lane that can distinguish
   NIC/RDMA, PCIe, memory-controller, and CPU-copy bottlenecks under 1M-session
-  gateway load.
+  gateway load. Journal entry added 2026-06-07 from the USENIX open-access
+  PDF.
 - `queued` — **IDIO: Network-Driven, Inbound Network Data Orchestration on
   Server Processors**, Alian et al., MICRO 2022.
   URL: `https://doi.org/10.1109/MICRO56248.2022.00042`
@@ -6845,6 +6846,24 @@ Append new candidates here as each paper is processed.
   mechanisms as a future datapath; useful for comparing NIC/storage inbound
   data placement with GPU DB pinned buffers, CPU response encoding, and
   GPU-bound staging.
+- `queued` — **Collie: Finding Performance Anomalies in RDMA Subsystems**,
+  Kong et al., NSDI 2022.
+  URL: `https://www.usenix.org/conference/nsdi22/presentation/kong`
+  PDF: `https://www.usenix.org/system/files/nsdi22-kong.pdf`
+  Why: Hostping cites Collie as an RNIC/RDMA-subsystem anomaly detector;
+  useful follow-up for separating host-path bottlenecks from RNIC resource,
+  queue-pair, and RDMA-stack scalability problems before GPU DB designs
+  high-session RDMA gateways or remote-tier traffic.
+- `queued` — **Reexamining Direct Cache Access to Optimize I/O Intensive
+  Applications for Multi-hundred-gigabit Networks**, Farshin et al., USENIX
+  ATC 2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/farshin`
+  PDF:
+  `https://www.usenix.org/system/files/atc20-farshin.pdf`
+  Why: Hostping points to DDIO/direct-cache-access bottlenecks as host-side
+  networking pressure; useful for deciding whether GPU DB's NIC, storage,
+  response encoding, and pinned-buffer paths should steer inbound data away
+  from overloaded CPU caches or LLC ways.
 - `reviewed` — **Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its
   Reliability on High Latency Memory**, Mahling, Weisgut, and Rabl, DaMoN 2025.
   URL: `https://doi.org/10.1145/3736227.3736231`
