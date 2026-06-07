@@ -5493,8 +5493,8 @@
               "nvme"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "Hardware-managed cache-line tiering hides placement from software.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Hardware-managed cache-line tiering hides placement from software. That is useful for low overhead, but dangerous if the database assumes that route-critical objects are physically stable.",
             "support_reason": "Matched journal terms (tier, tiering, placement, cache) to Multi-tier placement policy."
           },
           "evidence_terms": [
@@ -7352,9 +7352,9 @@
               "metadata",
               "quickstep"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "Quickstep turns query plans into work orders with scheduling metadata.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Quickstep turns query plans into work orders with scheduling metadata. MatrixKV bounds storage maintenance by compaction range.",
             "support_reason": "Matched journal terms (optimizer, metadata, quickstep) to Cost-based route optimizer."
           },
           "evidence_terms": [
@@ -10741,9 +10741,9 @@
               "logical session",
               "staR"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "For 1M logical sessions, the strongest transfer is admission simplicity.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For 1M logical sessions, the strongest transfer is admission simplicity. Runtime filters and operator switching should be attached to batch/route families, not each session as heavyweight state.",
             "support_reason": "Matched journal terms (session, logical session, staR) to Effective session counting."
           },
           "evidence_terms": [
@@ -12832,8 +12832,8 @@
               "blob"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The paper is object-level and mostly blob-oriented.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The paper is object-level and mostly blob-oriented. Database segments have predicates, indexes, MVCC visibility, compression layouts, and partial-column access.",
             "support_reason": "Matched journal terms (object, blob) to DB-owned cold objects."
           },
           "evidence_terms": [
@@ -18128,8 +18128,8 @@
               "snapshot isolation"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The paper targets snapshot isolation, not full serializability.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The paper targets snapshot isolation, not full serializability. Graveyard Indexes are described for B-Tree indexes and row-store LeanStore, so a columnar/GPU-resident layout needs different physical side structures.",
             "support_reason": "Matched journal terms (isolation, serializability, snapshot isolation) to Isolation trace oracle."
           },
           "evidence_terms": [
@@ -27699,9 +27699,9 @@
               "same-shape",
               "kernel launch"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "For retained read micro-batching, robust planning can become a template cache.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For retained read micro-batching, robust planning can become a template cache. Repeated same-shape queries over the same relation can remember which dimensions usually decide the route: cardinality, batch size, GPU queue wait, or response size.",
             "support_reason": "Matched journal terms (micro-batch, batching, same-shape, kernel launch) to Same-shape micro-batching."
           },
           "evidence_terms": [
@@ -28136,8 +28136,8 @@
               "publication"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "Residency owners publish immutable roots tied to those frontiers.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Residency owners publish immutable roots tied to those frontiers. Read workers acquire short-lived root handles.",
             "support_reason": "Matched journal terms (root, generation, immutable, publish) to Immutable route roots."
           },
           "evidence_terms": [
@@ -30667,8 +30667,8 @@
               "queue"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "Rebirth maps to adaptive ordering inside a bounded owner queue.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Rebirth maps to adaptive ordering inside a bounded owner queue. If an older admitted transaction discovers that a younger transaction already owns a hot key, the owner does not always need to kill the younger work or stall the queue.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
           "evidence_terms": [
@@ -30928,8 +30928,8 @@
               "read snapshot"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The read-set pointer optimization maps to retained read snapshots.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The read-set pointer optimization maps to retained read snapshots. For a known query template, the planner or snapshot publisher can pre-resolve stable handles: relation generation, partition generation, selected column buffers, resident key vectors, and visibility boundary.",
             "support_reason": "Matched journal terms (retained, resident, read snapshot) to Retained GPU snapshots."
           },
           "evidence_terms": [
@@ -31734,8 +31734,8 @@
               "cleanup"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "Rapid quiescent-state garbage collection keeps version chains short.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Rapid quiescent-state garbage collection keeps version chains short. A global hill-climbing backoff controller regulates abort pressure when contention is high.",
             "support_reason": "Matched journal terms (garbage collection, old version, version chain, cleanup) to MVCC garbage-collection frontiers."
           },
           "evidence_terms": [
@@ -38215,9 +38215,9 @@
               "logical session",
               "staR"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "For 1M logical sessions, the dispatcher lesson is double-edged.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For 1M logical sessions, the dispatcher lesson is double-edged. A central dispatcher gives useful global visibility and can apply admission policy, but it can also become the bottleneck.",
             "support_reason": "Matched journal terms (session, logical session, staR) to Effective session counting."
           },
           "evidence_terms": [
@@ -38871,8 +38871,8 @@
               "million"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "A million logical sessions cannot each own an unbounded queue or thread.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "A million logical sessions cannot each own an unbounded queue or thread. They need small per-owner schedulers that can pace accepted work, delay completions, and expose overload before CPU memory, socket buffers, or GPU staging buffers fill.",
             "support_reason": "Matched journal terms (session, connection, logical session, million) to Effective session counting."
           },
           "evidence_terms": [
@@ -40739,8 +40739,8 @@
               "recovery"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "Publication is then a pointer/generation swap gated by WAL-before-visibility.",
+            "quality_reason": "high-confidence link has a substantive journal snippet",
+            "snippet": "Instead of refreshing GPU state by scanning mutable tuples synchronously on the read path, the engine can batch logical WAL/MVCC changes into sorted per-table or per-partition refresh inputs, compact redundant updates, and build new resident column groups in parallel with OLTP writes. Publication is then a pointer/generation swap gated by WAL-before-visib...",
             "support_reason": "Matched journal terms (wal, logging, durability, commit protocol) to WAL-before-visibility boundary."
           },
           "evidence_terms": [
@@ -44154,9 +44154,9 @@
               "ordering",
               "proof"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "QURO-style reordering wants dependency and contention metadata.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "QURO-style reordering wants dependency and contention metadata. The NSDI scheduling-policy paper wants load-balancing and resource-allocation decisions separated.",
             "support_reason": "Matched journal terms (dependency, ordering, proof) to Dependency witnesses."
           },
           "evidence_terms": [
@@ -44519,8 +44519,8 @@
               "kernel launch"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The low/high threshold split is a strong fit for micro-batching.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The low/high threshold split is a strong fit for micro-batching. A small increase in queue wait below a `Tlow` equivalent may be acceptable because it amortizes a kernel launch or response encoding batch.",
             "support_reason": "Matched journal terms (micro-batch, batching, kernel launch) to Same-shape micro-batching."
           },
           "evidence_terms": [
@@ -47482,9 +47482,9 @@
               "fallback",
               "cpu fallback"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "Compare against current CUDA retained scan and CPU fallback.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Compare against current CUDA retained scan and CPU fallback. Measure build cost, resident bytes, p50/p99, memory bandwidth, and invalidation cost. - Test fused layout versus separate columns for grouped aggregates even on CUDA: encode `{predicate key, group id, aggregate payload}` into one resident lane and compare against scanning independent column buff...",
             "support_reason": "Matched journal terms (fallback, cpu fallback) to CPU fallback policy."
           },
           "evidence_terms": [
@@ -50037,9 +50037,9 @@
               "cost model",
               "metadata"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "The exact optimizer formula and cost model are unknown from accessible sources.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "...The paper proposes a memory-provisioning strategy that chooses local and remote memory amounts for a workload. The exact optimizer formula and cost model are unknown from accessible sources.",
             "support_reason": "Matched journal terms (optimizer, cost model, metadata) to Cost-based route optimizer."
           },
           "evidence_terms": [
@@ -53252,8 +53252,8 @@
               "cold"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "GPU DB should not treat cold chunks as raw rows waiting to be copied to HBM.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "GPU DB should not treat cold chunks as raw rows waiting to be copied to HBM. A cold segment can be immutable, columnar, byte-addressable, locally compressed, and decorated with compact pruning metadata, while SQL-visible correctness still lives in WAL/MVCC state and hot mutable chunks.",
             "support_reason": "Matched journal terms (tier, placement, cache, hbm) to Multi-tier placement policy."
           },
           "evidence_terms": [
@@ -53613,8 +53613,8 @@
               "gateway"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "A logical session should not be allowed to pin an unbounded result.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "A logical session should not be allowed to pin an unbounded result. Instead, response credits should account for a small number of fixed-byte chunks per active request, with backpressure when socket writability or downstream consumption lags.",
             "support_reason": "Matched journal terms (session, connection, logical session, million) to Effective session counting."
           },
           "evidence_terms": [
@@ -54856,9 +54856,9 @@
               "hbm",
               "dram"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "Resource class prices HBM/DRAM/L2/transfer/setup behavior.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Resource class prices HBM/DRAM/L2/transfer/setup behavior. Conflict class prices duplicate keys, hot owners, aborts, wait time, and validation cost.",
             "support_reason": "Matched journal terms (placement, hbm, dram) to Multi-tier placement policy."
           },
           "evidence_terms": [
@@ -57211,8 +57211,8 @@
               "cold"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "For tier placement, watermarks are also a cache-retirement tool.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For tier placement, watermarks are also a cache-retirement tool. A resident GPU segment, host spill page, or cold-tier index generation can be retired only when all active read frontiers have advanced past its visibility range.",
             "support_reason": "Matched journal terms (tier, placement, cache, buffer) to Multi-tier placement policy."
           },
           "evidence_terms": [
@@ -58081,8 +58081,8 @@
               "hbm"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The implementation and numbers are PostgreSQL-based, not GPU-resident.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Conflict-resolution rules must be chosen by application semantics; using add-wins or last-writer-wins on ordinary SQL rows can lose business invariants. The implementation and numbers are PostgreSQL-based, not GPU-resident.",
             "support_reason": "Matched journal terms (retained, resident, gpu-resident, gpu memory) to Retained GPU snapshots."
           },
           "evidence_terms": [
@@ -60730,8 +60730,8 @@
               "priority"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The priority invariant may also create fairness and tail-latency hazards.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The priority invariant may also create fairness and tail-latency hazards. A lower-priority route that overlaps many higher-priority queues can make progress only after those queues complete.",
             "support_reason": "Matched journal terms (fairness, priority) to Deficit fairness."
           },
           "evidence_terms": [
@@ -63236,9 +63236,9 @@
               "resident",
               "gpu snapshot"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "This maps cleanly to retained GPU snapshots.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "This maps cleanly to retained GPU snapshots. A resident refresh should be able to say \"refresh partition group 42 at visibility generation G\" rather than \"scan whatever files overlap this table today.\" That boundary can carry key range, source WAL frontier, tombstone/version metadata, compressed byte budget, and estimated GPU transfer cost.",
             "support_reason": "Matched journal terms (retained, resident, gpu snapshot) to Retained GPU snapshots."
           },
           "evidence_terms": [
@@ -66559,9 +66559,9 @@
               "conflict",
               "ltpg"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "LTPG separates speculative execution, conflict detection, and write-back.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "LTPG separates speculative execution, conflict detection, and write-back. Zero-sided RDMA separates producer/consumer buffers from the coordinator that owns flow state, batching, fairness, and elasticity.",
             "support_reason": "Matched journal terms (conflict, ltpg) to GPU OLTP conflict ordering."
           },
           "evidence_terms": [
@@ -66721,8 +66721,8 @@
               "route descriptor"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The temperature idea maps directly to route descriptors.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The temperature idea maps directly to route descriptors. A mutation or retained read route can carry conflict temperature for table, partition, key range, or resident segment generation.",
             "support_reason": "Matched journal terms (era, lock-free, route descriptor) to Bounded descriptor reclamation."
           },
           "evidence_terms": [
@@ -67618,8 +67618,8 @@
               "coalesced"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "Warp cooperative work sharing maps directly to retained lookup micro-batching.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Warp cooperative work sharing maps directly to retained lookup micro-batching. Same-shape key lookups can be grouped so a warp cooperates on node traversal and result scatter instead of assigning one independent lookup per lane and suffering divergent memory access.",
             "support_reason": "Matched journal terms (micro-batch, batching, same-shape, kernel launch) to Same-shape micro-batching."
           },
           "evidence_terms": [
@@ -70432,8 +70432,8 @@
               "nvm"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "No cache placement or prefetch policy can bypass WAL-before-visibility.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "GPU DB can use static placement within a visibility generation or snapshot epoch, but mutations, DDL, refresh, and invalidation mean the cache key must include relation identity, visibility generation, resident validity, and cold-chunk generation. No cache placement or prefetch policy can bypass WAL-before-visibility.",
             "support_reason": "Matched journal terms (wal, visibility, nvm) to WAL-before-visibility boundary."
           },
           "evidence_terms": [
@@ -73352,9 +73352,9 @@
               "gpu snapshot",
               "snapshot route"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "Mostly-read fields stay on optimistic MVCC or retained snapshot routes.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Mostly-read fields stay on optimistic MVCC or retained snapshot routes. Ownership fields should go through mutation-owner serialization early.",
             "support_reason": "Matched journal terms (retained, resident, gpu snapshot, snapshot route) to Retained GPU snapshots."
           },
           "evidence_terms": [
@@ -75239,8 +75239,8 @@
               "same-shape"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "Same-shape micro-batches are not enough.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Same-shape micro-batches are not enough. The GPU owner should maintain a small compatibility table saying which route pairs or route classes co-run well as spatially separated streams, which should share an SM-like execution window, and which should never be admitted together because they fight over memory bandwidth, cache, registers, shared memory, pinne...",
             "support_reason": "Matched journal terms (micro-batch, batching, same-shape) to Same-shape micro-batching."
           },
           "evidence_terms": [
@@ -76665,9 +76665,9 @@
               "logical session",
               "staR"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "For 1M logical sessions, PRICE is a warning against per-session learned state.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For 1M logical sessions, PRICE is a warning against per-session learned state. The learned component should sit at the route-template or table-generation level, with bounded feature extraction and cacheable predictions.",
             "support_reason": "Matched journal terms (session, logical session, staR) to Effective session counting."
           },
           "evidence_terms": [
@@ -77057,9 +77057,9 @@
               "htap",
               "fresh"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "Adaptive HTAP says the route must name its freshness demand and dirty frontier.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Adaptive HTAP says the route must name its freshness demand and dirty frontier. CD-search says the scheduler should also know the measured resource class before co-running GPU work.",
             "support_reason": "Matched journal terms (freshness, htap, fresh) to HTAP freshness router."
           },
           "evidence_terms": [
@@ -77440,8 +77440,8 @@
               "cold"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "D-RDMA also maps to future remote tiering.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "D-RDMA also maps to future remote tiering. If cold partitions, resident snapshots, or GPU refresh inputs ever move across nodes, the route descriptor should preserve table id, partition id, generation, columns, row mask, and destination set.",
             "support_reason": "Matched journal terms (tier, tiering, cache, buffer) to Multi-tier placement policy."
           },
           "evidence_terms": [
@@ -85967,8 +85967,8 @@
               "queueing"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The one-or-two outstanding request rule maps well to admission credits.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The one-or-two outstanding request rule maps well to admission credits. Each network worker, mutation owner, read snapshot worker, GPU execution lane, and response writer should expose a small active-window limit.",
             "support_reason": "Matched journal terms (credit, token, admission, flow control) to Vector-credit admission."
           },
           "evidence_terms": [
@@ -93098,9 +93098,9 @@
               "isolation",
               "elle"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "Elle and IsoDiff make isolation evidence observable after the fact.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Elle and IsoDiff make isolation evidence observable after the fact. TMTS shows that tier placement changes SLOs and therefore must be governed by hotness and slow-tier budgets.",
             "support_reason": "Matched journal terms (isolation, elle) to Isolation trace oracle."
           },
           "evidence_terms": [
@@ -93657,8 +93657,8 @@
               "read snapshot"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "For retained GPU snapshots, Bamboo is a warning about invalidation timing.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For retained GPU snapshots, Bamboo is a warning about invalidation timing. Early retirement may improve write throughput, but GPU read snapshots should not observe these uncommitted versions unless a special internal route proves the same dependency semantics.",
             "support_reason": "Matched journal terms (retained, gpu snapshot, read snapshot) to Retained GPU snapshots."
           },
           "evidence_terms": [
@@ -101108,8 +101108,8 @@
               "staR"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "For 1M logical sessions, the first-run latency lesson is important.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For 1M logical sessions, the first-run latency lesson is important. A system serving many distinct ad-hoc statements cannot afford to burn worker cores or GPU-owner time compiling every route up front.",
             "support_reason": "Matched journal terms (session, logical session, staR) to Effective session counting."
           },
           "evidence_terms": [
@@ -102340,8 +102340,8 @@
               "fresh"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "Measure write throughput, freshness lag, read latency, and refresh frequency.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Proof gate: user query overload can reject safely while crash recovery or replay has a bounded path to make progress. - Test mutable-delta plus immutable-main behavior for GPU residency: writes append to CPU/WAL deltas, retained reads combine a resident main segment with a bounded delta overlay or force refresh. Measure write throughput, freshness lag, re...",
             "support_reason": "Matched journal terms (freshness, htap, fresh) to HTAP freshness router."
           },
           "evidence_terms": [
@@ -105314,8 +105314,8 @@
               "queue"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The durable outcome queue maps to response rings.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The durable outcome queue maps to response rings. A commit response should not be emitted merely because the mutation owner accepted the work; it should be associated with a durable commit record or equivalent recovery fact.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
           "evidence_terms": [
@@ -105477,9 +105477,9 @@
               "join",
               "metadata"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "A hash join may need large scratch and longer occupancy.",
+            "quality": "weak_direct",
+            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "snippet": "A hash join may need large scratch and longer occupancy. A resident refresh may tolerate delay but should not steal resources from short read routes.",
             "support_reason": "Matched journal terms (join, metadata) to Cost-based route optimizer."
           },
           "evidence_terms": [
@@ -106027,8 +106027,8 @@
               "queue"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "The queue-centroid idea maps to owner rings.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "The queue-centroid idea maps to owner rings. Each owner or route lane can maintain a compact summary of recently queued work: hot key ranges, table ids, write/read mix, invalidation generations, and observed conflict or fallback counts.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
           "evidence_terms": [
@@ -108718,9 +108718,9 @@
               "batching",
               "same-shape"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "For retained reads, same-shape micro-batching should not erase this choice.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For retained reads, same-shape micro-batching should not erase this choice. If a batch contains many selective point or range predicates, grouping by snapshot and query shape is not enough; the runtime should also know whether the CPU fallback loop is branch-friendly or SIMD-friendly, and whether GPU launch overhead plus transfer/setup work beats a warmed...",
             "support_reason": "Matched journal terms (micro-batch, batching, same-shape) to Same-shape micro-batching."
           },
           "evidence_terms": [
@@ -117680,9 +117680,9 @@
               "generation",
               "publish"
             ],
-            "quality": "short_snippet",
-            "quality_reason": "snippet is too short for strong generated evidence",
-            "snippet": "Vegito publishes analytical generations only at stable epochs.",
+            "quality": "direct",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "Vegito publishes analytical generations only at stable epochs. Taurus NDP pushes work to storage only for rows and pages whose predicate, projection, and visibility proof are local; ambiguous rows return to InnoDB.",
             "support_reason": "Matched journal terms (generation, publish) to Immutable route roots."
           },
           "evidence_terms": [
@@ -118835,8 +118835,8 @@
               "cpu fallback"
             ],
             "quality": "direct",
-            "quality_reason": "concise high-confidence snippet contains matched mechanism terms",
-            "snippet": "For warm CPU fallback, the same rule helps prevent false GPU wins.",
+            "quality_reason": "snippet contains multiple matched mechanism terms",
+            "snippet": "For warm CPU fallback, the same rule helps prevent false GPU wins. A branchless CPU staged-filter route may beat a GPU transfer/fused route when a cheap early predicate eliminates most rows before later columns or text payloads are touched.",
             "support_reason": "Matched journal terms (fallback, cpu fallback) to CPU fallback policy."
           },
           "evidence_terms": [
@@ -127332,7 +127332,7 @@
             ],
             "quality": "direct",
             "quality_reason": "strong journal section contains matched mechanism terms",
-            "snippet": "**GPU DB mapping:** The first direct mapping is future-tier metadata.",
+            "snippet": "**GPU DB mapping:** The first direct mapping is future-tier metadata. GPU DB should not store route descriptors, warm CPU indexes, or resident snapshot catalogs in byte-addressable persistent memory as ordinary mutable structs until each update path has a log record, persist-order barrier, and recovery contract.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
           "evidence_terms": [
@@ -137577,17 +137577,14 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4028,
-      "short_snippet": 17,
-      "weak_direct": 626
+      "direct": 4044,
+      "weak_direct": 627
     },
     "evidence_quality_reason_counts": {
-      "concise high-confidence snippet contains matched mechanism terms": 27,
-      "high-confidence link has a substantive journal snippet": 439,
-      "snippet contains multiple matched mechanism terms": 3056,
-      "snippet is too short for strong generated evidence": 17,
+      "high-confidence link has a substantive journal snippet": 440,
+      "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 620,
+      "substantive snippet contains only one matched mechanism term": 621,
       "substantive snippet has no matched mechanism terms": 6
     },
     "evidence_span_counts": {

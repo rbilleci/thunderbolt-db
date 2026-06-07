@@ -2849,6 +2849,33 @@ def non_metadata_sentences(paragraphs: list[str]) -> list[str]:
     return sentences
 
 
+def expand_short_evidence_sentence(paragraph: str, sentence_index: int, minimum: int = 80) -> str:
+    sentences = [compact_whitespace(sentence) for sentence in SENTENCE_RE.split(paragraph)]
+    sentences = [sentence for sentence in sentences if sentence]
+    if not sentences or sentence_index >= len(sentences):
+        return ""
+
+    snippet = sentences[sentence_index]
+    if len(snippet) >= minimum:
+        return snippet
+
+    if sentence_index + 1 < len(sentences):
+        expanded = f"{snippet} {sentences[sentence_index + 1]}"
+        if len(expanded) >= minimum:
+            return expanded
+
+    if sentence_index > 0:
+        expanded = f"{sentences[sentence_index - 1]} {snippet}"
+        if len(expanded) >= minimum:
+            return expanded
+
+    if sentence_index + 1 < len(sentences):
+        return f"{snippet} {sentences[sentence_index + 1]}"
+    if sentence_index > 0:
+        return f"{sentences[sentence_index - 1]} {snippet}"
+    return snippet
+
+
 def truncate_evidence_snippet(snippet: str, terms: list[str], limit: int = 360) -> str:
     if len(snippet) <= limit:
         return snippet
@@ -2884,11 +2911,13 @@ def evidence_snippet(body: str, terms: list[str]) -> str:
 
     best = ""
     best_score = -1
+    best_paragraph = ""
+    best_sentence_index = -1
     for paragraph in paragraphs:
         paragraph_lower = paragraph.lower()
         metadata_penalty = 6 if paragraph_lower.startswith(METADATA_SNIPPET_PREFIXES) else 0
         section_bonus = 2 if paragraph_lower.startswith(STRONG_SNIPPET_PREFIXES) else 0
-        for sentence in SENTENCE_RE.split(paragraph):
+        for sentence_index, sentence in enumerate(SENTENCE_RE.split(paragraph)):
             sentence = compact_whitespace(sentence)
             if not sentence:
                 continue
@@ -2901,6 +2930,8 @@ def evidence_snippet(body: str, terms: list[str]) -> str:
             if score > best_score:
                 best = sentence
                 best_score = score
+                best_paragraph = paragraph
+                best_sentence_index = sentence_index
 
     if (not best or best.lower().startswith(METADATA_SNIPPET_PREFIXES)) and paragraphs:
         fallback_sentences = non_metadata_sentences(paragraphs)
@@ -2915,6 +2946,8 @@ def evidence_snippet(body: str, terms: list[str]) -> str:
             best = fallback_sentences[0]
         elif not best:
             best = paragraphs[0]
+    elif best and len(best) < 80:
+        best = expand_short_evidence_sentence(best_paragraph, best_sentence_index) or best
     return truncate_evidence_snippet(best, terms)
 
 

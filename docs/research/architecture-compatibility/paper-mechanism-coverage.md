@@ -33,17 +33,14 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - links with support reason: 4671 / 4671
 
 Evidence quality counts:
-- direct: 4028
-- short_snippet: 17
-- weak_direct: 626
+- direct: 4044
+- weak_direct: 627
 
 Evidence quality reason counts:
-- concise high-confidence snippet contains matched mechanism terms: 27
-- high-confidence link has a substantive journal snippet: 439
-- snippet contains multiple matched mechanism terms: 3056
-- snippet is too short for strong generated evidence: 17
+- high-confidence link has a substantive journal snippet: 440
+- snippet contains multiple matched mechanism terms: 3098
 - strong journal section contains matched mechanism terms: 506
-- substantive snippet contains only one matched mechanism term: 620
+- substantive snippet contains only one matched mechanism term: 621
 - substantive snippet has no matched mechanism terms: 6
 
 ## Evidence Span Quality Audit
@@ -66,7 +63,6 @@ Evidence quality reason counts:
 - `2026-06-06-cross-paper-synthesis-durable-publication-needs-small-proofs-with-bounded-fallback` -> dependency_witnesses:weak_direct (substantive snippet contains only one matched mechanism term): NVWAL, DHTM, DrTM, and NV-HALT converge on the same implementation hypothesis: the fast path is only trustworthy when it turns durability and visibility into small explicit proofs.
 - `2026-06-06-dhtm-treats-durability-as-part-of-the-transaction-fast-path` -> gpu_oltp_conflict_ordering:weak_direct (substantive snippet contains only one matched mechanism term): HTM provides atomic visibility and conflict detection; hardware-generated redo records provide atomic durability. - Each thread gets a private transaction log area and an overflow list, allocated and tracked by the OS.
 - `2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure` -> dependency_witnesses:weak_direct (substantive snippet contains only one matched mechanism term): Quickstep, MatrixKV, and DrTM converge on one design track: execution work should be decomposed only where the boundary carries enough proof to schedule, cancel, recover, and retry safely.
-- `2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure` -> cost_based_route_optimizer:short_snippet (snippet is too short for strong generated evidence): Quickstep turns query plans into work orders with scheduling metadata.
 - `2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure` -> owner_ring_bundling:weak_direct (substantive snippet contains only one matched mechanism term): Measure queue wait, p99 retained latency, refresh starvation, WAL reservation delay, stale-generation rejection, and crash/cancel safety.
 - `2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure` -> cpu_fallback_policy:weak_direct (substantive snippet contains only one matched mechanism term): A fragment needs a source WAL boundary, visibility boundary, generation/incarnation proof, buffer credits, fallback policy, and recovery or cancellation rule.
 - `2026-06-06-nvwal-makes-durable-logging-a-byte-granular-persistent-memory-protocol` -> owner_ring_bundling:weak_direct (substantive snippet contains only one matched mechanism term): If the log medium is byte-addressable, the DBMS should shape log records, persistence ordering, and allocator state around transaction semantics rather than page writes.
@@ -82,7 +78,6 @@ Evidence quality reason counts:
 - `2026-06-06-cross-paper-synthesis-adaptive-routes-need-local-caches-reusable-learning-and-handoff-under-cont` -> deterministic_hot_write_templates:weak_direct (substantive snippet contains only one matched mechanism term): ShiftLock shows that a hot remote authority should turn retry pressure into handoff queues instead of making every waiter hammer the same shared object.
 - `2026-06-06-cross-paper-synthesis-adaptive-routes-need-local-caches-reusable-learning-and-handoff-under-cont` -> retained_gpu_snapshots:weak_direct (substantive snippet contains only one matched mechanism term): **Converging design tracks:** First, route descriptors should carry physical facts: resident tier, chunk locality, snapshot generation, transfer bytes, and queue pressure.
 - `2026-06-06-bytehouse-makes-disaggregated-storage-local-through-ssd-chunks-and-route-modes` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): It does not describe GPU execution, CUDA buffers, WAL recovery details, or PostgreSQL-style interactive transactions.
-- `2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training` -> effective_session_counting:short_snippet (snippet is too short for strong generated evidence): For 1M logical sessions, the strongest transfer is admission simplicity.
 - `2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): Its answer is no: a simple adaptive execution layer combining Lookahead Information Passing (LIP) with an Adaptive Join Algorithm (AJA) can match or beat representative learned query optimizers on several benchmarks, while needing no training and remaining usable on query shapes that the learned optimizers cannot currently handle.
 - `2026-06-06-cross-paper-synthesis-route-authorities-should-publish-small-facts-and-keep-heavy-state-local` -> immutable_route_roots:weak_direct (substantive snippet contains only one matched mechanism term): - Implement a compact route-cell simulator with local wait queues and generation-carrying wakeups under 1M logical sessions. - Add route-history audit traces around retained GPU reads, refreshes, invalidations, and CPU fallback, then verify sampled histories against an SI-compatible checker. - Compare cache-aware scheduling policies only under explicit se...
 - `2026-06-06-cross-paper-synthesis-route-authorities-should-publish-small-facts-and-keep-heavy-state-local` -> owner_ring_bundling:weak_direct (substantive snippet contains only one matched mechanism term): - Implement a compact route-cell simulator with local wait queues and generation-carrying wakeups under 1M logical sessions. - Add route-history audit traces around retained GPU reads, refreshes, invalidations, and CPU fallback, then verify sampled histories against an SI-compatible checker. - Compare cache-aware scheduling policies only under explicit se...
@@ -128,7 +123,9 @@ Evidence quality reason counts:
 - `2026-06-03-pasha-partitioned-shared-cxl-pod-architecture` -> bounded_descriptor_reclamation:weak_direct (substantive snippet contains only one matched mechanism term): The partitioner should minimize shared-region operations, not merely minimize multi-host transactions. - High core counts in a future pod motivate scheduling transactions before execution, rather than resolving all conflicts reactively at runtime. - Durability and atomicity still require logging and checkpoints; the authors call out parallel logging and p...
 - `2026-06-03-pasha-partitioned-shared-cxl-pod-architecture` -> stable_handle_indirection:weak_direct (substantive snippet contains only one matched mechanism term): ...while still being much lower latency than RDMA-style disaggregated memory. - For MVCC, the paper identifies the cost of moving all tuple versions as a central problem.
 - `2026-06-03-owner-local-first-shared-only-when-measured` -> gpu_oltp_conflict_ordering:weak_direct (substantive snippet contains only one matched mechanism term): The recent reviewed papers now converge on a sharper architecture track: keep mutable hot paths owner-local, expose queue and movement pressure explicitly, and admit shared or accelerated tiers only when a route descriptor can prove the generation, bytes, and conflict class.
-- ... 563 more
+- `2026-06-03-cross-paper-synthesis-batch-boundaries-as-correctness-surfaces` -> owner_ring_bundling:weak_direct (substantive snippet contains only one matched mechanism term): - **Batch publication over per-request churn:** hot write paths should publish WAL, CPU visibility, resident invalidation, and route generations at explicit owner boundaries when latency budgets permit. - **Local conflict graphs before global scheduling:** start with owner-local metadata graphs over keys, partitions, resident generations, and active phase...
+- `2026-06-03-cross-paper-synthesis-batch-boundaries-as-correctness-surfaces` -> retained_gpu_snapshots:weak_direct (substantive snippet contains only one matched mechanism term): - **Batch publication over per-request churn:** hot write paths should publish WAL, CPU visibility, resident invalidation, and route generations at explicit owner boundaries when latency budgets permit. - **Local conflict graphs before global scheduling:** start with owner-local metadata graphs over keys, partitions, resident generations, and active phase...
+- ... 547 more
 
 ## Review Triage
 
