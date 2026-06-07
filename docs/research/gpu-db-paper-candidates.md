@@ -215,13 +215,15 @@ Where this matters most for GPU DB, in priority order:
   useful for bounding hot version chains under long retained CPU/GPU read
   snapshots with exact active-generation pruning. Journal entry added
   2026-06-07.
-- `queued` — **Practically and Theoretically Efficient Garbage Collection for
+- `reviewed` — **Practically and Theoretically Efficient Garbage Collection for
   Multiversioning**, Blelloch et al., arXiv 2022.
   URL: `https://arxiv.org/abs/2212.13557`
   Why: discovered while searching for modern MVCC garbage-collection
   follow-ups; useful for checking whether newer multiversion GC algorithms can
   provide bounded retired-memory guarantees for retained snapshots beyond
-  Steam's in-memory DBMS implementation.
+  Steam's in-memory DBMS implementation. Stale duplicate corrected on
+  2026-06-07; journal entry already exists under the PPoPP 2023 paper
+  metadata.
 
 ### Runtime scale, HFT-style mechanics, and admission
 
@@ -5006,18 +5008,28 @@ Append new candidates here as each paper is processed.
   Why: Tiered-Indexing cites EvenDB as record-placement work; useful for
   studying whether physical clustering by access locality can reduce cold-tier
   reads and resident refresh churn under skew.
-- `queued` — **Jiffy: A Lock-Free Skip List with Batch Updates and
+- `reviewed` — **Jiffy: A Lock-Free Skip List with Batch Updates and
   Snapshots**, Kobus, Kokocinski, and Wojciechowski, PPoPP 2022.
   URL: `https://doi.org/10.1145/3503221.3508437`
+  arXiv: `https://arxiv.org/abs/2102.01044`
   Why: cited by the MVGC paper as a modern multiversion/snapshot data structure;
   useful for comparing batched update publication and wait-free range snapshot
-  support against GPU DB retained-read generations.
+  support against GPU DB retained-read generations. Journal entry added
+  2026-06-07 from arXiv and the author PDF.
 - `queued` — **MV-RLU: Scaling Read-Log-Update with Multi-Versioning**,
   Kim et al., ASPLOS 2019.
   URL: `https://doi.org/10.1145/3297858.3304040`
   Why: cited by the MVGC paper as a practical multiversioning system; useful
   for contrasting reader-side logging, version lifetime, and reclamation costs
   with GPU DB MVCC chains and long retained snapshots.
+- `queued` — **Bundling Linked Data Structures for Linearizable Range
+  Queries**, Nelson-Slivon, Hassan, and Palmieri, PPoPP 2022.
+  URL: `https://doi.org/10.1145/3503221.3508412`
+  arXiv: `https://arxiv.org/abs/2201.00874`
+  Why: discovered while reviewing Jiffy; uses bundled references and
+  TSC-shaped range-query snapshots over linked data structures, useful for
+  comparing per-link version bundles against GPU DB route-fragment revisions
+  and snapshot-safe range traversal.
 - `reviewed` — **Constant-Time Snapshots with Applications to Concurrent Data
   Structures**, Wei et al., PPoPP 2021.
   URL: `https://arxiv.org/abs/2007.02372`

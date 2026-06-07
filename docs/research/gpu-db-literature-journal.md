@@ -38,6 +38,163 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Jiffy makes batched index mutation and snapshots one publication protocol
+
+**Citation:** Tadeusz Kobus, Maciej Kokocinski, and Pawel T.
+Wojciechowski. "Jiffy: A Lock-free Skip List with Batch Updates and
+Snapshots." PPoPP 2022, 400-415. DOI:
+`https://doi.org/10.1145/3503221.3508437`. Retrieved 2026-06-07 from
+arXiv and the author PDF:
+`https://arxiv.org/abs/2102.01044`,
+`https://www.cs.put.poznan.pl/pawelw/pdf/ppopp22-full.pdf`.
+
+**Category:** MVCC / snapshot / visibility; runtime scale, HFT-style
+mechanics, and admission; transaction processing / write path.
+
+**Relevance tags:** Jiffy; lock-free ordered index; batch updates;
+consistent snapshots; multiversioned skip list; Time Stamp Counter; immutable
+revisions; revision sizing; split/merge revisions; snapshot list; range scans;
+route indexes; retained reads; batch publication; key-range fragments.
+
+**Core idea:** Jiffy combines two features that are usually hard to keep
+together in a high-concurrency index: atomic batch updates and consistent
+snapshots for range scans. It does this with a multiversioned skip list whose
+leaf nodes own key ranges and point to immutable revision lists. Updates copy
+and publish a new revision with CAS, batch updates share a descriptor and one
+final version number, and readers use timestamped snapshots to choose the
+right revision without restarting range scans.
+
+For GPU DB, the strongest transferable idea is that a hot route index can
+publish immutable key-range fragments at batch boundaries while retained reads
+keep using an older fragment generation. This is the same shape needed for
+P8 resident key vectors, CPU route indexes, and visible-row maps: update a
+bounded fragment, attach one generation, and let compatible point/range reads
+execute without routing every lookup through the mutation owner.
+
+**Concrete mechanisms:**
+
+- Jiffy is a skip list where bottom-level nodes manage continuous key ranges.
+  Each node stores a pointer to the head of a revision list; a revision is an
+  immutable object containing sorted key and value arrays for the node's range.
+- A normal `put` or `remove` finds the responsible node, copies the head
+  revision, applies the key update, and CASes the new revision onto the node.
+  The final positive version number is assigned after publication and is the
+  update's linearization point.
+- Version numbers come from the CPU Time Stamp Counter path. An update first
+  uses a negative optimistic version based on a TSC read, then waits until the
+  clock reaches at least that value before publishing the final positive
+  version. The paper reports `RDTSCP` around 10 ns in its setup and notes that
+  the earlier atomic-counter design did not scale past roughly 4-8 threads.
+- Snapshot creation records the current TSC-derived value in a lock-free
+  snapshot list. Jiffy's internal GC scans that list for the oldest active
+  snapshot and lets update operations cut revision lists once old revisions
+  are no longer visible to any snapshot.
+- Snapshot reads and range scans evaluate revisions by version. A revision
+  newer than the snapshot is skipped; a pending revision whose optimistic
+  version is within the snapshot boundary is helped to completion so the read
+  can decide whether it belongs in the snapshot.
+- Batch updates carry their shared optimistic/final version in a batch
+  descriptor. A helper must add all required revisions, in descending key
+  order, before assigning the final version, so all keys in the batch become
+  visible atomically.
+- Jiffy changes synchronization granularity by splitting and merging nodes.
+  Splits move the upper half of a range into a new node through left and right
+  split revisions; merges publish a merge terminator and then a merge revision
+  on the preceding node. Any operation that encounters an in-progress split or
+  merge helps finish it.
+- Revision layout is cache-oriented: sorted key/value arrays support range
+  scans, and each revision also has a lightweight hash index to speed point
+  lookups. The evaluated revision sizes are in the 25-300 entry range.
+- The autoscaling policy records exponential moving averages for time spent in
+  reads and updates per revision. It uses those timings to shrink revisions
+  under write-heavy workloads and grow them under read/range-scan-heavy
+  workloads, avoiding a simple operation-count feedback loop.
+- The evaluation compares Java Jiffy against SnapTree, k-ary trees, CA trees,
+  LFCA, Java `ConcurrentSkipListMap`, and sometimes KiWi on a dual-socket
+  Intel Xeon Gold 6252N server. The paper reports scalable behavior across 8
+  to 96 threads, stronger range-scan performance than several competitors, and
+  large random batch-update throughput up to 7.4x better than a lock-based
+  CA-SL variant in one 4-byte key/value write-only scenario.
+
+**GPU DB mapping:** The direct mapping is to route indexes and resident
+fragment descriptors, not to the whole SQL table store. A resident key vector
+or CPU route fragment can be treated like a Jiffy revision: immutable after
+publication, tagged with a visibility/residency generation, and reclaimed only
+after retained readers release older generations.
+
+Batch descriptors map to GPU DB write batches and index-maintenance batches.
+If a `COPY`, hot-key update window, or resident-index refresh touches many
+keys, one batch descriptor can carry the generation and WAL boundary for all
+affected fragment revisions. The mutation owner still owns WAL-before-
+visibility, but the derived route/index fragments can be published as a
+single atomic generation.
+
+The split/merge rules are useful for P8 key-range fragments. Hot write-heavy
+fragments should shrink so each update copies less metadata; read-heavy or
+range-scan-heavy fragments can grow so scans and GPU-friendly segment pruning
+touch fewer descriptors. This is a concrete alternative to fixed-size resident
+fragments.
+
+The snapshot list maps to retained read generation tracking. Jiffy tracks
+active snapshot timestamps, not every logical client operation. GPU DB should
+track the small set of snapshot generations held by bounded workers and GPU
+owners, then retire route/index revisions against the oldest active generation.
+
+The TSC idea is directionally useful but not directly portable as the only
+clock. GPU DB can use cheap local generation reads for route snapshots, but
+SQL-visible visibility must still be tied to transaction/WAL generation and
+must work across sockets, devices, recovery, and future remote tiers.
+
+**Risks and mismatches:** Jiffy is an in-memory Java concurrent index, not a
+DBMS storage engine. It does not address WAL durability, crash recovery,
+secondary-index consistency for arbitrary SQL, DDL, GPU kernels, pinned host
+buffers, NVMe tiers, or pgwire session multiplexing.
+
+The design relies on immutable revision copying. That is attractive for small
+route fragments and resident descriptor arrays, but it can be expensive for
+large rows, wide SQL payloads, or HBM-resident column buffers. GPU DB should
+copy compact metadata and visible-row/key vectors first, not full table data.
+
+TSC-derived versioning assumes a reliable monotonic clock source inside one
+machine and one runtime. GPU DB needs an explicit visibility generation
+service for SQL correctness, and a separate faster route-generation cache only
+where correctness allows it.
+
+Helping is lock-free but not free. Under in-progress split, merge, or large
+batch operations, readers can be drafted into completing metadata work. For a
+latency-sensitive DB runtime, helping must be bounded or routed to owner
+maintenance queues so tiny retained reads do not inherit unbounded split/merge
+work.
+
+Snapshot GC depends on threads refreshing and unregistering snapshots. Near
+1M logical sessions, this cannot be per session. It must be per bounded worker,
+GPU stream owner, retained read batch, or explicit long-snapshot admission
+token.
+
+**Benchmark candidates:**
+
+- Prototype a small CPU route index whose fragments are immutable revisions
+  tagged by visibility generation. Compare fixed-size fragments with
+  read/write-time autoscaled fragment sizes under point lookups, prefix
+  ranges, and mixed updates.
+- Add a batched index-maintenance benchmark: one WAL/MVCC write batch updates
+  many route fragments through a shared generation descriptor. Gate: snapshot
+  reads observe either the old fragments or all new fragments, never a partial
+  batch.
+- Measure fragment split/merge helping under retained reads. Failure
+  condition: a point lookup or short range scan can be forced to perform
+  unbounded maintenance work instead of enqueueing bounded owner cleanup.
+- Compare global atomic visibility counters, local TSC-like route generation
+  reads, and owner-drain generation publication. Measure route lookup latency,
+  cross-socket consistency, stale-read detection, and recovery compatibility.
+- Track active retained generations per worker/GPU owner rather than per
+  logical session. Gate: revision retirement cost scales with active
+  generations and bounded workers, not with 1M logical sessions.
+- Benchmark cache-oriented revision layout for resident `int4` keys: sorted
+  arrays only, sorted arrays plus small hash index, and GPU-visible key vector
+  plus CPU hash sidecar. Measure point lookup, prefix scan, refresh cost, and
+  HBM/DRAM footprint.
+
 ### 2026-06-07 - Steam prunes MVCC garbage on the write path before chains grow
 
 **Citation:** Jan Boettcher, Viktor Leis, Thomas Neumann, and Alfons
