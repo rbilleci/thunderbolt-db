@@ -96499,3 +96499,149 @@ Benchmark priority is a three-part fault matrix: hidden host-domain contention
 under retained reads, stalled-worker descriptor retirement under route churn,
 and WAL/manifest crash recovery under bounded operation sequences. A route
 optimization should not be promoted unless it can survive all three.
+
+### 2026-06-07 - CCFS makes durability ordering a per-stream contract
+
+**Citation:** Thanumalayan Sankaranarayana Pillai, Ramnatthan Alagappan,
+Lanyue Lu, Vijay Chidambaram, Andrea C. Arpaci-Dusseau, and Remzi H.
+Arpaci-Dusseau. "Application Crash Consistency and Performance with CCFS."
+FAST 2017, 181-196. Retrieved 2026-06-07 from the USENIX page and PDF:
+`https://www.usenix.org/conference/fast17/technical-sessions/presentation/pillai`,
+`https://www.usenix.org/system/files/conference/fast17/fast17_pillai.pdf`.
+
+**Category:** WAL, logging, storage recovery, and read/write throughput;
+database file-system design and storage correctness.
+
+**Relevance tags:** CCFS; crash consistency; stream ordering; weak atomicity;
+false write dependencies; selective data journaling; hybrid-granularity
+journaling; delta journaling; order-preserving delayed allocation; fsync;
+WAL-before-visibility; manifest publication; route-owner streams.
+
+**Core idea:** CCFS argues that many application-level crash-consistency bugs
+come from file systems reordering writes that application recovery protocols
+implicitly expect to persist in program order. Its stream abstraction preserves
+program order and weak atomicity within one stream, while allowing reordering
+across independent streams to avoid global-order performance collapse.
+
+For GPU DB, the strongest transferable idea is not to rely on a generic file
+system to infer database durability intent. Every durable route should have an
+explicit ordering domain. WAL append, visibility publication, checkpoint
+install, cold-tier manifest update, and resident-route descriptor publication
+should be grouped into narrow owner streams where ordering is guaranteed, while
+independent partitions, maintenance jobs, and cold-tier object writes remain
+separable enough for IO scheduling and batching.
+
+**Concrete mechanisms:**
+
+- CCFS exposes a `setstream(s)` API that associates future updates from a
+  process or thread with stream `s`; children inherit the parent's stream.
+  `streamsync()` flushes the current stream, and an `IGNORE_FSYNC` flag lets an
+  application suppress ordinary `fsync` calls when stream ordering already
+  preserves recovery correctness and durability is not promised at that point.
+- Within a stream, file-system updates are committed in program order and
+  directory operations have weak atomicity. Across streams, CCFS permits
+  reordering so unrelated applications do not create false write dependencies.
+- The implementation extends ext4 with multiple per-stream running
+  transactions. An `fsync` commits the current stream's running transaction
+  instead of forcing every prior dirty update from unrelated streams.
+- Hybrid-granularity journaling tracks in-memory byte ranges per stream but
+  commits and checkpoints at block granularity. This lets independent metadata
+  fields sharing one block belong to different stream transactions without
+  giving up ext4-style block checkpointing.
+- Delta journaling records operations for truly shared metadata fields, such
+  as free inode counts, free block counts, directory link counts, and directory
+  modification times. The committing transaction applies its delta to the
+  initial field value during commit.
+- CCFS removes cross-stream pointer updates from some metadata structures. For
+  example, directories use a deleted bit rather than editing a previous entry's
+  next pointer, and the orphan list is replaced with an orphan directory.
+- Space reuse is ordered carefully: freed inodes, blocks, and directory entries
+  are not reused by another stream until the freeing transaction has committed.
+- Order-preserving delayed allocation reserves space when appends are issued,
+  but performs the actual allocations just before the stream transaction
+  commits. This keeps delayed allocation's performance benefit without letting
+  allocation order cross a stream's commit boundary.
+- In model-based tests with Alice over LevelDB, SQLite rollback journaling,
+  Git, Mercurial, and ZooKeeper, CCFS masked most ext4-exposed crash
+  inconsistencies; the remaining Mercurial cases were process-crash dirstate
+  corruption. BoB block-trace testing found no inconsistent recovered images
+  for Git or LevelDB on CCFS in the tested workloads.
+- Performance depends on separating streams. In the paper's false-dependency
+  microbenchmarks, a single globally ordered stream can turn a small `fsync`
+  into a 100 MB flush, while separate streams behave like ext4. On standard
+  Filebench workloads, CCFS is generally close to ext4 and much faster than
+  full ext4 data journaling, with extra CPU overhead in allocation-heavy cases.
+
+**GPU DB mapping:** Treat each mutation owner, partition owner, checkpoint
+installer, and cold-tier manifest owner as a stream-like ordering domain. A
+commit route should preserve WAL-before-visibility and descriptor publication
+order inside that domain, but should not force unrelated route metadata,
+large object writes, or background compactions into the same flush dependency
+unless the SQL or recovery contract truly requires it.
+
+The hybrid-granularity idea maps to metadata pages and route descriptors. GPU
+DB can keep per-owner logical update records for small fields inside a shared
+catalog or manifest page, then publish a block/page/object image only at
+install time. This avoids making unrelated descriptor fields share a false
+durability dependency.
+
+Delta journaling maps directly to counters and shared manifest facts:
+resident bytes, segment counts, free-space accounting, per-partition sequence
+allocators, and route-generation counters should be published as typed deltas
+or narrow records when the full structure is otherwise shared.
+
+The space-reuse rule is a useful cold-tier invariant. A segment id, manifest
+slot, row-version storage region, or resident-descriptor handle should not be
+reused in another owner stream until the freeing record is durable and any
+older route that could reference it is retired. That connects crash
+consistency with MVCC/descriptor reclamation.
+
+Order-preserving delayed allocation suggests a GPU DB ingestion policy:
+reserve durable logical space or manifest sequence numbers at admission, delay
+physical placement and coalescing until the owner reaches a flush boundary,
+then commit the ordered allocation facts with the WAL/checkpoint record.
+
+**Risks and mismatches:** CCFS is a file-system design, not a database storage
+engine. It does not provide SQL isolation, MVCC version visibility, group
+commit semantics, GPU memory management, object storage, replication, or
+database-level recovery oracles.
+
+The API assumes applications can opt into streams. GPU DB should not expose
+durability correctness through ad hoc client-controlled stream ids; stream-like
+domains should be internal owner contracts derived from table, partition,
+manifest, or route ownership.
+
+The paper's evaluation uses Linux 3.13, ext4-derived code, one HDD, one SSD,
+and a small set of application and Filebench workloads. The mechanism transfers
+as a design vocabulary, not as performance evidence for NVMe, cloud object
+stores, CXL, GPUDirect Storage, or GPU resident snapshot publication.
+
+CCFS can merge streams temporarily when related operations cross streams. GPU
+DB needs a stricter equivalent: if two owner streams touch related durable
+facts, the merge or dependency edge must be explicit, observable, and tested
+by crash recovery, not hidden in a storage layer.
+
+**Benchmark candidates:**
+
+- Build a stream-domain crash matrix for WAL, checkpoint, and cold-tier
+  manifest publication. Compare one global durability stream, per-partition
+  streams, and per-object/manifest streams. Gate: recovered SQL visibility,
+  manifest reachability, and route validity match the oracle.
+- Add a false-dependency benchmark: one hot mutation route performs tiny
+  commits while a background route writes or compacts large cold-tier objects.
+  Measure whether global flush ordering inflates hot-route p99 compared with
+  stream-separated durable publication.
+- Prototype typed metadata deltas for shared route counters and manifest
+  accounting. Gate: replay of deltas and replay of full metadata images produce
+  identical route state after crash injection at each flush boundary.
+- Test safe id/space reuse for segment ids, resident descriptor handles, and
+  manifest slots. Failure condition: a crash or long reader can observe a
+  reused id without a durable free-and-retire boundary.
+- Measure order-preserving allocation for ingest: reserve logical segment or
+  WAL positions at admission, delay physical placement until flush, then
+  commit placement facts in owner order. Report throughput, p99, write
+  amplification, and recovery correctness.
+- Extend the B3-style witness grammar with stream labels and cross-stream
+  dependencies. Generate related and unrelated operation sequences and verify
+  that unrelated streams can reorder without changing SQL-visible recovery,
+  while related streams preserve required order.

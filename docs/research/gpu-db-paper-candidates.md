@@ -1206,13 +1206,28 @@ Append new candidates here as each paper is processed.
   crash-consistency testing; useful for designing a bounded crash/fault matrix
   over GPU DB WAL, checkpoint, manifest, and route-publication states. Journal
   entry added 2026-06-07 from the USENIX page and PDF.
-- `queued` — **Application Crash Consistency and Performance with CCFS**,
+- `reviewed` — **Application Crash Consistency and Performance with CCFS**,
   Pillai et al., FAST 2017.
   URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/pillai`
   Why: cited by the fsync-failure paper as application-level crash-consistency
   support; useful for comparing file-system assistance, consistency contracts,
   and performance overhead before GPU DB builds DB-owned durable publication
-  checks.
+  checks. Journal entry added 2026-06-07 from the USENIX page and PDF.
+- `queued` — **Isotope: Transactional Isolation for Block Storage**,
+  Shin, Balakrishnan, Marian, and Weatherspoon, FAST 2016.
+  URL: `https://www.usenix.org/conference/fast16/technical-sessions/presentation/shin`
+  Why: CCFS notes that block-level atomicity and isolation can simplify
+  stream-separated crash consistency; useful for comparing lower-level storage
+  transaction support against GPU DB's owner-stream WAL/checkpoint/manifest
+  publication contracts.
+- `queued` — **Lightweight Application-Level Crash Consistency on
+  Transactional Flash Storage**, Min, Kang, Kim, Lee, and Eom, USENIX ATC
+  2015.
+  URL: `https://www.usenix.org/conference/atc15/technical-session/presentation/min`
+  Why: CCFS contrasts CFS-style application-level atomicity with stream
+  ordering; useful for checking whether a narrower transactional storage
+  primitive can protect GPU DB cold-tier metadata without replacing database
+  WAL/MVCC semantics.
 - `skipped` — **On the Complexity of Crafting Crash-Consistent Applications**,
   Pillai et al., OSDI 2014.
   URL: `https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai`
