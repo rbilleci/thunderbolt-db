@@ -44729,8 +44729,8 @@
             "matched_terms": [
               "buffer"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For network IO workers, mutation owners, read-snapshot workers, residency refresh queues, GPU execution workers, pinned-buffer pools, and response rings, the scheduler should distinguish \"large but draining\" from \"small but accelerating.\" That distinction matters when deciding whether to admit more retained reads, grow a micro-batch, force a drain, use CP...",
             "support_reason": "Matched journal terms (buffer) to Multi-tier placement policy."
           },
@@ -45880,8 +45880,8 @@
               "generation",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Syrup suggests that each boundary should accept a compact route descriptor rather than making isolated local decisions.",
             "support_reason": "Matched journal terms (generation, route descriptor) to Immutable route roots."
           },
@@ -51871,8 +51871,8 @@
             "matched_terms": [
               "tier"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The strongest design track is a classed admission plane with explicit frontiers.",
             "support_reason": "Matched journal terms (tier) to Multi-tier placement policy."
           },
@@ -67491,8 +67491,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A simple kernel can implement memory-expansion semantics over DRAM or NAND Flash, while a database kernel can implement richer read/write behavior. - The Type 2 choice is deliberate: because the device can cache lines, host writes that require exclusive ownership generate invalidations that notify the device before the final memory write arrives.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -68332,8 +68332,8 @@
               "publication",
               "checksum"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Tiny control payloads, storage-function ids, predicate constants, and generation tokens should be separated from bulk column pages or compressed segments.",
             "support_reason": "Matched journal terms (generation, route descriptor, publication, checksum) to Immutable route roots."
           },
@@ -70986,8 +70986,8 @@
               "occ",
               "aria"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "...atomics. - The same local/global pattern is used for grouped aggregation: local segmented reductions or pre-aggregation reduce contention before inserting pre-aggregates into a global hash table with atomics. - In their grouped-aggregation experiment, pre-aggregation reduces execution time by up to 126x versus the naive pipelined atomic approach for he...",
             "support_reason": "Matched journal terms (deterministic, contention, contended, occ) to Deterministic hot-write templates."
           },
@@ -74945,8 +74945,8 @@
             "matched_terms": [
               "model"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Kernels within a stream preserve order, while kernels from different streams may run concurrently if resources permit and dependencies allow it. - The model treats a block as the useful scheduling unit because CUDA schedules all threads in a block on the same multiprocessor resource pool. - Kernel launch parameters are the control surface: total blocks an...",
             "support_reason": "Matched journal terms (model) to Learned optimizer advisor."
           },
@@ -77908,8 +77908,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It should name at least relation/partition identity, snapshot or epoch generation, durable visibility boundary, physical layout, tier source, output shape, and dependency or lane coverage.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -80125,8 +80125,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The route certificate for a query should carry not only estimated rows and bytes, but also the training-domain features that made the estimate believable: query shape, predicate family, relation or partition identity, resident generation class, queue-pressure bucket, tenant/workload bucket, and model version.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -82159,8 +82159,8 @@
               "object",
               "lance"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "QueCC makes operation queues and priority lanes explicit; ORTHRUS separates concurrency-control ownership from transaction execution; CXL placement says object families need measured tier classes; Strife says the current batch's conflict graph should decide which writes can run without per-record control.",
             "support_reason": "Matched journal terms (object, lance) to DB-owned cold objects."
           },
@@ -83895,8 +83895,8 @@
               "remote memory",
               "far memory"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A route should not say only \"far memory\"; it should specify whether the request uses random loads, temporal stores, non-temporal copies, streaming prefetch, or promotion into local DRAM before GPU execution.",
             "support_reason": "Matched journal terms (pointer, moving, remote memory, far memory) to Stable handle indirection."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4448,
-      "weak_direct": 223
+      "direct": 4459,
+      "weak_direct": 212
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 286,
+      "snippet contains matched mechanism term plus visible aliases": 297,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 217,
+      "substantive snippet contains only one matched mechanism term": 206,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
