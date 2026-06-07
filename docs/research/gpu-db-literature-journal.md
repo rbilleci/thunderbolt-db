@@ -38,6 +38,168 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - ASAP treats persist ordering as recoverable speculation
+
+**Citation:** Sujay Yadalam, Nisarg Shah, Xiangyao Yu, and Michael
+Swift. "ASAP: A Speculative Approach to Persistence." HPCA 2022,
+892-907. DOI: `https://doi.org/10.1109/HPCA53966.2022.00070`.
+Retrieved 2026-06-07 from the author PDF:
+`https://pages.cs.wisc.edu/~swift/papers/hpca22-asap.pdf`.
+
+**Category:** WAL, logging, persistent-memory write path, and
+read/write throughput; runtime / HFT / session scale; multi-tier cache
+/ data placement.
+
+**Relevance tags:** ASAP; persistent memory; persist ordering; eager
+flushing; speculative persistence; recovery table; undo records; delay
+records; ADR; memory-controller recovery; cross-thread dependencies;
+persist buffers; epoch tables; release persistency; future CXL/NVM
+tiers; WAL frontier; durable descriptor publication.
+
+**Core idea:** ASAP observes that persist-ordering stalls are paid on
+the common path even though ordering only matters after failure. It lets
+writes reach persistent memory eagerly and out of order, while memory
+controllers keep enough recovery information to roll back unsafe
+speculative writes if a crash happens before the required earlier
+writes become durable.
+
+For GPU DB, the transferable idea is not hardware dependence on ASAP
+itself. It is the separation between a fast visible or staged write path
+and a small, explicit recovery witness for any ordering speculation. If
+future CPU/NVM/CXL/GPU-route metadata wants to publish descriptors or
+derived index changes before every backing structure is fully ordered,
+the engine needs an ASAP-like proof of what can be unwound, delayed, or
+replayed at the durable WAL frontier.
+
+**Concrete mechanisms:**
+
+- ASAP adds per-core persist buffers that enqueue stores to persistent
+  memory, flush them in the background, and let cores keep executing
+  instead of waiting at every persist-order boundary.
+- Writes are grouped into epochs separated by persist barriers. An
+  epoch is safe only after earlier local epochs are committed and any
+  cross-thread dependency has been resolved. A `dfence` waits until all
+  earlier epochs have committed.
+- The design supports epoch persistency and release persistency. With
+  release persistency, cross-thread dependencies are introduced through
+  acquire/release synchronization rather than every conflicting
+  persistent-memory coherence access.
+- Persist buffers eagerly flush writes from future or dependent epochs.
+  Early flush packets are marked so memory controllers know the write is
+  speculative relative to the required persist order.
+- Each memory controller has a recovery table in the ADR persistence
+  domain. When an early flush reaches the controller, the controller
+  records an undo entry with the old cache-line value before applying
+  the speculative write to memory.
+- If a later or early write to the same address arrives while an undo
+  record already exists, ASAP uses delay records to avoid losing the
+  correct safe value. When the delayed epoch commits, the controller
+  processes the delay as if the flush had just arrived in order.
+- Per-core epoch tables track pending acknowledgements, source epoch
+  dependencies, dependent threads, and the memory controllers that saw
+  early flushes. When an epoch becomes safe and complete, the table sends
+  commit messages to those controllers and cross-dependency-resolved
+  messages to dependent threads.
+- If a recovery table is full, the memory controller negatively
+  acknowledges the early flush. The persist buffer falls back to
+  conservative safe flushing for that epoch, so bounded recovery-table
+  capacity degrades performance rather than correctness.
+- On failure, memory controllers flush normal pending writes and then
+  write undo-record values back to memory. Delay records are ignored
+  because they correspond to epochs that had not committed; memory is
+  restored to a state where no unsafe epoch survives.
+- The evaluation is gem5 simulation of a 4-core, 2-memory-controller
+  system with update-heavy PM workloads including Nstore, Echo,
+  Vacation, Memcached, Atlas data structures, CCEH, Fast_Fair, Dash, and
+  RECIPE. The paper reports ASAP is 2.3x faster than current Intel-style
+  synchronous ordering on average, 22.8% faster than HOPS on average,
+  and within 3.9% of an ideal eADR/BBB-like system.
+
+**GPU DB mapping:** The first mapping is to future durable route
+descriptors, warm-tier indexes, checkpoint manifests, and resident
+fragment metadata. A write owner can keep the SQL WAL as the
+authoritative durable stream, but derived metadata may be installed,
+flushed, or replicated out of order if every speculative publication has
+an explicit undo, delay, or replay witness tied to a generation.
+
+Persist buffers map to owner-local durable-intent buffers. A mutation,
+residency, or route owner can group descriptor writes into epochs,
+drain them to NVMe/CXL/NVM/warm metadata asynchronously, and publish a
+frontier only after earlier epochs and cross-owner dependencies are
+known durable or recoverable.
+
+Recovery-table undo and delay records map to bounded failure-state
+metadata. For GPU DB, the durable witness might be a WAL record,
+manifest delta, route-overlay operation, or descriptor old-value record
+rather than a memory-controller CAM entry. The essential rule is the
+same: if the engine exposes a speculative derived state, recovery must
+know whether to keep it, undo it, or replay a delayed predecessor.
+
+Cross-thread dependency tracking maps to owner dependency graphs. A
+resident refresh that depends on a catalog generation, a route index that
+depends on a WAL generation, or a cold-tier manifest that depends on a
+checkpoint frontier should carry a compact dependency token. Direct
+owner-to-owner completion messages are preferable to polling global
+state on hot paths.
+
+The NACK fallback is a useful admission rule. If the bounded recovery
+witness budget is full, the engine should stop speculative metadata
+publication and fall back to conservative WAL-ordered publication,
+throttling, or explicit overload. It must not silently keep publishing
+unrecoverable descriptors.
+
+**Risks and mismatches:** ASAP is a hardware architecture paper for
+persistent memory ordering, not a DBMS, WAL protocol, or GPU runtime. It
+does not provide atomicity, isolation, SQL recovery, secondary-index
+maintenance, replication, DDL safety, CUDA execution, or pgwire/session
+multiplexing.
+
+The design assumes memory-controller recovery tables in an ADR domain.
+GPU DB cannot assume such hardware exists for NVMe, ordinary DRAM, HBM,
+or object storage. The portable version is a software-owned witness log
+or manifest protocol, which will have different costs and failure modes.
+
+ASAP restores memory by undoing speculative writes, while a database
+usually recovers by replaying a logical WAL and rebuilding derived state.
+Undo-style descriptor repair is attractive only for narrow metadata; the
+canonical row history should still be recovered from WAL/MVCC state.
+
+The evaluation is simulated. The paper models Optane-like NVM and a
+small multicore system, and it reports update-heavy persistent data
+structure behavior rather than production SQL commit latency, NVMe
+queueing, GPU snapshot invalidation, or checkpoint/replay workloads.
+
+Speculation can hide ordering stalls but create hidden recovery debt.
+GPU DB must expose witness-table occupancy, delayed publication depth,
+fallback counts, and recovery replay cost before adopting any similar
+approach for tier metadata.
+
+**Benchmark candidates:**
+
+- Add a durable-descriptor publication microbenchmark with three modes:
+  strict WAL-ordered install, asynchronous install with replay-only
+  witnesses, and speculative install with undo/delay witnesses. Gate:
+  crash recovery must reconstruct exactly the same route/residency state
+  as strict ordered install.
+- Prototype bounded witness tables for route descriptors and resident
+  fragment manifests. When the witness table fills, fall back to
+  conservative publication. Measure write p50/p99, fallback rate,
+  witness occupancy, and recovery time.
+- Simulate cross-owner dependencies among WAL, catalog, residency, and
+  checkpoint owners. Compare direct completion messages with polling a
+  global frontier. Measure owner queue wait, descriptor publish latency,
+  and stale-route rejection.
+- Test speculative warm-tier metadata writes across two physical devices
+  or queues. Failure condition: recovery cannot distinguish a safe
+  committed descriptor from an early descriptor whose predecessor never
+  became durable.
+- Add crash-state tests for undo, delay, and replay witnesses around
+  index split/merge, resident fragment admission, route invalidation, and
+  metadata free/reuse.
+- Measure whether coalescing derived metadata writes within an epoch
+  reduces write amplification without increasing commit visibility
+  latency or retained-read fallback rate.
+
 ### 2026-06-07 - Jiffy makes batched index mutation and snapshots one publication protocol
 
 **Citation:** Tadeusz Kobus, Maciej Kokocinski, and Pawel T.

@@ -691,13 +691,14 @@ Append new candidates here as each paper is processed.
   metadata for GPU DB route maintenance, checkpoint replay, or warm-tier
   updates without weakening SQL-visible side effects. Journal entry added
   2026-06-06; the queued DOI was corrected from `.3446748` to `.3446730`.
-- `queued` — **ASAP: A Speculative Approach to Persistence**, Yadalam,
+- `reviewed` — **ASAP: A Speculative Approach to Persistence**, Yadalam,
   Shah, Yu, and Swift, HPCA 2022.
   URL: `https://doi.org/10.1109/HPCA53966.2022.00070`
   Why: SpecPMT discusses speculative persistence approaches that relax
   ordering around persistence; useful for comparing when GPU DB can safely
   speculate on durable descriptor publication and when it must return
-  explicit overload or wait for WAL-before-visibility.
+  explicit overload or wait for WAL-before-visibility. Journal entry added
+  2026-06-07 from the author PDF.
 - `queued` — **MOD: Minimally Ordered Durable Data Structures**, Haria,
   Hill, and Swift, ASPLOS 2020.
   URL: `https://doi.org/10.1145/3373376.3378482`
@@ -713,6 +714,13 @@ Append new candidates here as each paper is processed.
   recovery-via-resumption design; useful for isolating when compiler-marked
   deterministic replay regions beat conventional undo/redo logging for future
   warm-tier metadata or route-publication records.
+- `queued` — **Asynchronous Persistence with ASAP**, Yadalam, Shah,
+  Yu, and Swift, arXiv 2023.
+  URL: `https://arxiv.org/abs/2302.13394`
+  Why: follow-up from the ASAP line that appears to move speculation toward
+  asynchronous atomic-region commit; useful for checking whether bounded
+  recovery witnesses can support delayed commit acknowledgement without
+  weakening WAL-before-visibility.
 
 ### Database file-system design, storage, and indexing
 
