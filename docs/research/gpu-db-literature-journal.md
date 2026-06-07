@@ -100339,3 +100339,147 @@ chunked, admitted explicitly, or routed through bulk ingest owners.
   old warm-tier versions and route metadata retire under bounded memory without
   blocking short retained reads or making bulk writes monopolize the mutation
   owner.
+
+### 2026-06-07 - MOD makes durability fast by minimizing ordered persist barriers
+
+**Citation:** Swapnil Haria, Mark D. Hill, and Michael M. Swift. "MOD:
+Minimally Ordered Durable Datastructures for Persistent Memory." ASPLOS 2020,
+pp. 775-788. DOI: `https://doi.org/10.1145/3373376.3378472`. Retrieved
+2026-06-07 from the author PDF/preprint:
+`https://pages.cs.wisc.edu/~swapnilh/resources/asplos20_mod_preprint.pdf`.
+
+**Category:** WAL, logging, and read/write throughput; database storage and
+indexing; future persistent-memory tiering.
+
+**Relevance tags:** persistent memory; crash consistency; failure-atomic
+sections; minimal persist ordering; out-of-place updates; shadow paging;
+structural sharing; functional data structures; durable route metadata;
+future CXL/NVM; flush/fence cost; recoverable metadata.
+
+**Core idea:** MOD takes a middle path between handcrafted persistent data
+structures and general persistent-memory software transactions. Instead of
+overwriting durable state in place and logging enough undo/redo information to
+recover, MOD creates a new durable shadow version out-of-place, flushes the
+new cache lines with as little ordering as possible, then atomically publishes
+the root pointer. The paper's key performance claim is that persistent-memory
+software often loses more time to ordered persist barriers than to the raw
+number of flushed bytes.
+
+The transferable GPU DB idea is **publish durable metadata as a small ordered
+root over unordered durable body writes**. Future warm-tier route descriptors,
+resident-fragment manifests, visibility-directory roots, or persistent index
+roots should be built as unpublished shadows first. The expensive ordering
+boundary should occur only at the publish point that makes the new version
+recoverable and visible to recovery, not after every internal metadata write.
+
+**Concrete mechanisms:**
+
+- MOD implements map, set, stack, queue, and vector as persistent C++ data
+  structures with familiar update interfaces. A basic interface hides
+  versioning for a single update; a composition interface lets callers build
+  several shadows and commit them together.
+- The implementation uses functional shadowing: updates are non-destructive,
+  allocate new persistent-memory nodes, reuse unchanged structure from the
+  previous version, flush modified cache lines, and then publish the new root
+  in a commit step.
+- Structural sharing keeps shadow-paging space overhead small. Tree-shaped
+  functional data structures reuse most unchanged internal nodes, avoiding a
+  full copy of the old structure for every update.
+- Out-of-place writes do not need undo logging because the old root remains
+  valid until commit. If a crash happens before commit, recovery can discard
+  incomplete shadows by reachability from durable roots.
+- MOD's common-case commit has one ordering point. The paper's Optane
+  measurements show that batching multiple `clwb` flushes behind one `sfence`
+  can be much faster than fencing each flush separately.
+- Reference counts used for reclamation are volatile rather than durable. On
+  recovery, the latest reachable version can be scanned and reference counts
+  reconstructed, while unreachable persistent allocations are reclaimed.
+- Multi-structure updates are composed by constructing all new shadows first
+  and then atomically replacing the relevant root pointers in one commit step.
+- Evaluation used real Intel Optane DC Persistent Memory in App Direct mode.
+  Against Intel PMDK v1.5 transactions, MOD reports average speedups around
+  43% for pointer-based data-structure microbenchmarks and 36% for application
+  benchmarks. Vector workloads were slower because tree-based functional
+  vectors lose the locality of dense arrays.
+
+**GPU DB mapping:** GPU DB should apply MOD to metadata publication, not to
+SQL tuple durability wholesale. WAL remains the current authority, but many
+derived and future-tier structures have MOD-shaped lifecycles: route
+certificate tables, resident segment manifests, visibility directories,
+warm-tier free lists, small persistent index roots, and checkpoint/object
+manifest generations.
+
+The publication rule should be: write the new body into owner-local durable or
+reconstructable storage, flush body cache lines without forcing intermediate
+global order, then publish a compact root or generation marker after a single
+durability barrier. Recovery should choose the old root or the new root, never
+a partially installed structure. This fits the P8 principle that GPU-resident
+and CPU-derived structures are explicit, versioned, observable acceleration
+state rather than hidden mutable truth.
+
+For route metadata, MOD suggests a two-level shape. Wide descriptors,
+visibility maps, and placement arrays can be immutable shadow bodies. A small
+root record carries relation id, catalog generation, source WAL boundary,
+visibility generation, layout id, checksum, and root pointer or object id.
+Only the root record is the ordered visibility point. Readers and recovery
+ignore unrooted bodies.
+
+For owner domains, MOD argues for per-owner shadow allocation and commit
+tokens. Mutation, catalog, residency, and GPU execution owners can each build
+new metadata bodies without taking global persistence locks, then publish
+roots through explicit generation sequencing. Cross-owner publication should
+look like MOD's composition interface: build all shadows first, then publish a
+single joint generation or abort without exposing partial roots.
+
+The volatile reference-count lesson maps to GPU DB cache metadata. Refcounts,
+LRU state, route-hotness counters, and temporary pin counts should remain
+volatile where possible and be rebuilt or invalidated after recovery. Durable
+metadata should prove which version is committed, not preserve every hot-path
+bookkeeping counter.
+
+**Risks and mismatches:** MOD is a persistent-memory data-structure library,
+not a database recovery protocol. It does not replace WAL-before-visibility,
+transaction isolation, checkpoint/archive replay, distributed replication, or
+SQL-visible MVCC semantics.
+
+Out-of-place metadata can increase bytes written and memory pressure. MOD's
+vector results are a warning: structural sharing is not automatically better
+for dense arrays or GPU-friendly column buffers. GPU DB should use MOD-style
+root publication for metadata and manifests, while keeping hot column payloads
+dense and contiguous.
+
+Recovery by reachability scan is acceptable only if bounded. Large warm-tier
+segments, object stores, or NVMe manifests may need persistent allocation
+summaries, checkpoints, or generation indexes so startup does not scan an
+unbounded heap before serving traffic.
+
+The paper evaluates Optane-era persistent memory and single-node data
+structures. GPU DB's current tiers include WAL files, CPU memory, GPU HBM,
+NVMe, and future tiers, so the exact `clwb`/`sfence` economics may not carry
+over to NVMe or object storage. The invariant that survives is minimizing
+forced ordering points in the commit-critical path.
+
+**Benchmark candidates:**
+
+- Build a route-manifest publication microbenchmark with three modes:
+  in-place update plus log, full CoW manifest rewrite, and MOD-style shadow
+  body plus compact root publish. Measure flush/write count, ordered barriers,
+  p50/p99 publish latency, recovery choice, and stale-route rejection.
+- Add a crash matrix for persistent route roots: crash before body flush, after
+  body flush but before root publish, during root publish, and after root
+  publish. Gate: recovery always sees either the old generation or the new
+  generation and never routes through a partial body.
+- Prototype volatile hot-path counters over durable metadata roots. Rebuild
+  refcounts, route-hotness, and residency pins after restart from committed
+  roots. Failure condition: recovery requires a durable counter to determine
+  correctness.
+- Compare dense resident column refresh against structural-sharing metadata
+  refresh. Gate: structural sharing is used only where it reduces ordered
+  metadata publication cost without damaging GPU scan locality.
+- Measure cross-owner composition for catalog plus residency metadata. Build
+  both shadows, publish one joint generation token, and verify readers never
+  observe a catalog generation without its matching residency/visibility
+  directory.
+- For future CXL/NVM tiers, simulate ordered persist barriers separately from
+  bytes written. Gate: batching unordered body writes behind one root-publish
+  barrier improves commit latency without increasing recovery ambiguity.

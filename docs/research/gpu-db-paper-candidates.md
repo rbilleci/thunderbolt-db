@@ -778,13 +778,15 @@ Append new candidates here as each paper is processed.
   speculate on durable descriptor publication and when it must return
   explicit overload or wait for WAL-before-visibility. Journal entry added
   2026-06-07 from the author PDF.
-- `queued` — **MOD: Minimally Ordered Durable Data Structures**, Haria,
+- `reviewed` — **MOD: Minimally Ordered Durable Data Structures**, Haria,
   Hill, and Swift, ASPLOS 2020.
-  URL: `https://doi.org/10.1145/3373376.3378482`
+  URL: `https://doi.org/10.1145/3373376.3378472`
+  PDF: `https://pages.cs.wisc.edu/~swapnilh/resources/asplos20_mod_preprint.pdf`
   Why: SpecPMT cites MOD as evidence that ordering can be minimized for
   durable data structures; useful for deriving minimal persist dependencies
   for route descriptors, resident metadata, and future CXL/NVM warm-tier
-  structures.
+  structures. Journal entry added 2026-06-07 from the author PDF/preprint
+  and DOI metadata; the queued DOI suffix was corrected.
 - `queued` — **iDO: Compiler-Directed Failure Atomicity for Nonvolatile
   Memory**, Lee et al., MICRO 2018.
   URL: `https://doi.org/10.1109/MICRO.2018.00051`
@@ -800,6 +802,14 @@ Append new candidates here as each paper is processed.
   asynchronous atomic-region commit; useful for checking whether bounded
   recovery witnesses can support delayed commit acknowledgement without
   weakening WAL-before-visibility.
+- `queued` — **Delegated Persist Ordering**, Kolli et al., MICRO 2016.
+  URL: `https://doi.org/10.1109/MICRO.2016.7783761`
+  Author PDF:
+  `https://aasheeshkolli.wordpress.com/wp-content/uploads/2016/08/delegated-persist-ordering-micro16.pdf`
+  Why: MOD motivates minimizing ordered persist barriers in software; DPO is a
+  hardware/persistency-model follow-up for comparing whether future PM/CXL
+  tiers should expose explicit persist-order queues rather than making GPU DB
+  route-publication threads stall on synchronous fences.
 
 ### Database file-system design, storage, and indexing
 
