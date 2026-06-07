@@ -38,6 +38,180 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - RapidLane turns hot shared counters into deferred commit-time deltas
+
+**Citation:** George Mitenkov, Igor Kabiljo, Zekun Li, Alexander
+Spiegelman, Satyanarayana Vusirikala, Zhuolun Xiang, Aleksandar
+Zlateski, Nuno P. Lopes, and Rati Gelashvili. "Deferred Objects to
+Enhance Smart Contract Programming with Optimistic Parallel Execution."
+arXiv 2024. Retrieved 2026-06-07 from arXiv:
+`https://arxiv.org/abs/2405.06117`, `https://arxiv.org/pdf/2405.06117`.
+
+**Category:** transaction processing / write path and runtime / HFT /
+session scale, with secondary relevance to MVCC / snapshot / visibility.
+
+**Relevance tags:** RapidLane; deferred objects; Block-STM; optimistic
+parallel execution; hot-key contention; deterministic transaction order;
+deferred counters; delta logs; rolling commit; commit-time validation;
+semantic deferral; misprediction; read-write conflict removal; hot write
+windows; route hints.
+
+**Core idea:** RapidLane observes that some apparent read-write conflicts
+on hot shared objects do not need to be conflicts during transaction
+execution. A transaction can record an operation against a deferred object
+instead of reading and writing the current value immediately. The engine
+later validates the prediction and applies the operation at commit time in
+the deterministic transaction order.
+
+For GPU DB, the transferable idea is a narrow semantic fast path for
+hot-key write windows: do not send every hot increment, bounded decrement,
+or monotone counter update through a fully serialized read-modify-write
+path if the SQL operation can be expressed as a typed deferred delta with
+an explicit precondition and commit-time proof. The idea is attractive for
+counters, quotas, append-position allocators, and route-maintenance
+statistics, but it should not become a general bypass around WAL, MVCC,
+or SQL expression semantics.
+
+**Concrete mechanisms:**
+
+- Deferred objects expose `create`, `reveal`, `update`, `map`, and
+  `combine`. In the evaluated implementation, supported deferred fields
+  are integer counters and small strings up to 256 bytes; counters support
+  addition/subtraction within fixed lower and upper bounds, and integer
+  deferred objects can be mapped once.
+- The VM extends a transaction output with per-deferred-object logs. An
+  update log records the function and the predicted precondition outcome;
+  a map/combine log can refer to a prefix of another deferred object's log.
+  Calling `reveal` materializes the value and reintroduces read-write
+  conflict pressure.
+- RapidLane integrates with Block-STM's ordered optimistic execution. The
+  normal write-set goes into Block-STM's multi-version memory; deferred
+  object updates go into a separate `MVDelayedFields` structure keyed by
+  deferred object id and transaction index.
+- Counter logs are compressed into a delta: a summed update plus history
+  constraints represented by four inequalities for the supported bounded
+  arithmetic shape. This avoids replaying long per-transaction histories
+  at commit time.
+- Delta traversal finds the latest prior delta or committed value for a
+  deferred object, follows source ids for mapped objects, applies deltas in
+  reverse traversal order, and can merge deltas during traversal. Revealed
+  values and committed values terminate traversal.
+- RapidLane deliberately ignores estimated markings in `MVDelayedFields`
+  unless a transaction re-execution changes the delta for that deferred
+  object. This avoids over-invalidating long delta chains; once a delta
+  changes, the design falls back to vanilla Block-STM-style estimate
+  handling for that object.
+- Rolling commit replaces Block-STM's block-granularity lazy commit. A
+  transaction can commit when the previous transaction is committed and
+  the latest required validation wave for the transaction has succeeded.
+  The implementation tracks global validation waves and per-transaction
+  required, triggered, and validated wave counters.
+- Immediately before commit, RapidLane validates revealed values and delta
+  history constraints against the committed state before the transaction.
+  If deferred validation fails, the transaction is re-executed from the
+  correct state and then committed.
+- Post-commit processing inserts the final deferred values into the normal
+  transaction output write-set.
+- The evaluation uses Aptos infrastructure on a single 60-core AMD Milan
+  Google Cloud machine, with 10 blocks of 10,000 transactions per block and
+  200,000 initialized accounts. Reported gains include up to 10.3x for
+  sponsored transactions in the main text, up to 15.2x in the figure
+  caption for a single deferred fee payer, up to 11.6x for single-receiver
+  transfers, up to 10.1x for limited NFT minting, and up to 12x in the
+  paper's conclusion for real workloads. Under a synthetic worst case with
+  roughly 50% counter-precondition prediction accuracy, throughput still
+  exceeded the sequential baseline by up to 1.8x; with 10% reveals,
+  throughput was up to 4.4x lower than no reveals.
+
+**GPU DB mapping:** RapidLane maps best to explicit stored-procedure or
+engine-native routes whose conflict semantics are known before execution.
+Examples include `counter = counter + delta` with fixed bounds, quota
+reservation, per-partition sequence allocation, append slot reservation,
+and route/cache-maintenance counters. These operations can enter a
+bounded hot-key write window as typed deltas instead of repeatedly reading
+the current row version on the request path.
+
+The `MVDelayedFields` idea maps to an owner-owned deferred-delta lane next
+to WAL/MVCC state. The mutation owner still decides commit order and
+durability, but compatible hot operations can be accumulated as compact
+deltas, validated at deterministic generation boundaries, and then
+published as ordinary MVCC versions or metadata updates. GPU execution
+could consume batches of these deltas only after the CPU owner has fixed
+their visibility generation.
+
+Rolling commit is relevant to micro-batched writes. Instead of waiting for
+a whole batch to finish before making any prefix visible, GPU DB can
+consider prefix publication when all earlier commands have durable WAL and
+the current command's validation wave is complete. That can reduce latency
+for long write windows while preserving ordered visibility.
+
+The reveal penalty is a useful route-admission signal. If a SQL statement
+needs the current value for branching, returns the updated value, touches
+secondary indexes with arbitrary predicates, or mixes deferred and
+non-deferred state in a way that exposes the value, it should leave the
+deferred lane and use the normal mutation owner path.
+
+The history-constraint compression suggests benchmarkable proof objects:
+for supported bounded arithmetic routes, the engine can validate a compact
+interval proof rather than replaying every operation. That shape is much
+closer to SQL-safe route specialization than a black-box learned hot-key
+policy.
+
+**Risks and mismatches:** RapidLane is a smart-contract/blockchain paper,
+not a SQL DBMS. It relies on deterministic block order, sandboxed VM
+execution, explicit language/runtime support for deferred objects, and a
+state model where transaction outputs are later applied to a global
+key-value state. GPU DB has SQL expressions, secondary indexes, ad hoc
+queries, WAL, MVCC snapshots, DDL, crash recovery, replication concerns,
+and client-visible result sets.
+
+The paper's safe deferred-object set is deliberately narrow. General SQL
+updates are not automatically deferrable, and non-commutative operations
+are safe only when their order, preconditions, and final materialization
+are explicitly represented. Treating arbitrary updates as deltas would be
+a correctness bug.
+
+Reveals materially hurt performance and can fall below the sequential
+baseline at high reveal rates. GPU DB should treat "returning current
+value" or branching on hot state as a separate route class, not as a small
+variation of the deferred fast path.
+
+The design validates at commit time, so misprediction shifts work later
+and can trigger re-execution. Under strict p99 latency goals, the engine
+needs a fallback threshold that disables semantic deferral for a route when
+prediction failure, reveal rate, or delta-chain depth rises.
+
+The evaluation is single-node blockchain execution, not durable SQL
+transaction processing. It does not evaluate WAL flush cost, relational
+index maintenance, GPU kernel scheduling, pgwire/session multiplexing,
+long SQL snapshots, or crash recovery.
+
+**Benchmark candidates:**
+
+- Prototype a one-table hot-counter stored procedure with three modes:
+  serialized read-modify-write, optimistic write-window validation, and
+  typed deferred deltas with compact interval validation. Gate: all modes
+  must produce identical MVCC-visible results and WAL replay state.
+- Add a bounded-quota benchmark where transactions reserve from a shared
+  counter with success/failure preconditions. Measure throughput, p50/p99,
+  misprediction rate, retry count, and visibility-lag per committed prefix.
+- Measure reveal sensitivity by varying the fraction of requests that need
+  `RETURNING counter` or branch on the current value. Failure condition:
+  deferred mode remains enabled when reveal-heavy traffic exceeds the
+  normal owner path's p99 latency.
+- Test prefix commit for micro-batched writes: publish durable, validated
+  prefixes while later commands in the batch still execute. Gate:
+  WAL-before-visibility and snapshot reads must observe exactly the
+  committed prefix, never speculative suffix state.
+- Compare replay cost for full per-operation logs versus compressed proof
+  records over hot counters, append slots, and route-maintenance stats.
+  Minimum proof gate: crash replay must reconstruct the same final values
+  and reject incomplete or out-of-order proof records.
+- Add a route-admission policy that disables deferred deltas when
+  prediction failure, reveal rate, delta-chain depth, or validation retries
+  exceed thresholds. Measure whether this protects p99 latency under mixed
+  hot/cold write traffic.
+
 ### 2026-06-07 - TIPS keeps persistent indexes out of the request's critical path
 
 **Citation:** R. Madhava Krishnan, Wook-Hee Kim, Xinwei Fu, Sumit Kumar

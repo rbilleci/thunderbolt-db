@@ -6088,13 +6088,29 @@ Append new candidates here as each paper is processed.
   the Forerunner review; useful for contrasting object-model OCC and
   contention-aware execution with GPU DB's hot-key write-window admission.
   Journal entry added 2026-06-07 from arXiv v1.
-- `queued` — **Deferred Objects to Enhance Smart Contract Programming with
+- `reviewed` — **Deferred Objects to Enhance Smart Contract Programming with
   Optimistic Parallel Execution**, Mitenkov et al., arXiv 2024.
   URL: `https://arxiv.org/abs/2405.06117`
   Why: NEMO contrasts RapidLane's deferred-object path as a way to turn
   conflict-heavy smart-contract operations into parallelizable work; useful for
   comparing semantic deferral, predicted results, and commit-time validation
   against GPU DB's hot-key write-window and route-hint admission designs.
+  Journal entry added 2026-06-07 from arXiv v1.
+- `queued` — **Utilizing Parallelism in Smart Contracts on Decentralized
+  Blockchains by Taming Application-Inherent Conflicts**, Garamvolgyi,
+  Liu, Zhou, Long, and Wu, ICSE 2022.
+  URL: `https://doi.org/10.1145/3510003.3510086`
+  Why: RapidLane contrasts deferred objects with prior attempts to tame
+  application-inherent smart-contract conflicts; useful for comparing
+  programmer-visible conflict structure, semantic hints, and high-contention
+  execution before GPU DB exposes any hot-write route annotations.
+- `queued` — **Practical Smart Contract Sharding with Ownership and
+  Commutativity Analysis**, Pirlea, Kumar, and Sergey, PLDI 2021.
+  URL: `https://doi.org/10.1145/3453483.3454112`
+  Why: RapidLane discusses commutativity and sharding as related ways to avoid
+  shared-state bottlenecks; useful for comparing ownership and commutativity
+  declarations with GPU DB's owner domains, partition-local writes, and
+  semantic deferred-delta lanes.
 - `reviewed` — **Processing Transactions in a Predefined Order**, Saad et al.,
   PPoPP 2019.
   URL: `https://doi.org/10.1145/3293883.3295730`
