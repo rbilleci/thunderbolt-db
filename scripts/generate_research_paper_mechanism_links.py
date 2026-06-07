@@ -377,6 +377,21 @@ CATEGORY_FALLBACKS: list[tuple[str, list[str]]] = [
 ]
 
 
+REVIEW_STATUS_BY_CONFIDENCE = {
+    "high": "auto_accepted",
+    "medium": "auto_accepted",
+    "low": "pending_low_confidence_review",
+    "needs_review": "manual_review_required",
+}
+
+REVIEW_PRIORITY_BY_CONFIDENCE = {
+    "high": "none",
+    "medium": "none",
+    "low": "normal",
+    "needs_review": "high",
+}
+
+
 def slugify(value: str) -> str:
     value = value.lower()
     value = re.sub(r"`([^`]+)`", r"\1", value)
@@ -499,6 +514,8 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     records: list[dict] = []
     mechanism_counts: Counter = Counter()
     confidence_counts: Counter = Counter()
+    review_status_counts: Counter = Counter()
+    review_priority_counts: Counter = Counter()
     type_counts: Counter = Counter()
     unlinked: list[str] = []
 
@@ -507,8 +524,13 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
         if not links:
             unlinked.append(entry["id"])
         for link in links:
+            confidence = link["confidence"]
+            link["review_status"] = REVIEW_STATUS_BY_CONFIDENCE[confidence]
+            link["review_priority"] = REVIEW_PRIORITY_BY_CONFIDENCE[confidence]
             mechanism_counts[link["mechanism_id"]] += 1
-            confidence_counts[link["confidence"]] += 1
+            confidence_counts[confidence] += 1
+            review_status_counts[link["review_status"]] += 1
+            review_priority_counts[link["review_priority"]] += 1
         type_counts[entry["entry_type"]] += 1
         records.append(
             {
@@ -538,6 +560,11 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "mechanisms_with_links": len(mechanism_counts),
             "mechanisms_without_links": len(mechanisms_without_links),
             "confidence_counts": dict(sorted(confidence_counts.items())),
+            "review_status_counts": dict(sorted(review_status_counts.items())),
+            "review_priority_counts": dict(sorted(review_priority_counts.items())),
+            "links_requiring_review": review_status_counts["pending_low_confidence_review"]
+            + review_status_counts["manual_review_required"],
+            "low_confidence_links": confidence_counts["low"],
         },
         "mechanism_counts": dict(sorted(mechanism_counts.items())),
         "mechanisms_without_links": mechanisms_without_links,
@@ -550,6 +577,8 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     names = {item["id"]: item["name"] for item in mechanisms["mechanisms"]}
     mechanism_counts = Counter(index["mechanism_counts"])
     confidence_counts = index["summary"]["confidence_counts"]
+    review_status_counts = index["summary"]["review_status_counts"]
+    review_priority_counts = index["summary"]["review_priority_counts"]
     records = index["records"]
     fallback_records = [
         record
@@ -591,6 +620,18 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     for confidence, count in sorted(confidence_counts.items()):
         lines.append(f"- {confidence}: {count}")
 
+    lines.extend(["", "## Review Triage", ""])
+    lines.append(f"- links requiring review: {index['summary']['links_requiring_review']}")
+    lines.append(f"- low-confidence links: {index['summary']['low_confidence_links']}")
+    lines.append("")
+    lines.append("Review status counts:")
+    for status, count in sorted(review_status_counts.items()):
+        lines.append(f"- {status}: {count}")
+    lines.append("")
+    lines.append("Review priority counts:")
+    for priority, count in sorted(review_priority_counts.items()):
+        lines.append(f"- {priority}: {count}")
+
     lines.extend(["", "## Mechanism Coverage", ""])
     for mechanism_id, count in mechanism_counts.most_common():
         lines.append(f"- `{mechanism_id}` ({names.get(mechanism_id, mechanism_id)}): {count}")
@@ -631,7 +672,8 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     lines.extend(["", "## Paper Entries", ""])
     for record in records:
         link_text = ", ".join(
-            f"{link['mechanism_id']}:{link['confidence']}" for link in record["mechanism_links"]
+            f"{link['mechanism_id']}:{link['confidence']}:{link['review_status']}"
+            for link in record["mechanism_links"]
         )
         lines.append(f"- `{record['id']}` ({record['entry_type']}): {link_text}")
 
