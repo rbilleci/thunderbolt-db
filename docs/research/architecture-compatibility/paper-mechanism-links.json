@@ -100637,8 +100637,8 @@
               "hot write",
               "occ"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The last four reviewed papers, FlexPushdownDB, HSM, OCC batching, and Crystal, converge on one practical rule: every fast route needs a certificate that explains why it is fast now, not just why it was fast in isolation.",
             "support_reason": "Matched journal terms (hot write, occ) to Deterministic hot-write templates."
           },
@@ -109218,8 +109218,8 @@
               "frontier",
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Add a route-certificate log for retained reads and CPU fallback: visibility frontier, tier frontier, code-shape choice, and fallback reason. - Calibrate CPU scan variants before any GPU resident route claims victory for selective filters or simple aggregates. - Make background refresh/tier migration prove it does not block WAL publication, short retaine...",
             "support_reason": "Matched journal terms (frontier, snapshot) to Snapshot frontier vectors."
           },
@@ -110550,8 +110550,8 @@
               "frontier",
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "TiDB says a retained analytical route is serviceable only when it can prove its timestamp, schema, and replay frontier.",
             "support_reason": "Matched journal terms (frontier, snapshot) to Snapshot frontier vectors."
           },
@@ -111030,8 +111030,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper is a specification overview by UE authors, not a database system paper, but its transport shape is directly relevant to a GPU DB that may eventually serve very large session counts through gateway workers, accelerator fabrics, or remote GPU/storage tiers.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -111524,8 +111524,8 @@
               "admission",
               "flow control"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Add route certificates that include frontier, placement, and flow proof fields for accepted, fallback, and rejected routes. - Measure publication p999 and route-admission p999 together, because a cheap GPU kernel is not useful if snapshot or flow-control boundaries spike. - Run CPU/GPU placement benchmarks across retained, cold-transfer, CPU-fallback, a...",
             "support_reason": "Matched journal terms (credit, admission, flow control) to Vector-credit admission."
           },
@@ -112758,8 +112758,8 @@
               "adaptive",
               "model"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Both use the same query plans, algorithms, data structures, and parallelization framework, so the comparison isolates execution model rather than whole-DBMS differences.",
             "support_reason": "Matched journal terms (adaptive, model) to Learned optimizer advisor."
           },
@@ -113225,8 +113225,8 @@
               "learned",
               "adaptive"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A CPU warm-tier learned or piecewise-linear index may save memory while paying false-positive/refinement cost.",
             "support_reason": "Matched journal terms (learned, adaptive) to Learned optimizer advisor."
           },
@@ -113578,8 +113578,8 @@
               "retention",
               "cleanup"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The transaction core still supplies a commit protocol, version numbers, and tracking items, but datatype callbacks own the concrete locking, validation, installation, rollback, and cleanup rules.",
             "support_reason": "Matched journal terms (retention, cleanup) to MVCC garbage-collection frontiers."
           },
@@ -114097,8 +114097,8 @@
             "matched_terms": [
               "fresh"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A retained read, grouped lookup batch, decompression pass, refresh job, and long scan should declare not only \"uses GPU,\" but also whether it is compute-bound, VRAM-bandwidth-bound, launch-bound, or output-bound.",
             "support_reason": "Matched journal terms (fresh) to HTAP freshness router."
           },
@@ -114302,8 +114302,8 @@
               "cache",
               "buffer"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Only reorderable classes should be packet-sprayed or path-switched freely; ordered classes need either a single lane or a bounded reorder buffer with explicit memory admission.",
             "support_reason": "Matched journal terms (cache, buffer) to Multi-tier placement policy."
           },
@@ -114325,8 +114325,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The transferable idea for GPU DB is not \"use RDMA now.\" It is that a high-throughput transport can change routes frequently only if it also has a bounded mechanism that restores the ordering contract required by the receiver.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -114462,8 +114462,8 @@
             "matched_terms": [
               "fresh"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A retained read, decompression pass, refresh chunk, index probe, and scan fragment can interfere differently.",
             "support_reason": "Matched journal terms (fresh) to HTAP freshness router."
           },
@@ -114510,8 +114510,8 @@
               "scheduling",
               "resource"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Best-effort work is allowed to run beside a high-priority job only when its kernel is small enough and has a complementary resource profile, such as memory-bound work beside compute-bound work.",
             "support_reason": "Matched journal terms (scheduler, scheduling, resource) to Resource-DAG scheduling."
           },
@@ -116070,8 +116070,8 @@
               "abort",
               "occ"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Deadlock occurs when paused links form a directed cycle and every switch in that cycle holds buffer needed by its upstream neighbor while waiting for downstream buffer to drain. - Existing proactive approaches try to eliminate cyclic buffer dependency through routing restrictions or structured buffer pools.",
             "support_reason": "Matched journal terms (deterministic, abort, occ) to Deterministic hot-write templates."
           },
@@ -116390,8 +116390,8 @@
               "proof",
               "publication proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Backpressure Flow Control and the HotNets deadlock paper argue that runtime progress depends on local, bounded pressure signals and escape paths, not only on average throughput or static topology.",
             "support_reason": "Matched journal terms (depends, proof, publication proof) to Dependency witnesses."
           },
@@ -116878,8 +116878,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Parquet's dictionary encoding is not generally order-preserving, and real queries include strings, UDFs, cross-table predicates, nulls, and nested structures.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -116902,8 +116902,8 @@
               "fallback",
               "cpu route"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The planner can then choose CPU compressed scan, CPU prefilter plus GPU transfer, resident GPU scan, or fallback based on measured thresholds instead of a static \"GPU is faster\" rule.",
             "support_reason": "Matched journal terms (fallback, cpu route) to CPU fallback policy."
           },
@@ -117607,8 +117607,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Selection Pushdown, Vegito, Taurus NDP, and BCC converge on the same design shape from different parts of the stack: accelerate only the part of the path whose correctness proof is cheap, and carry a precise fallback for the rest.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -117630,8 +117630,8 @@
               "dependency",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Selection Pushdown, Vegito, Taurus NDP, and BCC converge on the same design shape from different parts of the stack: accelerate only the part of the path whose correctness proof is cheap, and carry a precise fallback for the rest.",
             "support_reason": "Matched journal terms (dependency, proof) to Dependency witnesses."
           },
@@ -117849,8 +117849,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It stores logical data in filter-friendly encodings instead of requiring the Parquet ecosystem to adopt a new durable file format. - String arrays use a cascade: dictionary encoding, bit-packed dictionary keys, and FSST-compressed dictionary values.",
             "support_reason": "Matched journal terms (ring, queue) to Owner-ring bundling."
           },
@@ -117873,8 +117873,8 @@
               "warm tier",
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For GPU DB, a \"Liquid-like\" warm tier could sit between CPU MVCC truth and GPU resident snapshots.",
             "support_reason": "Matched journal terms (warm tier, nvm) to Log-structured warm tier."
           },
@@ -118977,8 +118977,8 @@
               "depends",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "One Loop Does Not Fit All says execution shape itself is a route decision that depends on selectivity and data movement.",
             "support_reason": "Matched journal terms (depends, proof) to Dependency witnesses."
           },
@@ -119432,8 +119432,8 @@
               "ordered",
               "depends"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A retained GPU scan, a warm CPU fallback pipeline, a top-k route, a merge-like ordered route, and a batched lookup route may each want different control flow.",
             "support_reason": "Matched journal terms (ordered, depends) to Dependency witnesses."
           },
@@ -121925,8 +121925,8 @@
               "ordering",
               "depends"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Instead of a leader sending accept messages to many replicas and receiving a fan-in of acknowledgements, replicas are ordered in a chain.",
             "support_reason": "Matched journal terms (witness, fence, ordered, ordering) to Dependency witnesses."
           },
@@ -122070,8 +122070,8 @@
               "visibility",
               "recovery"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Resident snapshot retirement, old MVCC delta cleanup, route metadata reclamation, DDL/catalog changes, replicated WAL membership, and local read routing should all answer the same questions: which generation/fence made this state visible, which later fence made it invalid for new readers, which physical execution contexts may still hold it, and which dura...",
             "support_reason": "Matched journal terms (wal, durability, checkpoint, visibility) to WAL-before-visibility boundary."
           },
@@ -124199,8 +124199,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For GPU DB, the common lesson is that 1M logical sessions should be represented at remote authorities by compact domain, cohort, or generation facts, not by per-session remote atomics or queue-pair-shaped state.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -124424,8 +124424,8 @@
               "handle",
               "remote memory"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "In local terms, that maps to request descriptors that carry route generation, snapshot boundary, buffer handle, and response-ring identity, rather than forcing the owner or GPU worker to retain every session's full state.",
             "support_reason": "Matched journal terms (handle, remote memory) to Stable handle indirection."
           },
@@ -125643,8 +125643,8 @@
               "fresh",
               "read-committed"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Template robustness certifies which read-committed transaction shapes are cheap enough to run directly.",
             "support_reason": "Matched journal terms (fresh, read-committed) to HTAP freshness router."
           },
@@ -126405,8 +126405,8 @@
               "retention",
               "long readers"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Version-graph retention benchmark across HBM, DRAM, NVMe, and WAL replay. - Logical read-index prototype that records proof metadata for every physical source used by a retained query. - Adaptive owner-side batching benchmark for WAL admission and resident refresh, with latency ceilings and explicit overload/fallback reasons. - Split/merge route-generat...",
             "support_reason": "Matched journal terms (retention, long readers) to MVCC garbage-collection frontiers."
           },
@@ -127689,8 +127689,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Instead of feeding only table statistics to a model, GPU DB can maintain compact route-state vectors: resident row counts, per-column min/max or histograms, invalidation age, visibility generation, compressed-byte estimates, HBM/DRAM/NVMe placement, GPU queue depth, pinned-buffer pressure, and recent fallback outcomes.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -129168,8 +129168,8 @@
               "fallback",
               "escape hatch"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The design track for GPU DB should therefore treat every high-throughput route as a credited fragment with an escape hatch.",
             "support_reason": "Matched journal terms (fallback, escape hatch) to CPU fallback policy."
           },
@@ -130718,8 +130718,8 @@
               "retention",
               "cleanup"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Reactors, OrcGC, and Justitia converge on a runtime design track: every hot path should name the owner that can safely act, the resource credits consumed to reach that owner, and the cleanup obligation left behind after publication.",
             "support_reason": "Matched journal terms (retention, cleanup) to MVCC garbage-collection frontiers."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4564,
-      "weak_direct": 107
+      "direct": 4596,
+      "weak_direct": 75
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 402,
+      "snippet contains matched mechanism term plus visible aliases": 434,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 101,
+      "substantive snippet contains only one matched mechanism term": 69,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
