@@ -95651,3 +95651,171 @@ record route eligibility, learned/adaptive ranking choices, and
 fallback/quarantine reasons. Passing throughput only counts if the
 history proves snapshot correctness and the recovery log proves no
 acknowledged durable commit was lost.
+
+### 2026-06-07 - Host interconnects need route credits, not just bandwidth counters
+
+**Citation:** Midhul Vuppalapati, Saksham Agarwal, Henry Schuch,
+Baris Kasikci, Arvind Krishnamurthy, and Rachit Agarwal.
+"Understanding the Host Network." ACM SIGCOMM 2024, 14 pages.
+Retrieved 2026-06-07 from the DOI page and author PDF:
+`https://doi.org/10.1145/3651890.3672271`,
+`https://www.cs.cornell.edu/~saksham/assets/pdf/UnderstandingHostNetwork.pdf`.
+
+**Category:** Runtime scale, HFT-style mechanics, and admission;
+multi-tier cache/data placement; high-concurrency networking.
+
+**Relevance tags:** host network; C2M; P2M; PCIe; DMA; NIC;
+storage; memory controller; DDIO; credit-based flow control; CHA;
+IIO; LFB; RPQ; WPQ; host-interconnect contention; route credits;
+GPU staging; pinned host buffers; NVMe; RDMA; gateway admission.
+
+**Core idea:** The paper argues that the "host network" - the
+processor, memory, and peripheral interconnect fabric inside a
+single server - should be treated like a credit-controlled network,
+not a free local bus. CPU-to-memory and peripheral-to-memory
+transfers traverse different domains with different credit limits and
+latencies. As a result, one workload can slow another even when
+aggregate memory bandwidth is not saturated.
+
+For GPU DB, the transferable idea is that route admission needs
+resource-domain credits. GPU kernels, pinned-buffer copies, NVMe
+reads, NIC ingress, response encoding, and CPU snapshot scans can
+all collide in memory-controller, cache-coherence, PCIe, and future
+CXL/NVLink domains. A planner that sees only HBM bytes, PCIe
+bytes, CPU cores, or DRAM bandwidth will miss the queueing regime
+that creates p99 latency spikes.
+
+**Concrete mechanisms:**
+
+- The paper decomposes host traffic into overlapping credit domains:
+  C2M-read, C2M-write, P2M-read, and P2M-write. A domain's maximum
+  throughput is bounded by roughly `credits * cacheline_size /
+  latency`, so a small latency increase can cut throughput when
+  credits are already full.
+- C2M-read requests hold line-fill-buffer credits until data returns
+  from DRAM. On the tested Intel systems the effective C2M-read
+  credit count is about 10-12 cachelines and unloaded latency is
+  roughly 70 ns.
+- P2M-write requests use IIO write-buffer credits and complete when
+  admitted to the memory controller. The paper measures an IIO
+  write-buffer limit near 92 cachelines and an unloaded P2M-write
+  latency around 300 ns on its servers.
+- P2M-read uses IIO read-buffer credits and waits for DRAM data to
+  return before PCIe completion. The authors could not measure the
+  precise IIO read-buffer occupancy on their server, but derive a
+  lower bound above 164 cachelines from CHA measurements.
+- The "blue" regime is the surprising one: C2M work slows down while
+  P2M work does not. Examples include CPU reads colocated with
+  storage/NIC DMA traffic. The paper reports 1.2-1.7x C2M throughput
+  degradation in one controlled quadrant even when memory bandwidth
+  is far from saturated.
+- The "red" regime is the previously observed saturation case: both
+  C2M and P2M degrade once memory bandwidth saturates, but not
+  always symmetrically.
+- Queueing can appear before bandwidth saturation because mixed
+  address streams increase DRAM row misses and expose bank load
+  imbalance. In the paper's single-core C2M example, colocated P2M
+  traffic raises row-miss ratio and creates memory-controller queueing
+  despite idle channel capacity.
+- The authors use Intel uncore counters and Little's law to estimate
+  per-domain latency from average occupancy and request arrival
+  rates. CHA opcode filters separate CPU/peripheral and read/write
+  traffic.
+- Their analytical formula breaks latency inflation into switching,
+  read head-of-line blocking, write head-of-line blocking,
+  top-of-queue delay, and, in high-load red-regime cases, CHA
+  admission delay. It predicts controlled-workload throughput within
+  about 10 percent for most reported points after adding measured CHA
+  admission delay in the heaviest case.
+- The observations generalize beyond local NVMe-style P2M traffic.
+  The authors report analogous blue/red regimes for RoCE/PFC and
+  DCTCP networked cases, though lossy TCP adds packet drops and
+  congestion feedback effects.
+
+**GPU DB mapping:** Treat host-interconnect domains as first-class
+route resources. A retained GPU read should not be admitted only
+because an HBM snapshot is valid; it also needs credits for pinned
+host staging, PCIe/NVLink or copy-engine movement, response-buffer
+writeback, and any CPU metadata reads it will trigger. A cold NVMe
+transfer plus a GPU result copy plus a network response may all look
+independent in the current architecture doc, but this paper says they
+can share hidden host-network queues.
+
+The runtime's bounded rings should gain a second layer of resource
+tokens. Queue capacity is not enough. We need per-route estimates
+for C2M-read pressure, C2M-writeback pressure, P2M-read/write
+pressure, pinned-buffer occupancy, and memory-controller queueing.
+For example, a batch of retained point lookups that scatters small
+responses to CPU memory may be limited by C2M metadata misses and
+P2M/GPU copy writebacks before it is limited by kernel time.
+
+This also changes benchmark interpretation. "DRAM bandwidth below
+peak" is not proof that the host path is healthy. GPU DB should
+record row-miss-like and queueing proxies where available: uncore
+RPQ/WPQ occupancy, CHA/IIO pressure, LLC miss traffic, PCIe/NVLink
+copy bytes, pinned-buffer waits, and CPU response-ring writeback.
+On hardware where those counters are unavailable, admission should
+still expose route-class load and observed latency inflation.
+
+For 1M logical sessions, the main lesson is isolation. Gateway,
+network IO, mutation-owner, storage-prefetch, and GPU-copy traffic
+should be paced against shared host domains. Session count alone is
+the wrong control variable; a small number of large cold transfers can
+hurt many tiny retained reads through hidden C2M/P2M contention.
+
+The paper also supports topology-aware placement. Keep CPU metadata
+reads, pinned buffers, NIC queues, NVMe queues, and GPU-copy workers
+near the NUMA/root-complex path they actually use; avoid assuming a
+single global "host memory" tier. Future CXL and NVLink paths should
+be modeled as additional credit domains until measured otherwise.
+
+**Risks and mismatches:** The evaluation is a host-architecture study,
+not a database or GPU paper. It uses controlled C2M/P2M workloads,
+Redis, GAPBS, FIO, RoCE/PFC, and DCTCP; it does not evaluate CUDA
+kernels, GPU direct storage, GPUDirect RDMA, PostgreSQL wire
+protocol, MVCC snapshots, or SQL query mixes.
+
+Most concrete reverse engineering is Intel-specific. AMD, Grace
+Hopper, multi-socket systems, PCIe switches, CXL expanders, NVLink,
+HBM, and GPU copy engines may expose different domains, credits, and
+counters. The conceptual credit-domain model transfers, but the
+numbers do not.
+
+Counter access may require privileges and careful per-platform
+programming. Production observability may need lower-fidelity
+proxies if uncore events are unavailable in containers or cloud VMs.
+
+The paper's analytical formula is retrospective: it uses measured
+counter inputs. GPU DB still needs practical online admission
+heuristics that work before the bad route has already inflated p99.
+
+**Benchmark candidates:**
+
+- Add a host-domain contention microbenchmark matrix: retained GPU
+  reads, CPU snapshot reads, NVMe cold transfers, network ingress,
+  response encoding, and GPU copy traffic in pairs and triples. Gate:
+  detect blue-regime slowdowns where DRAM bandwidth is below peak but
+  latency rises.
+- Measure route admission with and without host-domain tokens. Tokens
+  should cover pinned-buffer bytes, copy-engine slots, PCIe/NVLink
+  copy classes, CPU metadata read pressure, and response-ring
+  writeback. Report p50/p99 latency, queue wait, throughput, and
+  overload rejections.
+- Build a "hidden contention" dashboard for benchmark runs: CPU LLC
+  misses, uncore RPQ/WPQ or equivalent occupancy when available,
+  PCIe/NVLink bytes, pinned-buffer waits, GPU copy time, network
+  response backlog, and owner-ring wait. Failure condition: a route
+  is marked healthy solely because aggregate DRAM bandwidth is low.
+- Test NUMA/root-complex placement. Move NIC, NVMe, GPU, pinned host
+  buffers, IO workers, and GPU workers across local and remote paths.
+  Gate: route planner cost and admission reflect topology-induced
+  latency inflation.
+- Stress 1M logical sessions with a small fraction of cold or large
+  result routes. Compare session-count-only admission, byte-only
+  admission, and host-domain-credit admission. Failure condition:
+  cold transfers inflate retained-read p99 while aggregate CPU/GPU
+  utilization appears safe.
+- For future CXL/NVLink tiers, create a synthetic credit-domain model
+  before relying on transparent memory placement. Treat every new
+  interconnect as untrusted until local measurements identify its
+  latency, credits, sharing points, and backpressure behavior.

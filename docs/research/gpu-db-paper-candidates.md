@@ -6443,7 +6443,7 @@ Append new candidates here as each paper is processed.
   environments; useful for multi-tenant placement, isolation, and whether GPU
   DB can trust host/VM tiering for route-critical memory. Journal entry added
   2026-06-06 from the USENIX PDF.
-- `queued` — **Understanding the Host Network**, Vuppalapati, Agarwal,
+- `reviewed` — **Understanding the Host Network**, Vuppalapati, Agarwal,
   Schuh, Kasikci, Krishnamurthy, and Agarwal, SIGCOMM 2024.
   URL: `https://doi.org/10.1145/3651890.3672271`
   PDF:
@@ -6451,7 +6451,33 @@ Append new candidates here as each paper is processed.
   Why: Colloid depends on host-network contention and CHA-level latency
   measurement; useful for understanding CPU/memory/peripheral interconnect
   contention before GPU DB treats HBM, PCIe/NVLink, CXL, NIC, storage, and
-  host-memory movement as independent route resources.
+  host-memory movement as independent route resources. Journal entry added
+  2026-06-07 from the ACM/author PDF.
+- `queued` — **Host Congestion Control**, Agarwal, Krishnamurthy, and
+  Agarwal, SIGCOMM 2023.
+  URL: `https://doi.org/10.1145/3603269.3604878`
+  PDF: `https://homes.cs.washington.edu/~arvind/papers/hcc.pdf`
+  Why: Understanding the Host Network names hostCC as a direction for
+  host-network resource allocation; useful for deciding whether GPU DB should
+  expose host-interconnect pressure as local credits before NIC, storage, or
+  GPU data movers saturate shared memory-controller domains.
+- `queued` — **Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA
+  Servers**, Liu et al., NSDI 2023.
+  URL: `https://www.usenix.org/conference/nsdi23/presentation/liu-kefei`
+  PDF: `https://www.usenix.org/system/files/nsdi23-liu-kefei.pdf`
+  Why: Understanding the Host Network compares against intra-host bottleneck
+  diagnosis work; useful for a GPU DB observability lane that can distinguish
+  NIC/RDMA, PCIe, memory-controller, and CPU-copy bottlenecks under 1M-session
+  gateway load.
+- `queued` — **IDIO: Network-Driven, Inbound Network Data Orchestration on
+  Server Processors**, Alian et al., MICRO 2022.
+  URL: `https://doi.org/10.1109/MICRO56248.2022.00042`
+  Metadata:
+  `https://par.nsf.gov/biblio/10395078-idio-network-driven-inbound-network-data-orchestration-server-processors`
+  Why: Understanding the Host Network cites dynamic direct-cache-access
+  mechanisms as a future datapath; useful for comparing NIC/storage inbound
+  data placement with GPU DB pinned buffers, CPU response encoding, and
+  GPU-bound staging.
 - `reviewed` — **Fetch Me If You Can: Evaluating CPU Cache Prefetching and Its
   Reliability on High Latency Memory**, Mahling, Weisgut, and Rabl, DaMoN 2025.
   URL: `https://doi.org/10.1145/3736227.3736231`
