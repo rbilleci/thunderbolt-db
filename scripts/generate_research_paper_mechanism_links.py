@@ -2353,6 +2353,206 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "The route selector chooses among GPU resident, warm CPU columnar, CPU tuple/index, restore-on-demand, or rejection tiers.",
     },
+    (
+        "2026-06-05-cross-paper-synthesis-serviceable-snapshots-also-need-locality-proof",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The locality proof names where data lives, execution locality, resident segments, access ranges, and fallback tiers.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-need-semantic-proof-surfaces",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The benchmark priorities explicitly require retire/debt telemetry for lazy shortcuts, membership maps, and resident generations.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-need-semantic-proof-surfaces",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "HTAP appears only as a future category gap; the entry's evidence is semantic proof surfaces rather than freshness routing.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "same_shape_microbatching",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry discusses route execution shape and semantic conflict proof, not batching or same-shape microbatch admission.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Resident bytes and policy state are route-certificate fields here, but descriptor lifetime and reclamation are not discussed.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "learned_optimizer_advisor",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "NeurCC and policy-table versions provide a weak learned-policy signal, although the entry is broader route-proof synthesis.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The semantic fast-path proof must preserve SQL-visible histories under WAL, snapshot retention, cancellation, and replay.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Route certificates include resource and execution shape, giving a weak planning signal rather than a detailed optimizer mechanism.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot retention and route certificate frontier fields are part of the required semantic fast-path proof.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Resident bytes are route-certificate evidence, but placement is not the main mechanism of this synthesis entry.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-must-budget-fan-out-tiers-and-accelerator-interference",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry budgets fan-out, tiers, and accelerator interference, but does not address descriptor reclamation.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-must-budget-fan-out-tiers-and-accelerator-interference",
+        "htap_freshness_router",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Retained-read freshness is contextual here; the mechanism is admission budgeting, not HTAP freshness routing.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-must-budget-fan-out-tiers-and-accelerator-interference",
+        "vector_credit_admission",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The synthesis explicitly requires admission to budget fan-out, tier bytes, and GPU compute/memory-bandwidth shape before work enters.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-must-budget-fan-out-tiers-and-accelerator-interference",
+        "log_structured_warm_tier",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "NVM is cited for tier placement discipline, not for a log-structured warm-tier mechanism.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-publication-proof-needs-placement-proof",
+        "retained_gpu_snapshots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The GPU retained route must name source WAL boundary, snapshot mode, generation lineage, owner lease, and resident byte families.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-publication-proof-needs-placement-proof",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "The entry couples publication and placement proof, but it does not discuss descriptor lifetime or reclamation.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-publication-proof-needs-metadata-authority",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Typed metadata records carry cleanup responsibility for long retained reads and route refresh pressure, but reclamation is secondary.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-choice-needs-staged-proof",
+        "dependency_witnesses",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Staged proof and completion feedback act as witness surfaces, but the entry is not primarily about dependency ordering.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-choice-needs-staged-proof",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "The route stages include visibility checks and correctness metadata, though WAL publication is not the entry's main focus.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-staged-acceleration-needs-precise-fallback",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Each route stage carries generation, stale-generation, and fallback reason codes before publication or retry.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-staged-acceleration-needs-precise-fallback",
+        "db_owned_cold_objects",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The synthesis explicitly includes NVMe/cold-tier stages, storage pushdown, ambiguous-row fallback, and cold-tier placement.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-receiver-credits-and-execution-shape-proo",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Receiver credits, owner-granted buffer/stream capacity, response rings, and explicit queue edges directly support owner-ring routing.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-receiver-credits-and-execution-shape-proo",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "removed_low_confidence_noise",
+        "review_priority": "none",
+        "review_note": "Base/delta private-format proof is relevant to route state, but descriptor reclamation is not discussed.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-receiver-credits-and-execution-shape-proo",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry ties optimizer estimates, execution-shape choice, selectivity feedback, and runtime pressure into route decisions.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-receiver-credits-and-execution-shape-proo",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Private formats, data movement, resident snapshots, and placement-sensitive execution shape are part of the route certificate.",
+    },
 }
 
 

@@ -1,7 +1,7 @@
 {
   "description": "Generated traceability from literature journal entries to architecture mechanisms. Review low-confidence and fallback links before making architectural commitments.",
   "mechanism_counts": {
-    "bounded_descriptor_reclamation": 493,
+    "bounded_descriptor_reclamation": 489,
     "cost_based_route_optimizer": 254,
     "cpu_fallback_policy": 166,
     "db_owned_cold_objects": 52,
@@ -10,17 +10,17 @@
     "deterministic_hot_write_templates": 209,
     "effective_session_counting": 173,
     "gpu_oltp_conflict_ordering": 129,
-    "htap_freshness_router": 89,
+    "htap_freshness_router": 87,
     "immutable_route_roots": 340,
     "isolation_trace_oracle": 34,
     "learned_optimizer_advisor": 72,
-    "log_structured_warm_tier": 49,
+    "log_structured_warm_tier": 48,
     "multi_tier_placement": 505,
     "mvcc_gc_frontiers": 62,
     "owner_ring_bundling": 452,
     "resource_dag_scheduling": 100,
     "retained_gpu_snapshots": 488,
-    "same_shape_microbatching": 66,
+    "same_shape_microbatching": 65,
     "semantic_crash_oracle": 15,
     "snapshot_frontier_vectors": 215,
     "stable_handle_indirection": 39,
@@ -59885,8 +59885,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The locality proof names where data lives, execution locality, resident segments, access ranges, and fallback tiers.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         }
       ],
@@ -60722,21 +60723,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The benchmark priorities explicitly require retire/debt telemetry for lazy shortcuts, membership maps, and resident generations.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "htap",
-            "fresh"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         }
       ],
       "relevance_tags": [],
@@ -61061,8 +61051,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
+          "review_note": "Resident bytes are route-certificate evidence, but placement is not the main mechanism of this synthesis entry.",
           "review_priority": "none",
-          "review_status": "auto_accepted",
+          "review_status": "reviewed_weak_signal",
           "score": 10
         },
         {
@@ -61080,37 +61071,15 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "micro-batch",
-            "batching"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "same_shape_microbatching",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "learned",
             "advisor",
             "model"
           ],
           "link_basis": "keyword",
           "mechanism_id": "learned_optimizer_advisor",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "NeurCC and policy-table versions provide a weak learned-policy signal, although the entry is broader route-proof synthesis.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         }
       ],
@@ -61537,8 +61506,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The semantic fast-path proof must preserve SQL-visible histories under WAL, snapshot retention, cancellation, and replay.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -61548,8 +61518,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Route certificates include resource and execution shape, giving a weak planning signal rather than a detailed optimizer mechanism.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -61560,8 +61531,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Snapshot retention and route certificate frontier fields are part of the required semantic fast-path proof.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -61571,8 +61543,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Resident bytes are route-certificate evidence, but placement is not the main mechanism of this synthesis entry.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 2
         }
       ],
@@ -61811,46 +61784,14 @@
         {
           "confidence": "low",
           "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "fresh"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "htap_freshness_router",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
             "admission"
           ],
           "link_basis": "keyword",
           "mechanism_id": "vector_credit_admission",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The synthesis explicitly requires admission to budget fan-out, tier bytes, and GPU compute/memory-bandwidth shape before work enters.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "nvm"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "log_structured_warm_tier",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 2
         }
       ],
       "relevance_tags": [],
@@ -62581,20 +62522,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The GPU retained route must name source WAL boundary, snapshot mode, generation lineage, owner lease, and resident byte families.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         }
       ],
       "relevance_tags": [],
@@ -63064,8 +62995,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Typed metadata records carry cleanup responsibility for long retained reads and route refresh pressure, but reclamation is secondary.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 4
         }
       ],
@@ -63380,8 +63312,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Staged proof and completion feedback act as witness surfaces, but the entry is not primarily about dependency ordering.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 3
         },
         {
@@ -63391,8 +63324,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The route stages include visibility checks and correctness metadata, though WAL publication is not the entry's main focus.",
+          "review_priority": "none",
+          "review_status": "reviewed_weak_signal",
           "score": 2
         }
       ],
@@ -63752,8 +63686,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "immutable_route_roots",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Each route stage carries generation, stale-generation, and fallback reason codes before publication or retry.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
         },
         {
@@ -63763,8 +63698,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "db_owned_cold_objects",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The synthesis explicitly includes NVMe/cold-tier stages, storage pushdown, ambiguous-row fallback, and cold-tier placement.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -64481,20 +64417,10 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Receiver credits, owner-granted buffer/stream capacity, response rings, and explicit queue edges directly support owner-ring routing.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 4
-        },
-        {
-          "confidence": "low",
-          "evidence_terms": [
-            "era"
-          ],
-          "link_basis": "keyword",
-          "mechanism_id": "bounded_descriptor_reclamation",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
-          "score": 3
         },
         {
           "confidence": "low",
@@ -64504,8 +64430,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "The entry ties optimizer estimates, execution-shape choice, selectivity feedback, and runtime pressure into route decisions.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         },
         {
@@ -64516,8 +64443,9 @@
           ],
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
-          "review_priority": "normal",
-          "review_status": "pending_low_confidence_review",
+          "review_note": "Private formats, data movement, resident snapshots, and placement-sensitive execution shape are part of the route certificate.",
+          "review_priority": "none",
+          "review_status": "reviewed_supported",
           "score": 3
         }
       ],
@@ -74465,29 +74393,29 @@
   "summary": {
     "confidence_counts": {
       "high": 3059,
-      "low": 255,
+      "low": 247,
       "medium": 1365
     },
     "entries": 787,
     "linked_entries": 787,
-    "links_requiring_review": 50,
-    "low_confidence_links": 255,
+    "links_requiring_review": 25,
+    "low_confidence_links": 247,
     "mechanisms_with_links": 25,
     "mechanisms_without_links": 0,
     "paper_entries": 610,
-    "pending_low_confidence_links": 50,
-    "removed_low_confidence_links": 40,
+    "pending_low_confidence_links": 25,
+    "removed_low_confidence_links": 48,
     "review_priority_counts": {
-      "none": 4629,
-      "normal": 50
+      "none": 4646,
+      "normal": 25
     },
     "review_status_counts": {
-      "auto_accepted": 4424,
-      "pending_low_confidence_review": 50,
-      "reviewed_supported": 163,
-      "reviewed_weak_signal": 42
+      "auto_accepted": 4423,
+      "pending_low_confidence_review": 25,
+      "reviewed_supported": 174,
+      "reviewed_weak_signal": 49
     },
-    "reviewed_low_confidence_links": 205,
+    "reviewed_low_confidence_links": 223,
     "synthesis_entries": 177,
     "unlinked_entries": 0
   },
