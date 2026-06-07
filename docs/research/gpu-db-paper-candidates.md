@@ -527,13 +527,34 @@ Append new candidates here as each paper is processed.
   for GPU DB route scoring and which should remain guarded by deterministic
   eligibility and fallback rules. Journal entry added 2026-06-07 from the
   author PDF and DOI metadata.
-- `queued` — **PilotScope: Steering Databases with Machine Learning Drivers**,
+- `reviewed` — **PilotScope: Steering Databases with Machine Learning Drivers**,
   Zhu et al., PVLDB 2024.
-  URL: `https://github.com/alibaba/pilotscope`
+  URL: `https://www.vldb.org/pvldb/vol17/p980-zhu.pdf`
+  DOI: `https://doi.org/10.14778/3641204.3641209`
+  Code: `https://github.com/alibaba/pilotscope`
   Why: Learned Query Optimizer highlights PilotScope as a deployment bridge for
   ML drivers that push/pull plans, hints, cardinalities, and runtime data
   through database-specific interactors; useful for designing GPU DB route
   advisor hooks without putting Python or model lifecycle work on the hot path.
+  Journal entry added 2026-06-07 from the PVLDB PDF and author mirror after
+  the first direct PVLDB curl stalled.
+- `queued` — **The Holon Approach for Simultaneously Tuning Multiple
+  Components in a Self-Driving Database Management System with Machine
+  Learning via Synthesized Proto-Actions**, Zhang, Lim, Butrovich, and
+  Pavlo, PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p3373-zhang.pdf`
+  Why: PilotScope shows that multiple AI4DB drivers can interact badly; Holon
+  is a modern follow-up for coordinating knobs, hints, indexes, and other route
+  actions as joint policy units before GPU DB combines route scoring, cache
+  admission, and scheduler advisors.
+- `queued` — **Cardinality Estimation in DBMS: A Comprehensive Benchmark
+  Evaluation**, Han et al., PVLDB 2021.
+  URL: `https://kai-zeng.github.io/papers/benchmark_vldb_2021.pdf`
+  DOI: `https://doi.org/10.14778/3503585.3503586`
+  Why: PilotScope uses learned cardinality drivers and STATS-CEB in its
+  evaluation; this benchmark paper is useful for deciding which cardinality
+  telemetry and end-to-end route-regret measurements GPU DB should collect
+  before trusting learned CPU/GPU route advice.
 - `queued` — **QueryFormer: A Tree Transformer Model for Query Plan
   Representation**, Zhao, Cong, Shi, and Miao, PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1658-zhao.pdf`

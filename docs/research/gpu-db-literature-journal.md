@@ -38,6 +38,170 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - PilotScope turns learned planning into bounded push/pull drivers
+
+**Citation:** Rong Zhu, Lianggui Weng, Wenqing Wei, Di Wu,
+Jiazhen Peng, Yifan Wang, Bolin Ding, Defu Lian, Bolong Zheng,
+and Jingren Zhou. "PilotScope: Steering Databases with Machine
+Learning Drivers." PVLDB 17(5): 980-993, 2024. DOI:
+`https://doi.org/10.14778/3641204.3641209`. Retrieved 2026-06-07
+from the PVLDB PDF and author mirror:
+`https://www.vldb.org/pvldb/vol17/p980-zhu.pdf`,
+`https://bolinding.github.io/papers/vldb24pilotscope.pdf`.
+
+**Category:** query optimization / planning; runtime admission and
+telemetry; learned route advisors.
+
+**Relevance tags:** PilotScope; AI4DB drivers; DB interactor;
+push/pull operators; learned query optimizer; learned cardinality;
+knob tuning; index recommendation; validation mode; fault tolerance;
+route advisor sidecar; telemetry collection; deterministic hot path.
+
+**Core idea:** PilotScope is middleware for deploying learned database
+components without embedding arbitrary ML workflows deep inside a
+DBMS. It separates AI4DB drivers, which collect statistics, train
+models, run inference, and choose actions, from DB interactors, which
+are database-specific patches exposing a small push/pull interface for
+data collection and action injection.
+
+For GPU DB, the transferable idea is a route-advisor boundary. Learned
+models can tune route costs, cardinalities, hints, cache/index choices,
+or scheduling policy, but they should interact with the engine through
+explicit typed operators and recorded sessions. The mutation owner,
+resident snapshot validity checks, WAL-before-visibility sequencing,
+and GPU execution workers should keep deterministic authority.
+
+**Concrete mechanisms:**
+
+- PilotScope packages each AI4DB task as a driver containing an
+  algorithm workflow and ML model code, typically in an ML-friendly
+  language. The driver can collect data, train, infer, and push actions
+  without knowing each database engine's internal implementation.
+- Each database implements a DB interactor. The paper implements this
+  for PostgreSQL 13.1 and Spark 3.3.2 using lightweight patches and
+  native mechanisms such as PostgreSQL hooks, `SET`, and `EXPLAIN`.
+- The interactor API uses `session_start`, `session_end`,
+  `session_exec`, `push`, and `pull`. Operators can be staged in a
+  session and executed in order, which lets one workflow set flags,
+  push a query or cardinality, pull a plan, and pull execution time as
+  one interaction sequence.
+- Typed data includes flags, indexes, views, queries, subqueries,
+  cardinalities, costs, plans, and execution time. The same API supports
+  knob tuning, index recommendation, learned cardinality estimation,
+  and end-to-end learned query optimization.
+- Injection interfaces define where a driver can replace a database
+  component. The examples include knob tuning, index recommendation,
+  cardinality estimation, and end-to-end query optimization.
+- Collection APIs are also built on push/pull anchors. A driver can
+  request training data such as cardinalities, costs, plans, or
+  execution times, then retrain periodically or on explicit events.
+- Multiple drivers can run together when their workflow anchors do not
+  conflict. When injection interfaces overlap, such as cardinality
+  estimation and a learned query optimizer, PilotScope uses declared
+  conflicts and priorities to choose which driver controls a session.
+- Validation mode records original settings for workload-level tasks
+  and restores them on exit. For per-query tasks, it closes flags so
+  the original database component resumes. If a driver exceeds a wait
+  timeout, PilotScope falls back to the original database behavior.
+- The evaluation deploys 15 algorithms across four task classes, with
+  representative results for SMAC knob tuning, Extend index
+  recommendation, DeepDB cardinality estimation, and Bao query
+  optimization on PostgreSQL and Spark. Workloads include JOB,
+  STATS-CEB, and TPC-DS.
+- Reported overhead is small for most algorithms: at most 0.27% on
+  PostgreSQL and 0.066% on Spark in most measured cases. Bao is the
+  notable exception because repeatedly pulling many candidate plans can
+  make interaction and inference costs visible.
+- The paper also shows that combining learned components is not
+  automatically beneficial. Some combinations are comparable to a
+  single driver, while others perform worse because one learned
+  component changes the behavior observed by another.
+
+**GPU DB mapping:** GPU DB should expose an offline and nearline route
+driver interface rather than putting model code inside hot owners. A
+driver can pull candidate route sets, route features, estimated and
+actual rows, transfer bytes, queue wait, GPU kernel time, fallback
+reasons, invalidation churn, resident bytes, and p50/p99 latency. It
+can push bounded scoring tables, hint masks, calibrated coefficients,
+or threshold updates that the deterministic planner applies cheaply.
+
+The session model maps well to benchmarking route changes. One
+advisor session could stage a candidate route mask, run a query batch,
+pull plan/route choices and measured time, and then restore the prior
+settings. This gives the research loop a controlled way to test learned
+CPU/GPU route scoring, resident-cache admission, and index selection
+without making those experiments part of the correctness core.
+
+PilotScope's conflict handling maps to route-advisor composition. A
+cardinality-correction driver, resident-cache admission driver, and
+GPU route-ranking driver may all want to influence the same query.
+GPU DB should require declared authority and priorities for route
+fields: eligibility, visibility, capacity, cost estimate, hint/ranking,
+and fallback policy. Learned drivers may tune cost and ranking, but
+must not override visibility or WAL/residency validity.
+
+Validation and timeout fallback are directly useful. A model that
+blocks, exceeds its budget, or returns no answer should leave the
+engine running with the native deterministic planner. For production,
+model output should be cached as cheap immutable route-policy
+snapshots so network IO workers, mutation owners, and GPU execution
+workers never wait on training, Python, RPC, or large inference.
+
+The multiple-driver result is a warning. Combining learned
+cardinality, route ranking, cache admission, and scheduling may
+interact badly under write churn or memory pressure. GPU DB needs
+per-driver telemetry and ablation benchmarks before trusting a stack
+of advisors.
+
+**Risks and mismatches:** PilotScope is deployment middleware, not a
+new optimizer, concurrency-control protocol, MVCC design, WAL system,
+or GPU execution scheduler. Its performance claims are about middleware
+overhead and representative AI4DB algorithms, not about SQL isolation,
+durability, GPU kernels, or 1M-session admission.
+
+The evaluated systems are PostgreSQL and Spark, and the workloads are
+query-optimization benchmarks. The paper does not evaluate hot OLTP
+mutation owners, retained GPU snapshots, p99 session latency, HBM
+pressure, or WAL-before-visibility constraints.
+
+The push/pull API can still become expensive if a driver requests too
+many candidate plans or large telemetry payloads. Bao's overhead in the
+paper is a concrete example. GPU DB should cap candidate-route pulls,
+batch subquery/route features, and expose budgeted telemetry instead of
+unbounded introspection.
+
+Python or ML runtime code is acceptable for research and background
+training, but it is a mismatch for microsecond owner queues and GPU
+worker hot paths. Production output must be precomputed, bounded, and
+validated before publication.
+
+**Benchmark candidates:**
+
+- Build a PilotScope-style route-advisor harness for GPU DB. It should
+  pull candidate CPU/GPU routes, route features, and execution telemetry
+  from replayable sessions, then push bounded scoring tables or hint
+  masks. Gate: deterministic eligibility and visibility checks run
+  before any advisor ranking.
+- Add advisor timeout and validation mode. A route advisor can be
+  enabled for a workload, original route thresholds are restored on
+  exit, and timeout falls back to the native planner. Failure condition:
+  an advisor hang blocks mutation, response rings, or GPU workers.
+- Measure push/pull telemetry overhead. Compare per-query route pulls,
+  batched route-feature pulls, and sampled telemetry under retained
+  lookup, aggregate, and cold-transfer workloads. Gate: advisor
+  instrumentation stays below a fixed fraction of p99 latency budget.
+- Run a multi-advisor ablation: cardinality correction only, route
+  ranking only, cache admission only, scheduler hints only, and their
+  combinations. Measure mean latency, p99 latency, fallback storms,
+  resident-byte churn, invalidation retries, and write throughput.
+- Add conflict declarations for route policy fields. Gate: learned
+  drivers can affect costs, ranks, and thresholds, but cannot mark an
+  invalid snapshot visible or bypass WAL-before-visibility.
+- Test route-policy snapshot publication. Background training produces
+  a new immutable policy generation; hot workers read the current
+  generation without blocking. Failure condition: policy publication
+  creates unbounded retired metadata or stalls readers.
+
 ### 2026-06-07 - Cloud five-minute rule turns tiering into an access-frequency budget
 
 **Citation:** Kira Duwe, Angelos Anadiotis, Andrew Lamb, Lucas Lersch,
