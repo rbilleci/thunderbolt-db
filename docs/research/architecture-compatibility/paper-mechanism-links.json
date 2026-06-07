@@ -112732,8 +112732,8 @@
               "route choice",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Vectorized execution materializes more intermediate vectors, but its simpler primitive loops can generate more outstanding memory loads and hide cache-miss latency better in hash joins and other memory-bound work.",
             "support_reason": "Matched journal terms (planning, join, route choice, metadata) to Cost-based route optimizer."
           },
@@ -114349,8 +114349,8 @@
               "priority",
               "slo"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It does not solve SQL transaction ordering, WAL durability, MVCC visibility, cancellation, prepared statement state, or GPU execution fairness.",
             "support_reason": "Matched journal terms (fairness, priority, slo) to Deficit fairness."
           },
@@ -116366,8 +116366,8 @@
             "matched_terms": [
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "ScalarDB adds the transactional counterpart: every visible state transition needs a small, explicit authority and enough metadata for recovery, validation, and backup.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
@@ -116926,8 +116926,8 @@
               "ring",
               "handoff"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Parquet's dictionary encoding is not generally order-preserving, and real queries include strings, UDFs, cross-table predicates, nulls, and nested structures.",
             "support_reason": "Matched journal terms (ring, handoff) to Owner-ring bundling."
           },
@@ -118201,8 +118201,8 @@
               "fence",
               "ordering"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It does not define WAL ordering, retained snapshots, concurrent readers/writers, crash recovery, GPU residency, DDL invalidation, or compressed device kernels.",
             "support_reason": "Matched journal terms (fence, ordering) to Dependency witnesses."
           },
@@ -119695,8 +119695,8 @@
               "epoch",
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Recent route-format and execution-shape papers keep converging on the same rule: a fast route is only valid when its private physical representation also carries proof that the right rows are reachable at the requested snapshot.",
             "support_reason": "Matched journal terms (epoch, snapshot) to Snapshot frontier vectors."
           },
@@ -119720,8 +119720,8 @@
               "predicate",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Crystal's semantic regions prove coverage by table generation, columns, predicates, and overlap rules.",
             "support_reason": "Matched journal terms (join, predicate, metadata) to Cost-based route optimizer."
           },
@@ -119769,8 +119769,8 @@
               "generation",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Crystal's semantic regions prove coverage by table generation, columns, predicates, and overlap rules.",
             "support_reason": "Matched journal terms (generation, publication) to Immutable route roots."
           },
@@ -121951,8 +121951,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A candidate sends prepare for `maxack + 1`, collects a quorum of accepted instance state, then proposes the highest-numbered accepted values for outstanding instances before normal pipelined execution resumes. - Adding a replica is also a state-machine operation.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -124610,8 +124610,8 @@
               "immutable",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A read route should be admitted only when it has a valid snapshot generation, resident generation, output-buffer credit, and GPU/CPU execution credit.",
             "support_reason": "Matched journal terms (generation, immutable, publication) to Immutable route roots."
           },
@@ -124894,8 +124894,8 @@
               "frontier",
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The last cluster combines remote-lock factoring, RDMA connection-state compression, partial WAL frontiers, and contention-aware transaction scheduling.",
             "support_reason": "Matched journal terms (frontier, snapshot) to Snapshot frontier vectors."
           },
@@ -126354,8 +126354,8 @@
               "snapshot",
               "long reader"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Recent reviews now connect three related tracks: Vbox for auditably compact transaction histories, dataset versioning for costed retention frontiers, and Pravega for append-ordered tiered stream storage.",
             "support_reason": "Matched journal terms (frontier, snapshot, long reader) to Snapshot frontier vectors."
           },
@@ -127139,8 +127139,8 @@
             "matched_terms": [
               "generation"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "SkinnerDB says uncertain route choices can be explored under bounded budgets; Big Metadata says pruning/route metadata should be stored and scanned as a first-class columnar data product; CHEX says version reuse and checkpoint placement should be optimized over a bounded version tree instead of keeping or dropping generations naively.",
             "support_reason": "Matched journal terms (generation) to Immutable route roots."
           },
@@ -130196,8 +130196,8 @@
               "root",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A reactor encapsulates relational state and exposes procedures; cross-reactor work is expressed as asynchronous function calls, but the root invocation remains an ACID transaction.",
             "support_reason": "Matched journal terms (root, publication) to Immutable route roots."
           },
@@ -130569,8 +130569,8 @@
               "resident",
               "gpu memory"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A retained point lookup, an OLTP write, a GPU result transfer, a cold NVMe/RDMA fetch, and a refresh stream consume different mixtures of operations, bytes, pinned buffers, GPU copy bandwidth, and owner attention.",
             "support_reason": "Matched journal terms (retained, resident, gpu memory) to Retained GPU snapshots."
           },
@@ -131809,8 +131809,8 @@
               "scheduler",
               "scheduling"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "This orders known conflicts without overconstraining transactions that might not actually touch a branch-dependent object. - The priority scheduler uses a priority queue scored by the number of direct dependents a task is known to block.",
             "support_reason": "Matched journal terms (scheduler, scheduling) to Resource-DAG scheduling."
           },
@@ -131835,8 +131835,8 @@
               "ordering",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It assumes deterministic serializability relative to a preordered block, lazy block commit, and a smart-contract object model.",
             "support_reason": "Matched journal terms (dependency, ordered, ordering, proof) to Dependency witnesses."
           },
@@ -131901,8 +131901,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Eraser says learned route choices need a reliability gate before they can override conservative plans.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -131925,8 +131925,8 @@
               "route choice",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "GeminiFS says a GPU worker can move faster when it receives compact, validated storage metadata.",
             "support_reason": "Matched journal terms (optimizer, route choice, metadata) to Cost-based route optimizer."
           },
@@ -132195,8 +132195,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "...battery-backed host buffers, or similar protected domains, GPU DB can benchmark a small durable commit window per mutation owner before forcing every route descriptor, index fragment, or cold-tier manifest to media.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -133653,8 +133653,8 @@
               "wal",
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A cold NVMe transfer plus a GPU result copy plus a network response may all look independent in the current architecture doc, but this paper says they can share hidden host-network queues.",
             "support_reason": "Matched journal terms (wal, nvm) to WAL-before-visibility boundary."
           },
@@ -134110,8 +134110,8 @@
             "matched_terms": [
               "witness"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The near-term design track is compact witness generation for each owner boundary.",
             "support_reason": "Matched journal terms (witness) to Dependency witnesses."
           },
@@ -135534,8 +135534,8 @@
               "nvm",
               "recovery"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- A movable-warm-fragment benchmark with stable logical ids, mapping publication, cleaner movement, and retained snapshot pins. - A route-holon benchmark where cache placement, batching, fallback, and refresh cadence are tuned together but still checked by deterministic eligibility gates. - A crash/recovery benchmark that proves physical warm-tier movemen...",
             "support_reason": "Matched journal terms (wal, logging, visibility, nvm) to WAL-before-visibility boundary."
           },
@@ -136295,8 +136295,8 @@
             "matched_terms": [
               "witness"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "HostCC says the runtime needs local pressure witnesses before host resources overload. veDB-HTAP says accelerated routes need semantic freshness witnesses before secondary execution. vWeaver says MVCC scans need searchable visibility witnesses before they touch payload data.",
             "support_reason": "Matched journal terms (witness) to Dependency witnesses."
           },
@@ -137096,8 +137096,8 @@
               "bundle",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Route metadata should be published as immutable bodies plus compact roots: catalog generation, WAL boundary, visibility generation, layout id, checksum, and residency handle. - Hot-path counters, pins, and queue scores should remain volatile whenever recovery can rebuild them from committed roots and WAL boundaries. - Admission should produce bounded qu...",
             "support_reason": "Matched journal terms (bundle, queue) to Owner-ring bundling."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4596,
-      "weak_direct": 75
+      "direct": 4621,
+      "weak_direct": 50
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 434,
+      "snippet contains matched mechanism term plus visible aliases": 459,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 69,
+      "substantive snippet contains only one matched mechanism term": 44,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
