@@ -38,6 +38,174 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - TetriSched plans scarce accelerators in space and time
+
+**Citation:** Alexey Tumanov, Timothy Zhu, Jun Woo Park, Michael A.
+Kozuch, Mor Harchol-Balter, and Gregory R. Ganger. "TetriSched:
+Global Rescheduling with Adaptive Plan-ahead in Dynamic Heterogeneous
+Clusters." EuroSys 2016. DOI: `https://doi.org/10.1145/2901318.2901355`.
+Retrieved 2026-06-07 from the author PDF:
+`https://www.cs.cmu.edu/~harchol/Papers/EUROSYS16.pdf`.
+
+**Category:** runtime / HFT / session scale; high-concurrency admission;
+GPU execution and heterogeneous route scheduling.
+
+**Relevance tags:** adaptive plan-ahead; global rescheduling; soft
+constraints; heterogeneous resources; GPU preference; deadlines;
+runtime estimates; MILP scheduling; reservation integration; fallback
+resources; bounded solver latency; route-advisor policy snapshots.
+
+**Core idea:** TetriSched schedules heterogeneous cluster jobs by
+considering placement and time together. Instead of choosing greedily
+between "run now on a worse resource" and "wait indefinitely for a
+preferred resource", it builds a near-term space-time plan over all
+pending work, uses deadline/runtime information from a reservation
+system, and replans every scheduling cycle as jobs arrive or runtime
+estimates prove wrong.
+
+The strongest transferable idea for GPU DB is that scarce GPU resources
+need explicit time-aware fallback decisions. A retained query may prefer
+a valid GPU snapshot, but the right decision can be to wait briefly for
+a stream, run on CPU, refresh first, batch with compatible requests, or
+reject under overload. That decision should be made from a route-shaped
+plan with deadlines, estimated runtimes, and resource preferences, not
+from a static "GPU if resident" rule.
+
+**Concrete mechanisms:**
+
+- TetriSched runs alongside YARN's Rayon reservation system. Rayon
+  provides deadline and runtime-estimate information for SLO jobs, while
+  TetriSched uses that information for short-term scheduling rather than
+  blindly enforcing a fixed reservation plan.
+- The Space-Time Request Language (STRL) describes resource choices as
+  expression trees. Its main primitive, `nCk(equivalence set, k, start,
+  duration, value)`, asks for any `k` resources from an equivalent set
+  for a time window.
+- `MAX` expresses alternatives such as "two GPU nodes for a shorter
+  runtime" versus "any two nodes for a longer runtime"; `MIN` expresses
+  all-of constraints such as anti-affinity or rack placement; `SUM`
+  aggregates all pending jobs into a global objective; `SCALE` and
+  `BARRIER` modify values and thresholds.
+- Equivalence sets compress combinatorial placement. A GPU job can name
+  the set of GPU-capable nodes rather than enumerate every node pair;
+  time is discretized, so plan-ahead adds start-time alternatives
+  linearly with the plan-ahead window.
+- Each scheduling cycle aggregates pending STRL expressions, compiles
+  them into a Mixed Integer Linear Programming formulation, solves the
+  global placement problem, and launches only jobs scheduled for the
+  current tick. Deferred jobs are reconsidered on the next cycle.
+- The MILP uses binary indicator variables for selected subexpressions
+  and integer partition variables for resources consumed from
+  equivalence sets at each time slice. Demand constraints enforce each
+  chosen request's needs; supply constraints cap each equivalence set's
+  capacity over time.
+- Solver latency is managed with practical bounds: the solver may return
+  a solution within 10% of optimal after a configurable timeout, previous
+  cycle results can seed the next feasible solution, expired zero-value
+  jobs and impossible start times are culled, and cluster resources are
+  dynamically partitioned to reduce variables.
+- The implementation fires on a 4-second scheduling period in the
+  reported experiments and is integrated with YARN through a proxy
+  scheduler and Thrift communication with TetriSched.
+- Evaluation uses a 256-node real cluster, an 80-node real cluster, and
+  production-derived/synthetic mixes of SLO and best-effort jobs. The
+  paper reports up to 3.5x more SLOs met and best-effort latency reduced
+  by as much as 80% compared with the configured Rayon plus YARN
+  CapacityScheduler stack.
+- Ablations show the three main ingredients matter together:
+  heterogeneity-aware soft constraints, global scheduling across pending
+  jobs, and plan-ahead. Disabling plan-ahead performs poorly on
+  heterogeneous workloads; disabling global scheduling loses substantial
+  SLO attainment; disabling soft constraints loses the GPU/MPI placement
+  benefit.
+
+**GPU DB mapping:** Treat GPU streams, HBM resident snapshots, pinned
+host buffers, CPU fallback workers, mutation-owner budget, and refresh
+bandwidth as heterogeneous equivalence sets with different runtimes and
+validity constraints. A route request can be expressed as alternatives:
+execute now on CPU, execute on a valid GPU snapshot after a bounded wait,
+refresh then execute, join a same-shape micro-batch, or reject when no
+correct route can meet the SLO.
+
+The plan-ahead window maps to a small admission horizon, not seconds of
+per-query blocking. For OLTP point queries it may be tens or hundreds of
+microseconds; for COPY, refresh, analytical scans, or prepared recurring
+route families it can be larger. The principle is to quantify when
+waiting for a preferred GPU path is better than consuming CPU fallback or
+refresh capacity immediately.
+
+STRL's soft constraints are a useful vocabulary for route eligibility.
+A route advisor can score exact GPU-resident execution, split
+CPU-delta/GPU-base execution, CPU-only execution, and delayed micro-batch
+execution as alternatives with different values, deadlines, and resource
+footprints. The hot path should consume a compact policy snapshot rather
+than invoke MILP per request.
+
+Global scheduling maps to bundle-level admission. Instead of each IO
+worker greedily pushing requests into the first available GPU queue, a
+bounded advisor cycle can consider pending compatible reads, refresh
+work, write pressure, and response-ring backlog together, then publish
+which classes should drain now.
+
+The paper's repeated replanning is especially relevant to runtime
+estimates. GPU DB route estimates will be wrong under skew, stale
+resident generations, PCIe pressure, and hot-key conflicts. Replanning
+with observed runtimes should adjust future route choices while
+preserving WAL-before-visibility, snapshot validity, and explicit
+fallback reasons.
+
+**Risks and mismatches:** TetriSched is a cluster scheduler for YARN
+jobs, not a database transaction scheduler. Its cycle times and MILP
+solver costs are far too large for ordinary per-query OLTP admission.
+The useful adaptation is an offline, sidecar, or coarse-grained route
+advisor with a deterministic hot-path fallback.
+
+The paper optimizes SLO attainment and best-effort latency, not SQL
+correctness, MVCC visibility, crash recovery, or WAL durability. GPU DB
+route choices need proof fields for snapshot generation, catalog
+generation, resident layout, and recovery witness in addition to a
+scheduler score.
+
+TetriSched assumes runtime estimates and deadlines are supplied by
+frameworks or reservation systems. GPU DB must infer many estimates from
+prepared statement shape, cardinality telemetry, resident bytes, queue
+depth, and observed route history. Unknown shapes should fall back to
+conservative deterministic rules.
+
+The design does not use preemption in TetriSched. For GPU DB, once a
+mutation, kernel, or response is admitted, cancellation/preemption has
+correctness and resource-cleanup costs. Planning should therefore prefer
+short bounded windows and small bundles, with explicit overload rather
+than optimistic over-admission.
+
+**Benchmark candidates:**
+
+- Build a route-advisor simulator that models alternatives for each
+  request: CPU now, GPU now, GPU after bounded wait, refresh plus GPU,
+  split CPU-delta/GPU-base, micro-batch, and reject. Measure p50/p99,
+  GPU utilization, CPU fallback pressure, missed SLOs, and stale-route
+  prevention.
+- Compare greedy per-request routing against bounded global bundle
+  planning over a 50 us, 200 us, 1 ms, and 10 ms horizon. Gate: the
+  planner improves p99 or throughput without exceeding its own decision
+  budget or weakening route proofs.
+- Add soft route constraints to telemetry: preferred GPU route,
+  acceptable CPU fallback, required snapshot generation, maximum wait,
+  estimated runtime per route, and fallback value. Failure condition:
+  the system cannot explain why a request waited, fell back, or was
+  rejected.
+- Stress runtime estimate errors for retained lookups and refresh work.
+  Feed the advisor underestimated and overestimated GPU runtimes,
+  transfer costs, and refresh durations; require bounded SLO degradation
+  and deterministic fallback when estimates diverge.
+- Prototype policy snapshots compiled from a heavier advisor. Gate: IO
+  workers and read workers validate a route class from the snapshot
+  without allocation, MILP calls, or lock-heavy shared state.
+- Test plan-ahead for recurring prepared statements and refresh DAGs
+  separately from one-shot OLTP queries. Expected result: larger horizons
+  help stable recurring shapes, while unstable interactive traffic should
+  stay on simple admission rules.
+
 ### 2026-06-07 - Bullion makes column layout follow access shape, compliance, and precision
 
 **Citation:** Gang Liao, Ye Liu, Jianjun Chen, and Daniel J.

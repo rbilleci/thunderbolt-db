@@ -470,13 +470,14 @@ Append new candidates here as each paper is processed.
   for comparing deterministic troublesome-node and packing heuristics with
   learned route-DAG scheduling before GPU DB adds any learned admission
   advisor. Journal entry added 2026-06-07 from the USENIX PDF.
-- `queued` — **TetriSched: Global Rescheduling with Adaptive Plan-ahead in
+- `reviewed` — **TetriSched: Global Rescheduling with Adaptive Plan-ahead in
   Dynamic Heterogeneous Clusters**, Tumanov et al., EuroSys 2016.
   URL: `https://doi.org/10.1145/2901318.2901355`
   PDF: `https://www.cs.cmu.edu/~harchol/Papers/EUROSYS16.pdf`
   Why: Decima and Graphene both point at plan-ahead scheduling; TetriSched is
   useful for comparing reservation-aware choices between preferred GPU-like
   resources and fallback resources under deadlines and mis-estimated runtimes.
+  Journal entry added 2026-06-07 from the author PDF.
 - `queued` — **Hawk: Hybrid Datacenter Scheduling**, Delgado, Dinu,
   Kermarrec, and Zwaenepoel, USENIX ATC 2015.
   URL: `https://www.usenix.org/conference/atc15/technical-session/presentation/delgado`
@@ -497,6 +498,13 @@ Append new candidates here as each paper is processed.
   and cites C3 as a tail-latency workflow source; useful for GPU DB's
   response-ring admission, replica/fallback route selection, and p99-aware
   session scheduling.
+- `queued` — **Large-scale cluster management at Google with Borg**,
+  Verma et al., EuroSys 2015.
+  URL: `https://doi.org/10.1145/2741948.2741964`
+  Why: TetriSched contrasts Borg's scalable bilateral scoring and priority
+  model with space-time soft constraints; useful for comparing simple
+  production-proven route scoring against heavier global plan-ahead advisors
+  before GPU DB puts route admission on the hot path.
 - `reviewed` — **Simple Adaptive Query Processing vs. Learned Query
   Optimizers: Observations and Analysis**, Zhang et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2962-zhang.pdf`
