@@ -16,6 +16,8 @@ python3 scripts/generate_research_architecture_compatibility.py
 - Layer 1: `docs/research/architecture-compatibility/mechanisms.json`
 - Layer 2: `docs/research/architecture-compatibility/compatibility-edges.json`
 - Layer 3: this generated compatibility view
+- Paper traceability: `docs/research/architecture-compatibility/paper-mechanism-links.json`
+- Paper coverage report: `docs/research/architecture-compatibility/paper-mechanism-coverage.md`
 
 ## Summary
 

@@ -50,6 +50,7 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/research/gpu-db-paper-candidates.md`
    - `docs/research/gpu-db-literature-journal.md`
    - `docs/research/architecture-compatibility.md`
+   - `docs/research/architecture-compatibility/paper-mechanism-coverage.md`
 
 14. **Decision history (ADRs)**
    - `docs/adr/README.md`
