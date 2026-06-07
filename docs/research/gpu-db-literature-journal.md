@@ -100186,3 +100186,156 @@ format paper.
 - A mixed-pressure benchmark where resource pressure, freshness lag, and
   visibility-map absence each force different route decisions while preserving
   identical SQL results.
+
+### 2026-06-07 - Zen minimizes persistent write amplification by moving CC metadata out of NVM
+
+**Citation:** Gang Liu, Leying Chen, and Shimin Chen. "Zen: a
+High-Throughput Log-Free OLTP Engine for Non-Volatile Main Memory." PVLDB
+14(5), 2021, pp. 835-848. DOI:
+`https://doi.org/10.14778/3446095.3446105`. Retrieved 2026-06-07 from the
+PVLDB PDF: `https://www.vldb.org/pvldb/vol14/p835-liu.pdf`.
+
+**Category:** transaction processing / write path; database storage and
+recovery; multi-tier DRAM/NVM placement.
+
+**Relevance tags:** log-free OLTP; persistent memory; metadata-enhanced tuple
+cache; write amplification; last-persisted bit; NVM allocation; garbage
+queues; crash recovery; DRAM CC metadata; warm-tier durability; future CXL/NVM;
+WAL boundary design.
+
+**Core idea:** Zen asks what an OLTP engine should look like when byte-addressable
+non-volatile memory is the main durable tier rather than a slow block device. Its
+answer is not "put the existing in-memory engine in NVM." The paper separates
+durable tuple payload from volatile concurrency-control metadata, removes
+transaction logs and checkpoints from the normal persistence path, and treats
+tuple allocation/free metadata as rebuildable state whenever recovery can infer
+the latest committed versions.
+
+The main transferable lesson for GPU DB is narrower than adopting Zen's
+log-free durability wholesale. The valuable pattern is **single-purpose
+persistent evidence**: keep hot coordination metadata in the fastest volatile
+tier, persist only the bytes needed to prove committed tuple versions after a
+crash, and rebuild derived indexes or allocation structures by scanning durable
+payloads. For GPU DB, that suggests route metadata, resident snapshot
+directories, CPU indexes, and warm-tier allocation structures should not become
+durable merely because the payload or WAL is durable.
+
+**Concrete mechanisms:**
+
+- Zen stores base tuples in NVM without per-tuple concurrency-control metadata.
+  A DRAM metadata-enhanced tuple cache, or Met-Cache, caches recently used
+  tuples and attaches CC-specific fields such as locks, timestamps, version
+  links, dirty bits, active bits, and replacement bits.
+- Each table has an NVM tuple heap made of fixed-size pages, with each tuple
+  carrying a tuple id, transaction commit timestamp, deleted bit, and
+  last-persisted bit. The header is designed so the commit evidence can be
+  persisted with cache-line flushes.
+- Transaction processing is split into perform, persist, and maintenance.
+  Perform runs the selected concurrency-control method in DRAM. Persist writes
+  changed tuples to new or recycled NVM slots rather than overwriting old
+  versions. Maintenance garbage-collects old tuple versions into per-thread
+  queues and free lists.
+- Commit persistence writes all changed tuples, executes one fence, then marks
+  the last tuple's LP bit. The LP bit acts like a compact commit record: if
+  recovery finds the bit, the transaction's tuple versions are committed; if
+  not, the transaction is treated as interrupted and its written slots can be
+  discarded.
+- Tuple-level allocation metadata is kept in DRAM. Zen allocates large NVM
+  pages, initializes slots so `Tx-CTS=0` means empty, and reconstructs free
+  lists during recovery by scanning tuple headers and committed-version state.
+- Each thread owns a Met-Cache region and NVM tuple-heap region for writes,
+  reducing synchronization and keeping NUMA placement explicit. Threads may
+  read remote regions, but write to local regions.
+- For MVCC variants, active versions live in Met-Cache and are protected from
+  replacement while transactions can still use them. Committed NVM versions
+  exist for durability and log removal, not necessarily because the runtime
+  concurrency protocol needs every historical version in NVM.
+- Garbage queues retire old versions only after a global minimum transaction
+  timestamp says no running transaction can still access them. Zen bounds
+  normal per-transaction garbage work, but can enter an exclusive mode for a
+  long-running read-write transaction that threatens cache capacity or NVM
+  free space.
+- Evaluation used Intel Optane DC Persistent Memory with YCSB and TPCC-NP.
+  The paper reports up to 10.1x improvement over compared NVM OLTP designs,
+  1.8M transactions/s with 32 threads, and recovery on the order of seconds
+  for a few-hundred-GB database. Zen's gains are strongest when avoiding NVM
+  writes for reads, logs, aborted writes, and allocation metadata.
+- The paper discusses persistent indexes as optional recovery accelerators and
+  DRAM-based logs for shipping, PITR, or disaster recovery. Those logs are not
+  part of Zen's local persistence proof and therefore need not be write-ahead
+  in the same sense.
+
+**GPU DB mapping:** GPU DB should treat Zen as a pressure test for every piece
+of metadata it is tempted to persist. WAL/checkpoint/archive remain the
+authority in the current architecture, but derived state can borrow Zen's split:
+payload durability and commit evidence in the durable path; route descriptors,
+visibility directories, resident index caches, free lists, and CC metadata in
+DRAM/HBM when they can be rebuilt or invalidated from WAL and tuple payloads.
+
+For future warm tiers such as CXL-attached NVM or byte-addressable persistent
+memory, Zen suggests an alternative to blindly extending WAL with more metadata
+records. A CPU warm-tier segment could append new versions to fresh slots and
+publish a compact "last persisted" or generation marker only after all payload
+cache lines are durable. Recovery would rebuild indexes, allocation state, and
+resident-route metadata from committed tuple headers plus WAL boundaries.
+
+The Met-Cache maps naturally to GPU DB's owner domains. Mutation owners can
+keep volatile write-intent, lock, timestamp, and active-reader metadata near
+the CPU cores that execute writes, while the durable tuple or segment payload
+is appended in a warm/cold tier. GPU resident snapshots should remain derived
+read objects: they need generation certificates and invalidation metadata, not
+durable CC fields embedded into every device-resident payload row.
+
+Zen's per-thread region ownership is also relevant to high session counts.
+Instead of one global allocator or route-metadata pool, GPU DB can use
+owner-local slabs for tuple deltas, response buffers, visibility directories,
+and warm-tier append slots. Recovery can reconstruct global state from
+per-owner durable regions, while normal processing avoids shared allocation
+and free-list contention.
+
+**Risks and mismatches:** Zen deliberately removes local WAL/checkpointing for
+NVM-resident OLTP data. GPU DB should not copy that decision into the current
+engine because its correctness contract is WAL-before-visibility, archival
+replay, PITR, and recoverable CPU truth before GPU caches are trusted. Zen is
+most useful as a future-tier design contrast, not a reason to weaken WAL.
+
+Zen assumes the database fits in NVM. It does not solve HBM/DRAM/NVMe
+oversubscription, cold object storage, GPU kernel scheduling, SQL planner
+fallback, or pgwire session multiplexing. Its log-free proof also depends on
+careful persistent-memory cache-line semantics that may not apply to NVMe,
+object storage, or GPU memory.
+
+The LP-bit commit marker is compact but ties recovery to scanning the NVM tuple
+heap and rebuilding indexes. GPU DB must benchmark whether scanning large warm
+segments during recovery is acceptable or whether selected persistent indexes
+and log-offset indexes are needed.
+
+Long read-write transactions can force Zen's exclusive mode and delay other
+transactions. For GPU DB, an equivalent "let one long mutation own everything"
+mode would be dangerous under 1M logical sessions; large writes should be
+chunked, admitted explicitly, or routed through bulk ingest owners.
+
+**Benchmark candidates:**
+
+- Build a write-path simulator with three durability modes: WAL plus CPU tuple
+  update, Zen-style append with compact commit marker, and WAL plus derived
+  warm-tier append. Measure writes per tuple write, fences/flushes, commit
+  latency, recovery time, and read-route freshness.
+- Prototype volatile CC metadata over durable append-only tuple slots. Gate:
+  reads and writes avoid durable metadata writes until commit while preserving
+  WAL-before-visibility and exact MVCC visibility after crash/replay.
+- Add an owner-local allocation benchmark for tuple deltas, route descriptors,
+  visibility directories, and response buffers. Compare global allocator,
+  per-owner DRAM slabs, and reconstructable warm-tier free lists under high
+  session concurrency.
+- Test compact commit evidence for future warm-tier segments: append payloads,
+  persist a final generation marker, crash at every step, and verify recovery
+  either publishes all versions in the generation or none.
+- Compare recovery strategies for warm-tier indexes: rebuild all CPU indexes
+  from WAL/payload, persist only leaf-level route indexes, or maintain a
+  log-offset/index checkpoint. Failure condition: recovery accelerators weaken
+  replay correctness or make normal commits pay more than the measured benefit.
+- Stress long-reader and long-writer interaction with garbage queues. Gate:
+  old warm-tier versions and route metadata retire under bounded memory without
+  blocking short retained reads or making bulk writes monopolize the mutation
+  owner.

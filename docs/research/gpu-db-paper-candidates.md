@@ -5083,14 +5083,15 @@ Append new candidates here as each paper is processed.
   useful for comparing persistent-cache/eADR assumptions, small log windows,
   and selective data flushes with future GPU DB CXL/NVM metadata paths.
   Journal entry added 2026-06-07.
-- `queued` — **Zen: a High-Throughput Log-Free OLTP Engine for
+- `reviewed` — **Zen: a High-Throughput Log-Free OLTP Engine for
   Non-Volatile Main Memory**, Liu, Chen, and Chen, PVLDB 2021.
   URL: `https://www.vldb.org/pvldb/vol14/p835-liu.pdf`
   DOI: `https://doi.org/10.14778/3446095.3446105`
   Why: TB-Collect uses Zen as a background-scanning NVM GC and log-free OLTP
   baseline; useful for comparing metadata-enhanced tuple caches, log-free
   persistent transactions, and NVM space management with WAL-before-visibility
-  and GPU DB warm-tier durability constraints.
+  and GPU DB warm-tier durability constraints. Journal entry added
+  2026-06-07 from the PVLDB PDF.
 - `queued` — **Silo: Speculative Hardware Logging for Atomic Durability in
   Persistent Memory**, Zhang and Hua, IEEE Transactions on Computers 2024.
   URL: `https://doi.org/10.1109/TC.2023.3332118`
@@ -5098,6 +5099,20 @@ Append new candidates here as each paper is processed.
   logs on chip and writes them back only on crash; useful as a contrast to
   Falcon's software small-log-window approach before GPU DB assumes future
   hardware support for durable route-publication windows.
+- `queued` — **LB+-Trees: Optimizing Persistent Index Performance on
+  3DXPoint Memory**, Liu, Chen, and Wang, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p1078-liu.pdf`
+  DOI: `https://doi.org/10.14778/3389133.3389136`
+  Why: Zen names LB+-Tree-style selective persistence as an optional recovery
+  accelerator; useful for deciding whether GPU DB should persist cold/warm
+  index leaves while keeping internal route metadata rebuildable in DRAM.
+- `queued` — **NV-Tree: Reducing Consistency Cost for NVM-based Single Level
+  Systems**, Yang et al., FAST 2015.
+  URL: `https://www.usenix.org/conference/fast15/technical-sessions/presentation/yang`
+  PDF: `https://www.usenix.org/system/files/conference/fast15/fast15-paper-yang.pdf`
+  Why: Zen points to selective persistence in persistent indexes; useful as a
+  boundary case for how much index state GPU DB should make durable versus
+  reconstructing after WAL/checkpoint replay.
 - `queued` — **BBB: Simplifying Persistent Programming using Battery-Backed
   Buffers**, Alshboul, Ramrakhyani, Wang, and Solihin, HPCA 2021.
   URL: `https://doi.org/10.1109/HPCA51647.2021.00078`
