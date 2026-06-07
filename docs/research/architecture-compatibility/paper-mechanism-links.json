@@ -15733,8 +15733,8 @@
               "reclamation",
               "long readers"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The design track is now a route certificate with four proof layers: logical visibility, physical placement, pressure/admission, and lifetime/reclamation.",
             "support_reason": "Matched journal terms (reclamation, long readers) to MVCC garbage-collection frontiers."
           },
@@ -21564,8 +21564,8 @@
               "planning",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Umbra's disk-backed MVCC argues for ephemeral version metadata and durable latest-state/WAL authority, with a separate fallback for large writes.",
             "support_reason": "Matched journal terms (optimizer, planning, metadata) to Cost-based route optimizer."
           },
@@ -29259,8 +29259,8 @@
               "version chain",
               "reclamation"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Local DRAM remains the fast tier; CXL memory is used for colder pages while still being byte-addressable and coherent. - Demotion is integrated into Linux reclamation.",
             "support_reason": "Matched journal terms (version chain, reclamation) to MVCC garbage-collection frontiers."
           },
@@ -29334,8 +29334,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Its strongest transferable design pattern is fast-tier headroom management: proactively demote colder pages before local DRAM is exhausted so new request-related allocations and promotions of trapped hot pages have room to land.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -31992,8 +31992,8 @@
               "retry",
               "aria"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "**Papers covered:** LeanStore low-overhead transactional buffer management, Umbra variable-size pages for SSD-backed hot working sets, and Cicada dependably fast multi-core in-memory transactions.",
             "support_reason": "Matched journal terms (deterministic, retry, aria) to Deterministic hot-write templates."
           },
@@ -32179,8 +32179,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "They reduce round trips and help complex transactions: in the paper's TPC-C experiment, stored procedures reach up to 2.1x the maximum throughput of an interactive transaction model and avoid much of the latency added by repeated SQL parsing/planning/serialization.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -32513,8 +32513,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The key claim is budgetary: modern NICs and NVMe arrays can deliver enough packets or I/Os that a traditional kernel stack spends more CPU cycles per operation than the machine can afford, even before the DBMS does useful work.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -37235,8 +37235,8 @@
               "compaction",
               "rocksdb"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "LSM-style and delta-chain alternatives reduce some write amplification but can add read, scan, or compaction cost.",
             "support_reason": "Matched journal terms (object, cold tier, compaction, rocksdb) to DB-owned cold objects."
           },
@@ -37559,8 +37559,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A sharing-enabled path then restores concurrent sharing at the OS level, so bypassed ingestion does not degenerate into redundant device traffic when multiple queries read the same data.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -38564,8 +38564,8 @@
               "join",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A per-file structure tracks cached device blocks and dirty-page metadata; a per-VMA structure provides fuller reverse mappings. - Clean and dirty metadata are separated.",
             "support_reason": "Matched journal terms (join, metadata) to Cost-based route optimizer."
           },
@@ -38612,8 +38612,8 @@
               "era",
               "lock-free"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper targets data-intensive applications with little file sharing and infrequent `fork`; general-purpose mmap semantics would need more memory and edge-case handling.",
             "support_reason": "Matched journal terms (era, lock-free) to Bounded descriptor reclamation."
           },
@@ -39827,8 +39827,8 @@
               "snapshot",
               "multiversion"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "**Papers covered:** PACMAN parallel command-log recovery, bounded multiversion garbage collection, and Vortex.",
             "support_reason": "Matched journal terms (snapshot, multiversion) to Snapshot frontier vectors."
           },
@@ -42527,8 +42527,8 @@
               "retained",
               "resident"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For COPY and hot OLTP mutations, the current owner could record a batch order, pre-validate schema/constraints/known key sets, append stable command records, and then execute independent physical substeps in parallel: tuple append, CPU index append, GPU resident invalidation, and refresh scheduling.",
             "support_reason": "Matched journal terms (retained, resident) to Retained GPU snapshots."
           },
@@ -44064,8 +44064,8 @@
               "session",
               "staR"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It does not solve WAL-before-visibility, incremental mutation maintenance, snapshot retirement, DDL invalidation, or low-latency point lookups under many sessions.",
             "support_reason": "Matched journal terms (session, staR) to Effective session counting."
           },
@@ -44375,8 +44375,8 @@
             "matched_terms": [
               "aria"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Instead of choosing either a traditional binary plan or a Generic Join variable order, it represents a plan as nodes that may join any number of relations on any number of variables.",
             "support_reason": "Matched journal terms (aria) to Deterministic hot-write templates."
           },
@@ -44542,8 +44542,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It assumes NIC hardware timestamp support and prompt ACK generation, neither of which is guaranteed for pgwire over ordinary TCP.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -44999,8 +44999,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper contrasts block-wise decompression, which expands compressed pages into GPU global memory, with vectorized decompression that decodes into registers or shared memory and immediately feeds query operators.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -48137,8 +48137,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A P8 resident segment or future cold-tier page should have a stable handle while a kernel or retained snapshot is active, plus a reference or lease that prevents eviction until the GPU execution owner releases it.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -53364,8 +53364,8 @@
             "matched_terms": [
               "tpc-c"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "...mean over JIT scans by about 1.26x, and adding PSMA was most helpful when data was sorted or naturally clustered. - For TPC-C, compressing only old `neworder` records had negligible throughput difference in the reported setup: 89,229 TPS on uncompressed storage versus 88,699 TPS with cold Data Blocks.",
             "support_reason": "Matched journal terms (tpc-c) to GPU OLTP conflict ordering."
           },
@@ -54046,8 +54046,8 @@
               "era",
               "lock-free"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper's best transferable idea is to decouple durable IO granularity from hot-cache granularity.",
             "support_reason": "Matched journal terms (era, lock-free) to Bounded descriptor reclamation."
           },
@@ -66948,8 +66948,8 @@
             "matched_terms": [
               "tpc-c"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The evaluation is CPU distributed in-memory OLTP on TPC-C and Smallbank, not GPU-resident execution, SQL planning, or NVMe tier movement.",
             "support_reason": "Matched journal terms (tpc-c) to GPU OLTP conflict ordering."
           },
@@ -83253,8 +83253,8 @@
               "era",
               "lock-free"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "That is practical for stored procedures, prepared statements, COPY-style ingest, and known transaction templates, but not for arbitrary interactive SQL transactions whose read/write sets are discovered online.",
             "support_reason": "Matched journal terms (era, lock-free) to Bounded descriptor reclamation."
           },
@@ -108923,8 +108923,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For GPU DB, the analogous \"pages\" are resident column chunks, retained snapshot generations, CPU derived indexes, WAL replay buffers, text dictionaries, visibility summaries, and pinned transfer buffers.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4355,
-      "weak_direct": 316
+      "direct": 4378,
+      "weak_direct": 293
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 193,
+      "snippet contains matched mechanism term plus visible aliases": 216,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 310,
+      "substantive snippet contains only one matched mechanism term": 287,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
