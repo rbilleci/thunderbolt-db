@@ -38,6 +38,186 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - JUSTDO turns logging into resumable progress state
+
+**Citation:** Joseph Izraelevitz, Terence Kelly, and Aasheesh Kolli.
+"Failure-Atomic Persistent Memory Updates via JUSTDO Logging." ASPLOS
+2016. DOI: `https://doi.org/10.1145/2872362.2872410`. Retrieved
+2026-06-07 from the author/HPE technical report PDF:
+`https://akolli.github.io/pubs/justdo-asplos16.pdf`.
+
+**Category:** database file-system/storage/indexing and WAL/logging
+throughput; transaction processing/write path; recovery and future
+persistent-memory tiers.
+
+**Relevance tags:** failure atomicity; persistent memory; persistent
+caches; log reduction; resumable critical sections; lock-delimited FASEs;
+per-thread logs; parallel recovery; persist ordering; warm-tier metadata;
+route-publication recovery witness; WAL-adjacent design.
+
+**Core idea:** JUSTDO logging targets lock-delimited failure-atomic
+sections on systems where main memory and CPU caches are persistent but CPU
+registers are transient. Instead of using undo or redo logs to roll back or
+replay every modified byte, it records only the last persistent store that a
+thread attempted inside a failure-atomic section, then resumes the interrupted
+section from that store during recovery.
+
+The strongest transferable idea for GPU DB is to separate the durable
+database WAL from smaller internal recovery witnesses. SQL-visible data still
+needs WAL-before-visibility, but future warm-tier metadata, resident-route
+publication records, cache-descriptor updates, or persistent-memory indexes
+may not need full per-field undo/redo if their update regions are small,
+idempotent, lock-owned, and resumable after failure.
+
+**Concrete mechanisms:**
+
+- JUSTDO assumes failure-atomic sections are the outermost critical sections
+  protected by mutexes. A thread may temporarily violate invariants while it
+  holds locks, but must restore them before releasing its final lock.
+- Each thread owns a small JUSTDO log with one active entry. The active entry
+  records the destination address, value, write size, and program counter for
+  the most recent store inside the section.
+- The log physically keeps two entries and flips an active indicator packed
+  into high program-counter bits. The inactive entry is filled first, release
+  fences make the log persistent, then the program-counter indicator is
+  stored, fenced, and the actual persistent store is executed.
+- Recovery re-enters each interrupted failure-atomic section at the recorded
+  program counter, re-executes the idempotent store, and continues the section
+  to completion instead of rolling back partial effects.
+- The design requires all loads and stores inside a section to access
+  persistent memory only. Data that would normally live on a stack must be
+  moved into persistent thread-local storage before entering the section.
+- The implementation prevents unsafe register promotion in sections, because
+  a recovered execution cannot depend on a value that was only present in a
+  lost CPU register.
+- Persistent lock intention logs and lock ownership logs record locks a
+  thread was trying to acquire or already held. Recovery first unlocks locks
+  that may be stuck, then recovery threads reacquire owned locks, synchronize
+  at a barrier, and resume their sections.
+- Recovery is parallel: one recovery thread is spawned per non-empty JUSTDO
+  log. Once recovery threads have reacquired their locks and passed the
+  barrier, ordinary application execution can resume against synchronized
+  persistent state while recovery sections finish.
+- The prototype is a C/C++ library. It requires annotated JUSTDO routines,
+  explicit special stores, persistent-only access discipline, and manual
+  recovery boilerplate; the paper notes that compiler support could remove
+  much of this burden.
+- Correctness was tested with crash injection against five concurrent data
+  structures, including a 128 GB hash map. Performance experiments report
+  more than 3x higher operation throughput than Atlas on the evaluated
+  lock-based persistent data structures, while still slower than transient
+  crash-vulnerable versions.
+
+**GPU DB mapping:** Keep the main mutation path conservative:
+user-visible table changes, catalog changes, and visibility publication still
+flow through WAL, invalidation, CPU truth, and snapshot generation in that
+order. JUSTDO should not replace the database WAL.
+
+The useful adaptation is narrower: route-publication and warm-tier metadata
+can be designed as resumable owner sections. A residency owner publishing a
+new segment descriptor might persist a compact "done-to-here" witness for the
+descriptor field currently being installed, plus the owner lock/epoch and
+target generation. After a crash, recovery can either complete the descriptor
+publication or discard the unpublished generation before opening routes.
+
+For P8, this suggests a benchmarkable alternative to heavyweight descriptor
+logs. Resident and warm-tier metadata updates could be grouped into tiny
+idempotent sections: allocate descriptor slot, write immutable offsets and
+checksum fields, publish generation pointer, then mark route-ready. Each
+phase would have a compact recovery witness rather than a full undo log over
+all descriptor bytes.
+
+For 1M-session runtime state, JUSTDO's discipline reinforces a useful split:
+high-churn request/session buffers should stay transient and replayable, while
+only compact route/catalog/residency witnesses become persistent. The
+persistent-only rule is too strict for ordinary query execution, but good for
+small expert-owned maintenance sections whose inputs are already durable.
+
+For future CXL/NVM tiers, the paper is a reminder that persist ordering and
+recovery shape should be part of the data-structure API. A remote/warm index
+or cache manifest should define which stores are idempotent, which generation
+pointer is the visibility point, and whether recovery completes or rolls back
+partially published state.
+
+**Risks and mismatches:** JUSTDO assumes persistent caches or similarly cheap
+persist ordering. Commodity systems without those properties may pay explicit
+flush/fence costs, and GPU DB cannot assume future hardware will make every
+store persistent cheaply.
+
+The model does not tolerate bugs inside a failure-atomic section and does not
+support rollback. That is inappropriate for arbitrary SQL execution,
+untrusted extension code, or complex mutation paths that can discover errors
+late. GPU DB should apply the pattern only to small verified owner routines
+with deterministic completion.
+
+The persistent-only access rule is restrictive. Normal query execution,
+network IO, GPU kernels, pinned buffers, and response encoding depend on
+transient state. The adaptation should be descriptor publication and recovery
+metadata, not whole-request persistence.
+
+JUSTDO is evaluated on concurrent data structures, not a DBMS WAL, MVCC
+engine, GPU cache manager, or distributed storage tier. Its reported
+throughput wins are evidence that log-size reduction can matter, not proof
+that a DB can omit WAL or reduce commit durability.
+
+**Benchmark candidates:**
+
+- Prototype a route-descriptor publication log with two modes: full redo log
+  for every descriptor field versus a compact resumable phase witness. Gate:
+  crash injection after every descriptor store either completes publication
+  or leaves the route unavailable with CPU fallback.
+- Build a warm-tier metadata microbenchmark for `{segment_id, checksum_root,
+  codec_ids, offsets, visibility_generation, ready_pointer}`. Measure persist
+  fences, bytes logged, recovery time, and route-open latency.
+- Add a crash-injection harness for P8 residency maintenance: fail during
+  admission, invalidation, refresh publication, eviction, and generation
+  pointer swap. Failure condition: a stale or partially initialized resident
+  route becomes selectable.
+- Compare descriptor recovery policies: complete interrupted publication,
+  roll back to previous generation, or mark generation suspect and rebuild.
+  Report recovery latency, route availability, and amount of durable witness
+  state.
+- Test whether owner-section inputs can obey a persistent-only discipline:
+  all route-publication inputs must come from WAL/checkpoint/catalog state or
+  already-persisted build artifacts, not stack-only/transient scratch.
+- Evaluate whether persistent-memory log reduction is still attractive when
+  explicit flushes are required. Gate: smaller logs must reduce p99 metadata
+  publication or recovery time enough to offset fence cost.
+
+### 2026-06-07 - Cross-paper synthesis: route admission now needs three witnesses
+
+**Converging tracks:** Firmament, Graphene, TetriSched, Hostping, and JUSTDO
+all point at a similar runtime shape from different layers. Firmament and
+TetriSched favor a global or plan-ahead advisor when scarce resources and
+fallback choices interact. Graphene argues that dependency structure and
+packing can be handled with cheaper heuristics when full optimization is too
+expensive. Hostping says the chosen route is only good if the intra-host path
+is healthy. JUSTDO says durable internal metadata should carry compact
+recovery progress rather than a large opaque log.
+
+For GPU DB, the converging track is **three-witness route admission**. A route
+should be admitted only when it has a semantic witness, a resource witness,
+and a recovery witness: semantic proof that the snapshot/catalog/resident
+generation is valid; resource proof that GPU, CPU, memory, NIC, NVMe, and host
+paths can meet the route class; and recovery proof that any published
+descriptor or warm-tier metadata is either complete or safely rebuildable.
+
+**Category gaps:** The queue is now heavy with runtime scheduling, learned
+optimization, disaggregated-memory indexes, and persistent-memory durability.
+The next few papers should bias toward MVCC validation, OLTP transaction
+scheduling, WAL/checkpoint/replay, or session admission that is closer to
+database request semantics than cluster-job scheduling.
+
+**Benchmark priorities:**
+
+- A route-admission simulator with explicit semantic, resource, and recovery
+  witness fields, including degraded host paths and partially published
+  descriptors.
+- Crash-injected P8 route publication that proves stale resident routes cannot
+  become selectable after interrupted refresh or eviction.
+- Mixed OLTP/read workload tests that compare greedy local admission, global
+  bundle planning, and witness-aware deterministic fallback under p99 limits.
+
 ### 2026-06-07 - Hostping makes host interconnect health a route precondition
 
 **Citation:** Kefei Liu, Zhuo Jiang, Jiao Zhang, Haoran Wei,

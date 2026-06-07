@@ -753,12 +753,14 @@ Append new candidates here as each paper is processed.
   random writes and improving sequential/coalesced persistence, useful for a
   software/storage-oriented baseline for future GPU DB CXL/NVM route
   metadata. Journal entry added 2026-06-06.
-- `queued` — **Failure-Atomic Persistent Memory Updates via JUSTDO Logging**,
+- `reviewed` — **Failure-Atomic Persistent Memory Updates via JUSTDO Logging**,
   Izraelevitz, Kelly, and Kolli, ASPLOS 2016.
   URL: `https://doi.org/10.1145/2872362.2872410`
+  PDF: `https://akolli.github.io/pubs/justdo-asplos16.pdf`
   Why: ArchTM cites JUSTDO as a persistent-memory logging baseline; useful for
   comparing minimal logging, persist ordering, and recovery annotation against
-  CoW-style route-publication records.
+  CoW-style route-publication records. Journal entry added 2026-06-07 from
+  the author/HPE technical report PDF.
 - `queued` — **Durable Transactional Memory Can Scale with TimeStone**,
   Krishnan et al., ASPLOS 2020.
   URL: `https://doi.org/10.1145/3373376.3378493`
@@ -810,6 +812,19 @@ Append new candidates here as each paper is processed.
   recovery-via-resumption design; useful for isolating when compiler-marked
   deterministic replay regions beat conventional undo/redo logging for future
   warm-tier metadata or route-publication records.
+- `queued` — **Arcadia: A Fast and Reliable Persistent Memory Replicated
+  Log**, Denk et al., arXiv 2022.
+  URL: `https://arxiv.org/abs/2206.12495`
+  Why: discovered while reviewing JUSTDO; useful as a newer replicated-log
+  follow-up for checking whether persistent-memory log abstractions can hide
+  PMEM ordering limits while preserving DB-style durability and failover
+  semantics.
+- `queued` — **Detectable Sequential Specifications for Recoverable Shared
+  Objects**, Li and Golab, DISC 2021.
+  URL: `https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.DISC.2021.29`
+  Why: discovered while reviewing JUSTDO; useful for comparing recoverable
+  object detectability and post-crash operation outcomes against GPU DB route
+  publication witnesses, idempotent retry, and client-visible commit status.
 - `reviewed` — **Asynchronous Persistence with ASAP / ASAP: Architecture
   Support for Asynchronous Persistence**, Abulila, El Hajj, Jung, and Kim,
   arXiv 2023 / ISCA 2022.
