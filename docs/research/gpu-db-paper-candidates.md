@@ -1166,6 +1166,15 @@ Append new candidates here as each paper is processed.
   Why: PALF compares CSN-style database ordering with replicated log services;
   useful for deciding whether GPU DB should keep WAL bundled with mutation
   owners or expose an independent replicated log service.
+- `queued` — **Moving on From Group Commit: Autonomous Commit Enables High
+  Throughput and Low Latency on NVMe SSDs**, Nguyen, Alhomssi, Ziegler, and
+  Leis, PACMMOD/SIGMOD 2025.
+  URL: `https://doi.org/10.1145/3725328`
+  PDF: `https://lamduynguyen.github.io/assets/pdf/latency.pdf`
+  Why: discovered while reviewing Chardonnay's fast 2PC and pipelined WAL
+  assumptions; useful for comparing per-worker small log writes and parallel
+  commit acknowledgement against group commit when GPU DB tries to keep
+  WAL-before-visibility latency low on modern NVMe.
 - `reviewed` — **Rethinking Logging, Checkpoints, and Recovery for
   High-Performance Storage Engines**, Haubenschild, Sauer, Neumann, and Leis,
   SIGMOD/PACMMOD 2020.
@@ -1435,14 +1444,15 @@ Append new candidates here as each paper is processed.
   write visibility from global retained-snapshot publication with
   epoch-based MVCC, regional publishers, leader-lease validation, and
   lock-free global snapshot reads. Journal entry added 2026-06-07.
-- `queued` — **Chardonnay: Fast and General Datacenter Transactions for
+- `reviewed` — **Chardonnay: Fast and General Datacenter Transactions for
   On-Disk Databases**, Eldeeb et al., OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/eldeeb`
   PDF: `https://www.usenix.org/system/files/osdi23-eldeeb.pdf`
   Why: Chablis extends Chardonnay's single-datacenter epoch-based transaction
   design; useful for deeper mechanisms around local epoch services,
   lock-free strictly serializable snapshots, eRPC batching, and on-disk WAL
-  integration before GPU DB adopts local visibility publishers.
+  integration before GPU DB adopts local visibility publishers. Journal entry
+  added 2026-06-07.
 - `reviewed` — **Q-Store: Distributed, Multi-partition Transactions via
   Queue-oriented Execution and Communication**, Qadah, Gupta, and Sadoghi,
   EDBT 2020.

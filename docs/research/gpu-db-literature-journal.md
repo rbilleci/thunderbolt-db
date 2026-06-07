@@ -96824,3 +96824,168 @@ by crash recovery, not hidden in a storage layer.
   dependencies. Generate related and unrelated operation sequences and verify
   that unrelated streams can reorder without changing SQL-visible recovery,
   while related streams preserve required order.
+
+### 2026-06-07 - Chardonnay turns epoch snapshots into pre-lock admission
+
+**Citation:** Tamer Eldeeb, Xincheng Xie, Philip A. Bernstein, Asaf Cidon,
+and Junfeng Yang. "Chardonnay: Fast and General Datacenter Transactions for
+On-Disk Databases." OSDI 2023. Retrieved 2026-06-07 from
+`https://www.usenix.org/system/files/osdi23-eldeeb.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; multi-tier cache / data placement.
+
+**Relevance tags:** epoch visibility, lock-free snapshot reads, fast 2PC,
+prefetch admission, pinned read sets, range pinning, WAL-before-release,
+deadlock avoidance, low-latency RPC.
+
+**Core idea:** Chardonnay assumes modern datacenter RPC and fast log devices
+make 2PC cheap enough that the next bottleneck is holding locks while fetching
+cold data from slower storage. It keeps a general shared-nothing on-disk
+transaction model with strict 2PL and 2PC, then uses an epoch-based snapshot
+protocol to run a transparent dry run before the real transaction. The dry run
+discovers and pins the read set without taking locks, so the real execution
+can acquire locks over hot records only after the cold reads are already in
+memory.
+
+The paper is a useful bridge from Chablis back to a single-datacenter design.
+Instead of making epoch boundaries a global sequencing bottleneck, Chardonnay
+lets transactions commit out of epoch order but proves an equivalent epoch
+ordering for committed transactions. That property makes an epoch boundary a
+complete snapshot frontier when readers also wait for any write locks that
+could belong to prepared transactions below the frontier.
+
+**Concrete mechanisms:**
+
+- The epoch service is a Multi-Paxos replicated counter advanced at a fixed
+  interval, 10 ms in the experiments. Clients read the epoch by querying
+  replicas and using a majority value. Transaction clients batch concurrent
+  read-epoch calls, and read the epoch in parallel with the Prepare phase.
+- Each range has a leader lease expressed as an epoch interval. Prepare
+  responses include that interval, and the client validates that its commit
+  epoch falls inside every participant's lease interval before recording the
+  commit decision. This maintains a leader-disjointness invariant for each
+  epoch.
+- Versions are keyed by `(user key, version id)`, where the version id has an
+  epoch prefix and a per-epoch suffix. Deletes are tombstone versions, and an
+  unversioned latest record is also stored for the normal write path.
+- A snapshot read first reads epoch `ec`, validates it against the relevant
+  range leader interval, waits for current write-lock holders on its read set
+  if those locks could cover transactions below `ec`, and then reads the
+  largest version below `(ec, 0)`. The read does not acquire locks.
+- Linearizable read-only transactions can wait for the epoch to advance once
+  before choosing the snapshot epoch. In the evaluation this adds about half
+  the 10 ms epoch interval to median latency.
+- Version GC uses the lower end of the range leader's lease interval plus a
+  retention delta. Snapshot reads validate after execution that their epoch is
+  still inside the retained window. Same-epoch superseded versions can be
+  removed immediately because snapshots only target epoch boundaries.
+- Dry-run transactions execute user logic under the snapshot protocol, request
+  key or range pinning, discard writes at the client, and then rerun normally.
+  The prefetch buffer is write-through for pinned records, and pinned ranges
+  also capture later inserts or deletes inside the range.
+- Lock acquisition uses the approximate read/write set found by the dry run.
+  Chardonnay acquires locks in ascending key order and uses an RPC-chain style
+  protocol where ranges acquire local locks, perform local reads, and forward
+  the request, reducing round trips compared with one lock RPC per key.
+- The paper's 2PC path uses pipelined WAL entries rather than large batches:
+  each Prepare has its own Paxos log append, but appends are pipelined and
+  applied in log order. A client-driven transaction-state store records commit
+  or abort decisions in a tiny per-transaction Paxos log.
+- Evaluation claims include 2PC over Paxos around 150 microseconds on Azure in
+  the authors' fast setup, stable TPC-C New-Order scaling to 200 nodes at a
+  capped 2500 TPS per node, a 1.2M read-epoch-calls/second microbenchmark with
+  median latency below 60 microseconds, YCSB snapshot-read median latency near
+  220 microseconds uniform and 355 microseconds under Zipfian 0.99, and a
+  contention microbenchmark where full Chardonnay avoids deadlock aborts and
+  drops far less than the baseline under high contention.
+
+**GPU DB mapping:** The strongest transferable idea is to turn retained
+snapshot execution into an admission and prefetch phase for writes, not only a
+read acceleration path. A GPU DB write route can do a snapshot dry run that
+discovers keys, ranges, resident segments, CPU index pages, and cold-tier
+objects before entering the mutation owner's critical section. The real commit
+then acquires owner-domain locks or reservations after data movement is done,
+keeping WAL-before-visibility intact while shrinking the lock-held window.
+
+Chardonnay's epoch frontier maps cleanly to GPU DB generation publication.
+The mutation/catalog/residency owners can publish local visibility generations
+that retained reads use as complete snapshot frontiers. A read may skip the
+mutation owner only when every write, invalidation, DDL, and resident refresh
+below the chosen generation is either committed and visible or known by an
+explicit lock/reservation wait to be unable to change that snapshot.
+
+The leader-lease interval idea maps to route-descriptor authority. A route
+descriptor should carry an owner/generation interval, and any commit,
+resident-refresh, or DDL publication should validate that the descriptor's
+authority interval still covers the generation being published. That gives a
+concrete invariant for avoiding stale route owners after partition movement or
+residency ownership changes.
+
+Pinned keys and pinned ranges are directly useful for P8. A dry-run retained
+lookup can pin CPU rows, resident GPU column chunks, cold segment descriptors,
+or prefix/range fragments before the write phase. Writes into pinned ranges
+must update or invalidate the pinned buffer, which is the same contract needed
+for GPU resident snapshots and prefix filters.
+
+The immediate same-epoch version cleanup suggests a bounded MVCC optimization:
+if GPU DB only exposes retained snapshots at generation boundaries, multiple
+updates inside the same unpublished generation may not need to create
+independently visible retained versions. This must be tied to WAL replay and
+SQL isolation, but it could reduce hot-key version-chain pressure.
+
+**Risks and mismatches:** Chardonnay is a distributed key-value store, not a
+SQL engine or GPU database. It assumes point and range keys, strict 2PL, Paxos
+logs, static ranges in the prototype, fast eRPC-style communication, and an
+emulated fast NVMe WAL on RAMdisk. It does not cover SQL join planning,
+secondary-index maintenance details, GPU kernels, pinned host buffers,
+device-memory eviction, pgwire multiplexing, or CPU/GPU transfer contention.
+
+Dry runs execute transaction logic twice. That is a poor fit for
+compute-heavy stored procedures, external side effects, volatile functions, or
+queries whose access set changes often between dry run and execution. GPU DB
+should apply the idea first to predictable OLTP shapes, prepared statements,
+and bounded range/prefix mutations rather than to arbitrary SQL.
+
+The snapshot algorithm can still wait on write locks in the read set. Under a
+hot-key workload, retained reads may see higher latency rather than fully
+lock-free execution. The system needs clear telemetry for wait-on-prepared,
+wait-on-invalidation, and wait-on-refresh causes.
+
+Chardonnay's range pinning requires precise range-lock and phantom semantics.
+For SQL predicates, prefix filters, and secondary indexes, GPU DB needs a
+predicate-compatible invalidation or range-reservation model before treating a
+dry-run access set as complete.
+
+The epoch interval is a latency trade-off. The 10 ms interval works for the
+paper's setup, but GPU DB's local retained reads may need microsecond-scale
+generation publication for p50 latency, while strong cross-partition or
+administrative reads may tolerate explicit generation waits.
+
+**Benchmark candidates:**
+
+- Build a write-route dry-run benchmark for prepared point updates: execute a
+  retained snapshot pass to discover keys and resident/cold fragments, prefetch
+  them, then enter the mutation owner. Compare lock-held time, write p50/p99,
+  abort/retry rate, and throughput against direct owner execution.
+- Add a range/prefix dry-run benchmark with concurrent inserts and deletes.
+  Gate: the dry-run pinned range must either capture later in-range changes or
+  force a safe retry/invalidation before visibility is published.
+- Prototype generation-interval route descriptors:
+  `{owner_id, lower_generation, upper_generation, route_generation}`. Any WAL,
+  resident refresh, or DDL publication must validate authority before publish.
+  Failure condition: a stale owner can publish visibility or residency for a
+  generation outside its interval.
+- Measure snapshot wait causes separately: no wait, prepared-write wait,
+  invalidation wait, refresh wait, and GC-window failure. Use this to decide
+  which retained reads can bypass the owner and which should fall back.
+- Test same-generation version coalescing for hot keys. Gate: crash replay,
+  MVCC reads, and retained GPU snapshots observe the same histories as the
+  uncoalesced version-chain implementation.
+- Compare generation intervals of 10 ms, 1 ms, 100 microseconds, and
+  owner-drain boundary publication. Report retained-read latency, write
+  throughput, version retention, publisher overhead, and stale-read risk.
+- Add a dry-run resource-admission policy for pinned CPU/GPU/cold-tier
+  buffers. Failure condition: a dry run can starve real commits, exceed pinned
+  memory budgets, or admit a transaction that later blocks under locks on cold
+  IO.
