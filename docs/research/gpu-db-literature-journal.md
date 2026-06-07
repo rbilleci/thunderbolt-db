@@ -38,6 +38,177 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Taurus MM makes multi-master snapshots cheap enough for shared storage
+
+**Citation:** Alex Depoutovitch, Chong Chen, Per-Ake Larson, Jack Ng,
+Shu Lin, Guanzhu Xiong, Paul Lee, Emad Boctor, Samiao Ren, Lengdong
+Wu, Yuchen Zhang, and Calvin Sun. "Taurus MM: bringing multi-master
+to the cloud." PVLDB 16(12):3488-3500, 2023. DOI:
+`https://doi.org/10.14778/3611540.3611542`. Retrieved 2026-06-07
+from the PVLDB PDF:
+`https://www.vldb.org/pvldb/vol16/p3488-depoutovitch.pdf`.
+
+**Category:** transaction processing / write path and concurrency
+control; MVCC / snapshot / visibility; database storage and shared
+storage coordination.
+
+**Relevance tags:** multi-master OLTP; shared storage; vector-scalar
+clocks; distributed snapshots; pessimistic concurrency control;
+hybrid page-row locking; local row locks; global page locks; WAL
+fan-out; page-store replay; versioned reads; snapshot publication;
+cross-owner write ordering.
+
+**Core idea:** Taurus MM extends a shared-storage cloud database from
+single-master to multi-master OLTP without making every update pay a
+full shared-nothing distributed commit cost. Each transaction runs on
+one master and writes that master's WAL, while other masters and page
+stores consume log-position information to keep buffer-pool pages and
+storage pages current. The paper's main trick is to reduce the
+network tax that normally makes shared-storage multi-master systems
+fragile in cloud networks: most messages carry compact scalar clock
+state, only snapshot-critical paths use vector state, and row-lock
+ownership is delegated locally when a page is already owned.
+
+The strongest transferable idea for GPU DB is that cross-owner
+visibility does not need a giant vector timestamp on every hot record
+or a global owner on every row-level conflict. A route can usually
+carry a small scalar generation, while the runtime keeps enough
+vector-like frontier state to prove distributed snapshots, retained
+GPU read generations, and cross-owner cache invalidations.
+
+**Concrete mechanisms:**
+
+- Taurus MM uses a shared-storage architecture with multiple compute
+  masters, shared log stores, shared page stores, a global lock
+  manager, and a global slice manager for page-to-slice metadata.
+- A user transaction executes on one master; the system does not use
+  distributed transactions across masters for one transaction. The
+  executing master writes its own WAL and periodically publishes new
+  log-record locations to the other masters.
+- Page stores receive logs from all masters, apply log records, and
+  serve page reads. Other masters read peer log records using the
+  published locations and update their local buffer-pool copies.
+- The design separates physical consistency from logical consistency.
+  Page locks protect internal page and B-tree structure while SQL
+  isolation ensures user data visibility.
+- Vector-scalar clocks keep per-master scalar clocks plus enough
+  vector information to generate causality-preserving snapshots. The
+  frequent log records can carry scalar timestamps, while messages
+  that need snapshot reasoning can use vector-style state.
+- VS clocks are used to create global snapshots that make lock-free
+  versioned reads possible for remote updates, while preserving enough
+  causal dependency information to decide when log fragments can be
+  applied immediately.
+- Hybrid page-row locking uses global page-lock coordination but lets
+  a master grant row locks locally when it has the relevant page-lock
+  authority and row-lock information. Row-lock state is piggybacked
+  on page-lock requests and responses rather than sent as separate
+  row lock/unlock messages.
+- When a remote master needs a page-lock grant, row-lock information
+  and the page's latest version are included in the response so the
+  recipient's local lock manager can continue granting row locks
+  without repeatedly contacting the global lock manager.
+- Versioned reads avoid remote page locking for many reads by reading
+  a page version valid for the snapshot. A master still takes a local
+  page lock to prevent local modifications of the buffer-pool copy
+  while reading.
+- The evaluation uses SysBench and a Percona TPC-C variant on up to
+  eight masters over 25Gbps networking, with storage-layer nodes for
+  log and page stores. The paper reports Taurus MM outperforming
+  Aurora multi-master and CockroachDB in the tested configurations.
+- Appendix experiments report that VS clocks reduce log traffic
+  substantially versus vector clocks, versioned reads cut page-lock
+  requests and more than double query rate in one read/write split
+  test, and hybrid locks reduce global-lock traffic under shared
+  access. Exact generality beyond the reported setup is unknown.
+
+**GPU DB mapping:** Treat Taurus MM's VS-clock idea as a design
+pattern for route generations. A single mutation owner may be enough
+for the first implementation, but future partition owners, residency
+owners, GPU execution owners, and cold-tier owners will still need
+compact comparable visibility metadata. Most route certificates should
+carry scalar `visibility_generation`, `wal_frontier`, and
+`resident_generation` fields, while a separate vector-frontier object
+records the minimum cross-owner state required to prove a consistent
+retained snapshot.
+
+For retained GPU snapshots, versioned reads map directly to immutable
+resident generations. A read should avoid the mutation owner when it
+can prove that the resident generation is valid for the transaction's
+snapshot frontier. If the proof fails, the route should fall back to a
+locking/owner path rather than hoping the GPU copy is fresh enough.
+
+For write throughput, hybrid page-row locking suggests a two-level
+conflict authority. GPU DB can coordinate segment, page, or resident
+partition ownership globally while letting the current owner grant
+fine-grained row/key locks or schedule witnesses locally. This is a
+better shape than sending every hot row conflict through one central
+queue, provided the delegated owner also publishes invalidation and
+WAL-frontier facts.
+
+For multi-tier storage, Taurus MM reinforces the split between log
+truth, page/storage materialization, and compute-local caches. GPU DB
+should preserve the same separation: WAL/checkpoint is truth,
+CPU/page/segment stores are replayable materialization, and GPU HBM
+contains invalidatable versions whose source frontier is explicit.
+
+For 1M logical sessions, the relevant lesson is that idle sessions
+should not expand vector clocks, lock tables, or route metadata.
+Only active owners and admitted commands should contribute to the
+frontier state. The high-session benchmark should therefore measure
+active frontier size, not only connection count.
+
+**Risks and mismatches:** Taurus MM is a multi-master cloud OLTP
+system, not a single-node GPU database. Its design assumes page-based
+storage, global page locks, and page-store replay, whereas GPU DB's
+first P8 slice uses generated GPU column-group snapshots over CPU
+MVCC truth.
+
+Pessimistic locking avoids many aborts but can serialize hot shared
+pages and push latency into lock waits. GPU DB should not adopt
+global page locking as the default for all workloads; it should test
+delegated fine-grained locking only for routes whose conflict
+footprint is known or whose resident segment ownership is explicit.
+
+VS clocks help with distributed causality, but they add complexity to
+snapshot publication and garbage collection. A single-node or
+single-owner deployment may only need scalar generations initially.
+Vector frontier state should appear only when multiple independent
+owners can publish visible changes.
+
+The evaluation uses modest cluster sizes and specific SysBench/TPC-C
+variants. The paper does not evaluate GPU execution, GPU memory
+residency, 1M client sessions, GPUDirect-style I/O, or over-resident
+GPU routes.
+
+**Benchmark candidates:**
+
+- Build a visibility-frontier simulator with one scalar generation per
+  owner and an optional vector frontier for cross-owner snapshots.
+  Gate: retained reads accept only generations that satisfy the
+  declared snapshot frontier; failure condition is a route that reads
+  an owner newer or older than the certified frontier.
+- Compare all-scalar, full-vector, and vector-scalar route metadata
+  under 1, 4, 16, and 64 owners. Measure bytes per command, cache
+  footprint, frontier merge cost, and snapshot-admission latency.
+- Prototype delegated row/key locking under segment ownership: a
+  global owner assigns segment authority, while the segment owner
+  grants local key locks and publishes row-version invalidations.
+  Compare against one central row-lock owner and pure OCC retry under
+  Zipfian hot-key writes.
+- Add a retained-read fallback benchmark where GPU snapshots execute
+  versioned reads until the frontier proof fails, then fall back to
+  the mutation owner. Measure fallback rate, p99 latency, and stale
+  route rejection accuracy.
+- Model WAL fan-out separately from resident refresh fan-out. Expected
+  result: log publication can stay compact and scalar for most updates,
+  while resident GPU refresh uses coarser segment-level invalidation
+  and explicit vector-frontier checks only at publication boundaries.
+- Stress snapshot-frontier garbage collection with long GPU readers.
+  Gate: retired frontier metadata and invalidated resident generations
+  remain bounded by active owners/readers, not by total logical
+  sessions.
+
 ### 2026-06-07 - Leopard turns isolation semantics into an online verifier
 
 **Citation:** Peiyuan Liu, Siyang Weng, Keqiang Li, Lyu Ni,

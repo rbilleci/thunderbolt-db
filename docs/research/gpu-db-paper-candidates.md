@@ -4044,12 +4044,22 @@ Append new candidates here as each paper is processed.
   aggregation into the storage layer; useful for comparing GPU DB cold-tier
   pushdown with GPU-resident and CPU fallback routes. Journal entry added
   2026-06-05.
-- `queued` — **Taurus MM: bringing multi-master to the cloud**, Depoutovitch
+- `reviewed` — **Taurus MM: bringing multi-master to the cloud**, Depoutovitch
   et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p3488-depoutovitch.pdf`
   Why: direct Taurus follow-up on multi-master cloud database design; useful
   for comparing cross-owner write ordering, conflict handling, and snapshot
-  publication in a disaggregated architecture.
+  publication in a disaggregated architecture. Journal entry added
+  2026-06-07 from the primary PVLDB PDF via the browser fetch path after
+  direct `curl` to VLDB timed out.
+- `queued` — **Hybrid Shared-Buffer for Multi-Master Databases**, Zhang,
+  Ye, Cai, Zhou, Cai, and Qian, Journal of Database Management 2024.
+  URL: `https://doi.org/10.4018/JDM.356920`
+  Publisher page:
+  `https://www.sciencedirect.com/org/science/article/pii/S1063801624000075`
+  Why: discovered while reviewing Taurus MM; useful as a modern follow-up on
+  hybrid row/page shared buffers, cache-coherence metadata placement, and
+  multi-master conflict granularity for future delegated segment ownership.
 - `queued` — **Near-Data Processing in Database Systems on Native
   Computational Storage under HTAP Workloads**, Vincon et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1991-petrov.pdf`
