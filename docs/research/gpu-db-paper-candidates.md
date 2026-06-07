@@ -1366,14 +1366,31 @@ Append new candidates here as each paper is processed.
   database-level WAL, checkpoint, object-manifest, and route-publication
   operations without enumerating every low-level storage state. Journal entry
   added 2026-06-07 from the arXiv PDF and ACM metadata.
-- `queued` — **DURINN: Adversarial Memory and Thread Interleaving for
+- `reviewed` — **DURINN: Adversarial Memory and Thread Interleaving for
   Detecting Durable Linearizability Bugs**, Fu, Lee, and Min, OSDI 2022.
   URL: `https://www.usenix.org/conference/osdi22/presentation/fu`
   Why: Pathfinder explicitly does not systematically explore thread
   synchronization interleavings; DURINN is a primary follow-up for combining
   durable persistence ordering with adversarial concurrency schedules before
   GPU DB trusts crash witnesses for multi-owner WAL, catalog, and resident
-  metadata updates.
+  metadata updates. Journal entry added 2026-06-07 from the USENIX page and
+  PDF.
+- `queued` — **PMTest: A Fast and Flexible Testing Framework for Persistent
+  Memory Programs**, Liu, Wei, Zhao, Kolli, and Khan, ASPLOS 2019.
+  URL: `https://doi.org/10.1145/3297858.3304015`
+  PDF: `https://cseweb.ucsd.edu/~jzhao/files/pmtest-asplos2019.pdf`
+  Why: DURINN contrasts application-level and annotation-based persistent
+  memory testing tools; useful for checking whether GPU DB can express
+  route-publication ordering and durability guarantees as reusable assertions
+  before building heavier adversarial interleaving tests.
+- `queued` — **Jaaru: Efficiently Model Checking Persistent Memory
+  Programs**, Gorjiara, Xu, and Demsky, ASPLOS 2021.
+  URL: `https://doi.org/10.1145/3445814.3446735`
+  PDF: `https://web.cs.ucla.edu/~harryxu/papers/jaaru-asplos21.pdf`
+  Why: DURINN compares against exhaustive/model-checking approaches for
+  persistent memory; useful for deciding when symbolic persistence-state
+  exploration is worthwhile for GPU DB WAL/checkpoint/manifest state machines
+  versus targeted representative crash tests.
 - `queued` — **Agamotto: How Persistent is your Persistent Memory
   Application?**, Neal et al., OSDI 2020.
   URL: `https://www.usenix.org/conference/osdi20/presentation/neal`

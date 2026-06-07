@@ -38,6 +38,178 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - DURINN turns visibility-vs-durability gaps into adversarial tests
+
+**Citation:** Xinwei Fu, Dongyoon Lee, and Changwoo Min.
+"DURINN: Adversarial Memory and Thread Interleaving for Detecting
+Durable Linearizability Bugs." OSDI 2022, 195-211. Retrieved
+2026-06-07 from the USENIX page and PDF:
+`https://www.usenix.org/conference/osdi22/presentation/fu`,
+`https://www.usenix.org/system/files/osdi22-fu.pdf`.
+
+**Category:** WAL / logging / crash consistency; runtime concurrency;
+future persistent-memory and CXL-tier metadata.
+
+**Relevance tags:** durable linearizability; visibility point;
+durability point; crash consistency; persistent memory; CXL NVM;
+linearization point; adversarial crash testing; thread interleaving;
+visible-but-not-durable; WAL-before-visibility; route-publication
+witnesses; multi-owner metadata tests.
+
+**Core idea:** DURINN studies concurrent persistent-memory data
+structures where an operation can become visible to other threads
+before its effects are durable. The paper frames correctness around
+the gap between a linearization point, where a change becomes visible,
+and a durability point, where it is guaranteed to survive a crash.
+That gap creates bug patterns that ordinary linearizability tests and
+single-threaded crash-consistency tests miss.
+
+For GPU DB, the transferable idea is a test vocabulary for any future
+route metadata, warm-tier index, resident-fragment directory, or
+CXL/NVM descriptor that might be published before every dependent byte
+is durably recoverable. The engine's existing rule says WAL must commit
+before visibility; DURINN shows how to turn that rule into targeted
+adversarial tests for the places where fast publication is tempting.
+
+**Concrete mechanisms:**
+
+- DURINN defines durable linearizability with three conditions: normal
+  executions must be linearizable, completed operations before a crash
+  must remain completed and visible after recovery, and an operation
+  interrupted by a crash must recover as either all done or not done.
+- The paper splits an operation into regions around the linearization
+  point and durability point: neither visible nor durable, visible but
+  not durable, and both visible and durable.
+- It derives three bug patterns from those regions. An
+  incompletely-durable bug occurs when a crash after the durability
+  point leaves only part of the operation durable. An
+  unrecovered-durable bug occurs when a crash before the durability
+  point leaves partial updates visible after recovery. A
+  visible-but-not-durable bug occurs when a concurrent operation reads
+  another operation's visible but not yet durable update and completes
+  before the crash.
+- Testing does not enumerate every crash state or every thread
+  interleaving. For incompletely-durable tests, DURINN tries to persist
+  the synchronization variable while leaving preceding stores as
+  unpersisted as the memory model permits. For unrecovered-durable
+  tests, it does the opposite: persist preceding stores while leaving
+  the synchronization variable unpersisted.
+- Visible-but-not-durable tests require a precise race. DURINN finds
+  potentially racy operation pairs from a single-thread trace, rewrites
+  the test so the pair shares a useful prefix, then uses breakpoints to
+  schedule one thread after another thread's publish point but before
+  its durability point.
+- DURINN infers likely linearization points instead of requiring manual
+  annotations. It treats atomic instructions, guarded-protection
+  patterns, and publish-after-initialization stores as likely publish
+  points, while filtering initialization-only stores in newly allocated
+  regions.
+- It instruments NVM loads, stores, heap allocation, control flow,
+  flushes, fences, locks, and stored values using LLVM, then simulates
+  cache/NVM state under the x86-64 TSO and persistence model to produce
+  feasible crash images.
+- Validation restarts from a crash image, runs recovery, and executes
+  operations such as `get` and `delete` to check that previously
+  completed effects remain visible and the crashed operation has
+  all-or-nothing semantics.
+- The evaluation covers 13 concurrent NVM data structures, including
+  lock-free and lock-based trees, hash tables, queues, arrays, and
+  PMDK-based structures. DURINN reports 27 durable-linearizability
+  bugs, 15 of them new, across 12 structures: 10 incompletely-durable,
+  7 unrecovered-durable, and 10 visible-but-not-durable.
+- The paper reports that likely-linearization inference reduced the
+  traced-store space to about 13% likely linearization points on
+  average for the tested workloads, and that all three bug-pattern test
+  classes over 1000-operation cases took 1h23m18s total across the
+  evaluated structures.
+- Limitations are explicit. DURINN is trace-based, so it can miss bugs
+  absent from the input test; likely-LP inference is heuristic; and the
+  adversarial strategy does not exhaust all possible crash states or
+  multi-thread interleavings. For a generated failing crash image,
+  however, the paper argues validation gives a concrete true bug rather
+  than a speculative warning.
+
+**GPU DB mapping:** Treat every publication boundary as having both a
+visibility point and a recovery point. A resident route descriptor,
+snapshot generation, route-policy generation, warm-tier index root,
+object-manifest pointer, or CXL/NVM descriptor must not become
+discoverable by readers until the WAL, recovery witness, and dependent
+metadata are either durable or explicitly recoverable.
+
+The strongest mapping is to add adversarial publication tests for
+route metadata. For each publish step, generate crash states where the
+root pointer or generation counter is visible but dependent arrays,
+checksums, old-generation retire records, or invalidation records are
+missing. Recovery must either ignore the new descriptor or complete it
+from WAL/checkpoint truth; it must never route a retained read through
+half-published metadata.
+
+DURINN's visible-but-not-durable pattern maps to multi-owner runtime
+bugs. A read snapshot worker, GPU execution worker, or network response
+path can observe a new route generation before the mutation,
+residency, or catalog owner has made the generation recoverable. Tests
+should intentionally schedule a reader between "published for lookup"
+and "durable/recoverable" and then crash before the latter boundary.
+
+The likely-linearization-point idea is a useful static audit checklist
+even before building a full DURINN-like tool. Search for atomics,
+generation-counter stores, pointer swaps, handle-table root changes,
+manifest root updates, and valid-bit stores. Each one needs a matching
+durability or recovery witness and a crash test that proves
+all-or-nothing behavior.
+
+For future CXL/NVM tiers, do not assume eADR removes the design
+problem. DURINN notes that optional persistent-cache support,
+non-temporal stores, and partial pre-linearization updates still leave
+recovery hazards. GPU DB should keep WAL/checkpoint authority and
+derived metadata rebuildability even if a future warm tier is
+byte-addressable and persistent.
+
+**Risks and mismatches:** DURINN is a testing tool for concurrent NVM
+data structures, not a DBMS WAL protocol, MVCC system, SQL recovery
+design, GPU runtime, or network admission system. Its mechanisms do
+not directly prescribe how GPU DB should log transactions or schedule
+queries.
+
+The evaluated systems are small data structures, not full database
+engines with catalogs, snapshots, secondary indexes, DDL, replication,
+or GPU-resident caches. GPU DB needs higher-level oracles that check
+SQL-visible rows, MVCC visibility, catalog generation, resident route
+validity, and replay from WAL, not only key-value get/delete behavior.
+
+The implementation assumes PMDK/libpmem-style programs and low-level
+flush/fence instrumentation. Current GPU DB storage is WAL plus CPU
+truth, so the immediate adaptation is at the state-machine and crash
+test level. Full LLVM-level instrumentation is future work.
+
+**Benchmark candidates:**
+
+- Add a route-publication crash matrix. For each descriptor root,
+  generation counter, valid bit, manifest pointer, and snapshot handle,
+  test crash states where the publish marker survives but dependent
+  metadata does not. Gate: recovery either discards the descriptor or
+  rebuilds it from WAL/checkpoint truth before any read can use it.
+- Build a visibility-vs-recovery boundary table for mutation,
+  catalog, residency, route-policy, and future warm-tier owners. Each
+  entry names the visible marker, the durability/recovery witness, and
+  the test that crashes between them.
+- Add adversarial interleaving tests for resident reads: one worker
+  observes a newly published route generation while another owner has
+  not completed invalidation or recovery-witness publication. Failure
+  condition: a retained read returns from a generation that cannot be
+  justified after crash replay.
+- Extend crash tests for future CXL/NVM metadata with three DURINN-like
+  cases: incomplete durable publish, unrecovered partial publish, and
+  visible-but-not-durable reader observation.
+- Audit atomics and generation stores in hot metadata code as likely
+  linearization points. Gate: every likely publish point has a matching
+  WAL/checkpoint/rebuild witness and an explicit invalidation/retire
+  path.
+- Measure the cost of adding recovery witnesses to route publication:
+  compare pure volatile derived metadata, WAL-backed semantic logs, and
+  rebuildable checkpoint manifests by p50/p99 route publication latency,
+  write throughput, recovery time, and false route discard rate.
+
 ### 2026-06-07 - Version-aware layout makes MVCC visibility a search key
 
 **Citation:** Qian Zhang, Jianhao Wei, Shichen Zhang, Hao Luan, and
