@@ -1427,6 +1427,22 @@ Append new candidates here as each paper is processed.
   CockroachDB on TPC-C; useful for contrasting closed timestamps, leaseholder
   ownership, and distributed commit coordination with lighter geo-OLTP
   protocols.
+- `reviewed` — **Chablis: Fast and General Transactions in Geo-Distributed
+  Systems**, Eldeeb, Bernstein, Cidon, and Yang, CIDR 2024.
+  URL: `https://www.vldb.org/cidrdb/papers/2024/p4-eldeeb.pdf`
+  Why: discovered after the queue's strongest modern transaction follow-ups
+  were either already reviewed or closed-access; useful for separating local
+  write visibility from global retained-snapshot publication with
+  epoch-based MVCC, regional publishers, leader-lease validation, and
+  lock-free global snapshot reads. Journal entry added 2026-06-07.
+- `queued` — **Chardonnay: Fast and General Datacenter Transactions for
+  On-Disk Databases**, Eldeeb et al., OSDI 2023.
+  URL: `https://www.usenix.org/conference/osdi23/presentation/eldeeb`
+  PDF: `https://www.usenix.org/system/files/osdi23-eldeeb.pdf`
+  Why: Chablis extends Chardonnay's single-datacenter epoch-based transaction
+  design; useful for deeper mechanisms around local epoch services,
+  lock-free strictly serializable snapshots, eRPC batching, and on-disk WAL
+  integration before GPU DB adopts local visibility publishers.
 - `reviewed` — **Q-Store: Distributed, Multi-partition Transactions via
   Queue-oriented Execution and Communication**, Qadah, Gupta, and Sadoghi,
   EDBT 2020.

@@ -38,6 +38,185 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Chablis splits fast local commits from global snapshot publication
+
+**Citation:** Tamer Eldeeb, Philip A. Bernstein, Asaf Cidon, and
+Junfeng Yang. "Chablis: Fast and General Transactions in Geo-Distributed
+Systems." CIDR 2024. Retrieved 2026-06-07 from the CIDR proceedings and
+PDF: `https://www.vldb.org/cidrdb/2024/`,
+`https://www.vldb.org/cidrdb/papers/2024/p4-eldeeb.pdf`.
+
+**Category:** transaction processing / write path; MVCC / snapshot /
+visibility; runtime / session scale.
+
+**Relevance tags:** Chablis; Chardonnay; geo-distributed transactions;
+strict serializability; epoch-based versioning; global epoch publishers;
+regional commits; lock-free snapshot reads; leader leases; 2PL; 2PC;
+MVCC version IDs; bounded stale publishers; read snapshot admission.
+
+**Core idea:** Chablis keeps single-region read-write transactions fast
+while still supporting global strictly-serializable snapshot reads. It
+does this by decoupling the service that advances a global epoch from
+regional publishers that serve epoch reads locally. Regional transactions
+read a local publisher during prepare, so they avoid a wide-area
+round-trip in the commit path; global snapshot reads pay the extra wait
+needed to choose a complete epoch boundary.
+
+For GPU DB, the transferable idea is a split between write visibility
+publication and read snapshot admission. The mutation owner can keep
+commits on a local, low-latency WAL/MVCC path, while a slower global or
+cross-owner snapshot clock is published to read workers, GPU execution
+owners, and future remote tiers. Reads that need a global retained view
+wait for a proven generation boundary instead of forcing every write to
+pay that cost.
+
+**Concrete mechanisms:**
+
+- Chablis builds on Chardonnay's epoch-based transaction design. In each
+  region, range leaders use 2PL for concurrency control and 2PC for
+  atomic commit. A committing transaction reads local and global epochs
+  in parallel with Prepare RPCs, then durably records a Commit record in
+  a replicated transaction state store before releasing locks.
+- The global epoch service is globally replicated and advances a single
+  counter, but clients do not read it directly on the normal regional
+  commit path. Instead, each region has a replicated epoch publisher.
+  The global service advances the epoch by updating every publisher
+  before advancing again.
+- A publisher can be equal to the true global epoch or one epoch behind
+  while updates are in flight. Therefore, Chablis uses a weaker global
+  epoch invariant: a later publisher read may return a value at least
+  the previous read minus one, not necessarily monotonically greater or
+  equal to the previous read.
+- Range leaders keep the highest global epoch they have observed in
+  memory and return it with Prepare replies. The transaction's global
+  epoch is the maximum of the local publisher read and the values
+  returned by participating leaders. A new leader waits for the global
+  epoch to advance once before resetting this memory-only value.
+- Record versions are keyed as `(user_key, VID)`, where the VID prefix is
+  the transaction's global epoch and a suffix counter distinguishes
+  multiple transactions in the same epoch. Deletes are represented as
+  tombstone versions.
+- Leader leases are expressed as local-epoch intervals and are stored in
+  the range's Paxos log. During prepare, the coordinator validates that
+  the local epoch it read falls inside every participant leader's lease
+  interval. The paper calls the single-valid-leader property the leader
+  disjointedness invariant.
+- A multi-region snapshot read first reads a global epoch from its
+  publisher, then waits for the global epoch to advance once. That wait
+  ensures later transactions cannot still choose an epoch below the
+  snapshot boundary.
+- For each region read by the snapshot, the client reads the region's
+  local epoch once, checks that it remains within the current leader
+  lease interval, waits for any current write lock on the target key to
+  release, and then reads the largest version with VID below the chosen
+  epoch boundary. The read does not acquire read locks, so it does not
+  contend with read-write transactions after admission.
+- For linearizable multi-region snapshot reads, Chablis can read the
+  epoch directly from the global epoch service, wait for each local
+  publisher to reach the next epoch, and execute at that next epoch. An
+  alternative avoids frequent direct global reads by waiting for two
+  local-publisher epoch advances, trading extra latency for less
+  cross-region RPC pressure.
+- In the Azure evaluation, Chablis uses two regions with global epoch
+  publishers and a central global epoch service. The paper reports
+  regional YCSB p50 latencies of 214 microseconds for reads and 199
+  microseconds for writes, median global epoch update intervals around
+  47 ms, p99 around 76 ms, and average multi-region linearizable
+  snapshot latency around 107 ms. The workload fits in DRAM and uses
+  YCSB-A single-region transactions plus periodic two-key multi-region
+  linearizable snapshots.
+
+**GPU DB mapping:** The main mapping is to route and snapshot clocks.
+Write owners should not be forced to synchronously publish every commit
+to every read tier, GPU worker, remote cache, or future region. They can
+commit locally with WAL-before-visibility, publish a local visibility
+generation, and let a separate snapshot publication owner expose slower
+cross-domain retained-read generations.
+
+Chablis's publisher shape maps to a GPU DB snapshot-generation service:
+network/read workers consult a cheap local publisher to decide which
+retained snapshot generation is admissible, while the actual generation
+advancer coordinates with mutation, catalog, residency, and possibly
+remote-tier owners. A bounded "publisher may lag by one" invariant is
+much easier to reason about than an opaque eventually consistent route
+cache.
+
+The version-ID prefix maps to MVCC and resident snapshots. CPU truth can
+store row or segment versions under a visibility generation; GPU
+resident snapshots and route descriptors should advertise the largest
+complete generation they include. Snapshot reads can then choose the
+largest version below a boundary instead of revalidating every row
+through the mutation owner.
+
+The lock-release wait is an important admission rule. A read can be
+lock-free during execution only after it proves that prepared-but-not-yet
+published writes below its snapshot boundary can no longer change the
+keys or ranges it will read. GPU DB's retained read path needs an
+equivalent rule for in-flight WAL batches, invalidations, refreshes, and
+catalog changes.
+
+The direct-global-read versus wait-two-epochs option maps to latency
+classes. A normal retained read might accept a slightly older complete
+snapshot from a local publisher; a strong administrative, backup, or
+cross-partition consistency read may pay for the global generation
+barrier explicitly.
+
+**Risks and mismatches:** Chablis is a geo-distributed key-value store
+paper, not a GPU relational DBMS. It assumes homed keys, range leaders,
+2PL, 2PC, Paxos-backed logs, and key-value versions. It does not cover
+SQL planning, joins, secondary index maintenance, DDL, GPU kernels,
+resident HBM budgeting, pinned host buffers, or pgwire session
+multiplexing.
+
+The snapshot read algorithm shown for point keys waits on write locks
+for the read set. Range reads and relational predicates need careful
+range-lock or predicate-lock equivalents, otherwise a retained scan
+could miss an in-flight write below the advertised boundary.
+
+Chablis's global snapshots can be stale or delayed. In the evaluation,
+linearizable global snapshots average around 107 ms. That is reasonable
+for geo reads, but too high for many local OLTP point queries. GPU DB
+should make global retained-snapshot routes explicit instead of silently
+adding generation waits to every read.
+
+The evaluation is narrow: two Azure regions, two shards per region,
+DRAM-resident data, uniform YCSB-A local transactions, and periodic
+two-key global snapshots. It does not show large analytical scans,
+hot-key contention, long SQL transactions, crash recovery behavior,
+large version-chain GC, or GPU/CPU tier movement.
+
+If a region or owner stops receiving epoch updates, Chablis can let some
+regional work continue while global snapshots become stale or stop. GPU
+DB needs clear overload and failure semantics for a stalled snapshot
+publisher: keep local writes safe, stop advertising stale GPU snapshots
+for stronger reads, and report the oldest/latest complete generation.
+
+**Benchmark candidates:**
+
+- Prototype a local visibility publisher plus slower global retained
+  snapshot publisher. Measure write p50/p99 with and without reading the
+  global publisher on the commit path. Gate: WAL-before-visibility and
+  MVCC reads must produce identical histories.
+- Add a snapshot-admission benchmark with publisher lag of zero, one,
+  and multiple generations. Failure condition: a read executes against a
+  generation that can still be changed by an in-flight mutation,
+  invalidation, or refresh below its boundary.
+- Test two read classes: local retained reads that accept the latest
+  complete local generation, and strong cross-partition reads that wait
+  for a global generation barrier. Measure latency, queue wait, version
+  chain length, and visible staleness.
+- Implement version-ID-prefix lookup over CPU MVCC rows or segment
+  metadata, then compare per-row visibility validation against choosing
+  the largest version below a published generation boundary.
+- Add lock/wait probes for prepared writes, WAL batches, catalog DDL, and
+  resident refreshes. Gate: a retained GPU read may skip owner
+  validation only when the relevant write or invalidation locks below
+  its boundary are known to be released.
+- Simulate a stalled snapshot publisher. The engine should keep local
+  writes safe, stop admitting reads that require newer global snapshots,
+  expose latest/oldest complete generation telemetry, and recover when
+  the publisher resumes.
+
 ### 2026-06-07 - RapidLane turns hot shared counters into deferred commit-time deltas
 
 **Citation:** George Mitenkov, Igor Kabiljo, Zekun Li, Alexander
