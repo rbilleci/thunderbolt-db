@@ -5290,12 +5290,23 @@ Append new candidates here as each paper is processed.
   Why: BTrim-related SAP tiering work for keeping warm/cold data outside the
   hot in-memory store; useful for comparing row-level IMRS packing with
   columnar warm-store placement and explicit cold-tier access.
-- `queued` — **Rethink the Scan in MVCC Databases**, Kim et al.,
+- `reviewed` — **Rethink the Scan in MVCC Databases**, Kim et al.,
   SIGMOD 2021.
   URL: `https://doi.org/10.1145/3448016.3452783`
   Why: modern MVCC scan/access-method work from the vDriver/DIVA ecosystem;
   useful for retained snapshot scans where version traversal can erase index
   benefits and GPU routes need a compact visible-version access structure.
+  Journal entry added 2026-06-07 from the ACM DOI, SNU publication page, and
+  DBLP metadata after the ACM PDF endpoint returned only an access wrapper.
+- `queued` — **Scalable Version-aware Data Placement for In-Memory Databases**,
+  Zhang, Wei, Zhang, Luan, and Gong, Research Square preprint 2024.
+  URL: `https://doi.org/10.21203/rs.3.rs-4205982/v1`
+  PDF:
+  `https://assets-eu.researchsquare.com/files/rs-4205982/v1_covered_5b835ffa-0523-4eff-a27a-b13a1ef48910.pdf`
+  Why: discovered while reviewing vWeaver; a newer version-aware placement
+  follow-up that reports partitioning and placement techniques for in-memory
+  MVCC under heterogeneous workloads, useful for comparing compact version
+  search structures with broader version-aware data placement.
 - `reviewed` — **Adaptive Optimistic Concurrency Control for Heterogeneous
   Workloads**, Guo et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p584-guo.pdf`

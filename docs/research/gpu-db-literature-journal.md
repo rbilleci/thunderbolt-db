@@ -100008,3 +100008,181 @@ analytical throughput.
   host slabs, response workers, and cold-tier IO. Failure condition:
   best-effort analytical refresh or large scans inflate retained-read p99
   for a protected tenant beyond the configured SLO.
+
+### 2026-06-07 - vWeaver turns MVCC scan visibility into an access path
+
+**Citation:** Jongbin Kim, Jaeseon Yu, Jaechan Ahn, Sooyong Kang, and
+Hyungsoo Jung. "Rethink the Scan in MVCC Databases." SIGMOD 2021,
+pp. 868-880. DOI: `https://doi.org/10.1145/3448016.3452783`.
+Retrieved 2026-06-07 from the ACM DOI page, Seoul National University
+publication metadata, and DBLP:
+`https://doi.org/10.1145/3448016.3452783`,
+`https://cse.snu.ac.kr/en/research/publications/rethink-scan-mvcc-databases`,
+`https://dblp.org/rec/conf/sigmod/KimYAKJ21`.
+
+**Category:** MVCC / snapshot / visibility; hybrid HTAP storage; query access
+paths.
+
+**Relevance tags:** MVCC scans; vWeaver; vDriver; Diva lineage; version chain
+traversal; visibility search; retained snapshots; analytical scans; HTAP;
+visible-version access path; GPU resident snapshot directories; old-version
+metadata; scan latency.
+
+**Core idea:** The vWeaver paper argues that ordinary MVCC scan paths are often
+wrong for mixed OLTP/OLAP workloads. A scan that logically needs only the
+visible version of each tuple may still pay for version-chain traversal,
+visibility checks, and old-version search in a storage shape optimized for
+fresh transactional point access. The paper's title captures the design
+direction: treat "find the version visible to this snapshot" as a first-class
+scan/access-path problem, not as incidental work hidden inside tuple-chain
+iteration.
+
+The accessible sources in this run did not expose the full PDF. ACM returned
+metadata and a small access wrapper from the PDF endpoint, while SNU and DBLP
+provided primary publication metadata. The mechanism details below therefore
+stay at the level supported by public metadata plus the established vDriver,
+vWeaver, and Diva research line already represented in this journal. Exact
+algorithm internals, data-structure layout, and numeric evaluation claims are
+marked unknown until a full text source is available.
+
+For GPU DB, the transferable point is still strong: retained GPU snapshots
+should not make kernels or CPU read workers walk arbitrary MVCC chains. The
+engine needs a compact per-generation visibility access path that answers
+"which row version is visible for this route certificate?" before execution
+touches wide payloads or GPU-resident columns.
+
+**Concrete mechanisms:**
+
+- The paper is part of the vDriver/vWeaver/Diva line from the same SNU group.
+  vDriver focused on improving version access over MVCC records; vWeaver is
+  the scan-oriented step; Diva later decouples version indexes from version
+  data for disk-based HTAP systems.
+- The target problem is MVCC scan overhead under analytical or mixed workloads,
+  where long snapshots and update-heavy histories can make version-chain
+  traversal dominate the useful scan work.
+- The public metadata and abstract-level descriptions indicate that vWeaver
+  introduces an access method for scans over MVCC databases, rather than
+  relying only on the base table/index traversal plus per-tuple visibility
+  chase.
+- The design direction is to preorganize or weave version-search metadata so a
+  scan can find visible versions more directly for a snapshot. The exact
+  weaving structure, maintenance protocol, and concurrency rules were not
+  available from the accessible sources in this run.
+- Because the authors later emphasize decoupled version index and data in
+  Diva, vWeaver should be read as a predecessor that makes version-search
+  metadata explicit enough for scan acceleration, but not necessarily as the
+  final answer for version garbage collection or tiered payload placement.
+- The evaluation venue and metadata establish this as a peer-reviewed SIGMOD
+  2021 database paper. Exact workloads, hardware, throughput, and latency
+  deltas were not available from accessible primary text in this run, so no
+  numeric claims are recorded here.
+
+**GPU DB mapping:** GPU DB's current P8 direction already publishes immutable
+resident snapshots tied to WAL, catalog, visibility, and layout generations.
+vWeaver strengthens the access-path side of that plan: a snapshot generation
+needs a compact visibility directory, not just resident column buffers and a
+validity flag. For each admitted segment, the directory should let a read
+worker or GPU kernel resolve visible row ordinals for a snapshot generation
+without pointer chasing through CPU tuple-version chains.
+
+This maps cleanly to route certificates. A retained route should carry a
+visibility generation and a resident layout id; the snapshot directory should
+prove that the route's read boundary has a direct visible-version map for the
+target segment. If the map is absent, stale, or too expensive to build, the
+planner can choose CPU fallback, bounded refresh, or explicit overload before
+the query enters the GPU queue.
+
+The paper also cautions against all-or-nothing resident snapshots. A GPU
+segment can keep hot payload columns in HBM while keeping version-search
+metadata in host memory or a smaller device-side directory. For point lookups,
+the route may use a key index plus visibility directory. For scans, it may use
+a dense visible-row bitmap, row-id remap, or generation-specific selection
+vector. Which shape wins depends on update density, snapshot age, and batch
+size.
+
+Mutation owners should not maintain every historical map eagerly. The likely
+production rule is lazy, costed publication: build visible-version maps for
+admitted snapshot classes, publish them with generation metadata, and retire
+or demote them when no active route interval can use them. That connects
+vWeaver to the later Diva idea of keeping version-search metadata independent
+from old-version payload bytes.
+
+**Risks and mismatches:** The full paper text was not available during this
+cron run, so the exact vWeaver data structure, maintenance cost, synchronization
+protocol, and evaluation numbers are unknown. This entry should be refined if
+an author PDF or publisher PDF becomes accessible.
+
+vWeaver targets CPU MVCC database scans, not CUDA kernels, HBM residency,
+GPUDirect Storage, pgwire session multiplexing, or GPU micro-batching. A
+visibility directory that helps CPU scans could still be too branchy,
+pointer-rich, or maintenance-heavy for GPU execution.
+
+Prebuilding visible-version maps can move cost from reads to writes and refresh
+owners. If every write forces every retained snapshot directory to update, the
+design will damage write throughput and p99 latency. GPU DB should publish
+generation maps only when their measured reuse justifies build and retention
+cost.
+
+Version-search metadata can also become a stale correctness hazard. A GPU route
+must prove both metadata freshness and payload freshness; a compact visibility
+map without matching WAL/catalog/layout boundaries is not enough.
+
+**Benchmark candidates:**
+
+- Build a visible-version directory benchmark for retained scans. Compare CPU
+  MVCC chain traversal, host-side visible-row selection vectors, GPU-side
+  bitmaps, and row-id remap arrays under varied update density and snapshot
+  age. Gate: directory lookup plus scan beats CPU fallback at realistic
+  retained-read batch sizes.
+- Add route-certificate validation for visibility directories: relation id,
+  catalog generation, visibility generation, source WAL boundary, segment id,
+  layout id, and delete-mask generation. Failure condition: any stale field
+  can route to a GPU scan.
+- Measure lazy versus eager directory construction. Eager builds every map at
+  refresh; lazy builds on first compatible route and caches by snapshot class.
+  Gate: lazy construction avoids write-path inflation while keeping repeated
+  retained scans below the p99 target.
+- Test a split placement policy: payload columns in HBM, visible-version
+  metadata in HBM, pinned host memory, or compressed host memory. Measure HBM
+  bytes, PCIe/NVLink transfer, kernel divergence, p50/p99 latency, and
+  fallback rate.
+- Stress one long analytical snapshot plus many short retained reads and
+  steady updates. Gate: old visible-version directories retire or demote
+  without making fresh writes wait on long-snapshot metadata.
+- Compare directory shapes for point lookups versus scans. Point routes may
+  prefer key index plus visibility check; scan routes may prefer dense masks or
+  selection vectors. Failure condition: one universal metadata shape loses to
+  specialized CPU fallback across most workloads.
+
+### 2026-06-07 - Cross-paper synthesis: freshness needs explicit search metadata
+
+HostCC, veDB-HTAP, and vWeaver converge on a common control-plane requirement:
+fast routes need more than queue depth and a "resident" bit. HostCC says the
+runtime needs local pressure witnesses before host resources overload.
+veDB-HTAP says accelerated routes need semantic freshness witnesses before
+secondary execution. vWeaver says MVCC scans need searchable visibility
+witnesses before they touch payload data.
+
+The design track for GPU DB is therefore **route witnesses with independent
+lifetimes**. A route should carry pressure witnesses, semantic witnesses, and
+visibility-search witnesses: resource budget, freshness boundary, catalog and
+layout generation, resident payload location, visible-version directory id,
+delete-mask generation, and fallback reason. These witnesses should be small
+enough to validate in the hot path and independent enough to retire, refresh,
+or demote separately from wide payload columns.
+
+**Category gaps:** The latest cluster covered runtime pressure, HTAP freshness,
+and MVCC scan metadata. The next reviews should bias toward transaction write
+admission, deterministic concurrency control, WAL group commit, or bounded
+session/runtime queues before taking another pure analytics or lakehouse
+format paper.
+
+**Benchmark priorities:**
+
+- A route-witness validation microbenchmark that measures certificate size,
+  validation latency, stale-route rejection, and fallback reason accuracy.
+- A visibility-directory benchmark that treats old-version search as its own
+  cacheable object, separate from resident payload bytes.
+- A mixed-pressure benchmark where resource pressure, freshness lag, and
+  visibility-map absence each force different route decisions while preserving
+  identical SQL results.
