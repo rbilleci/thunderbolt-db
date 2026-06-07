@@ -3158,7 +3158,7 @@
               "predicate",
               "metadata"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** GPU DB should treat tier placement as a route-planning input with explicit thresholds.",
             "support_reason": "Matched journal terms (planning, cost model, predicate, metadata) to Cost-based route optimizer."
           },
@@ -4763,7 +4763,7 @@
               "hazard",
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** TL4x observes that many deployed databases use buffered durability: committed operations may be lost after a crash, but recovery must return a consistent state.",
             "support_reason": "Matched journal terms (hazard, era) to Bounded descriptor reclamation."
           },
@@ -5313,7 +5313,7 @@
               "dram",
               "nvme"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "Hardware-managed cache-line tiering hides placement from software.",
             "support_reason": "Matched journal terms (tier, tiering, placement, cache) to Multi-tier placement policy."
           },
@@ -5797,7 +5797,7 @@
               "occ",
               "plor"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** Learned optimizers can improve average plan quality but occasionally choose plans that are much worse than the native optimizer.",
             "support_reason": "Matched journal terms (deterministic, occ, plor) to Deterministic hot-write templates."
           },
@@ -10412,7 +10412,7 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** GPU DB's route planner should treat learned ranking and static cost estimates as advisory, then attach cheap adaptive operators that can correct a route after seeing real cardinality, pruning, queue, and tier signals.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -11285,7 +11285,7 @@
               "route choice",
               "predicate"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** GPU DB already wants route certificates that include catalog generation, visibility boundary, residency generation, resident layout, supported predicates, queue saturation, and fallback reasons.",
             "support_reason": "Matched journal terms (optimizer, planning, route choice, predicate) to Cost-based route optimizer."
           },
@@ -11630,7 +11630,7 @@
               "resident",
               "gpu memory"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** The P8 storage target currently treats GPU memory as an explicit performance tier and leaves future tiers open.",
             "support_reason": "Matched journal terms (retained, resident, gpu memory) to Retained GPU snapshots."
           },
@@ -12407,7 +12407,7 @@
               "object",
               "blob"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The paper is object-level and mostly blob-oriented.",
             "support_reason": "Matched journal terms (object, blob) to DB-owned cold objects."
           },
@@ -13442,7 +13442,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** Cabin starts from a practical problem for resident analytical acceleration: the fastest scan indexes can be larger than the base column, which makes them hard to keep in memory.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -14720,7 +14720,7 @@
               "append",
               "nvm"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** The design is tied to LeanStore's buffer manager, pointer swizzling, page ids, B+-tree pages, and persistent-memory/NVMe hardware assumptions.",
             "support_reason": "Matched journal terms (append, nvm) to Log-structured warm tier."
           },
@@ -17055,7 +17055,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper argues that RoCE inherited InfiniBand-era assumptions that fit simple, lossless, in-order fabrics better than hyperscale Ethernet.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -17523,7 +17523,7 @@
               "serializability",
               "snapshot isolation"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The paper targets snapshot isolation, not full serializability.",
             "support_reason": "Matched journal terms (isolation, serializability, snapshot isolation) to Isolation trace oracle."
           },
@@ -17836,7 +17836,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** GPU analytical queries often reserve far more device memory than they actively use and leave copy engines and compute units idle during CPU phases, dependencies, and operator transitions.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -17859,7 +17859,7 @@
               "backpressure",
               "queueing"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** This strongly supports the current plan in `11-high-throughput-query-runtime.md` to treat GPU execution workers and residency state as explicit owner domains with bounded admission.",
             "support_reason": "Matched journal terms (admission, backpressure, queueing) to Vector-credit admission."
           },
@@ -18380,7 +18380,7 @@
               "session",
               "staR"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** MV3C targets the cost of optimistic MVCC abort-and-restart under high contention or long-running transactions.",
             "support_reason": "Matched journal terms (session, staR) to Effective session counting."
           },
@@ -18873,7 +18873,7 @@
               "page table",
               "address translation"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** The most important transfer is the split between hardware-assisted address translation and DBMS-owned placement policy.",
             "support_reason": "Matched journal terms (handle, pointer, page table, address translation) to Stable handle indirection."
           },
@@ -21217,7 +21217,7 @@
               "occ",
               "plor"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** This is a design/exploration paper with preliminary evaluation, not a mature production engine.",
             "support_reason": "Matched journal terms (contention, occ, plor) to Deterministic hot-write templates."
           },
@@ -23812,7 +23812,7 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** NOMAD challenges exclusive memory tiering, where a page exists in either fast memory or slow memory but not both.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -24631,7 +24631,7 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** Morty is a replicated key-value store for interactive transactions, not a PostgreSQL-compatible SQL engine.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -25296,7 +25296,7 @@
               "route descriptor",
               "publication"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** The accessible material is a publication record and slide deck, not the full paper text.",
             "support_reason": "Matched journal terms (generation, route descriptor, publication) to Immutable route roots."
           },
@@ -26791,7 +26791,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** Hint-QPT is an interactive tuning demonstration, not a production autonomous optimizer.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -27189,7 +27189,7 @@
               "publish",
               "publication"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "Residency owners publish immutable roots tied to those frontiers.",
             "support_reason": "Matched journal terms (root, generation, immutable, publish) to Immutable route roots."
           },
@@ -28324,7 +28324,7 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** The immediate GPU DB lesson is to separate \"transparent host allocation tiering\" from \"DBMS route residency.\" TPP-style CXL placement could eventually help ordinary host memory pressure for WAL buffers, CPU indexes, cold immutable segments, or background snapshot state.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -28442,7 +28442,7 @@
               "resident",
               "read snapshot"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** The production runtime already targets network IO workers, bounded command rings, owner domains, read snapshot workers, GPU execution workers, and response rings.",
             "support_reason": "Matched journal terms (retained, resident, read snapshot) to Retained GPU snapshots."
           },
@@ -29634,7 +29634,7 @@
               "ring",
               "queue"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "Rebirth maps to adaptive ordering inside a bounded owner queue.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -29886,7 +29886,7 @@
               "resident",
               "read snapshot"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The read-set pointer optimization maps to retained read snapshots.",
             "support_reason": "Matched journal terms (retained, resident, read snapshot) to Retained GPU snapshots."
           },
@@ -30666,7 +30666,7 @@
               "version chain",
               "cleanup"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "Rapid quiescent-state garbage collection keeps version chains short.",
             "support_reason": "Matched journal terms (garbage collection, old version, version chain, cleanup) to MVCC garbage-collection frontiers."
           },
@@ -33055,7 +33055,7 @@
               "cache",
               "buffer"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** Tigger attacks a specific modern OLTP bottleneck: DBMS proxies are useful because they multiplex many client sessions over fewer backend connections, but conventional proxies still copy protocol buffers between kernel-space and user-space for every request and response.",
             "support_reason": "Matched journal terms (cache, buffer) to Multi-tier placement policy."
           },
@@ -35612,7 +35612,7 @@
               "append",
               "nvm"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper argues that an array of directly attached PCIe NVMe SSDs is not just a faster disk tier.",
             "support_reason": "Matched journal terms (append, nvm) to Log-structured warm tier."
           },
@@ -36339,7 +36339,7 @@
             "matched_terms": [
               "resident"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** zicIO fits P8's cold/warm/hot tier problem: when a resident GPU route misses, the system should not discover the need for cold bytes only after a GPU worker is already idle.",
             "support_reason": "Matched journal terms (resident) to Retained GPU snapshots."
           },
@@ -36876,7 +36876,7 @@
               "resident",
               "read snapshot"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** Concord maps directly to the planned runtime split between network IO workers, bounded command rings, read snapshot workers, GPU execution owners, and response rings.",
             "support_reason": "Matched journal terms (retained, resident, read snapshot) to Retained GPU snapshots."
           },
@@ -36951,7 +36951,7 @@
             "matched_terms": [
               "scheduling"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** Concord argues that microsecond runtimes can keep most of the tail-latency benefit of theoretically optimal single-queue, preemptive scheduling without paying the full throughput cost of implementing those policies exactly.",
             "support_reason": "Matched journal terms (scheduling) to Resource-DAG scheduling."
           },
@@ -37561,7 +37561,7 @@
               "logical session",
               "million"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "A million logical sessions cannot each own an unbounded queue or thread.",
             "support_reason": "Matched journal terms (session, connection, logical session, million) to Effective session counting."
           },
@@ -39045,7 +39045,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper argues that once a middle tier such as byte-addressable NVM is close enough to DRAM, a DBMS should stop treating every page miss as \"copy to DRAM before doing work.\" NVM creates more legal data paths: operate on NVM-resident data directly, persist some writes directly to NVM, sometimes skip NVM on SSD reads, and sometimes skip NVM...",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -39366,7 +39366,7 @@
               "nvm",
               "recovery"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "Publication is then a pointer/generation swap gated by WAL-before-visibility.",
             "support_reason": "Matched journal terms (wal, logging, durability, commit protocol) to WAL-before-visibility boundary."
           },
@@ -41210,7 +41210,7 @@
               "retained",
               "read snapshot"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** GPU DB's target runtime already names network IO workers, bounded command rings, owner domains, read snapshot workers, GPU execution workers, and response rings.",
             "support_reason": "Matched journal terms (retained, read snapshot) to Retained GPU snapshots."
           },
@@ -41581,7 +41581,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** DRAGON extends NVIDIA Pascal-era Unified Memory so a GPU kernel can access data backed by files on NVM/NVMe through ordinary load/store instructions.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -43017,7 +43017,7 @@
               "batching",
               "kernel launch"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The low/high threshold split is a strong fit for micro-batching.",
             "support_reason": "Matched journal terms (micro-batch, batching, kernel launch) to Same-shape micro-batching."
           },
@@ -47692,7 +47692,7 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper dissects Parquet and ORC as representative open columnar formats and argues that their early-2010s Hadoop-era design choices no longer match modern hardware and workloads.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -50364,7 +50364,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** GPU DB should use 2-Tree as a template for hot-record and hot-segment placement across GPU HBM, CPU DRAM, and NVMe, not as a literal instruction to maintain two B+trees for every relation.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -50730,7 +50730,7 @@
               "append",
               "nvm"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** GOLAP is a strong fit for the over-resident side of P8: cold partitions should not be thought of as \"CPU rows later copied to GPU.\" They should have an explicit compressed column-chunk format, chunk metadata, and route eligibility that tells the planner whether a query can stream compressed bytes from NVMe to GPU and consume them witho...",
             "support_reason": "Matched journal terms (append, nvm) to Log-structured warm tier."
           },
@@ -51452,7 +51452,7 @@
               "nvme",
               "cold"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "GPU DB should not treat cold chunks as raw rows waiting to be copied to HBM.",
             "support_reason": "Matched journal terms (tier, placement, cache, hbm) to Multi-tier placement policy."
           },
@@ -51800,7 +51800,7 @@
               "million",
               "gateway"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "A logical session should not be allowed to pin an unbounded result.",
             "support_reason": "Matched journal terms (session, connection, logical session, million) to Effective session counting."
           },
@@ -52045,7 +52045,7 @@
             "matched_terms": [
               "nvm"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** KVell argues that modern block-addressable NVMe storage changes the usual persistent key-value tradeoff.",
             "support_reason": "Matched journal terms (nvm) to Log-structured warm tier."
           },
@@ -53205,7 +53205,7 @@
               "resident",
               "gpu snapshot"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** GPU DB should keep the current WAL-first correctness rule, but this paper sharpens the shape of the retained read path.",
             "support_reason": "Matched journal terms (retained, resident, gpu snapshot) to Retained GPU snapshots."
           },
@@ -54060,7 +54060,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** Epic assumes one-shot stored procedures and known read/write sets, while GPU DB must support interactive SQL, pgwire extended-query semantics, errors, portals, and transactions whose future statements are not known at admission time.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -54700,7 +54700,7 @@
               "route descriptor",
               "publish"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** This paper is a direct argument for making materialization shape part of the route descriptor.",
             "support_reason": "Matched journal terms (generation, route descriptor, publish) to Immutable route roots."
           },
@@ -54723,7 +54723,7 @@
             "matched_terms": [
               "ring"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper's strongest lesson is that GPU join and group-by performance is often dominated by the supposedly boring final step: fetching payload columns and materializing output.",
             "support_reason": "Matched journal terms (ring) to Owner-ring bundling."
           },
@@ -55274,7 +55274,7 @@
               "buffer",
               "cold"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "For tier placement, watermarks are also a cache-retirement tool.",
             "support_reason": "Matched journal terms (tier, placement, cache, buffer) to Multi-tier placement policy."
           },
@@ -56114,7 +56114,7 @@
               "gpu memory",
               "hbm"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The implementation and numbers are PostgreSQL-based, not GPU-resident.",
             "support_reason": "Matched journal terms (retained, resident, gpu-resident, gpu memory) to Retained GPU snapshots."
           },
@@ -56245,7 +56245,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** CRDV maps cleanly to derived state inside GPU DB: retained route tables, per-session or per-tenant counters, materialized hot aggregates, invalidation summaries, and conflict-tolerant denormalized metadata.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -57754,7 +57754,7 @@
               "era",
               "retire"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper argues against treating an analytical operator as exclusively CPU-owned or GPU-owned.",
             "support_reason": "Matched journal terms (era, retire) to Bounded descriptor reclamation."
           },
@@ -58672,7 +58672,7 @@
               "fairness",
               "priority"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The priority invariant may also create fairness and tail-latency hazards.",
             "support_reason": "Matched journal terms (fairness, priority) to Deficit fairness."
           },
@@ -61743,7 +61743,7 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** For P8, RTScan is a candidate for a narrow, opt-in resident predicate index over immutable GPU snapshots.",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -64460,7 +64460,7 @@
               "lock-free",
               "route descriptor"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The temperature idea maps directly to route descriptors.",
             "support_reason": "Matched journal terms (era, lock-free, route descriptor) to Bounded descriptor reclamation."
           },
@@ -64634,7 +64634,7 @@
             "matched_terms": [
               "adaptive"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** Adaptive Logging treats log detail as a tunable resource rather than a fixed system-wide choice.",
             "support_reason": "Matched journal terms (adaptive) to Learned optimizer advisor."
           },
@@ -65327,7 +65327,7 @@
               "kernel launch",
               "coalesced"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "Warp cooperative work sharing maps directly to retained lookup micro-batching.",
             "support_reason": "Matched journal terms (micro-batch, batching, same-shape, kernel launch) to Same-shape micro-batching."
           },
@@ -67610,7 +67610,7 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** This strengthens the current bounded-ring and cooperative-memory direction.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -68044,7 +68044,7 @@
               "visibility",
               "nvm"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "No cache placement or prefetch policy can bypass WAL-before-visibility.",
             "support_reason": "Matched journal terms (wal, visibility, nvm) to WAL-before-visibility boundary."
           },
@@ -69270,7 +69270,7 @@
               "scheduling",
               "resource"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** The direct lesson for GPU DB is that placement and scheduling should be controlled by route-level pressure, not by a permanent \"spread everything everywhere\" rule.",
             "support_reason": "Matched journal terms (scheduler, scheduling, resource) to Resource-DAG scheduling."
           },
@@ -72685,7 +72685,7 @@
               "batching",
               "same-shape"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "Same-shape micro-batches are not enough.",
             "support_reason": "Matched journal terms (micro-batch, batching, same-shape) to Same-shape micro-batching."
           },
@@ -74811,7 +74811,7 @@
               "buffer",
               "cold"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "D-RDMA also maps to future remote tiering.",
             "support_reason": "Matched journal terms (tier, tiering, cache, buffer) to Multi-tier placement policy."
           },
@@ -76109,7 +76109,7 @@
               "multi-version",
               "multiversion"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper asks when a transactional workload can run under multi-version Read Committed while every allowed execution remains serializable.",
             "support_reason": "Matched journal terms (snapshot, multi-version, multiversion) to Snapshot frontier vectors."
           },
@@ -77112,7 +77112,7 @@
               "scheduling",
               "resource"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** This paper argues that the usual conflict graph is too coarse for scheduling OLTP work.",
             "support_reason": "Matched journal terms (scheduling, resource) to Resource-DAG scheduling."
           },
@@ -78912,7 +78912,7 @@
               "object",
               "cold tier"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** This strengthens the P8 tiering model: future CXL or far-memory tiers should be placed by object behavior, not by simple free-capacity pressure.",
             "support_reason": "Matched journal terms (object, cold tier) to DB-owned cold objects."
           },
@@ -79108,7 +79108,7 @@
               "ycsb",
               "tpc-c"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** ORTHRUS argues that high-contention OLTP systems lose throughput for two reasons beyond the unavoidable serialization of conflicting logical operations: one execution thread usually performs both transaction logic and concurrency-control work, and transactions often discover their data accesses dynamically.",
             "support_reason": "Matched journal terms (conflict, access set, ycsb, tpc-c) to GPU OLTP conflict ordering."
           },
@@ -79798,7 +79798,7 @@
               "micro-batch",
               "prepared"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** T-Part is a useful shape for GPU DB's prepared write and refresh lanes.",
             "support_reason": "Matched journal terms (micro-batch, prepared) to Same-shape micro-batching."
           },
@@ -82137,7 +82137,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** D2PC is designed for geo-distributed databases, not a single-node GPU-accelerated storage engine.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -82777,7 +82777,7 @@
             "matched_terms": [
               "admission"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** RackSched maps directly to the production runtime target in `11-high-throughput-query-runtime.md`: IO workers should behave like a compact admission and steering layer, not like full query owners.",
             "support_reason": "Matched journal terms (admission) to Vector-credit admission."
           },
@@ -83043,7 +83043,7 @@
               "flow control",
               "queueing"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The one-or-two outstanding request rule maps well to admission credits.",
             "support_reason": "Matched journal terms (credit, token, admission, flow control) to Vector-credit admission."
           },
@@ -86078,7 +86078,7 @@
             "matched_terms": [
               "metadata"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** OPTIK is a good fit for CPU-side route metadata that must stay cheap under many read workers: relation-to-resident-generation maps, session credit buckets, prepared-route certificates, resident segment maps, and small CPU fallback indexes.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
@@ -86570,7 +86570,7 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** NeoMem argues that CXL memory tiering is limited less by the mechanics of page migration than by low-quality visibility into which slow-tier pages are actually worth promoting.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -90470,7 +90470,7 @@
               "gpu snapshot",
               "read snapshot"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "For retained GPU snapshots, Bamboo is a warning about invalidation timing.",
             "support_reason": "Matched journal terms (retained, gpu snapshot, read snapshot) to Retained GPU snapshots."
           },
@@ -91763,7 +91763,7 @@
             "matched_terms": [
               "metadata"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** HybridTier argues that practical CXL memory tiering has to solve two problems at once: place the true hot set in local DRAM and adapt quickly when the hot set moves, without spending so much metadata memory or cache bandwidth that tiering eats the benefit.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
@@ -91784,7 +91784,7 @@
             "matched_terms": [
               "object"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** HybridTier is application-transparent page tiering, not DBMS-owned object placement.",
             "support_reason": "Matched journal terms (object) to DB-owned cold objects."
           },
@@ -91805,7 +91805,7 @@
             "matched_terms": [
               "ring"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** HybridTier argues that practical CXL memory tiering has to solve two problems at once: place the true hot set in local DRAM and adapt quickly when the hot set moves, without spending so much metadata memory or cache bandwidth that tiering eats the benefit.",
             "support_reason": "Matched journal terms (ring) to Owner-ring bundling."
           },
@@ -92630,7 +92630,7 @@
               "predicate",
               "metadata"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** PIM-Tree is a future-tier paper, but its strongest lesson applies immediately to GPU DB route metadata and resident lookup indexes: accelerator placement cannot be a static partitioning rule.",
             "support_reason": "Matched journal terms (join, predicate, metadata) to Cost-based route optimizer."
           },
@@ -92676,7 +92676,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** PIM-Tree is a future-tier paper, but its strongest lesson applies immediately to GPU DB route metadata and resident lookup indexes: accelerator placement cannot be a static partitioning rule.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -92915,7 +92915,7 @@
               "session",
               "staR"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** REEF's strongest transferable idea is not \"kill database kernels.\" It is a contract for urgent GPU work: a route can only be preemptible if its side effects are either absent, buffered, or restartable from a precise input snapshot.",
             "support_reason": "Matched journal terms (session, staR) to Effective session counting."
           },
@@ -93667,7 +93667,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** CALC targets main-memory transactional systems where synchronous redo logging or quiesced full snapshots erase much of the latency benefit of keeping the database in memory.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -97668,7 +97668,7 @@
               "logical session",
               "staR"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "For 1M logical sessions, the first-run latency lesson is important.",
             "support_reason": "Matched journal terms (session, logical session, staR) to Effective session counting."
           },
@@ -97742,7 +97742,7 @@
               "era",
               "retire"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** Compilation-based query engines can lose badly on short, interactive, metadata-heavy, or machine-generated SQL because compilation time can dominate actual execution.",
             "support_reason": "Matched journal terms (era, retire) to Bounded descriptor reclamation."
           },
@@ -98591,7 +98591,7 @@
               "rocksdb",
               "lance"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** The P8 cold-tier path should not be a side effect of a generic filesystem or OS queue if it becomes hot enough to affect query latency.",
             "support_reason": "Matched journal terms (filesystem, compaction, rocksdb, lance) to DB-owned cold objects."
           },
@@ -98858,7 +98858,7 @@
               "htap",
               "fresh"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "Measure write throughput, freshness lag, read latency, and refresh frequency.",
             "support_reason": "Matched journal terms (freshness, htap, fresh) to HTAP freshness router."
           },
@@ -98908,7 +98908,7 @@
               "warm tier",
               "nvm"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** HANA's Native Store Extension extends an in-memory HTAP column store with a paged warm tier without building a separate disk engine or forcing queries through a different logical representation.",
             "support_reason": "Matched journal terms (append, warm tier, nvm) to Log-structured warm tier."
           },
@@ -99084,7 +99084,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** The paper is SQL Server 2016-era CPU columnstore work, not a GPU execution design.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -99699,7 +99699,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** SLOG targets geo-replication, but its transferable idea is a locality-aware transaction path that keeps local work off the slow global coordination path.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -100397,7 +100397,7 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** SAP HANA's normal in-memory column store keeps a column fragment's data vector, dictionary, and optional inverted index fully resident during access.",
             "support_reason": "Matched journal terms (ring, queue) to Owner-ring bundling."
           },
@@ -101729,7 +101729,7 @@
               "ring",
               "queue"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The durable outcome queue maps to response rings.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -101865,7 +101865,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** KRISP argues that model-wide or process-wide GPU partitioning leaves capacity idle because different kernels inside one request tolerate very different amounts of GPU compute restriction.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -102417,7 +102417,7 @@
               "ring",
               "queue"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "The queue-centroid idea maps to owner rings.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -102824,7 +102824,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper argues that GPU hash joins cannot be treated as a single operator with a \"run on GPU\" switch.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -105194,7 +105194,7 @@
             "matched_terms": [
               "nvm"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** HeMem argues that real DRAM+Optane-NVM tiering needs application-visible policy without putting heavy tracking and migration work on the request path.",
             "support_reason": "Matched journal terms (nvm) to Log-structured warm tier."
           },
@@ -106678,7 +106678,7 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** P8 should treat resident GPU data placement as more than \"table is on GPU.\" A retained route certificate can include segment or partition locality: resident buffer id, GPU device, chiplet or MIG slice when visible, stream owner, expected column vectors, expected key or row-id ranges, and whether the route's kernel accesses them with co...",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -106701,7 +106701,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** LADM argues that future large GPUs will look less like one uniform device and more like a hierarchy of locality domains: chiplets, local HBM stacks, packages, and potentially multiple discrete GPUs presented as one logical GPU.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -108531,7 +108531,7 @@
               "era",
               "retire"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** P8 currently treats GPU resident state as acceleration state rebuilt from CPU truth.",
             "support_reason": "Matched journal terms (era, retire) to Bounded descriptor reclamation."
           },
@@ -109173,7 +109173,7 @@
               "adaptive",
               "model"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** Flowcut addresses a tension in datacenter and supercomputer networks: per-packet adaptive routing can reduce queueing, but protocols such as RoCE, TCP, and QUIC can pay heavily when packets arrive out of order.",
             "support_reason": "Matched journal terms (adaptive, model) to Learned optimizer advisor."
           },
@@ -110189,7 +110189,7 @@
               "era",
               "retire"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Risks and mismatches:** SGDRC is specialized to DNN inference and assumes kernel generation/transformation through TVM-like compilation.",
             "support_reason": "Matched journal terms (era, retire) to Bounded descriptor reclamation."
           },
@@ -111728,7 +111728,7 @@
             "matched_terms": [
               "buffer"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** BFC argues that end-to-end congestion-control feedback is too slow for very fast datacenter links, short flows, bursty arrivals, and switch buffers that do not scale with link speed.",
             "support_reason": "Matched journal terms (buffer) to Multi-tier placement policy."
           },
@@ -111951,7 +111951,7 @@
               "compaction",
               "rocksdb"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper characterizes production RocksDB workloads at Facebook from three use cases: UDB as the MySQL/MyRocks storage layer for social graph data, ZippyDB as a distributed key-value store, and UP2X as persistent storage for AI/ML profile data.",
             "support_reason": "Matched journal terms (object, compaction, rocksdb) to DB-owned cold objects."
           },
@@ -114785,7 +114785,7 @@
               "fallback",
               "cpu fallback"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "For warm CPU fallback, the same rule helps prevent false GPU wins.",
             "support_reason": "Matched journal terms (fallback, cpu fallback) to CPU fallback policy."
           },
@@ -114859,7 +114859,7 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** The paper studies a narrow but useful execution-choice problem in in-memory column stores: whether a conjunctive predicate pipeline should run as several tight vectorized loops, one predicate at a time, or as a single fused loop that evaluates all predicates together.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -122996,7 +122996,7 @@
             "matched_terms": [
               "metadata"
             ],
-            "quality": "short_snippet",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** The first direct mapping is future-tier metadata.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
@@ -125261,7 +125261,7 @@
               "resident",
               "gpu memory"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**GPU DB mapping:** P8's durable truth is still WAL/checkpoint/archive plus CPU MVCC state, while GPU memory is rebuildable acceleration.",
             "support_reason": "Matched journal terms (retained, resident, gpu memory) to Retained GPU snapshots."
           },
@@ -126102,7 +126102,7 @@
               "gateway",
               "staR"
             ],
-            "quality": "weak_direct",
+            "quality": "direct",
             "snippet": "**Core idea:** Justitia starts from a practical RDMA problem: RDMA's microsecond latency and high message rate often hold only when an application runs alone.",
             "support_reason": "Matched journal terms (session, gateway, staR) to Effective session counting."
           },
@@ -132906,9 +132906,9 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 3903,
-      "short_snippet": 45,
-      "weak_direct": 723
+      "direct": 4008,
+      "short_snippet": 17,
+      "weak_direct": 646
     },
     "evidence_span_counts": {
       "links_with_evidence_snippet": 4671,

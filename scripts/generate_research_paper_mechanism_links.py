@@ -2900,10 +2900,14 @@ def evidence_quality(link: dict) -> str:
         return "fallback_review"
     if snippet_lower.startswith(METADATA_SNIPPET_PREFIXES):
         return "metadata_only"
-    if len(snippet) < 80:
-        return "short_snippet"
     matched_terms = [term for term in span.get("matched_terms", []) if term != "category fallback"]
     snippet_term_hits = sum(1 for term in matched_terms if term.lower() in snippet_lower)
+    if snippet_lower.startswith(STRONG_SNIPPET_PREFIXES) and snippet_term_hits >= 1:
+        return "direct"
+    if len(snippet) < 80:
+        if link["confidence"] == "high" and snippet_term_hits >= 1:
+            return "direct"
+        return "short_snippet"
     if snippet_term_hits >= 2 or link["confidence"] == "high":
         return "direct"
     return "weak_direct"
