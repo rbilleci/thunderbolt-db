@@ -28213,8 +28213,8 @@
             "matched_terms": [
               "tier"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The last batch spans networking/runtime admission (TAS), robust planner diagnostics (Hint-QPT), parallel WAL dependency frontiers (Taurus), and bounded-delay snapshot/version retirement (Ben-David et al.).",
             "support_reason": "Matched journal terms (tier) to Multi-tier placement policy."
           },
@@ -51810,8 +51810,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The benchmark records transactional progress and analytical-observed progress so each analytical result can be assigned a recency lag. - HATtrick extends a star-schema analytical workload with a transaction workload derived from TPC-C-style operations, avoiding the full complexity of TPC-C/TPC-H while keeping both workload families present. - The evaluati...",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -53386,8 +53386,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper deliberately avoids sub-byte encodings for the main HTAP format. - Order-preserving dictionaries let equality and range predicates run against compressed integer codes, often with more values per SIMD register than the uncompressed representation. - Each block stores ordinary min/max SMAs per attribute, allowing whole blocks to be skipped when a...",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -62778,8 +62778,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Eigen makes capacity a layered resource flow, GaccO keeps the CPU database primary while batching same-shape GPU work, No False Negatives makes conflict acceptance explicit, and Bre\u00df/Funke/Teubner show that accelerator routes collapse when residency and heap budgets are treated as afterthoughts.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -65685,8 +65685,8 @@
               "depends",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A resident `int4`/`int8` key column could expose several route families: GPU hash for high-hit point probes, GPU B-tree or sorted vectors for ordered/range access, and RT-core/BVH lookup for batched point probes with high miss rates, skew, or key widths where comparison costs dominate.",
             "support_reason": "Matched journal terms (ordered, ordering, depends, proof) to Dependency witnesses."
           },
@@ -66024,8 +66024,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The current runtime already describes COPY admission batches and same-shape lookup batches; GPU-TPS suggests adding same-shape write batches where the admission key includes transaction family, expected index operations, write-set pattern when known, and conflict risk.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -67918,8 +67918,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "**Converging design tracks:** Database Kernels, GPU B-Trees, and SMF all push the engine away from opaque queues and byte ranges.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -68810,8 +68810,8 @@
             "matched_terms": [
               "ring"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper represents indexed integer keys as objects in a ray-tracing scene, builds an OptiX bounding volume hierarchy over them, and answers point or range lookups by firing rays through the key space.",
             "support_reason": "Matched journal terms (ring) to Owner-ring bundling."
           },
@@ -69159,8 +69159,8 @@
               "tenant",
               "slo"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For 1M logical sessions, the useful classifier is not \"predict every session's next request perfectly.\" It is \"which tenant, route shape, table generation, or prepared query family is predictable enough to receive scarce warm resources?\" New or unpredictable identities should stay on default teardown, default admission, or CPU fallback until history justi...",
             "support_reason": "Matched journal terms (tenant, slo) to Deficit fairness."
           },
@@ -69332,8 +69332,8 @@
               "join",
               "predicate"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A hash index over a published resident segment could map keys to row ordinals or compact row-id lists, then route the result through normal visibility and predicate checks.",
             "support_reason": "Matched journal terms (join, predicate) to Cost-based route optimizer."
           },
@@ -73425,8 +73425,8 @@
               "admission",
               "queueing"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper's account debit/credit example replays deltas against the latest state, aborting only if constraints fail. - Class E uses escrow-like guarantees for numeric, constrained, commutative data where the transaction needs assurance during the read phase that the later update can succeed, such as reserving stock. - The classification rules consider own...",
             "support_reason": "Matched journal terms (credit, admission, queueing) to Vector-credit admission."
           },
@@ -74758,8 +74758,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Detock says multi-owner work needs explicit conflict edges and deterministic resolution.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -74922,8 +74922,8 @@
               "join",
               "predicate"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The runtime can then co-schedule compatible retained reads and joins explicitly, rather than hoping that concurrent CUDA streams produce useful overlap.",
             "support_reason": "Matched journal terms (join, predicate) to Cost-based route optimizer."
           },
@@ -75647,8 +75647,8 @@
               "append",
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Instead, the storage device exposes two integrated paths: a conventional block SSD side and a PM-backed byte-addressable fast side for append-only log writes.",
             "support_reason": "Matched journal terms (append, nvm) to Log-structured warm tier."
           },
@@ -75835,8 +75835,8 @@
               "append",
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A commit path must publish visibility only after the selected durability certificate is satisfied, not merely after an RDMA, NVMe, CXL, or storage API reports completion.",
             "support_reason": "Matched journal terms (append, nvm) to Log-structured warm tier."
           },
@@ -76129,8 +76129,8 @@
             "matched_terms": [
               "predicate"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "BinDex adds the read side complement: a route certificate should also state the memory budget, index representation, snapshot generation, and refine/materialization cost for predicate reads.",
             "support_reason": "Matched journal terms (predicate) to Cost-based route optimizer."
           },
@@ -76615,8 +76615,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Instead of training a separate model from scratch for every database, it uses transferable low-level features: per-attribute value distributions, join scaling-factor distributions, predicate features, table-level auxiliary estimates, and coarse query-level estimates.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -79448,8 +79448,8 @@
             "matched_terms": [
               "admission"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The useful mapping is an edge admission and routing layer before pgwire work enters heavier engine owners.",
             "support_reason": "Matched journal terms (admission) to Vector-credit admission."
           },
@@ -79496,8 +79496,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Instead of treating the kernel as a packet pipe into a user-space transaction server, DINT runs lock, small key-value, and log operations in eBPF maps at XDP/TC hooks, rewrites request packets into responses, and sends only overflow or unsupported cases to a normal UDP user-space backup process.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -82865,8 +82865,8 @@
               "tier",
               "promotion"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "BtrBlocks adds that tiered data should carry codec and decode facts, because compressed bytes, decoded bytes, and decode engine determine whether a route is actually fast.",
             "support_reason": "Matched journal terms (tier, promotion) to Multi-tier placement policy."
           },
@@ -85116,8 +85116,8 @@
               "ring",
               "queue"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "HyBench makes freshness a benchmark dimension, F1 Lightning turns freshness into a safe timestamp window for analytical routing, and D2PC splits transaction ordering from final durable completion to shorten the time scarce concurrency-control resources are held.",
             "support_reason": "Matched journal terms (owner, ring, queue) to Owner-ring bundling."
           },
@@ -122294,8 +122294,8 @@
               "access path",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The in-memory tables and indexes are treated as volatile access paths over that durable indexed log.",
             "support_reason": "Matched journal terms (access path, metadata) to Cost-based route optimizer."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4426,
-      "weak_direct": 245
+      "direct": 4448,
+      "weak_direct": 223
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 264,
+      "snippet contains matched mechanism term plus visible aliases": 286,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 239,
+      "substantive snippet contains only one matched mechanism term": 217,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
