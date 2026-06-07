@@ -7410,12 +7410,21 @@ Append new candidates here as each paper is processed.
   Why: Crystalline cites Stamp-it as a bounded-reclamation-cost epoch
   direction; useful for comparing monotonic stamp-based retirement with
   route generation tokens and owner-local cleanup queues.
-- `queued` — **Concurrent Deferred Reference Counting with Constant-Time
+- `reviewed` — **Concurrent Deferred Reference Counting with Constant-Time
   Overhead**, Anderson, Blelloch, and Wei, PLDI 2021.
   URL: `https://doi.org/10.1145/3453483.3454060`
+  PDF: `https://www.cs.cmu.edu/~guyb/papers/3453483.3454060.pdf`
   Why: Publish on Ping's related work includes automatic/reference-counting
   style reclamation; useful as a contrast to hazard/epoch designs before GPU
-  DB picks a route metadata lifetime scheme.
+  DB picks a route metadata lifetime scheme. Journal entry added 2026-06-07.
+- `queued` — **Concurrent Fixed-Size Allocation and Free in Constant Time**,
+  Blelloch and Wei, DISC 2020 brief announcement / arXiv 2020.
+  URL: `https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.DISC.2020.51`
+  arXiv: `https://arxiv.org/abs/2008.04296`
+  Why: Concurrent Deferred Reference Counting depends on bounded auxiliary
+  memory and fixed-size reclamation costs; useful for route-descriptor pools,
+  response-buffer slabs, and owner-local allocation where allocation/free
+  should remain constant-time under high session counts.
 - `reviewed` — **OrcGC: Automatic Lock-Free Memory Reclamation**, Correia,
   Ramalhete, and Felber, PPoPP 2021.
   URL: `https://doi.org/10.1145/3437801.3441596`

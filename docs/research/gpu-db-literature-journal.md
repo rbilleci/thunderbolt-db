@@ -95819,3 +95819,160 @@ heuristics that work before the bad route has already inflated p99.
   before relying on transparent memory placement. Treat every new
   interconnect as untrusted until local measurements identify its
   latency, credits, sharing points, and backpressure behavior.
+
+### 2026-06-07 - Deferred reference counting makes descriptor lifetime automatic but bounded
+
+**Citation:** Daniel Anderson, Guy E. Blelloch, and Yuanhao Wei.
+"Concurrent Deferred Reference Counting with Constant-Time Overhead."
+PLDI 2021, 526-541. DOI: `https://doi.org/10.1145/3453483.3454060`.
+Retrieved 2026-06-07 from the DOI metadata, DBLP metadata, and author
+PDF: `https://dblp.org/rec/conf/pldi/AndersonBW21`,
+`https://www.cs.cmu.edu/~guyb/papers/3453483.3454060.pdf`.
+
+**Category:** GC, memory reclamation, and in-memory state movement;
+runtime scale, HFT-style mechanics, and admission.
+
+**Relevance tags:** concurrent deferred reference counting; acquire-retire;
+snapshot pointers; reference counts; hazard pointers; automatic memory
+reclamation; route descriptors; snapshot handles; response buffers; bounded
+retired state; wait-free overhead; 1M logical sessions.
+
+**Core idea:** The paper combines reference counting with a generalized
+hazard-pointer interface, called acquire-retire, so concurrent programs can
+avoid manual `retire` mistakes while keeping constant-time pointer operations.
+Instead of protecting an object only after its reference count reaches zero,
+the algorithm protects the reference count itself while increments may be in
+flight. Decrements are deferred until no active acquire can still be racing
+with the counter.
+
+For GPU DB, the strongest transferable idea is a two-mode lifetime contract
+for route-visible metadata. Long-lived ownership should use explicit counted
+references, while very short-lived reads should use snapshot-style temporary
+protection that avoids incrementing hot counters. That maps better to 1M
+logical sessions than making every retained snapshot, route descriptor, or
+response buffer bump a shared atomic counter.
+
+**Concrete mechanisms:**
+
+- Acquire-retire generalizes hazard pointers with four operations:
+  `acquire`, `release`, `retire`, and `eject`. Unlike classic hazard pointers,
+  it permits multiple concurrent retires of the same handle, which is necessary
+  when several shared references to the same reference-counted object are
+  removed independently.
+- A load from a shared reference-counted pointer first acquires the reference
+  count, increments the counter, releases the acquisition, and returns the
+  pointer. This prevents a decrement from racing the increment down to zero.
+- A store increments the new desired pointer, atomically swaps it into the
+  shared location, and retires the old pointer. The deferred eject path later
+  performs the actual decrement and deletes the object if the count reaches
+  zero.
+- Successful compare-and-swap protects the desired pointer before the CAS,
+  increments it only after success, and retires the overwritten expected
+  pointer. The paper calls out that protecting the desired pointer is required
+  because another thread could otherwise remove and reclaim it before the CAS
+  increments the count.
+- The algorithm represents references as single-word raw pointers and does not
+  steal pointer bits. The paper reports constant-time loads, expected
+  constant-time stores and CAS excluding destructor work, `O(P^2)` auxiliary
+  space, and `O(P^2)` deferred decrements on `P` processes using ordinary
+  single-word atomics.
+- Snapshot pointers are the practical performance lever. A short-lived
+  traversal reference temporarily protects the reference count through
+  acquire-retire but does not increment or decrement it. If the reference is
+  not promoted to a longer-lived reference, the hot counter is never modified.
+- The acquire-retire implementation uses per-process announcement slots and
+  process-local retired lists. Eject computes which retired handles are not
+  protected by active announcements; the paper describes a bounded
+  implementation using local hash-table work spread across operations.
+- In stack microbenchmarks at 128 threads, snapshotting improves the
+  read-heavy workload by 5x over the same deferred reference-counting scheme
+  without snapshots, 7x over the optimized Herlihy-style implementation, and
+  16x over Folly's shared-pointer path as reported by the paper.
+- Against manual safe-memory-reclamation schemes on lists, hash tables, and
+  trees, the paper reports that deferred reference counting with snapshots is
+  often within 1.2-2.5x of the fastest epoch-style methods while using much
+  less extra memory; the paper also reports cases where epoch or era methods
+  suffer under oversubscription because stalled threads delay reclamation.
+- The authors document several manual-SMR integration bugs in published
+  research artifacts, especially missing retires when a tree cleanup removes
+  more than one node and missing restarts after protection announcements.
+
+**GPU DB mapping:** Route descriptors, resident snapshot handles, catalog
+generation objects, CPU-side resident indexes, prepared-route cache entries,
+and response-buffer slabs all need cheap lifetime protection. The paper argues
+for separating long-lived ownership from short-lived traversal protection.
+Network IO workers and read workers should be able to inspect a route
+descriptor or snapshot handle briefly without touching a contended reference
+count unless they actually enqueue or retain work.
+
+The acquire-retire shape maps to owner-published handles. Owners publish
+single-word handles to immutable descriptor objects. Readers acquire a handle
+through an announcement slot, validate its generation and route eligibility,
+and release it quickly. Only work that leaves the local worker, crosses a ring,
+or survives a scheduling boundary should promote the handle to a counted
+reference.
+
+This gives a useful alternative to pure epoch reclamation for 1M logical
+sessions. Epochs are attractive for owner-local batching, but long or stalled
+sessions can pin retired metadata. A bounded deferred-counting scheme would
+let retired route descriptors, response buffers, and snapshot handles have an
+observable worst-case backlog tied to active worker slots rather than to every
+logical client.
+
+The paper's usability warning is also relevant. Route invalidation and
+resident-cache cleanup will remove whole chains of metadata: table route,
+column buffer, key vector, GPU event, pinned host slab, and result encoder
+template. A manual "remember to retire every detached object" API is too easy
+to misuse. GPU DB should prefer owner-owned descriptor types whose destructor
+or retire path walks the dependent resources deterministically.
+
+**Risks and mismatches:** This is a memory-reclamation paper, not a database
+or GPU systems paper. It does not discuss WAL ordering, MVCC visibility, SQL
+isolation, CUDA resources, pinned host memory, NUMA, or session admission.
+
+Reference counting still cannot collect cycles by itself. GPU DB route graphs
+should remain acyclic by construction, or cycles must use weak/back references
+and owner-domain teardown rules.
+
+The `O(P^2)` bound is over processes or worker slots, not logical sessions.
+That is a good fit only if GPU DB protects metadata through bounded IO,
+execution, and owner workers. It would be a bad fit if every logical session
+received its own announcement slot.
+
+Atomic reference-count operations can still contend on update-heavy paths.
+The paper shows snapshot pointers are crucial for read-heavy traversal; GPU DB
+should not infer that counted references are free on route churn, invalidation
+storms, or response-buffer recycling.
+
+Destructor cascades remain real work. If a retired descriptor owns GPU memory,
+pinned host slabs, or file handles, the owner must account cleanup work to a
+bounded reclamation queue rather than hiding it inside a latency-sensitive
+read path.
+
+**Benchmark candidates:**
+
+- Prototype a route-descriptor handle with two access modes: short snapshot
+  acquire for local validation and counted retain for work crossing rings.
+  Measure route lookup p50/p99, atomic counter writes, retired descriptor
+  backlog, and invalidation latency under 1M logical sessions multiplexed onto
+  bounded workers.
+- Compare pure epoch reclamation, hazard pointers, simple atomic reference
+  counts, and deferred reference counting for resident-snapshot descriptors.
+  Gate: retired bytes must remain bounded when one worker is stalled and route
+  invalidations continue.
+- Add a descriptor-chain cleanup test where DDL or residency invalidation
+  detaches a table route, column buffers, key vectors, pinned slabs, and GPU
+  events in one operation. Failure condition: any detached object requires
+  ad hoc manual retire calls outside the owning descriptor teardown path.
+- Benchmark snapshot-style route validation with and without promotion to a
+  counted reference. Expected result: short rejected or CPU-fallback routes
+  avoid shared-counter modification, while admitted GPU work retains the
+  descriptor until the response is published.
+- Add reclamation telemetry to runtime stress tests: active announcement
+  slots, deferred decrement backlog, counted descriptor references, owner
+  cleanup queue depth, bytes retired but not freed, and maximum descriptor
+  lifetime after invalidation.
+- Test cleanup budgeting for heavyweight resources. Retired descriptors that
+  own GPU buffers, CUDA events, pinned host memory, or mapped storage should
+  enqueue bounded owner-domain cleanup work; read workers should never pay an
+  unbounded destructor cascade.
