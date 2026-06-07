@@ -38,6 +38,187 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Cloud five-minute rule turns tiering into an access-frequency budget
+
+**Citation:** Kira Duwe, Angelos Anadiotis, Andrew Lamb, Lucas Lersch,
+Boaz Leskes, Daniel Ritter, and Pinar Tozun. "The Five-Minute Rule for
+the Cloud: Caching in Analytics Systems." CIDR 2025. Retrieved
+2026-06-07 from the CIDR/VLDB PDF:
+`https://www.vldb.org/cidrdb/papers/2025/p4-duwe.pdf`.
+
+**Category:** multi-tier cache / data placement; storage layout and
+indexing; query optimization / planning.
+
+**Relevance tags:** cloud five-minute rule; object store caches; S3;
+EBS; NVMe; cache break-even; disaggregated storage; local cache;
+shared-nothing cache; cache service; racing reads; request sizing;
+latency-sensitive analytics; access-frequency budget; HBM/DRAM/NVMe
+placement; route cost model.
+
+**Core idea:** The paper adapts the classic five-minute rule to
+cloud-native analytics, where object storage is cheap and durable but
+request charges, latency variance, and elastic compute change the
+cache decision. Instead of asking only whether DRAM is cheaper than
+disk for a page reuse interval, it models when a cloud database should
+pay for cache hardware rather than repeatedly paying object-store
+request and latency costs.
+
+For GPU DB, the strongest transferable idea is that tier admission
+should be expressed as a measurable break-even rule, not as a vague
+"hot data goes up" heuristic. HBM, host DRAM, local NVMe, network
+storage, and future object/CXL tiers should each have an observed
+request-frequency, latency, miss-rate, and capacity-price threshold.
+A route certificate should say not only "resident and valid" but also
+why the resident placement is economically or latency justified.
+
+**Concrete mechanisms:**
+
+- The paper surveys four cloud cache architectures: no cache,
+  compute-local memory cache, compute-local memory plus local storage,
+  shared-nothing cooperative cache, and a separate cache service. It
+  compares them by latency, cost, operational complexity, elasticity,
+  duplicate storage, and cache hit behavior.
+- It observes that on modern AWS instance families, network bandwidth
+  to object storage has improved rapidly relative to local read
+  throughput, so bandwidth alone is not enough to justify local cache
+  tiers. Local storage still matters for lower and more predictable
+  latency and for avoiding per-request object-store charges.
+- The cost model equates hourly cache-hardware cost with the cost of
+  repeatedly serving requests from object storage, while accounting for
+  cache miss rate and storage/instance pricing. Cache miss rate is the
+  workload-specific input that must be measured rather than guessed.
+- For non-latency-sensitive analytical workloads, the model treats
+  object-store request cost as the main no-cache cost and cache
+  hardware as mostly fixed hourly cost. The AWS case study uses
+  Graviton instances, EBS, local NVMe, and S3 request pricing.
+- The paper's AWS analysis finds that for non-latency-sensitive
+  workloads, caches become economical around seven requests per
+  second under its assumptions. This is a cost result, not a universal
+  performance constant.
+- For latency-sensitive workloads, the paper models racing reads:
+  issuing redundant object-store requests and using the fastest result
+  to reduce tail latency. Racing reduces tail latency but multiplies
+  request cost.
+- Request size is part of the latency-cost tradeoff. Because object
+  stores charge per request rather than per byte, larger objects can
+  reduce request count, but they may miss tight latency targets and
+  require more concurrent racing requests. In the paper's example, 1
+  MiB requests are cheaper than larger requests for a 150 ms 99th
+  percentile target when downloading 10 GiB.
+- For latency-sensitive repeated reads, the AWS analysis finds that an
+  EBS cache becomes economical once a 1 GiB dataset is accessed about
+  twice per hour, while local NVMe becomes economical at about four
+  accesses per hour under the stated assumptions and a 95% hit rate.
+- The paper explicitly names limitations: the model excludes software
+  engineering and operational cache costs, assumes similar cloud cost
+  structures, treats cache compute cost as small, focuses on analytic
+  workloads, and leaves transaction-processing/write-request effects
+  for future work.
+
+**GPU DB mapping:** GPU DB should treat tier placement as a
+route-planning input with explicit thresholds. For a retained route,
+the planner should know the expected request rate, hit probability,
+refresh cost, transfer bytes, miss penalty, and latency SLO before
+placing data in HBM, DRAM, NVMe, or a future remote/object tier.
+
+The cache architectures map cleanly to GPU DB deployment choices.
+Compute-local cache is analogous to per-GPU HBM and per-node DRAM/NVMe
+residency. Shared-nothing cooperative cache maps to partition owners
+sharing warm fragments. A cache service maps to a future remote
+residency or storage gateway. Each choice has a different duplicate
+byte cost, elasticity story, and admission control surface.
+
+The paper's latency-sensitive case argues for separating bandwidth
+routes from tail-latency routes. A cold object/NVMe read may have
+adequate throughput but still be a poor route for short interactive
+queries if tail variance burns the query budget. GPU DB route
+certificates should therefore carry p50/p99 miss latency and not only
+bytes per second.
+
+Racing reads map to speculative cold-tier fetches or redundant
+gateway/NVMe reads, but only as an explicit overload or tail-control
+mode. Redundancy can hide latency variance while increasing request
+cost, IO credits, and queue pressure. It should be budgeted like any
+other admission lane.
+
+The request-size discussion maps to cold/warm segment granularity.
+Large segments reduce per-object metadata and request overhead, but
+small segments can satisfy tight latency targets and avoid dragging
+irrelevant bytes into HBM or DRAM. GPU DB should benchmark 1 MiB-ish,
+4 MiB-ish, and larger segment shapes against point lookups, prefix
+filters, and analytical scans instead of picking one cold-tier object
+size from intuition.
+
+**Risks and mismatches:** The paper is about cloud analytical caches,
+not an OLTP engine, MVCC implementation, WAL protocol, GPU execution
+runtime, or SQL transaction scheduler. Its break-even constants are
+AWS-specific and depend on 2024 prices, instance families, request
+pricing, and assumed hit rates.
+
+The model is economic and latency-oriented; it does not prove cache
+correctness. GPU DB still needs WAL-before-visibility, snapshot
+compatibility, invalidation, DDL safety, and recovery rebuild rules
+before any placement is valid.
+
+The paper focuses on read caching over object storage. Transactional
+write paths add dirty data, WAL flushes, checkpointing, compaction,
+replication, and visibility publication. Those costs can dominate any
+simple request-rate rule for write-heavy routes.
+
+Its cache-miss input is external to the model. For GPU DB, miss rate
+must be measured per route shape, generation, predicate family,
+segment size, and memory-pressure state; a global hit ratio would hide
+the wrong failures.
+
+**Benchmark candidates:**
+
+- Add a tier break-even simulator for HBM, host DRAM, local NVMe, and
+  a synthetic remote/object tier. Inputs: request rate, miss rate,
+  refresh cost, transfer bytes, p50/p99 miss latency, capacity cost,
+  and queue credit cost. Gate: planner explanations name the threshold
+  that made a route eligible.
+- Benchmark cold/warm segment sizes for point lookup, prefix filter,
+  and scan workloads. Compare 1 MiB, 4 MiB, 8 MiB, and larger segments
+  by p50/p99, bytes moved, request count, HBM admission waste, and
+  refresh time.
+- Add a latency-sensitive route mode that can issue redundant cold-tier
+  reads under a strict budget. Failure condition: racing reads improve
+  p99 while silently exhausting IO credits or starving normal retained
+  reads.
+- Track cache hit rate per route certificate, not only globally.
+  Minimum proof: demotion from HBM to DRAM/NVMe/object tier follows
+  measured route-specific reuse and miss penalty.
+- Compare per-GPU local residency, node-local shared DRAM/NVMe
+  residency, and a simulated cache-service owner for the same hot
+  fragments. Measure duplicate bytes, admission latency, refresh
+  fan-out, invalidation cost, and session-visible tail latency.
+- Add planner tests where bandwidth favors a cold route but p99
+  latency favors a warm/resident route. Gate: the planner can explain
+  choosing the warmer tier for latency-sensitive queries and the
+  colder tier for batch work.
+
+### 2026-06-07 - Cross-paper synthesis: tier placement needs price, proof, and cleanup horizons
+
+The recent cluster around Steam, Jiffy, ASAP, and the cloud
+five-minute rule converges on a sharper route contract. A retained
+route should have a visibility frontier, a publication/recovery
+witness, an active-holder cleanup horizon, and a placement budget that
+states why the route deserves HBM, DRAM, NVMe, or colder storage.
+
+The design track is no longer just "publish immutable snapshots."
+Snapshots need economic and latency evidence too: expected reuse,
+route-local hit rate, p99 miss penalty, refresh cost, segment size, and
+fallback behavior when witness tables, revision chains, or cache
+budgets fill. GPU DB should let owners publish fast derived state, but
+only with bounded recovery debt and measured demotion/admission rules.
+
+Category gaps after this batch: transaction write-path papers are
+reasonably represented, while query optimizer route pricing and
+transactional tiering under writes still need more modern coverage.
+Benchmark priorities are route-local hit telemetry, segment-size
+latency curves, bounded retained-generation cleanup, and crash-safe
+derived metadata publication.
+
 ### 2026-06-07 - ASAP treats persist ordering as recoverable speculation
 
 **Citation:** Sujay Yadalam, Nisarg Shah, Xiangyao Yu, and Michael

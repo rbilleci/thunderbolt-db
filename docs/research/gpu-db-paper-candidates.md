@@ -7425,7 +7425,7 @@ Append new candidates here as each paper is processed.
   baked into one file format; this primary follow-up is useful for decomposing
   GPU DB's cold/warm segment format into independently benchmarked layout,
   metadata, compression, and access-method components.
-- `queued` — **The Five-Minute Rule for the Cloud: Caching in Analytics
+- `reviewed` — **The Five-Minute Rule for the Cloud: Caching in Analytics
   Systems**, Duwe, Anadiotis, Lamb, Lersch, Leskes, Ritter, and Tozun,
   CIDR 2025.
   URL:
@@ -7434,7 +7434,24 @@ Append new candidates here as each paper is processed.
   Why: Lance frames NVMe as a cache layer for cloud/object storage; this
   follow-up is useful for deciding when GPU DB should keep hot/warm columnar
   fragments in HBM, DRAM, NVMe, or object storage based on access frequency,
-  object-store latency, and cache cost.
+  object-store latency, and cache cost. Journal entry added 2026-06-07 from
+  the CIDR/VLDB PDF.
+- `queued` — **Exploiting Cloud Object Storage for High-Performance
+  Analytics**, Durner, Leis, and Neumann, PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p2769-durner.pdf`
+  DOI: `https://doi.org/10.14778/3611540.3611549`
+  Why: the cloud five-minute-rule paper uses this work for object-store
+  latency and performance data; useful for comparing direct object-store
+  access, request parallelism, caching, and cold-tier object sizing before GPU
+  DB models a remote/object storage tier.
+- `queued` — **Predicate Caching: Query-Driven Secondary Indexing for Cloud
+  Data Warehouses**, Schmidt, Kipf, Horn, Saxena, and Kraska, SIGMOD/PACMMOD
+  2024.
+  URL: `https://doi.org/10.1145/3654903`
+  Why: the cloud five-minute-rule paper points to query-driven secondary
+  indexing for cloud warehouses; useful for deciding when GPU DB should
+  materialize predicate-specific warm fragments or on-the-fly indexes instead
+  of caching whole cold-tier objects.
 - `queued` — **Bullion: A Column Store for Machine Learning**, Liao, Liu,
   Chen, and Abadi, CIDR 2025.
   URL:
