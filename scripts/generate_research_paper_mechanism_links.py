@@ -2553,6 +2553,206 @@ REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "review_priority": "none",
         "review_note": "Private formats, data movement, resident snapshots, and placement-sensitive execution shape are part of the route certificate.",
     },
+    (
+        "2026-06-06-cross-paper-synthesis-route-proof-now-spans-publication-reclamation-and-storage-placement",
+        "effective_session_counting",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The synthesis contrasts stalled logical sessions with physical route lifetime proof and restartable/reacquirable route descriptors.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-publication-needs-explicit-fences",
+        "multi_tier_placement",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Resident buffer generations and placement gaps touch tier placement, but the synthesis mainly concerns publication fences.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-remote-routes-need-tiny-authorities-and-external-witnesses",
+        "isolation_trace_oracle",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The Viper-inspired benchmark requires begin, commit, read-from, route generation, and invalidation facts for isolation checking.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-hot-paths-need-compact-authorities-and-schedulable-residuals",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The entry explicitly calls for local heavy-state reclamation and descriptor safety checks for delayed grants and reused buffers.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-hot-paths-need-compact-authorities-and-schedulable-residuals",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Contention-aware transaction scheduling, hot/cold decomposition, and TPC-C-style skew are central benchmark targets.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-publication-needs-prediction-plus-fallback",
+        "deterministic_hot_write_templates",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Template robustness, predicted batch execution, and deterministic conflict prediction directly support certified hot route templates.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-resource-credits-should-travel-with-route-work",
+        "deficit_fairness",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Session and tenant budgets, protected scheduled work, disposable speculation, and SLO-oriented overload signals support fairness policy.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-resource-credits-should-travel-with-route-work",
+        "resource_dag_scheduling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Route work carries explicit resource proofs so the runtime can schedule, batch, reject, redirect, and cancel speculative DAG-like work.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-resource-credits-should-travel-with-route-work",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Snapshot-generation eligibility, retry generations, revocation generations, and stale-completion rejection support immutable route roots.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-maintenance-needs-credits-generations-and-preemption",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Route work descriptors and schedulable units touch owner-domain execution, but owner-ring bundling is not the primary focus.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-maintenance-needs-credits-generations-and-preemption",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Maintenance chunks carry source WAL boundaries and need crash-safe generation publication before visible effects.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-reusable-work-needs-visible-lifetime-contracts",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The route asset registry is explicitly optimizer-visible and exposes reusable assets for plan and route selection.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-reusable-work-needs-visible-lifetime-contracts",
+        "learned_optimizer_advisor",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Lemo-style reusable intermediate state and learned plan selection are core inputs to the visible lifetime contract.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-route-hints-need-measured-trust",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Hints must carry fallback paths, stale-route rejection, retry budgets, and degradation telemetry before trust is spent.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-movement-needs-semantic-guards",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Retired descriptor memory, bounded worker-tied protection, protected-object counts, and unreclaimed bytes are central guards.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-movement-needs-semantic-guards",
+        "effective_session_counting",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The synthesis explicitly prefers bounded protection tied to active workers over logical session count.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-movement-needs-semantic-guards",
+        "snapshot_frontier_vectors",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Tier movement is eligible only when visibility boundaries and retained-read snapshot correctness agree with placement state.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-movement-needs-semantic-guards",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Durability and visibility boundaries are separate records that must agree before resident or warm objects are visible.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-correctness-needs-external-witnesses-plus-failure-states",
+        "cost_based_route_optimizer",
+    ): {
+        "review_status": "reviewed_weak_signal",
+        "review_priority": "none",
+        "review_note": "Learned and adaptive route ranking require deterministic eligibility gates, but detailed cost optimization is secondary.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-correctness-needs-external-witnesses-plus-failure-states",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Route evidence includes resident/storage generations, deterministic eligibility, manifest boundaries, and quarantine states.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-recovery-needs-compact-witnesses",
+        "wal_before_visibility",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The fault matrix explicitly tests WAL and manifest crash recovery before promoted routes can be considered safe.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-recovery-needs-compact-witnesses",
+        "immutable_route_roots",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Compact generated witnesses and post-condition checks protect owner-boundary route facts and recovered publication state.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-recovery-needs-compact-witnesses",
+        "owner_ring_bundling",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "The design track names compact witness generation for each owner boundary, including resource-credit and recovery witnesses.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-freshness-needs-explicit-search-metadata",
+        "bounded_descriptor_reclamation",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Independent witness lifetimes include objects that can retire, refresh, or demote separately from wide payload columns.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-freshness-needs-explicit-search-metadata",
+        "cpu_fallback_policy",
+    ): {
+        "review_status": "reviewed_supported",
+        "review_priority": "none",
+        "review_note": "Fallback reasons are first-class route witnesses when pressure, freshness lag, or visibility-map absence rejects a route.",
+    },
 }
 
 
