@@ -38,6 +38,151 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Leopard turns isolation semantics into an online verifier
+
+**Citation:** Peiyuan Liu, Siyang Weng, Keqiang Li, Lyu Ni,
+Chengcheng Yang, Rong Zhang, Weining Qian, and Dian Qiao. "Leopard:
+A General Test Suite for Isolation Level Verification." CIDR 2024.
+Retrieved 2026-06-07 from the CIDR proceedings PDF:
+`https://vldb.org/cidrdb/papers/2024/p44-liu.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction-processing
+correctness verification; high-concurrency runtime observability.
+
+**Relevance tags:** isolation-level verification; MVCC version chains;
+snapshot reads; serializable read/write dependencies; client-side traces;
+black-box testing; online verification; trace sharding; verifier garbage
+collection; repeatable-read snapshot boundary; write-skew detection.
+
+**Core idea:** Leopard treats isolation level behavior as something that can
+be checked from the client side while the database is running. Instead of
+instrumenting the DBMS kernel or forcing carefully shaped workloads, it logs
+operation intervals at clients, reconstructs possible data evolution through
+mirrored concurrency-control mechanisms, and reports executions that cannot
+match the claimed isolation semantics.
+
+The strongest transferable idea for GPU DB is that MVCC/snapshot correctness
+needs an external trace oracle before performance work gets trusted. When the
+engine introduces retained GPU snapshots, CPU/GPU fallback, split fresh-data
+routes, and micro-batched writes, it should continuously verify that observed
+reads and commits still fit the advertised visibility contract.
+
+**Concrete mechanisms:**
+
+- Each client operation records a start timestamp, end timestamp, operation
+  type, transaction id, and read or write set. The exact server execution point
+  is unknown, so Leopard reasons over the interval bounded by the client
+  timestamps.
+- Per-client traces are naturally ordered. A trace manager merges per-client
+  buffers into a global order with a min-heap and watermark. Traces whose
+  start time is below the current watermark can be delivered for verification.
+- To keep online verification bounded, traces are sharded by accessed data to
+  verifier instances. Data-local checks run independently; serializability
+  checks that span data partitions need inter-verifier dependency exchange.
+- The state evolver mirrors three data structures used by concurrency-control
+  implementations: lock tables, MVCC version chains, and dependency graphs.
+- Leopard abstracts isolation mechanisms into Consistent Read, Mutual
+  Exclusion, First Updater Wins, and Serialization Certifier. These mechanism
+  pieces are combined to model different DBMS isolation-level
+  implementations.
+- Consistent Read checks whether a returned read value is in the candidate
+  version set allowed by the operation interval and the isolation rule, such
+  as statement-level versus transaction-level snapshots.
+- Mutual Exclusion infers minimum incompatible-lock intervals from operation
+  traces. If all possible lock orders violate compatibility, Leopard reports a
+  lock/isolation anomaly.
+- First Updater Wins detects lost-update patterns by checking whether a
+  transaction that read then wrote an item had a concurrent committed writer
+  in the interval from its read snapshot point to its write commit.
+- Serialization Certifier avoids general dependency-cycle search by checking
+  implementation-specific forbidden dependency patterns. The paper uses
+  PostgreSQL SSI-style consecutive read/write dependencies as an example of a
+  write-skew certifier.
+- Version chains and dependency graphs are garbage-collected by active
+  transaction horizons. A version can be discarded if the end timestamp of its
+  trace is older than the oldest start timestamp of active transactions.
+- The demonstration adapts Leopard to MySQL/PostgreSQL-compatible systems,
+  OLTP-Bench SmallBank and TPC-C workloads, and classic isolation levels. The
+  paper reports 24 transaction bugs found across commercial DBMSs, with 16
+  confirmed at the time of writing.
+
+**GPU DB mapping:** Use Leopard as a correctness harness for the future
+retained-snapshot runtime, not as a replacement concurrency-control protocol.
+Every route that can observe data should emit compact verification traces:
+logical session id, transaction id, statement id, client interval, selected
+route, snapshot generation, catalog generation, resident layout id, read keys
+or predicate footprint when known, write keys, commit/abort, and returned
+version boundary.
+
+For MVCC, the consistent-read candidate-set idea maps directly to retained
+GPU snapshots. A GPU route is valid only if its returned row versions fit the
+allowed snapshot interval and generation. Bugs like "repeatable read uses the
+wrong snapshot boundary" become testable when the verifier knows whether the
+engine claims transaction-start, first-statement, statement-start, or explicit
+read-boundary semantics.
+
+For split CPU/GPU routes, Leopard's mechanism-mirrored approach gives a way
+to test hybrid freshness. A query that reads a GPU base segment plus CPU delta
+should produce the same candidate-version behavior as the declared isolation
+level. If a CPU fallback sees a newer version than a GPU-retained route under
+the same transaction boundary, the trace oracle should explain why or flag an
+anomaly.
+
+For 1M logical sessions, the sharded verifier architecture is a useful shape:
+verification state should scale with active conflicting keys and transactions,
+not with idle sessions. GPU DB can keep online verification optional and
+sampled, but the benchmark harness should stress trace dispatch, verifier
+backlog, dependency exchange, and horizon-based GC under high session counts.
+
+For write throughput and WAL-before-visibility, Leopard reinforces that commit
+visibility needs observable timestamps/generations. A mutation must not become
+visible to CPU or GPU reads before its WAL-backed visibility boundary is
+published; the verifier can compare read results against commit intervals and
+generation publication traces.
+
+**Risks and mismatches:** Leopard is a CIDR demonstration paper rather than a
+full production-verification system paper. It sketches mechanisms and reports
+bug counts, but not all engineering details, overhead numbers, or failure
+modes are fully developed in the demo paper.
+
+Client-side intervals are conservative and may be wide under network jitter,
+queueing, or high session counts. Wider intervals increase candidate sets and
+can hide anomalies. GPU DB should emit internal generation markers in tests
+when available, while still keeping black-box client traces as a portability
+check.
+
+The verifier needs read/write sets or predicate footprints. Arbitrary SQL
+predicates, range scans, joins, and GPU kernels may not expose exact footprints
+cheaply. The first benchmark should restrict itself to point keys, declared
+ranges, and retained route families before generalizing.
+
+Leopard verifies isolation behavior, not crash recovery, WAL durability, GPU
+memory coherence, route-health selection, or planner optimality. It should be
+combined with crash-injection and route-certificate tests rather than treated
+as the only correctness gate.
+
+**Benchmark candidates:**
+
+- Add an MVCC trace-oracle harness for point reads/writes over retained CPU
+  and GPU snapshots. Gate: every read result belongs to the candidate version
+  set for the declared isolation rule and snapshot generation.
+- Run SmallBank-style and TPC-C-inspired contention tests through CPU-only,
+  GPU-retained, split CPU/GPU fresh-data, and CPU-fallback routes. Measure
+  verifier backlog, anomalies, p99 latency, and throughput impact.
+- Emit route-level visibility traces: WAL frontier, visibility generation,
+  catalog generation, resident generation, route id, read footprint, write
+  footprint, and returned version ids. Failure condition: a GPU route returns
+  a version outside the allowed interval.
+- Compare black-box client intervals against internal generation markers under
+  1K, 100K, and 1M logical sessions. Expected result: black-box verification
+  remains conservative, while internal markers catch narrower boundary bugs.
+- Test verifier sharding by key/partition with cross-partition transactions.
+  Gate: serializability or snapshot certifier checks still catch write skew
+  when dependencies span verifier shards.
+- Add horizon-based GC checks for verifier state and MVCC state together.
+  Failure condition: long retained GPU readers either cause unbounded verifier
+  state or hide a version needed for a later isolation check.
+
 ### 2026-06-07 - DecentSched makes deterministic hot writes self-schedule
 
 **Citation:** Chen Chen, Xingbo Wu, Wenshao Zhong, and Jakob Eriksson.

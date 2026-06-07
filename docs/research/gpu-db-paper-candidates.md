@@ -224,6 +224,37 @@ Where this matters most for GPU DB, in priority order:
   Steam's in-memory DBMS implementation. Stale duplicate corrected on
   2026-06-07; journal entry already exists under the PPoPP 2023 paper
   metadata.
+- `reviewed` — **Leopard: A General Test Suite for Isolation Level
+  Verification**, Liu et al., CIDR 2024.
+  URL: `https://vldb.org/cidrdb/2024/leopard-a-general-test-suite-for-isolation-level-verification.html`
+  PDF: `https://vldb.org/cidrdb/papers/2024/p44-liu.pdf`
+  Why: selected after the current queue lacked a strong queued 2023-present
+  MVCC/isolation verification candidate; useful for black-box and online
+  checking of snapshot, first-updater-wins, mutual-exclusion, and
+  serializability behavior before GPU DB trusts retained GPU snapshots,
+  CPU/GPU split freshness, and micro-batched writes. Journal entry added
+  2026-06-07.
+- `queued` — **Leopard: A Black-Box Approach for Efficiently Verifying Various
+  Isolation Levels**, Li et al., ICDE 2023.
+  URL: `https://doi.org/10.1109/ICDE55515.2023.00046`
+  Why: the CIDR 2024 demonstration summarizes the ICDE 2023 full Leopard
+  paper; useful if the loop needs deeper algorithms, performance numbers, and
+  bug-study details for isolation-level verification under high-throughput
+  workloads.
+- `queued` — **Cobra: Making Transactional Key-Value Stores Verifiably
+  Serializable**, Tan et al., OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/tan`
+  PDF: `https://www.usenix.org/system/files/osdi20-tan.pdf`
+  Why: Leopard compares against Cobra as a serializability verifier; useful
+  for contrasting dependency-graph cycle checking with mechanism-mirrored
+  verification for GPU DB's retained-snapshot and write-publication tests.
+- `queued` — **Elle: Inferring Isolation Anomalies from Experimental
+  Observations**, Kingsbury and Alvaro, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol14/p268-alvaro.pdf`
+  DOI: `https://doi.org/10.14778/3430915.3430918`
+  Why: Leopard contrasts Elle as a workload-observation isolation checker;
+  useful for comparing anomaly-family inference against GPU DB's planned
+  route-level visibility trace oracle.
 
 ### Runtime scale, HFT-style mechanics, and admission
 
