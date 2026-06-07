@@ -38,6 +38,215 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Decima learns DAG-aware admission but belongs outside hot owners
+
+**Citation:** Hongzi Mao, Malte Schwarzkopf, Shaileshh Bojja
+Venkatakrishnan, Zili Meng, and Mohammad Alizadeh. "Learning
+Scheduling Algorithms for Data Processing Clusters." SIGCOMM 2019,
+270-288. DOI: `https://doi.org/10.1145/3341302.3342080`. Retrieved
+2026-06-07 from the author PDF:
+`https://people.csail.mit.edu/hongzi/content/publications/Decima-Sigcomm19.pdf`.
+
+**Category:** runtime / HFT / session scale; query optimization /
+planning; GPU execution and batching.
+
+**Relevance tags:** Decima; reinforcement learning scheduler; DAG
+scheduling; graph neural network; critical-path features; parallelism
+limits; stochastic arrivals; curriculum training; input-dependent
+baseline; Spark; multi-resource scheduling; admission advisor;
+micro-batch route scheduling; GPU stream allocation; learned policy
+guardrails.
+
+**Core idea:** Decima is a learned scheduler for DAG-shaped data
+processing jobs. Instead of manually coding a workload-specific
+heuristic, it trains a reinforcement-learning policy offline from job
+traces and a simulator, using a graph neural network to summarize each
+job DAG and a policy network to choose both the next stage and a
+parallelism limit.
+
+For GPU DB, the transferable idea is not to place a neural scheduler
+on the mutation or GPU-worker hot path. The useful shape is a
+bounded, offline-trained admission advisor for compatible read DAGs,
+refresh DAGs, and GPU micro-batches. It can learn when to spend scarce
+GPU streams, pinned buffers, HBM, or CPU fallback capacity on short
+jobs versus larger batches, while deterministic route eligibility,
+snapshot validity, and WAL-before-visibility remain non-negotiable.
+
+**Concrete mechanisms:**
+
+- Decima models data-processing jobs as DAGs of stages. Each stage
+  carries features such as remaining task count, average task duration,
+  current executors, available executors, and locality of executors to
+  the job.
+- The graph neural network computes per-node, per-job, and global
+  embeddings. Child-to-parent message passing uses two nonlinear
+  transforms, which the paper argues are needed to express scheduling
+  features such as a DAG critical path.
+- The action space is deliberately constrained. At a scheduling event,
+  the policy chooses a runnable stage and a job-level parallelism
+  limit, instead of assigning every executor in one huge action or
+  choosing one executor at a time.
+- Scheduling events occur when runnable stages change: a stage runs
+  out of tasks, a stage completes and unlocks descendants, or a new
+  job arrives. The agent repeats actions until free executors are
+  assigned or no runnable stages remain.
+- Training uses policy-gradient RL over simulated episodes. For an
+  average job-completion-time objective, the reward penalizes elapsed
+  time multiplied by the number of jobs in the system, matching the
+  Little's-law intuition that lowering average queued jobs lowers
+  average completion time.
+- Continuous stochastic arrivals need special treatment. Decima starts
+  with short training episodes and gradually lengthens them, using
+  random memoryless episode termination so the policy cannot learn to
+  starve large jobs near a fixed horizon.
+- To reduce reward variance from random arrivals, Decima repeats
+  training over identical arrival sequences and computes baselines per
+  arrival sequence. This isolates the scheduler's action quality from
+  exogenous load bursts.
+- The Spark integration is a pluggable scheduling service. Spark DAG
+  schedulers contact Decima at startup and scheduling events, while
+  the Spark master asks Decima how many executors to launch and helps
+  reclaim executors after stages complete.
+- The training simulator models first-wave task warmup, 2-3 second
+  Spark executor startup delays, and parallelism-induced task
+  slowdown. The paper reports simulator fidelity within 9% at the
+  95th percentile for shared-cluster job completion time.
+- Evaluation on a 25-node Spark cluster reports at least 21% lower
+  average job completion time than hand-tuned heuristics for TPC-H job
+  mixes, 29% lower average completion time under continuous arrivals,
+  and up to 2x improvement during busy high-load periods.
+- In a simulated multi-resource setting based on an Alibaba production
+  trace, Decima chooses stage, parallelism, and executor class. The
+  paper reports 32%-43% lower average completion time than adapted
+  Graphene-style heuristics, partly by using larger executors for small
+  jobs when that clears queue backlog quickly.
+- The trained model is small in the Spark prototype, about 12,736
+  parameters, and the paper reports average scheduling-decision latency
+  below 15 ms. That is acceptable for Spark stage events, not
+  automatically acceptable for microsecond database owner queues.
+
+**GPU DB mapping:** Treat every read or refresh request as a small
+route DAG: parse/plan, visibility proof, residency check, optional
+cold fetch, H2D transfer, GPU kernel, D2H/result encode, and response
+publication. A Decima-like advisor could rank compatible work by
+critical path, queue pressure, resident bytes, transfer cost, and
+parallelism saturation, then push cheap policy tables to the runtime.
+
+The parallelism-limit idea maps directly to GPU streams and pinned
+buffers. Instead of asking a model to assign every request, the runtime
+can ask for bounded limits: how many compatible lookups to drain, how
+many streams a refresh should consume, whether to give a small
+latency-sensitive query immediate capacity, and when a large scan
+should wait for a better batch.
+
+Decima's stochastic-arrival training is a warning for the 1M-session
+target. Training only on closed batches can learn policies that defer
+large or cold work indefinitely. GPU DB scheduling benchmarks should
+include continuous pgwire arrivals, bursty retained reads, long refresh
+jobs, write invalidations, and cold-tier stalls, with reward terms for
+p99 latency, starvation, and fallback storms.
+
+The graph embedding is useful as a feature contract even if GPU DB
+starts without RL. A deterministic scheduler can compute route-DAG
+features such as remaining stages, critical path, HBM bytes, expected
+kernel time, transfer bytes, and blocking frontiers. Learned scheduling
+should be a replaceable scorer over those features, not the owner of
+correctness decisions.
+
+The best near-term shape is the same as PilotScope-style learned
+drivers: train offline or nearline, publish immutable route-policy
+generations, and let hot workers evaluate a tiny bounded policy. If
+the advisor is stale, slow, or outside its trained envelope, the native
+deterministic scheduler must continue.
+
+**Risks and mismatches:** Decima schedules Spark jobs at stage-event
+timescales. It is not a database transaction scheduler, MVCC protocol,
+network runtime, GPU kernel scheduler, or WAL system. Its average
+decision latency is small for Spark but too large for per-request hot
+database admission.
+
+The paper optimizes job completion time and makespan, not SQL
+isolation, p99 query latency, commit latency, fairness between
+tenants, or snapshot retention. Its learned policy currently lacks a
+fairness objective, which is risky for a server that must avoid
+starving long scans, cold transfers, refreshes, or writes.
+
+The evaluation relies on task-duration estimates and a simulator. GPU
+DB will need reliable route telemetry before a learned policy can
+generalize across data distributions, invalidation rates, and hardware
+tiers. Unknown or changing query shapes should fall back to measured
+deterministic heuristics.
+
+Preemption is explicitly future work in Decima. GPU DB cannot assume
+it can reclaim a running GPU kernel, cold fetch, or response encode
+without cost. The first advisor should choose admission and batch
+limits before dispatch, not arbitrary mid-flight preemption.
+
+**Benchmark candidates:**
+
+- Build a route-DAG feature extractor for retained reads, scans,
+  refreshes, and cold-tier fetches. Include critical-path estimate,
+  resident bytes, transfer bytes, queue wait, stream occupancy, pinned
+  buffer occupancy, and snapshot-generation compatibility.
+- Compare deterministic scheduling against a Decima-style offline
+  learned scorer that only chooses route priority and batch/parallelism
+  limits. Gate: visibility, WAL, residency validity, and overload
+  rejection remain deterministic.
+- Train and test on continuous-arrival workloads, not only closed
+  batches. Include 1M logical-session style burst traces, hot-key
+  lookups, long scans, invalidating writes, and refresh work. Failure
+  condition: the policy improves average latency while starving cold
+  or long-running work.
+- Measure scheduler overhead at database timescales. A learned scorer
+  must publish precomputed policy snapshots or execute in a fixed
+  microsecond budget; if it needs millisecond inference, it belongs in
+  background admission tuning only.
+- Add reward variants for p99 latency, missed deadlines, GPU stream
+  idleness, fallback storms, and write throughput. Compare them
+  against average-latency-only policies to expose unfairness or
+  starvation.
+- Test GPU parallelism-limit policies: immediate single lookup,
+  small lookup micro-batch, large scan batch, and refresh batch under
+  shared stream and pinned-buffer budgets. Minimum proof: learned
+  limits do not increase p99 latency beyond the deterministic dual
+  count/time threshold under burst load.
+
+### 2026-06-07 - Cross-paper synthesis: learned route control needs deterministic envelopes
+
+PilotScope, the cloud five-minute rule, and Decima converge on a
+route-control track that is useful only if it is bounded. PilotScope
+shows how learned components can live behind typed push/pull
+operators with validation and fallback. The cloud five-minute rule
+adds economic and latency thresholds for placing data in HBM, DRAM,
+NVMe, or colder tiers. Decima adds DAG-aware scheduling and
+parallelism-limit selection under continuous arrivals.
+
+The design direction is a deterministic route envelope with optional
+learned scoring inside it. Eligibility, visibility, WAL frontiers,
+residency validity, overload rejection, and snapshot cleanup horizons
+remain owner-controlled facts. Learned drivers may tune costs,
+ranking, placement thresholds, and batch/parallelism limits, but their
+output should be published as immutable policy generations that hot
+workers can evaluate cheaply.
+
+The most important gap is now a unified route telemetry schema:
+route DAG features, route-local hit rate, p50/p99 miss latency,
+refresh cost, stream and pinned-buffer occupancy, fallback cause,
+invalidation churn, and stale-policy detection. Without that evidence,
+learned policies will overfit to analytics traces or average latency
+and quietly harm p99, writes, or cold work.
+
+Benchmark priorities:
+
+- First, build deterministic route-DAG telemetry and policy-snapshot
+  publication before training any scheduler.
+- Second, measure fixed heuristic, learned ranking, and learned
+  batch-limit variants under continuous mixed arrivals.
+- Third, require advisor timeout, validation restore, and native
+  fallback in every learned-route benchmark.
+- Fourth, report route-local cache economics alongside latency, so
+  placement choices explain both "valid" and "worth keeping resident."
+
 ### 2026-06-07 - PilotScope turns learned planning into bounded push/pull drivers
 
 **Citation:** Rong Zhu, Lianggui Weng, Wenqing Wei, Di Wu,

@@ -444,13 +444,38 @@ Append new candidates here as each paper is processed.
   useful for extracting morsel/work-order, scheduler, and resource-estimation
   mechanisms that can inform GPU DB operator fragments and route-feature
   telemetry. Journal entry added 2026-06-06.
-- `queued` — **Learning Scheduling Algorithms for Data Processing Clusters**,
+- `reviewed` — **Learning Scheduling Algorithms for Data Processing Clusters**,
   Mao et al., SIGCOMM 2019.
   URL: `https://doi.org/10.1145/3341302.3342080`
   Code: `https://github.com/hongzimao/decima-sim`
   Why: LSched contrasts Decima's black-box DAG scheduling with DB-specific
   physical-plan features; useful as a control point for what should remain
-  outside GPU DB's hot scheduler when learned policies are evaluated.
+  outside GPU DB's hot scheduler when learned policies are evaluated. Journal
+  entry added 2026-06-07 from the author PDF.
+- `queued` — **Firmament: Fast, Centralized Cluster Scheduling at Scale**,
+  Gog, Schwarzkopf, Gleave, Watson, and Hand, OSDI 2016.
+  URL: `https://www.usenix.org/conference/osdi16/technical-sessions/presentation/gog`
+  PDF: `https://pdos.csail.mit.edu/papers/firmament:osdi16.pdf`
+  Why: Decima contrasts centralized and distributed cluster schedulers;
+  Firmament is a modern scalable centralized scheduler useful for comparing
+  flow-network placement, scheduler latency, and global admission decisions
+  against GPU DB's local owner rings and route-advisor policy snapshots.
+- `queued` — **Graphene: Packing and Dependency-Aware Scheduling for
+  Data-Parallel Clusters**, Grandl et al., OSDI 2016.
+  URL: `https://www.usenix.org/conference/osdi16/technical-sessions/presentation/grandl`
+  PDF:
+  `https://www.usenix.org/system/files/conference/osdi16/osdi16-grandl-graphene.pdf`
+  Why: Decima uses Graphene-style DAG-aware scheduling as a baseline; useful
+  for comparing deterministic troublesome-node and packing heuristics with
+  learned route-DAG scheduling before GPU DB adds any learned admission
+  advisor.
+- `queued` — **TetriSched: Global Rescheduling with Adaptive Plan-ahead in
+  Dynamic Heterogeneous Clusters**, Tumanov et al., EuroSys 2016.
+  URL: `https://doi.org/10.1145/2901318.2901355`
+  PDF: `https://www.cs.cmu.edu/~harchol/Papers/EUROSYS16.pdf`
+  Why: Decima and Graphene both point at plan-ahead scheduling; TetriSched is
+  useful for comparing reservation-aware choices between preferred GPU-like
+  resources and fallback resources under deadlines and mis-estimated runtimes.
 - `reviewed` — **Simple Adaptive Query Processing vs. Learned Query
   Optimizers: Observations and Analysis**, Zhang et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2962-zhang.pdf`
