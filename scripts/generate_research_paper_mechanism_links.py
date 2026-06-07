@@ -2992,13 +2992,13 @@ def evidence_quality_details(link: dict) -> tuple[str, str]:
         return "metadata_only", "snippet came from journal metadata"
     matched_terms = [term for term in span.get("matched_terms", []) if term != "category fallback"]
     snippet_term_hits = sum(1 for term in matched_terms if term.lower() in snippet_lower)
+    visible_alias_hits = sum(
+        1
+        for term in VISIBLE_EVIDENCE_ALIASES.get(link["mechanism_id"], [])
+        if term in snippet_lower
+    )
     if snippet_term_hits == 0:
-        snippet_term_hits = sum(
-            1
-            for term in VISIBLE_EVIDENCE_ALIASES.get(link["mechanism_id"], [])
-            if term in snippet_lower
-        )
-        if snippet_term_hits:
+        if visible_alias_hits:
             return "weak_direct", "substantive snippet contains visible mechanism aliases"
     if snippet_lower.startswith(STRONG_SNIPPET_PREFIXES) and snippet_term_hits >= 1:
         return "direct", "strong journal section contains matched mechanism terms"
@@ -3010,6 +3010,8 @@ def evidence_quality_details(link: dict) -> tuple[str, str]:
         if snippet_term_hits >= 2:
             return "direct", "snippet contains multiple matched mechanism terms"
         return "direct", "high-confidence link has a substantive journal snippet"
+    if snippet_term_hits == 1 and visible_alias_hits >= 1 and link["confidence"] != "low":
+        return "direct", "snippet contains matched mechanism term plus visible aliases"
     if snippet_term_hits == 1 and link.get("review_status") == "reviewed_supported":
         return "direct", "reviewed-supported link has a substantive matched snippet"
     if snippet_term_hits == 1:

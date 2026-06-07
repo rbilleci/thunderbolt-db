@@ -8269,8 +8269,8 @@
             "matched_terms": [
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "PCSO logging, MTM, Crystalline, and Aeolus converge on a practical control track for GPU DB: hot paths should exchange compact proof-carrying metadata, then manage that metadata with bounded lifetime, bounded sampling overhead, and explicit admission credits.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
@@ -18526,8 +18526,8 @@
               "placement",
               "buffer"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The scheduler can then co-run same-generation reads only while the sum of effective demand stays inside per-GPU memory, copy-engine, and scratch-buffer budgets.",
             "support_reason": "Matched journal terms (placement, buffer) to Multi-tier placement policy."
           },
@@ -18844,8 +18844,8 @@
               "buffer",
               "cold"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The strongest transferable idea is an explicit three-way route choice: resident GPU for hot valid snapshots, CPU scan/filter for cold or over-resident reduction, and GPU execution only for the reduced compute-heavy tail.",
             "support_reason": "Matched journal terms (placement, cache, buffer, cold) to Multi-tier placement policy."
           },
@@ -22488,8 +22488,8 @@
               "pruning",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "RFA depends on page-local GSN ordering and last-modifier metadata; translating it to MVCC row versions, column segments, and resident snapshot generations needs a fresh correctness proof.",
             "support_reason": "Matched journal terms (access path, pruning, metadata) to Cost-based route optimizer."
           },
@@ -27306,8 +27306,8 @@
               "buffer",
               "hbm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- generation-level MVCC/resident retirement with chain-length and index-maintenance telemetry - hot-key or hot-bucket routing driven by measured conflict heat - distribution-aware residency admission with warm-state anti-thrash behavior - sub-segment versus full-segment placement under skewed lookups and uniform scans - a logical-session memory probe that...",
             "support_reason": "Matched journal terms (placement, buffer, hbm) to Multi-tier placement policy."
           },
@@ -61668,8 +61668,8 @@
               "cost model",
               "join"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "...accelerator throughput, and a limited-capacity queueing model (`M/M/s/k`) that estimates utilization and queued items. - The cost model searches nearby `q-size` values and chooses the one with the lowest estimated runtime for the remaining work, balancing accelerator utilization against queue buildup and straggler risk. - Follow-up work can be fused in...",
             "support_reason": "Matched journal terms (optimizer, planning, cost model, join) to Cost-based route optimizer."
           },
@@ -72193,8 +72193,8 @@
               "predicate",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper's own cost model includes transfer initialization, key transfer, kernel execution, and result transfer, and it observes that GPU advantage grows with query batch size while PCIe transfer eventually dominates.",
             "support_reason": "Matched journal terms (planning, cost model, predicate, metadata) to Cost-based route optimizer."
           },
@@ -98319,8 +98319,8 @@
               "route choice",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The last four reviews, deferred runtime pipelining, anti-caching for memory-constrained OLTP, GPU OLTP concurrency-control analysis, and zero-shot cost models, converge on one design track: GPU DB routes need explicit contracts before they need more clever execution.",
             "support_reason": "Matched journal terms (cost model, route choice, metadata) to Cost-based route optimizer."
           },
@@ -101831,8 +101831,8 @@
               "buffer",
               "cold"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A safer first step is a Bao-like route-hint layer that chooses among bounded, semantically equivalent route families: CPU tuple/index path, CPU fused scan, GPU resident scan, GPU resident key-vector lookup, GPU cold transfer, delayed refresh, or explicit overload/fallback.",
             "support_reason": "Matched journal terms (tier, placement, cache, buffer) to Multi-tier placement policy."
           },
@@ -107147,8 +107147,8 @@
               "fallback",
               "cpu fallback"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Build one resident lookup route that reports both freshness and index proof fields: source boundary, applied boundary, delta window, segment count, error width, delete density, and fallback reason. - Measure delete/delta-aware lookup refinement under skew before adding more GPU index families. - Add a planner guardrail that rejects resident index routes...",
             "support_reason": "Matched journal terms (fallback, cpu fallback) to CPU fallback policy."
           },
@@ -111549,8 +111549,8 @@
               "fallback",
               "split route"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Add route certificates that include frontier, placement, and flow proof fields for accepted, fallback, and rejected routes. - Measure publication p999 and route-admission p999 together, because a cheap GPU kernel is not useful if snapshot or flow-control boundaries spike. - Run CPU/GPU placement benchmarks across retained, cold-transfer, CPU-fallback, a...",
             "support_reason": "Matched journal terms (fallback, split route) to CPU fallback policy."
           },
@@ -137577,15 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4162,
-      "weak_direct": 509
+      "direct": 4173,
+      "weak_direct": 498
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
+      "snippet contains matched mechanism term plus visible aliases": 11,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 503,
+      "substantive snippet contains only one matched mechanism term": 492,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
