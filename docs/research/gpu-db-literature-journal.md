@@ -97494,3 +97494,159 @@ Benchmark priorities:
   corrupted bytes.
 - Fourth, measure whether semantic stream separation reduces hot-commit p99
   when background checkpoint or cold-tier compaction is active.
+
+### 2026-06-07 - DudeTM decouples execution from durable reproduction
+
+**Citation:** Mengxing Liu, Mingxing Zhang, Kang Chen, Xuehai Qian,
+Yongwei Wu, and Jinglei Ren. "DudeTM: Building Durable Transactions with
+Decoupling for Persistent Memory." ASPLOS 2017. Retrieved 2026-06-07 from
+`https://www.microsoft.com/en-us/research/wp-content/uploads/2017/02/dudetm_asplos17.pdf`.
+DOI: `https://doi.org/10.1145/3037697.3037714`.
+
+**Category:** WAL, logging, persistent-memory write path, and transaction
+throughput.
+
+**Relevance tags:** decoupled durability, shadow DRAM, redo-log channel,
+background persistence, ordered reproduction, durable ID, cross-transaction
+log combination, log compression, persistent-memory paging, warm-tier commit
+latency.
+
+**Core idea:** DudeTM attacks the durable-transaction trade-off between undo
+logging and redo logging. Undo logging keeps reads simple but needs
+persist-ordering on updates; redo logging can persist once per transaction but
+forces read/write redirection. DudeTM instead runs transactions against a
+shared volatile shadow memory, emits redo logs, persists those logs
+asynchronously, and later reproduces the updates into persistent memory in
+transaction-ID order.
+
+The transferable idea is not "use transactional memory" for GPU DB. It is the
+three-stage split: execute on a fast mutable mirror, make a compact durable
+intent stream authoritative, then let a background reproducer install durable
+state while acknowledgements are tied to a durable frontier. That is close to a
+future GPU DB warm-tier design where CPU/GPU-facing state should avoid
+per-update persistence stalls, but visibility must still be gated by explicit
+WAL/durable-generation rules.
+
+**Concrete mechanisms:**
+
+- Transactions execute in the **Perform** step on shared DRAM shadow memory
+  using an out-of-the-box STM or HTM. Writes also append address/value entries
+  into a thread-local volatile redo log.
+- The **Persist** step copies committed redo logs into persistent log regions
+  with background threads. Logs may be flushed out of commit order, but a
+  global durable transaction ID only advances when all smaller transactions are
+  durable.
+- The **Reproduce** step replays durable redo logs into persistent memory in
+  transaction-ID order. A transaction can be acknowledged durable after Persist
+  completes; Reproduce may lag because recovery can replay the durable log.
+- Shadow memory is shared across transactions and page-managed, rather than
+  transaction-local. The shadow page may be discarded on eviction because the
+  durable path is the redo log, not dirty shadow-page writeback.
+- Paging tracks a per-page touching ID. Loading a persistent page into shadow
+  memory may need to wait until Reproduce has installed all updates up to that
+  touching ID, avoiding stale page loads from persistent memory.
+- Persist can batch redo logs, combine repeated writes to the same address
+  across transaction groups, and compress logs before persistence. The paper
+  reports up to 93% write reduction from log combination in a skewed workload
+  and about 69% compression ratio with lz4 in its experiments.
+- Recovery scans the persistent log, replays complete transaction logs in
+  increasing transaction-ID order, and abandons an omitted or incomplete log
+  together with its unacknowledged transaction.
+- Evaluation uses emulated NVM on a 12-core Xeon with TinySTM-based workloads
+  including B+-tree, hash table, TPC-C New Order, and TATP Update Location.
+  Reported throughput degradation versus volatile STM is 7.4% to 24.6%;
+  DudeTM is reported as 1.7x to 4.4x faster than Mnemosyne/NVML variants in
+  the tested setup. Real NVM hardware was not available in the paper.
+
+**GPU DB mapping:** Map Perform to owner-local fast execution against CPU
+canonical or GPU-resident mirrors, not to SQL visibility. Mutation owners could
+build compact redo/WAL intents while updating private or unpublished staging
+state, then publish a visibility generation only after the durable frontier
+covers the transaction. This keeps WAL-before-visibility intact while giving a
+way to overlap commit execution, durable writes, and later warm-tier
+installation.
+
+The durable ID maps directly to a GPU DB WAL frontier. Reads, resident
+snapshots, route descriptors, and checkpoint installers should depend on an
+explicit durable generation, not on whether some background reproducer has
+already installed a CPU/NVM/CXL copy. A retained read can use a staged mirror
+only when its snapshot generation is at or below the durable frontier and the
+mirror's reproduction frontier is known to contain all required rows or index
+entries.
+
+DudeTM's redo-log channel is a useful shape for CXL/NVM warm-tier staging.
+GPU DB can persist compact logical row/segment deltas, acknowledge at the
+durable-log frontier, and let a background installer update warm indexes,
+resident-invalidations, checkpoint manifests, or persistent route metadata.
+The installer must preserve generation order for structures whose reads depend
+on exact version sequence.
+
+Cross-transaction log combination maps to hot-key write coalescing inside a
+bounded owner epoch. Multiple updates to the same row, route descriptor, or
+resident-invalidated segment within an unpublished generation may be collapsed
+in the warm-tier install stream if the WAL still preserves SQL-visible history
+needed for recovery, MVCC, replication, and audit. The safe first target is
+derived physical state, not the logical WAL itself.
+
+The touching-ID paging rule maps to multi-tier cache placement. A CPU DRAM,
+CXL, NVMe, or GPU cache page/segment should carry the last mutation generation
+that touched it and the install/reproduce frontier that made its backing state
+complete. Loading a cold segment into a warm or GPU tier must wait, repair, or
+replay deltas when the backing frontier is behind the touch frontier.
+
+**Risks and mismatches:** DudeTM is a persistent-memory transactional memory
+library, not a SQL DBMS, WAL system, GPU runtime, or distributed storage
+engine. It uses address/value memory logs rather than relational row versions,
+secondary indexes, SQL isolation metadata, or crash-replay manifests. Its
+evaluation uses emulated NVM, not production Optane/CXL/NVMe/GPU paths.
+
+The shadow-memory model assumes direct load/store persistent data and a TM
+conflict manager. GPU DB cannot expose staged shadow updates to SQL readers
+before commit visibility, and it cannot let background reproduction reorder
+logical MVCC histories. The design is safest for private owner staging and
+derived physical structures.
+
+Asynchronous persistence changes acknowledgement semantics. DudeTM allows
+applications to check a durable ID before externally acknowledging. GPU DB
+must make this rule non-optional: client commit success, replication
+acknowledgement, and retained snapshot publication must be tied to the durable
+WAL frontier, not to speculative Perform completion.
+
+Log combination is dangerous if applied to logical history. Collapsing writes
+may erase intermediate versions required by MVCC readers, triggers, conflict
+detection, replication, CDC, or forensic recovery. Any coalescing benchmark
+must distinguish logical WAL, physical warm-tier install logs, and derived
+cache refresh logs.
+
+The paging/touching-ID idea can introduce stalls when a hot page is repeatedly
+touched faster than Reproduce can install updates. GPU DB needs telemetry for
+install-frontier lag, cache-load waits, and hot-segment repair cost before
+adopting a similar rule.
+
+**Benchmark candidates:**
+
+- Build a decoupled commit/install microbenchmark: owner execution emits
+  compact WAL intents, durable frontier advances after flush, and a background
+  installer updates a derived warm index or resident segment. Measure commit
+  p50/p99, installer lag, read fallback rate, and recovery correctness against
+  a synchronous install baseline.
+- Add a durable-frontier gate: client commit success and retained snapshot
+  publication must wait for the WAL frontier, while derived warm-tier
+  installation may lag. Failure condition: a read observes a generation whose
+  logical WAL is not durable.
+- Prototype per-segment `{touch_generation, install_generation}` metadata for
+  CPU/GPU/cold-tier segments. On cache load, wait, replay deltas, or reject
+  when `install_generation < touch_generation`. Measure load latency and
+  blocked-read causes under hot updates.
+- Test safe physical-log coalescing for derived structures only: combine
+  repeated updates to the same resident row/index slot within one unpublished
+  generation while preserving uncoalesced logical WAL. Gate: crash replay,
+  MVCC snapshot reads, and derived-cache rebuilds match the uncombined path.
+- Compare group sizes for install-log combination and compression under skewed
+  OLTP updates. Report write bytes, installer CPU, durable-log latency,
+  coalescing delay, and p99 commit latency. Failure condition: batching
+  improves write volume but violates the commit SLO or increases stale-cache
+  fallback beyond budget.
+- Add recovery tests where Perform completed, Persist partially completed, or
+  Reproduce lagged. Recovery must replay only complete durable-log records and
+  rebuild derived warm/GPU state from the authoritative WAL frontier.

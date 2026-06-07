@@ -7677,12 +7677,22 @@ Append new candidates here as each paper is processed.
   Why: discovered while reviewing REWIND; useful follow-up on low-overhead
   persistent Masstree-style structures, in-cache-line undo records, and
   checkpoint granularity for future CPU warm indexes or route metadata.
-- `queued` — **DudeTM: Building Durable Transactions with Decoupling for
+- `reviewed` — **DudeTM: Building Durable Transactions with Decoupling for
   Persistent Memory**, Liu et al., ASPLOS 2017.
+  PDF:
+  `https://www.microsoft.com/en-us/research/wp-content/uploads/2017/02/dudetm_asplos17.pdf`
   DOI: `https://doi.org/10.1145/3037697.3037714`
   Why: PCSO logging contrasts DudeTM's background persistence and durability
   latency tradeoff; useful for comparing foreground one-flush durability with
   decoupled logging when GPU DB evaluates NVM/CXL write-path staging.
+  Journal entry added 2026-06-07 from the Microsoft Research author PDF.
+- `queued` — **DUMBO: Making durable read-only transactions fly on hardware
+  transactional memory**, Dias, Felber, Fetzer, and Ramalhete, arXiv 2024.
+  URL: `https://arxiv.org/abs/2410.16110`
+  Why: discovered while reviewing DudeTM; useful modern follow-up on durable
+  read-only transaction costs, persistent HTM design, and whether GPU DB can
+  separate durable read validation from write-path persistence under retained
+  snapshot workloads.
 - `queued` — **Log-Structured Non-Volatile Main Memory**, Hu, Ren, Badam, and
   Moscibroda, USENIX ATC 2017.
   URL: `https://www.usenix.org/conference/atc17/technical-sessions/presentation/hu`
