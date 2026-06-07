@@ -34801,8 +34801,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The strongest transferable lesson is that GPU DB should select write-batch protocols by measured conflict shape, not by a single favorite isolation algorithm.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -51235,8 +51235,8 @@
               "predicate",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "AOCC, the CXL database position paper, and TiQuE converge on one design track: GPU DB should expose metadata movement and validation as first-class planned routes.",
             "support_reason": "Matched journal terms (predicate, metadata) to Cost-based route optimizer."
           },
@@ -54588,8 +54588,8 @@
               "predicate",
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "For each retained route family, the engine should record a compact profile: bytes transferred, DRAM bytes, L2 requests, integer or relevant operation counts, kernel count, kernel fusion shape, CPU planning/encoding overhead, queue wait, and result materialization bytes.",
             "support_reason": "Matched journal terms (planning, join, predicate, metadata) to Cost-based route optimizer."
           },
@@ -56272,8 +56272,8 @@
             "matched_terms": [
               "ring"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Its tuple reordering is local to 1024-value vectors and usually safe for relational scans, but GPU DB must still preserve row identity, pgwire response order, stable portals, and snapshot visibility.",
             "support_reason": "Matched journal terms (ring) to Owner-ring bundling."
           },
@@ -61187,8 +61187,8 @@
               "publish",
               "checksum"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "QueCC, the GPU multiversion B-tree, and Tectonic converge on the same systems lesson from different layers: high throughput comes from publishing intent early enough that the runtime can choose the right lane before scarce resources are consumed.",
             "support_reason": "Matched journal terms (generation, route descriptor, publish, checksum) to Immutable route roots."
           },
@@ -61846,8 +61846,8 @@
               "fallback",
               "stale"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Cache benefit is workload-dependent: it does not help when remote accesses are mostly writes or when stale cached data creates extra aborts.",
             "support_reason": "Matched journal terms (fallback, stale) to CPU fallback policy."
           },
@@ -62714,8 +62714,8 @@
               "contention",
               "abort"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "On accelerator memory allocation failure, it aborts and restarts only the failed operator on CPU instead of aborting the full query. - The paper identifies cache thrashing when the query working set exceeds the accelerator data cache.",
             "support_reason": "Matched journal terms (contention, abort) to Deterministic hot-write templates."
           },
@@ -63645,8 +63645,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Distributed GPU joins point toward accelerator throughput from large, shape-compatible batches; Spooky argues that maintenance and refresh should use stable boundary groups; CCaaS separates conflict resolution from execution and storage; Strife shows that high-contention OLTP can be made more predictable when each batch exposes its actual conflict graph.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -63695,8 +63695,8 @@
               "retire",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Distributed GPU joins point toward accelerator throughput from large, shape-compatible batches; Spooky argues that maintenance and refresh should use stable boundary groups; CCaaS separates conflict resolution from execution and storage; Strife shows that high-contention OLTP can be made more predictable when each batch exposes its actual conflict graph.",
             "support_reason": "Matched journal terms (era, retire, route descriptor) to Bounded descriptor reclamation."
           },
@@ -66395,8 +66395,8 @@
               "publish",
               "publication"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Endpoint memory ordering is also subtle: GPU pointer publication and cached state must be fenced or the coordinator can move stale or partially written items.",
             "support_reason": "Matched journal terms (generation, publish, publication) to Immutable route roots."
           },
@@ -72746,8 +72746,8 @@
               "ordering",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It also rearranges validation order using schema access patterns, such as TPC-C's tree-shaped Warehouse-to-District-to-Customer ordering, to lower the chance that healing inserts records earlier than the current validation point. - Independent transactions, whose read/write sets can be determined from input parameters before execution, get a tighter path...",
             "support_reason": "Matched journal terms (dependency, ordered, ordering, proof) to Dependency witnesses."
           },
@@ -73184,8 +73184,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The view/conflict-robustness paper says RC/SI/SSI route templates should be certified with conflict-robustness; view-robustness is not a hidden extra shortcut for this MVCC family.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -73401,8 +73401,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Instead, each data item is assigned a semantic class: O for optimistic snapshot-isolation-style first-committer-wins behavior, R for reconciliation where commutative operations can be replayed subject to constraints, P for pessimistic ownership with first-reader-wins behavior, and E for escrow-style guarantees where a bounded resource is reserved during t...",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -73918,8 +73918,8 @@
             "matched_terms": [
               "metadata"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "SwitchFS delays metadata updates only because every dependent read has a dirty-state oracle.",
             "support_reason": "Matched journal terms (metadata) to Cost-based route optimizer."
           },
@@ -79260,8 +79260,8 @@
             "matched_terms": [
               "scheduling"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The certificate now needs static isolation safety, physical tier state, freshness clocks, and scheduling intent for hot keys or hot segments.",
             "support_reason": "Matched journal terms (scheduling) to Resource-DAG scheduling."
           },
@@ -82182,8 +82182,8 @@
             "matched_terms": [
               "conflict"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "QueCC makes operation queues and priority lanes explicit; ORTHRUS separates concurrency-control ownership from transaction execution; CXL placement says object families need measured tier classes; Strife says the current batch's conflict graph should decide which writes can run without per-record control.",
             "support_reason": "Matched journal terms (conflict) to GPU OLTP conflict ordering."
           },
@@ -84340,8 +84340,8 @@
               "dag",
               "scheduling"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "If the fast path discovers that a transaction no longer matches the original sequential semantics, mainly because funds are unavailable, OCToPus compensates the partial effects and re-executes the aborted transaction plus its dependent transactions through a deterministic DAG fallback.",
             "support_reason": "Matched journal terms (dag, scheduling) to Resource-DAG scheduling."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4378,
-      "weak_direct": 293
+      "direct": 4395,
+      "weak_direct": 276
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 216,
+      "snippet contains matched mechanism term plus visible aliases": 233,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 287,
+      "substantive snippet contains only one matched mechanism term": 270,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
