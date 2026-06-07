@@ -563,15 +563,34 @@ Append new candidates here as each paper is processed.
   advisor hooks without putting Python or model lifecycle work on the hot path.
   Journal entry added 2026-06-07 from the PVLDB PDF and author mirror after
   the first direct PVLDB curl stalled.
-- `queued` — **The Holon Approach for Simultaneously Tuning Multiple
+- `reviewed` — **The Holon Approach for Simultaneously Tuning Multiple
   Components in a Self-Driving Database Management System with Machine
   Learning via Synthesized Proto-Actions**, Zhang, Lim, Butrovich, and
   Pavlo, PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p3373-zhang.pdf`
+  DOI: `https://doi.org/10.14778/3681954.3682007`
+  Code: `https://github.com/17zhangw/protox`
   Why: PilotScope shows that multiple AI4DB drivers can interact badly; Holon
   is a modern follow-up for coordinating knobs, hints, indexes, and other route
   actions as joint policy units before GPU DB combines route scoring, cache
-  admission, and scheduler advisors.
+  admission, and scheduler advisors. Journal entry added 2026-06-07 from the
+  primary VLDB PDF; direct `curl` to VLDB timed out, but the browser fetch path
+  retrieved the indexed open-access PDF.
+- `queued` — **A Unified and Efficient Coordinating Framework for Autonomous
+  DBMS Tuning**, Zeng et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2303.05710`
+  Why: Holon contrasts multi-tuner coordinator approaches that tune individual
+  DBMS components through separate agents; useful as a follow-up for deciding
+  whether GPU DB route scoring, cache admission, and scheduler policy should
+  coordinate through a shared action model or remain separate advisors.
+- `queued` — **LlamaTune: Sample-Efficient DBMS Configuration Tuning**,
+  Kanellis et al., VLDB 2022.
+  URL:
+  `https://www.microsoft.com/en-us/research/publication/llamatune-sample-efficient-dbms-configuration-tuning/`
+  Why: Holon uses sample-efficiency and limited tuning budgets as deployment
+  constraints; useful for comparing low-sample knob/advisor tuning against GPU
+  DB's need to learn route thresholds without spending many production-like
+  benchmark hours.
 - `queued` — **Cardinality Estimation in DBMS: A Comprehensive Benchmark
   Evaluation**, Han et al., PVLDB 2021.
   URL: `https://kai-zeng.github.io/papers/benchmark_vldb_2021.pdf`

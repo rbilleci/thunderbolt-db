@@ -98700,3 +98700,144 @@ adopting a similar rule.
 - Add recovery tests where Perform completed, Persist partially completed, or
   Reproduce lagged. Recovery must replay only complete durable-log records and
   rebuild derived warm/GPU state from the authoritative WAL frontier.
+
+### 2026-06-07 - Holon turns independent tuning knobs into joint route actions
+
+**Citation:** William Zhang, Wan Shen Lim, Matthew Butrovich, and Andrew
+Pavlo. "The Holon Approach for Simultaneously Tuning Multiple Components in a
+Self-Driving Database Management System with Machine Learning via Synthesized
+Proto-Actions." PVLDB 17(11):3373-3387, 2024. Retrieved 2026-06-07 from
+`https://www.vldb.org/pvldb/vol17/p3373-zhang.pdf`. DOI:
+`https://doi.org/10.14778/3681954.3682007`. Artifact:
+`https://github.com/17zhangw/protox`.
+
+**Category:** query optimization / planning, autonomous DBMS tuning, and
+control-plane route coordination.
+
+**Relevance tags:** joint route actions, proto-actions, multi-space tuning,
+knob/index/query-hint coordination, offline route advisor, cache admission,
+scheduler advisor, deterministic envelope, PostgreSQL, OLTP/OLAP tuning.
+
+**Core idea:** Holon identifies a failure mode in self-driving DBMS work:
+tuning one action family at a time, such as knobs, indexes, or query hints,
+misses configurations where a locally bad move enables a globally better
+system state. The Proto-X framework treats a full candidate configuration as a
+"holon" assembled from choices across multiple configuration spaces, then uses
+similarity structure to search the joint space without enumerating it blindly.
+
+The transferable idea for GPU DB is not to let an ML model own correctness or
+per-query decisions. It is to represent route-advisor actions as joint policy
+units. A useful route change may need to adjust several levers together:
+resident-cache admission, GPU/CPU route thresholds, micro-batch limits,
+index/segment materialization, fallback policy, and scheduler priority. Tuning
+those independently can produce the same prisoner's-dilemma behavior Holon
+describes.
+
+**Concrete mechanisms:**
+
+- Proto-X represents DBMS configuration spaces as sets of "holons" rather than
+  isolated knobs. The evaluated spaces include PostgreSQL system knobs, table
+  or index options, generated indexes, and query-level hints/options.
+- Phase I collects benefit scores for sampled actions, then shapes a latent
+  space using structural similarity and objective/performance similarity. The
+  paper uses this shaped space to define neighborhoods of promising actions
+  instead of exploring the raw Cartesian product.
+- During action selection, the actor network emits proto-actions in the shaped
+  space. Proto-X maps each proto-action slice back to nearby valid concrete
+  actions in each configuration space.
+- Candidate neighborhoods from multiple spaces are combined into candidate
+  holons. A critic network scores the latent representation of those holons and
+  chooses one to evaluate on the DBMS.
+- Structural generation rules expand candidate actions. For indexes, examples
+  include structural variants and user-specified physical settings such as
+  PostgreSQL B+Tree `fillfactor`.
+- The coordinator adds operational guardrails: maximal query optimization for
+  OLAP query-option sets, periodic resets to either initial or best-known
+  configurations, and query/workload timeouts so bad configurations do not
+  consume the whole tuning budget.
+- Evaluation targets PostgreSQL v15.1 with HypoPG and `pg_hint_plan`, three
+  OLAP workloads (JOB, TPC-H SF10, DSB SF10), and TPC-C SF100 with 40
+  terminals after removing selected secondary indexes. Proto-X is reported to
+  improve PostgreSQL performance by up to 53% over the next-best approach in
+  the abstract; the introduction rounds a similar claim to 54%.
+- The paper reports sensitivity to actor/critic size, state representation,
+  exploration parameters, dataset/workload drift, and schema changes. Larger
+  or smaller networks are not uniformly better, and the authors note that
+  limited sample budgets can make model/hyperparameter choice matter.
+
+**GPU DB mapping:** Treat a GPU DB "route action" as a bounded holon rather
+than a single knob. A candidate policy should bundle a route family, residency
+admission rule, micro-batch ceiling, GPU queue saturation threshold, CPU
+fallback threshold, refresh/invalidation rule, and optional derived index or
+segment materialization. This prevents a learned advisor from recommending a
+GPU route without the resident-cache and scheduler settings that make it valid.
+
+The shaped-space idea maps to route-family descriptors. Structural similarity
+can come from stable facts already in the architecture: query shape,
+snapshot-generation compatibility, relation/partition identity, predicate
+family, selected column family, required index or resident segment, transfer
+bytes, and queue ownership. Objective similarity can come from measured p50,
+p99, fallback rate, refresh cost, and GPU occupancy. The advisor can explore
+nearby route bundles offline while production execution still uses explicit
+eligibility checks.
+
+Candidate holons also fit the cache/tiering problem. For example, "promote
+segment to GPU" should be evaluated together with refresh cadence, host-pinned
+buffer budget, warm DRAM copy policy, CPU fallback path, and eviction priority.
+Optimizing only promotion or only scheduling can make the route look bad even
+when the joint configuration is good.
+
+Proto-X's reset and timeout mechanisms map cleanly to benchmark automation.
+GPU DB should run advisor experiments in replayable benchmark windows, reset
+to a known policy snapshot, abort configurations that exceed p99 or fallback
+budgets, and keep the best-known deterministic policy available for rollback.
+
+**Risks and mismatches:** Holon is a tuning framework for PostgreSQL, not a GPU
+database runtime. Its actions operate over coarse DBMS configuration, indexes,
+and query hints. GPU DB cannot allow a model to bypass WAL-before-visibility,
+snapshot compatibility, resident invalidation, or queue admission contracts.
+
+The evaluation spends long tuning windows, including 30h trials. That is fine
+for offline policy search but not for hot deployment. GPU DB needs cheap
+surrogates, trace replay, and shadow evaluation before any learned route
+advisor can influence production traffic.
+
+The OLAP "maximal query optimization" shortcut assumes independent analytical
+queries and is explicitly not applied to OLTP in the paper. GPU DB must not
+reuse that assumption for interactive transactions, writes, or read-after-write
+dependencies. Transactional route changes need generation and visibility gates.
+
+Proto-X depends on valid action generators and DBMS extensions such as HypoPG
+and `pg_hint_plan`. GPU DB would need its own constrained action schema. Any
+candidate holon that lacks a proof of route eligibility, memory budget,
+fallback behavior, and invalidation handling should be rejected before
+benchmarking.
+
+The paper studies PostgreSQL on CPU hardware. It does not evaluate GPU memory,
+kernel-launch amortization, pinned buffers, NVMe/object tiers, or 1M logical
+session admission. The GPU mapping is therefore an inference from its tuning
+and coordination mechanisms, not a direct performance claim.
+
+**Benchmark candidates:**
+
+- Build an offline route-holon schema for one retained lookup family:
+  `{route_family, resident_state, batch_ceiling_us, batch_count, gpu_queue_cap,
+  cpu_fallback_threshold, refresh_policy, eviction_priority}`. Gate: every
+  field maps to a deterministic runtime check or benchmark knob.
+- Compare independent one-knob tuning against joint holon tuning for retained
+  point lookups under mixed read/write invalidation. Measure throughput, p99,
+  fallback rate, resident bytes, refresh cost, and rejected-route count.
+- Add a route-advisor shadow mode: generate candidate holons from benchmark
+  traces, score them offline, but execute only the current deterministic
+  policy. Gate: the advisor can explain each recommendation in terms of
+  measured route features and hard eligibility constraints.
+- Test reset and rollback behavior. Each advisor experiment starts from a
+  known policy snapshot, has query/workload timeout budgets, and restores the
+  best-known safe policy after a failed candidate. Failure condition: a bad
+  candidate can poison subsequent trials or production configuration.
+- Evaluate a cache/scheduler joint action: promote one segment to GPU, adjust
+  micro-batch thresholds, and change CPU fallback policy together. Compare
+  against tuning only promotion, only batch size, or only fallback threshold.
+- Track model budget as a first-class metric: samples required before
+  improvement, benchmark hours consumed, stale-policy regressions after
+  workload drift, and the cost of revalidating after schema or route changes.
