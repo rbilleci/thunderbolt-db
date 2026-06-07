@@ -1,0 +1,321 @@
+{
+  "schema": "gpu-db-research-compatibility-edges-v1",
+  "description": "Typed compatibility edges between mechanism cards. Use these edges to generate focused matrices and end-to-end architecture views.",
+  "edge_types": {
+    "requires": "The source mechanism depends on the target mechanism or its contract.",
+    "strengthens": "The source mechanism improves or makes the target mechanism safer or more useful.",
+    "compatible": "The mechanisms can be combined without a known semantic conflict.",
+    "tension": "The mechanisms can combine, but only with explicit guardrails or benchmark proof.",
+    "conflicts": "The mechanisms should not be combined as stated.",
+    "alternative_to": "The mechanisms solve a similar problem and should usually be selected deliberately rather than stacked blindly.",
+    "unknown_needs_benchmark": "The relationship is plausible but must be validated before architecture commitment."
+  },
+  "edges": [
+    {
+      "from": "immutable_route_roots",
+      "to": "wal_before_visibility",
+      "type": "requires",
+      "reason": "Route roots become externally eligible only after their referenced visibility/WAL frontier is durable."
+    },
+    {
+      "from": "dependency_witnesses",
+      "to": "immutable_route_roots",
+      "type": "strengthens",
+      "reason": "Witnesses explain which route body, generation, and checksum dependencies must fence before root eligibility."
+    },
+    {
+      "from": "semantic_crash_oracle",
+      "to": "wal_before_visibility",
+      "type": "strengthens",
+      "reason": "Crash-state validation proves the WAL boundary is not bypassed by optimized publication paths."
+    },
+    {
+      "from": "semantic_crash_oracle",
+      "to": "dependency_witnesses",
+      "type": "strengthens",
+      "reason": "The oracle checks whether dependency chains recover as old-or-new instead of partial mixed states."
+    },
+    {
+      "from": "retained_gpu_snapshots",
+      "to": "snapshot_frontier_vectors",
+      "type": "requires",
+      "reason": "Resident snapshots need a proof that their generation is valid across owners or partitions."
+    },
+    {
+      "from": "retained_gpu_snapshots",
+      "to": "immutable_route_roots",
+      "type": "requires",
+      "reason": "Readers need compact route metadata tying residency, layout, visibility, and freshness together."
+    },
+    {
+      "from": "retained_gpu_snapshots",
+      "to": "mvcc_gc_frontiers",
+      "type": "tension",
+      "reason": "Retained snapshots improve reads but can pin old versions unless GC accounts for reader horizons."
+    },
+    {
+      "from": "mvcc_gc_frontiers",
+      "to": "snapshot_frontier_vectors",
+      "type": "strengthens",
+      "reason": "Exact active frontiers make old-version reclamation compatible with cross-owner snapshots."
+    },
+    {
+      "from": "bounded_descriptor_reclamation",
+      "to": "immutable_route_roots",
+      "type": "strengthens",
+      "reason": "Old immutable roots and descriptors need bounded retirement under long readers."
+    },
+    {
+      "from": "bounded_descriptor_reclamation",
+      "to": "stable_handle_indirection",
+      "type": "compatible",
+      "reason": "Handles stabilize logical identity while reclamation retires obsolete physical descriptors."
+    },
+    {
+      "from": "stable_handle_indirection",
+      "to": "multi_tier_placement",
+      "type": "strengthens",
+      "reason": "Tier movement is safer when logical identity survives physical relocation."
+    },
+    {
+      "from": "multi_tier_placement",
+      "to": "retained_gpu_snapshots",
+      "type": "strengthens",
+      "reason": "Placement policy decides which generations deserve scarce HBM residency."
+    },
+    {
+      "from": "multi_tier_placement",
+      "to": "stable_handle_indirection",
+      "type": "requires",
+      "reason": "Promotion, demotion, and compaction need handles or generation-checked indirection."
+    },
+    {
+      "from": "log_structured_warm_tier",
+      "to": "dependency_witnesses",
+      "type": "requires",
+      "reason": "Append-style warm metadata can persist asynchronously only if publication dependencies are explicit."
+    },
+    {
+      "from": "log_structured_warm_tier",
+      "to": "semantic_crash_oracle",
+      "type": "requires",
+      "reason": "Rebuildable mappings need crash tests that verify replay, root, and compaction states."
+    },
+    {
+      "from": "db_owned_cold_objects",
+      "to": "immutable_route_roots",
+      "type": "requires",
+      "reason": "Cold-object manifests must be published through generation roots to avoid dangling route metadata."
+    },
+    {
+      "from": "vector_credit_admission",
+      "to": "effective_session_counting",
+      "type": "strengthens",
+      "reason": "Credits should be allocated to effective active work, not total logical connection count."
+    },
+    {
+      "from": "effective_session_counting",
+      "to": "vector_credit_admission",
+      "type": "requires",
+      "reason": "The active-flow count becomes useful only when translated into bounded per-resource budgets."
+    },
+    {
+      "from": "owner_ring_bundling",
+      "to": "vector_credit_admission",
+      "type": "requires",
+      "reason": "Bundle selection must respect available tokens before it pushes work into downstream queues."
+    },
+    {
+      "from": "resource_dag_scheduling",
+      "to": "owner_ring_bundling",
+      "type": "strengthens",
+      "reason": "DAG annotations guide which bounded bundle fragments unlock scarce resources."
+    },
+    {
+      "from": "resource_dag_scheduling",
+      "to": "dependency_witnesses",
+      "type": "compatible",
+      "reason": "Runtime dependencies and durable publication dependencies are distinct but share a witness vocabulary."
+    },
+    {
+      "from": "deficit_fairness",
+      "to": "owner_ring_bundling",
+      "type": "strengthens",
+      "reason": "Deficit counters cap the unfairness introduced by packing-friendly bundle selection."
+    },
+    {
+      "from": "deficit_fairness",
+      "to": "resource_dag_scheduling",
+      "type": "tension",
+      "reason": "Resource-efficient schedules can starve small classes unless deficits bound schedule preference."
+    },
+    {
+      "from": "same_shape_microbatching",
+      "to": "retained_gpu_snapshots",
+      "type": "strengthens",
+      "reason": "Resident generations provide a natural grouping key for same-shape read batches."
+    },
+    {
+      "from": "same_shape_microbatching",
+      "to": "vector_credit_admission",
+      "type": "requires",
+      "reason": "Micro-batches need request, byte, buffer, GPU, and latency budgets before admission."
+    },
+    {
+      "from": "same_shape_microbatching",
+      "to": "deficit_fairness",
+      "type": "tension",
+      "reason": "Batch formation can delay singleton queries unless fairness and latency caps are explicit."
+    },
+    {
+      "from": "gpu_oltp_conflict_ordering",
+      "to": "wal_before_visibility",
+      "type": "requires",
+      "reason": "GPU conflict-ordered batches still need CPU-owned durable publication before visibility."
+    },
+    {
+      "from": "gpu_oltp_conflict_ordering",
+      "to": "same_shape_microbatching",
+      "type": "compatible",
+      "reason": "Both use batch boundaries, but one targets write conflicts while the other targets repeated read/route shapes."
+    },
+    {
+      "from": "gpu_oltp_conflict_ordering",
+      "to": "deterministic_hot_write_templates",
+      "type": "alternative_to",
+      "reason": "Both address hot write contention; choose GPU batch ordering for large batches and templates for low-latency hot keys."
+    },
+    {
+      "from": "deterministic_hot_write_templates",
+      "to": "owner_ring_bundling",
+      "type": "strengthens",
+      "reason": "Owner rings can schedule hot-key queues by deterministic position instead of retrying optimistic conflicts."
+    },
+    {
+      "from": "cpu_fallback_policy",
+      "to": "retained_gpu_snapshots",
+      "type": "strengthens",
+      "reason": "Fallback preserves correctness when a resident snapshot is stale, missing, or over budget."
+    },
+    {
+      "from": "cpu_fallback_policy",
+      "to": "isolation_trace_oracle",
+      "type": "requires",
+      "reason": "Fallback must be validated as the same SQL-visible snapshot contract, not a weaker path."
+    },
+    {
+      "from": "htap_freshness_router",
+      "to": "snapshot_frontier_vectors",
+      "type": "requires",
+      "reason": "Freshness routing depends on knowing which generation satisfies the request."
+    },
+    {
+      "from": "htap_freshness_router",
+      "to": "cpu_fallback_policy",
+      "type": "strengthens",
+      "reason": "Fallback is one of the router's safe outcomes when freshness or residency does not fit."
+    },
+    {
+      "from": "htap_freshness_router",
+      "to": "retained_gpu_snapshots",
+      "type": "strengthens",
+      "reason": "Freshness contracts determine when retained GPU snapshots are eligible."
+    },
+    {
+      "from": "cost_based_route_optimizer",
+      "to": "htap_freshness_router",
+      "type": "strengthens",
+      "reason": "Cost estimates help choose wait, refresh, retained GPU, CPU, or cold-tier routes inside the freshness envelope."
+    },
+    {
+      "from": "cost_based_route_optimizer",
+      "to": "vector_credit_admission",
+      "type": "requires",
+      "reason": "The optimizer needs live resource budgets; otherwise cheap-looking routes can create hidden queues."
+    },
+    {
+      "from": "learned_optimizer_advisor",
+      "to": "cost_based_route_optimizer",
+      "type": "strengthens",
+      "reason": "Learning should suggest route or knob choices inside a deterministic optimizer guardrail."
+    },
+    {
+      "from": "learned_optimizer_advisor",
+      "to": "wal_before_visibility",
+      "type": "tension",
+      "reason": "Learned decisions must never choose actions that weaken durability or visibility invariants."
+    },
+    {
+      "from": "learned_optimizer_advisor",
+      "to": "isolation_trace_oracle",
+      "type": "requires",
+      "reason": "Adaptive route decisions need continuous validation that observed reads remain within the declared isolation contract."
+    },
+    {
+      "from": "multi_tier_placement",
+      "to": "cost_based_route_optimizer",
+      "type": "compatible",
+      "reason": "Placement supplies physical choices and the optimizer selects among them based on cost and freshness."
+    },
+    {
+      "from": "db_owned_cold_objects",
+      "to": "multi_tier_placement",
+      "type": "strengthens",
+      "reason": "Cold objects become an explicit tier in placement and route decisions."
+    },
+    {
+      "from": "log_structured_warm_tier",
+      "to": "multi_tier_placement",
+      "type": "compatible",
+      "reason": "A warm log-structured home can act as the middle tier between HBM/DRAM and cold objects."
+    },
+    {
+      "from": "semantic_crash_oracle",
+      "to": "db_owned_cold_objects",
+      "type": "requires",
+      "reason": "Cold object manifests, aging, and backup boundaries must survive crash-state checks."
+    },
+    {
+      "from": "isolation_trace_oracle",
+      "to": "htap_freshness_router",
+      "type": "strengthens",
+      "reason": "Trace validation catches stale-route mistakes made by freshness routing."
+    },
+    {
+      "from": "isolation_trace_oracle",
+      "to": "retained_gpu_snapshots",
+      "type": "strengthens",
+      "reason": "Resident reads need black-box proof that their returned versions fit the requested isolation contract."
+    },
+    {
+      "from": "resource_dag_scheduling",
+      "to": "same_shape_microbatching",
+      "type": "compatible",
+      "reason": "Repeated route-shape batches can be represented as DAG fragments with shared transfer and kernel nodes."
+    },
+    {
+      "from": "vector_credit_admission",
+      "to": "resource_dag_scheduling",
+      "type": "strengthens",
+      "reason": "Credits prevent resource-DAG scheduling from pushing too much work into a scarce downstream boundary."
+    },
+    {
+      "from": "stable_handle_indirection",
+      "to": "retained_gpu_snapshots",
+      "type": "strengthens",
+      "reason": "Handles let resident snapshots survive movement or compaction of their backing fragments."
+    },
+    {
+      "from": "bounded_descriptor_reclamation",
+      "to": "mvcc_gc_frontiers",
+      "type": "compatible",
+      "reason": "Descriptor retirement and MVCC version reclamation can share reader horizon concepts while reclaiming different objects."
+    },
+    {
+      "from": "gpu_oltp_conflict_ordering",
+      "to": "same_shape_microbatching",
+      "type": "tension",
+      "reason": "Read micro-batches and write conflict batches can compete for GPU streams; admission must separate budgets."
+    }
+  ]
+}
