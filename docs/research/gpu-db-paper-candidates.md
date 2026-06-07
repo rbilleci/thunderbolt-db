@@ -1217,13 +1217,33 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai`
   Why: pre-2015 historical source cited by the fsync paper; skipped by the
   2015-present selection policy.
-- `queued` — **TIPS: Making Volatile Index Structures Persistent with
+- `reviewed` — **TIPS: Making Volatile Index Structures Persistent with
   DRAM-NVMM Tiering**, Ramanathan et al., USENIX ATC 2021.
   URL: `https://www.usenix.org/conference/atc21/presentation/krishnan`
   Why: TL4x's replica-copy approach contrasts with tiering volatile index
   structures onto persistent memory; useful for comparing route/index
   reconstruction, persistent update granularity, and DRAM/NVMM placement
   before GPU DB persists warm-tier indexes or resident-fragment directories.
+  Journal entry added 2026-06-07 from the USENIX page and PDF.
+- `queued` — **Pronto: Easy and Fast Persistence for Volatile Data
+  Structures**, Liu et al., ASPLOS 2020.
+  URL: `https://doi.org/10.1145/3373376.3378456`
+  Why: TIPS compares against PRONTO's operation-log/snapshot conversion of
+  volatile indexes; useful for deciding when route metadata can be persisted
+  by semantic logs versus when the hot structure itself should live in a
+  future persistent tier.
+- `queued` — **RECIPE: Converting Concurrent DRAM Indexes to Persistent-Memory
+  Indexes**, Lee et al., SOSP 2019.
+  URL: `https://doi.org/10.1145/3341301.3359635`
+  Why: TIPS contrasts RECIPE's index-specific conversion guidelines and
+  weaker durability assumptions; useful for checking which persistent-index
+  conversions are too fragile for GPU DB route/index publication.
+- `queued` — **NVTraverse: In NVRAM Data Structures, the Destination is More
+  Important than the Journey**, Friedman et al., PLDI 2020.
+  URL: `https://doi.org/10.1145/3385412.3386031`
+  Why: TIPS compares against NVTraverse for durable-linearizable lock-free
+  indexes; useful for deciding whether GPU DB future-tier indexes should pay
+  per-traversal persistence costs or keep persistence off read paths.
 
 - `queued` — **Atlas: Scalable and Available State Machine Replication**,
   Enes et al., EuroSys 2020.

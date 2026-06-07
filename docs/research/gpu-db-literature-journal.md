@@ -38,6 +38,184 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - TIPS keeps persistent indexes out of the request's critical path
+
+**Citation:** R. Madhava Krishnan, Wook-Hee Kim, Xinwei Fu, Sumit Kumar
+Monga, Hee Won Lee, Minsung Jang, Ajit Mathew, and Changwoo Min. "TIPS:
+Making Volatile Index Structures Persistent with DRAM-NVMM Tiering."
+USENIX ATC 2021, 773-787. Retrieved 2026-06-07 from the USENIX page and
+PDF: `https://www.usenix.org/conference/atc21/presentation/krishnan`,
+`https://www.usenix.org/system/files/atc21-krishnan.pdf`.
+
+**Category:** database file-system/storage/indexing; WAL, logging, and
+read/write throughput; multi-tier cache / data placement.
+
+**Relevance tags:** TIPS; DRAM-NVMM tiering; persistent indexes; durable
+linearizability; operation log; UNO logging; undo log; memory log; background
+replay; tiered concurrency; persistent memory leaks; DRAM-cache; range scans;
+NVMM; future warm tier; route indexes; resident-fragment directories.
+
+**Core idea:** TIPS converts existing volatile indexes into persistent
+indexes by moving the write visibility point into a DRAM frontend and pushing
+the persistent index update into a backend replay path. A write first persists
+an operation record, then becomes visible through a DRAM cache; a background
+thread later replays operations into the plugged-in index stored on NVMM.
+
+For GPU DB, the transferable idea is a two-stage publication rule for future
+warm-tier indexes and resident-fragment directories: the hot request path
+should pay for a small durable intent plus a fast visible overlay, while the
+large persistent structure is updated by ordered, recoverable replay. This
+fits P8's split between WAL/checkpoint authority, CPU truth, and rebuildable
+resident state, but only if normal SQL commits still obey WAL-before-visibility.
+
+**Concrete mechanisms:**
+
+- TIPS keeps a frontend DRAM-cache and per-thread persistent operation logs
+  (`OLog`) in front of a plugged-in index allocated on NVMM. Insert, update,
+  and delete operations are committed to the `OLog` for durability, then made
+  visible by inserting a value or tombstone into the DRAM-cache.
+- Lookups first probe the DRAM-cache. On a miss, they use the plugged-in index.
+  The DRAM-cache is an open-chaining hash table with per-bucket writer locks,
+  lock-free reads, single-atomic-store publication, and epoch-based
+  reclamation.
+- Range scans use the plugged-in index but also traverse not-yet-propagated
+  `OLog` entries up to the scan timestamp, then adjust the scan result for
+  pending inserts, updates, and deletes. The paper reports this extra
+  sequential log traversal as negligible in its experiments.
+- Backend replay combines per-thread `OLog` entries and dispatches them to
+  worker queues. Non-commutative operations for the same key are hashed to the
+  same worker queue; each worker sorts its queue by commit timestamp before
+  replaying into the index.
+- TIPS adapts backend worker count by comparing foreground log production with
+  backend replay consumption. If foreground writers outrun backend replay, it
+  adds workers up to a configured cap and remembers the best worker count.
+- UNO logging combines operational logging, undo logging, and memory logging.
+  `OLog` carries durable operations. `ULog` stores old bytes before background
+  replay mutates an existing persistent address. `MLog` tracks allocated and
+  freed addresses so recovery can avoid persistent leaks and double frees.
+- `ULog` is optimized by using `OLog` reclamation timestamps: if an address was
+  allocated after the last `OLog` reclamation, the operation that can recreate
+  it is still in the `OLog`, so TIPS skips undo logging for that address.
+  Repeated updates to the same cache line are coalesced until log reclamation.
+- Log reclamation waits for the current replay epoch and pending scans, flushes
+  addresses referenced by `ULog` and `MLog`, atomically marks completion with a
+  `flush_done` flag, then reclaims replayed `OLog`, persisted `ULog`, and
+  memory-log state.
+- Recovery checks whether logs were cleanly shut down. If not, it restores the
+  plugged-in index using `ULog`, frees newly allocated-but-unreachable memory
+  from `MLog`, then replays `OLog` up to durable tail pointers. The authors
+  injected 200 crashes per TIPS index and report successful recovery; worst
+  case measured recovery was 0.5-9 seconds when crashing with a full `OLog`.
+- The evaluation converts seven volatile indexes and Redis. The paper reports
+  3-10x gains over conversion techniques and NVMM-optimized indexes overall,
+  about 20x over PRONTO for hash table and B+Tree conversions across YCSB
+  workloads, and up to 3x over BzTree for B+Tree workloads. Exact results are
+  tied to an Optane DCPMM platform and YCSB-style key-value workloads.
+
+**GPU DB mapping:** TIPS suggests that future GPU DB warm-tier route indexes
+or resident-fragment directories should not update large persistent index
+nodes on the request path. The request path can append a compact, ordered,
+durable route/index operation and publish a DRAM overlay entry; a maintenance
+owner can replay those operations into a persistent range/hash directory that
+survives restart.
+
+The DRAM-cache overlay maps to route metadata for recent mutations, invalidated
+resident fragments, and newly admitted hot segments. Lookups should consult the
+overlay before the durable warm-tier index; range or pruning scans need to
+merge the base index with pending log entries up to a snapshot boundary. That
+is close to MVCC snapshot visibility: the log merge must be bounded by the
+reader's advertised visibility generation.
+
+UNO logging maps to persistent route/index maintenance rather than tuple
+commit durability. GPU DB can use WAL as the durable authority for SQL data,
+while a TIPS-like `OLog`/`ULog`/`MLog` pattern protects derived persistent
+metadata such as cold-tier directories, resident-fragment manifests, or future
+CXL/NVM indexes. Recovery should be able to rebuild or repair those structures
+without trusting volatile route tables.
+
+The adaptive replay path maps to a background maintenance owner. If route
+overlay backlog grows faster than replay, the engine should expose backlog
+depth, add replay workers only when the target structure scales, or throttle
+new warm-tier admissions. This prevents a fast overlay from hiding unbounded
+persistent-index debt.
+
+The persistent-memory-leak handling is directly useful for future tiered
+metadata. Route/index publication must track allocations and frees as first
+class recovery inputs; otherwise crashes during split, merge, compaction, or
+eviction can leak durable objects forever.
+
+**Risks and mismatches:** TIPS is an index and key-value-store conversion
+framework, not a relational DBMS. It does not solve SQL transaction isolation,
+secondary-index consistency across table updates, WAL group commit, DDL,
+replication, GPU kernels, pinned host buffers, or query planning.
+
+The design targets byte-addressable NVMM and was evaluated on Optane DCPMM.
+GPU DB's near-term tiers are DRAM, HBM, and NVMe; future CXL or NVM tiers may
+have different write granularity and failure behavior. The useful part is the
+ordered overlay/replay/recovery contract, not the assumption that every warm
+tier is load-store persistent memory.
+
+Writes become visible through the DRAM-cache after the `OLog` durability
+point, but GPU DB must not treat a derived index `OLog` as a substitute for the
+canonical SQL WAL. For normal commits, tuple visibility still follows
+WAL-before-visibility and MVCC publication.
+
+Range scans must merge base index results with pending log entries. That is a
+potential latency and correctness hazard under long backlogs, large scans, or
+many distinct route overlays. GPU DB needs explicit backlog caps and fallback
+rules instead of assuming replay will always keep up.
+
+TIPS requires developers to annotate persistent writes with `tips_ulog_add`.
+For GPU DB, manual annotation of every persistent metadata mutation would be
+fragile; route/index maintenance should go through narrow owned APIs or typed
+publication records so missing an annotation cannot corrupt recovery.
+
+**Benchmark candidates:**
+
+- Prototype a derived persistent route-index overlay: append compact route
+  operations, publish a DRAM overlay, and replay into a persistent warm-tier
+  directory. Gate: crash recovery must restore or rebuild the directory and
+  reject partial tail records.
+- Measure lookup latency and p99 under overlay hit, base-index hit, and
+  overlay-plus-base merge paths. Failure condition: pending overlay depth
+  makes retained reads exceed their route SLO without explicit fallback.
+- Add a range/pruning benchmark that merges base fragment metadata with
+  pending route operations up to a snapshot generation. Gate: result set must
+  match a full WAL/MVCC truth rebuild for every tested crash and visibility
+  boundary.
+- Compare synchronous persistent-index mutation, semantic operation-log plus
+  background replay, and rebuild-on-restart metadata. Measure write latency,
+  replay lag, recovery time, memory leaks, and cold-start route availability.
+- Add maintenance-owner backpressure: when replay throughput falls behind
+  foreground route updates, admit more replay workers only if the target index
+  scales, then throttle warm-tier admissions or force CPU truth fallback.
+- Fault-inject crashes during index split/merge, route eviction, fragment
+  admission, and metadata free. Gate: recovery must neither leak persistent
+  metadata objects nor resurrect freed route targets.
+
+### 2026-06-07 - Cross-paper synthesis: persistent metadata needs overlay, replay, and witnesses
+
+TIPS, fsync-failure handling, host-interconnect credits, and deferred reference
+counting converge on one design track: do not let fast metadata publication
+become an invisible pile of debt. Durable or semi-durable route state needs a
+small visible overlay, an ordered replay or rebuild path, explicit resource
+credits, and an external witness that can prove whether the published state
+survived failure.
+
+For GPU DB, the promising track is a tiered metadata owner. Foreground work
+publishes a compact operation record and a DRAM route overlay; background
+maintenance replays into warm/cold indexes, resident-fragment manifests, or
+future CXL/NVM directories; crash tests and WAL/MVCC truth rebuilds verify the
+result. Descriptor lifetime should be bounded by generation, reference count,
+or snapshot epoch, but cleanup cannot be allowed to block short retained reads
+or hide unbounded backlog.
+
+Category gaps after this cluster: transaction commit batching and MVCC garbage
+collection remain stronger than GPU analytics in the next selection window.
+Benchmark priorities are overlay-depth SLOs, crash-state matrices for derived
+metadata, backpressure when replay lags, and snapshot-correct range/pruning
+merges across base metadata plus pending operations.
+
 ### 2026-06-06 - TL4x turns buffered durability into a snapshot-copying contract
 
 **Citation:** Gal Assa, Andreia Correia, Pedro Ramalhete, Valerio
