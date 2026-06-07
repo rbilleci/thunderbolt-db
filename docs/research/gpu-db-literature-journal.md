@@ -96154,3 +96154,174 @@ read path.
   own GPU buffers, CUDA events, pinned host memory, or mapped storage should
   enqueue bounded owner-domain cleanup work; read workers should never pay an
   unbounded destructor cascade.
+
+### 2026-06-07 - B3 turns crash consistency into bounded witness generation
+
+**Citation:** Jayashree Mohan, Ashlie Martinez, Soujanya Ponnapalli,
+Pandian Raju, and Vijay Chidambaram. "Finding Crash-Consistency Bugs with
+Bounded Black-Box Crash Testing." OSDI 2018, 33-50. Retrieved 2026-06-07 from
+the USENIX page and PDF:
+`https://www.usenix.org/conference/osdi18/presentation/mohan`,
+`https://www.usenix.org/system/files/osdi18-mohan.pdf`.
+
+**Category:** WAL, logging, storage recovery, and read/write throughput;
+database file-system design and storage correctness.
+
+**Relevance tags:** crash consistency; black-box testing; fsync; durability
+contracts; WAL/checkpoint/replay; cold-tier manifests; resident snapshot
+publication; fault injection; bounded workload generation; oracle checking.
+
+**Core idea:** B3, bounded black-box crash testing, makes crash-consistency
+testing practical by shrinking an otherwise infinite state space to small,
+systematically generated workloads and crashes after persistence points. The
+paper's study found that most reported Linux file-system crash-consistency
+bugs could be reproduced with three or fewer core file-system operations on a
+new file system, and that the bugs involved crashes after `fsync()`,
+`fdatasync()`, or `sync`.
+
+The transferable lesson for GPU DB is that durability bugs should not be
+tested only with long randomized workloads or full end-to-end benchmarks.
+Every durable publication primitive needs a small bounded witness grammar:
+append WAL, publish visibility, write checkpoint, compact manifest, rename or
+install cold-tier object, invalidate resident generation, refresh resident
+snapshot, and recover. If a persisted boundary claims to survive a crash, the
+test harness should be able to generate short operation sequences, crash after
+each persistence boundary, recover, and compare the recovered database state
+against an oracle.
+
+**Concrete mechanisms:**
+
+- B3 generates bounded sequences of file-system operations and exhaustively
+  tests workloads inside the chosen bounds rather than sampling a broad
+  unbounded workload space.
+- It simulates crashes only after persistence points. The paper argues this is
+  both tractable and semantically meaningful because persisted files and
+  directories are the objects whose survival can be checked clearly.
+- CrashMonkey profiles workloads by recording block IO and relevant system
+  calls, then creates crash states by replaying recorded IO up to each
+  persistence checkpoint.
+- At each persistence point, CrashMonkey also creates an oracle by safely
+  unmounting the file system so pending work completes. After mounting the
+  crash state and allowing recovery, AutoChecker compares only explicitly
+  persisted files and directories against the oracle.
+- ACE generates workloads from bounds over sequence length, file/directory
+  arguments, data-write shapes, persistence calls, and dependency operations
+  such as creating a file before renaming it.
+- The implementation avoids relying on `fsck` as the main checker because
+  `fsck` can be slow and can miss user-data loss. It performs finer-grained
+  data and metadata checks, including size, link count, block count, and write
+  checks for recovered files and directories.
+- The authors tested 3.37 million workloads per file system in about 48 hours
+  on 780 VMs. They report reproducing 24 of 26 known crash-consistency bugs
+  from the prior five years and finding 10 new bugs in btrfs and F2FS.
+- Reported limitations are important: B3 is sound but incomplete inside its
+  bounds; it does not crash in the middle of file-system operations, does not
+  reorder IO to synthesize extra crash states, does not explore long delayed
+  persistence intervals, and does not identify the exact faulty source line.
+
+**GPU DB mapping:** GPU DB has more durable publication surfaces than the
+current simple WAL path will eventually expose: WAL segments, checkpoints,
+archive manifests, cold-tier object manifests, resident snapshot metadata,
+route descriptors, compaction outputs, and future replicated-log membership
+records. B3 suggests treating each of these as a small state machine with
+explicit persistence points and oracles, not as behavior verified only through
+normal benchmark success.
+
+For WAL-before-visibility, a bounded crash grammar should generate sequences
+such as append WAL, fail or complete flush, publish CPU visibility, invalidate
+resident generation, install checkpoint metadata, and recover. The oracle is
+not just "database opens"; it must check visible rows, hidden rows, catalog
+generation, resident-route validity, and fallback state after replay.
+
+For P8 storage, B3 maps directly to manifest and file/object publication. A
+cold-tier segment should not become route-eligible until its data object,
+metadata object, checksum, and catalog pointer are recoverably ordered. Tests
+should crash after each install, rename, manifest append, checksum write, and
+checkpoint pointer swap, then compare recovered catalog and route eligibility
+against a safely completed oracle.
+
+Resident GPU state is rebuildable, but its metadata can still become dangerous
+if recovery trusts stale descriptors. A B3-style checker should verify that
+post-crash GPU caches are either absent, explicitly stale, or tied to a valid
+recovered WAL/catalog boundary. Any crash state that routes a read to a
+pre-crash resident generation without proof should fail the test.
+
+For 1M logical sessions, the bounded grammar should also include in-flight
+responses and admission states. Crashes at persistence points should not
+recover half-published command results, duplicate acknowledged writes, or
+leave session-visible prepared routes pointing at invalid generations.
+
+**Risks and mismatches:** This is a file-system testing paper, not a database
+recovery paper. It does not evaluate SQL isolation, MVCC, group commit,
+replicated logs, GPU memory, pinned buffers, object storage, or cloud/NVMe
+tiering. The concepts transfer as a testing methodology, not as a direct
+storage architecture.
+
+The paper's oracle is built from a safely unmounted file-system image. GPU DB
+will need domain-specific oracles: replay from WAL/checkpoint, SQL-visible
+state comparison, catalog and route-state comparison, and explicit cache
+validity checks.
+
+B3's bounds are empirical. They found many file-system bugs with small
+workloads, but GPU DB may require different bounds for transaction batches,
+multi-table catalog changes, checkpoints, compactions, and resident refresh
+cycles. The harness must make bounds configurable and report which state space
+was actually covered.
+
+Crashing only after persistence points is a good first gate, but GPU DB may
+also need injected partial writes, failed flushes, torn manifest records, lost
+object-store writes, and replay reorderings for storage media that do not
+match local block-device assumptions.
+
+**Benchmark candidates:**
+
+- Build a bounded crash-recovery harness for WAL-before-visibility sequences:
+  insert/update/delete, WAL append, flush success/failure, visibility publish,
+  resident invalidation, checkpoint, crash, recover. Gate: recovered SQL
+  visibility and resident-route validity match the oracle for every generated
+  sequence.
+- Add a P8 manifest-publication crash matrix for cold-tier segment install:
+  data object, metadata object, checksum, manifest append, pointer swap,
+  checkpoint, and cleanup. Failure condition: a recovered route can reference
+  a missing, unchecksummed, or wrong-generation segment.
+- Test resident snapshot recovery states. After any crash, GPU-resident
+  descriptors must be absent, stale, or explicitly reconstructed from the
+  recovered catalog/WAL boundary; they must never be trusted solely because a
+  pre-crash cache directory or metadata file exists.
+- Add fsync/failure-state variants that combine B3 with the fsync-failure
+  paper's lesson: successful flush, failed flush, delayed error, retry,
+  quarantine, and read-only degraded mode. Gate: durability state is explicit
+  after recovery.
+- Generate small multi-object DDL workloads: create/drop/truncate table,
+  install/drop index metadata, invalidate resident generations, checkpoint,
+  recover. Check catalog generations, route descriptors, and rejected prepared
+  routes.
+- Track crash-test coverage as product telemetry: number of generated
+  sequences, persistence boundaries explored, crash states tested, oracle
+  mismatches, recoverable quarantines, and unsupported bounds.
+
+### 2026-06-07 - Cross-paper synthesis: recovery needs compact witnesses
+
+Host-interconnect credits, deferred descriptor reclamation, and B3-style crash
+testing converge on the same engineering track: GPU DB needs explicit
+contracts around hidden system state. Bandwidth counters alone do not prove a
+route is healthy; reference ownership alone does not prove retired descriptors
+are bounded; and "the database restarted" alone does not prove durable state
+was published safely.
+
+The near-term design track is compact witness generation for each owner
+boundary. Runtime routes need resource-credit witnesses, descriptor lifetimes
+need bounded-retirement witnesses, and durable storage transitions need
+crash-recovery witnesses. These should be small enough to run constantly:
+short generated sequences, explicit state counters, and post-condition checks
+that name the violated contract.
+
+Category gaps remain around modern application-level crash consistency and
+PM/CXL-oriented crash testing. The next candidates should include PM file
+system testing, synthesis-aided crash-consistent storage, or application-level
+representative crash testing before returning to another GPU analytics paper.
+
+Benchmark priority is a three-part fault matrix: hidden host-domain contention
+under retained reads, stalled-worker descriptor retirement under route churn,
+and WAL/manifest crash recovery under bounded operation sequences. A route
+optimization should not be promoted unless it can survive all three.

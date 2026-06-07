@@ -1199,12 +1199,13 @@ Append new candidates here as each paper is processed.
   checking how GPU DB should surface, retry, or quarantine failed flushes in
   WAL, checkpoint, resident-image, and cold-tier manifest publication paths.
   Journal entry added 2026-06-07 from the USENIX page and PDF.
-- `queued` — **Finding Crash-Consistency Bugs with Bounded Black-Box Crash
+- `reviewed` — **Finding Crash-Consistency Bugs with Bounded Black-Box Crash
   Testing**, Mohan et al., OSDI 2018.
   URL: `https://www.usenix.org/conference/osdi18/presentation/mohan`
   Why: the fsync-failure paper contrasts transient block-write failures with
   crash-consistency testing; useful for designing a bounded crash/fault matrix
-  over GPU DB WAL, checkpoint, manifest, and route-publication states.
+  over GPU DB WAL, checkpoint, manifest, and route-publication states. Journal
+  entry added 2026-06-07 from the USENIX page and PDF.
 - `queued` — **Application Crash Consistency and Performance with CCFS**,
   Pillai et al., FAST 2017.
   URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/pillai`
@@ -1244,6 +1245,27 @@ Append new candidates here as each paper is processed.
   Why: TIPS compares against NVTraverse for durable-linearizable lock-free
   indexes; useful for deciding whether GPU DB future-tier indexes should pay
   per-traversal persistence costs or keep persistence off read paths.
+- `queued` — **Chipmunk: Investigating Crash-Consistency in Persistent-Memory
+  File Systems**, LeBlanc et al., EuroSys 2023.
+  URL: `https://doi.org/10.1145/3552326.3567498`
+  PDF: `https://jamesbornholt.com/papers/chipmunk-eurosys23.pdf`
+  Why: modern follow-up to CrashMonkey/ACE for persistent-memory file systems;
+  useful for checking whether GPU DB's future PM/CXL warm-tier metadata needs
+  PM-specific crash-state generation beyond block-device persistence points.
+- `queued` — **Synthesis-Aided Crash Consistency for Storage Systems**, Van
+  Geffen, Wang, Torlak, and Bornholt, ECOOP 2023.
+  URL: `https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.ECOOP.2023.35`
+  DOI: `https://doi.org/10.4230/LIPIcs.ECOOP.2023.35`
+  Why: discovered while reviewing B3; useful for comparing black-box witness
+  generation with storage code synthesis and crash-consistency-by-construction
+  for future WAL/checkpoint/manifest state machines.
+- `queued` — **Scalable and Accurate Application-Level Crash-Consistency
+  Testing via Representative Testing**, arXiv 2025.
+  URL: `https://arxiv.org/abs/2503.01390`
+  Why: modern application-level crash-testing follow-up discovered from the
+  B3 line; useful for deriving representative crash states for GPU DB's
+  database-level WAL, checkpoint, object-manifest, and route-publication
+  operations without enumerating every low-level storage state.
 
 - `queued` — **Atlas: Scalable and Available State Machine Replication**,
   Enes et al., EuroSys 2020.
