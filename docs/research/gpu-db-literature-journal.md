@@ -38,6 +38,180 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - Steam prunes MVCC garbage on the write path before chains grow
+
+**Citation:** Jan Boettcher, Viktor Leis, Thomas Neumann, and Alfons
+Kemper. "Scalable Garbage Collection for In-Memory MVCC Systems."
+PVLDB 13(2), 2019. DOI: `https://doi.org/10.14778/3364324.3364328`.
+Retrieved 2026-06-07 from the PVLDB PDF:
+`https://www.vldb.org/pvldb/vol13/p128-bottcher.pdf`.
+
+**Category:** MVCC / snapshot / visibility; transaction processing /
+write path; runtime / session scale.
+
+**Relevance tags:** Steam; MVCC garbage collection; eager pruning of
+obsolete versions; long-running transactions; HTAP; CH benchmark;
+version chains; thread-local transaction lists; active timestamp lists;
+foreground GC; snapshot retention; skewed hot tuples; reader batching.
+
+**Core idea:** Steam attacks a specific MVCC failure mode: a long read
+snapshot can keep one old version alive while many in-between versions
+are already useless. Traditional high-watermark GC keeps too much of
+that chain because it only tracks the oldest active transaction. Steam
+uses the full active-transaction timestamp set to prune obsolete
+in-between versions whenever a chain is touched, especially when an
+update would extend the chain.
+
+For GPU DB, the strongest transferable idea is that version cleanup
+should be a write-path and snapshot-publication contract, not only a
+best-effort background vacuum. Retained GPU snapshots and 1M logical
+sessions can create many old read boundaries; if every active snapshot
+turns hot rows into long version chains, retained reads and write
+admission will amplify each other's latency. The write owner should keep
+hot chains bounded by active read generations and expose cleanup debt as
+admission telemetry.
+
+**Concrete mechanisms:**
+
+- Steam replaces global active/committed transaction lists with
+  thread-local transaction lists. Each thread publishes only its local
+  minimum start timestamp through an atomic 64-bit value; other threads
+  scan these values to derive a global minimum without latching a shared
+  transaction list.
+- Normal committed-version cleanup is interspersed with transaction
+  processing. Worker threads reclaim obsolete versions after commits, so
+  cleanup work is tied to the threads producing and observing version
+  churn rather than to one detached background cleaner.
+- The key optimization is eager pruning of obsolete versions (EPO). Each
+  thread periodically builds a sorted list of currently active
+  transaction start timestamps. When it touches a version chain, it keeps
+  only versions visible to some active transaction and removes
+  in-between versions that no active transaction can still need.
+- Steam prunes on version creation: when an update inserts a new version
+  and already has the chain latched, it prunes the same chain. This
+  makes the updater pay bounded cleanup cost before the chain grows
+  unbounded, and it prevents slow readers from becoming responsible for
+  traversing avoidable garbage.
+- Because HyPer-style update versions store changed attributes rather
+  than full tuple copies, EPO cannot always drop an in-between version
+  blindly. If the version to be removed contains an attribute not present
+  in the older visible version, Steam merges the missing before-image
+  attributes into the retained visible version before unlinking the
+  intermediate record.
+- Active timestamp list creation is amortized. Threads can reuse a
+  recent sorted active-list snapshot, and the paper reports that a 5 ms
+  update period showed no measurable overhead in cheap key-value update
+  microbenchmarks while remaining far below the lifetime of even short
+  long-running transactions.
+- The evaluation reimplements several GC styles inside HyPer for
+  apples-to-apples comparison: epoch/watermark styles, HANA-like lazy
+  exact interval pruning, Hekaton-like background identification plus
+  worker cleanup, and Steam's continuous foreground pruning. Workloads
+  include CH benchmark mixes, TPC-C, cheap key-value updates with Zipf
+  skew, and varying read/write ratios.
+- In the CH benchmark with one read and one write thread over 300k
+  transactions, EPO reduced GC traversed versions from about 1.2 billion
+  to 4.2 million, average GC chain length from 287.43 to 1.07, maximum
+  GC chain length from 30,287 to 2, and transaction throughput from
+  6,554 to 30,580 txn/s. Query-side traversed versions dropped from
+  120 million to 37 million.
+- The paper reports that Steam with EPO achieved roughly 3x higher write
+  throughput than the second-best approach in its 10-minute CH run, while
+  read throughput stayed closer because many analytical scans did not
+  touch the hottest chains. It also reports that GC frequency choices
+  alone can change throughput by more than 500x for the compared systems.
+
+**GPU DB mapping:** P8 currently treats CPU MVCC state as canonical and
+GPU resident state as immutable, rebuildable snapshots. Steam says the
+CPU truth still needs precise, low-contention cleanup before retained
+GPU snapshots make old read boundaries common. A retained GPU snapshot
+should publish its read generation into a compact active-generation set;
+the mutation owner can prune row or segment version chains down to the
+versions visible to active CPU/GPU snapshots.
+
+The active timestamp list maps naturally to snapshot-generation
+publication. Instead of tracking every logical session, GPU DB can track
+the small set of distinct retained read generations currently held by IO
+workers, read workers, GPU execution owners, and long analytical scans.
+Cleaning against distinct generations, not sessions, is the only
+plausible shape near 1M logical sessions.
+
+EPO maps to hot-key and hot-segment write admission. When a write extends
+a hot chain, the owner should prune in-between versions while the chain,
+row group, or segment delta is already owned. That keeps write-produced
+cleanup local and prevents a later retained read from paying a surprise
+version traversal cost.
+
+The before-image merge rule maps to column-group MVCC. If GPU DB stores
+delta versions by changed column family, pruning an intermediate delta
+must preserve the older snapshot's logical row by merging missing column
+before-images into the retained version or into a compact snapshot-delta
+record. Full-row versions can drop intermediates more simply, but with
+higher memory and write amplification.
+
+Reader batching by start timestamp is directly relevant to read
+micro-batching. The paper notes that fewer active read timestamps make
+pruning more effective. GPU DB can group compatible retained reads by
+snapshot generation, route shape, and latency class, which helps both GPU
+batching and MVCC cleanup. The tradeoff is explicit: delaying readers to
+share generations may improve cleanup and batching but can hurt p50.
+
+**Risks and mismatches:** Steam is implemented and evaluated in an
+in-memory HyPer-style MVCC engine. It does not cover WAL durability,
+crash recovery, SQL DDL, secondary-index cleanup, GPU kernels, resident
+HBM pressure, pinned buffers, remote tiers, or pgwire session
+multiplexing.
+
+The paper's thread-local design assumes a worker-thread transaction
+model. GPU DB's production runtime targets async IO workers, owner
+domains, read workers, and GPU execution owners. The same idea should be
+translated into owner-published generation minima, not copied as
+thread-per-session transaction lists.
+
+Eager pruning adds work to the update path. That is attractive when it
+prevents runaway chains, but it must be bounded under hot-key write
+bursts. GPU DB needs per-route cleanup budgets, cleanup-debt telemetry,
+and fallback to deferred maintenance when pruning would violate write
+p99.
+
+The active timestamp list grows with the number of distinct active
+snapshot generations. If the engine allows every session to hold a
+unique long-lived snapshot, exact pruning can become expensive. This is
+an admission and API problem: retained GPU/read snapshots need generation
+classes, age caps, or explicit long-reader quotas.
+
+The evaluation reports CPU in-memory behavior on a 20-core/40-thread
+machine and CH/TPC-C-style workloads. It does not measure GPU-resident
+snapshot invalidation, columnar segment refresh, large cold-tier scans,
+or crash-replay interaction with pruned version chains.
+
+**Benchmark candidates:**
+
+- Implement a distinct active-read-generation registry for CPU reads,
+  retained GPU snapshots, and long scans. Measure registry update cost
+  with 1K, 100K, and 1M logical sessions collapsed into varying numbers
+  of distinct generations. Gate: cleanup cost scales with generations,
+  not sessions.
+- Add an MVCC hot-chain benchmark with three cleanup modes: oldest
+  watermark only, background cleanup, and write-owner eager pruning
+  against active generations. Measure write p50/p99, read p50/p99,
+  chain length, cleanup debt, retired bytes, and snapshot age.
+- Test column-delta pruning with changed-column before images. Gate:
+  every retained generation reconstructs the same rows before and after
+  pruning, including updates that touch disjoint column families.
+- Add retained GPU snapshot pressure: hold one or more resident
+  generations while writes update hot rows or hot segments. Failure
+  condition: a valid retained GPU read forces unbounded CPU version-chain
+  growth without admission, cleanup, or invalidation telemetry.
+- Compare reader-start policies: immediate snapshot assignment, coarse
+  generation ticks, and micro-batch-aligned read generations. Measure
+  p50 latency cost against chain length, cleanup time, and GPU batch
+  efficiency.
+- Add cleanup-budget admission to hot writes. If eager pruning exceeds a
+  per-route microsecond or work budget, record cleanup debt and decide
+  between throttling, background owner cleanup, or rejecting/deferring
+  new long snapshots.
+
 ### 2026-06-07 - Chablis splits fast local commits from global snapshot publication
 
 **Citation:** Tamer Eldeeb, Philip A. Bernstein, Asaf Cidon, and

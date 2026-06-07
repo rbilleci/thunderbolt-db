@@ -206,6 +206,22 @@ Where this matters most for GPU DB, in priority order:
   Why: modern production metadata-MVCC design selected after recent reviews
   called for more MVCC/snapshot work; relevant to versioned route metadata,
   DDL/read concurrency, snapshot-safe plan reuse, and route-metadata GC.
+- `reviewed` — **Scalable Garbage Collection for In-Memory MVCC Systems**,
+  Boettcher, Leis, Neumann, and Kemper, PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol13/p128-bottcher.pdf`
+  DOI: `https://doi.org/10.14778/3364324.3364328`
+  Why: selected after the recent journal called for more MVCC garbage
+  collection work and the queue lacked a strong queued candidate in that lane;
+  useful for bounding hot version chains under long retained CPU/GPU read
+  snapshots with exact active-generation pruning. Journal entry added
+  2026-06-07.
+- `queued` — **Practically and Theoretically Efficient Garbage Collection for
+  Multiversioning**, Blelloch et al., arXiv 2022.
+  URL: `https://arxiv.org/abs/2212.13557`
+  Why: discovered while searching for modern MVCC garbage-collection
+  follow-ups; useful for checking whether newer multiversion GC algorithms can
+  provide bounded retired-memory guarantees for retained snapshots beyond
+  Steam's in-memory DBMS implementation.
 
 ### Runtime scale, HFT-style mechanics, and admission
 
