@@ -38,6 +38,171 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - DoppelGanger++ makes dependency ordering a streaming state problem
+
+**Citation:** Wonseok Lee, Jaehyun Ha, Wook-Shin Han, Changgyoo
+Park, Myunggon Park, Juhyeng Han, and Juchang Lee.
+"DoppelGanger++: Towards Fast Dependency Graph Generation for
+Database Replay." Proceedings of the ACM on Management of Data
+2(1), article 67, 2024. DOI: `https://doi.org/10.1145/3639322`.
+Retrieved 2026-06-07 from DBLP/DOI metadata, the accessible abstract
+mirror, and the PVLDB 2024 demonstration paper:
+`https://dblp.org/rec/journals/pacmmod/LeeHHPPHL24`,
+`https://www.vldb.org/pvldb/vol17/p4313-han.pdf`. Direct ACM DOI and
+PDF fetches returned Cloudflare 403 pages from the cron worker, so
+details below are limited to mechanisms exposed in the abstract,
+metadata, demo paper, and public disclosure text; full-paper-only
+details are marked unknown.
+
+**Category:** Transaction processing, write path, and concurrency
+control; runtime/session ordering; replay and deterministic schedule
+generation.
+
+**Relevance tags:** dependency graph; deterministic replay; session
+ordering; conflict ordering; SSFS; stateful single forward scan;
+parallel scan; output determinism; TPC-C; high-concurrency replay;
+hot-key ordering; route schedule witness; request capture.
+
+**Core idea:** DoppelGanger++ targets database replay systems that
+capture production requests and replay them in a test system while
+preserving output determinism and maximizing replay concurrency. The
+baseline generates many candidate dependency edges by repeatedly
+scanning backward for each request, then pays an expensive transitive
+reduction cost to remove redundant edges.
+
+The paper's transferable move is to avoid building a bloated graph in
+the first place. It defines classes of dependency graphs, identifies
+dominant redundant edges such as object transitivity and inter-session
+transitivity, and generates compact dependency edges with a stateful
+single forward scan rather than repeated backward scans plus global
+pruning. For GPU DB, this suggests that conflict/order witnesses for
+replay, deterministic batches, and hot-key admission should be
+generated while requests flow through owners, not reconstructed later
+with quadratic history scans.
+
+**Concrete mechanisms:**
+
+- A captured workload is modeled as user requests carrying SQL
+  statements and session ids. The replay dependency graph has one node
+  per request; edges encode relative ordering constraints needed for
+  deterministic output during concurrent replay.
+- The baseline described in the paper and demo uses repeated backward
+  session scans to find incoming edges for each request, then applies
+  transitive reduction. The authors report that this can become
+  quadratic in the number of requests and can consume more than half of
+  end-to-end capture-and-replay time.
+- DoppelGanger++ names two dominant redundant-edge families: object
+  transitivity and inter-session transitivity. The accessible demo
+  explains that the system removes these during graph generation rather
+  than after constructing a larger graph.
+- The stateful single forward scan (SSFS) processes requests in
+  timestamp order. For each current request, it generates incoming
+  edges from maintained state, updates that state, and appends the
+  current edge set. The public disclosure presents the skeleton as:
+  initialize current edges and states, iterate requests by increasing
+  timestamp, generate incoming edges from states and graph type, update
+  states, and return the resulting graph.
+- The maintained states are memoized summaries needed for edge
+  generation. Publicly accessible text says states are stored and
+  maintained for efficient dependency graph generation; exact data
+  structures from the full paper are unknown from accessible sources.
+- Parallel SSFS partitions the workload by time range, generates local
+  dependency graphs, then hierarchically merges them while adding
+  missing inter-partition edges and maintaining merge states. Public
+  disclosure says candidate destination vertices include the first
+  commit request accessing an object and non-commit requests before
+  that first commit in the right-side partition.
+- The paper reports implementation inside a leading commercial DBMS
+  and evaluation on TPC-C, SD benchmarks, and a real-world customer
+  workload. The abstract reports dependency-graph generation time
+  improves by up to two orders of magnitude compared with the
+  state-of-the-art baseline.
+- The PVLDB 2024 demo paper reports that the SSFS path reduces more
+  than 50% of end-to-end capture-and-replay pipeline time in the
+  demonstrated system. Exact workload sizes, edge counts, memory
+  footprints, and p99 replay behavior are unknown from the accessible
+  sources.
+
+**GPU DB mapping:** Use request capture as an ordering witness, not
+only as a debug trace. Mutation owners, read snapshot routers, and GPU
+batch schedulers can emit compact dependency facts while processing
+requests: session predecessor, touched logical objects or key ranges,
+snapshot boundary, commit/visibility generation, resident route
+generation, and any fallback/retry edge. A later replay or schedule
+simulator should consume those facts without rescanning full SQL
+history.
+
+For hot-key write admission, the SSFS idea maps to online conflict
+state. Instead of deriving a dependency graph after a burst, maintain
+per-partition and per-object summaries such as last writer, last commit
+generation, last session request, pending high-priority transaction,
+and compatible retained-read batch generation. Incoming requests can
+then be placed into a deterministic batch or deferred with a concrete
+edge witness.
+
+For GPU micro-batches, dependency edges should distinguish order that
+is semantically required from order that is only a capture artifact. If
+many retained reads share a snapshot generation and do not conflict
+with a writer's visibility boundary, they should not inherit redundant
+session or object edges that serialize the batch unnecessarily. The
+benchmark should track edge count and replay/schedule width, not only
+throughput.
+
+For crash and recovery testing, the graph can become a compact oracle:
+given a captured execution, replay with different GPU/CPU route choices
+while preserving dependency edges and compare SQL outputs, visibility
+boundaries, and error results. This is especially useful before trusting
+learned route advisors or deterministic transaction schedules, because
+the replay graph can separate safe concurrency from accidental timing.
+
+**Risks and mismatches:** DoppelGanger++ is about database replay, not
+online transaction execution. A replay dependency edge is not the same
+as a commit dependency, WAL dependency, MVCC visibility rule, or
+serializability proof. GPU DB must not use a replay graph as a
+substitute for concurrency-control validation.
+
+The accessible sources do not expose every graph class, state
+definition, proof, or full evaluation table. The journal should treat
+the implementation details as a design hint, not a complete recipe,
+until the full PACMMOD body is accessible.
+
+Capture overhead matters. If GPU DB records per-request dependencies
+for 1M logical sessions, the metadata path must be bounded, sampled, or
+restricted to replay/debug modes. The production hot path should emit
+small typed witnesses, not allocate arbitrary graph nodes per request.
+
+Replay determinism can over-constrain live scheduling if used naively.
+Captured session order and object dependencies are useful for testing,
+but live admission should still prioritize WAL-before-visibility,
+snapshot validity, tail latency, and overload policy.
+
+**Benchmark candidates:**
+
+- Add a dependency-witness capture prototype for mutation and retained
+  read requests. Record `{session_id, request_seq, object/key_range,
+  read_snapshot_generation, commit_generation, route_generation,
+  result_hash}` and compare graph construction by backward scans versus
+  forward-maintained state.
+- Build a replay scheduler that preserves captured dependency edges
+  while varying CPU/GPU route choices. Gate: SQL result hashes,
+  visibility generations, and error outcomes match capture; failure
+  condition: a route advisor produces a different visible result despite
+  obeying local queue rules.
+- Measure edge reduction and schedule width for TPC-C-like hot-key
+  batches, retained lookup storms, and mixed read/write sessions.
+  Report graph-build time, edges per request, maximum runnable frontier,
+  replay throughput, and memory bytes per captured request.
+- Compare deterministic batch generation with and without online
+  per-object/per-session summaries. Expected win: fewer aborts or
+  unnecessary deferrals under contention without a quadratic prepass.
+- Stress 1M logical-session trace capture with tiny requests. Gate:
+  dependency-witness capture stays bounded in memory and does not
+  inflate p99 retained-read latency beyond the configured threshold.
+- Use the captured graph as a regression oracle for learned/adaptive
+  route policies. Failure condition: a new policy improves average
+  throughput but violates a dependency edge, snapshot generation, or
+  WAL-before-visibility witness.
+
 ### 2026-06-07 - Firmament makes global admission cheap enough to keep centralized
 
 **Citation:** Ionel Gog, Malte Schwarzkopf, Adam Gleave,

@@ -1483,12 +1483,19 @@ Append new candidates here as each paper is processed.
   sets, integrates MVCC-style fallback, and generates conflict-aware
   deterministic schedules under skew. Journal entry added 2026-06-06 from
   arXiv v2.
-- `queued` — **DoppelGanger++: Towards Fast Dependency Graph Generation for
+- `reviewed` — **DoppelGanger++: Towards Fast Dependency Graph Generation for
   Database Replay**, Lee et al., PACMMOD 2024.
-  DOI: `https://doi.org/10.1145/3639305`
+  URL: `https://dblp.org/rec/journals/pacmmod/LeeHHPPHL24`
+  DOI: `https://doi.org/10.1145/3639322`
+  Supporting demo:
+  `https://www.vldb.org/pvldb/vol17/p4313-han.pdf`
   Why: ForeSight cites SSFS/DoppelGanger++ as a fast dependency-graph
   generation baseline; useful for separating replay-oriented dependency graph
   construction from online route scheduling and conflict prediction.
+  Journal entry added 2026-06-07 from DBLP/DOI metadata, accessible abstract
+  text, and the PVLDB 2024 demo paper after direct ACM DOI/PDF fetches
+  returned Cloudflare 403 pages. The previously queued DOI was corrected from
+  `10.1145/3639305` to `10.1145/3639322`.
 - `queued` — **Practical Deterministic Transaction Processing with Low-cost
   Re-execution**, Li, Wang, and Huang, ICPADS 2024.
   DOI: `https://doi.org/10.1109/ICPADS63350.2024.00065`
