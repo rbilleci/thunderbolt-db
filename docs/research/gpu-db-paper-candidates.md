@@ -5807,13 +5807,14 @@ Append new candidates here as each paper is processed.
   useful for deciding when GPU DB should prefer deterministic rerun,
   lock-based fallback, or owner-serialized execution for mispredicted
   read/write sets. Journal entry added 2026-06-06.
-- `queued` — **Fast Abort-Freedom for Deterministic Transactions**,
+- `reviewed` — **Fast Abort-Freedom for Deterministic Transactions**,
   Chen, Wu, Zhong, and Eriksson, IPDPS 2024.
   URL: `https://par.nsf.gov/servlets/purl/10548863`
+  DOI: `https://doi.org/10.1109/IPDPS57955.2024.00067`
   Why: discovered while reviewing Aria; modern deterministic-transaction
   follow-up focused on reducing aborts, useful for testing whether GPU DB can
   keep batch/snapshot execution while avoiding retry amplification under
-  hot-key or dependency-heavy workloads.
+  hot-key or dependency-heavy workloads. Journal entry added 2026-06-07.
 - `reviewed` — **Caracal: Contention Management with Deterministic
   Concurrency Control**, Qin, Demke Brown, and Goel, SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483591`
@@ -5829,6 +5830,13 @@ Append new candidates here as each paper is processed.
   evaluation; useful for deciding whether GPU DB owner-thread and
   partition-owner experiments should emulate many-core effects or require
   real multi-socket validation.
+- `queued` — **Design Principles for Scaling Multi-Core OLTP Under High
+  Contention**, Ren, Faleiro, and Abadi, SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2882955`
+  Why: DecentSched cites this as a high-contention OLTP scheduling and
+  partitioning baseline; useful for comparing deterministic queue ordering
+  against core design principles for hot-key contention, ownership, and
+  partition-local execution.
 - `reviewed` — **NWR: Rethinking Thomas Write Rule for Omittable Write
   Operations**, Nakazono et al., arXiv 2020.
   URL: `https://arxiv.org/abs/1904.08119`

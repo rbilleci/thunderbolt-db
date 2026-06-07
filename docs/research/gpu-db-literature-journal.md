@@ -38,6 +38,160 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-07 - DecentSched makes deterministic hot writes self-schedule
+
+**Citation:** Chen Chen, Xingbo Wu, Wenshao Zhong, and Jakob Eriksson.
+"Fast Abort-Freedom for Deterministic Transactions." IPDPS 2024. DOI:
+`https://doi.org/10.1109/IPDPS57955.2024.00067`. Retrieved 2026-06-07
+from the NSF PAR PDF: `https://par.nsf.gov/servlets/purl/10548863`.
+
+**Category:** transaction processing / write path and concurrency control;
+runtime scheduling for deterministic transaction classes.
+
+**Relevance tags:** deterministic transactions; abort freedom;
+decentralized scheduling; per-object queues; conflict discovery; tail
+latency; hot-key writes; queue sharing; epoch reclamation; transaction id
+allocation; route-template scheduling; owner-ring admission.
+
+**Core idea:** DecentSched targets transactions whose read/write object sets
+are known before execution. Instead of letting OCC discover conflicts late or
+using one centralized scheduler to order every transaction, each transaction
+enqueues itself on the objects it will access, discovers enough dependencies
+from those queues to see cycles, and derives a globally consistent execution
+order locally. The result is serializable execution without
+concurrency-control-induced aborts, while avoiding a monolithic scheduler
+bottleneck.
+
+The strongest transferable idea for GPU DB is that deterministic hot-write
+templates should carry an explicit conflict footprint and schedule witness.
+For known-shape writes, COPY chunks, counter updates, and retained lookup
+batches, the engine can generate an order from owner-local queue positions
+before execution rather than burning latency on abort/retry loops or routing
+all ordering through one global owner.
+
+**Concrete mechanisms:**
+
+- Each transaction has a known access set of object ids and access modes
+  (`R` or `W`) before it executes. Objects are the scheduling unit, roughly
+  rows in a database table.
+- DecentSched keeps a queue per object in the model. A transaction appends a
+  queue entry containing its transaction id and access type to every object in
+  its access set.
+- Direct dependencies are transactions ahead of the current transaction in an
+  accessed object's queue, except when both accesses are read-only.
+- Indirect dependencies are found recursively from the direct-dependency sets
+  of direct dependencies. A transaction waits until a dependency's `ready`
+  flag shows its direct dependencies are complete before reading them.
+- If two transactions are in each other's dependency sets, they are treated as
+  part of a dependency cycle and ordered by transaction id. If only one sees
+  the other as a dependency, the dependency runs first.
+- The scheduler avoids unnecessary waits when two transactions are only
+  indirectly connected through another transaction and neither is the other's
+  direct dependency.
+- Queue search is pruned with a retired flag. A finished transaction can be
+  retired once its dependency set and all unfinished transactions ahead of it
+  in queues have completed, letting later scans stop earlier.
+- The practical implementation bounds metadata by sharing queues: objects map
+  to `m` lock-free queues by hash. False positives cause extra waiting but do
+  not break serializability.
+- Queue entries are inserted with lock-free singly linked lists and CAS.
+  Memory for transaction metadata and queue entries is reclaimed by epochs
+  after worker synchronization.
+- Transaction ids are allocated per worker with stride `worker_count` and
+  reset at epoch boundaries, avoiding one global fetch-and-add bottleneck
+  while limiting long-term unfairness.
+- A waiting transaction may execute program logic opportunistically on local
+  copies. If its real scheduled turn arrives and the read versions still
+  match, it can commit immediately.
+- Evaluation integrates DecentSched with DBx1000/Bamboo and compares against
+  centralized scheduling, ordered locking, OCC variants, and 2PL variants on
+  YCSB and TPC-C-NP. The paper reports up to 1.7x throughput over the
+  second-best protocol on write-intensive YCSB, up to 2.1x on long YCSB
+  transactions, and up to 1.8x on moderate-contention TPC-C-NP except for
+  OCC at high thread counts, where OCC can beat throughput but with much
+  higher p99 latency.
+
+**GPU DB mapping:** Treat DecentSched as a route-template mechanism, not a
+general SQL magic wand. It fits operations whose conflict footprint is known
+or cheaply derivable before execution: prepared point updates, counter-like
+commutative updates after semantic certification, COPY batches by key range,
+index-maintenance batches, refresh/invalidation tasks touching known
+segments, and same-shape retained lookup batches that must preserve
+visibility boundaries.
+
+For the write path, owner domains could publish per-key or per-segment
+conflict queues. A mutation request would enqueue its footprint, derive a
+local schedule witness, then execute only when predecessor writes or
+write/read conflicts are safe. This may reduce retry amplification under hot
+keys while preserving WAL-before-visibility: the schedule orders execution,
+but durable commit still requires WAL append/flush before visibility
+publication.
+
+For GPU batch execution, the mechanism suggests a way to pre-order
+deterministic write or refresh batches before launching kernels. Queue
+positions can define which GPU batch owns each version slot or segment
+repair, while the CPU owner remains responsible for WAL, MVCC generation
+publication, and conflict-footprint validation.
+
+For 1M logical sessions, the paper reinforces a split between session count
+and active scheduling state. Most sessions should not occupy transaction
+metadata. Only admitted deterministic commands enter bounded owner-local
+queues, and the queue-sharing parameter becomes a measured admission knob
+that trades false-positive waits against cache footprint.
+
+For retained read snapshots, DecentSched's direct-versus-indirect dependency
+distinction is useful for route explanations. A read-only retained route
+should not wait merely because it is indirectly connected to a hot writer
+unless there is an actual read/write conflict on its visibility generation,
+segment, or predicate footprint.
+
+**Risks and mismatches:** DecentSched assumes deterministic transactions with
+known access sets. General SQL queries, range predicates, secondary-index
+lookups whose touched rows are discovered during execution, and arbitrary
+user logic do not fit unless a reconnaissance or certification phase first
+produces a sound footprint.
+
+The paper provides serializability for the in-memory concurrency-control
+protocol, not WAL durability, crash recovery, MVCC snapshot retention, DDL
+invalidation, or GPU cache coherence. GPU DB must add those proof fields
+before using a schedule witness to publish visibility.
+
+Queue sharing can create false conflicts. That is acceptable for correctness,
+but under 1M sessions or high-cardinality tables the queue count, hash
+quality, and epoch size could dominate p99 latency. Queue tuning needs to be
+measured per workload and per owner domain.
+
+The reported system runs on a 32-hardware-thread dual-socket CPU server.
+There is no GPU evaluation, no distributed storage tier, and no network
+protocol admission path. The result should seed CPU owner and batch-ordering
+benchmarks before being mapped to GPU kernels.
+
+**Benchmark candidates:**
+
+- Implement a deterministic hot-key scheduling simulator with per-key queues,
+  shared queues, and an owner-local schedule witness. Compare against OCC
+  retry, ordered locking, and owner-serialized execution under Zipfian
+  read/write mixes. Measure throughput, p50/p99, aborts, false-positive
+  waits, and queue metadata bytes.
+- Add a prepared-statement footprint gate: only templates with exact point
+  keys or certified segment/key ranges may enter DecentSched-style ordering.
+  Failure condition: an execution touches a row, segment, index entry, or
+  predicate range outside its declared footprint.
+- Prototype deterministic COPY chunk admission by key range or segment id.
+  Gate: WAL append, resident invalidation, CPU visibility publication, and
+  schedule order remain explainable for every chunk.
+- Compare queue counts for 1K, 16K, 64K, and 1M logical keys with bounded
+  active transactions. Measure false-positive waits, cache misses,
+  dependency-search time, and metadata footprint.
+- Test GPU batch pre-ordering for known key updates: CPU generates schedule
+  witnesses and version slots, GPU computes updates, CPU publishes WAL/MVCC.
+  Gate: no stale resident snapshot can observe an update before WAL-backed
+  visibility.
+- Benchmark read-only retained routes that share indirect dependencies with
+  hot writes. Expected result: reads wait only on direct visibility or
+  predicate-footprint conflicts, not on unrelated transitive scheduler
+  structure.
+
 ### 2026-06-07 - JUSTDO turns logging into resumable progress state
 
 **Citation:** Joseph Izraelevitz, Terence Kelly, and Aasheesh Kolli.
