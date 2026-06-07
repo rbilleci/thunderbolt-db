@@ -98841,3 +98841,159 @@ and coordination mechanisms, not a direct performance claim.
 - Track model budget as a first-class metric: samples required before
   improvement, benchmark hours consumed, stale-policy regressions after
   workload drift, and the cost of revalidating after schema or route changes.
+
+### 2026-06-07 - LSNVMM makes the log the home location
+
+**Citation:** Qingda Hu, Jinglei Ren, Anirudh Badam, Jiwu Shu, and Thomas
+Moscibroda. "Log-Structured Non-Volatile Main Memory." USENIX ATC 2017.
+Retrieved 2026-06-07 from
+`https://www.usenix.org/system/files/conference/atc17/atc17-hu.pdf`.
+
+**Category:** WAL, logging, persistent-memory storage layout, and multi-tier
+cache / data placement.
+
+**Relevance tags:** log-as-home, persistent memory, write amplification,
+fragmentation control, address translation, thread-local logs, cleaning,
+parallel recovery, CXL/NVMM warm tier, route metadata placement.
+
+**Core idea:** LSNVMM removes the split between a transactional log and a
+separate persistent home space. Allocations and updates are appended to the
+NVMM log, and the appended log record becomes the current physical location of
+the data. Applications still see a stable virtual home address, but a runtime
+mapping translates that address to the latest log position.
+
+For GPU DB, the transferable shape is a warm-tier segment design where the
+durable append stream is not just a replay artifact. For selected derived
+metadata, resident-route descriptors, or cold/warm segment fragments, the
+append record can be the live physical copy, while stable logical identifiers
+are resolved through compact mapping tables that can be rebuilt after crash.
+
+**Concrete mechanisms:**
+
+- LSNVMM exposes allocation/free and transaction operations. Stores inside a
+  transaction are buffered and then persisted atomically to log records; loads
+  translate the application home address to the current log location.
+- Address mappings live in DRAM for speed and are rebuilt from persistent logs
+  after crash. Clean shutdowns can flush compacted metadata for faster restart.
+- Mapping uses a two-layer structure: a fixed partition index routes a home
+  address in O(1), and each partition has a smaller skip-list tree for range
+  mappings where access granularity may differ from allocation granularity.
+- Consecutive writes to contiguous home addresses are grouped so one appended
+  log region and one mapping update can cover a larger range.
+- Thread-local tree-node caches exploit locality. The paper reports a 92.2%
+  average hit ratio and a 30.1% average throughput gain from those caches.
+- The NVMM region is split into static chunks. Each thread owns local logs, and
+  chunks can be cleaned and recycled incrementally.
+- Separate update, allocation, and deallocation logs improve cleaning because
+  stores and allocations have different locality. Tombstones represent freed
+  regions for recovery filtering.
+- Recovery runs like a map-reduce pass: scan chunks in parallel, group valid
+  log entries by home partition, then replay each partition's entries by home
+  address and version to rebuild mappings. The paper reports rebuilding 10 GB
+  of NVMM logs in 3.0 seconds with eight recovery threads for 128-byte values.
+- Evaluation modifies TinySTM and compares against Mnemosyne-style redo and
+  undo logging. Reported results include up to 89.9% higher transaction
+  throughput, up to 82.8% lower write traffic, 55.3% average throughput gain,
+  and 72.2% average write-wear reduction when NVMM usage is over 90%.
+
+**GPU DB mapping:** Treat this as a candidate design for a CPU/CXL/NVMe-adjacent
+warm tier, not as a replacement for the SQL WAL. The authoritative logical WAL
+must still preserve commit order, MVCC version history, replication, and
+recovery facts. But derived physical state can use log-as-home layout: route
+metadata blocks, resident snapshot manifests, warm column fragments, and
+rebuildable secondary structures can be appended and made current by publishing
+logical-to-physical mapping entries.
+
+The two-layer mapping suggests a route-descriptor table keyed first by stable
+partition or segment generation, then by a small per-partition interval/index
+structure. GPU DB already needs stable logical table/segment ids while physical
+fragments move among HBM, host DRAM, CXL, NVMe, and object/cold tiers. A
+partition-local mapping tree plus tiny hot cache could let the planner and
+runtime dereference current physical placement without scanning global state.
+
+Group update maps directly to mutation-owner epochs. Within one unpublished
+generation, contiguous route metadata updates, resident invalidation records,
+or warm-tier column fragments can be coalesced before publication. This should
+be limited to derived state unless a correctness proof preserves every
+SQL-visible version required by MVCC and recovery.
+
+The chunk and cleaner model gives a concrete benchmark shape for warm-tier
+fragmentation. Instead of treating cold-tier compaction as a background mystery,
+GPU DB can expose chunk live-byte ratios, cleaning bandwidth, per-tier write
+traffic, mapping-cache hit rate, and recovery rebuild time.
+
+**Risks and mismatches:** LSNVMM is a persistent transactional-memory library,
+not a DBMS storage engine. It assumes instrumented loads/stores, TinySTM-style
+transactions, user-space address mapping, and emulated NVMM rather than real
+CXL/NVMe/GPU tier behavior. Its stable home addresses are process-level memory
+addresses, not SQL row ids, tuple ids, index keys, WAL LSNs, or replicated
+storage identities.
+
+Mapping indirection is not free. A DRAM footprint around 16.9% of NVMM for
+128-byte values is acceptable for some memory heaps but may be too high for
+route metadata at GPU DB scale. GPU DB needs bounded metadata budgets and must
+measure mapping cache miss cost under 1M logical sessions.
+
+Log cleaning moves live physical data. Any GPU DB adaptation must preserve
+snapshot pins, resident GPU handles, DMA safety, and recovery references while
+moving warm-tier fragments. A cleaner cannot reclaim a chunk merely because
+new mappings exist if an older retained snapshot, GPU kernel, or replay cursor
+can still reference it.
+
+The paper's recovery rebuilds mappings from persistent logs, but it does not
+cover SQL crash states such as partial commits, WAL-before-visibility,
+replication acknowledgements, catalog generation changes, or long MVCC reader
+horizons. Those facts must remain external witnesses in GPU DB.
+
+**Benchmark candidates:**
+
+- Prototype a log-as-home warm-tier metadata store for derived route descriptors
+  or resident snapshot manifests. Measure append throughput, mapping-cache hit
+  rate, lookup p50/p99, DRAM mapping bytes, and recovery rebuild time.
+- Compare traditional logical-WAL-plus-home-install against log-as-home for a
+  rebuildable resident-index fragment. Gate: logical WAL replay still rebuilds
+  the same state, and no client-visible generation appears before WAL
+  durability.
+- Add per-partition mapping tables for warm fragments:
+  `{logical_segment_id, generation, home_range -> physical_chunk_offset}`.
+  Measure planner/runtime dereference cost and cache miss behavior at high
+  route counts.
+- Stress chunk cleaning with retained snapshots and simulated GPU readers.
+  Failure condition: a cleaner recycles a chunk still reachable by any snapshot
+  generation, DMA operation, replay cursor, or route descriptor.
+- Measure group-update coalescing for contiguous warm-tier fragment writes
+  inside one owner epoch. Report write bytes, mapping updates, publication
+  latency, recovery equivalence, and lost-history checks.
+- Run recovery drills over 1 GB, 10 GB, and 100 GB of synthetic warm-tier logs.
+  Gate: rebuild exposes only fully durable logical generations and reconstructs
+  the same mapping table as before crash.
+
+### 2026-06-07 - Cross-paper synthesis: warm tiers need logical witnesses and movable homes
+
+**Converging tracks:** DudeTM, Holon, and LSNVMM all separate fast local action
+from the proof needed to make that action safe. DudeTM splits execution,
+durable logging, and later reproduction; Holon bundles multiple route knobs so
+the advisor changes a whole safe policy; LSNVMM appends the new physical copy
+and publishes a mapping rather than updating a fixed home in place.
+
+For GPU DB, the common design track is **logical identity plus movable physical
+homes**. Rows, route descriptors, resident fragments, and warm-tier metadata
+should keep stable logical names, while physical copies move by publication of
+small generation-checked mappings. The hard contract is not the location; it is
+the witness set: durable WAL frontier, visibility generation, mapping
+generation, snapshot pins, and cleanup horizon.
+
+**Category gaps:** Recent reviews have strong WAL/persistent-memory and learned
+route-control coverage. The next few runs should bias toward high-concurrency
+networking/session admission, MVCC visibility under long readers, or modern
+HTAP snapshot routing before taking another persistent-memory logging paper.
+
+**Benchmark priorities:**
+
+- A movable-warm-fragment benchmark with stable logical ids, mapping
+  publication, cleaner movement, and retained snapshot pins.
+- A route-holon benchmark where cache placement, batching, fallback, and
+  refresh cadence are tuned together but still checked by deterministic
+  eligibility gates.
+- A crash/recovery benchmark that proves physical warm-tier movement never
+  outruns the logical WAL and visibility witnesses.

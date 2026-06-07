@@ -7809,17 +7809,32 @@ Append new candidates here as each paper is processed.
   latency tradeoff; useful for comparing foreground one-flush durability with
   decoupled logging when GPU DB evaluates NVM/CXL write-path staging.
   Journal entry added 2026-06-07 from the Microsoft Research author PDF.
-- `queued` — **DUMBO: Making durable read-only transactions fly on hardware
-  transactional memory**, Dias, Felber, Fetzer, and Ramalhete, arXiv 2024.
+- `reviewed` — **DUMBO: Making durable read-only transactions fly on hardware
+  transactional memory**, Barreto, Castro, Romano, and Baldassin, arXiv 2024.
   URL: `https://arxiv.org/abs/2410.16110`
   Why: discovered while reviewing DudeTM; useful modern follow-up on durable
   read-only transaction costs, persistent HTM design, and whether GPU DB can
   separate durable read validation from write-path persistence under retained
-  snapshot workloads.
-- `queued` — **Log-Structured Non-Volatile Main Memory**, Hu, Ren, Badam, and
+  snapshot workloads. Journal entry already exists; this stale duplicate was
+  corrected from `queued` to `reviewed` on 2026-06-07 and its author metadata
+  was fixed.
+- `reviewed` — **Log-Structured Non-Volatile Main Memory**, Hu, Ren, Badam, and
   Moscibroda, USENIX ATC 2017.
   URL: `https://www.usenix.org/conference/atc17/technical-sessions/presentation/hu`
   Why: PCSO logging contrasts log-structured NVM management that turns writes
   into append operations indexed by volatile metadata; useful for comparing
   persistent warm-tier logs, allocator recovery, and route-metadata rebuild
-  strategies.
+  strategies. Journal entry added 2026-06-07 from the USENIX ATC PDF.
+- `queued` — **Makalu: Fast Recoverable Allocation of Non-Volatile Memory**,
+  Bhandari, Chakrabarti, and Boehm, OOPSLA 2016.
+  URL: `https://doi.org/10.1145/2983990.2984019`
+  Why: LSNVMM contrasts log-structured allocation with recoverable NVMM
+  allocation; useful for checking whether GPU DB warm-tier metadata should use
+  allocator recovery and conservative pointer scanning or explicit log-mapping
+  rebuilds.
+- `queued` — **NOVA: A Log-structured File System for Hybrid
+  Volatile/Non-volatile Main Memories**, Xu and Swanson, FAST 2016.
+  URL: `https://www.usenix.org/conference/fast16/technical-sessions/presentation/xu`
+  Why: LSNVMM's related work points to NOVA's per-inode log structure for
+  hybrid memory; useful for comparing per-object/per-segment logs, recovery,
+  and metadata placement before GPU DB designs CXL/NVMe-backed warm fragments.
