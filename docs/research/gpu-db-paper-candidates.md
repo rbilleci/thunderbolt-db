@@ -810,13 +810,25 @@ Append new candidates here as each paper is processed.
   recovery-via-resumption design; useful for isolating when compiler-marked
   deterministic replay regions beat conventional undo/redo logging for future
   warm-tier metadata or route-publication records.
-- `queued` — **Asynchronous Persistence with ASAP**, Yadalam, Shah,
-  Yu, and Swift, arXiv 2023.
+- `reviewed` — **Asynchronous Persistence with ASAP / ASAP: Architecture
+  Support for Asynchronous Persistence**, Abulila, El Hajj, Jung, and Kim,
+  arXiv 2023 / ISCA 2022.
   URL: `https://arxiv.org/abs/2302.13394`
-  Why: follow-up from the ASAP line that appears to move speculation toward
-  asynchronous atomic-region commit; useful for checking whether bounded
-  recovery witnesses can support delayed commit acknowledgement without
-  weakening WAL-before-visibility.
+  PDF: `https://ielhajj.github.io/publications/paper/paper-asap-isca22.pdf`
+  DOI: `https://doi.org/10.1145/3470496.3527399`
+  Why: hardware-assisted undo logging with asynchronous log and data
+  persistence plus control/data dependency tracking; useful for checking how
+  bounded recovery witnesses can move internal durable metadata waits off the
+  hot path without weakening WAL-before-visibility. Journal entry added
+  2026-06-07; the previously queued author metadata was corrected from the
+  unrelated HPCA 2022 speculative-persistence ASAP paper.
+- `queued` — **Pmem-Spec: Persistent Memory Speculation (Strict Persistency
+  Can Trump Relaxed Persistency)**, Jeong and Jung, ASPLOS 2021.
+  URL: `https://doi.org/10.1145/3445814.3446698`
+  Why: ASAP cites Pmem-Spec as related work on speculation around persistent
+  memory ordering; useful for comparing hardware/software speculation against
+  explicit route fences before GPU DB experiments with delayed durable
+  metadata publication.
 - `queued` — **Delegated Persist Ordering**, Kolli et al., MICRO 2016.
   URL: `https://doi.org/10.1109/MICRO.2016.7783761`
   Author PDF:

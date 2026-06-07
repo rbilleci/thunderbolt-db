@@ -100987,3 +100987,158 @@ Benchmark priorities:
 - Bounded-bundle queue draining for retained reads and GPU kernels.
 - Deficit-counter fairness under 1M logical-session simulation.
 - Refresh/read co-scheduling with explicit stale-route and overload witnesses.
+
+### 2026-06-07 - ASAP moves persistence waits behind dependency witnesses
+
+**Citation:** Ahmed Abulila, Izzat El Hajj, Myoungsoo Jung, and
+Nam Sung Kim. "ASAP: Architecture Support for Asynchronous Persistence."
+ISCA 2022. DOI: `https://doi.org/10.1145/3470496.3527399`. Retrieved
+2026-06-07 from the author PDF and the arXiv/NVMW extended abstract:
+`https://ielhajj.github.io/publications/paper/paper-asap-isca22.pdf`,
+`https://arxiv.org/abs/2302.13394`.
+
+**Category:** WAL, logging, and read/write throughput; future persistent
+memory / CXL warm-tier metadata; recovery witnesses.
+
+**Relevance tags:** persistent memory; hardware WAL; asynchronous commit;
+undo logging; log persist operation; data persist operation; dependency
+tracking; atomic regions; persistence fences; route-publication witnesses;
+future CXL/NVM tiers; commit-critical path; durable metadata.
+
+**Core idea:** ASAP observes that hardware-assisted persistent-memory WAL
+still leaves a synchronization point at the end of an atomic region. Prior
+hardware undo logging waits for both log persist operations (LPOs) and data
+persist operations (DPOs), while hardware redo logging can defer DPOs but
+still waits for LPOs. ASAP removes that end-of-region wait by letting both
+log and data persistence continue asynchronously, then enforcing commit order
+with hardware-tracked control and data dependencies between atomic regions.
+
+The strongest transferable idea is not "put GPU DB's WAL in hardware." It is
+**make delayed durability safe with explicit dependency witnesses**. If a
+future warm tier, CXL/NVM descriptor store, or route metadata structure lets
+publication work continue after the request hot path moves on, the engine
+needs a compact proof of which later publications depend on which earlier
+ones, and a fence only at the external point that truly needs durable
+acknowledgement.
+
+**Concrete mechanisms:**
+
+- ASAP exposes a small persistent-memory interface: initialization,
+  persistent allocation/free, `asap_begin()`, and `asap_end()`. Atomic
+  regions provide atomic durability but not isolation; software must still
+  use locks or another isolation mechanism for conflicting multithreaded
+  updates.
+- Each thread has log-management registers for log address, size, head, tail,
+  nesting depth, and current region id. Nested atomic regions are flattened.
+- Persistent cache lines carry tag extensions: a persistent bit, a lock bit,
+  and the owning region id. On the first write to a persistent cache line,
+  hardware allocates a log entry and initiates an LPO for the old value.
+- A per-core modified-cache-line list tracks which cache lines an atomic
+  region has modified and which DPOs still need to complete. DPOs are not
+  launched after every write; ASAP waits for a short distance or region end
+  so repeated writes to the same cache line can coalesce.
+- A memory-controller dependence list tracks active atomic regions and the
+  region ids they depend on. Starting a new top-level region records a control
+  dependency on the previous still-active region. Reads or writes to a
+  persistent cache line owned by another active region record a data
+  dependency on that owner.
+- `asap_end()` lets instruction execution proceed immediately. The region is
+  marked done in the cache-line list, DPOs drain asynchronously, then the
+  region is marked done in the dependence list. Its undo log is freed only
+  after all modified cache lines have persisted and all dependency slots have
+  cleared.
+- ASAP provides `asap_fence()` for external synchronization points. A caller
+  can run many atomic regions asynchronously and fence only before an I/O or
+  acknowledgement that depends on their durable commit.
+- The paper adds persistent-memory traffic optimizations that become more
+  effective with asynchronous persistence: LPO dropping when an LPO is still
+  queued for a committed region, DPO coalescing for repeated writes to the
+  same cache line, and DPO dropping when a later LPO contains the same data
+  as an earlier queued DPO.
+- Recovery uses persisted write-pending queues, log-header queues, and active
+  dependence-list entries to infer uncommitted region order and undo them.
+  Exact implementation depends on the paper's assumed persistence domain,
+  where memory-controller write-pending queues are persistent.
+- Evaluation uses gem5 with persistent-memory data-structure benchmarks plus
+  a TPC-C New Order variant. The paper reports ASAP is 2.25x faster than a
+  software undo-logging baseline, 1.52x faster than hardware redo logging,
+  1.41x faster than hardware undo logging, and within 1.04x of a no-persistence
+  upper bound on average. It also reports 0.39x, 0.62x, and 0.52x persistent
+  memory write traffic versus software, hardware redo, and hardware undo
+  baselines respectively, with about 2.5% modeled chip-area overhead.
+
+**GPU DB mapping:** For the current NVMe-backed WAL, GPU DB must still keep
+WAL-before-visibility and must not acknowledge a commit before the durable WAL
+contract is satisfied. ASAP therefore maps best to future internal durable
+metadata paths, not to relaxing SQL commit semantics today.
+
+The immediate design lesson is to separate **request completion fences** from
+**internal publication fences**. Catalog route roots, residency descriptors,
+warm-tier indexes, cold-tier manifests, and future CXL/NVM segment metadata
+may be updated in atomic regions whose physical persistence completes after
+the mutation owner has moved on, as long as no external route or commit result
+depends on them without an explicit fence.
+
+The dependence-list idea maps cleanly to route-publication witnesses. A new
+resident descriptor may depend on an earlier catalog generation, WAL frontier,
+visibility generation, checksum body, or cold-tier manifest. Rather than
+forcing every descriptor write to synchronously persist before scheduling the
+next descriptor, the owner can publish a dependency chain and fence only
+before making the new route eligible for readers.
+
+For read throughput, asynchronous internal persistence could reduce stalls in
+metadata-heavy paths: route-cache refresh, resident segment manifest updates,
+statistics publication, and cold-tier object-directory maintenance. Readers
+would still consume only a durable-or-rebuildable generation root that has
+crossed the required fence.
+
+For write throughput, ASAP's warning is equally important: delayed persistence
+is safe only when dependency order is tracked. If GPU DB batches route roots,
+index metadata, or future warm-tier objects without dependency witnesses, a
+crash could recover a later route without the earlier body or visibility state
+it assumes.
+
+**Risks and mismatches:** ASAP is an architecture paper for persistent-memory
+hardware logging, not a DBMS WAL protocol. It assumes hardware extensions,
+persistent write-pending queues, cache-line ownership metadata, and a
+particular recovery path that the current GPU DB does not have.
+
+The paper's atomic regions provide durability but not isolation. GPU DB still
+needs MVCC, owner-domain serialization, locks, or another concurrency-control
+mechanism for SQL correctness.
+
+The evaluation is simulated with PM data-structure benchmarks and a TPC-C New
+Order variant. It does not evaluate NVMe WAL, SQL commit acknowledgement,
+replication, GPU HBM, pinned buffers, object storage, or multi-version
+snapshot retention.
+
+Most importantly, asynchronous persistence is not permission to acknowledge
+durable commit early. In GPU DB, it should first be explored for rebuildable
+or internally fenced route metadata where recovery can see old-or-new state
+and where route eligibility remains explicit.
+
+**Benchmark candidates:**
+
+- Build a route-publication simulator with three modes: synchronous persist
+  after every metadata body, async body persist plus dependency witness and
+  final root fence, and unsafe async without dependency tracking. Gate:
+  crash recovery sees only old-or-new route roots; unsafe mode must fail the
+  injected crash matrix.
+- Add dependency witnesses to durable route metadata: `{region_id,
+  depends_on_generation, body_checksum, root_generation, fence_state}`.
+  Measure publication latency, ordered flush count, recovered generation, and
+  route-eligibility delay.
+- Compare commit-critical WAL with internal async metadata persistence.
+  Expected result: SQL commit latency remains governed by WAL durability,
+  while route/cache metadata updates can move out of the owner critical path
+  when they are fenced before reader eligibility.
+- Prototype `route_fence()` semantics analogous to `asap_fence()`: owners may
+  issue multiple internal metadata writes, then fence before publishing a
+  route root or external readiness event. Failure condition: readers can route
+  through a descriptor whose dependency chain is not durable or rebuildable.
+- Stress long dependency chains: catalog generation -> visibility generation
+  -> residency body -> checksum -> route root. Gate: compaction or chain
+  collapse prevents unbounded retired metadata while preserving recovery order.
+- For future CXL/NVM experiments, measure traffic reductions from body-write
+  coalescing and obsolete-write dropping separately from latency. Gate:
+  reduced traffic does not change the external WAL-before-visibility contract.
