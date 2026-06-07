@@ -73871,8 +73871,8 @@
               "era",
               "route descriptor"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "A route should name the data semantics, visible generation, dirty metadata state, predicted resource class, queue lane, fallback class, and overload behavior before it can consume mutation-owner time, GPU streams, pinned buffers, resident snapshots, or cold-tier placement metadata.",
             "support_reason": "Matched journal terms (era, route descriptor) to Bounded descriptor reclamation."
           },
@@ -76054,8 +76054,8 @@
               "visibility",
               "recovery"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Implement route certificates with both durability counters and read-route memory budgets before adding more accelerator-specific shortcuts. - Add a predicate-route benchmark matrix: resident scan, sketch, binned bitmap/refine, GPU tree, and CPU fallback across selectivity, update rate, HBM pressure, and queue depth. - Require every retained read route t...",
             "support_reason": "Matched journal terms (wal, durability, visibility, recovery) to WAL-before-visibility boundary."
           },
@@ -79884,8 +79884,8 @@
             "matched_terms": [
               "priority"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Polaris says priority should be sparse and attached to active conflicts, not every record or session.",
             "support_reason": "Matched journal terms (priority) to Deficit fairness."
           },
@@ -81711,8 +81711,8 @@
               "visibility",
               "nvm"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "GPU DB should classify each resident, host, CXL, and NVMe object by access pattern: sequential scan column, random index node, write-heavy mutation metadata, TID/result buffer, join/hash state, cold segment, retained snapshot column, or refresh scratch.",
             "support_reason": "Matched journal terms (wal, visibility, nvm) to WAL-before-visibility boundary."
           },
@@ -83967,8 +83967,8 @@
               "wal",
               "visibility"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It does not evaluate SQL plans, MVCC metadata, WAL, GPU transfers, GPUDirect, CUDA pinned memory, or PostgreSQL protocol paths.",
             "support_reason": "Matched journal terms (wal, visibility) to WAL-before-visibility boundary."
           },
@@ -83991,8 +83991,8 @@
               "session",
               "staR"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "In the Redis experiment, TPP migration caused higher latency than static placement because page copying and page-table updates interfere with urgent memory reads. - In DeathStarBench social-network workloads, placing caching/storage pages in CXL had little p99 impact because the end-to-end latency was millisecond-scale and front-end/logic work dominated t...",
             "support_reason": "Matched journal terms (session, staR) to Effective session counting."
           },
@@ -84316,8 +84316,8 @@
               "conflict",
               "access set"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "In the SRM model, compensating an aborted transfer can be implemented as depositing value back, which the paper treats as an operation that always succeeds. - The fallback path builds a DAG where edges follow the original block order: if earlier transaction `T1` conflicts with later transaction `T2`, the graph contains an edge from `T1` to `T2`. - Access...",
             "support_reason": "Matched journal terms (conflict, access set) to GPU OLTP conflict ordering."
           },
@@ -84461,8 +84461,8 @@
               "logical session",
               "staR"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- **Route certificates as admission authority:** each request should carry tier placement, access mode, admitted bytes, credit issuer, route class, and semantic commutativity proof where applicable. - **Local-hot, remote-cold placement:** session state, visibility heads, queue control words, and hot index heads stay local; cold column bytes, old snapshots...",
             "support_reason": "Matched journal terms (session, logical session, staR) to Effective session counting."
           },
@@ -84511,8 +84511,8 @@
             "matched_terms": [
               "snapshot"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- **Route certificates as admission authority:** each request should carry tier placement, access mode, admitted bytes, credit issuer, route class, and semantic commutativity proof where applicable. - **Local-hot, remote-cold placement:** session state, visibility heads, queue control words, and hot index heads stay local; cold column bytes, old snapshots...",
             "support_reason": "Matched journal terms (snapshot) to Snapshot frontier vectors."
           },
@@ -85849,8 +85849,8 @@
             "matched_terms": [
               "admission"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "MD-MVCC, Constant Time Recovery, and RackSched converge on one runtime principle: fast paths stay fast when the admission record is compact, but still names the frontier that makes the work safe.",
             "support_reason": "Matched journal terms (admission) to Vector-credit admission."
           },
@@ -87873,8 +87873,8 @@
             "matched_terms": [
               "append"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "WALTZ moves WAL allocation serialization into a ZNS append path but still requires reserved zones and durable append results before visibility publication.",
             "support_reason": "Matched journal terms (append) to Log-structured warm tier."
           },
@@ -90572,8 +90572,8 @@
               "era",
               "retire"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "- Route-certificate invariant tests that reject duplicate execution unless visibility, schema, resident, movement, and estimator generations match. - Receiver-owned credit benchmarks for response rings, refresh installs, and movement chunks, with control metadata bypassing large payload queues. - Snapshot-handle stress tests that track version-chain dista...",
             "support_reason": "Matched journal terms (era, retire) to Bounded descriptor reclamation."
           },
@@ -91929,8 +91929,8 @@
               "ordering",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "Conflicted suffix work would carry write-set and dependency evidence into the next batch.",
             "support_reason": "Matched journal terms (dependency, ordered, ordering, proof) to Dependency witnesses."
           },
@@ -93798,8 +93798,8 @@
               "dependency",
               "proof"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "HPCC argues for precise in-flight telemetry and headroom-aware control loops; the storage-device mismatch paper shows that a cold-tier route must expose IO shape, flush cadence, and queue parallelism; Bamboo shows that a hot write route needs dependency and cascade-abort shape, not just a \"write\" label.",
             "support_reason": "Matched journal terms (dependency, proof) to Dependency witnesses."
           },
@@ -95977,8 +95977,8 @@
             "matched_terms": [
               "era"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "OLTPim, MOT, and PIM-Tree converge on a more precise rule for GPU DB's accelerated state: never ask \"can this table be on the accelerator?\" without also asking which metadata has accelerator affinity, how it is published, and when skew makes the accelerator path the wrong choice.",
             "support_reason": "Matched journal terms (era) to Bounded descriptor reclamation."
           },
@@ -96725,8 +96725,8 @@
               "snapshot",
               "visibility generation"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It needs four fields: side-effect safety, transaction-shape compatibility, snapshot/publication boundary, and tier-confidence state.",
             "support_reason": "Matched journal terms (snapshot, visibility generation) to Snapshot frontier vectors."
           },
@@ -96771,8 +96771,8 @@
               "gpu oltp",
               "gacco"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "GaccO says GPU transaction throughput depends on admitting only compatible, high-volume shapes while CPU/WAL truth keeps publication authority.",
             "support_reason": "Matched journal terms (gpu oltp, gacco) to GPU OLTP conflict ordering."
           },
@@ -98663,8 +98663,8 @@
             "matched_terms": [
               "priority"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "The paper's target is ML serving, not databases, but the problem shape is familiar for GPU DB: high-priority short work and best-effort long work share an expensive accelerator whose default scheduling can either waste capacity or damage tail latency.",
             "support_reason": "Matched journal terms (priority) to Deficit fairness."
           },
@@ -103233,8 +103233,8 @@
               "session",
               "staR"
             ],
-            "quality": "weak_direct",
-            "quality_reason": "substantive snippet contains only one matched mechanism term",
+            "quality": "direct",
+            "quality_reason": "snippet contains matched mechanism term plus visible aliases",
             "snippet": "It carries the local access set, orders the multi-home transaction against single-home transactions at that home, and usually does not carry executable transaction code. - A multi-home transaction's code may start when its code record appears in a region's global log, but it blocks when it tries to access a granule whose corresponding LockOnlyTxn has not...",
             "support_reason": "Matched journal terms (session, staR) to Effective session counting."
           },
@@ -137577,16 +137577,16 @@
     },
     "entries": 787,
     "evidence_quality_counts": {
-      "direct": 4485,
-      "weak_direct": 186
+      "direct": 4504,
+      "weak_direct": 167
     },
     "evidence_quality_reason_counts": {
       "high-confidence link has a substantive journal snippet": 440,
       "reviewed-supported link has a substantive matched snippet": 118,
-      "snippet contains matched mechanism term plus visible aliases": 323,
+      "snippet contains matched mechanism term plus visible aliases": 342,
       "snippet contains multiple matched mechanism terms": 3098,
       "strong journal section contains matched mechanism terms": 506,
-      "substantive snippet contains only one matched mechanism term": 180,
+      "substantive snippet contains only one matched mechanism term": 161,
       "substantive snippet contains visible mechanism aliases": 6
     },
     "evidence_span_counts": {
