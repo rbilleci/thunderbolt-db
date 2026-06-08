@@ -3514,6 +3514,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Fast-device placement requires measured service-owned buffers, saturation counters, session backpressure, and async cold-tier behavior.",
     },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-devices-require-explicit-service-ownership",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring service ownership is gated on measured IO-worker multiplexing, response-ring backpressure, and saturation counters.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-devices-require-explicit-service-ownership",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fast-path handles are safe only when buffers carry snapshot, WAL, visibility, and generation metadata.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-devices-require-explicit-service-ownership",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Session counting requires measured multiplexing and backpressure under thousands of logical sessions before fast-device adoption.",
+    },
+    (
+        "2026-06-03-autonomous-commit-for-low-latency-nvme-durability",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshot transfer is explicitly gated on WAL replay equivalence and bursty COPY admission measurements.",
+    },
+    (
+        "2026-06-03-modern-nvme-storage-engine-exploitation",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "NVMe tier placement needs measured queue-depth saturation before combining storage with CUDA and resident-generation safety.",
+    },
+    (
+        "2026-06-03-modern-nvme-storage-engine-exploitation",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The storage-engine evidence cannot support WAL visibility without durable-write, publication, and replay measurements.",
+    },
+    (
+        "2026-06-03-modern-nvme-storage-engine-exploitation",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The evaluation disables logging and weakens isolation, warning against direct durable GPU OLTP conflict-ordering transfer.",
+    },
+    (
+        "2026-06-03-modern-nvme-storage-engine-exploitation",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Page or segment fetch routes are valid only when owned buffers publish completion for still-valid generations.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-generations-need-durable-and-logical-fronts",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier placement is routed through a prototype generation-frontier timeline and sealed-descriptor measurements.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-generations-need-durable-and-logical-fronts",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots need prototype generation-frontier traces spanning execution, durability, invalidation, residency, and response.",
+    },
+    (
+        "2026-06-03-mosaicdb-multi-source-latency-hiding",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Cold and future CXL tier queues must be sized by measured bandwidth, IOPS, pinned-buffer budget, and stale-generation risk.",
+    },
+    (
+        "2026-06-03-mosaicdb-multi-source-latency-hiding",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MosaicDB motivates owner-ring runtime shape, but the transfer still needs benchmarking against the current endpoint.",
+    },
+    (
+        "2026-06-03-tesseract-online-schema-evolution",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Schema-frontier snapshot transfer needs tests for overlapped CDC, relaxed snapshots, and pending-schema routing.",
+    },
+    (
+        "2026-06-03-tesseract-online-schema-evolution",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "New route generations are valid only when complete enough for the requested shape, otherwise reads wait or fall back.",
+    },
+    (
+        "2026-06-03-tesseract-online-schema-evolution",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained GPU snapshots are valid only when visibility, schema generation, layout, predicates, and response shape agree.",
+    },
+    (
+        "2026-06-03-bonspiel-low-tail-geo-distributed-transactions",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Bonspiel omits GPU execution, PostgreSQL serving, NVMe tiering, MVCC storage, and local durable WAL measurements.",
+    },
+    (
+        "2026-06-03-carpo-listwise-context-aware-query-plan-ranking",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Fallback routing must account for stale-generation risk and fallback reasons rather than trusting ranked routes alone.",
+    },
+    (
+        "2026-06-03-webridge-synthesized-stored-procedures-for-hot-paths",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Synthesized hot paths require hot-key update/read benchmarks against ordinary statement execution before adoption.",
+    },
+    (
+        "2026-06-03-webridge-synthesized-stored-procedures-for-hot-paths",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Stored-procedure route roots are valid only when conditional branches and writes publish at explicit durable and visible frontiers.",
+    },
+    (
+        "2026-06-03-gcctb-gpu-oltp-concurrency-control-study",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Per-batch access tables and deterministic GPU conflict order are presented as benchmarkable alternatives for hot rows.",
+    },
+    (
+        "2026-06-03-gcctb-gpu-oltp-concurrency-control-study",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Resident GPU state in the testbed still needs DB-scale retained-snapshot and generated-code configuration measurements.",
+    },
+    (
+        "2026-06-03-gcctb-gpu-oltp-concurrency-control-study",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Write-batch protocol choice should be selected by measured conflict shape rather than assumed isolation preference.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-gpu-writes-need-classed-conflict-lanes",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Classed write templates are explicitly framed as a lab for measuring optimistic versus deterministic preprocessing costs.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-gpu-writes-need-classed-conflict-lanes",
+        "isolation_trace_oracle",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Isolation trace transfer is gated on event traces that prove isolation and WAL publication for measured write batches.",
+    },
+    (
+        "2026-06-03-databases-on-modern-networks",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Future CXL, remote memory, and remote GPU tiers warn against treating local HBM/DRAM/NVMe placement as sufficient.",
+    },
+    (
+        "2026-06-03-databases-on-modern-networks",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Offloaded paths are valid only when WAL, MVCC, catalog invalidation, and recovery state remain database-owned or fully proved.",
+    },
+    (
+        "2026-06-03-databases-on-modern-networks",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Networked memory movement warns against assuming retained snapshots and cold partitions remain local-placement problems.",
+    },
+    (
+        "2026-06-03-databases-on-modern-networks",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Zero-copy NIC reads from userspace buffers are presented as an alternative state-movement shape to local stable handles.",
+    },
+    (
+        "2026-06-03-skyloft-user-space-preemptive-scheduling",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Scheduler and key-value results do not cover SQL, MVCC, WAL durability, PostgreSQL protocol, GPU kernels, or CUDA scheduling.",
+    },
+    (
+        "2026-06-03-dbms-owned-large-objects-instead-of-files",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Large-object tiering transfer depends on measured object throughput and metadata scans rather than filesystem-style assumptions.",
+    },
 }
 
 
