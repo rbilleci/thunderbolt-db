@@ -331,114 +331,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-archtm-makes-persistent-writes-a-locality-contract",
-      "paper_id": "paper-2021-archtm-architecture-aware-high-performance-transaction-for-persistent-memory",
-      "title": "ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem",
-      "paper_id": "paper-2022-high-throughput-replication-with-integrated-membership-management",
-      "title": "High Throughput Replication with Integrated Membership Management."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-citron-makes-remote-range-locks-a-static-metadata-protocol",
-      "paper_id": "paper-2023-citron-distributed-range-lock-management-with-one-sided-rdma",
-      "title": "Citron: Distributed Range Lock Management with One-sided RDMA."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-cloudcast-turns-cold-tier-replication-into-an-explicit-cost-time-and-stripe-routing-optimization",
-      "paper_id": "paper-2024-cloudcast-high-throughput-cost-aware-overlay-multicast-in-the-cloud",
-      "title": "Cloudcast: High-Throughput, Cost-Aware Overlay Multicast in the Cloud."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-cobra-turns-serializability-into-an-off-path-route-history-check",
-      "paper_id": "paper-2020-cobra-making-transactional-key-value-stores-verifiably-serializable",
-      "title": "Cobra: Making Transactional Key-Value Stores Verifiably Serializable."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-diffkv-makes-value-placement-a-scan-write-ordering-dial",
-      "paper_id": "paper-2021-differentiated-key-value-storage-management-for-balanced-i-o-performance",
-      "title": "Differentiated Key-Value Storage Management for Balanced I/O Performance."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-eqds-moves-network-queues-to-the-edge-and-clocks-admission-with-receiver-credits",
-      "paper_id": "paper-2022-an-edge-queued-datagram-service-for-all-datacenter-traffic",
-      "title": "An Edge-Queued Datagram Service for All Datacenter Traffic."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-fisslock-splits-fast-grant-facts-from-heavy-waiter-state",
-      "paper_id": "paper-2024-fast-and-scalable-in-network-lock-management-using-lock-fission",
-      "title": "Fast and Scalable In-network Lock Management Using Lock Fission."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-ford-makes-remote-durable-transactions-a-round-trip-budget",
-      "paper_id": "paper-2022-ford-fast-one-sided-rdma-based-distributed-transactions-for-disaggregated-persistent-memory",
-      "title": "FORD: Fast One-sided RDMA-based Distributed Transactions for Disaggregated Persistent Memory."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-geminifs-makes-gpu-storage-metadata-explicit-enough-for-device-side-io",
-      "paper_id": "paper-2025-geminifs-a-companion-file-system-for-gpus",
-      "title": "GeminiFS: A Companion File System for GPUs."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-hdtx-coalesces-remote-transaction-fences-without-giving-up-priority",
-      "paper_id": "paper-2025-fast-distributed-transactions-for-rdma-based-disaggregated-memory",
-      "title": "Fast Distributed Transactions for RDMA-based Disaggregated Memory."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-matrixkv-makes-write-stalls-a-compaction-granularity-problem",
-      "paper_id": "paper-2020-matrixkv-reducing-write-stalls-and-write-amplification-in-lsm-tree-based-kv-stores-with-a-matrix",
-      "title": "MatrixKV: Reducing Write Stalls and Write Amplification in LSM-tree Based KV Stores with a Matrix Container in NVM."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-06-memstrata-makes-cxl-tiering-an-isolation-and-outlier-control-problem",
       "paper_id": "paper-2024-managing-memory-tiers-with-cxl-in-virtualized-environments",
       "title": "Managing Memory Tiers with CXL in Virtualized Environments."
@@ -7057,6 +6949,25 @@
       "title": "Aeolus: A Building Block for Proactive Transport in Datacenters."
     },
     {
+      "citation": "Kai Wu, Jie Ren, Ivy Peng, and Dong Li. \"ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory.\" FAST 2021, 141-153. Retrieved 2026-06-06 from the USENIX page and PDF: `https://www.usenix.org/conference/fast21/presentation/wu-kai`, `https://www.usenix.org/system/files/fast21-wu-kai.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/1903.06226",
+        "review_status": "reviewed_identifier_repair",
+        "title": "ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory."
+      },
+      "journal_entry_id": "2026-06-06-archtm-makes-persistent-writes-a-locality-contract",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2021-archtm-architecture-aware-high-performance-transaction-for-persistent-memory",
+      "title": "ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory."
+    },
+    {
       "citation": "Yi Lu, Xiangyao Yu, Lei Cao, and Samuel Madden. \"Aria: A Fast and Practical Deterministic OLTP Database.\" PVLDB 13(11), 2047-2060, 2020. DOI: `https://doi.org/10.14778/3407790.3407808`. Retrieved 2026-06-06 from the VLDB PDF: `https://www.vldb.org/pvldb/vol13/p2047-lu.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -9969,33 +9880,15 @@
       "title": "Retrofitting High Availability Mechanism to Tame Hybrid Transaction/Analytical Processing."
     },
     {
-      "citation": "Kai Wu, Jie Ren, Ivy Peng, and Dong Li. \"ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory.\" FAST 2021, 141-153. Retrieved 2026-06-06 from the USENIX page and PDF: `https://www.usenix.org/conference/fast21/presentation/wu-kai`, `https://www.usenix.org/system/files/fast21-wu-kai.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory."
-      },
-      "journal_entry_id": "2026-06-06-archtm-makes-persistent-writes-a-locality-contract",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2021-archtm-architecture-aware-high-performance-transaction-for-persistent-memory",
-      "title": "ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory."
-    },
-    {
       "citation": "Pedro Fouto, Nuno Preguica, and Joao Leitao. \"High Throughput Replication with Integrated Membership Management.\" 2022 USENIX Annual Technical Conference, pages 575-592. Retrieved 2026-06-06 from USENIX `https://www.usenix.org/system/files/atc22-fouto.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/usenix/FoutoP022",
+        "review_status": "reviewed_identifier_repair",
         "title": "High Throughput Replication with Integrated Membership Management."
       },
       "journal_entry_id": "2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem",
@@ -10009,12 +9902,13 @@
     {
       "citation": "Jian Gao, Youyou Lu, Minhui Xie, Qing Wang, and Jiwu Shu. \"Citron: Distributed Range Lock Management with One-sided RDMA.\" FAST 2023, pages 297-314. Retrieved 2026-06-06 from the USENIX paper page and PDF at `https://www.usenix.org/conference/fast23/presentation/gao` and `https://www.usenix.org/system/files/fast23-gao.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/fast23/presentation/gao",
+        "review_status": "reviewed_identifier_repair",
         "title": "Citron: Distributed Range Lock Management with One-sided RDMA."
       },
       "journal_entry_id": "2026-06-06-citron-makes-remote-range-locks-a-static-metadata-protocol",
@@ -10028,12 +9922,13 @@
     {
       "citation": "Sarah Wooders, Shu Liu, Paras Jain, Xiangxi Mo, Joseph E. Gonzalez, Vincent Liu, and Ion Stoica. \"Cloudcast: High-Throughput, Cost-Aware Overlay Multicast in the Cloud.\" NSDI 2024, pages 281-296. Retrieved 2026-06-06 from the USENIX paper page and PDF at `https://www.usenix.org/conference/nsdi24/presentation/wooders` and `https://www.usenix.org/system/files/nsdi24-wooders.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/nsdi/WoodersL0MG0S24",
+        "review_status": "reviewed_identifier_repair",
         "title": "Cloudcast: High-Throughput, Cost-Aware Overlay Multicast in the Cloud."
       },
       "journal_entry_id": "2026-06-06-cloudcast-turns-cold-tier-replication-into-an-explicit-cost-time-and-stripe-routing-optimization",
@@ -10047,12 +9942,13 @@
     {
       "citation": "Cheng Tan, Changgeng Zhao, Shuai Mu, and Michael Walfish. \"Cobra: Making Transactional Key-Value Stores Verifiably Serializable.\" OSDI 2020, pp. 63-80. Retrieved 2026-06-06 from the USENIX page, `https://www.usenix.org/conference/osdi20/presentation/tan`, and PDF, `https://www.usenix.org/system/files/osdi20-tan.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi20/presentation/tan",
+        "review_status": "reviewed_identifier_repair",
         "title": "Cobra: Making Transactional Key-Value Stores Verifiably Serializable."
       },
       "journal_entry_id": "2026-06-06-cobra-turns-serializability-into-an-off-path-route-history-check",
@@ -10066,12 +9962,13 @@
     {
       "citation": "Yongkun Li, Zhen Liu, Patrick P. C. Lee, Jiayu Wu, Yinlong Xu, Yi Wu, Liu Tang, Qi Liu, and Qiu Cui. \"Differentiated Key-Value Storage Management for Balanced I/O Performance.\" USENIX ATC 2021. Retrieved 2026-06-06 from the USENIX page and PDF: `https://www.usenix.org/conference/atc21/presentation/li-yongkun`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc21/presentation/li-yongkun",
+        "review_status": "reviewed_identifier_repair",
         "title": "Differentiated Key-Value Storage Management for Balanced I/O Performance."
       },
       "journal_entry_id": "2026-06-06-diffkv-makes-value-placement-a-scan-write-ordering-dial",
@@ -10085,12 +9982,13 @@
     {
       "citation": "Vladimir Olteanu, Haggai Eran, Dragos Dumitrescu, Adrian Popa, Cristi Baciu, Mark Silberstein, Georgios Nikolaidis, Mark Handley, and Costin Raiciu. \"An Edge-Queued Datagram Service for All Datacenter Traffic.\" NSDI 2022. Retrieved 2026-06-06 from the USENIX paper page and PDF, `https://www.usenix.org/conference/nsdi22/presentation/olteanu`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_author_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/nsdi/OlteanuEDPBSNHR22",
+        "review_status": "reviewed_identifier_repair",
         "title": "An Edge-Queued Datagram Service for All Datacenter Traffic."
       },
       "journal_entry_id": "2026-06-06-eqds-moves-network-queues-to-the-edge-and-clocks-admission-with-receiver-credits",
@@ -10104,12 +10002,13 @@
     {
       "citation": "Hanze Zhang, Ke Cheng, Rong Chen, and Haibo Chen. \"Fast and Scalable In-network Lock Management Using Lock Fission.\" OSDI 2024. Retrieved 2026-06-06 from the USENIX paper page, `https://www.usenix.org/conference/osdi24/presentation/zhang-hanze`, and official PDF, `https://www.usenix.org/system/files/osdi24-zhang-hanze.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi24/presentation/zhang-hanze",
+        "review_status": "reviewed_identifier_repair",
         "title": "Fast and Scalable In-network Lock Management Using Lock Fission."
       },
       "journal_entry_id": "2026-06-06-fisslock-splits-fast-grant-facts-from-heavy-waiter-state",
@@ -10123,12 +10022,13 @@
     {
       "citation": "Ming Zhang, Yu Hua, Pengfei Zuo, and Lurong Liu. \"FORD: Fast One-sided RDMA-based Distributed Transactions for Disaggregated Persistent Memory.\" FAST 2022, pages 51-68. Retrieved 2026-06-06 from the USENIX paper page, `https://www.usenix.org/conference/fast22/presentation/zhang-ming`, and official PDF, `https://www.usenix.org/system/files/fast22-zhang-ming.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_fast_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_fast_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/fast/Zhang0ZL22",
+        "review_status": "reviewed_identifier_repair",
         "title": "FORD: Fast One-sided RDMA-based Distributed Transactions for Disaggregated Persistent Memory."
       },
       "journal_entry_id": "2026-06-06-ford-makes-remote-durable-transactions-a-round-trip-budget",
@@ -10142,12 +10042,13 @@
     {
       "citation": "Shi Qiu, Weinan Liu, Yifan Hu, Jianqin Yan, Zhirong Shen, Xin Yao, Renhai Chen, Gong Zhang, and Yiming Zhang. \"GeminiFS: A Companion File System for GPUs.\" 23rd USENIX Conference on File and Storage Technologies (FAST 25), pp. 221-236, 2025. Retrieved 2026-06-06 from USENIX: `https://www.usenix.org/conference/fast25/presentation/qiu`. PDF: `https://www.usenix.org/system/files/fast25-qiu.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/fast25/presentation/qiu",
+        "review_status": "reviewed_identifier_repair",
         "title": "GeminiFS: A Companion File System for GPUs."
       },
       "journal_entry_id": "2026-06-06-geminifs-makes-gpu-storage-metadata-explicit-enough-for-device-side-io",
@@ -10161,12 +10062,13 @@
     {
       "citation": "Haodi Lu, Haikun Liu, Yujian Zhang, Zhuohui Duan, Xiaofei Liao, Hai Jin, and Yu Zhang. \"Fast Distributed Transactions for RDMA-based Disaggregated Memory.\" USENIX ATC 2025, pages 943-958. Retrieved 2026-06-06 from USENIX, `https://www.usenix.org/system/files/atc25-lu.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc25/presentation/lu",
+        "review_status": "reviewed_identifier_repair",
         "title": "Fast Distributed Transactions for RDMA-based Disaggregated Memory."
       },
       "journal_entry_id": "2026-06-06-hdtx-coalesces-remote-transaction-fences-without-giving-up-priority",
@@ -10180,12 +10082,13 @@
     {
       "citation": "Ting Yao, Yiwen Zhang, Jiguang Wan, Qiu Cui, Liu Tang, Hong Jiang, Changsheng Xie, and Xubin He. \"MatrixKV: Reducing Write Stalls and Write Amplification in LSM-tree Based KV Stores with a Matrix Container in NVM.\" USENIX ATC 2020, 17-31. Retrieved 2026-06-06 from the USENIX page and PDF: `https://www.usenix.org/conference/atc20/presentation/yao`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc20/presentation/yao",
+        "review_status": "reviewed_identifier_repair",
         "title": "MatrixKV: Reducing Write Stalls and Write Amplification in LSM-tree Based KV Stores with a Matrix Container in NVM."
       },
       "journal_entry_id": "2026-06-06-matrixkv-makes-write-stalls-a-compaction-granularity-problem",
@@ -16454,11 +16357,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:cobra-making-transactional-key-value-stores-verifiably-serializable",
@@ -16865,11 +16768,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:matrixkv-reducing-write-stalls-and-write-amplification-in-lsm-tree-based-kv-stores-with-a-matrix",
@@ -17624,7 +17527,7 @@
       "year": "2021"
     },
     {
-      "arxiv": "",
+      "arxiv": "1903.06226",
       "authors": [
         "Kai Wu",
         "Jie Ren",
@@ -17634,11 +17537,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:archtm-architecture-aware-high-performance-transaction-for-persistent-memory",
@@ -17646,8 +17549,7 @@
         "2026-06-06-archtm-makes-persistent-writes-a-locality-contract"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2021-archtm-architecture-aware-high-performance-transaction-for-persistent-memory",
       "review_status": "generated_identity",
@@ -17997,11 +17899,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:differentiated-key-value-storage-management-for-balanced-i-o-performance",
@@ -19434,11 +19336,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_author_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:an-edge-queued-datagram-service-for-all-datacenter-traffic",
@@ -20068,11 +19970,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_fast_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_fast_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:ford-fast-one-sided-rdma-based-distributed-transactions-for-disaggregated-persistent-memory",
@@ -20134,11 +20036,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:high-throughput-replication-with-integrated-membership-management",
@@ -21555,11 +21457,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:citron-distributed-range-lock-management-with-one-sided-rdma",
@@ -24477,11 +24379,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:cloudcast-high-throughput-cost-aware-overlay-multicast-in-the-cloud",
@@ -24920,11 +24822,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:fast-and-scalable-in-network-lock-management-using-lock-fission",
@@ -27736,11 +27638,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:fast-distributed-transactions-for-rdma-based-disaggregated-memory",
@@ -27940,11 +27842,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:geminifs-a-companion-file-system-for-gpus",
@@ -37168,7 +37070,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "1903.06226",
         "authors": [
           "Kai Wu",
           "Jie Ren",
@@ -37177,19 +37079,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/1903.06226",
+          "review_status": "reviewed_identifier_repair",
           "title": "ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory."
         },
         "identity_key": "title:archtm-architecture-aware-high-performance-transaction-for-persistent-memory",
         "journal_entry_id": "2026-06-06-archtm-makes-persistent-writes-a-locality-contract",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2021-archtm-architecture-aware-high-performance-transaction-for-persistent-memory",
         "review_status": "generated_identity",
@@ -41846,12 +41748,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/fast23/presentation/gao",
+          "review_status": "reviewed_identifier_repair",
           "title": "Citron: Distributed Range Lock Management with One-sided RDMA."
         },
         "identity_key": "title:citron-distributed-range-lock-management-with-one-sided-rdma",
@@ -42798,12 +42701,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/nsdi/WoodersL0MG0S24",
+          "review_status": "reviewed_identifier_repair",
           "title": "Cloudcast: High-Throughput, Cost-Aware Overlay Multicast in the Cloud."
         },
         "identity_key": "title:cloudcast-high-throughput-cost-aware-overlay-multicast-in-the-cloud",
@@ -45797,12 +45701,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi24/presentation/zhang-hanze",
+          "review_status": "reviewed_identifier_repair",
           "title": "Fast and Scalable In-network Lock Management Using Lock Fission."
         },
         "identity_key": "title:fast-and-scalable-in-network-lock-management-using-lock-fission",
@@ -46520,12 +46425,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_fast_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_fast_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/fast/Zhang0ZL22",
+          "review_status": "reviewed_identifier_repair",
           "title": "FORD: Fast One-sided RDMA-based Distributed Transactions for Disaggregated Persistent Memory."
         },
         "identity_key": "title:ford-fast-one-sided-rdma-based-distributed-transactions-for-disaggregated-persistent-memory",
@@ -48451,12 +48357,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi20/presentation/tan",
+          "review_status": "reviewed_identifier_repair",
           "title": "Cobra: Making Transactional Key-Value Stores Verifiably Serializable."
         },
         "identity_key": "title:cobra-making-transactional-key-value-stores-verifiably-serializable",
@@ -195571,12 +195478,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_author_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/nsdi/OlteanuEDPBSNHR22",
+          "review_status": "reviewed_identifier_repair",
           "title": "An Edge-Queued Datagram Service for All Datacenter Traffic."
         },
         "identity_key": "title:an-edge-queued-datagram-service-for-all-datacenter-traffic",
@@ -200012,12 +199920,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/usenix/FoutoP022",
+          "review_status": "reviewed_identifier_repair",
           "title": "High Throughput Replication with Integrated Membership Management."
         },
         "identity_key": "title:high-throughput-replication-with-integrated-membership-management",
@@ -201721,12 +201630,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc25/presentation/lu",
+          "review_status": "reviewed_identifier_repair",
           "title": "Fast Distributed Transactions for RDMA-based Disaggregated Memory."
         },
         "identity_key": "title:fast-distributed-transactions-for-rdma-based-disaggregated-memory",
@@ -209673,12 +209583,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc20/presentation/yao",
+          "review_status": "reviewed_identifier_repair",
           "title": "MatrixKV: Reducing Write Stalls and Write Amplification in LSM-tree Based KV Stores with a Matrix Container in NVM."
         },
         "identity_key": "title:matrixkv-reducing-write-stalls-and-write-amplification-in-lsm-tree-based-kv-stores-with-a-matrix",
@@ -210672,12 +210583,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc21/presentation/li-yongkun",
+          "review_status": "reviewed_identifier_repair",
           "title": "Differentiated Key-Value Storage Management for Balanced I/O Performance."
         },
         "identity_key": "title:differentiated-key-value-storage-management-for-balanced-i-o-performance",
@@ -213399,12 +213311,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/fast25/presentation/qiu",
+          "review_status": "reviewed_identifier_repair",
           "title": "GeminiFS: A Companion File System for GPUs."
         },
         "identity_key": "title:geminifs-a-companion-file-system-for-gpus",
@@ -221527,31 +221440,31 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 36,
-      "arxiv_present": 128,
-      "arxiv_reviewed_absent": 52,
+      "arxiv_needs_identifier_review": 24,
+      "arxiv_present": 129,
+      "arxiv_reviewed_absent": 63,
       "arxiv_secondary_missing": 386,
-      "doi_needs_identifier_review": 36,
+      "doi_needs_identifier_review": 24,
       "doi_not_expected_yet": 52,
       "doi_present": 442,
-      "doi_reviewed_absent": 62,
+      "doi_reviewed_absent": 74,
       "doi_secondary_missing": 10
     },
     "paper_identity_counts": {
-      "paper_entries_with_arxiv": 128,
+      "paper_entries_with_arxiv": 129,
       "paper_entries_with_doi": 442,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
-      "missing_arxiv": 474,
+      "missing_arxiv": 473,
       "missing_doi": 160
     },
     "paper_identity_missing_field_sets": {
       "arxiv": 386,
-      "doi": 72,
-      "doi,arxiv": 88,
+      "doi": 73,
+      "doi,arxiv": 87,
       "none": 56
     },
     "paper_records": 563,

@@ -33,47 +33,35 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - duplicate identity groups: 32
 
 Generated identity field counts:
-- paper_entries_with_arxiv: 128
+- paper_entries_with_arxiv: 129
 - paper_entries_with_doi: 442
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
-- missing_arxiv: 474
+- missing_arxiv: 473
 - missing_doi: 160
 
 Generated identity missing-field sets:
 - arxiv: 386
-- doi: 72
-- doi,arxiv: 88
+- doi: 73
+- doi,arxiv: 87
 - none: 56
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 36
-- arxiv_present: 128
-- arxiv_reviewed_absent: 52
+- arxiv_needs_identifier_review: 24
+- arxiv_present: 129
+- arxiv_reviewed_absent: 63
 - arxiv_secondary_missing: 386
-- doi_needs_identifier_review: 36
+- doi_needs_identifier_review: 24
 - doi_not_expected_yet: 52
 - doi_present: 442
-- doi_reviewed_absent: 62
+- doi_reviewed_absent: 74
 - doi_secondary_missing: 10
-- actionable_identifier_review: 36
+- actionable_identifier_review: 24
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-06-archtm-makes-persistent-writes-a-locality-contract` -> `paper-2021-archtm-architecture-aware-high-performance-transaction-for-persistent-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory.
-- `2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem` -> `paper-2022-high-throughput-replication-with-integrated-membership-management`: doi=needs_identifier_review, arxiv=needs_identifier_review: High Throughput Replication with Integrated Membership Management.
-- `2026-06-06-citron-makes-remote-range-locks-a-static-metadata-protocol` -> `paper-2023-citron-distributed-range-lock-management-with-one-sided-rdma`: doi=needs_identifier_review, arxiv=needs_identifier_review: Citron: Distributed Range Lock Management with One-sided RDMA.
-- `2026-06-06-cloudcast-turns-cold-tier-replication-into-an-explicit-cost-time-and-stripe-routing-optimization` -> `paper-2024-cloudcast-high-throughput-cost-aware-overlay-multicast-in-the-cloud`: doi=needs_identifier_review, arxiv=needs_identifier_review: Cloudcast: High-Throughput, Cost-Aware Overlay Multicast in the Cloud.
-- `2026-06-06-cobra-turns-serializability-into-an-off-path-route-history-check` -> `paper-2020-cobra-making-transactional-key-value-stores-verifiably-serializable`: doi=needs_identifier_review, arxiv=needs_identifier_review: Cobra: Making Transactional Key-Value Stores Verifiably Serializable.
-- `2026-06-06-diffkv-makes-value-placement-a-scan-write-ordering-dial` -> `paper-2021-differentiated-key-value-storage-management-for-balanced-i-o-performance`: doi=needs_identifier_review, arxiv=needs_identifier_review: Differentiated Key-Value Storage Management for Balanced I/O Performance.
-- `2026-06-06-eqds-moves-network-queues-to-the-edge-and-clocks-admission-with-receiver-credits` -> `paper-2022-an-edge-queued-datagram-service-for-all-datacenter-traffic`: doi=needs_identifier_review, arxiv=needs_identifier_review: An Edge-Queued Datagram Service for All Datacenter Traffic.
-- `2026-06-06-fisslock-splits-fast-grant-facts-from-heavy-waiter-state` -> `paper-2024-fast-and-scalable-in-network-lock-management-using-lock-fission`: doi=needs_identifier_review, arxiv=needs_identifier_review: Fast and Scalable In-network Lock Management Using Lock Fission.
-- `2026-06-06-ford-makes-remote-durable-transactions-a-round-trip-budget` -> `paper-2022-ford-fast-one-sided-rdma-based-distributed-transactions-for-disaggregated-persistent-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: FORD: Fast One-sided RDMA-based Distributed Transactions for Disaggregated Persistent Memory.
-- `2026-06-06-geminifs-makes-gpu-storage-metadata-explicit-enough-for-device-side-io` -> `paper-2025-geminifs-a-companion-file-system-for-gpus`: doi=needs_identifier_review, arxiv=needs_identifier_review: GeminiFS: A Companion File System for GPUs.
-- `2026-06-06-hdtx-coalesces-remote-transaction-fences-without-giving-up-priority` -> `paper-2025-fast-distributed-transactions-for-rdma-based-disaggregated-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: Fast Distributed Transactions for RDMA-based Disaggregated Memory.
-- `2026-06-06-matrixkv-makes-write-stalls-a-compaction-granularity-problem` -> `paper-2020-matrixkv-reducing-write-stalls-and-write-amplification-in-lsm-tree-based-kv-stores-with-a-matrix`: doi=needs_identifier_review, arxiv=needs_identifier_review: MatrixKV: Reducing Write Stalls and Write Amplification in LSM-tree Based KV Stores with a Matrix Container in NVM.
 - `2026-06-06-memstrata-makes-cxl-tiering-an-isolation-and-outlier-control-problem` -> `paper-2024-managing-memory-tiers-with-cxl-in-virtualized-environments`: doi=needs_identifier_review, arxiv=needs_identifier_review: Managing Memory Tiers with CXL in Virtualized Environments.
 - `2026-06-06-pangu-makes-rdma-a-fast-path-with-tcp-as-the-safety-valve` -> `paper-2021-when-cloud-storage-meets-rdma`: doi=needs_identifier_review, arxiv=needs_identifier_review: When Cloud Storage Meets RDMA.
 - `2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy` -> `paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: Polyjuice: High-Performance Transactions via Learned Concurrency Control.
