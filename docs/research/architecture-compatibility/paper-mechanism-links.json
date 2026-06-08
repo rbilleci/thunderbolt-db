@@ -1,5 +1,5 @@
 {
-  "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, and normalized paper identity records. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
+  "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, normalized paper identity records, and benchmark backlog inputs. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
   "mechanism_counts": {
     "bounded_descriptor_reclamation": 489,
     "cost_based_route_optimizer": 254,
@@ -221218,7 +221218,7 @@
     "supports": "paper evidence supports or motivates this mechanism",
     "warns_against": "paper evidence warns against adopting this mechanism without constraints"
   },
-  "schema": "gpu-db-research-paper-mechanism-links-v9",
+  "schema": "gpu-db-research-paper-mechanism-links-v10",
   "source_journal": "docs/research/gpu-db-literature-journal.md",
   "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
   "summary": {

@@ -2212,6 +2212,35 @@ RELATION_CANDIDATE_PRIORITY = [
     "alternative_to",
 ]
 
+BENCHMARK_BACKLOG_SCHEMA = "gpu-db-research-benchmark-backlog-v1"
+
+BENCHMARK_GATE_BY_DECISION_STATUS = {
+    "adopt_now": "correctness_gate",
+    "prototype": "prototype_gate",
+    "benchmark_only": "decision_gate",
+    "defer": "deferred_gate",
+    "reject": "rejection_audit",
+    "unknown": "discovery_gate",
+}
+
+BENCHMARK_DECISION_STATUS_ORDER = {
+    "adopt_now": 0,
+    "prototype": 1,
+    "benchmark_only": 2,
+    "unknown": 3,
+    "defer": 4,
+    "reject": 5,
+}
+
+BENCHMARK_GATE_DESCRIPTIONS = {
+    "correctness_gate": "must continuously validate a baseline architecture invariant",
+    "prototype_gate": "must produce prototype evidence before the mechanism is adopted",
+    "decision_gate": "must decide whether the mechanism graduates or stays experimental",
+    "deferred_gate": "recorded for later once prerequisite architecture telemetry exists",
+    "rejection_audit": "kept only to preserve the reason the mechanism is rejected",
+    "discovery_gate": "needs exploratory evidence before a decision status can be assigned",
+}
+
 
 RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
     (
@@ -14141,6 +14170,179 @@ def normalize_paper_records(paper_identities: list[dict]) -> tuple[list[dict], l
     return paper_records, duplicate_groups
 
 
+def benchmark_gate_for_status(status: str) -> str:
+    return BENCHMARK_GATE_BY_DECISION_STATUS.get(status, "discovery_gate")
+
+
+def build_benchmark_backlog(index: dict, mechanisms: dict) -> dict:
+    records = index["records"]
+    mechanisms_by_id = {item["id"]: item for item in mechanisms["mechanisms"]}
+    relation_counts_by_mechanism: dict[str, Counter] = defaultdict(Counter)
+    evidence_by_mechanism: dict[str, list[dict]] = defaultdict(list)
+
+    for record in records:
+        for link in record["mechanism_links"]:
+            mechanism_id = link["mechanism_id"]
+            relation_type = link["relation_type"]
+            relation_counts_by_mechanism[mechanism_id][relation_type] += 1
+            evidence_by_mechanism[mechanism_id].append(
+                {
+                    "journal_entry_id": record["id"],
+                    "entry_type": record["entry_type"],
+                    "title": record["title"],
+                    "relation_type": relation_type,
+                    "confidence": link["confidence"],
+                    "review_status": link["review_status"],
+                    "evidence_quality": link["evidence_span"]["quality"],
+                    "snippet": link["evidence_span"]["snippet"],
+                }
+            )
+
+    backlog_items: list[dict] = []
+    gate_counts: Counter = Counter()
+    decision_counts: Counter = Counter()
+    relation_totals: Counter = Counter()
+    links_requiring_benchmark = 0
+
+    for mechanism_id, mechanism in sorted(mechanisms_by_id.items()):
+        decision_status = mechanism["decision_status"]
+        gate = benchmark_gate_for_status(decision_status)
+        relation_counts = relation_counts_by_mechanism[mechanism_id]
+        evidence_links = evidence_by_mechanism[mechanism_id]
+        benchmark_required_links = relation_counts["benchmark_required"]
+        links_requiring_benchmark += benchmark_required_links
+        gate_counts[gate] += 1
+        decision_counts[decision_status] += 1
+        relation_totals.update(relation_counts)
+
+        sorted_evidence = sorted(
+            evidence_links,
+            key=lambda item: (
+                item["relation_type"] != "benchmark_required",
+                item["relation_type"] != "only_valid_if",
+                item["relation_type"] != "warns_against",
+                item["confidence"] != "high",
+                item["journal_entry_id"],
+            ),
+        )
+        backlog_items.append(
+            {
+                "benchmark_id": f"benchmark-{mechanism_id}",
+                "mechanism_id": mechanism_id,
+                "mechanism_name": mechanism["name"],
+                "layer": mechanism["layer"],
+                "decision_status": decision_status,
+                "decision_rationale": mechanism["decision_rationale"],
+                "gate_type": gate,
+                "gate_description": BENCHMARK_GATE_DESCRIPTIONS[gate],
+                "benchmark_question": mechanism["benchmark"],
+                "acceptance_signal": f"Evidence decides whether `{mechanism_id}` remains `{decision_status}` by measuring: {mechanism['benchmark']}",
+                "relation_type_counts": dict(sorted(relation_counts.items())),
+                "evidence_link_count": len(evidence_links),
+                "benchmark_required_link_count": benchmark_required_links,
+                "evidence_examples": sorted_evidence[:8],
+            }
+        )
+
+    backlog_items.sort(
+        key=lambda item: (
+            BENCHMARK_DECISION_STATUS_ORDER.get(item["decision_status"], 99),
+            item["layer"],
+            item["mechanism_id"],
+        )
+    )
+    return {
+        "schema": BENCHMARK_BACKLOG_SCHEMA,
+        "description": "Generated benchmark and proof-gate backlog from mechanism decision status, mechanism benchmark fields, and typed paper-mechanism relations.",
+        "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
+        "source_paper_mechanism_links": "docs/research/architecture-compatibility/paper-mechanism-links.json",
+        "summary": {
+            "backlog_items": len(backlog_items),
+            "mechanisms_with_benchmark_questions": sum(1 for item in backlog_items if item["benchmark_question"]),
+            "links_requiring_benchmark": links_requiring_benchmark,
+            "gate_type_counts": dict(sorted(gate_counts.items())),
+            "decision_status_counts": dict(sorted(decision_counts.items())),
+            "relation_type_counts": dict(sorted(relation_totals.items())),
+        },
+        "items": backlog_items,
+    }
+
+
+def write_benchmark_backlog_markdown(backlog: dict, output: Path) -> None:
+    lines = [
+        "# GPU DB Research Benchmark Backlog",
+        "",
+        "This report is generated from mechanism decisions and paper-mechanism",
+        "relations. It answers: what experiments decide the architecture?",
+        "",
+        "Regenerate with:",
+        "",
+        "```sh",
+        "python3 scripts/generate_research_paper_mechanism_links.py",
+        "```",
+        "",
+        "## Summary",
+        "",
+        f"- backlog items: {backlog['summary']['backlog_items']}",
+        f"- mechanisms with benchmark questions: {backlog['summary']['mechanisms_with_benchmark_questions']}",
+        f"- paper links requiring benchmark/proof gates: {backlog['summary']['links_requiring_benchmark']}",
+        "",
+        "Gate type counts:",
+    ]
+    for gate, count in sorted(backlog["summary"]["gate_type_counts"].items()):
+        description = BENCHMARK_GATE_DESCRIPTIONS.get(gate, "")
+        lines.append(f"- {gate}: {count} ({description})")
+    lines.append("")
+    lines.append("Decision status counts:")
+    for status, count in sorted(
+        backlog["summary"]["decision_status_counts"].items(),
+        key=lambda item: BENCHMARK_DECISION_STATUS_ORDER.get(item[0], 99),
+    ):
+        lines.append(f"- {status}: {count}")
+    lines.append("")
+    lines.append("Paper relation counts feeding the backlog:")
+    for relation_type, count in sorted(backlog["summary"]["relation_type_counts"].items()):
+        description = RELATION_TYPE_DESCRIPTIONS.get(relation_type, "")
+        lines.append(f"- {relation_type}: {count} ({description})")
+
+    lines.extend(["", "## Experiment Backlog", ""])
+    for item in backlog["items"]:
+        lines.extend(
+            [
+                f"### `{item['benchmark_id']}`",
+                "",
+                f"- mechanism: `{item['mechanism_id']}` ({item['mechanism_name']})",
+                f"- layer: {item['layer']}",
+                f"- decision: {item['decision_status']} - {item['decision_rationale']}",
+                f"- gate: {item['gate_type']} - {item['gate_description']}",
+                f"- experiment: {item['benchmark_question']}",
+                f"- evidence links: {item['evidence_link_count']}",
+                f"- benchmark-required links: {item['benchmark_required_link_count']}",
+                "- relation counts: "
+                + ", ".join(
+                    f"{relation_type}={count}"
+                    for relation_type, count in item["relation_type_counts"].items()
+                ),
+                "",
+                "Evidence examples:",
+            ]
+        )
+        if item["evidence_examples"]:
+            for evidence in item["evidence_examples"][:5]:
+                snippet = evidence["snippet"].replace("|", "\\|")
+                lines.append(
+                    f"- `{evidence['journal_entry_id']}` {evidence['relation_type']}/{evidence['confidence']}: {snippet}"
+                )
+        else:
+            lines.append("- none")
+        lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanism_ids = {item["id"] for item in mechanisms["mechanisms"]}
     mechanism_names = {item["id"]: item["name"] for item in mechanisms["mechanisms"]}
@@ -14257,8 +14459,8 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
     paper_records, duplicate_groups = normalize_paper_records(paper_identities)
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v9",
-        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, and normalized paper identity records. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
+        "schema": "gpu-db-research-paper-mechanism-links-v10",
+        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, normalized paper identity records, and benchmark backlog inputs. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
         "relation_types": {
@@ -14656,14 +14858,31 @@ def main() -> None:
         type=Path,
         default=Path("docs/research/architecture-compatibility/paper-mechanism-coverage.md"),
     )
+    parser.add_argument(
+        "--benchmark-backlog-json",
+        type=Path,
+        default=Path("docs/research/architecture-compatibility/benchmark-backlog.json"),
+    )
+    parser.add_argument(
+        "--benchmark-backlog-markdown",
+        type=Path,
+        default=Path("docs/research/architecture-compatibility/benchmark-backlog.md"),
+    )
     args = parser.parse_args()
 
     journal = args.journal.read_text(encoding="utf-8")
     mechanisms = json.loads(args.mechanisms.read_text(encoding="utf-8"))
     index = build_index(split_entries(journal), mechanisms)
+    benchmark_backlog = build_benchmark_backlog(index, mechanisms)
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_markdown(index, mechanisms, args.markdown_output)
+    args.benchmark_backlog_json.parent.mkdir(parents=True, exist_ok=True)
+    args.benchmark_backlog_json.write_text(
+        json.dumps(benchmark_backlog, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    write_benchmark_backlog_markdown(benchmark_backlog, args.benchmark_backlog_markdown)
 
 
 if __name__ == "__main__":

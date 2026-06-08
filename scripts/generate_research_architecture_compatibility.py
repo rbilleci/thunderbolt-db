@@ -364,6 +364,7 @@ def write_markdown(mechanisms: dict[str, dict], edge_doc: dict, output: Path) ->
         "- Layer 3: this generated compatibility view",
         "- Paper traceability: `docs/research/architecture-compatibility/paper-mechanism-links.json`",
         "- Paper coverage report: `docs/research/architecture-compatibility/paper-mechanism-coverage.md`",
+        "- Benchmark backlog: `docs/research/architecture-compatibility/benchmark-backlog.md`",
         "",
         "## Summary",
         "",
