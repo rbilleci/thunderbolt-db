@@ -5194,6 +5194,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "The synthesis names proof of visibility, authority, residency, and conflict intent as the first gate.",
     },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-should-be-a-typed-contract-not-an-owner-thread-habit",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Tiering follow-ups support placement only when they feed the same route-safety contract.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-should-be-a-typed-contract-not-an-owner-thread-habit",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Mixed visibility choices are safe only when attached to transaction templates.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-should-be-a-typed-contract-not-an-owner-thread-habit",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Metadata route hints support route roots only when authority is partitioned and generation-checked.",
+    },
+    (
+        "2026-06-04-filescale-keeps-metadata-transactions-authoritative-while-caching-the-common-route",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-subtree maintenance and dirty metadata flush behavior are explicitly named as benchmark work.",
+    },
+    (
+        "2026-06-04-filescale-keeps-metadata-transactions-authoritative-while-caching-the-common-route",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-resolution cost, stale-route repair, and owner queue depth are explicit measurement gates.",
+    },
+    (
+        "2026-06-04-saving-private-hash-join-makes-temporary-memory-a-shared-route-budget",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Observed operator sizes support cost-based route planning rather than static optimizer guesses.",
+    },
+    (
+        "2026-06-04-bolt-makes-admission-feedback-arrive-before-the-queue-is-already-stale",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Typed lane-credit admission is valid only if p99 latency and per-session fairness do not regress.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-budgets-need-fast-typed-feedback",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Lane-specific credits and direct bottleneck feedback directly support vector credit admission.",
+    },
+    (
+        "2026-06-04-nwr-omits-blind-writes-only-when-another-visible-version-makes-them-unreachable",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Blind writes risk wasting owner slots, WAL bandwidth, invalidations, and retained snapshot retirement work.",
+    },
+    (
+        "2026-06-04-nwr-omits-blind-writes-only-when-another-visible-version-makes-them-unreachable",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Blind-write coalescing needs latency, WAL, invalidation, and retained-snapshot retirement measurements.",
+    },
+    (
+        "2026-06-04-nwr-omits-blind-writes-only-when-another-visible-version-makes-them-unreachable",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Resident-generation churn with blind-write coalescing must be measured before retained-snapshot adoption.",
+    },
+    (
+        "2026-06-04-nwr-omits-blind-writes-only-when-another-visible-version-makes-them-unreachable",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The prototype is not a production SQL recovery system, so direct WAL-before-visibility inference is unsafe.",
+    },
+    (
+        "2026-06-04-nwr-omits-blind-writes-only-when-another-visible-version-makes-them-unreachable",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Template-level validation and fallback support deterministic hot-write templates despite the cautionary wording.",
+    },
+    (
+        "2026-06-04-nwr-omits-blind-writes-only-when-another-visible-version-makes-them-unreachable",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Blind writes can consume owner queue capacity even when only the latest value matters.",
+    },
+    (
+        "2026-06-04-dace-learns-planner-residuals-instead-of-replacing-planner-expertise",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The evidence warns that learned residuals must not replace deterministic placement and fallback facts.",
+    },
+    (
+        "2026-06-04-dace-learns-planner-residuals-instead-of-replacing-planner-expertise",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The planner must keep deterministic resident-generation and fallback facts around learned residuals.",
+    },
+    (
+        "2026-06-04-heterogeneous-aggregations-split-a-pipeline-by-calibrated-fragments",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Fragmented CPU/GPU aggregation is an alternative to choosing only a fully GPU-resident aggregate.",
+    },
+    (
+        "2026-06-04-heterogeneous-aggregations-split-a-pipeline-by-calibrated-fragments",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "CPU/GPU split aggregation offers a calibrated placement alternative to a single resident execution choice.",
+    },
+    (
+        "2026-06-04-heterogeneous-aggregations-split-a-pipeline-by-calibrated-fragments",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Explicit CPU/GPU fragment sets and fallback legality support a structured CPU fallback policy.",
+    },
+    (
+        "2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Warm-tier placement is valid only if metadata footprint and false-positive cold reads stay within budget.",
+    },
+    (
+        "2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Resident-resource handles are explicitly proposed as prototype work before retained-read adoption.",
+    },
+    (
+        "2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Typed object lifecycles with handles and pools directly support stable handle indirection.",
+    },
+    (
+        "2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract",
+        "db_owned_cold_objects",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Database-visible lifecycle, admission, tier, and restart contracts support DB-owned cold objects.",
+    },
+    (
+        "2026-06-04-pifos-make-scheduling-policy-explicit-at-enqueue-time",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "PIFO-style ranking is an alternative to relying only on FIFO arrival order inside owner rings.",
+    },
+    (
+        "2026-06-04-pifos-make-scheduling-policy-explicit-at-enqueue-time",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Session shaping is valid only if burst recovery does not push short-response p99 beyond target.",
+    },
+    (
+        "2026-06-04-kvell-propagates-old-scan-versions-instead-of-retaining-snapshots",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MVCC retention versus propagation needs version-byte, queue-wait, mutation-p99, and cleanup benchmarks.",
+    },
+    (
+        "2026-06-04-quecc-makes-write-contention-a-planning-problem-not-an-execution-surprise",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Write-template route descriptors require batch-size, latency, WAL grouping, and abort/reject measurements.",
+    },
+    (
+        "2026-06-04-quecc-makes-write-contention-a-planning-problem-not-an-execution-surprise",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "QueCC's in-memory update model warns against adopting its persistence shape for WAL-before-visibility.",
+    },
+    (
+        "2026-06-04-tectonic-turns-cold-tier-efficiency-into-explicit-traffic-classes-and-sealed-metadata",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier time across NVMe, host, PCIe, HBM, kernels, and pinned buffers is an explicit measurement gate.",
+    },
+    (
+        "2026-06-04-hetcache-makes-cache-placement-execution-centric-across-cpu-gpu-and-nvme",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "HetCache targets analytical scans, so it cautions against WAL, MVCC, and session-admission inference.",
+    },
 }
 
 
