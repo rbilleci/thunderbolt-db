@@ -230,9 +230,141 @@ state column says how the mechanism may shape the first candidate set:
   CPU/WAL authority path in the preferred architecture. They may appear as
   explicit labs for bounded write-shape families.
 
-## P2.1 Output Boundary
+## Candidate Construction Rules
 
-This slice assigns every mechanism in the research compatibility graph to a
-design dimension and candidate-construction state. The next P2 slice will turn
-the matrix and compatibility edges into explicit candidate construction rules,
-named assumptions, and rejection rules for P3 architecture-family generation.
+P3 candidates must be constructed as whole architecture families. A family is
+valid only when every selected mechanism has a role in the owner topology,
+publication path, routing path, admission path, storage path, recovery path, or
+validation path. Isolated mechanism adoption is not a candidate.
+
+### Mandatory Spine
+
+Every candidate starts with this non-negotiable spine:
+
+1. `wal_before_visibility` gates SQL visibility, route eligibility, resident
+   snapshot publication, catalog/root publication, and tier metadata
+   publication.
+2. `immutable_route_roots` publishes route, catalog, layout, residency, and
+   visibility generations as immutable roots with reclaimable old bodies.
+3. `vector_credit_admission` bounds request, byte, pinned-buffer, GPU-stream,
+   WAL-slot, response, and residency-refresh pressure before work enters a hot
+   path.
+4. `cpu_fallback_policy` gives every unsupported, stale, saturated,
+   nonresident, over-budget, low-benefit, or unproven route an explicit CPU,
+   wait, reject, retry, or refresh outcome.
+5. `semantic_crash_oracle` and `isolation_trace_oracle` are validation
+   requirements, not optional tests, because they prove the durable prefix and
+   SQL-visible route semantics.
+
+A candidate may be conservative or aggressive about retained GPU work, tiering,
+or runtime scheduling, but it cannot weaken this spine.
+
+### Compatibility Rules
+
+The compatibility graph is interpreted as construction logic:
+
+- `requires`: the target mechanism must be present and assigned a concrete
+  owner/proof role before the source mechanism may appear in a candidate.
+- `strengthens`: the source may appear without the target only if the candidate
+  states why the weaker form is deliberately used; otherwise use the pair
+  together in the natural direction.
+- `compatible`: the pair can co-exist, but P3 must still name the shared
+  resource boundary or descriptor that keeps the interaction bounded.
+- `tension`: the candidate must name the conflict, the cap or fallback that
+  contains it, and the proof gate that decides whether the combination remains
+  viable.
+- `alternative_to`: the candidate may choose one as its write-path experiment,
+  but the preferred baseline cannot depend on both until benchmark gates show a
+  reason to merge them.
+
+### Construction Order
+
+Build each candidate in this order so correctness and operability remain ahead
+of performance claims:
+
+1. Choose the durable authority and publication model. For this search, the
+   default is CPU/WAL/MVCC authority with immutable route roots.
+2. Choose the read-visibility model. Retained GPU candidates must bind
+   `retained_gpu_snapshots`, `snapshot_frontier_vectors`,
+   `mvcc_gc_frontiers`, `bounded_descriptor_reclamation`, and
+   `cpu_fallback_policy`.
+3. Choose the runtime admission and scheduling model. Any claim about 1M
+   sessions, micro-batching, owner rings, GPU streams, or response backpressure
+   must flow through `vector_credit_admission`.
+4. Choose the routing and optimizer model. Freshness-sensitive routes require
+   `htap_freshness_router`; deterministic route selection over CPU, GPU,
+   retained, refresh, transfer, and cold paths requires
+   `cost_based_route_optimizer`.
+5. Choose the storage placement model. Tiered or over-resident candidates must
+   include `stable_handle_indirection`; multi-tier candidates then add
+   `multi_tier_placement` and may optionally add `db_owned_cold_objects`.
+6. Choose optional experiments. `gpu_oltp_conflict_ordering`,
+   `deterministic_hot_write_templates`, and `log_structured_warm_tier` may
+   appear as bounded labs, not as unproven baseline dependencies.
+7. Attach validation gates. Every publication, route, isolation, recovery,
+   admission, reclamation, and tiering claim must map to a benchmark/proof gate
+   from `benchmark-backlog.md`.
+
+### Candidate Archetype Seeds
+
+P3 should produce 3 to 5 families from these seeds. The seeds are intentionally
+architecture-shaped rather than mechanism-shaped.
+
+| Seed | Required mechanisms beyond mandatory spine | Optional mechanisms | Primary workload fit | First rejection risk |
+| --- | --- | --- | --- | --- |
+| Conservative retained-read evolution | `retained_gpu_snapshots`, `snapshot_frontier_vectors`, `mvcc_gc_frontiers`, `bounded_descriptor_reclamation`, `stable_handle_indirection`, `same_shape_microbatching`, `htap_freshness_router`, `cost_based_route_optimizer`, `effective_session_counting`, `owner_ring_bundling`, `deficit_fairness` | `resource_dag_scheduling`, `multi_tier_placement` | Hot point lookups, retained aggregates, mixed freshness reads within current P8 boundaries | Rejected if retained snapshot routes cannot bound HBM/version lifetime or fallback reasons under write churn. |
+| Partition-owner retained snapshots | Conservative seed plus partition-scoped owner topology, `multi_tier_placement`, stronger `snapshot_frontier_vectors` usage, and partition-level route roots | `db_owned_cold_objects`, `resource_dag_scheduling` | Over-resident partitioned reads, mixed HTAP, tenant or partition locality | Rejected if cross-owner snapshot vectors make route preflight too expensive or partition movement breaks stable-handle proofs. |
+| Aggressive GPU-resident hot path | Conservative seed plus one benchmark-only write lab: either `gpu_oltp_conflict_ordering` or `deterministic_hot_write_templates` | `resource_dag_scheduling`, selected `log_structured_warm_tier` lab | Known-shape hot writes, repeated prepared reads, narrow high-throughput lanes | Rejected if write acceleration tries to bypass WAL-before-visibility, CPU/MVCC authority, or isolation traceability. |
+| Multi-tier freshness router | Partition-owner seed plus `multi_tier_placement`, `db_owned_cold_objects`, and costed transfer/refresh routing | `log_structured_warm_tier` after dependency witnesses and crash oracle pass | HBM/DRAM/NVMe/object placement, cold and warm reads, over-resident scans | Rejected if cold/warm metadata cannot recover from WAL/checkpoint/archive plus immutable roots. |
+| Runtime-first 1M-session architecture | Mandatory spine plus `effective_session_counting`, `owner_ring_bundling`, `deficit_fairness`, `same_shape_microbatching`, and optional `resource_dag_scheduling`; retained execution can be narrower than the conservative seed | `retained_gpu_snapshots`, `cost_based_route_optimizer`, `multi_tier_placement` as staged additions | High-concurrency idle plus bursty active sessions, response backpressure, admission stability | Rejected if active-flow accounting hides standing queues or p99 response pressure behind logical-session counts. |
+
+### Named Assumptions For Candidate Scoring
+
+P3 and P4 must use these assumption ids instead of loose prose when a claim is
+not yet implemented:
+
+| Assumption id | Statement | Deciding gate |
+| --- | --- | --- |
+| `A1-retained-refresh-latency` | Retained GPU generations can refresh or invalidate fast enough that common hot reads beat CPU fallback at p50 and p99 under write churn. | `benchmark-retained_gpu_snapshots`; `benchmark-htap_freshness_router` |
+| `A2-frontier-preflight-cost` | Snapshot frontier vectors can prove cross-owner visibility without making route preflight dominate short read latency. | `benchmark-snapshot_frontier_vectors`; `benchmark-isolation_trace_oracle` |
+| `A3-version-retention-bound` | MVCC and descriptor reclamation frontiers keep old versions, resident generations, and retired route bodies bounded under long readers. | `benchmark-mvcc_gc_frontiers`; `benchmark-bounded_descriptor_reclamation` |
+| `A4-vector-credit-sufficiency` | Vector credits can prevent hidden queues across network, WAL, CPU, GPU, pinned memory, residency refresh, and response paths. | `benchmark-vector_credit_admission`; `benchmark-effective_session_counting` |
+| `A5-microbatch-latency-cap` | Same-shape micro-batching improves GPU occupancy without violating p99, fairness, or response backpressure caps. | `benchmark-same_shape_microbatching`; `benchmark-deficit_fairness` |
+| `A6-tier-route-benefit` | Stable handles plus multi-tier placement can route over-resident data with useful work per transferred byte above CPU fallback. | `benchmark-stable_handle_indirection`; `benchmark-multi_tier_placement`; `benchmark-cost_based_route_optimizer` |
+| `A7-cold-object-recovery` | DB-owned cold objects can be recovered, invalidated, and backed up through immutable roots and crash-oracle proofs. | `benchmark-db_owned_cold_objects`; `benchmark-semantic_crash_oracle` |
+| `A8-owner-ring-tail-control` | Owner-ring bundling plus deficit fairness can raise throughput without starving interactive or freshness-sensitive classes. | `benchmark-owner_ring_bundling`; `benchmark-deficit_fairness` |
+| `A9-write-lab-containment` | GPU conflict ordering or deterministic hot-write templates can be evaluated without changing the durable CPU/WAL authority path. | `benchmark-gpu_oltp_conflict_ordering`; `benchmark-deterministic_hot_write_templates`; `benchmark-wal_before_visibility` |
+| `A10-dependency-witness-cost` | Dependency witnesses can explain async body persistence and delayed route eligibility without adding unacceptable publish latency. | `benchmark-dependency_witnesses`; `benchmark-immutable_route_roots` |
+
+### Rejection Rules
+
+Reject a candidate before scoring when any of these conditions hold:
+
+- It publishes a SQL-visible generation, route root, resident snapshot, catalog
+  root, tier manifest, or cold-object descriptor without durable commit or
+  dependency-witness evidence.
+- It treats GPU memory, resident indexes, encoded responses, warm-tier logs, or
+  cold objects as durability authority rather than rebuildable acceleration
+  state.
+- It includes retained GPU reads without snapshot frontiers, MVCC/version
+  retention bounds, stale-route rejection, and CPU/fallback semantics.
+- It claims 1M logical-session viability without separating idle logical
+  sessions from active flows and response backpressure.
+- It uses batching, owner rings, or resource-DAG scheduling without vector
+  credits and fairness or latency caps.
+- It uses multi-tier placement without stable handle indirection and explicit
+  movement/freshness costs.
+- It adopts learned optimizer advice as a correctness-affecting decision path
+  before deterministic route telemetry and fallback guardrails exist.
+- It promotes benchmark-only write mechanisms into the preferred baseline
+  before WAL, isolation, conflict, and tail-latency gates pass.
+- It has no crash/recovery, isolation, fallback, and operator-observability
+  validation plan.
+
+## P2 Output Boundary
+
+P2 is complete. The design-space file now contains the objective model,
+hard-constraint checklist, mechanism-to-dimension matrix, compatibility
+interpretation rules, candidate construction order, candidate archetype seeds,
+named assumptions, and rejection rules. P3 can now generate architecture
+families without rereading the full literature journal.
