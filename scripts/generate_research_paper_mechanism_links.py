@@ -5404,6 +5404,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "warns_against",
         "relation_review_note": "HetCache targets analytical scans, so it cautions against WAL, MVCC, and session-admission inference.",
     },
+    (
+        "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Accelerator rewrites are useful only when route descriptors and telemetry prove an end-to-end latency win.",
+    },
+    (
+        "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Dedicated versus piggybacked accelerator queue ownership must be evaluated before adopting the owner shape.",
+    },
+    (
+        "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Queue buildup and straggler risk make the route-cost model a measurement gate rather than immediate support.",
+    },
+    (
+        "2026-06-04-sundial-logical-leases-unify-serializable-ordering-and-cache-coherence",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Logical leases can inform retained snapshots only after lease-renewal and fallback behavior is benchmarked.",
+    },
+    (
+        "2026-06-04-eigen-manages-database-capacity-as-a-three-layer-resource-flow",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The resource-vector evidence supports retained snapshot routes declaring explicit resource demand.",
+    },
+    (
+        "2026-06-04-gacco-batches-same-shape-oltp-on-gpu-while-cpu-owns-the-full-database",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The accessible evidence leaves recovery and logging unknown, so WAL-before-visibility needs validation.",
+    },
+    (
+        "2026-06-04-no-false-negatives-makes-serializable-conflict-acceptance-explicit",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The single-version graph scheduler evidence directly supports explicit GPU OLTP conflict ordering.",
+    },
+    (
+        "2026-06-04-no-false-negatives-makes-serializable-conflict-acceptance-explicit",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Epoch-marked prior row snapshots support frontier-style visibility for mixed OLTP and OLAP reads.",
+    },
+    (
+        "2026-06-04-no-false-negatives-makes-serializable-conflict-acceptance-explicit",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner telemetry is useful only when routes cannot enter execution without enough conflict information.",
+    },
+    (
+        "2026-06-04-robust-co-processor-routes-need-data-residency-and-heap-budgets",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Operator-level CPU restart on accelerator allocation failure is an alternative to deterministic hot-write templating.",
+    },
+    (
+        "2026-06-04-distributed-gpu-joins-hide-network-shuffle-under-gpu-work",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Overlapping network shuffle with GPU work is presented as an alternative to retained snapshot locality assumptions.",
+    },
+    (
+        "2026-06-04-distributed-gpu-joins-hide-network-shuffle-under-gpu-work",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Skew-aware placement and GPUDirect topology choices are explicitly route-cost benchmark gates.",
+    },
+    (
+        "2026-06-04-distributed-gpu-joins-hide-network-shuffle-under-gpu-work",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The movement-overlap evidence supports placement decisions that account for unavoidable tier transfers.",
+    },
+    (
+        "2026-06-04-spooky-granulates-lsm-compaction-by-largest-level-boundaries",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Refresh boundaries carrying visibility generation and WAL frontier support snapshot frontier vectors.",
+    },
+    (
+        "2026-06-04-spooky-granulates-lsm-compaction-by-largest-level-boundaries",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The entry explicitly maps refresh partition groups and visibility generations to retained GPU snapshots.",
+    },
+    (
+        "2026-06-04-ccaas-separates-conflict-resolution-from-execution-and-storage",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Subdomain owner saturation must be measured with a write-heavy benchmark before adopting the owner split.",
+    },
+    (
+        "2026-06-04-strife-turns-high-contention-oltp-into-batch-local-owner-lanes",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "TPC-C, YCSB, and hot-record measurements are required before transferring the conflict-ordering shape.",
+    },
+    (
+        "2026-06-04-strife-turns-high-contention-oltp-into-batch-local-owner-lanes",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Conflict-free queues and separated cluster discovery support explicit owner-lane bundling.",
+    },
+    (
+        "2026-06-04-strife-turns-high-contention-oltp-into-batch-local-owner-lanes",
+        "effective_session_counting",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Admission by active conflict shape rather than raw connection count supports effective session counting.",
+    },
+    (
+        "2026-06-04-strife-turns-high-contention-oltp-into-batch-local-owner-lanes",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained reads coexist with hot write clusters only when descriptor density amortizes setup and transfer costs.",
+    },
+    (
+        "2026-06-04-rtscan-maps-conjunctive-filters-onto-ray-tracing-cores",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "RT route selection depends on downstream device locality, result size, rebuild policy, and telemetry benchmarks.",
+    },
+    (
+        "2026-06-04-rtscan-maps-conjunctive-filters-onto-ray-tracing-cores",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Attaching RT resident indexes to immutable retained generations supports route-root publication.",
+    },
+    (
+        "2026-06-04-acc-chooses-concurrency-control-per-cluster-instead-of-globally",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cluster-specific concurrency-control selection needs GPU DB workload benchmarking before adoption.",
+    },
+    (
+        "2026-06-04-acc-chooses-concurrency-control-per-cluster-instead-of-globally",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Mixed protocol routing is safe only if WAL replay and cache rebuild share deterministic visibility order.",
+    },
+    (
+        "2026-06-04-acc-chooses-concurrency-control-per-cluster-instead-of-globally",
+        "effective_session_counting",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Using active conflict shape rather than raw session count supports the effective-session admission model.",
+    },
+    (
+        "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Hot-write templates are valid only when retry and deferred-commit conditions prove consistent reads.",
+    },
+    (
+        "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Deterministic batch logs are useful only with explicit replay order, checkpoint, and invalidation frontiers.",
+    },
+    (
+        "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Dependency frontiers carrying WAL epoch, owner generation, and batch id support snapshot frontier vectors.",
+    },
+    (
+        "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Transaction-shaped route descriptors support explicit owner routing beyond a single global rule.",
+    },
+    (
+        "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Per-item metadata placement is valid only if cache-contention hot spots are partitioned or sampled carefully.",
+    },
 }
 
 
