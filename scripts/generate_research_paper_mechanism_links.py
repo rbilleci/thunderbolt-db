@@ -4564,6 +4564,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "supports",
         "relation_review_note": "Mapping rich ranks onto a few bounded request or response rings supports owner-ring bundling.",
     },
+    (
+        "2026-06-03-sp-pifo-strict-priority-approximation-of-programmable-scheduling",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "SP-PIFO's strict-priority approximation is an alternative scheduling abstraction to explicit resource-DAG execution.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-adaptive-scheduling-must-share-commit-generation-truth",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts blind aborts with deterministic epoch repair; the retained evidence supports bounded admission signals.",
+    },
+    (
+        "2026-06-03-ruma-rewired-user-space-memory-access",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "RUMA-style rewired snapshots are useful only when snapshot intervals, reader attachment, and mapping lifetime stay explicit.",
+    },
+    (
+        "2026-06-03-an-empirical-evaluation-of-columnar-storage-formats",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Analytical file-format evidence does not establish WAL, MVCC, recovery, or in-place mutation safety.",
+    },
+    (
+        "2026-06-03-counting-is-all-you-need-for-instant-tuple-discovery",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Deterministic future-placement vectors support retained snapshot refresh rather than making this an alternative to snapshots.",
+    },
+    (
+        "2026-06-03-counting-is-all-you-need-for-instant-tuple-discovery",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Deterministic scatter placement directly supports multi-tier placement metadata despite the rather-than cue.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-refresh-metadata-is-becoming-the-storage-design",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Trace-assisted refresh metadata supports placement descriptors instead of being a separate alternative mechanism.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-refresh-metadata-is-becoming-the-storage-design",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The not-just cue expands route costing to generation-indexed metadata rather than warning against cost-based routing.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-refresh-metadata-is-becoming-the-storage-design",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Generation-indexed metadata for retained reads supports retained snapshots; the not-just cue rejects byte-only storage thinking.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-refresh-metadata-is-becoming-the-storage-design",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Refresh and pruning metadata supports freshness routing; the not-just cue is a modeling constraint, not a caution relation.",
+    },
+    (
+        "2026-06-03-towards-buffer-management-with-tiered-main-memory",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Remote-memory indexing choices need GPU DB handle-lifetime and placement benchmarks before stable-handle adoption.",
+    },
+    (
+        "2026-06-03-tiga-synchronized-clock-transaction-ordering",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Measured ring, WAL, and mutation-owner delays are needed before publication generations can drive route roots.",
+    },
+    (
+        "2026-06-03-tiga-synchronized-clock-transaction-ordering",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Speculative execution remains valid only when replay or WAL state proves order before client visibility.",
+    },
+    (
+        "2026-06-03-tiga-synchronized-clock-transaction-ordering",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Cross-owner dependency handling is useful only when generation tracking drives admission instead of hiding saturation.",
+    },
+    (
+        "2026-06-03-aocc-adaptive-validation-for-heterogeneous-occ",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained aggregate reads over resident partitions need HTAP transaction-shape tests before relying on this transfer.",
+    },
+    (
+        "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Distinct CXL, DRAM, HBM, NVMe, and authority zones directly support explicit multi-tier placement.",
+    },
+    (
+        "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "CXL tiering warns against treating retained snapshot placement as simply system memory versus disk.",
+    },
+    (
+        "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Per-partition placement descriptors support stable handle indirection across future host and device tiers.",
+    },
+    (
+        "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU/CXL interaction is future work, so descriptor reclamation needs direct measurement before adoption.",
+    },
+    (
+        "2026-06-03-tique-transactions-in-the-query-engine",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Priority retry and reservation modes need comparison against OCC aborts and owner execution templates.",
+    },
+    (
+        "2026-06-03-ringleader-offloads-intra-server-orchestration-to-nics",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Logical session count needs explicit lookup-latency and starvation benchmarks before relying on NIC orchestration.",
+    },
+    (
+        "2026-06-03-ringleader-offloads-intra-server-orchestration-to-nics",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "FPGA scheduling latency must be measured in the DB request path before it can inform resource-DAG scheduling.",
+    },
+    (
+        "2026-06-03-mrvs-split-bounded-numeric-hotspots-across-records",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Split numeric hotspots are useful only if invariant checks and snapshot reads preserve ordering within cost bounds.",
+    },
+    (
+        "2026-06-03-mrvs-split-bounded-numeric-hotspots-across-records",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Split bounded counters remain ordinary MVCC rows under WAL-before-visibility, so the instead-of cue does not reclassify the link.",
+    },
+    (
+        "2026-06-03-hattrick-throughput-frontier-for-htap-evaluation",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Freshness routing is valid only when telemetry attributes throughput loss to bounded queue and freshness budgets.",
+    },
+    (
+        "2026-06-03-hattrick-throughput-frontier-for-htap-evaluation",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "HATtrick's simplified benchmark needs GPU DB-specific transfer, launch, buffer, and invalidation measurements.",
+    },
+    (
+        "2026-06-03-hattrick-throughput-frontier-for-htap-evaluation",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Analytical recency tracking needs descriptor-lifetime and retained-reader measurements in GPU DB workloads.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-frontier-metrics-make-tradeoffs-visible",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Freshness routing needs frontier metrics that split retained reads, long scans, refreshes, and write batches.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-frontier-metrics-make-tradeoffs-visible",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Session-counting transfer requires benchmarks separating logical sessions from runnable requests and route classes.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-frontier-metrics-make-tradeoffs-visible",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots need visibility-generation metrics under mixed reads, scans, refreshes, and write batches.",
+    },
 }
 
 
