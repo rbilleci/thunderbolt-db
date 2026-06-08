@@ -8764,6 +8764,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Compression placement thresholds must be remeasured for HBM, DRAM, NVMe, and future tiers.",
     },
+    (
+        "2026-06-05-adaptive-compression-should-be-a-tier-policy-not-a-column-default",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The integer-column prototype leaves string, index, join, SQL expression, CUDA, and memory-management coverage as benchmark debt.",
+    },
+    (
+        "2026-06-05-orpheusdb-makes-old-version-lookup-a-partitioning-problem",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Old-version placement needs separate GPU memory, NVMe, and write-heavy transactional measurements before transfer.",
+    },
+    (
+        "2026-06-05-orpheusdb-makes-old-version-lookup-a-partitioning-problem",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Partition refresh supports WAL recovery only when measured reconstruction cost crosses a tolerated threshold.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-need-semantic-proof-surfaces",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The not-just-timestamp cue strengthens the need for compact dependency proof surfaces rather than weakening the mechanism.",
+    },
+    (
+        "2026-06-05-hana-nse-makes-warm-placement-byte-compatible-not-separate-engine",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Warm placement is safe only when crash recovery and log replay keep emergency buffer paths separate from normal cache pressure.",
+    },
+    (
+        "2026-06-05-skq-makes-event-delivery-a-schedulable-resource",
+        "deficit_fairness",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fair event delivery is valid only if high-priority routes cannot starve regular traffic or delay cancellation indefinitely.",
+    },
+    (
+        "2026-06-05-execution-routes-should-choose-fusion-by-data-behavior",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Execution-model isolation is an alternative planning signal to treating learned advice or whole-engine identity as the route decision.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The synthesis frames route-shape proof as an alternative to one-time engine identity or opaque learned route advice.",
+    },
+    (
+        "2026-06-05-flowcut-keeps-adaptive-network-routing-in-order-by-draining-active-flows",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Session-count transfer depends on measured response order, reorder bytes, cancellation latency, and in-flight bytes.",
+    },
+    (
+        "2026-06-05-neurcc-makes-concurrency-control-a-learned-action-table",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Learned hot-write choices are valid only if they never expose dirty state or partial retries after pgwire-visible results.",
+    },
+    (
+        "2026-06-05-neurcc-makes-concurrency-control-a-learned-action-table",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The lookup-table cue supports bounded learned advice by avoiding model inference in the hot path.",
+    },
+    (
+        "2026-06-05-type-aware-transactions-make-conflict-semantics-a-data-structure-contract",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Datatype-owned conflict predicates directly support explicit GPU OLTP conflict ordering rather than a universal word-level rule.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The synthesis supports costed route choice by requiring route state, access costs, and datatype conflict predicates.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Drain frontiers and resident route state support explicit snapshot frontier tracking for ordered route policies.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-policies-need-execution-shape-proof",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Resident access costs and route-shape proof support tier placement as an explicit route-policy input.",
+    },
+    (
+        "2026-06-05-sap-hana-nvm-keeps-hot-mutability-out-of-the-persistent-tier",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Persistent-tier placement is valid only when mutable deltas, visibility metadata, route state, and buffers remain in DRAM or HBM unless benchmarks prove otherwise.",
+    },
+    (
+        "2026-06-05-sap-hana-nvm-keeps-hot-mutability-out-of-the-persistent-tier",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Physical block removal is safe only when retained snapshots, rollback, and recovery replay no longer name the block.",
+    },
+    (
+        "2026-06-05-sap-hana-nvm-keeps-hot-mutability-out-of-the-persistent-tier",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained snapshots may use persistent backing only if hot mutability and visibility metadata stay in fast memory or are benchmark-proven.",
+    },
+    (
+        "2026-06-05-sap-hana-nvm-keeps-hot-mutability-out-of-the-persistent-tier",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Session-admission transfer needs benchmarks because the evidence omits GPU kernels, CUDA transfers, GPUDirect, CXL, and pgwire sessions.",
+    },
+    (
+        "2026-06-05-sgdrc-splits-gpu-service-quality-into-sm-and-vram-channel-budgets",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Sliding-window GPU reservation is an alternative owner-capacity policy to fixed foreground fractions.",
+    },
+    (
+        "2026-06-05-sgdrc-splits-gpu-service-quality-into-sm-and-vram-channel-budgets",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Dynamic SM reservation and eviction are alternatives to static resource DAG partitioning for latency-sensitive kernels.",
+    },
+    (
+        "2026-06-05-sgdrc-splits-gpu-service-quality-into-sm-and-vram-channel-budgets",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The DNN-inference and TVM-like compilation assumptions caution against direct descriptor-reclamation transfer.",
+    },
+    (
+        "2026-06-05-conweave-masks-rdma-rerouting-disorder-inside-the-network",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Rerouting supports dependency witnesses only if pgwire-visible responses preserve order or explicitly declare independent completion.",
+    },
+    (
+        "2026-06-05-conweave-masks-rdma-rerouting-disorder-inside-the-network",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Frequent route changes are safe only with a bounded mechanism that restores the receiver's ordering contract.",
+    },
+    (
+        "2026-06-05-orion-co-schedules-gpu-kernels-by-resource-complementarity",
+        "deficit_fairness",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Best-effort co-scheduling is fair only when the added kernel is small and resource-complementary to the high-priority job.",
+    },
+    (
+        "2026-06-05-orion-co-schedules-gpu-kernels-by-resource-complementarity",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Complementary-kernel scheduling is valid only when resource profiles prove the best-effort work will not harm the priority route.",
+    },
+    (
+        "2026-06-05-l-store-stages-write-optimized-deltas-into-read-optimized-pages-by-lineage",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Independent column and index refresh cautions against coarse snapshot validity without generation and delta frontiers.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-routes-need-ordered-profiled-lineage-certified-publication",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Per-column and per-index lineage frontiers are presented as an alternative to a single coarse immutable route validity bit.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-routes-need-ordered-profiled-lineage-certified-publication",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that queue delay, freshness, and tier placement are plan risks rather than after-the-fact runtime events.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-routes-need-ordered-profiled-lineage-certified-publication",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that freshness must be a first-class route risk rather than an after-the-fact runtime event.",
+    },
 }
 
 
