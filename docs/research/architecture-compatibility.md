@@ -29,6 +29,14 @@ python3 scripts/generate_research_architecture_compatibility.py
 - strengthens: 22
 - tension: 5
 
+Decision status counts:
+- adopt_now: 6 (make this a baseline architecture invariant)
+- benchmark_only: 4 (keep as an experiment until measurement decides adoption)
+- defer: 1 (postpone until prerequisite mechanisms or product pressure exist)
+- prototype: 14 (build the first implementation behind an explicit proof gate)
+- reject: 0 (do not include in the architecture)
+- unknown: 0 (not enough reviewed evidence to decide yet)
+
 ## Recommended End-to-End Spine
 
 - `wal_before_visibility` (durability): Durable commit evidence must exist before SQL-visible state or route eligibility advances.
@@ -63,6 +71,7 @@ Reclaim old versions by exact active snapshot generations and bounded multiversi
 - evidence: Scalable Garbage Collection for In-Memory MVCC, Practically and Theoretically Efficient GC for Multiversioning, BOHM
 - provides: bounded version memory; long-reader accounting; hot-chain pruning
 - requires: active snapshot registry; safe reclamation frontier; index/version unlink protocol
+- decision: prototype - Exact active-reader frontiers are needed to bound old versions, but retention behavior under GPU snapshots must be measured.
 - benchmark: Long-reader and hot-write MVCC retention benchmark with exact frontier pruning.
 
 #### `snapshot_frontier_vectors` - Snapshot frontier vectors
@@ -72,6 +81,7 @@ Use compact scalar generations on hot paths and vector/frontier state only where
 - evidence: Taurus MM, Chardonnay, Read-Safe Snapshots, Scalable Snapshot Isolation
 - provides: multi-owner visibility proof; long-reader admission basis; refresh safety
 - requires: owner generation map; active reader horizon; frontier compaction
+- decision: prototype - Cross-owner visibility proof is required for retained snapshots, while the scalar/vector split needs implementation evidence.
 - benchmark: Vector-scalar visibility simulator across owners with retained snapshot admission and fallback.
 
 ### Durability
@@ -83,6 +93,7 @@ Durable commit evidence must exist before SQL-visible state or route eligibility
 - evidence: ARIES lineage, FineLine, Siberia, fsync failures, Chipmunk, CCFS
 - provides: crash-safe commit boundary; old-or-new recovery basis; replication handoff point
 - requires: commit generation; durable log frontier; visibility publication gate
+- decision: adopt_now - Durability before SQL-visible publication is a non-negotiable correctness invariant, and many downstream route/root/fallback mechanisms require it.
 - benchmark: Crash-injected commit and route-publication matrix proving no visible generation lacks durable WAL evidence.
 
 ### Execution
@@ -94,6 +105,7 @@ Route stale, unsupported, over-budget, or low-cardinality work to CPU without vi
 - evidence: ADR-003 local decision, GPU-Accelerated OLTP, veDB-HTAP, TetriSched
 - provides: correctness-preserving escape hatch; latency cap; unsupported-route handling
 - requires: fallback reason; same SQL semantics; snapshot proof
+- decision: adopt_now - Every accelerated route needs an explicit safe fallback reason so correctness and latency budgets survive stale residency or resource pressure.
 - benchmark: Split CPU/GPU route benchmark with fallback reasons and isolation trace validation.
 
 #### `retained_gpu_snapshots` - Retained GPU snapshots
@@ -103,6 +115,7 @@ Keep hot read generations resident on GPU and route matching reads directly when
 - evidence: vDriver, vWeaver, Diva, veDB-HTAP, GPU-Accelerated OLTP
 - provides: low-latency repeated reads; reduced CPU owner pressure; GPU amortization
 - requires: snapshot generation; residency descriptor; stale-route rejection; refresh policy
+- decision: prototype - Resident read generations are central to the GPU value proposition, but freshness, HBM pressure, and version retention need prototype evidence.
 - benchmark: Same-shape retained lookup benchmark under refresh lag, write churn, and fallback pressure.
 
 #### `same_shape_microbatching` - Same-shape micro-batching
@@ -112,6 +125,7 @@ Batch repeated prepared route shapes by snapshot generation, partition, and resu
 - evidence: GaccO, LTPG, GPU-Accelerated OLTP, Pipelined Query Processing, push/pull query papers
 - provides: kernel launch amortization; coalesced reads; response scatter efficiency
 - requires: route shape id; snapshot generation; batch size/latency cap
+- decision: prototype - Repeated route shapes are a core GPU execution opportunity, while batch limits need latency and occupancy curves before adoption.
 - benchmark: Prepared point lookup and aggregate micro-batch curves over p50, p99, and GPU occupancy.
 
 ### Memory Reclamation
@@ -123,6 +137,7 @@ Retire route, catalog, and plan descriptors through bounded hazard/era/epoch-sty
 - evidence: WFE, Crystalline, Hyaline, Publish on Ping, NBR, Hazard Eras
 - provides: safe lock-free descriptor lifetime; bounded retired metadata; reader-friendly publication
 - requires: reader protection token; retire queues; stalled-reader policy
+- decision: prototype - Immutable publication requires safe descriptor lifetime, while the specific hazard/era/epoch strategy should follow churn measurements.
 - benchmark: Route-descriptor churn benchmark with long readers, stalled sessions, and bounded retired bytes.
 
 ### Metadata Publication
@@ -134,6 +149,7 @@ Represent delayed internal publication as explicit dependency chains that must f
 - evidence: ASAP, MOD, Graphene, CCFS
 - provides: safe async metadata persistence; explainable route readiness; ordered recovery proof
 - requires: dependency ids; fence state; root eligibility check
+- decision: prototype - Async publication needs explicit dependency proof, but the witness representation should be prototyped before fixing hot-path shape.
 - benchmark: Async body-persist simulator that proves readers see only fenced roots while measuring ordered flush reduction.
 
 #### `immutable_route_roots` - Immutable route roots
@@ -143,6 +159,7 @@ Publish route, catalog, layout, residency, and visibility metadata as immutable 
 - evidence: MOD, Zen, REWIND, Falcon, ASAP
 - provides: atomic route eligibility; rebuildable metadata; compact invalidation handle
 - requires: body checksum; root generation; reclaimable old roots
+- decision: adopt_now - Compact immutable generations give the architecture a shared publication contract for routes, catalogs, residency, and visibility.
 - benchmark: Route-root publish benchmark comparing full rewrite, in-place mutation, and immutable-body/root-swap under crash injection.
 
 ### Query Optimization
@@ -154,6 +171,7 @@ Choose CPU, GPU, retained snapshot, refresh, transfer, or fallback routes from m
 - evidence: Holon, Cardinality Estimation surveys, Free Join, Learned Query Optimizer, NoisePage/DBOS line
 - provides: route choice; join/scan planning; transfer avoidance
 - requires: cardinality signals; route telemetry; guarded planner contract
+- decision: prototype - The system needs deterministic route choice over CPU, GPU, retained, refresh, and cold paths before learning or advanced placement can matter.
 - benchmark: Route-choice benchmark over point, range, join, retained, and cold-tier queries.
 
 #### `learned_optimizer_advisor` - Learned optimizer advisor
@@ -163,6 +181,7 @@ Use ML or adaptive learning to suggest route, knob, or placement decisions while
 - evidence: Learned Query Optimizer, Bao, Holon, Polyjuice
 - provides: adaptive tuning; large design-space pruning; workload-sensitive route hints
 - requires: safe action envelope; fallback baseline; online regret telemetry
+- decision: defer - Learned route advice should wait until deterministic route telemetry, guardrails, and baseline costs are stable.
 - benchmark: Advisor-vs-baseline route selection with guardrail rejections and p99/regret tracking.
 
 ### Routing
@@ -174,6 +193,7 @@ Route reads by freshness requirement, snapshot availability, wait budget, and ac
 - evidence: veDB-HTAP, vWeaver, Diva, F1 Lightning
 - provides: freshness-aware acceleration; bounded stale-route rejection; wait-or-fallback decision
 - requires: freshness contract; snapshot frontier; route cost model
+- decision: prototype - Freshness-aware routing is fundamental to retained reads, but exact wait, refresh, and fallback thresholds need prototype feedback.
 - benchmark: Freshness router benchmark over read-committed, bounded-staleness, and exact-snapshot routes.
 
 ### Runtime Admission
@@ -185,6 +205,7 @@ Count only sessions with ready work or blocked responses as active flows; idle l
 - evidence: TFC, Demikernel, DBOS, HFT/runtime papers
 - provides: 1M logical-session scalability; idle-session cheapness; fair active-flow accounting
 - requires: ready-work flags; socket writeability state; session memory tiers
+- decision: prototype - Large logical-session counts are a target workload, but active-flow accounting needs a simulator before adoption as a fixed runtime rule.
 - benchmark: Fan-in activation simulator comparing logical sessions, active flows, and hot-path memory.
 
 #### `vector_credit_admission` - Vector-credit admission
@@ -194,6 +215,7 @@ Admit work using per-boundary credits for requests, bytes, pinned buffers, GPU s
 - evidence: TFC, PIFO/SP-PIFO, HostCC, Justitia, Silo
 - provides: zero-standing-queue target; explicit overload reason; bounded p99 pressure
 - requires: resource counters; admission interval; fallback/reject policy
+- decision: adopt_now - Route choice must expose bounded resource budgets up front so GPU, CPU, WAL, buffer, and response queues cannot hide overload.
 - benchmark: 1M logical-session simulator with vector credits and standing-queue telemetry.
 
 ### Runtime Scheduling
@@ -205,6 +227,7 @@ Allow short-term throughput-favorable scheduling while tracking deficits so inte
 - evidence: Graphene, PIFO/SP-PIFO, Justitia, Silo
 - provides: bounded unfairness; tenant/session SLO guard; batching without starvation
 - requires: class counters; queue-wait telemetry; overload policy
+- decision: prototype - Fairness counters are needed to bound batching and DAG scheduling bias, but policy constants should come from mixed-class measurements.
 - benchmark: Mixed class retained-read benchmark with throughput, p99, and deficit bound gates.
 
 #### `owner_ring_bundling` - Owner-ring bundling
@@ -214,6 +237,7 @@ Drain bounded bundles from owner rings and record why selected or skipped work m
 - evidence: Graphene, TetriSched, Syrup, libpreemptible, mechanical sympathy queue papers
 - provides: low-allocation scheduling; observable queue decisions; micro-batch formation
 - requires: bounded ring window; selection policy; skip reason telemetry
+- decision: prototype - Owner-local bounded drains are promising for low-allocation scheduling, with selection policy and skip telemetry still needing proof.
 - benchmark: Owner-drain benchmark comparing FIFO, bundle packing, and troublesome-first selection.
 
 #### `resource_dag_scheduling` - Resource-DAG scheduling
@@ -223,6 +247,7 @@ Represent query, refresh, write, transfer, kernel, and response work as small de
 - evidence: Graphene, TetriSched, Hawk, Firmament
 - provides: dependency-aware GPU scheduling; refresh/read co-scheduling; scarce-resource packing
 - requires: fragment estimates; dependency edges; bounded online planner
+- decision: benchmark_only - DAG scheduling could improve scarce-resource packing, but estimation errors can hurt p99 and must be benchmarked against simpler queues.
 - benchmark: Route-DAG simulator over refresh, H2D, kernel, D2H, and response fragments.
 
 ### Storage Layout
@@ -234,6 +259,7 @@ Separate logical row/route identity from movable physical placement through hand
 - evidence: AIFM, RUMA, Log-Structured NVM, GC research lane, Mosaic
 - provides: safe movement across tiers; compaction support; resident descriptor stability
 - requires: handle table; generation checks; movement publication protocol
+- decision: prototype - Tier movement and compaction need stable identity, but lookup overhead must be measured before the handle shape is fixed.
 - benchmark: Handle-table lookup and movement benchmark across HBM, DRAM, and NVMe-resident fragments.
 
 ### Storage Placement
@@ -245,6 +271,7 @@ Manage cold blobs, segments, and object-store files with database-owned layout, 
 - evidence: BLOB papers, Vortex, RocksDB workload papers, storage-device mismatch papers
 - provides: cold-tier scan/index control; object lifecycle ownership; backup/PITR alignment
 - requires: object manifest; compaction/aging policy; backup boundary
+- decision: prototype - Cold object manifests should be DB-owned to preserve recovery and routing semantics, with compaction and backup boundaries still to prove.
 - benchmark: Cold-object read/write/compaction benchmark with object manifest crash recovery.
 
 #### `log_structured_warm_tier` - Log-structured warm tier
@@ -254,6 +281,7 @@ Treat future DRAM/NVM/CXL warm metadata and fragments as append/log-structured h
 - evidence: Log-Structured NVM, NOVA, REWIND, Falcon, DudeTM
 - provides: write coalescing; rebuildable metadata; reduced in-place persist ordering
 - requires: segment log; mapping rebuild; GC/compaction policy
+- decision: benchmark_only - A rebuildable warm tier may simplify recovery, but append-map, root-publication, and in-place metadata variants need direct comparison.
 - benchmark: Warm-tier manifest benchmark comparing append-map rebuild, in-place metadata, and root publication.
 
 #### `multi_tier_placement` - Multi-tier placement policy
@@ -263,6 +291,7 @@ Place fragments across HBM, DRAM, compressed host memory, NVMe, object storage, 
 - evidence: AIFM, Mosaic, vDriver/vWeaver, BtrBlocks, Five-minute rule cloud papers, SAP HANA CXL work
 - provides: bounded HBM use; warm/cold separation; placement explainability
 - requires: fragment heat; movement cost; tier capacity; freshness policy
+- decision: prototype - HBM/DRAM/NVMe placement is necessary for capacity, but movement costs and hit-rate targets need simulator and prototype data.
 - benchmark: Tier-placement simulator measuring HBM hit rate, movement latency, p99, and write amplification.
 
 ### Transaction Execution
@@ -274,6 +303,7 @@ Use predictable per-object queues or deterministic templates for highly contende
 - evidence: DecentSched, PLOR, batching/reordering OCC, Mostly-Optimistic CC
 - provides: hot-key tail control; lower abort rate; owner-local scheduling
 - requires: hot-key detection; template or queue position; fallback for dynamic transactions
+- decision: benchmark_only - Hot-write templates may beat abort/retry loops for narrow key shapes, but they should remain benchmark-gated until workload fit is proven.
 - benchmark: Zipfian hot-key simulator comparing retry, ordered locking, owner serialization, and deterministic queue positions.
 
 #### `gpu_oltp_conflict_ordering` - GPU OLTP conflict ordering
@@ -283,6 +313,7 @@ Preprocess large transaction batches to detect conflicts and execute compatible 
 - evidence: GaccO, LTPG, GPU-Accelerated OLTP, PLOR
 - provides: GPU write-path throughput; high-contention batch ordering; conflict visibility
 - requires: known access sets or conservative conflict model; batch boundary; CPU WAL publication
+- decision: benchmark_only - GPU conflict preprocessing is useful only for specific hot-key batch regimes and must compete with CPU OCC and owner serialization.
 - benchmark: YCSB/TPC-C style hot-key batch benchmark comparing CPU OCC, owner serialization, and GPU conflict ordering.
 
 ### Validation
@@ -294,6 +325,7 @@ Validate every observed read against allowed snapshot intervals, fallback routes
 - evidence: Leopard, PolySI, Elle/Jepsen lineage
 - provides: black-box isolation validation; fallback correctness gate; snapshot route audit
 - requires: operation trace; version intervals; declared isolation contract
+- decision: adopt_now - Fallback and retained-snapshot routes need continuous external validation that returned versions match the declared isolation contract.
 - benchmark: CPU-only, GPU-retained, split CPU/GPU, and fallback MVCC trace oracle.
 
 #### `semantic_crash_oracle` - Semantic crash oracle
@@ -303,6 +335,7 @@ Test recovery by semantic states and externally visible outcomes rather than by 
 - evidence: B3, Pathfinder, Chipmunk, fsync failures
 - provides: recovery proof gate; failure-state coverage; unsafe publication detector
 - requires: observable invariants; crash-state generator; old-or-new expectation model
+- decision: adopt_now - Crash-state validation is required to prove WAL, route-root, catalog, and residency publication boundaries before optimized paths are trusted.
 - benchmark: Crash-state generator for WAL, route roots, catalog roots, and residency manifests.
 
 ## Compatibility Matrices
