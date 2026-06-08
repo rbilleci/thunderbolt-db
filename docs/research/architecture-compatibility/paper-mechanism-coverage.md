@@ -34,44 +34,34 @@ python3 scripts/generate_research_paper_mechanism_links.py
 
 Generated identity field counts:
 - paper_entries_with_arxiv: 118
-- paper_entries_with_doi: 391
+- paper_entries_with_doi: 395
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
 - missing_arxiv: 484
-- missing_doi: 211
+- missing_doi: 207
 
 Generated identity missing-field sets:
-- arxiv: 343
+- arxiv: 347
 - doi: 70
-- doi,arxiv: 141
+- doi,arxiv: 137
 - none: 48
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 141
+- arxiv_needs_identifier_review: 129
 - arxiv_present: 118
-- arxiv_secondary_missing: 343
-- doi_needs_identifier_review: 141
+- arxiv_reviewed_absent: 8
+- arxiv_secondary_missing: 347
+- doi_needs_identifier_review: 129
 - doi_not_expected_yet: 54
-- doi_present: 391
+- doi_present: 395
+- doi_reviewed_absent: 8
 - doi_secondary_missing: 16
-- actionable_identifier_review: 141
+- actionable_identifier_review: 129
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-02-caladan-mitigating-interference-at-microsecond-timescales` -> `paper-2020-caladan-mitigating-interference-at-microsecond-timescales`: doi=needs_identifier_review, arxiv=needs_identifier_review: Caladan: Mitigating Interference at Microsecond Timescales.
-- `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus`: doi=needs_identifier_review, arxiv=needs_identifier_review: Concurrent Analytical Query Processing with GPUs.
-- `2026-06-02-datacenter-rpcs-can-be-general-and-fast` -> `paper-2019-datacenter-rpcs-can-be-general-and-fast`: doi=needs_identifier_review, arxiv=needs_identifier_review: Datacenter RPCs can be General and Fast.
-- `2026-06-03-2-tree-record-level-hot-cold-migration-for-skewed-indexes` -> `paper-2023-two-is-better-than-one-the-case-for-2-tree-for-skewed-data-sets`: doi=needs_identifier_review, arxiv=needs_identifier_review: Two is Better Than One: The Case for 2-Tree for Skewed Data Sets.
-- `2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges` -> `paper-2024-a-cxl-powered-database-system-opportunities-and-challenges`: doi=needs_identifier_review, arxiv=needs_identifier_review: A CXL-Powered Database System: Opportunities and Challenges.
-- `2026-06-03-arachne-core-aware-thread-management` -> `paper-2018-arachne-core-aware-thread-management`: doi=needs_identifier_review, arxiv=needs_identifier_review: Arachne: Core-Aware Thread Management.
-- `2026-06-03-bmc-safe-in-kernel-pre-stack-caching` -> `paper-2021-bmc-accelerating-memcached-using-safe-in-kernel-caching-and-pre-stack-processing`: doi=needs_identifier_review, arxiv=needs_identifier_review: BMC: Accelerating Memcached using Safe In-kernel Caching and Pre-stack Processing.
-- `2026-06-03-bohm-serializable-multiversion-ordering` -> `paper-2015-rethinking-serializable-multiversion-concurrency-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: Rethinking Serializable Multiversion Concurrency Control.
-- `2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp` -> `paper-2018-btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs`: doi=needs_identifier_review, arxiv=needs_identifier_review: BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs.
-- `2026-06-03-dana-directly-attached-nvme-arrays` -> `paper-2020-exploiting-directly-attached-nvme-arrays-in-dbms`: doi=needs_identifier_review, arxiv=needs_identifier_review: Exploiting Directly-Attached NVMe Arrays in DBMS.
-- `2026-06-03-dbos-database-oriented-operating-system-stack` -> `paper-2022-a-progress-report-on-dbos-a-database-oriented-operating-system`: doi=needs_identifier_review, arxiv=needs_identifier_review: A Progress Report on DBOS: A Database-oriented Operating System.
-- `2026-06-03-detox-transactional-cache-hit-rate` -> `paper-2023-take-out-the-trache-maximizing-tra-nsactional-ca-che-hit-rate`: doi=needs_identifier_review, arxiv=needs_identifier_review: Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit Rate.
 - `2026-06-03-efficient-scheduling-policies-for-microsecond-scale-tasks` -> `paper-2022-efficient-scheduling-policies-for-microsecond-scale-tasks`: doi=needs_identifier_review, arxiv=needs_identifier_review: Efficient Scheduling Policies for Microsecond-Scale Tasks.
 - `2026-06-03-empirical-in-memory-mvcc-design-tradeoffs` -> `paper-2017-an-empirical-evaluation-of-in-memory-multi-version-concurrency-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: An Empirical Evaluation of In-Memory Multi-Version Concurrency Control.
 - `2026-06-03-fastmap-scalable-mmap-for-fast-storage` -> `paper-2020-optimizing-memory-mapped-i-o-for-fast-storage-devices`: doi=needs_identifier_review, arxiv=needs_identifier_review: Optimizing Memory-mapped I/O for Fast Storage Devices.
@@ -100,9 +90,22 @@ Actionable DOI/arXiv identifier audit:
 - `2026-06-04-calvinfs-makes-namespace-metadata-a-deterministic-transaction-workload` -> `paper-2015-calvinfs-consistent-wan-replication-and-scalable-metadata-management-for-distributed-file-system`: doi=needs_identifier_review, arxiv=needs_identifier_review: CalvinFS: Consistent WAN Replication and Scalable Metadata Management for Distributed File Systems.
 - `2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges` -> `paper-2020-query-performance-prediction-for-concurrent-queries-using-graph-embedding`: doi=needs_identifier_review, arxiv=needs_identifier_review: Query Performance Prediction for Concurrent Queries using Graph Embedding.
 - `2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice` -> `paper-2023-cooperative-memory-management-for-table-and-temporary-data`: doi=needs_identifier_review, arxiv=needs_identifier_review: Cooperative Memory Management for Table and Temporary Data.
-- ... 101 more
+- `2026-06-04-d-rdma-makes-fragmented-database-transfer-a-nic-scheduling-problem` -> `paper-2022-d-rdma-bringing-zero-copy-rdma-to-database-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: D-RDMA: Bringing Zero-Copy RDMA to Database Systems.
+- `2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks` -> `paper-2016-data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation`: doi=needs_identifier_review, arxiv=needs_identifier_review: Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation.
+- `2026-06-04-database-kernels-turn-cxl-storage-into-typed-database-services` -> `paper-2024-database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl`: doi=needs_identifier_review, arxiv=needs_identifier_review: Database Kernels: Seamless Integration of Database Systems and Fast Storage via CXL.
+- `2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling` -> `paper-2021-everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-mai`: doi=needs_identifier_review, arxiv=needs_identifier_review: Everything is a Transaction: Unifying Logical Concurrency Control and Physical Data Structure Maintenance in Database Management Systems.
+- `2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them` -> `paper-2023-detock-high-performance-multi-region-transactions-at-scale`: doi=needs_identifier_review, arxiv=needs_identifier_review: Detock: High Performance Multi-region Transactions at Scale.
+- `2026-06-04-dint-keeps-frequent-transaction-steps-inside-the-kernel-datapath` -> `paper-2024-dint-fast-in-kernel-distributed-transactions-with-ebpf`: doi=needs_identifier_review, arxiv=needs_identifier_review: DINT: Fast In-Kernel Distributed Transactions with eBPF.
+- `2026-06-04-eiffel-software-packet-scheduling-for-request-admission` -> `paper-2019-eiffel-efficient-and-flexible-software-packet-scheduling`: doi=needs_identifier_review, arxiv=needs_identifier_review: Eiffel: Efficient and Flexible Software Packet Scheduling.
+- `2026-06-04-epic-deterministic-mvcc-removes-version-search-from-gpu-oltp-batches` -> `paper-2024-massively-parallel-multi-versioned-transaction-processing`: doi=needs_identifier_review, arxiv=needs_identifier_review: Massively Parallel Multi-Versioned Transaction Processing.
+- `2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates` -> `paper-2019-engineering-a-high-performance-gpu-b-tree`: doi=needs_identifier_review, arxiv=needs_identifier_review: Engineering a High-Performance GPU B-Tree.
+- `2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts` -> `paper-2024-g-learned-index-enabling-efficient-learned-index-on-gpu`: doi=needs_identifier_review, arxiv=needs_identifier_review: G-Learned Index: Enabling Efficient Learned Index on GPU.
+- `2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem` -> `paper-2019-concurrent-query-processing-in-a-gpu-based-database-system`: doi=needs_identifier_review, arxiv=needs_identifier_review: Concurrent query processing in a GPU-based database system.
+- `2026-06-04-gpu-sharing-should-be-measured-not-guessed` -> `paper-2017-dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus`: doi=needs_identifier_review, arxiv=needs_identifier_review: Dynamic Resource Management for Efficient Utilization of Multitasking GPUs.
+- ... 89 more
 
 Missing identity metadata audit:
+- `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus` missing arxiv: Concurrent Analytical Query Processing with GPUs.
 - `2026-06-02-data-path-fusion-in-gpu-for-analytical-query-processing` -> `paper-2026-data-path-fusion-in-gpu-for-analytical-query-processing` missing doi: Data Path Fusion in GPU for Analytical Query Processing.
 - `2026-06-02-demikernel-datapath-os-architecture-for-microsecond-scale-datacenter-systems` -> `paper-2021-the-demikernel-datapath-os-architecture-for-microsecond-scale-datacenter-systems` missing arxiv: The Demikernel Datapath OS Architecture for Microsecond-scale Datacenter Systems.
 - `2026-06-02-oze-decentralized-graph-based-concurrency-control` -> `paper-2025-oze-decentralized-graph-based-concurrency-control-for-long-running-update-transactions` missing arxiv: Oze: Decentralized Graph-based Concurrency Control for Long-running Update Transactions.
@@ -110,6 +113,7 @@ Missing identity metadata audit:
 - `2026-06-02-scaling-gpu-accelerated-databases-beyond-gpu-memory-size` -> `paper-2025-scaling-gpu-accelerated-databases-beyond-gpu-memory-size` missing arxiv: Scaling GPU-Accelerated Databases beyond GPU Memory Size.
 - `2026-06-02-virtual-memory-assisted-buffer-management` -> `paper-2023-virtual-memory-assisted-buffer-management` missing arxiv: Virtual-Memory Assisted Buffer Management.
 - `2026-06-02-virtual-memory-assisted-buffer-management-in-tiered-memory` -> `paper-2026-virtual-memory-assisted-buffer-management-in-tiered-memory` missing doi: Virtual-Memory Assisted Buffer Management In Tiered Memory.
+- `2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges` -> `paper-2024-a-cxl-powered-database-system-opportunities-and-challenges` missing arxiv: A CXL-Powered Database System: Opportunities and Challenges.
 - `2026-06-03-a-wake-up-call-for-kernel-bypass-on-modern-hardware` -> `paper-2025-a-wake-up-call-for-kernel-bypass-on-modern-hardware` missing arxiv: A Wake-Up Call for Kernel-Bypass on Modern Hardware.
 - `2026-06-03-accelerating-gpu-data-processing-with-fastlanes-compression` -> `paper-2024-accelerating-gpu-data-processing-using-fastlanes-compression` missing arxiv: Accelerating GPU Data Processing using FastLanes Compression.
 - `2026-06-03-activepointers-software-address-translation-on-gpus` -> `paper-2016-activepointers-a-case-for-software-address-translation-on-gpus` missing arxiv: ActivePointers: A Case for Software Address Translation on GPUs.
@@ -121,9 +125,11 @@ Missing identity metadata audit:
 - `2026-06-03-autonomous-commit-for-low-latency-nvme-durability` -> `paper-2025-moving-on-from-group-commit-autonomous-commit-enables-high-throughput-and-low-latency-on-nvme-ss` missing arxiv: Moving on From Group Commit: Autonomous Commit Enables High Throughput and Low Latency on NVMe SSDs.
 - `2026-06-03-autosteer-learned-optimizer-knob-steering` -> `paper-2023-autosteer-learned-query-optimization-for-any-sql-database` missing arxiv: AutoSteer: Learned Query Optimization for Any SQL Database.
 - `2026-06-03-bf-tree-variable-length-mini-pages-for-larger-than-memory-indexes` -> `paper-2024-bf-tree-a-modern-read-write-optimized-concurrent-larger-than-memory-range-index` missing arxiv: Bf-Tree: A Modern Read-Write-Optimized Concurrent Larger-Than-Memory Range Index.
+- `2026-06-03-bohm-serializable-multiversion-ordering` -> `paper-2015-rethinking-serializable-multiversion-concurrency-control` missing arxiv: Rethinking Serializable Multiversion Concurrency Control.
 - `2026-06-03-bonspiel-low-tail-geo-distributed-transactions` -> `paper-2025-bonspiel-low-tail-latency-transactions-in-geo-distributed-databases` missing arxiv: Bonspiel: Low Tail Latency Transactions in Geo-Distributed Databases.
 - `2026-06-03-bounded-delay-multiversion-concurrency-and-precise-gc` -> `paper-2019-multiversion-concurrency-with-bounded-delay-and-precise-garbage-collection` missing arxiv: Multiversion Concurrency with Bounded Delay and Precise Garbage Collection.
 - `2026-06-03-bounded-multiversion-garbage-collection` -> `paper-2023-practically-and-theoretically-efficient-garbage-collection-for-multiversioning` missing doi: Practically and Theoretically Efficient Garbage Collection for Multiversioning.
+- `2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp` -> `paper-2018-btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs` missing arxiv: BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs.
 - `2026-06-03-caerus-partial-order-transaction-sequencing` -> `paper-2023-caerus-low-latency-distributed-transactions-for-geo-replicated-systems` missing arxiv: Caerus: Low-Latency Distributed Transactions for Geo-Replicated Systems.
 - `2026-06-03-cam-asynchronous-gpu-initiated-cpu-managed-ssd-access` -> `paper-2025-cam-asynchronous-gpu-initiated-cpu-managed-ssd-management-for-batching-storage-access` missing arxiv: CAM: Asynchronous GPU-Initiated, CPU-Managed SSD Management for Batching Storage Access.
 - `2026-06-03-caracal-deterministic-contention-management` -> `paper-2021-caracal-contention-management-with-deterministic-concurrency-control` missing arxiv: Caracal: Contention Management with Deterministic Concurrency Control.
@@ -139,10 +145,6 @@ Missing identity metadata audit:
 - `2026-06-03-diva-decoupled-mvcc-version-index-and-data` -> `paper-2022-diva-making-mvcc-systems-htap-friendly` missing arxiv: Diva: Making MVCC Systems HTAP-Friendly.
 - `2026-06-03-dragon-breaking-gpu-memory-capacity-limits-with-direct-nvm-access` -> `paper-2018-dragon-breaking-gpu-memory-capacity-limits-with-direct-nvm-access` missing arxiv: DRAGON: Breaking GPU Memory Capacity Limits with Direct NVM Access.
 - `2026-06-03-ermia-snapshot-friendly-mixed-workload-oltp` -> `paper-2016-ermia-fast-memory-optimized-database-system-for-heterogeneous-workloads` missing arxiv: ERMIA: Fast Memory-Optimized Database System for Heterogeneous Workloads.
-- `2026-06-03-fast-serializable-main-memory-mvcc` -> `paper-2015-fast-serializable-multi-version-concurrency-control-for-main-memory-database-systems` missing arxiv: Fast Serializable Multi-Version Concurrency Control for Main-Memory Database Systems.
-- `2026-06-03-fncc-fast-notification-congestion-control` -> `paper-2024-fncc-fast-notification-congestion-control-in-data-center-networks` missing doi: FNCC: Fast Notification Congestion Control in Data Center Networks.
-- `2026-06-03-foedus-thousand-core-oltp-with-dual-pages` -> `paper-2015-foedus-oltp-engine-for-a-thousand-cores-and-nvram` missing arxiv: FOEDUS: OLTP Engine for a Thousand Cores and NVRAM.
-- `2026-06-03-free-join-unified-binary-and-worst-case-optimal-joins` -> `paper-2023-free-join-unifying-worst-case-optimal-and-traditional-joins` missing doi: Free Join: Unifying Worst-Case Optimal and Traditional Joins.
 - ... 514 more
 
 Duplicate identity audit:

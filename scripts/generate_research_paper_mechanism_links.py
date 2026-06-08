@@ -19,6 +19,85 @@ URL_RE = re.compile(r"https?://[^\s`)>]+")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 QUOTED_TITLE_RE = re.compile(r'"(?P<title>[^"]+)"')
 
+IDENTIFIER_REVIEW_OVERRIDES: dict[str, dict[str, str]] = {
+    "2026-06-02-caladan-mitigating-interference-at-microsecond-timescales": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/osdi20/presentation/fried",
+    },
+    "2026-06-02-concurrent-analytical-query-processing-with-gpus": {
+        "doi": "10.14778/2732967.2732976",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "review_source": "https://doi.org/10.14778/2732967.2732976",
+    },
+    "2026-06-02-datacenter-rpcs-can-be-general-and-fast": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/nsdi19/presentation/kalia",
+    },
+    "2026-06-03-2-tree-record-level-hot-cold-migration-for-skewed-indexes": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "review_source": "https://www.cidrdb.org/cidr2023/papers/p57-zhou.pdf",
+    },
+    "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges": {
+        "doi": "10.1109/icde60146.2024.00447",
+        "doi_review": "repaired_from_crossref_ieee_record",
+        "review_source": "https://doi.org/10.1109/icde60146.2024.00447",
+    },
+    "2026-06-03-arachne-core-aware-thread-management": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/osdi18/presentation/qin",
+    },
+    "2026-06-03-bmc-safe-in-kernel-pre-stack-caching": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/nsdi21/presentation/ghigoff",
+    },
+    "2026-06-03-bohm-serializable-multiversion-ordering": {
+        "doi": "10.14778/2809974.2809981",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "review_source": "https://doi.org/10.14778/2809974.2809981",
+    },
+    "2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp": {
+        "doi": "10.14778/3229863.3229875",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "review_source": "https://doi.org/10.14778/3229863.3229875",
+    },
+    "2026-06-03-dana-directly-attached-nvme-arrays": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "review_source": "https://www.cidrdb.org/cidr2020/papers/p16-haas-cidr20.pdf",
+    },
+    "2026-06-03-dbos-database-oriented-operating-system-stack": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "review_source": "https://www.vldb.org/cidrdb/papers/2022/p26-li.pdf",
+    },
+    "2026-06-03-detox-transactional-cache-hit-rate": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/osdi23/presentation/cheng",
+    },
+}
+
 METADATA_SNIPPET_PREFIXES = (
     "**citation:**",
     "**category:**",
@@ -12821,6 +12900,45 @@ def paper_identifier_audit(identity: dict, citation: str) -> dict:
     }
 
 
+def apply_identifier_review_override(identity: dict, entry_id: str) -> None:
+    override = IDENTIFIER_REVIEW_OVERRIDES.get(entry_id)
+    if not override:
+        return
+    if override.get("doi"):
+        identity["doi"] = normalize_identifier(override["doi"])
+        if not identity["url"]:
+            identity["url"] = citation_url([], identity["doi"], identity["arxiv"])
+    if override.get("arxiv"):
+        identity["arxiv"] = normalize_arxiv(override["arxiv"])
+        if not identity["url"]:
+            identity["url"] = citation_url([], identity["doi"], identity["arxiv"])
+
+    audit = identity["identifier_audit"]
+    if identity["doi"]:
+        audit["doi_status"] = "present"
+        audit["doi_review"] = override.get("doi_review", "repaired_identifier_review")
+    elif override.get("doi_status"):
+        audit["doi_status"] = override["doi_status"]
+        audit["doi_review"] = override.get("doi_review", audit["doi_review"])
+
+    if identity["arxiv"]:
+        audit["arxiv_status"] = "present"
+        audit["arxiv_review"] = override.get("arxiv_review", "repaired_identifier_review")
+    elif override.get("arxiv_status"):
+        audit["arxiv_status"] = override["arxiv_status"]
+        audit["arxiv_review"] = override.get("arxiv_review", audit["arxiv_review"])
+    elif identity["doi"] and audit["arxiv_status"] == "needs_identifier_review":
+        audit["arxiv_status"] = "secondary_missing"
+        audit["arxiv_review"] = "publisher_record_has_doi_but_no_arxiv_in_journal_citation"
+
+    audit["needs_identifier_review"] = (
+        audit["doi_status"] == "needs_identifier_review"
+        or audit["arxiv_status"] == "needs_identifier_review"
+    )
+    audit["review_status"] = "reviewed_identifier_repair"
+    audit["review_source"] = override.get("review_source", "")
+
+
 def build_paper_identity(entry: dict) -> dict | None:
     if entry["entry_type"] != "paper":
         return None
@@ -12847,8 +12965,9 @@ def build_paper_identity(entry: dict) -> dict | None:
         "source": "generated_from_journal_citation",
         "review_status": "generated_identity",
     }
-    identity["missing_fields"] = paper_identity_missing_fields(identity)
     identity["identifier_audit"] = paper_identifier_audit(identity, citation)
+    apply_identifier_review_override(identity, entry["id"])
+    identity["missing_fields"] = paper_identity_missing_fields(identity)
     return identity
 
 
@@ -13422,7 +13541,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
     paper_records, duplicate_groups = normalize_paper_records(paper_identities)
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v8",
+        "schema": "gpu-db-research-paper-mechanism-links-v9",
         "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, and normalized paper identity records. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",

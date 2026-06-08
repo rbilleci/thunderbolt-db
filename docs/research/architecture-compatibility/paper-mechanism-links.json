@@ -331,114 +331,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-02-caladan-mitigating-interference-at-microsecond-timescales",
-      "paper_id": "paper-2020-caladan-mitigating-interference-at-microsecond-timescales",
-      "title": "Caladan: Mitigating Interference at Microsecond Timescales."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-02-concurrent-analytical-query-processing-with-gpus",
-      "paper_id": "paper-2014-concurrent-analytical-query-processing-with-gpus",
-      "title": "Concurrent Analytical Query Processing with GPUs."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-02-datacenter-rpcs-can-be-general-and-fast",
-      "paper_id": "paper-2019-datacenter-rpcs-can-be-general-and-fast",
-      "title": "Datacenter RPCs can be General and Fast."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-2-tree-record-level-hot-cold-migration-for-skewed-indexes",
-      "paper_id": "paper-2023-two-is-better-than-one-the-case-for-2-tree-for-skewed-data-sets",
-      "title": "Two is Better Than One: The Case for 2-Tree for Skewed Data Sets."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges",
-      "paper_id": "paper-2024-a-cxl-powered-database-system-opportunities-and-challenges",
-      "title": "A CXL-Powered Database System: Opportunities and Challenges."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-arachne-core-aware-thread-management",
-      "paper_id": "paper-2018-arachne-core-aware-thread-management",
-      "title": "Arachne: Core-Aware Thread Management."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-bmc-safe-in-kernel-pre-stack-caching",
-      "paper_id": "paper-2021-bmc-accelerating-memcached-using-safe-in-kernel-caching-and-pre-stack-processing",
-      "title": "BMC: Accelerating Memcached using Safe In-kernel Caching and Pre-stack Processing."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-bohm-serializable-multiversion-ordering",
-      "paper_id": "paper-2015-rethinking-serializable-multiversion-concurrency-control",
-      "title": "Rethinking Serializable Multiversion Concurrency Control."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp",
-      "paper_id": "paper-2018-btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs",
-      "title": "BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-dana-directly-attached-nvme-arrays",
-      "paper_id": "paper-2020-exploiting-directly-attached-nvme-arrays-in-dbms",
-      "title": "Exploiting Directly-Attached NVMe Arrays in DBMS."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-dbos-database-oriented-operating-system-stack",
-      "paper_id": "paper-2022-a-progress-report-on-dbos-a-database-oriented-operating-system",
-      "title": "A Progress Report on DBOS: A Database-oriented Operating System."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-detox-transactional-cache-hit-rate",
-      "paper_id": "paper-2023-take-out-the-trache-maximizing-tra-nsactional-ca-che-hit-rate",
-      "title": "Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit Rate."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-03-efficient-scheduling-policies-for-microsecond-scale-tasks",
       "paper_id": "paper-2022-efficient-scheduling-policies-for-microsecond-scale-tasks",
       "title": "Efficient Scheduling Policies for Microsecond-Scale Tasks."
@@ -1598,6 +1490,25 @@
   ],
   "paper_identity_missing_audit": [
     {
+      "citation": "Kaibo Wang, Kai Zhang, Yuan Yuan, Siyuan Ma, Rubao Lee, Xiaoning Ding, and Xiaodong Zhang. \"Concurrent Analytical Query Processing with GPUs.\" PVLDB 7(11), 2014. Retrieved 2026-06-02 from `https://www.vldb.org/pvldb/vol7/p1011-wang.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/2732967.2732976",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Concurrent Analytical Query Processing with GPUs."
+      },
+      "journal_entry_id": "2026-06-02-concurrent-analytical-query-processing-with-gpus",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2014-concurrent-analytical-query-processing-with-gpus",
+      "title": "Concurrent Analytical Query Processing with GPUs."
+    },
+    {
       "citation": "Tsuyoshi Ozawa and Kazuo Goda. \"Data Path Fusion in GPU for Analytical Query Processing.\" arXiv:2605.10511, submitted 2026-05-11. Retrieved 2026-06-02 from `https://arxiv.org/pdf/2605.10511`. The preprint contains PVLDB placeholder metadata; final venue details are unknown.",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
@@ -1722,6 +1633,25 @@
       ],
       "paper_id": "paper-2026-virtual-memory-assisted-buffer-management-in-tiered-memory",
       "title": "Virtual-Memory Assisted Buffer Management In Tiered Memory."
+    },
+    {
+      "citation": "Yunyan Guo and Guoliang Li. \"A CXL-Powered Database System: Opportunities and Challenges.\" ICDE 2024. Retrieved 2026-06-03 from the authors' PDF, `https://dbgroup.cs.tsinghua.edu.cn/ligl/papers/CXL_ICDE.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_ieee_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1109/icde60146.2024.00447",
+        "review_status": "reviewed_identifier_repair",
+        "title": "A CXL-Powered Database System: Opportunities and Challenges."
+      },
+      "journal_entry_id": "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2024-a-cxl-powered-database-system-opportunities-and-challenges",
+      "title": "A CXL-Powered Database System: Opportunities and Challenges."
     },
     {
       "citation": "Matthias Jasny, Muhammad El-Hindi, Tobias Ziegler, and Carsten Binnig. \"A Wake-Up Call for Kernel-Bypass on Modern Hardware.\" DaMoN 2025. DOI: `10.1145/3736227.3736235`. Retrieved 2026-06-03 from the official author-hosted PDF, `https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/damon25_wake_up_call.pdf`.",
@@ -1922,6 +1852,25 @@
       "title": "Bf-Tree: A Modern Read-Write-Optimized Concurrent Larger-Than-Memory Range Index."
     },
     {
+      "citation": "Jose M. Faleiro and Daniel J. Abadi. \"Rethinking Serializable Multiversion Concurrency Control.\" PVLDB 8(11), 2015, pp. 1190-1201. Retrieved 2026-06-03 from `https://www.cs.umd.edu/~abadi/papers/rethink-mvcc.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/2809974.2809981",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Rethinking Serializable Multiversion Concurrency Control."
+      },
+      "journal_entry_id": "2026-06-03-bohm-serializable-multiversion-ordering",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2015-rethinking-serializable-multiversion-concurrency-control",
+      "title": "Rethinking Serializable Multiversion Concurrency Control."
+    },
+    {
       "citation": "Fan Cui, Eric Lo, Srijan Srivastava, and Ziliang Lai. \"Bonspiel: Low Tail Latency Transactions in Geo-Distributed Databases.\" PVLDB 18(11), 2025, pp. 3840-3853. doi:10.14778/3749646.3749658. Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol18/p3840-cui.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -1974,6 +1923,25 @@
       ],
       "paper_id": "paper-2023-practically-and-theoretically-efficient-garbage-collection-for-multiversioning",
       "title": "Practically and Theoretically Efficient Garbage Collection for Multiversioning."
+    },
+    {
+      "citation": "Aditya Gurajada, Dheren Gala, Fei Zhou, Amit Pathak, and Zhan-Feng Ma. \"BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs.\" PVLDB 2018. Retrieved 2026-06-03 from the VLDB PDF, `https://www.vldb.org/pvldb/vol11/p1889-gurajada.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3229863.3229875",
+        "review_status": "reviewed_identifier_repair",
+        "title": "BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs."
+      },
+      "journal_entry_id": "2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2018-btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs",
+      "title": "BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs."
     },
     {
       "citation": "Joshua Hildred, Michael Abebe, and Khuzaima Daudjee. \"Caerus: Low-Latency Distributed Transactions for Geo-Replicated Systems.\" PVLDB 17(3), 2023, pp. 469-482. doi:10.14778/3632093.3632109. Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol17/p469-hildred.pdf`.",
@@ -9034,12 +9002,13 @@
     {
       "citation": "Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay. \"Caladan: Mitigating Interference at Microsecond Timescales.\" OSDI 2020, pp. 281-297. Retrieved 2026-06-02 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi20/presentation/fried` and `https://www.usenix.org/system/files/osdi20-fried.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi20/presentation/fried",
+        "review_status": "reviewed_identifier_repair",
         "title": "Caladan: Mitigating Interference at Microsecond Timescales."
       },
       "journal_entry_id": "2026-06-02-caladan-mitigating-interference-at-microsecond-timescales",
@@ -9051,33 +9020,15 @@
       "title": "Caladan: Mitigating Interference at Microsecond Timescales."
     },
     {
-      "citation": "Kaibo Wang, Kai Zhang, Yuan Yuan, Siyuan Ma, Rubao Lee, Xiaoning Ding, and Xiaodong Zhang. \"Concurrent Analytical Query Processing with GPUs.\" PVLDB 7(11), 2014. Retrieved 2026-06-02 from `https://www.vldb.org/pvldb/vol7/p1011-wang.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Concurrent Analytical Query Processing with GPUs."
-      },
-      "journal_entry_id": "2026-06-02-concurrent-analytical-query-processing-with-gpus",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2014-concurrent-analytical-query-processing-with-gpus",
-      "title": "Concurrent Analytical Query Processing with GPUs."
-    },
-    {
       "citation": "Anuj Kalia, Michael Kaminsky, and David G. Andersen. \"Datacenter RPCs can be General and Fast.\" NSDI 2019, pp. 1-16. Retrieved 2026-06-02 from the USENIX publication page and PDF, `https://www.usenix.org/conference/nsdi19/presentation/kalia`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/nsdi19/presentation/kalia",
+        "review_status": "reviewed_identifier_repair",
         "title": "Datacenter RPCs can be General and Fast."
       },
       "journal_entry_id": "2026-06-02-datacenter-rpcs-can-be-general-and-fast",
@@ -9091,12 +9042,13 @@
     {
       "citation": "Xinjing Zhou, Xiangyao Yu, Goetz Graefe, and Michael Stonebraker. \"Two is Better Than One: The Case for 2-Tree for Skewed Data Sets.\" CIDR 2023. Retrieved 2026-06-03 from the CIDR PDF at `https://www.cidrdb.org/cidr2023/papers/p57-zhou.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.cidrdb.org/cidr2023/papers/p57-zhou.pdf",
+        "review_status": "reviewed_identifier_repair",
         "title": "Two is Better Than One: The Case for 2-Tree for Skewed Data Sets."
       },
       "journal_entry_id": "2026-06-03-2-tree-record-level-hot-cold-migration-for-skewed-indexes",
@@ -9108,33 +9060,15 @@
       "title": "Two is Better Than One: The Case for 2-Tree for Skewed Data Sets."
     },
     {
-      "citation": "Yunyan Guo and Guoliang Li. \"A CXL-Powered Database System: Opportunities and Challenges.\" ICDE 2024. Retrieved 2026-06-03 from the authors' PDF, `https://dbgroup.cs.tsinghua.edu.cn/ligl/papers/CXL_ICDE.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "A CXL-Powered Database System: Opportunities and Challenges."
-      },
-      "journal_entry_id": "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2024-a-cxl-powered-database-system-opportunities-and-challenges",
-      "title": "A CXL-Powered Database System: Opportunities and Challenges."
-    },
-    {
       "citation": "Henry Qin, Qian Li, Jacqueline Speiser, Peter Kraft, and John Ousterhout. \"Arachne: Core-Aware Thread Management.\" OSDI 2018, pp. 145-160. Retrieved 2026-06-03 from `https://www.usenix.org/system/files/osdi18-qin.pdf`; USENIX page: `https://www.usenix.org/conference/osdi18/presentation/qin`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi18/presentation/qin",
+        "review_status": "reviewed_identifier_repair",
         "title": "Arachne: Core-Aware Thread Management."
       },
       "journal_entry_id": "2026-06-03-arachne-core-aware-thread-management",
@@ -9148,12 +9082,13 @@
     {
       "citation": "Yoann Ghigoff, Julien Sopena, Kahina Lazri, Antoine Blin, and Gilles Muller. \"BMC: Accelerating Memcached using Safe In-kernel Caching and Pre-stack Processing.\" NSDI 2021, pp. 487-501. Retrieved 2026-06-03 from `https://www.usenix.org/conference/nsdi21/presentation/ghigoff` and `https://www.usenix.org/system/files/nsdi21-ghigoff.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/nsdi21/presentation/ghigoff",
+        "review_status": "reviewed_identifier_repair",
         "title": "BMC: Accelerating Memcached using Safe In-kernel Caching and Pre-stack Processing."
       },
       "journal_entry_id": "2026-06-03-bmc-safe-in-kernel-pre-stack-caching",
@@ -9165,52 +9100,15 @@
       "title": "BMC: Accelerating Memcached using Safe In-kernel Caching and Pre-stack Processing."
     },
     {
-      "citation": "Jose M. Faleiro and Daniel J. Abadi. \"Rethinking Serializable Multiversion Concurrency Control.\" PVLDB 8(11), 2015, pp. 1190-1201. Retrieved 2026-06-03 from `https://www.cs.umd.edu/~abadi/papers/rethink-mvcc.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Rethinking Serializable Multiversion Concurrency Control."
-      },
-      "journal_entry_id": "2026-06-03-bohm-serializable-multiversion-ordering",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2015-rethinking-serializable-multiversion-concurrency-control",
-      "title": "Rethinking Serializable Multiversion Concurrency Control."
-    },
-    {
-      "citation": "Aditya Gurajada, Dheren Gala, Fei Zhou, Amit Pathak, and Zhan-Feng Ma. \"BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs.\" PVLDB 2018. Retrieved 2026-06-03 from the VLDB PDF, `https://www.vldb.org/pvldb/vol11/p1889-gurajada.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs."
-      },
-      "journal_entry_id": "2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2018-btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs",
-      "title": "BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs."
-    },
-    {
       "citation": "Gabriel Haas, Michael Haubenschild, and Viktor Leis. \"Exploiting Directly-Attached NVMe Arrays in DBMS.\" CIDR 2020. Retrieved 2026-06-03 from the CIDR PDF, `https://www.cidrdb.org/cidr2020/papers/p16-haas-cidr20.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.cidrdb.org/cidr2020/papers/p16-haas-cidr20.pdf",
+        "review_status": "reviewed_identifier_repair",
         "title": "Exploiting Directly-Attached NVMe Arrays in DBMS."
       },
       "journal_entry_id": "2026-06-03-dana-directly-attached-nvme-arrays",
@@ -9224,12 +9122,13 @@
     {
       "citation": "Qian Li, Peter Kraft, Kostis Kaffes, Athinagoras Skiadopoulos, Deeptaanshu Kumar, Jason Li, Michael Cafarella, Goetz Graefe, Jeremy Kepner, Christos Kozyrakis, Michael Stonebraker, Lalith Suresh, and Matei Zaharia. \"A Progress Report on DBOS: A Database-oriented Operating System.\" CIDR 2022. Retrieved 2026-06-03 from the official CIDR/VLDB PDF, `https://www.vldb.org/cidrdb/papers/2022/p26-li.pdf`. The originally queued CIDR URL used `p49-li.pdf`, which now returns 404 from this worker.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.vldb.org/cidrdb/papers/2022/p26-li.pdf",
+        "review_status": "reviewed_identifier_repair",
         "title": "A Progress Report on DBOS: A Database-oriented Operating System."
       },
       "journal_entry_id": "2026-06-03-dbos-database-oriented-operating-system-stack",
@@ -9243,12 +9142,13 @@
     {
       "citation": "Audrey Cheng, David Chu, Terrance Li, Jason Chan, Natacha Crooks, Joseph M. Hellerstein, Ion Stoica, and Xiangyao Yu. \"Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit Rate.\" OSDI 2023, pp. 419-439. Retrieved 2026-06-03 from the USENIX page and PDF, `https://www.usenix.org/conference/osdi23/presentation/cheng` and `https://www.usenix.org/system/files/osdi23-cheng.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi23/presentation/cheng",
+        "review_status": "reviewed_identifier_repair",
         "title": "Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit Rate."
       },
       "journal_entry_id": "2026-06-03-detox-transactional-cache-hit-rate",
@@ -11723,14 +11623,14 @@
         "Xiaoning Ding",
         "Xiaodong Zhang"
       ],
-      "doi": "",
+      "doi": "10.14778/2732967.2732976",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:concurrent-analytical-query-processing-with-gpus",
@@ -11738,7 +11638,6 @@
         "2026-06-02-concurrent-analytical-query-processing-with-gpus"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2014-concurrent-analytical-query-processing-with-gpus",
@@ -12218,14 +12117,14 @@
         "Jose M. Faleiro",
         "Daniel J. Abadi"
       ],
-      "doi": "",
+      "doi": "10.14778/2809974.2809981",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:rethinking-serializable-multiversion-concurrency-control",
@@ -12233,7 +12132,6 @@
         "2026-06-03-bohm-serializable-multiversion-ordering"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2015-rethinking-serializable-multiversion-concurrency-control",
@@ -14696,11 +14594,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:arachne-core-aware-thread-management",
@@ -14765,14 +14663,14 @@
         "Amit Pathak",
         "Zhan-Feng Ma"
       ],
-      "doi": "",
+      "doi": "10.14778/3229863.3229875",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs",
@@ -14780,7 +14678,6 @@
         "2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2018-btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs",
@@ -15776,11 +15673,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:datacenter-rpcs-can-be-general-and-fast",
@@ -17401,11 +17298,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:caladan-mitigating-interference-at-microsecond-timescales",
@@ -17614,11 +17511,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:exploiting-directly-attached-nvme-arrays-in-dbms",
@@ -18821,11 +18718,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:bmc-accelerating-memcached-using-safe-in-kernel-caching-and-pre-stack-processing",
@@ -20484,11 +20381,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:a-progress-report-on-dbos-a-database-oriented-operating-system",
@@ -24685,11 +24582,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:take-out-the-trache-maximizing-tra-nsactional-ca-che-hit-rate",
@@ -25050,11 +24947,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:two-is-better-than-one-the-case-for-2-tree-for-skewed-data-sets",
@@ -25247,14 +25144,14 @@
         "Yunyan Guo",
         "Guoliang Li"
       ],
-      "doi": "",
+      "doi": "10.1109/icde60146.2024.00447",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_ieee_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:a-cxl-powered-database-system-opportunities-and-challenges",
@@ -25262,7 +25159,6 @@
         "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2024-a-cxl-powered-database-system-opportunities-and-challenges",
@@ -56672,12 +56568,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/nsdi19/presentation/kalia",
+          "review_status": "reviewed_identifier_repair",
           "title": "Datacenter RPCs can be General and Fast."
         },
         "identity_key": "title:datacenter-rpcs-can-be-general-and-fast",
@@ -56913,20 +56810,20 @@
           "Xiaoning Ding",
           "Xiaodong Zhang"
         ],
-        "doi": "",
+        "doi": "10.14778/2732967.2732976",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_crossref_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/2732967.2732976",
+          "review_status": "reviewed_identifier_repair",
           "title": "Concurrent Analytical Query Processing with GPUs."
         },
         "identity_key": "title:concurrent-analytical-query-processing-with-gpus",
         "journal_entry_id": "2026-06-02-concurrent-analytical-query-processing-with-gpus",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2014-concurrent-analytical-query-processing-with-gpus",
@@ -59596,12 +59493,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi20/presentation/fried",
+          "review_status": "reviewed_identifier_repair",
           "title": "Caladan: Mitigating Interference at Microsecond Timescales."
         },
         "identity_key": "title:caladan-mitigating-interference-at-microsecond-timescales",
@@ -65682,12 +65580,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi23/presentation/cheng",
+          "review_status": "reviewed_identifier_repair",
           "title": "Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit Rate."
         },
         "identity_key": "title:take-out-the-trache-maximizing-tra-nsactional-ca-che-hit-rate",
@@ -73490,12 +73389,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi18/presentation/qin",
+          "review_status": "reviewed_identifier_repair",
           "title": "Arachne: Core-Aware Thread Management."
         },
         "identity_key": "title:arachne-core-aware-thread-management",
@@ -74205,20 +74105,20 @@
           "Jose M. Faleiro",
           "Daniel J. Abadi"
         ],
-        "doi": "",
+        "doi": "10.14778/2809974.2809981",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_crossref_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/2809974.2809981",
+          "review_status": "reviewed_identifier_repair",
           "title": "Rethinking Serializable Multiversion Concurrency Control."
         },
         "identity_key": "title:rethinking-serializable-multiversion-concurrency-control",
         "journal_entry_id": "2026-06-03-bohm-serializable-multiversion-ordering",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2015-rethinking-serializable-multiversion-concurrency-control",
@@ -82442,12 +82342,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.cidrdb.org/cidr2020/papers/p16-haas-cidr20.pdf",
+          "review_status": "reviewed_identifier_repair",
           "title": "Exploiting Directly-Attached NVMe Arrays in DBMS."
         },
         "identity_key": "title:exploiting-directly-attached-nvme-arrays-in-dbms",
@@ -89524,12 +89425,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/nsdi21/presentation/ghigoff",
+          "review_status": "reviewed_identifier_repair",
           "title": "BMC: Accelerating Memcached using Safe In-kernel Caching and Pre-stack Processing."
         },
         "identity_key": "title:bmc-accelerating-memcached-using-safe-in-kernel-caching-and-pre-stack-processing",
@@ -94226,20 +94128,20 @@
           "Amit Pathak",
           "Zhan-Feng Ma"
         ],
-        "doi": "",
+        "doi": "10.14778/3229863.3229875",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_crossref_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3229863.3229875",
+          "review_status": "reviewed_identifier_repair",
           "title": "BTrim - Hybrid In-Memory Database Architecture for Extreme Transaction Processing in VLDBs."
         },
         "identity_key": "title:btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs",
         "journal_entry_id": "2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2018-btrim-hybrid-in-memory-database-architecture-for-extreme-transaction-processing-in-vldbs",
@@ -95916,12 +95818,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.vldb.org/cidrdb/papers/2022/p26-li.pdf",
+          "review_status": "reviewed_identifier_repair",
           "title": "A Progress Report on DBOS: A Database-oriented Operating System."
         },
         "identity_key": "title:a-progress-report-on-dbos-a-database-oriented-operating-system",
@@ -101957,20 +101860,20 @@
           "Yunyan Guo",
           "Guoliang Li"
         ],
-        "doi": "",
+        "doi": "10.1109/icde60146.2024.00447",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_crossref_ieee_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1109/icde60146.2024.00447",
+          "review_status": "reviewed_identifier_repair",
           "title": "A CXL-Powered Database System: Opportunities and Challenges."
         },
         "identity_key": "title:a-cxl-powered-database-system-opportunities-and-challenges",
         "journal_entry_id": "2026-06-03-a-cxl-powered-database-system-opportunities-and-challenges",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2024-a-cxl-powered-database-system-opportunities-and-challenges",
@@ -103622,12 +103525,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.cidrdb.org/cidr2023/papers/p57-zhou.pdf",
+          "review_status": "reviewed_identifier_repair",
           "title": "Two is Better Than One: The Case for 2-Tree for Skewed Data Sets."
         },
         "identity_key": "title:two-is-better-than-one-the-case-for-2-tree-for-skewed-data-sets",
@@ -222597,7 +222501,7 @@
     "supports": "paper evidence supports or motivates this mechanism",
     "warns_against": "paper evidence warns against adopting this mechanism without constraints"
   },
-  "schema": "gpu-db-research-paper-mechanism-links-v8",
+  "schema": "gpu-db-research-paper-mechanism-links-v9",
   "source_journal": "docs/research/gpu-db-literature-journal.md",
   "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
   "summary": {
@@ -222633,29 +222537,31 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 141,
+      "arxiv_needs_identifier_review": 129,
       "arxiv_present": 118,
-      "arxiv_secondary_missing": 343,
-      "doi_needs_identifier_review": 141,
+      "arxiv_reviewed_absent": 8,
+      "arxiv_secondary_missing": 347,
+      "doi_needs_identifier_review": 129,
       "doi_not_expected_yet": 54,
-      "doi_present": 391,
+      "doi_present": 395,
+      "doi_reviewed_absent": 8,
       "doi_secondary_missing": 16
     },
     "paper_identity_counts": {
       "paper_entries_with_arxiv": 118,
-      "paper_entries_with_doi": 391,
+      "paper_entries_with_doi": 395,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
       "missing_arxiv": 484,
-      "missing_doi": 211
+      "missing_doi": 207
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 343,
+      "arxiv": 347,
       "doi": 70,
-      "doi,arxiv": 141,
+      "doi,arxiv": 137,
       "none": 48
     },
     "paper_records": 563,
