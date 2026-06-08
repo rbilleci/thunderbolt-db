@@ -4354,6 +4354,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Direct GPU promotion requests versus residency-owner rings need H2D, NVMe, host-memory, latency, and interference measurements.",
     },
+    (
+        "2026-06-03-dbos-database-oriented-operating-system-stack",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Replacing a worker table with partition-owner and route-class counters directly supports bounded owner-ring state.",
+    },
+    (
+        "2026-06-03-dbos-database-oriented-operating-system-stack",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The VoltDB stored-procedure prototype does not directly solve GPU DB WAL, MVCC visibility, protocol, or CUDA ownership.",
+    },
+    (
+        "2026-06-03-the-fastlanes-file-format",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Shared vector and expression descriptors across HBM and host/NVMe tiers support explicit tier placement.",
+    },
+    (
+        "2026-06-03-the-fastlanes-file-format",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Format-level lightweight compression is an alternative storage-shape concern rather than descriptor-lifetime management.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-tier-aware-execution-needs-metadata-before-movement",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier miss classes and bytes-avoided accounting are explicitly framed as prototype measurements.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-tier-aware-execution-needs-metadata-before-movement",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback is part of the measured tier-miss matrix rather than an already-set policy.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-tier-aware-execution-needs-metadata-before-movement",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained route behavior needs descriptor-hit, HBM-hit, host-promotion, NVMe-fetch, and stale-generation measurements.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-tier-aware-execution-needs-metadata-before-movement",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route costing depends on measured bytes avoided, queue slots avoided, and tier miss classes.",
+    },
+    (
+        "2026-06-03-mainlining-databases-supporting-fast-transactional-workloads-on-universal-columnar-data-file-for",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Hot/cold block state and fixed-size metadata updates support explicit multi-tier placement metadata.",
+    },
+    (
+        "2026-06-03-mainlining-databases-supporting-fast-transactional-workloads-on-universal-columnar-data-file-for",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Sign-bit timestamps and before-image reconstruction need GPU DB snapshot-frontier tests before adoption.",
+    },
+    (
+        "2026-06-03-mainlining-databases-supporting-fast-transactional-workloads-on-universal-columnar-data-file-for",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Cooling and frozen segment refresh directly supports freshness routing instead of whole-table rebuilds.",
+    },
+    (
+        "2026-06-03-mainlining-databases-supporting-fast-transactional-workloads-on-universal-columnar-data-file-for",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Version-free frozen routes are valid only when tuple identity, visibility, refresh, eviction, and WAL replay agree.",
+    },
+    (
+        "2026-06-03-rtcudb-ray-tracing-core-query-execution",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Specialized retained routes are valid only when side-structure build amortization beats simple CUDA retained scans.",
+    },
+    (
+        "2026-06-03-rtcudb-ray-tracing-core-query-execution",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Ray-tracing routes need same-answer, bytes-read, and atomic-contention benchmarks before optimizer use.",
+    },
+    (
+        "2026-06-03-rtcudb-ray-tracing-core-query-execution",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Fused BVH query execution is an alternative route shape rather than a descriptor reclamation mechanism.",
+    },
+    (
+        "2026-06-03-rtcudb-ray-tracing-core-query-execution",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Immutable RT route publication needs measured visibility-side-structure cost against plain CUDA retained routes.",
+    },
+    (
+        "2026-06-03-rtcudb-ray-tracing-core-query-execution",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback decisions require build-cost, resident-byte, latency, bandwidth, and invalidation measurements.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-specialized-data-paths-need-declared-shape-contracts",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Specialized route roots are valid only when descriptors prove encoding, visibility generation, side structures, wait, and fallback.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-specialized-data-paths-need-declared-shape-contracts",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Dependency witnesses are useful only when response feedback observes queue and tier saturation before admission.",
+    },
+    (
+        "2026-06-03-mind-the-gap-informed-request-scheduling-at-the-nic",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "CXL-like shared memory is presented as an alternative tier interface to PCIe packet messaging alone.",
+    },
+    (
+        "2026-06-03-mind-the-gap-informed-request-scheduling-at-the-nic",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "NIC-informed request scheduling is an alternative scheduling layer to application-local resource DAG scheduling.",
+    },
+    (
+        "2026-06-03-mind-the-gap-informed-request-scheduling-at-the-nic",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "NIC just-in-time packet delivery is an alternative admission signal to database-owned vector credits.",
+    },
+    (
+        "2026-06-03-programmable-packet-scheduling-with-a-single-queue",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "AIFO resource tradeoffs and workload simulations need GPU DB admission measurements before transfer.",
+    },
+    (
+        "2026-06-03-programmable-packet-scheduling-with-a-single-queue",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "A small FIFO ring with rank-aware admission directly supports owner-ring bundling over per-session queues.",
+    },
+    (
+        "2026-06-03-activepointers-software-address-translation-on-gpus",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "GPU-side page-fault handling and I/O page tables are an alternative memory-management path to CPU-routed snapshots.",
+    },
+    (
+        "2026-06-03-activepointers-software-address-translation-on-gpus",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU page-cache hash tables and transfer batches need descriptor lifetime and lock-free read measurements.",
+    },
+    (
+        "2026-06-03-activepointers-software-address-translation-on-gpus",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Publishing new generations instead of mutating active mappings directly supports immutable route roots.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-simple-queues-need-stable-memory-contracts",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Mixed retained and over-resident admission must report route rank, snapshot generation, memory lease, misses, and fallback.",
+    },
+    (
+        "2026-06-03-modeling-concurrency-control-as-a-learnable-function",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Learned per-operation concurrency choices are an alternative protocol-selection concern to bounded descriptor reclamation.",
+    },
+    (
+        "2026-06-03-sp-pifo-strict-priority-approximation-of-programmable-scheduling",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Mapping rich ranks onto a few bounded request or response rings supports owner-ring bundling.",
+    },
 }
 
 
