@@ -2044,6 +2044,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "alternative_to",
         "relation_review_note": "Poplar suggests per-owner or per-partition durability frontiers instead of forcing every read behind unrelated WAL traffic.",
     },
+    (
+        "2026-06-06-poplar-relaxes-wal-order-to-the-dependencies-recovery-actually-needs",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Poplar proposes durable owner-stream frontiers as an alternative to a single global LSN for retained snapshot publication.",
+    },
+    (
+        "2026-06-06-poplar-relaxes-wal-order-to-the-dependencies-recovery-actually-needs",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Dependency-ordered recovery is explicitly gated on replay benchmarks and same-visible-snapshot proof checks.",
+    },
+    (
+        "2026-06-06-fisslock-splits-fast-grant-facts-from-heavy-waiter-state",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Moving fast grant facts out of heavy waiter state is valid only if database-owned WAL, MVCC, and recovery proofs remain intact.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-authorities-should-publish-small-facts-and-keep-heavy-state-local",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis names WAL/recovery and transaction scheduling as the next evaluation gap for publication boundaries.",
+    },
+    (
+        "2026-06-06-smartqueue-treats-cache-residency-as-scheduler-state",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts greedy execution with cache-aware scheduling, which supports placement-aware routing.",
+    },
+    (
+        "2026-06-06-ford-makes-remote-durable-transactions-a-round-trip-budget",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Mutable cold-tier descriptor acquisition is framed as something the engine should test before adopting the route shape.",
+    },
+    (
+        "2026-06-06-pulse-moves-pointer-traversal-to-the-future-memory-tier",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Near-memory pointer traversal is useful only when the continuation program stays restricted and iterator-shaped.",
+    },
+    (
+        "2026-06-06-pulse-moves-pointer-traversal-to-the-future-memory-tier",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "PULSE is not a SQL WAL, MVCC, isolation, or recovery protocol, so it cautions against direct WAL inference.",
+    },
+    (
+        "2026-06-06-pulse-moves-pointer-traversal-to-the-future-memory-tier",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evidence requires remote pointer-hop evaluation, so optimizer transfer needs route-cost benchmarking beyond byte counts.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-retained-routes-need-bounded-reconstruction-placement-and-retirement",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier demotion is gated on SLO reconstruction latency and descriptor-retirement stress tests.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-retained-routes-need-bounded-reconstruction-placement-and-retirement",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Session-counting transfer is valid only if reclamation state avoids scaling with logical sessions and heavy cleanup on IO workers.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-retained-routes-need-bounded-reconstruction-placement-and-retirement",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Immutable route-root adoption is gated on reconstruction-latency budgets and descriptor-retirement stress.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-retained-routes-need-bounded-reconstruction-placement-and-retirement",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Hyaline-style physical-worker reachability is presented as an alternative retirement basis for old descriptors and resident handles.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-correctness-needs-external-witnesses-too",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-root correctness is routed through route-history traces and deterministic write-window benchmarks before solver verification.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-correctness-needs-external-witnesses-too",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL boundary correctness is explicitly tied to trace-format and serial-replay benchmark gates.",
+    },
+    (
+        "2026-06-06-cobra-turns-serializability-into-an-off-path-route-history-check",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evidence calls for selected stress-test route-history records including WAL boundary and publication generation.",
+    },
+    (
+        "2026-06-06-cobra-turns-serializability-into-an-off-path-route-history-check",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor-lifetime transfer needs stress-test route-history records before it can support retained execution.",
+    },
+    (
+        "2026-06-06-cobra-turns-serializability-into-an-off-path-route-history-check",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Immutable route roots need route-history stress traces that capture route shape, snapshot boundary, and publication generation.",
+    },
+    (
+        "2026-06-06-sundial-unifies-cache-validity-and-transaction-order-with-logical-leases",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Sundial omits CUDA, GPU placement, pinned buffers, session multiplexing, NVMe recovery, and MVCC storage costs.",
+    },
+    (
+        "2026-06-06-sundial-unifies-cache-validity-and-transaction-order-with-logical-leases",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Persisted route metadata needs recovery tests and measurements before leases can inform WAL visibility boundaries.",
+    },
+    (
+        "2026-06-06-sundial-unifies-cache-validity-and-transaction-order-with-logical-leases",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Validity intervals and generation ranges are presented as an alternative to simple fresh-or-stale retained snapshot state.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-budgeted-metadata-must-carry-route-proof-not-only-speed",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Bounded retirement is explicitly part of the route-certificate benchmark and proof-gate backlog.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-budgeted-metadata-must-carry-route-proof-not-only-speed",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The not-just cue rejects faster optimistic retry and supports explicit hot-write conflict ownership templates.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-budgeted-metadata-must-carry-route-proof-not-only-speed",
+        "deficit_fairness",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The evidence supports fairness policy by requiring explicit priority and fairness rules beyond faster retry.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-budgeted-metadata-must-carry-route-proof-not-only-speed",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Placement is explicitly named as a benchmark requiring tiered metadata and fallback or promotion telemetry.",
+    },
+    (
+        "2026-06-06-cabin-makes-scan-indexes-budgetable-resident-metadata",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cabin's resident scan-index idea is a size and memory-budget problem that needs GPU DB testing before descriptor adoption.",
+    },
+    (
+        "2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The learned policy is evaluated through benchmark baselines and needs deterministic hot-write comparison before adoption.",
+    },
+    (
+        "2026-06-06-orthrus-separates-conflict-ownership-from-transaction-execution",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts cache-coherence contention with queueing at an owner, directly supporting owner bundling.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-tail-control-needs-bounded-retry-not-only-faster-queues",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU conflict ordering is gated on p99.9, max retry count, and route-stampede benchmarks.",
+    },
+    (
+        "2026-06-06-sherman-makes-remote-indexes-write-friendly-by-moving-proof-to-tiny-ordered-updates",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Descriptor publication is safe only if generation state cannot point at uncommitted or partially updated entries.",
+    },
 }
 
 
