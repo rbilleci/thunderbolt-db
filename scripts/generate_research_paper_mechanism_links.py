@@ -5824,6 +5824,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "supports",
         "relation_review_note": "The instead-of cue contrasts memory residency choices; the evidence remains supporting context for WAL-governed cold-tier routing.",
     },
+    (
+        "2026-06-04-database-kernels-turn-cxl-storage-into-typed-database-services",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The CXL-storage path is promising, but the entry explicitly treats device-side preparation as an early warning rather than immediate placement support.",
+    },
+    (
+        "2026-06-04-database-kernels-turn-cxl-storage-into-typed-database-services",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "The descriptor transfer assumes cooperative database software and specialized storage hardware beyond the first CPU/GPU/NVMe target.",
+    },
+    (
+        "2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Warp-shaped resident indexes are viable only behind database visibility rules and generation-scoped invalidation.",
+    },
+    (
+        "2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts lane-independent lookup with warp-cooperative lookup, which directly supports same-shape micro-batching.",
+    },
+    (
+        "2026-06-04-smf-schedules-hot-conflicts-before-concurrency-control-sees-them",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The sampled-hint scheduling evidence needs workload evaluation before becoming a deterministic hot-write template.",
+    },
+    (
+        "2026-06-04-smf-schedules-hot-conflicts-before-concurrency-control-sees-them",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts serial timestamp racing with predicted hot-key queues, which supports explicit conflict ordering.",
+    },
+    (
+        "2026-06-04-tile-based-gpu-integer-compression-keeps-decode-inside-the-route",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Compressed generations are useful only when refresh cost, retired bytes, invalidation frequency, and p95 impact stay bounded.",
+    },
+    (
+        "2026-06-04-tile-based-gpu-integer-compression-keeps-decode-inside-the-route",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Compressed GPU segment refresh must be measured at batch boundaries before relying on WAL/MVCC invalidation safety.",
+    },
+    (
+        "2026-06-04-delilah-exposes-the-real-cost-of-programmable-storage-offload",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Programmable-storage placement needs setup, throughput, verification, recovery, and byte-savings measurements.",
+    },
+    (
+        "2026-06-04-delilah-exposes-the-real-cost-of-programmable-storage-offload",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The paper omits SQL operators, MVCC, recovery, GPU handoff, and multi-tenant admission, so descriptor transfer needs validation.",
+    },
+    (
+        "2026-06-04-delilah-exposes-the-real-cost-of-programmable-storage-offload",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Storage-side filtering supports owner routing only when the route has explicit byte-range, cache-maintenance, and result contracts.",
+    },
+    (
+        "2026-06-04-primo-removes-2pc-by-making-commit-conflict-free-before-it-starts",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Asynchronous group commit needs crash-point validation before it can satisfy WAL-before-visibility.",
+    },
+    (
+        "2026-06-04-primo-removes-2pc-by-making-commit-conflict-free-before-it-starts",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The separate execution and publication frontier is explicitly presented as the benchmarkable route-root hook.",
+    },
+    (
+        "2026-06-04-primo-removes-2pc-by-making-commit-conflict-free-before-it-starts",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Distributed commit throughput results need GPU DB hot-write and latency evaluation before conflict-ordering transfer.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-execution-and-publication-frontiers",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis names telemetry and crash/recovery tests as the gate for execution-frontier versus publication-frontier route roots.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-execution-and-publication-frontiers",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fallback routes are valid only when stale, rolled-back, invalidated, or over-budget publication frontiers are rejected.",
+    },
+    (
+        "2026-06-04-rtindex-maps-resident-indexes-onto-rtx-bvh-traversal",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "RTIndex assumes resident data and large batches, which cautions against direct p50-sensitive OLTP snapshot adoption.",
+    },
+    (
+        "2026-06-04-rtindex-maps-resident-indexes-onto-rtx-bvh-traversal",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Large-batch resident traversal evidence warns against assuming the same shape fits short OLTP lookup batches automatically.",
+    },
+    (
+        "2026-06-04-bght-makes-gpu-hash-indexes-a-probe-budgeted-route-not-just-a-lookup-primitive",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Visible-delta correctness and stale-hit filtering are proof gates before resident hash descriptors can be trusted.",
+    },
+    (
+        "2026-06-04-bght-makes-gpu-hash-indexes-a-probe-budgeted-route-not-just-a-lookup-primitive",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hash-route fallback needs miss-rate, batch-depth, memory-pressure, and rebuild-economics measurements.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-resident-indexes-need-route-envelopes-and-rebuild-economics",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Resident indexes must expose probe, load-factor, hit/miss, and construction-risk facts before the planner can trust snapshots.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-resident-indexes-need-route-envelopes-and-rebuild-economics",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Scarce warm resources should remain scheduled only when decision-specific history proves that they pay for themselves.",
+    },
+    (
+        "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained lookups are safe only when unrelated scan, refresh, allocation, or memory-return latency cannot leak into the route.",
+    },
+    (
+        "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Temporary-memory admission needs fixed-partition, cooperative-eviction, cooperative-spill, and reject-under-SLO benchmarks.",
+    },
+    (
+        "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The read-mostly workload leaves dirty-page writeback, WAL/checkpoint interaction, and update latency unevaluated.",
+    },
+    (
+        "2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Schedule-first queues are an alternative to abort/retry templates for hot conflicting operations.",
+    },
+    (
+        "2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "SMF conflict-cost scheduling needs GPU DB workload tests before becoming the conflict-ordering policy.",
+    },
+    (
+        "2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Makespan-driven scheduling requires resource-DAG measurements under GPU DB arrival and conflict patterns.",
+    },
+    (
+        "2026-06-04-allocator-behavior-is-part-of-the-query-route-contract",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The CPU analytical allocator scope cautions against inferring retained GPU snapshot behavior directly.",
+    },
+    (
+        "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Hierarchical learned prediction is useful only when uncertainty and expected route duration justify the added inference cost.",
+    },
 }
 
 
