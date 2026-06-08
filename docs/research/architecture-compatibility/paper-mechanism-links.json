@@ -327,57 +327,6 @@
   ],
   "paper_identity_missing_audit": [
     {
-      "citation": "Xiangpeng Hao, Xinjing Zhou, Xiangyao Yu, and Michael Stonebraker. \"Towards Buffer Management with Tiered Main Memory.\" Proceedings of the ACM on Management of Data 2(1), Article 31, 2024, pages 31:1-31:26. doi:10.1145/3639286. Retrieved 2026-06-03 from the SIGMOD/PACMMOD table of contents, DBLP metadata, Mendeley abstract page, Xiangyao Yu's publication page, and the public `Two-tier-memory-project/tiered-buffer-pool` code repository. The ACM HTML/PDF endpoints returned HTTP 403 in this worker, so details below are limited to the accessible abstract, official metadata, author pages, and code. Unknown paper-only details are marked as such.",
-      "journal_entry_id": "2026-06-03-towards-buffer-management-with-tiered-main-memory",
-      "missing_fields": [
-        "arxiv",
-        "url"
-      ],
-      "paper_id": "paper-2024-towards-buffer-management-with-tiered-main-memory",
-      "title": "Towards Buffer Management with Tiered Main Memory."
-    },
-    {
-      "citation": "Akon Dey, Alan D. Fekete, and Uwe Rohm. \"Scalable Distributed Transactions across Heterogeneous Stores.\" ICDE 2015, pp. 125-136, doi:10.1109/ICDE.2015.7113278. Retrieved 2026-06-05 from the DOI/DBLP record, with full text read from the author-uploaded ResearchGate copy after the IEEE paper endpoint was not directly accessible.",
-      "journal_entry_id": "2026-06-05-cherry-garcia-commits-heterogeneous-store-writes-through-recoverable-metadata",
-      "missing_fields": [
-        "arxiv",
-        "url"
-      ],
-      "paper_id": "paper-2015-scalable-distributed-transactions-across-heterogeneous-stores",
-      "title": "Scalable Distributed Transactions across Heterogeneous Stores."
-    },
-    {
-      "citation": "Yunjia Zhang, Yannis Chronis, Jignesh M. Patel, and Theodoros Rekatsinas. \"Simple Adaptive Query Processing vs. Learned Query Optimizers: Observations and Analysis.\" PVLDB 2023; extended VLDB Journal 34:62, 2025. DOI: `10.1007/s00778-025-00936-6`. Retrieved 2026-06-06 from the open Springer PDF after the VLDB PDF endpoint timed out from the cron worker.",
-      "journal_entry_id": "2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training",
-      "missing_fields": [
-        "arxiv",
-        "url"
-      ],
-      "paper_id": "paper-2025-simple-adaptive-query-processing-vs-learned-query-optimizers-observations-and-analysis",
-      "title": "Simple Adaptive Query Processing vs. Learned Query Optimizers: Observations and Analysis."
-    },
-    {
-      "citation": "Immanuel Trummer, Junxiong Wang, Deepak Maram, Samuel Moseley, Saehan Jo, and Joseph Antonakakis. \"SkinnerDB: Regret-Bounded Query Evaluation via Reinforcement Learning.\" SIGMOD 2019 / arXiv 1901.05152; earlier PVLDB 11(12):2074-2077, 2018 demonstration paper. DOI: `10.1145/3299869.3300088` for the SIGMOD paper and `10.14778/3229863.3236263` for the PVLDB demonstration. Retrieved 2026-06-06 from arXiv after the VLDB PDF endpoint timed out from the cron worker.",
-      "journal_entry_id": "2026-06-06-skinnerdb-turns-bad-join-orders-into-bounded-exploration-cost",
-      "missing_fields": [
-        "arxiv",
-        "url"
-      ],
-      "paper_id": "paper-2019-skinnerdb-regret-bounded-query-evaluation-via-reinforcement-learning",
-      "title": "SkinnerDB: Regret-Bounded Query Evaluation via Reinforcement Learning."
-    },
-    {
-      "citation": "Pedro Fouto, Nuno Preguica, and Joao Leitao. \"High Throughput Replication with Integrated Membership Management.\" 2022 USENIX Annual Technical Conference, pages 575-592. Retrieved 2026-06-06 from USENIX `https://www.usenix.org/system/files/atc22-fouto.pdf`.",
-      "journal_entry_id": "2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem",
-      "missing_fields": [
-        "doi",
-        "arxiv",
-        "venue"
-      ],
-      "paper_id": "paper-2022-high-throughput-replication-with-integrated-membership-management",
-      "title": "High Throughput Replication with Integrated Membership Management."
-    },
-    {
       "citation": "Tsuyoshi Ozawa and Kazuo Goda. \"Data Path Fusion in GPU for Analytical Query Processing.\" arXiv:2605.10511, submitted 2026-05-11. Retrieved 2026-06-02 from `https://arxiv.org/pdf/2605.10511`. The preprint contains PVLDB placeholder metadata; final venue details are unknown.",
       "journal_entry_id": "2026-06-02-data-path-fusion-in-gpu-for-analytical-query-processing",
       "missing_fields": [
@@ -1276,6 +1225,15 @@
       ],
       "paper_id": "paper-2023-tique-improving-the-transactional-performance-of-analytical-systems-for-true-hybrid-workloads",
       "title": "TiQuE: Improving the Transactional Performance of Analytical Systems for True Hybrid Workloads."
+    },
+    {
+      "citation": "Xiangpeng Hao, Xinjing Zhou, Xiangyao Yu, and Michael Stonebraker. \"Towards Buffer Management with Tiered Main Memory.\" Proceedings of the ACM on Management of Data 2(1), Article 31, 2024, pages 31:1-31:26. doi:10.1145/3639286. Retrieved 2026-06-03 from the SIGMOD/PACMMOD table of contents, DBLP metadata, Mendeley abstract page, Xiangyao Yu's publication page, and the public `Two-tier-memory-project/tiered-buffer-pool` code repository. The ACM HTML/PDF endpoints returned HTTP 403 in this worker, so details below are limited to the accessible abstract, official metadata, author pages, and code. Unknown paper-only details are marked as such.",
+      "journal_entry_id": "2026-06-03-towards-buffer-management-with-tiered-main-memory",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2024-towards-buffer-management-with-tiered-main-memory",
+      "title": "Towards Buffer Management with Tiered Main Memory."
     },
     {
       "citation": "Hasan Al Maruf, Hao Wang, Abhishek Dhanotia, Johannes Weiner, Niket Agarwal, Pallab Bhattacharya, Chris Petersen, Mosharaf Chowdhury, Shobhit Kanaujia, and Prakash Chauhan. \"TPP: Transparent Page Placement for CXL-Enabled Tiered-Memory.\" ASPLOS 2023. doi:10.1145/3582016.3582063. Retrieved 2026-06-03 from the authors' PDF at `https://symbioticlab.org/publications/files/tpp%3Aasplos23/tpp-asplos23.pdf`.",
@@ -2232,6 +2190,15 @@
       "title": "Concurrency Control as a Service."
     },
     {
+      "citation": "Akon Dey, Alan D. Fekete, and Uwe Rohm. \"Scalable Distributed Transactions across Heterogeneous Stores.\" ICDE 2015, pp. 125-136, doi:10.1109/ICDE.2015.7113278. Retrieved 2026-06-05 from the DOI/DBLP record, with full text read from the author-uploaded ResearchGate copy after the IEEE paper endpoint was not directly accessible.",
+      "journal_entry_id": "2026-06-05-cherry-garcia-commits-heterogeneous-store-writes-through-recoverable-metadata",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2015-scalable-distributed-transactions-across-heterogeneous-stores",
+      "title": "Scalable Distributed Transactions across Heterogeneous Stores."
+    },
+    {
       "citation": "Yi Lu, Xiangyao Yu, Lei Cao, and Samuel Madden. \"Epoch-based Commit and Replication in Distributed OLTP Databases.\" PVLDB 14(5), 2021, pp. 743-756. doi:10.14778/3446095.3446098. Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol14/p743-lu.pdf`.",
       "journal_entry_id": "2026-06-05-coco-batches-commit-and-replication-into-epoch-barriers",
       "missing_fields": [
@@ -3121,6 +3088,15 @@
       ],
       "paper_id": "paper-2020-1rma-re-envisioning-remote-memory-access-for-multi-tenant-datacenters",
       "title": "1RMA: Re-envisioning Remote Memory Access for Multi-tenant Datacenters."
+    },
+    {
+      "citation": "Yunjia Zhang, Yannis Chronis, Jignesh M. Patel, and Theodoros Rekatsinas. \"Simple Adaptive Query Processing vs. Learned Query Optimizers: Observations and Analysis.\" PVLDB 2023; extended VLDB Journal 34:62, 2025. DOI: `10.1007/s00778-025-00936-6`. Retrieved 2026-06-06 from the open Springer PDF after the VLDB PDF endpoint timed out from the cron worker.",
+      "journal_entry_id": "2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2025-simple-adaptive-query-processing-vs-learned-query-optimizers-observations-and-analysis",
+      "title": "Simple Adaptive Query Processing vs. Learned Query Optimizers: Observations and Analysis."
     },
     {
       "citation": "Shuihai Hu, Wei Bai, Gaoxiong Zeng, Zilong Wang, Baochen Qiao, Kai Chen, Kun Tan, and Yi Wang. \"Aeolus: A Building Block for Proactive Transport in Datacenters.\" SIGCOMM 2020, pages 422-434. DOI: `10.1145/3387514.3405878`. Retrieved 2026-06-06 from the author PDF at `https://www.cse.ust.hk/~kaichen/papers/aeolus-sigcomm20.pdf`; metadata checked against the HKUST publication page and DOI.",
@@ -5128,6 +5104,16 @@
       "title": "ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory."
     },
     {
+      "citation": "Pedro Fouto, Nuno Preguica, and Joao Leitao. \"High Throughput Replication with Integrated Membership Management.\" 2022 USENIX Annual Technical Conference, pages 575-592. Retrieved 2026-06-06 from USENIX `https://www.usenix.org/system/files/atc22-fouto.pdf`.",
+      "journal_entry_id": "2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem",
+      "missing_fields": [
+        "doi",
+        "arxiv"
+      ],
+      "paper_id": "paper-2022-high-throughput-replication-with-integrated-membership-management",
+      "title": "High Throughput Replication with Integrated Membership Management."
+    },
+    {
       "citation": "Jian Gao, Youyou Lu, Minhui Xie, Qing Wang, and Jiwu Shu. \"Citron: Distributed Range Lock Management with One-sided RDMA.\" FAST 2023, pages 297-314. Retrieved 2026-06-06 from the USENIX paper page and PDF at `https://www.usenix.org/conference/fast23/presentation/gao` and `https://www.usenix.org/system/files/fast23-gao.pdf`.",
       "journal_entry_id": "2026-06-06-citron-makes-remote-range-locks-a-static-metadata-protocol",
       "missing_fields": [
@@ -5935,14 +5921,13 @@
         "2026-06-05-cherry-garcia-commits-heterogeneous-store-writes-through-recoverable-metadata"
       ],
       "missing_fields": [
-        "arxiv",
-        "url"
+        "arxiv"
       ],
       "paper_id": "paper-2015-scalable-distributed-transactions-across-heterogeneous-stores",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
       "title": "Scalable Distributed Transactions across Heterogeneous Stores.",
-      "url": "",
+      "url": "https://doi.org/10.1109/icde.2015.7113278",
       "venue": "ICDE",
       "year": "2015"
     },
@@ -9431,7 +9416,7 @@
       "year": "2019"
     },
     {
-      "arxiv": "",
+      "arxiv": "1901.05152",
       "authors": [
         "Immanuel Trummer",
         "Junxiong Wang",
@@ -9446,15 +9431,12 @@
       "journal_entry_ids": [
         "2026-06-06-skinnerdb-turns-bad-join-orders-into-bounded-exploration-cost"
       ],
-      "missing_fields": [
-        "arxiv",
-        "url"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2019-skinnerdb-regret-bounded-query-evaluation-via-reinforcement-learning",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
       "title": "SkinnerDB: Regret-Bounded Query Evaluation via Reinforcement Learning.",
-      "url": "",
+      "url": "https://arxiv.org/abs/1901.05152",
       "venue": "SIGMOD",
       "year": "2019"
     },
@@ -12790,15 +12772,14 @@
       ],
       "missing_fields": [
         "doi",
-        "arxiv",
-        "venue"
+        "arxiv"
       ],
       "paper_id": "paper-2022-high-throughput-replication-with-integrated-membership-management",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
       "title": "High Throughput Replication with Integrated Membership Management.",
       "url": "https://www.usenix.org/system/files/atc22-fouto.pdf",
-      "venue": "",
+      "venue": "USENIX Annual Technical Conference",
       "year": "2022"
     },
     {
@@ -17854,7 +17835,7 @@
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
       "title": "Towards Buffer Management with Tiered Main Memory.",
-      "url": "https://github.com/Two-tier-memory-project/tiered-buffer-pool",
+      "url": "https://doi.org/10.1145/3639286",
       "venue": "Proceedings of the ACM on Management of Data 2(1), Article 31",
       "year": "2024"
     },
@@ -19852,14 +19833,13 @@
         "2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training"
       ],
       "missing_fields": [
-        "arxiv",
-        "url"
+        "arxiv"
       ],
       "paper_id": "paper-2025-simple-adaptive-query-processing-vs-learned-query-optimizers-observations-and-analysis",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
       "title": "Simple Adaptive Query Processing vs. Learned Query Optimizers: Observations and Analysis.",
-      "url": "",
+      "url": "https://doi.org/10.1007/s00778-025-00936-6",
       "venue": "PVLDB",
       "year": "2025"
     },
@@ -34996,14 +34976,13 @@
         "identity_key": "title:simple-adaptive-query-processing-vs-learned-query-optimizers-observations-and-analysis",
         "journal_entry_id": "2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training",
         "missing_fields": [
-          "arxiv",
-          "url"
+          "arxiv"
         ],
         "paper_id": "paper-2025-simple-adaptive-query-processing-vs-learned-query-optimizers-observations-and-analysis",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
         "title": "Simple Adaptive Query Processing vs. Learned Query Optimizers: Observations and Analysis.",
-        "url": "",
+        "url": "https://doi.org/10.1007/s00778-025-00936-6",
         "venue": "PVLDB",
         "year": "2025"
       },
@@ -88038,14 +88017,13 @@
         "identity_key": "title:towards-buffer-management-with-tiered-main-memory",
         "journal_entry_id": "2026-06-03-towards-buffer-management-with-tiered-main-memory",
         "missing_fields": [
-          "arxiv",
-          "url"
+          "arxiv"
         ],
         "paper_id": "paper-2024-towards-buffer-management-with-tiered-main-memory",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
         "title": "Towards Buffer Management with Tiered Main Memory.",
-        "url": "",
+        "url": "https://doi.org/10.1145/3639286",
         "venue": "Proceedings of the ACM on Management of Data 2(1), Article 31",
         "year": "2024"
       },
@@ -176415,14 +176393,13 @@
         "identity_key": "title:scalable-distributed-transactions-across-heterogeneous-stores",
         "journal_entry_id": "2026-06-05-cherry-garcia-commits-heterogeneous-store-writes-through-recoverable-metadata",
         "missing_fields": [
-          "arxiv",
-          "url"
+          "arxiv"
         ],
         "paper_id": "paper-2015-scalable-distributed-transactions-across-heterogeneous-stores",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
         "title": "Scalable Distributed Transactions across Heterogeneous Stores.",
-        "url": "",
+        "url": "https://doi.org/10.1109/icde.2015.7113278",
         "venue": "ICDE",
         "year": "2015"
       },
@@ -185550,15 +185527,14 @@
         "journal_entry_id": "2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem",
         "missing_fields": [
           "doi",
-          "arxiv",
-          "venue"
+          "arxiv"
         ],
         "paper_id": "paper-2022-high-throughput-replication-with-integrated-membership-management",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
         "title": "High Throughput Replication with Integrated Membership Management.",
         "url": "https://www.usenix.org/system/files/atc22-fouto.pdf",
-        "venue": "",
+        "venue": "USENIX Annual Technical Conference",
         "year": "2022"
       },
       "relevance_tags": [
@@ -191750,7 +191726,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "1901.05152",
         "authors": [
           "Immanuel Trummer",
           "Junxiong Wang",
@@ -191762,15 +191738,12 @@
         "doi": "10.1145/3299869.3300088",
         "identity_key": "title:skinnerdb-regret-bounded-query-evaluation-via-reinforcement-learning",
         "journal_entry_id": "2026-06-06-skinnerdb-turns-bad-join-orders-into-bounded-exploration-cost",
-        "missing_fields": [
-          "arxiv",
-          "url"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2019-skinnerdb-regret-bounded-query-evaluation-via-reinforcement-learning",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
         "title": "SkinnerDB: Regret-Bounded Query Evaluation via Reinforcement Learning.",
-        "url": "",
+        "url": "https://arxiv.org/abs/1901.05152",
         "venue": "SIGMOD",
         "year": "2019"
       },
@@ -206445,7 +206418,7 @@
     "supports": "paper evidence supports or motivates this mechanism",
     "warns_against": "paper evidence warns against adopting this mechanism without constraints"
   },
-  "schema": "gpu-db-research-paper-mechanism-links-v6",
+  "schema": "gpu-db-research-paper-mechanism-links-v7",
   "source_journal": "docs/research/gpu-db-literature-journal.md",
   "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
   "summary": {
@@ -206481,25 +206454,21 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identity_counts": {
-      "paper_entries_with_arxiv": 117,
+      "paper_entries_with_arxiv": 118,
       "paper_entries_with_doi": 391,
       "paper_entries_with_identity": 602,
-      "paper_entries_with_url": 598,
-      "paper_entries_with_venue": 601
+      "paper_entries_with_url": 602,
+      "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
-      "missing_arxiv": 485,
-      "missing_doi": 211,
-      "missing_url": 4,
-      "missing_venue": 1
+      "missing_arxiv": 484,
+      "missing_doi": 211
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 340,
-      "arxiv,url": 4,
+      "arxiv": 343,
       "doi": 70,
-      "doi,arxiv": 140,
-      "doi,arxiv,venue": 1,
-      "none": 47
+      "doi,arxiv": 141,
+      "none": 48
     },
     "paper_records": 563,
     "pending_low_confidence_links": 0,

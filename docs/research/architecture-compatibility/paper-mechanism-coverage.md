@@ -33,32 +33,23 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - duplicate identity groups: 32
 
 Generated identity field counts:
-- paper_entries_with_arxiv: 117
+- paper_entries_with_arxiv: 118
 - paper_entries_with_doi: 391
 - paper_entries_with_identity: 602
-- paper_entries_with_url: 598
-- paper_entries_with_venue: 601
+- paper_entries_with_url: 602
+- paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
-- missing_arxiv: 485
+- missing_arxiv: 484
 - missing_doi: 211
-- missing_url: 4
-- missing_venue: 1
 
 Generated identity missing-field sets:
-- arxiv: 340
-- arxiv,url: 4
+- arxiv: 343
 - doi: 70
-- doi,arxiv: 140
-- doi,arxiv,venue: 1
-- none: 47
+- doi,arxiv: 141
+- none: 48
 
 Missing identity metadata audit:
-- `2026-06-03-towards-buffer-management-with-tiered-main-memory` -> `paper-2024-towards-buffer-management-with-tiered-main-memory` missing arxiv, url: Towards Buffer Management with Tiered Main Memory.
-- `2026-06-05-cherry-garcia-commits-heterogeneous-store-writes-through-recoverable-metadata` -> `paper-2015-scalable-distributed-transactions-across-heterogeneous-stores` missing arxiv, url: Scalable Distributed Transactions across Heterogeneous Stores.
-- `2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training` -> `paper-2025-simple-adaptive-query-processing-vs-learned-query-optimizers-observations-and-analysis` missing arxiv, url: Simple Adaptive Query Processing vs. Learned Query Optimizers: Observations and Analysis.
-- `2026-06-06-skinnerdb-turns-bad-join-orders-into-bounded-exploration-cost` -> `paper-2019-skinnerdb-regret-bounded-query-evaluation-via-reinforcement-learning` missing arxiv, url: SkinnerDB: Regret-Bounded Query Evaluation via Reinforcement Learning.
-- `2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem` -> `paper-2022-high-throughput-replication-with-integrated-membership-management` missing doi, arxiv, venue: High Throughput Replication with Integrated Membership Management.
 - `2026-06-02-data-path-fusion-in-gpu-for-analytical-query-processing` -> `paper-2026-data-path-fusion-in-gpu-for-analytical-query-processing` missing doi: Data Path Fusion in GPU for Analytical Query Processing.
 - `2026-06-02-demikernel-datapath-os-architecture-for-microsecond-scale-datacenter-systems` -> `paper-2021-the-demikernel-datapath-os-architecture-for-microsecond-scale-datacenter-systems` missing arxiv: The Demikernel Datapath OS Architecture for Microsecond-scale Datacenter Systems.
 - `2026-06-02-oze-decentralized-graph-based-concurrency-control` -> `paper-2025-oze-decentralized-graph-based-concurrency-control-for-long-running-update-transactions` missing arxiv: Oze: Decentralized Graph-based Concurrency Control for Long-running Update Transactions.
@@ -94,7 +85,12 @@ Missing identity metadata audit:
 - `2026-06-03-dbms-owned-large-objects-instead-of-files` -> `paper-2024-why-files-if-you-have-a-dbms` missing arxiv: Why Files If You Have a DBMS?
 - `2026-06-03-diva-decoupled-mvcc-version-index-and-data` -> `paper-2022-diva-making-mvcc-systems-htap-friendly` missing arxiv: Diva: Making MVCC Systems HTAP-Friendly.
 - `2026-06-03-dragon-breaking-gpu-memory-capacity-limits-with-direct-nvm-access` -> `paper-2018-dragon-breaking-gpu-memory-capacity-limits-with-direct-nvm-access` missing arxiv: DRAGON: Breaking GPU Memory Capacity Limits with Direct NVM Access.
-- ... 515 more
+- `2026-06-03-ermia-snapshot-friendly-mixed-workload-oltp` -> `paper-2016-ermia-fast-memory-optimized-database-system-for-heterogeneous-workloads` missing arxiv: ERMIA: Fast Memory-Optimized Database System for Heterogeneous Workloads.
+- `2026-06-03-fast-serializable-main-memory-mvcc` -> `paper-2015-fast-serializable-multi-version-concurrency-control-for-main-memory-database-systems` missing arxiv: Fast Serializable Multi-Version Concurrency Control for Main-Memory Database Systems.
+- `2026-06-03-fncc-fast-notification-congestion-control` -> `paper-2024-fncc-fast-notification-congestion-control-in-data-center-networks` missing doi: FNCC: Fast Notification Congestion Control in Data Center Networks.
+- `2026-06-03-foedus-thousand-core-oltp-with-dual-pages` -> `paper-2015-foedus-oltp-engine-for-a-thousand-cores-and-nvram` missing arxiv: FOEDUS: OLTP Engine for a Thousand Cores and NVRAM.
+- `2026-06-03-free-join-unified-binary-and-worst-case-optimal-joins` -> `paper-2023-free-join-unifying-worst-case-optimal-and-traditional-joins` missing doi: Free Join: Unifying Worst-Case Optimal and Traditional Joins.
+- ... 514 more
 
 Duplicate identity audit:
 - `paper-2016-design-principles-for-scaling-multi-core-oltp-under-high-contention` (2 entries): 2026-06-04-orthrus-separates-contention-control-from-transaction-execution, 2026-06-06-orthrus-separates-conflict-ownership-from-transaction-execution

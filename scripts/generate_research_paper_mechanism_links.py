@@ -14,7 +14,7 @@ TAGS_RE = re.compile(r"^\*\*Relevance tags:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 CITATION_RE = re.compile(r"^\*\*Citation:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`])")
 DOI_RE = re.compile(r"(?:doi:\s*|doi\.org/)(?P<doi>10\.\d{4,9}/[^\s`]+)", re.IGNORECASE)
-ARXIV_RE = re.compile(r"(?:arxiv:|arxiv\.org/(?:abs|pdf)/)(?P<arxiv>\d{4}\.\d{4,5}(?:v\d+)?)", re.IGNORECASE)
+ARXIV_RE = re.compile(r"(?:arxiv[:\s]+|arxiv\.org/(?:abs|pdf)/)(?P<arxiv>\d{4}\.\d{4,5}(?:v\d+)?)", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s`)>]+")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 QUOTED_TITLE_RE = re.compile(r'"(?P<title>[^"]+)"')
@@ -12728,7 +12728,12 @@ def citation_venue(citation: str) -> str:
     after_title = re.sub(r"\bDOI:\s*.*$", "", after_title, flags=re.IGNORECASE)
     after_title = re.sub(r"\bRetrieved\s+\d{4}-\d{2}-\d{2}.*$", "", after_title, flags=re.IGNORECASE)
     after_title = URL_RE.sub("", after_title)
-    after_title = re.sub(r"\b(19|20)\d{2}\b.*$", "", after_title)
+    legacy_venue = compact_whitespace(re.sub(r"\b(19|20)\d{2}\b.*$", "", after_title).strip(" .,:;"))
+    if legacy_venue:
+        return legacy_venue
+    after_title = re.sub(r"^\s*[.,;:]?\s*\b(19|20)\d{2}\b\s*", "", after_title)
+    after_title = re.sub(r"\bpages?\s+.*$", "", after_title, flags=re.IGNORECASE)
+    after_title = re.sub(r"\bpp\.\s+.*$", "", after_title, flags=re.IGNORECASE)
     return compact_whitespace(after_title.strip(" .,:;"))
 
 
@@ -12738,6 +12743,16 @@ def normalize_identifier(value: str) -> str:
 
 def normalize_arxiv(value: str) -> str:
     return re.sub(r"v\d+$", "", normalize_identifier(value))
+
+
+def citation_url(urls: list[str], doi: str, arxiv: str) -> str:
+    if urls:
+        return urls[0]
+    if arxiv:
+        return f"https://arxiv.org/abs/{arxiv}"
+    if doi:
+        return f"https://doi.org/{doi}"
+    return ""
 
 
 def citation_year(citation: str, entry_date: str) -> str:
@@ -12780,7 +12795,7 @@ def build_paper_identity(entry: dict) -> dict | None:
         "year": year,
         "doi": doi,
         "arxiv": arxiv,
-        "url": urls[0] if urls else "",
+        "url": citation_url(urls, doi, arxiv),
         "journal_entry_id": entry["id"],
         "source": "generated_from_journal_citation",
         "review_status": "generated_identity",
@@ -13316,7 +13331,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
     paper_records, duplicate_groups = normalize_paper_records(paper_identities)
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v6",
+        "schema": "gpu-db-research-paper-mechanism-links-v7",
         "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, and normalized paper identity records. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
