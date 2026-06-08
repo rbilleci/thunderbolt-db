@@ -8974,6 +8974,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "warns_against",
         "relation_review_note": "The synthesis warns that freshness must be a first-class route risk rather than an after-the-fact runtime event.",
     },
+    (
+        "2026-06-05-cherry-garcia-commits-heterogeneous-store-writes-through-recoverable-metadata",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Heterogeneous-store routing is valid only when the route can prove common read, conditional-write, durability, and metadata capabilities.",
+    },
+    (
+        "2026-06-05-unimem-makes-far-memory-useful-by-separating-addressability-filtering-and-promotion",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Promotion is useful only when placement proof shows the promoted unit has enough useful bytes for the fast tier.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-publication-proof-needs-placement-proof",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Admission work should proceed only if no nearer runtime, session, network, or scheduling evidence fills the same gap.",
+    },
+    (
+        "2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Active-session lane and buffer-credit admission is explicitly framed as a benchmark before adoption.",
+    },
+    (
+        "2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded",
+        "deficit_fairness",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fairness is required only when hot sessions can reacquire scarce active lanes ahead of quiet sessions.",
+    },
+    (
+        "2026-06-05-deadlock-safety-needs-packet-level-pressure-not-just-cycle-detection",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Template routing is safe only with restrictions or structured resources that prevent cyclic buffer dependencies.",
+    },
+    (
+        "2026-06-05-scalardb-makes-transaction-authority-an-adapter-visible-metadata-layer",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Adapter-visible route choice is valid only for stores that expose linearizable reads, conditional mutation, durability, and metadata room.",
+    },
+    (
+        "2026-06-05-reps-turns-path-choice-into-tiny-recycled-endpoint-state",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Recycled endpoint hints must be benchmarked inside owner rings and response lanes before relying on the transfer.",
+    },
+    (
+        "2026-06-05-rethinking-simd-vectorization-for-in-memory-databases",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Operator-specific layout work is needed before CPU fallback and warm-tier routes assume generic acceleration wins.",
+    },
+    (
+        "2026-06-05-rethinking-simd-vectorization-for-in-memory-databases",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Explicit vector primitives are presented as an alternative to hoping scalar operators expose useful hardware behavior.",
+    },
+    (
+        "2026-06-05-selection-pushdown-in-column-stores-using-bit-manipulation-instructions",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Compressed chunk pushdown supports retained snapshots only if freshness under mutations is handled separately.",
+    },
+    (
+        "2026-06-05-selection-pushdown-in-column-stores-using-bit-manipulation-instructions",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Dictionary-order and predicate-shape caveats warn against treating compressed descriptors as generally reusable.",
+    },
+    (
+        "2026-06-05-selection-pushdown-in-column-stores-using-bit-manipulation-instructions",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU compressed scan, CPU prefilter, GPU transfer, resident GPU scan, and fallback thresholds require measurement.",
+    },
+    (
+        "2026-06-05-selection-pushdown-in-column-stores-using-bit-manipulation-instructions",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The non-order-preserving dictionary warning is a route-shape caveat; owner-ring evidence remains a support candidate.",
+    },
+    (
+        "2026-06-05-vegito-turns-ha-backups-into-fresh-columnar-htap-replicas",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "A fresh HA backup retrofitted as a columnar replica is an alternative to separate ETL or dual-layout HTAP routing.",
+    },
+    (
+        "2026-06-05-vegito-turns-ha-backups-into-fresh-columnar-htap-replicas",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Backup-like generation semantics are valid only if they do not add hidden commit-time replication cost.",
+    },
+    (
+        "2026-06-05-taurus-ndp-makes-cold-tier-pushdown-best-effort-and-mvcc-safe",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Disaggregated analytical pushdown cautions against direct inference for GPU-resident OLTP snapshots.",
+    },
+    (
+        "2026-06-05-taurus-ndp-makes-cold-tier-pushdown-best-effort-and-mvcc-safe",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Cold-tier pushdown is valid only if it does not silently worsen later retained or CPU fallback routes.",
+    },
+    (
+        "2026-06-05-bcc-reduces-false-occ-aborts-with-bounded-dependency-checks",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Read-only snapshot convenience can hide metadata costs, so publication and long-reader frontiers must be explicit.",
+    },
+    (
+        "2026-06-06-liquidcache-makes-pushdown-a-cache-format-problem",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Warm-tier encoded pushdown must be measured against CPU tuple scan, GPU resident scan, and cold segment scan baselines.",
+    },
+    (
+        "2026-06-06-liquidcache-makes-pushdown-a-cache-format-problem",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Selective decode batch sizing needs microbenchmarks before the optimizer can price the route.",
+    },
+    (
+        "2026-06-06-liquidcache-makes-pushdown-a-cache-format-problem",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "File-catalog consistency is an alternative to SQL MVCC, WAL-before-visibility, DDL generation, and row-update chains.",
+    },
+    (
+        "2026-06-06-liquidcache-makes-pushdown-a-cache-format-problem",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained filters need warm encoded, resident GPU, CPU, and cold segment benchmark comparisons.",
+    },
+    (
+        "2026-06-06-liquidcache-makes-pushdown-a-cache-format-problem",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Filter-friendly cache encodings are an alternative way to shape work instead of owner-oriented durable format changes.",
+    },
+    (
+        "2026-06-06-shardingsphere-makes-route-metadata-a-first-class-execution-boundary",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Proxy compatibility and million-session multiplexing need benchmarks before embedded route fast paths are trusted.",
+    },
+    (
+        "2026-06-06-upbit-keeps-bitmap-filters-mutable-by-separating-sparse-update-state",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Segment-local bitmap and delta summaries are prototype work before they inform route costing.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-plus-publication-proof",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Private pushdown formats and mutable predicate evidence are alternatives to rewriting base compressed representation for route choice.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-plus-publication-proof",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback must be measured alongside raw CPU, encoded warm, sparse bitmap, and GPU resident routes.",
+    },
+    (
+        "2026-06-06-cubit-makes-updatable-bitmap-indexes-concurrent-with-logged-horizontal-deltas",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Append-heavy updates and retained analytical reads require an HTAP freshness benchmark before adopting bitmap maintenance.",
+    },
+    (
+        "2026-06-06-cubit-makes-updatable-bitmap-indexes-concurrent-with-logged-horizontal-deltas",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Selective bitmap-powered scan, aggregation, and join routes need evaluation before general route-cost adoption.",
+    },
 }
 
 
