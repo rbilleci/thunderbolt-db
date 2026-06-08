@@ -331,114 +331,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-efficient-scheduling-policies-for-microsecond-scale-tasks",
-      "paper_id": "paper-2022-efficient-scheduling-policies-for-microsecond-scale-tasks",
-      "title": "Efficient Scheduling Policies for Microsecond-Scale Tasks."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-empirical-in-memory-mvcc-design-tradeoffs",
-      "paper_id": "paper-2017-an-empirical-evaluation-of-in-memory-multi-version-concurrency-control",
-      "title": "An Empirical Evaluation of In-Memory Multi-Version Concurrency Control."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-fastmap-scalable-mmap-for-fast-storage",
-      "paper_id": "paper-2020-optimizing-memory-mapped-i-o-for-fast-storage-devices",
-      "title": "Optimizing Memory-mapped I/O for Fast Storage Devices."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-leveraging-lock-contention-to-improve-oltp-application-performance",
-      "paper_id": "paper-2016-leveraging-lock-contention-to-improve-oltp-application-performance",
-      "title": "Leveraging Lock Contention to Improve OLTP Application Performance."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-mmap-is-not-a-buffer-pool-substitute",
-      "paper_id": "paper-2022-are-you-sure-you-want-to-use-mmap-in-your-database-management-system",
-      "title": "Are You Sure You Want to Use MMAP in Your Database Management System?"
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-ncc-response-timed-strict-serializability-for-naturally-ordered-transactions",
-      "paper_id": "paper-2023-ncc-natural-concurrency-control-for-strictly-serializable-datastores-by-avoiding-the-timestamp-i",
-      "title": "NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-nomad-non-exclusive-memory-tiering",
-      "paper_id": "paper-2024-nomad-non-exclusive-memory-tiering-via-transactional-page-migration",
-      "title": "Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-oltp-through-the-looking-glass-16-years-later",
-      "paper_id": "paper-2025-oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck",
-      "title": "OLTP Through the Looking Glass 16 Years Later: Communication is the New Bottleneck."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots",
-      "paper_id": "paper-2019-on-supporting-efficient-snapshot-isolation-for-hybrid-workloads-with-multi-versioned-indexes",
-      "title": "On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-pasha-partitioned-shared-cxl-pod-architecture",
-      "paper_id": "paper-2025-pasha-an-efficient-scalable-database-architecture-for-cxl-pods",
-      "title": "Pasha: An Efficient, Scalable Database Architecture for CXL Pods."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-polyjuice-learned-concurrency-control-policies",
-      "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
-      "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-03-predicate-transfer-for-multi-join-pre-filtering",
-      "paper_id": "paper-2024-predicate-transfer-efficient-pre-filtering-on-multi-join-queries",
-      "title": "Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-03-pwv-early-write-visibility",
       "paper_id": "paper-2017-high-performance-transactions-via-early-write-visibility",
       "title": "High Performance Transactions via Early Write Visibility."
@@ -2196,6 +2088,25 @@
       "title": "DRAGON: Breaking GPU Memory Capacity Limits with Direct NVM Access."
     },
     {
+      "citation": "Yingjun Wu, Joy Arulraj, Jiexi Lin, Ran Xian, and Andrew Pavlo. \"An Empirical Evaluation of In-Memory Multi-Version Concurrency Control.\" PVLDB 10(7), 2017, pp. 781-792. Retrieved 2026-06-03 from the VLDB PDF, `https://www.vldb.org/pvldb/vol10/p781-Wu.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3067421.3067427",
+        "review_status": "reviewed_identifier_repair",
+        "title": "An Empirical Evaluation of In-Memory Multi-Version Concurrency Control."
+      },
+      "journal_entry_id": "2026-06-03-empirical-in-memory-mvcc-design-tradeoffs",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2017-an-empirical-evaluation-of-in-memory-multi-version-concurrency-control",
+      "title": "An Empirical Evaluation of In-Memory Multi-Version Concurrency Control."
+    },
+    {
       "citation": "Kangnyeon Kim, Tianzheng Wang, Ryan Johnson, and Ippokratis Pandis. \"ERMIA: Fast Memory-Optimized Database System for Heterogeneous Workloads.\" SIGMOD 2016, pp. 1675-1687. doi:10.1145/2882903.2882905. Retrieved 2026-06-03 from the author PDF, `https://www2.cs.sfu.ca/~tzwang/ermia.pdf`; publisher page: `https://dl.acm.org/doi/10.1145/2882903.2882905`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -2484,6 +2395,25 @@
       "title": "Lero: A Learning-to-Rank Query Optimizer."
     },
     {
+      "citation": "Cong Yan and Alvin Cheung. \"Leveraging Lock Contention to Improve OLTP Application Performance.\" Proceedings of the VLDB Endowment 9(5), 2016. Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/2876473.2876479",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Leveraging Lock Contention to Improve OLTP Application Performance."
+      },
+      "journal_entry_id": "2026-06-03-leveraging-lock-contention-to-improve-oltp-application-performance",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2016-leveraging-lock-contention-to-improve-oltp-application-performance",
+      "title": "Leveraging Lock Contention to Improve OLTP Application Performance."
+    },
+    {
       "citation": "Yueying Li, Nikita Lazarev, David Koufaty, Tenny Yin, Andy Anderson, Zhiru Zhang, G. Edward Suh, Kostis Kaffes, and Christina Delimitrou. \"LibPreemptible: Enabling Fast, Adaptive, and Hardware-Assisted User-Space Scheduling.\" HPCA 2024, pp. 922-936. doi:10.1109/HPCA57654.2024.00075. Retrieved 2026-06-03 from the author PDF, `https://people.csail.mit.edu/delimitrou/papers/2024.hpca.libpreemptible.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -2736,6 +2666,63 @@
       "title": "Natto: Providing Distributed Transaction Prioritization for High-Contention Workloads."
     },
     {
+      "citation": "Haonan Lu, Shuai Mu, Siddhartha Sen, and Wyatt Lloyd. \"NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall.\" OSDI 2023. Retrieved 2026-06-03 from the USENIX page and PDF at `https://www.usenix.org/conference/osdi23/presentation/lu` and `https://www.usenix.org/system/files/osdi23-lu.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/2305.14270",
+        "review_status": "reviewed_identifier_repair",
+        "title": "NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall."
+      },
+      "journal_entry_id": "2026-06-03-ncc-response-timed-strict-serializability-for-naturally-ordered-transactions",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2023-ncc-natural-concurrency-control-for-strictly-serializable-datastores-by-avoiding-the-timestamp-i",
+      "title": "NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall."
+    },
+    {
+      "citation": "Lingfeng Xiang, Zhen Lin, Weishu Deng, Hui Lu, Jia Rao, Yifan Yuan, and Ren Wang. \"Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration.\" OSDI 2024. Retrieved 2026-06-03 from the USENIX page and PDF, `https://www.usenix.org/conference/osdi24/presentation/xiang` and `https://www.usenix.org/system/files/osdi24-xiang.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/2401.13154",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration."
+      },
+      "journal_entry_id": "2026-06-03-nomad-non-exclusive-memory-tiering",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2024-nomad-non-exclusive-memory-tiering-via-transactional-page-migration",
+      "title": "Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration."
+    },
+    {
+      "citation": "Yihan Sun, Guy E. Blelloch, Wan Shen Lim, and Andrew Pavlo. \"On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes.\" PVLDB 13(2), 2019. Retrieved 2026-06-03 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p211-sun.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3364324.3364334",
+        "review_status": "reviewed_identifier_repair",
+        "title": "On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes."
+      },
+      "journal_entry_id": "2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2019-on-supporting-efficient-snapshot-isolation-for-hybrid-workloads-with-multi-versioned-indexes",
+      "title": "On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes."
+    },
+    {
       "citation": "Yingjun Wu, Wentian Guo, Chee-Yong Chan, and Kian-Lee Tan. \"Fast Failure Recovery for Main-Memory DBMSs on Multicores.\" SIGMOD 2017, pp. 267-281. doi:10.1145/3035918.3064011. Retrieved 2026-06-03 from `https://yingjunwu.github.io/papers/sigmod2017.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -2844,6 +2831,25 @@
       "title": "Polaris: Enabling Transaction Priority in Optimistic Concurrency Control."
     },
     {
+      "citation": "Jiachen Wang, Ding Ding, Huan Wang, Conrad Christensen, Zhaoguo Wang, Haibo Chen, and Jinyang Li. \"Polyjuice: High-Performance Transactions via Learned Concurrency Control.\" OSDI 2021. Retrieved 2026-06-03 from the USENIX PDF, `https://www.usenix.org/system/files/osdi21-wang-jiachen.pdf`, and USENIX landing page, `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/2105.10329",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
+      },
+      "journal_entry_id": "2026-06-03-polyjuice-learned-concurrency-control-policies",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
+      "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
+    },
+    {
       "citation": "Vamsi Addanki, Oliver Michel, and Stefan Schmid. \"PowerTCP: Pushing the Performance Limits of Datacenter Networks.\" NSDI 2022, pp. 51-70. Retrieved 2026-06-03 from the USENIX open-access landing page, `https://www.usenix.org/conference/nsdi22/presentation/addanki`, and the arXiv author version, `https://arxiv.org/abs/2112.14309`.",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
@@ -2860,6 +2866,25 @@
       ],
       "paper_id": "paper-2022-powertcp-pushing-the-performance-limits-of-datacenter-networks",
       "title": "PowerTCP: Pushing the Performance Limits of Datacenter Networks."
+    },
+    {
+      "citation": "Yifei Yang, Hangdong Zhao, Xiangyao Yu, and Paraschos Koutris. \"Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries.\" CIDR 2024. Retrieved 2026-06-03 from the CIDR PDF, `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/2307.15255",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries."
+      },
+      "journal_entry_id": "2026-06-03-predicate-transfer-for-multi-join-pre-filtering",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2024-predicate-transfer-efficient-pre-filtering-on-multi-join-queries",
+      "title": "Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries."
     },
     {
       "citation": "Ashwini Raina, Jianan Lu, Asaf Cidon, and Michael J. Freedman. \"Efficient Compactions Between Storage Tiers with PrismDB.\" arXiv:2008.02352 v6, 2022. Retrieved 2026-06-03 from arXiv, `https://arxiv.org/pdf/2008.02352`.",
@@ -9162,12 +9187,13 @@
     {
       "citation": "Sarah McClure, Amy Ousterhout, Scott Shenker, and Sylvia Ratnasamy. \"Efficient Scheduling Policies for Microsecond-Scale Tasks.\" NSDI 2022. Retrieved 2026-06-03 from the USENIX publication page and PDF, `https://www.usenix.org/conference/nsdi22/presentation/mcclure`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/nsdi22/presentation/mcclure",
+        "review_status": "reviewed_identifier_repair",
         "title": "Efficient Scheduling Policies for Microsecond-Scale Tasks."
       },
       "journal_entry_id": "2026-06-03-efficient-scheduling-policies-for-microsecond-scale-tasks",
@@ -9179,33 +9205,15 @@
       "title": "Efficient Scheduling Policies for Microsecond-Scale Tasks."
     },
     {
-      "citation": "Yingjun Wu, Joy Arulraj, Jiexi Lin, Ran Xian, and Andrew Pavlo. \"An Empirical Evaluation of In-Memory Multi-Version Concurrency Control.\" PVLDB 10(7), 2017, pp. 781-792. Retrieved 2026-06-03 from the VLDB PDF, `https://www.vldb.org/pvldb/vol10/p781-Wu.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "An Empirical Evaluation of In-Memory Multi-Version Concurrency Control."
-      },
-      "journal_entry_id": "2026-06-03-empirical-in-memory-mvcc-design-tradeoffs",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2017-an-empirical-evaluation-of-in-memory-multi-version-concurrency-control",
-      "title": "An Empirical Evaluation of In-Memory Multi-Version Concurrency Control."
-    },
-    {
       "citation": "Anastasios Papagiannis, Giorgos Xanthakis, Giorgos Saloustros, Manolis Marazakis, and Angelos Bilas. \"Optimizing Memory-mapped I/O for Fast Storage Devices.\" USENIX ATC 2020. Retrieved 2026-06-03 from `https://www.usenix.org/system/files/atc20-papagiannis.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc20/presentation/papagiannis",
+        "review_status": "reviewed_identifier_repair",
         "title": "Optimizing Memory-mapped I/O for Fast Storage Devices."
       },
       "journal_entry_id": "2026-06-03-fastmap-scalable-mmap-for-fast-storage",
@@ -9217,33 +9225,15 @@
       "title": "Optimizing Memory-mapped I/O for Fast Storage Devices."
     },
     {
-      "citation": "Cong Yan and Alvin Cheung. \"Leveraging Lock Contention to Improve OLTP Application Performance.\" Proceedings of the VLDB Endowment 9(5), 2016. Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Leveraging Lock Contention to Improve OLTP Application Performance."
-      },
-      "journal_entry_id": "2026-06-03-leveraging-lock-contention-to-improve-oltp-application-performance",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2016-leveraging-lock-contention-to-improve-oltp-application-performance",
-      "title": "Leveraging Lock Contention to Improve OLTP Application Performance."
-    },
-    {
       "citation": "Andrew Crotty, Viktor Leis, and Andrew Pavlo. \"Are You Sure You Want to Use MMAP in Your Database Management System?\" CIDR 2022. Retrieved 2026-06-03 from the CIDR PDF at `https://www.cidrdb.org/cidr2022/papers/p13-crotty.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://db.cs.cmu.edu/mmap-cidr2022/",
+        "review_status": "reviewed_identifier_repair",
         "title": "Are You Sure You Want to Use MMAP in Your Database Management System?"
       },
       "journal_entry_id": "2026-06-03-mmap-is-not-a-buffer-pool-substitute",
@@ -9255,52 +9245,15 @@
       "title": "Are You Sure You Want to Use MMAP in Your Database Management System?"
     },
     {
-      "citation": "Haonan Lu, Shuai Mu, Siddhartha Sen, and Wyatt Lloyd. \"NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall.\" OSDI 2023. Retrieved 2026-06-03 from the USENIX page and PDF at `https://www.usenix.org/conference/osdi23/presentation/lu` and `https://www.usenix.org/system/files/osdi23-lu.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall."
-      },
-      "journal_entry_id": "2026-06-03-ncc-response-timed-strict-serializability-for-naturally-ordered-transactions",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2023-ncc-natural-concurrency-control-for-strictly-serializable-datastores-by-avoiding-the-timestamp-i",
-      "title": "NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall."
-    },
-    {
-      "citation": "Lingfeng Xiang, Zhen Lin, Weishu Deng, Hui Lu, Jia Rao, Yifan Yuan, and Ren Wang. \"Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration.\" OSDI 2024. Retrieved 2026-06-03 from the USENIX page and PDF, `https://www.usenix.org/conference/osdi24/presentation/xiang` and `https://www.usenix.org/system/files/osdi24-xiang.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration."
-      },
-      "journal_entry_id": "2026-06-03-nomad-non-exclusive-memory-tiering",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2024-nomad-non-exclusive-memory-tiering-via-transactional-page-migration",
-      "title": "Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration."
-    },
-    {
       "citation": "Xinjing Zhou, Viktor Leis, Xiangyao Yu, and Michael Stonebraker. \"OLTP Through the Looking Glass 16 Years Later: Communication is the New Bottleneck.\" CIDR 2025. Retrieved 2026-06-03 from the CIDR proceedings page and PDF, `https://vldb.org/cidrdb/2025/oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck.html` and `https://vldb.org/cidrdb/papers/2025/p17-zhou.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://vldb.org/cidrdb/2025/oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "OLTP Through the Looking Glass 16 Years Later: Communication is the New Bottleneck."
       },
       "journal_entry_id": "2026-06-03-oltp-through-the-looking-glass-16-years-later",
@@ -9312,33 +9265,15 @@
       "title": "OLTP Through the Looking Glass 16 Years Later: Communication is the New Bottleneck."
     },
     {
-      "citation": "Yihan Sun, Guy E. Blelloch, Wan Shen Lim, and Andrew Pavlo. \"On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes.\" PVLDB 13(2), 2019. Retrieved 2026-06-03 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p211-sun.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes."
-      },
-      "journal_entry_id": "2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2019-on-supporting-efficient-snapshot-isolation-for-hybrid-workloads-with-multi-versioned-indexes",
-      "title": "On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes."
-    },
-    {
       "citation": "Yibo Huang, Newton Ni, Vijay Chidambaram, Emmett Witchel, and Dixin Tang. \"Pasha: An Efficient, Scalable Database Architecture for CXL Pods.\" CIDR 2025. Retrieved 2026-06-03 from the CIDR proceedings page and author PDF, `https://www.vldb.org/cidrdb/2025/pasha-an-efficient-scalable-database-architecture-for-cxl-pods.html` and `https://www.cs.utexas.edu/~witchel/pubs/huang25cidr-pasha.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://vldb.org/cidrdb/2025/pasha-an-efficient-scalable-database-architecture-for-cxl-pods.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "Pasha: An Efficient, Scalable Database Architecture for CXL Pods."
       },
       "journal_entry_id": "2026-06-03-pasha-partitioned-shared-cxl-pod-architecture",
@@ -9348,44 +9283,6 @@
       ],
       "paper_id": "paper-2025-pasha-an-efficient-scalable-database-architecture-for-cxl-pods",
       "title": "Pasha: An Efficient, Scalable Database Architecture for CXL Pods."
-    },
-    {
-      "citation": "Jiachen Wang, Ding Ding, Huan Wang, Conrad Christensen, Zhaoguo Wang, Haibo Chen, and Jinyang Li. \"Polyjuice: High-Performance Transactions via Learned Concurrency Control.\" OSDI 2021. Retrieved 2026-06-03 from the USENIX PDF, `https://www.usenix.org/system/files/osdi21-wang-jiachen.pdf`, and USENIX landing page, `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
-      },
-      "journal_entry_id": "2026-06-03-polyjuice-learned-concurrency-control-policies",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
-      "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
-    },
-    {
-      "citation": "Yifei Yang, Hangdong Zhao, Xiangyao Yu, and Paraschos Koutris. \"Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries.\" CIDR 2024. Retrieved 2026-06-03 from the CIDR PDF, `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries."
-      },
-      "journal_entry_id": "2026-06-03-predicate-transfer-for-multi-join-pre-filtering",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2024-predicate-transfer-efficient-pre-filtering-on-multi-join-queries",
-      "title": "Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries."
     },
     {
       "citation": "Jose M. Faleiro, Daniel J. Abadi, and Joseph M. Hellerstein. \"High Performance Transactions via Early Write Visibility.\" PVLDB 10(5), 2017, pp. 613-624. Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol10/p613-faleiro.pdf`.",
@@ -13008,14 +12905,14 @@
         "Cong Yan",
         "Alvin Cheung"
       ],
-      "doi": "",
+      "doi": "10.14778/2876473.2876479",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:leveraging-lock-contention-to-improve-oltp-application-performance",
@@ -13023,7 +12920,6 @@
         "2026-06-03-leveraging-lock-contention-to-improve-oltp-application-performance"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2016-leveraging-lock-contention-to-improve-oltp-application-performance",
@@ -13785,14 +13681,14 @@
         "Ran Xian",
         "Andrew Pavlo"
       ],
-      "doi": "",
+      "doi": "10.14778/3067421.3067427",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:an-empirical-evaluation-of-in-memory-multi-version-concurrency-control",
@@ -13800,7 +13696,6 @@
         "2026-06-03-empirical-in-memory-mvcc-design-tradeoffs"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2017-an-empirical-evaluation-of-in-memory-multi-version-concurrency-control",
@@ -16329,14 +16224,14 @@
         "Wan Shen Lim",
         "Andrew Pavlo"
       ],
-      "doi": "",
+      "doi": "10.14778/3364324.3364334",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:on-supporting-efficient-snapshot-isolation-for-hybrid-workloads-with-multi-versioned-indexes",
@@ -16344,7 +16239,6 @@
         "2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2019-on-supporting-efficient-snapshot-isolation-for-hybrid-workloads-with-multi-versioned-indexes",
@@ -18011,11 +17905,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:optimizing-memory-mapped-i-o-for-fast-storage-devices",
@@ -19504,7 +19398,7 @@
       "year": "2021"
     },
     {
-      "arxiv": "",
+      "arxiv": "2105.10329",
       "authors": [
         "Jiachen Wang",
         "Ding Ding",
@@ -19517,11 +19411,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:polyjuice-high-performance-transactions-via-learned-concurrency-control",
@@ -19530,8 +19424,7 @@
         "2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
       "review_status": "generated_identity",
@@ -20492,11 +20385,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:are-you-sure-you-want-to-use-mmap-in-your-database-management-system",
@@ -21021,11 +20914,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:efficient-scheduling-policies-for-microsecond-scale-tasks",
@@ -23786,7 +23679,7 @@
       "year": "2023"
     },
     {
-      "arxiv": "",
+      "arxiv": "2305.14270",
       "authors": [
         "Haonan Lu",
         "Shuai Mu",
@@ -23796,11 +23689,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:ncc-natural-concurrency-control-for-strictly-serializable-datastores-by-avoiding-the-timestamp-i",
@@ -23808,8 +23701,7 @@
         "2026-06-03-ncc-response-timed-strict-serializability-for-naturally-ordered-transactions"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2023-ncc-natural-concurrency-control-for-strictly-serializable-datastores-by-avoiding-the-timestamp-i",
       "review_status": "generated_identity",
@@ -26802,7 +26694,7 @@
       "year": "2024"
     },
     {
-      "arxiv": "",
+      "arxiv": "2401.13154",
       "authors": [
         "Lingfeng Xiang",
         "Zhen Lin",
@@ -26815,11 +26707,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:nomad-non-exclusive-memory-tiering-via-transactional-page-migration",
@@ -26827,8 +26719,7 @@
         "2026-06-03-nomad-non-exclusive-memory-tiering"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2024-nomad-non-exclusive-memory-tiering-via-transactional-page-migration",
       "review_status": "generated_identity",
@@ -27047,7 +26938,7 @@
       "year": "2024"
     },
     {
-      "arxiv": "",
+      "arxiv": "2307.15255",
       "authors": [
         "Yifei Yang",
         "Hangdong Zhao",
@@ -27057,11 +26948,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:predicate-transfer-efficient-pre-filtering-on-multi-join-queries",
@@ -27069,8 +26960,7 @@
         "2026-06-03-predicate-transfer-for-multi-join-pre-filtering"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2024-predicate-transfer-efficient-pre-filtering-on-multi-join-queries",
       "review_status": "generated_identity",
@@ -29712,11 +29602,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck",
@@ -29814,11 +29704,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:pasha-an-efficient-scalable-database-architecture-for-cxl-pods",
@@ -63888,12 +63778,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://vldb.org/cidrdb/2025/pasha-an-efficient-scalable-database-architecture-for-cxl-pods.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "Pasha: An Efficient, Scalable Database Architecture for CXL Pods."
         },
         "identity_key": "title:pasha-an-efficient-scalable-database-architecture-for-cxl-pods",
@@ -64352,20 +64243,20 @@
           "Wan Shen Lim",
           "Andrew Pavlo"
         ],
-        "doi": "",
+        "doi": "10.14778/3364324.3364334",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3364324.3364334",
+          "review_status": "reviewed_identifier_repair",
           "title": "On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes."
         },
         "identity_key": "title:on-supporting-efficient-snapshot-isolation-for-hybrid-workloads-with-multi-versioned-indexes",
         "journal_entry_id": "2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2019-on-supporting-efficient-snapshot-isolation-for-hybrid-workloads-with-multi-versioned-indexes",
@@ -65322,7 +65213,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "2401.13154",
         "authors": [
           "Lingfeng Xiang",
           "Zhen Lin",
@@ -65334,19 +65225,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/2401.13154",
+          "review_status": "reviewed_identifier_repair",
           "title": "Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration."
         },
         "identity_key": "title:nomad-non-exclusive-memory-tiering-via-transactional-page-migration",
         "journal_entry_id": "2026-06-03-nomad-non-exclusive-memory-tiering",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2024-nomad-non-exclusive-memory-tiering-via-transactional-page-migration",
         "review_status": "generated_identity",
@@ -68461,20 +68352,20 @@
           "Ran Xian",
           "Andrew Pavlo"
         ],
-        "doi": "",
+        "doi": "10.14778/3067421.3067427",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3067421.3067427",
+          "review_status": "reviewed_identifier_repair",
           "title": "An Empirical Evaluation of In-Memory Multi-Version Concurrency Control."
         },
         "identity_key": "title:an-empirical-evaluation-of-in-memory-multi-version-concurrency-control",
         "journal_entry_id": "2026-06-03-empirical-in-memory-mvcc-design-tradeoffs",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2017-an-empirical-evaluation-of-in-memory-multi-version-concurrency-control",
@@ -71628,12 +71519,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://db.cs.cmu.edu/mmap-cidr2022/",
+          "review_status": "reviewed_identifier_repair",
           "title": "Are You Sure You Want to Use MMAP in Your Database Management System?"
         },
         "identity_key": "title:are-you-sure-you-want-to-use-mmap-in-your-database-management-system",
@@ -75819,12 +75711,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://vldb.org/cidrdb/2025/oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "OLTP Through the Looking Glass 16 Years Later: Communication is the New Bottleneck."
         },
         "identity_key": "title:oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck",
@@ -83749,7 +83642,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "2307.15255",
         "authors": [
           "Yifei Yang",
           "Hangdong Zhao",
@@ -83758,19 +83651,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/2307.15255",
+          "review_status": "reviewed_identifier_repair",
           "title": "Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries."
         },
         "identity_key": "title:predicate-transfer-efficient-pre-filtering-on-multi-join-queries",
         "journal_entry_id": "2026-06-03-predicate-transfer-for-multi-join-pre-filtering",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2024-predicate-transfer-efficient-pre-filtering-on-multi-join-queries",
         "review_status": "generated_identity",
@@ -84722,12 +84615,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc20/presentation/papagiannis",
+          "review_status": "reviewed_identifier_repair",
           "title": "Optimizing Memory-mapped I/O for Fast Storage Devices."
         },
         "identity_key": "title:optimizing-memory-mapped-i-o-for-fast-storage-devices",
@@ -91770,20 +91664,20 @@
           "Cong Yan",
           "Alvin Cheung"
         ],
-        "doi": "",
+        "doi": "10.14778/2876473.2876479",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/2876473.2876479",
+          "review_status": "reviewed_identifier_repair",
           "title": "Leveraging Lock Contention to Improve OLTP Application Performance."
         },
         "identity_key": "title:leveraging-lock-contention-to-improve-oltp-application-performance",
         "journal_entry_id": "2026-06-03-leveraging-lock-contention-to-improve-oltp-application-performance",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2016-leveraging-lock-contention-to-improve-oltp-application-performance",
@@ -92020,12 +91914,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/nsdi22/presentation/mcclure",
+          "review_status": "reviewed_identifier_repair",
           "title": "Efficient Scheduling Policies for Microsecond-Scale Tasks."
         },
         "identity_key": "title:efficient-scheduling-policies-for-microsecond-scale-tasks",
@@ -93853,7 +93748,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "2105.10329",
         "authors": [
           "Jiachen Wang",
           "Ding Ding",
@@ -93865,19 +93760,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/2105.10329",
+          "review_status": "reviewed_identifier_repair",
           "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
         },
         "identity_key": "title:polyjuice-high-performance-transactions-via-learned-concurrency-control",
         "journal_entry_id": "2026-06-03-polyjuice-learned-concurrency-control-policies",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
         "review_status": "generated_identity",
@@ -103767,7 +103662,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "2305.14270",
         "authors": [
           "Haonan Lu",
           "Shuai Mu",
@@ -103776,19 +103671,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/2305.14270",
+          "review_status": "reviewed_identifier_repair",
           "title": "NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall."
         },
         "identity_key": "title:ncc-natural-concurrency-control-for-strictly-serializable-datastores-by-avoiding-the-timestamp-i",
         "journal_entry_id": "2026-06-03-ncc-response-timed-strict-serializability-for-naturally-ordered-transactions",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2023-ncc-natural-concurrency-control-for-strictly-serializable-datastores-by-avoiding-the-timestamp-i",
         "review_status": "generated_identity",
@@ -222537,31 +222432,31 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 129,
-      "arxiv_present": 118,
-      "arxiv_reviewed_absent": 8,
-      "arxiv_secondary_missing": 347,
-      "doi_needs_identifier_review": 129,
+      "arxiv_needs_identifier_review": 117,
+      "arxiv_present": 122,
+      "arxiv_reviewed_absent": 13,
+      "arxiv_secondary_missing": 350,
+      "doi_needs_identifier_review": 117,
       "doi_not_expected_yet": 54,
-      "doi_present": 395,
-      "doi_reviewed_absent": 8,
+      "doi_present": 398,
+      "doi_reviewed_absent": 17,
       "doi_secondary_missing": 16
     },
     "paper_identity_counts": {
-      "paper_entries_with_arxiv": 118,
-      "paper_entries_with_doi": 395,
+      "paper_entries_with_arxiv": 122,
+      "paper_entries_with_doi": 398,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
-      "missing_arxiv": 484,
-      "missing_doi": 207
+      "missing_arxiv": 480,
+      "missing_doi": 204
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 347,
-      "doi": 70,
-      "doi,arxiv": 137,
+      "arxiv": 350,
+      "doi": 74,
+      "doi,arxiv": 130,
       "none": 48
     },
     "paper_records": 563,

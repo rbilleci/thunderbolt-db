@@ -33,47 +33,35 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - duplicate identity groups: 32
 
 Generated identity field counts:
-- paper_entries_with_arxiv: 118
-- paper_entries_with_doi: 395
+- paper_entries_with_arxiv: 122
+- paper_entries_with_doi: 398
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
-- missing_arxiv: 484
-- missing_doi: 207
+- missing_arxiv: 480
+- missing_doi: 204
 
 Generated identity missing-field sets:
-- arxiv: 347
-- doi: 70
-- doi,arxiv: 137
+- arxiv: 350
+- doi: 74
+- doi,arxiv: 130
 - none: 48
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 129
-- arxiv_present: 118
-- arxiv_reviewed_absent: 8
-- arxiv_secondary_missing: 347
-- doi_needs_identifier_review: 129
+- arxiv_needs_identifier_review: 117
+- arxiv_present: 122
+- arxiv_reviewed_absent: 13
+- arxiv_secondary_missing: 350
+- doi_needs_identifier_review: 117
 - doi_not_expected_yet: 54
-- doi_present: 395
-- doi_reviewed_absent: 8
+- doi_present: 398
+- doi_reviewed_absent: 17
 - doi_secondary_missing: 16
-- actionable_identifier_review: 129
+- actionable_identifier_review: 117
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-03-efficient-scheduling-policies-for-microsecond-scale-tasks` -> `paper-2022-efficient-scheduling-policies-for-microsecond-scale-tasks`: doi=needs_identifier_review, arxiv=needs_identifier_review: Efficient Scheduling Policies for Microsecond-Scale Tasks.
-- `2026-06-03-empirical-in-memory-mvcc-design-tradeoffs` -> `paper-2017-an-empirical-evaluation-of-in-memory-multi-version-concurrency-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: An Empirical Evaluation of In-Memory Multi-Version Concurrency Control.
-- `2026-06-03-fastmap-scalable-mmap-for-fast-storage` -> `paper-2020-optimizing-memory-mapped-i-o-for-fast-storage-devices`: doi=needs_identifier_review, arxiv=needs_identifier_review: Optimizing Memory-mapped I/O for Fast Storage Devices.
-- `2026-06-03-leveraging-lock-contention-to-improve-oltp-application-performance` -> `paper-2016-leveraging-lock-contention-to-improve-oltp-application-performance`: doi=needs_identifier_review, arxiv=needs_identifier_review: Leveraging Lock Contention to Improve OLTP Application Performance.
-- `2026-06-03-mmap-is-not-a-buffer-pool-substitute` -> `paper-2022-are-you-sure-you-want-to-use-mmap-in-your-database-management-system`: doi=needs_identifier_review, arxiv=needs_identifier_review: Are You Sure You Want to Use MMAP in Your Database Management System?
-- `2026-06-03-ncc-response-timed-strict-serializability-for-naturally-ordered-transactions` -> `paper-2023-ncc-natural-concurrency-control-for-strictly-serializable-datastores-by-avoiding-the-timestamp-i`: doi=needs_identifier_review, arxiv=needs_identifier_review: NCC: Natural Concurrency Control for Strictly Serializable Datastores by Avoiding the Timestamp-Inversion Pitfall.
-- `2026-06-03-nomad-non-exclusive-memory-tiering` -> `paper-2024-nomad-non-exclusive-memory-tiering-via-transactional-page-migration`: doi=needs_identifier_review, arxiv=needs_identifier_review: Nomad: Non-Exclusive Memory Tiering via Transactional Page Migration.
-- `2026-06-03-oltp-through-the-looking-glass-16-years-later` -> `paper-2025-oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck`: doi=needs_identifier_review, arxiv=needs_identifier_review: OLTP Through the Looking Glass 16 Years Later: Communication is the New Bottleneck.
-- `2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots` -> `paper-2019-on-supporting-efficient-snapshot-isolation-for-hybrid-workloads-with-multi-versioned-indexes`: doi=needs_identifier_review, arxiv=needs_identifier_review: On Supporting Efficient Snapshot Isolation for Hybrid Workloads with Multi-Versioned Indexes.
-- `2026-06-03-pasha-partitioned-shared-cxl-pod-architecture` -> `paper-2025-pasha-an-efficient-scalable-database-architecture-for-cxl-pods`: doi=needs_identifier_review, arxiv=needs_identifier_review: Pasha: An Efficient, Scalable Database Architecture for CXL Pods.
-- `2026-06-03-polyjuice-learned-concurrency-control-policies` -> `paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: Polyjuice: High-Performance Transactions via Learned Concurrency Control.
-- `2026-06-03-predicate-transfer-for-multi-join-pre-filtering` -> `paper-2024-predicate-transfer-efficient-pre-filtering-on-multi-join-queries`: doi=needs_identifier_review, arxiv=needs_identifier_review: Predicate Transfer: Efficient Pre-Filtering on Multi-Join Queries.
 - `2026-06-03-pwv-early-write-visibility` -> `paper-2017-high-performance-transactions-via-early-write-visibility`: doi=needs_identifier_review, arxiv=needs_identifier_review: High Performance Transactions via Early Write Visibility.
 - `2026-06-03-r2p2-request-response-pairs-for-rpc-admission` -> `paper-2019-r2p2-making-rpcs-first-class-datacenter-citizens`: doi=needs_identifier_review, arxiv=needs_identifier_review: R2P2: Making RPCs First-Class Datacenter Citizens.
 - `2026-06-03-resource-adaptive-query-execution-with-paged-memory-management` -> `paper-2025-resource-adaptive-query-execution-with-paged-memory-management`: doi=needs_identifier_review, arxiv=needs_identifier_review: Resource-Adaptive Query Execution with Paged Memory Management.
@@ -102,7 +90,19 @@ Actionable DOI/arXiv identifier audit:
 - `2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts` -> `paper-2024-g-learned-index-enabling-efficient-learned-index-on-gpu`: doi=needs_identifier_review, arxiv=needs_identifier_review: G-Learned Index: Enabling Efficient Learned Index on GPU.
 - `2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem` -> `paper-2019-concurrent-query-processing-in-a-gpu-based-database-system`: doi=needs_identifier_review, arxiv=needs_identifier_review: Concurrent query processing in a GPU-based database system.
 - `2026-06-04-gpu-sharing-should-be-measured-not-guessed` -> `paper-2017-dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus`: doi=needs_identifier_review, arxiv=needs_identifier_review: Dynamic Resource Management for Efficient Utilization of Multitasking GPUs.
-- ... 89 more
+- `2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes` -> `paper-2025-a-hybrid-approach-to-integrating-deterministic-and-non-deterministic-concurrency-control-in-data`: doi=needs_identifier_review, arxiv=needs_identifier_review: A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems.
+- `2026-06-04-hetcache-makes-cache-placement-execution-centric-across-cpu-gpu-and-nvme` -> `paper-2023-hetcache-synergising-nvme-storage-and-gpu-acceleration-for-memory-efficient-analytics`: doi=needs_identifier_review, arxiv=needs_identifier_review: HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics.
+- `2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards` -> `paper-2017-hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases`: doi=needs_identifier_review, arxiv=needs_identifier_review: HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases.
+- `2026-06-04-hyperion-treats-gpu-storage-access-as-a-schedulable-pipeline` -> `paper-2025-hyperion-co-optimizing-ssd-access-and-gpu-computation-for-cost-efficient-gnn-training`: doi=needs_identifier_review, arxiv=needs_identifier_review: Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training.
+- `2026-06-04-kvell-propagates-old-scan-versions-instead-of-retaining-snapshots` -> `paper-2020-kvell-snapshot-isolation-without-snapshots`: doi=needs_identifier_review, arxiv=needs_identifier_review: KVell+: Snapshot Isolation without Snapshots.
+- `2026-06-04-learned-gpu-indexes-need-batch-shaped-admission-not-single-query-routing` -> `paper-2022-learned-index-on-gpu`: doi=needs_identifier_review, arxiv=needs_identifier_review: Learned Index on GPU.
+- `2026-06-04-mako-decouples-fast-speculative-certification-from-slow-durable-replication` -> `paper-2025-mako-speculative-distributed-transactions-with-geo-replication`: doi=needs_identifier_review, arxiv=needs_identifier_review: Mako: Speculative Distributed Transactions with Geo-Replication.
+- `2026-06-04-manycore-file-systems-expose-hidden-cold-tier-contention` -> `paper-2016-understanding-manycore-scalability-of-file-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: Understanding Manycore Scalability of File Systems.
+- `2026-06-04-memory-centric-databases-make-pooled-memory-a-query-route-resource` -> `paper-2025-databases-in-the-era-of-memory-centric-computing`: doi=needs_identifier_review, arxiv=needs_identifier_review: Databases in the Era of Memory-Centric Computing.
+- `2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default` -> `paper-2023-allocating-isolation-levels-to-transactions-in-a-multiversion-setting`: doi=needs_identifier_review, arxiv=needs_identifier_review: Allocating Isolation Levels to Transactions in a Multiversion Setting.
+- `2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem` -> `paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-`: doi=needs_identifier_review, arxiv=needs_identifier_review: What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines.
+- `2026-06-04-moneyball-keeps-serverless-databases-warm-only-when-history-pays-for-it` -> `paper-2022-moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless`: doi=needs_identifier_review, arxiv=needs_identifier_review: Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless.
+- ... 77 more
 
 Missing identity metadata audit:
 - `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus` missing arxiv: Concurrent Analytical Query Processing with GPUs.
@@ -144,7 +144,7 @@ Missing identity metadata audit:
 - `2026-06-03-dbms-owned-large-objects-instead-of-files` -> `paper-2024-why-files-if-you-have-a-dbms` missing arxiv: Why Files If You Have a DBMS?
 - `2026-06-03-diva-decoupled-mvcc-version-index-and-data` -> `paper-2022-diva-making-mvcc-systems-htap-friendly` missing arxiv: Diva: Making MVCC Systems HTAP-Friendly.
 - `2026-06-03-dragon-breaking-gpu-memory-capacity-limits-with-direct-nvm-access` -> `paper-2018-dragon-breaking-gpu-memory-capacity-limits-with-direct-nvm-access` missing arxiv: DRAGON: Breaking GPU Memory Capacity Limits with Direct NVM Access.
-- `2026-06-03-ermia-snapshot-friendly-mixed-workload-oltp` -> `paper-2016-ermia-fast-memory-optimized-database-system-for-heterogeneous-workloads` missing arxiv: ERMIA: Fast Memory-Optimized Database System for Heterogeneous Workloads.
+- `2026-06-03-empirical-in-memory-mvcc-design-tradeoffs` -> `paper-2017-an-empirical-evaluation-of-in-memory-multi-version-concurrency-control` missing arxiv: An Empirical Evaluation of In-Memory Multi-Version Concurrency Control.
 - ... 514 more
 
 Duplicate identity audit:
