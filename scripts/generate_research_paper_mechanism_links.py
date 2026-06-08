@@ -2254,6 +2254,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Descriptor publication is safe only if generation state cannot point at uncommitted or partially updated entries.",
     },
+    (
+        "2026-06-06-sherman-makes-remote-indexes-write-friendly-by-moving-proof-to-tiny-ordered-updates",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Ordered future-tier update and publish coalescing is explicitly framed as something to test before adoption.",
+    },
+    (
+        "2026-06-06-sherman-makes-remote-indexes-write-friendly-by-moving-proof-to-tiny-ordered-updates",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts wait points; the ordered generation-marker publish still supports compact route roots.",
+    },
+    (
+        "2026-06-06-leanstore-recovery-makes-wal-a-sharded-tiered-and-checkpoint-bounded-pipeline",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Edge logging can publish visibility only when canonical recovery or deterministic replay covers the write.",
+    },
+    (
+        "2026-06-06-leanstore-recovery-makes-wal-a-sharded-tiered-and-checkpoint-bounded-pipeline",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evidence names DRAM, NVMe, battery-backed, CXL/NVDIMM-like, and edge-staged benchmark variants.",
+    },
+    (
+        "2026-06-06-leanstore-recovery-makes-wal-a-sharded-tiered-and-checkpoint-bounded-pipeline",
+        "log_structured_warm_tier",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "LeanStore-specific buffer-manager and PMem/NVMe assumptions warn against direct warm-tier transfer.",
+    },
+    (
+        "2026-06-06-itlogging-turns-wal-overhead-into-an-admission-boundary-problem",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner handoff is gated on throughput, latency, owner CPU, copied bytes, recovery work, and crash-state tests.",
+    },
+    (
+        "2026-06-06-itlogging-turns-wal-overhead-into-an-admission-boundary-problem",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The TPC-C and LinkBench evidence needs GPU DB conflict-ordering validation before architectural adoption.",
+    },
+    (
+        "2026-06-06-itlogging-turns-wal-overhead-into-an-admission-boundary-problem",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Staged request references require payload checksum and generation-stamp validation before route-root adoption.",
+    },
+    (
+        "2026-06-06-eemarq-makes-retained-range-snapshots-compatible-with-aggressive-reclamation",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained range snapshots are valid only when stale index entries revalidate snapshot and route generations.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-proofs-need-reclamation-proofs-too",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor lifetime, stale-route, long-reader, scheduling, and recovery witnesses are named stress gates.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-proofs-need-reclamation-proofs-too",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained reads need stress coverage for descriptor reuse, stale routes, scheduling refusal, and recovery proof.",
+    },
+    (
+        "2026-06-06-smart-makes-remote-index-traversal-a-cache-validation-and-iops-shaping-problem",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner-owned leaf queues are valid only if read-after-write and invalidation-after-read ordering are proven.",
+    },
+    (
+        "2026-06-06-smart-makes-remote-index-traversal-a-cache-validation-and-iops-shaping-problem",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Radix-style indirection helps only with remote locking, concurrent access handling, and cached-node validation.",
+    },
+    (
+        "2026-06-06-lsched-makes-query-scheduling-a-physical-plan-and-pressure-problem",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Adaptive scheduling is explicitly evaluated outside the trusted serving path before being adopted.",
+    },
+    (
+        "2026-06-06-carousel-overlaps-read-prepare-commit-and-replication-when-the-route-shape-is-known",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fixed-footprint same-shape micro-batching is called out as a measurement gate.",
+    },
+    (
+        "2026-06-06-carousel-overlaps-read-prepare-commit-and-replication-when-the-route-shape-is-known",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Deterministic hot-write templates require abort-after-GPU-work, latency, and queue-wait measurements.",
+    },
+    (
+        "2026-06-06-carousel-overlaps-read-prepare-commit-and-replication-when-the-route-shape-is-known",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Admission-time preflight is prototype work gated by identical serializable outcomes and WAL-before-visibility behavior.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-overlap-needs-proof-shaped-admission",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback policy depends on measured p99, conflict-rate crossover, and explicit fallback-reason output.",
+    },
+    (
+        "2026-06-06-laser-buffer-aware-learned-scheduling-should-route-by-residency-footprint-not-only-load",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Laser's replicated PostgreSQL query-routing scope cautions against direct retained GPU snapshot transfer.",
+    },
+    (
+        "2026-06-06-laser-buffer-aware-learned-scheduling-should-route-by-residency-footprint-not-only-load",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue supports physical-footprint grouping rather than treating GPU queue depth as the only signal.",
+    },
+    (
+        "2026-06-06-query-compiler-architecture-should-preserve-planner-facts-until-code-generation",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Specializing static plan structure at generation time supports preserving route facts through publication.",
+    },
+    (
+        "2026-06-06-query-compiler-architecture-should-preserve-planner-facts-until-code-generation",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts generic loops with certificate-specialized fallback and staging code.",
+    },
+    (
+        "2026-06-06-query-compiler-architecture-should-preserve-planner-facts-until-code-generation",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The alternative access paths are the costed placement choices this mechanism is meant to expose.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-semantic-certificates-reusable-descriptors-and-generation",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue supports version-validated recycled metadata rather than unbounded pinned retired state.",
+    },
+    (
+        "2026-06-06-datacenter-ethernet-and-rdma-issues-at-hyperscale",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The networking evidence omits database transactions, GPU kernels, WAL, MVCC, and cache-placement measurements.",
+    },
+    (
+        "2026-06-06-rome-robust-query-optimization-via-parallel-multi-plan-execution",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue is an optimizer comparison; the retained link remains only a weak descriptor-lifetime support signal.",
+    },
+    (
+        "2026-06-06-rome-robust-query-optimization-via-parallel-multi-plan-execution",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Parallel optimizer-generated alternatives are presented as an alternative to relying on learned optimizer advice.",
+    },
+    (
+        "2026-06-06-decibel-the-relational-dataset-branching-system",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Decibel warns that timestamps alone do not make retained historical snapshots cheap or physically safe.",
+    },
+    (
+        "2026-06-06-decibel-the-relational-dataset-branching-system",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Recovery publication is valid only with demotion, rebuild, compressed-delta, WAL replay, and checksum proof.",
+    },
+    (
+        "2026-06-06-decibel-the-relational-dataset-branching-system",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The SimpleDB prototype omits modern contention, GPU execution, CUDA ownership, NVMe tiering, and pgwire scale.",
+    },
 }
 
 
