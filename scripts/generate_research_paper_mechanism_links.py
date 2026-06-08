@@ -1834,6 +1834,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "warns_against",
         "relation_review_note": "Lance is not a transactional WAL/MVCC/recovery design, so it cautions against inferring WAL-before-visibility support.",
     },
+    (
+        "2026-06-06-farm-makes-distributed-commit-a-reservation-backed-rdma-log-protocol",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Reservation-backed owner coordination is useful only after hot-key latency, abort, queue-wait, and unused-capacity measurements.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-metadata-needs-proof-fields-bounded-lifetime-and-sampled-movement",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route decisions support WAL visibility only when durability, visibility, freshness, placement, and queue authority are provable.",
+    },
+    (
+        "2026-06-06-citron-makes-remote-range-locks-a-static-metadata-protocol",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Ancestor/descendant range counters are an alternative coordination shape to arbitrary interval-set or central-queue ownership.",
+    },
+    (
+        "2026-06-06-citron-makes-remote-range-locks-a-static-metadata-protocol",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts compact bounded range metadata with heaps; it supports bounded descriptor shaping.",
+    },
+    (
+        "2026-06-06-paella-turns-gpu-scheduling-into-a-software-owned-dispatch-contract",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Queued GPU routes are valid only when dispatch proves schema, snapshot, resident, and output-order generations.",
+    },
+    (
+        "2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cold-tier placement depends on measured throughput across HBM, host, DRAM, NVMe, object, and remote tiers.",
+    },
+    (
+        "2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The cloud-transfer planning evidence needs a GPU DB session-scale benchmark before supporting session counting.",
+    },
+    (
+        "2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Future cold-tier movement descriptors require measured throughput, transfer cost, queue capacity, and freshness-budget gates.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-cold-tier-movement-needs-route-certificates-not-background-mystery-copies",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Measured cold and warm route inputs are part of the intended multi-tier placement mechanism, not separate audit debt.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-cold-tier-movement-needs-route-certificates-not-background-mystery-copies",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless clause is corpus-planning guidance; the retained evidence still keeps WAL and visibility as preferred next constraints.",
+    },
+    (
+        "2026-06-06-cloudcast-turns-cold-tier-replication-into-an-explicit-cost-time-and-stripe-routing-optimization",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CloudCast-style stripe routes need prototype validation before combining WAL boundary, visibility, encoding, and checksum lineage.",
+    },
+    (
+        "2026-06-06-xenic-puts-transaction-protocol-state-on-the-network-edge",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Gateway route-edge caching is explicitly framed as a 10K, 100K, and simulated 1M logical-session benchmark.",
+    },
+    (
+        "2026-06-06-tdsql-makes-scale-out-oltp-a-proxy-shard-and-jitter-control-problem",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The stress-run stability evidence warns against conflict-ordering designs that optimize throughput without rollback and jitter controls.",
+    },
+    (
+        "2026-06-06-tdsql-makes-scale-out-oltp-a-proxy-shard-and-jitter-control-problem",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The gateway, planner, mutation-owner, residency-owner, and runtime queue path must be measured as one transaction path.",
+    },
+    (
+        "2026-06-06-tdsql-makes-scale-out-oltp-a-proxy-shard-and-jitter-control-problem",
+        "deficit_fairness",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The stability result warns that fairness policy cannot treat throughput as sufficient without jitter and rollback accounting.",
+    },
+    (
+        "2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Handoff-eligible contention states support deterministic hot-write templates instead of blind retry loops.",
+    },
+    (
+        "2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "ShiftLock does not measure 1M logical sessions or GPU DB queues, so session-count transfer needs benchmarking.",
+    },
+    (
+        "2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The paper omits mixed local and remote placement, CUDA buffers, and cold-tier traffic measurements.",
+    },
+    (
+        "2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "ShiftLock is distributed locking rather than SQL WAL, MVCC, GPU execution, or recovery, so direct WAL inference is unsafe.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-adaptive-routes-need-local-caches-reusable-learning-and-handoff-under-cont",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The handoff-queue contrast supports owner bundling by moving hot authority pressure into explicit owner-local queues.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-adaptive-routes-need-local-caches-reusable-learning-and-handoff-under-cont",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue rejects hammering shared objects and supports deterministic handoff states for hot writes.",
+    },
+    (
+        "2026-06-06-bytehouse-makes-disaggregated-storage-local-through-ssd-chunks-and-route-modes",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The warm-tier cache descriptor is explicitly prototype work with local NVMe, host DRAM, HBM, and object offsets.",
+    },
+    (
+        "2026-06-06-crystalline-bounds-reclamation-without-session-shaped-snapshots",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The transfer requires stressing 1M logical sessions over fixed workers before relying on physical-worker protection.",
+    },
+    (
+        "2026-06-06-crystalline-bounds-reclamation-without-session-shaped-snapshots",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cleanup-owner queue telemetry and pinned-buffer release behavior need stress validation before owner bundling adoption.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-adaptive-routes-also-need-bounded-metadata-lifetimes",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor reclamation transfer is gated on generation checks, retired-byte bounds, route retries, and p99 latency.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-adaptive-routes-also-need-bounded-metadata-lifetimes",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue describes named fallback proof boundaries, which directly support dependency witnesses.",
+    },
+    (
+        "2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Adaptive filters are presented as a no-training alternative that can match or beat learned query optimizers.",
+    },
+    (
+        "2026-06-06-adaptive-filters-beat-brittle-route-confidence-without-training",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evidence is benchmark-centered and needs GPU DB validation before informing descriptor lifetime policy.",
+    },
+    (
+        "2026-06-06-multiverse-versions-only-when-long-readers-prove-they-need-it",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "MVCC frontiers are valid only if long readers do not force unbounded metadata growth or reclamation stalls.",
+    },
+    (
+        "2026-06-06-poplar-relaxes-wal-order-to-the-dependencies-recovery-actually-needs",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Poplar suggests per-owner or per-partition durability frontiers instead of forcing every read behind unrelated WAL traffic.",
+    },
 }
 
 
