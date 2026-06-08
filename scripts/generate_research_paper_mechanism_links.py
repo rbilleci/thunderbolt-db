@@ -7294,6 +7294,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Owner-serialized route metadata needs the proposed concurrent-map versus owner-map microbenchmark.",
     },
+    (
+        "2026-06-05-asynchronized-concurrency-the-secret-to-scaling-concurrent-search-data-structures",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "ASCYLIB-style retained reads are useful only if failed-search coherence traffic stays bounded.",
+    },
+    (
+        "2026-06-05-optimistic-concurrency-with-optik",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Optik-style stale-route retry needs p95/p99 validation under invalidation and republication pressure.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-metadata-needs-read-mostly-validation-cells",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis makes bounded retired-cell memory and p99 route lookup latency explicit proof gates.",
+    },
+    (
+        "2026-06-05-sss-scalable-key-value-store-with-external-consistent-and-abort-free-read-only-transactions",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Per-key reader queuing needs evaluation against tuple-level owner grouping and 2PC validation costs.",
+    },
+    (
+        "2026-06-05-sss-scalable-key-value-store-with-external-consistent-and-abort-free-read-only-transactions",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Vector-clock and per-key queue metadata are valid only if compressed or grouped to bound tuple-level cost.",
+    },
+    (
+        "2026-06-05-neomem-hardware-software-co-design-for-cxl-native-memory-tiering",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "NeoMem transfer depends on CXL-style microbenchmarks for retained snapshot buffers and route metadata.",
+    },
+    (
+        "2026-06-05-ice-makes-dynamic-cardinality-estimates-an-updateable-index-problem",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "ICE motivates safer CPU routes and exact probes as alternatives to unbounded planner-estimation work.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-estimate-freshness-and-tier-freshness",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained GPU routing is valid only when visibility, schema, resident, and movement frontiers agree.",
+    },
+    (
+        "2026-06-05-mgcrab-transaction-crabbing-for-live-migration-in-deterministic-database-systems",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner migration is plausible only with spare capacity and unsafe under saturated GPU or mutation queues.",
+    },
+    (
+        "2026-06-05-ndp-re-architecting-datacenter-networks-and-stacks-for-low-latency",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "NDP-style response rings require incast benchmarks before setting retained micro-batch admission policy.",
+    },
+    (
+        "2026-06-05-constant-time-snapshots-make-snapshot-handles-cheap-but-old-object-reads-pay-the-update-distance",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Old retained handles need proof that generation lifetime and HBM release remain bounded under readers.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-cheap-handles-still-need-bounded-payloads",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Cheap snapshot handles remain valid only when route certificates reject duplicate or stale execution.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-cheap-handles-still-need-bounded-payloads",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Descriptor retention is valid only with bounded payloads and generation-matched route certificates.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-cheap-handles-still-need-bounded-payloads",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Session counting requires snapshot-handle stress tests at 100K to 1M logical sessions.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-cheap-handles-still-need-bounded-payloads",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner queues are valid only if receiver-owned credits bound response, refresh, and movement payloads.",
+    },
+    (
+        "2026-06-05-pathcas-validates-search-paths-without-full-transactional-memory",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "PathCAS-style route updates are valid only if searched descriptor nodes retain the same generation.",
+    },
+    (
+        "2026-06-05-descriptor-reuse-turns-helping-metadata-into-a-bounded-per-worker-resource",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Reusable descriptors provide a bounded metadata fast path rather than expanding CPU fallback state.",
+    },
+    (
+        "2026-06-05-socrates-separates-log-truth-page-availability-and-cheap-durable-storage",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Socrates-style residency ownership needs global-versus-partitioned owner latency and recovery benchmarks.",
+    },
+    (
+        "2026-06-05-foundationdb-unbundles-transaction-processing-logging-and-storage-reads",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Deterministic hot-write lanes are framed as alternatives to FDB-style restart-only conflict handling.",
+    },
+    (
+        "2026-06-05-lmsfc-learns-the-resident-multidimensional-order-not-just-the-lookup-model",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Learned resident segments need delta and invalidation tests before retained snapshot adoption.",
+    },
+    (
+        "2026-06-05-lmsfc-learns-the-resident-multidimensional-order-not-just-the-lookup-model",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Learned multidimensional ordering needs proof-gate tests for stale layouts and warm-tier prefetch.",
+    },
+    (
+        "2026-06-05-dodo-makes-deterministic-batch-order-scale-by-staging-retries",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Dodo-style durable safe-prefix publication is an alternative to independently admitting each conflict.",
+    },
+    (
+        "2026-06-05-dodo-makes-deterministic-batch-order-scale-by-staging-retries",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Prepared deterministic batches provide an alternative to routing every conflict through owner queues.",
+    },
+    (
+        "2026-06-05-dodo-makes-deterministic-batch-order-scale-by-staging-retries",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Dodo favors ordered deterministic batches over blind retries for repeated hot-key conflicts.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-isolation-evidence-not-just-performance-evidence",
+        "isolation_trace_oracle",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that isolation labels are insufficient without operation-level anomaly evidence.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-isolation-evidence-not-just-performance-evidence",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Weak-isolation routes need dependency evidence and anomaly witnesses, not just nominal isolation levels.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-isolation-evidence-not-just-performance-evidence",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route cost must include certificate creation, trace capture, anomaly analysis, and replay witnesses.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-isolation-evidence-not-just-performance-evidence",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Compact route certificates need benchmarking across schema, WAL, snapshot, layout, and isolation fields.",
+    },
+    (
+        "2026-06-05-elle-turns-isolation-claims-into-generated-history-witnesses",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Elle-style history witnesses are an alternative proof path to complete serial-order reconstruction.",
+    },
+    (
+        "2026-06-05-elle-turns-isolation-claims-into-generated-history-witnesses",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Retained snapshot failures should produce direct witnesses rather than only mismatch counters.",
+    },
 }
 
 
