@@ -9604,6 +9604,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "warns_against",
         "relation_review_note": "Vortex's BigQuery-scale analytics scope cautions against direct OLTP GPU placement transfer.",
     },
+    (
+        "2026-06-06-foresight-schedules-hot-transactions-before-spending-execution-work",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Prediction-driven snapshot use is valid only while schema, join, and changed-condition fallbacks are explicit.",
+    },
+    (
+        "2026-06-06-foresight-schedules-hot-transactions-before-spending-execution-work",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fallback is required when prediction admits work that later reads stale resident state.",
+    },
+    (
+        "2026-06-06-foresight-schedules-hot-transactions-before-spending-execution-work",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Conflict estimation supports route costing; the conflict cue is not evidence against the optimizer mechanism.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-publication-needs-prediction-plus-fallback",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot-generation publication proof is named as a route-certificate benchmark gate.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-publication-needs-prediction-plus-fallback",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Dependency witnesses need route-certificate benchmarks that expose conflict prediction and fallback reasons.",
+    },
+    (
+        "2026-06-06-vbox-makes-predicate-serializability-checking-compact-enough-for-route-audits",
+        "isolation_trace_oracle",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Predicate-aware verification directly supports the isolation trace oracle despite the not-just cue.",
+    },
+    (
+        "2026-06-06-vbox-makes-predicate-serializability-checking-compact-enough-for-route-audits",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot frontier route facts are explicitly part of the proposed benchmark transaction records.",
+    },
+    (
+        "2026-06-06-vbox-makes-predicate-serializability-checking-compact-enough-for-route-audits",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Witness quality and overlap-window measurements are required before adopting the verifier-derived dependency shape.",
+    },
+    (
+        "2026-06-06-vbox-makes-predicate-serializability-checking-compact-enough-for-route-audits",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback paths need mixed predicate read/write serial-order tests before they can be trusted.",
+    },
+    (
+        "2026-06-06-dataset-version-retention-should-be-a-graph-frontier-not-an-age-rule",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Graph-frontier retention needs long-reader and eviction stress measurements before adoption.",
+    },
+    (
+        "2026-06-06-dataset-version-retention-should-be-a-graph-frontier-not-an-age-rule",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL replay edges are part of a proposed snapshot-retention graph benchmark, not settled support.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-tiered-histories-need-one-logical-address-space",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots need version-graph benchmarks across HBM, DRAM, NVMe, and WAL replay.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-tiered-histories-need-one-logical-address-space",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MVCC frontier transfer depends on version-graph retention measurements across tiered histories.",
+    },
+    (
+        "2026-06-06-skinnerdb-turns-bad-join-orders-into-bounded-exploration-cost",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Bounded exploration compares CPU fallback against retained GPU and cold-transfer route alternatives.",
+    },
+    (
+        "2026-06-06-chex-turns-multiversion-replay-into-bounded-checkpoint-placement",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Tiered checkpoint placement is valid only if pinned generations do not force unbounded HBM or DRAM growth.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-decisions-need-explainable-metadata-bounded-exploration-and-version-",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Bounded route exploration is presented as an alternative to relying only on deterministic route costing.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-decisions-need-explainable-metadata-bounded-exploration-and-version-",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier selection requires route-certificate and version-tree placement benchmarks before adoption.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-decisions-need-explainable-metadata-bounded-exploration-and-version-",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Visibility-boundary and WAL-related route facts are part of the proposed benchmark gate.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-decisions-need-explainable-metadata-bounded-exploration-and-version-",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hot-write template adoption is tied to route-certificate and bounded-exploration benchmarks.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-decisions-need-explainable-metadata-bounded-exploration-and-version-",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Optimized version trees are an alternative to naive generation retention and descriptor retirement.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-decisions-need-explainable-metadata-bounded-exploration-and-version-",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Route metadata as a first-class columnar product is an alternative publication shape to opaque route roots.",
+    },
+    (
+        "2026-06-06-rewind-makes-byte-addressable-durability-a-log-structure-problem",
+        "log_structured_warm_tier",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "REWIND's byte-addressable NVM scope cautions against direct SQL/GPU warm-tier transfer.",
+    },
+    (
+        "2026-06-06-rewind-makes-byte-addressable-durability-a-log-structure-problem",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "REWIND omits GPU database tiering and warns against inferring HBM/DRAM/NVMe placement behavior.",
+    },
+    (
+        "2026-06-06-alece-makes-dynamic-cardinality-a-query-data-attention-problem",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Live route-state vectors provide an alternative to static table statistics for tier placement decisions.",
+    },
+    (
+        "2026-06-06-alece-makes-dynamic-cardinality-a-query-data-attention-problem",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Visibility-generation route vectors complement WAL safety but are not direct WAL-before-visibility evidence.",
+    },
+    (
+        "2026-06-06-alece-makes-dynamic-cardinality-a-query-data-attention-problem",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Compact route-state vectors are an alternative to descriptor-heavy planning metadata.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-planning-needs-live-state-but-correctness-still-needs-hard-gates",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The retained evidence directly supports hard queue-capacity and memory-budget admission gates.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-planning-needs-live-state-but-correctness-still-needs-hard-gates",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL and checkpoint safety are hard proof gates that need explicit route validation.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-planning-needs-live-state-but-correctness-still-needs-hard-gates",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained GPU route selection needs regret benchmarks under changing distributions, generations, and pressure.",
+    },
+    (
+        "2026-06-06-aeolus-protects-scheduled-work-by-making-speculation-disposable",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Speculative same-shape batching needs measured first-request latency, rejection rate, and scheduled-lane tail latency.",
+    },
 }
 
 
