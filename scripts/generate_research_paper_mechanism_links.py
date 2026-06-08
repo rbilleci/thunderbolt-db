@@ -9814,6 +9814,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Speculative same-shape batching needs measured first-request latency, rejection rate, and scheduled-lane tail latency.",
     },
+    (
+        "2026-06-06-aeolus-protects-scheduled-work-by-making-speculation-disposable",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Aeolus omits SQL isolation, MVCC visibility, WAL durability, GPU launch overhead, and 1M-session evaluation.",
+    },
+    (
+        "2026-06-06-mtm-makes-tier-placement-a-sampled-control-loop-not-a-static-hot-page-rule",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "MTM supports tier placement only when placement is driven by profiling quality instead of a fixed hottest-page rule.",
+    },
+    (
+        "2026-06-06-1rma-makes-remote-memory-access-connection-free-and-credit-shaped",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Remote/cold-tier placement needs p99 retained-lookup and typed-overload prototype measurements before adoption.",
+    },
+    (
+        "2026-06-06-1rma-makes-remote-memory-access-connection-free-and-credit-shaped",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring bundling needs measured remote queue congestion, solicitation-window congestion, and completion delay.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-resource-credits-should-travel-with-route-work",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier-placement transfer is explicitly routed through route-credit simulation and cold-tier chunking benchmarks.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-resource-credits-should-travel-with-route-work",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Vector-credit admission needs route-credit simulation with typed overload and revocation completions.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-resource-credits-should-travel-with-route-work",
+        "deficit_fairness",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Protected scheduled credits and typed pressure signals support fairness rather than a competing mechanism.",
+    },
+    (
+        "2026-06-06-aria-makes-deterministic-oltp-a-batch-snapshot-conflict-filter",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Compact stable operation inputs are an alternative to shipping full materialized results across owners.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-batches-need-bounded-credits-and-escape-hatches",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL and visibility boundaries must be measured alongside p99 maintenance latency and write retry amplification.",
+    },
+    (
+        "2026-06-06-tb-collect-makes-nvm-mvcc-cleanup-a-block-level-write-amplification-problem",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Block or cohort retirement by visibility epoch is an alternative to per-version snapshot frontier cleanup.",
+    },
+    (
+        "2026-06-06-diffkv-makes-value-placement-a-scan-write-ordering-dial",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner bundling around value placement needs rewrite, stale-byte, snapshot-lag, queue-wait, and crash-boundary measurements.",
+    },
+    (
+        "2026-06-06-silk-makes-compaction-a-foreground-slo-scheduling-problem",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "SILK shows scheduling still degrades under long write peaks when resource headroom is insufficient.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-maintenance-needs-credits-generations-and-preemption",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Shared credits across reads, writes, refresh, cleanup, and cold-tier merge require mixed-plane benchmarks.",
+    },
+    (
+        "2026-06-06-reactors-make-owner-domains-a-programmable-latency-boundary",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner-domain distribution is useful only if communication hops do not improve average throughput while regressing p99.",
+    },
+    (
+        "2026-06-06-orcgc-makes-reclamation-bounds-part-of-the-hot-path-contract",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Stable handle adoption needs CPU-path measurements for pointer protection, reference counts, epochs, and owner-local handles.",
+    },
+    (
+        "2026-06-06-orcgc-makes-reclamation-bounds-part-of-the-hot-path-contract",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MVCC GC transfer needs prototype proof that retired bytes stay bounded without blocking WAL visibility publication.",
+    },
+    (
+        "2026-06-06-justitia-makes-shared-fabric-admission-a-multi-resource-credit-problem",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Justitia's low-latency fabric evidence applies only when shared-resource interference is explicitly controlled.",
+    },
+    (
+        "2026-06-06-justitia-makes-shared-fabric-admission-a-multi-resource-credit-problem",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Session-scale transfer is valid only when RDMA-like latency assumptions survive shared application load.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-owner-routes-need-credits-and-bounded-cleanup",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The synthesis directly supports bounded retired-metadata handoff rather than an unbounded background cleanup detail.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-owner-routes-need-credits-and-bounded-cleanup",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Multi-resource token control is retained as direct support for vector-credit admission.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-owner-routes-need-credits-and-bounded-cleanup",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Effective session counting needs route-hop, credit, queue-wait, cleanup-generation, and tiny-read stress measurements.",
+    },
+    (
+        "2026-06-06-conditional-access-makes-reclamation-a-cache-coherence-contract",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Conditional Access supports reclamation only if per-read validation overhead beats lower-overhead reclamation schemes.",
+    },
+    (
+        "2026-06-06-conditional-access-makes-reclamation-a-cache-coherence-contract",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retired route metadata is useful only with bounded lifetime and without depending on unavailable CPU primitives.",
+    },
+    (
+        "2026-06-06-clobber-nvm-makes-durable-metadata-replay-a-deterministic-input-problem",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Durable route descriptors, resident directories, checkpoint indexes, and manifests support immutable route-root metadata.",
+    },
+    (
+        "2026-06-06-lemo-makes-concurrent-query-optimization-cache-aware",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Lemo-style cached intermediates need reuse, invalidation, HBM-pressure, and multi-tier artifact placement measurements.",
+    },
+    (
+        "2026-06-06-lemo-makes-concurrent-query-optimization-cache-aware",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Missing Lemo model, replacement, evaluation, and failure details caution against direct learned-advisor transfer.",
+    },
+    (
+        "2026-06-06-lemo-makes-concurrent-query-optimization-cache-aware",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Shared key-vector and response-metadata reuse needs latency, launch, HBM, reuse-hit, and fallback benchmarks.",
+    },
+    (
+        "2026-06-06-lemo-makes-concurrent-query-optimization-cache-aware",
+        "effective_session_counting",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Binding reuse to worker and route cohorts directly supports effective session counting over session-local caches.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-reusable-work-needs-visible-lifetime-contracts",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Reusable work supports WAL visibility only when deterministic replay inputs and validation contracts remain explicit.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-reusable-work-needs-visible-lifetime-contracts",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Learned reuse is valid only when hot-path state lifetime, reuse, and retirement contracts are explicit.",
+    },
 }
 
 
