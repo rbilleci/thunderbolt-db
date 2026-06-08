@@ -26,6 +26,59 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - low: 247
 - medium: 1365
 
+## Paper Identity Records
+
+- normalized paper records: 571
+- paper entries with generated identity: 610
+- duplicate identity groups: 32
+
+Generated identity field counts:
+- paper_entries_with_arxiv: 117
+- paper_entries_with_doi: 391
+- paper_entries_with_identity: 610
+- paper_entries_with_url: 598
+- paper_entries_with_venue: 601
+
+Generated identity missing-field counts:
+- missing_arxiv: 493
+- missing_doi: 219
+- missing_url: 12
+- missing_venue: 9
+
+Duplicate identity audit:
+- `paper-2016-design-principles-for-scaling-multi-core-oltp-under-high-contention` (2 entries): 2026-06-04-orthrus-separates-contention-control-from-transaction-execution, 2026-06-06-orthrus-separates-conflict-ownership-from-transaction-execution
+- `paper-2018-improving-optimistic-concurrency-control-through-transaction-batching-and-operation-reordering` (3 entries): 2026-06-03-semantic-occ-batching-and-operation-reordering, 2026-06-05-occ-batching-makes-commit-order-a-bounded-optimization-problem, 2026-06-06-occ-batching-turns-contention-into-a-reorderable-route-batch
+- `paper-2018-pipelined-query-processing-in-coprocessor-environments` (2 entries): 2026-06-04-compound-gpu-pipelines-trade-materialization-for-explicit-reduction-pressure, 2026-06-05-horseqc-makes-gpu-transfer-routes-prove-pipeline-density
+- `paper-2018-quecc-a-queue-oriented-control-free-concurrency-architecture` (2 entries): 2026-06-04-quecc-makes-write-contention-a-planning-problem-not-an-execution-surprise, 2026-06-04-quecc-turns-hot-transactions-into-planned-priority-queues
+- `paper-2018-sundial-harmonizing-concurrency-control-and-caching-in-a-distributed-oltp-database-management-sy` (2 entries): 2026-06-04-sundial-logical-leases-unify-serializable-ordering-and-cache-coherence, 2026-06-06-sundial-unifies-cache-validity-and-transaction-order-with-logical-leases
+- `paper-2019-native-store-extension-for-sap-hana` (2 entries): 2026-06-05-hana-nse-makes-warm-placement-byte-compatible-not-separate-engine, 2026-06-05-sap-hana-nse-makes-warm-data-a-first-class-column-store-load-unit
+- `paper-2019-r2p2-making-rpcs-first-class-datacenter-citizens` (2 entries): 2026-06-03-r2p2-request-response-pairs-for-rpc-admission, 2026-06-04-r2p2-request-response-pairs-as-schedulable-runtime-units
+- `paper-2019-scalable-garbage-collection-for-in-memory-mvcc-systems` (2 entries): 2026-06-03-scalable-garbage-collection-for-in-memory-mvcc, 2026-06-07-steam-prunes-mvcc-garbage-on-the-write-path-before-chains-grow
+- `paper-2020-adaptive-htap-through-elastic-resource-scheduling` (2 entries): 2026-06-04-adaptive-htap-makes-freshness-a-resource-scheduling-input, 2026-06-07-adaptive-htap-treats-freshness-as-a-resource-scheduling-input
+- `paper-2020-aria-a-fast-and-practical-deterministic-oltp-database` (2 entries): 2026-06-03-aria-deterministic-oltp-batches, 2026-06-06-aria-makes-deterministic-oltp-a-batch-snapshot-conflict-filter
+- `paper-2020-f1-lightning-htap-as-a-service` (2 entries): 2026-06-04-f1-lightning-turns-htap-into-safe-time-routing-over-a-replicated-analytical-lsm, 2026-06-05-f1-lightning-turns-htap-into-a-freshness-windowed-service
+- `paper-2020-rethinking-logging-checkpoints-and-recovery-for-high-performance-storage-engines` (2 entries): 2026-06-03-rethinking-logging-checkpoints-and-recovery, 2026-06-06-leanstore-recovery-makes-wal-a-sharded-tiered-and-checkpoint-bounded-pipeline
+- `paper-2020-tidb-a-raft-based-htap-database` (2 entries): 2026-06-05-tidb-makes-htap-freshness-a-consensus-derived-route-property, 2026-06-05-tidb-turns-consensus-replication-into-an-htap-freshness-path
+- `paper-2021-constant-time-snapshots-with-applications-to-concurrent-data-structures` (2 entries): 2026-06-05-constant-time-snapshots-make-snapshot-handles-cheap-but-old-object-reads-pay-the-update-distance, 2026-06-06-constant-time-snapshots-make-metadata-reads-lazy-and-versioned
+- `paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control` (2 entries): 2026-06-03-polyjuice-learned-concurrency-control-policies, 2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy
+- `paper-2022-gacco-a-gpu-accelerated-oltp-dbms` (3 entries): 2026-06-03-gacco-gpu-accelerated-oltp-co-execution, 2026-06-04-gacco-batches-same-shape-oltp-on-gpu-while-cpu-owns-the-full-database, 2026-06-05-gacco-batches-same-shape-oltp-transactions-on-gpu-while-cpu-handles-the-rest
+- `paper-2022-plor-general-transactions-with-predictable-low-tail-latency` (3 entries): 2026-06-03-plor-predictable-low-tail-transactions, 2026-06-05-plor-gives-aborted-hot-transactions-timestamp-priority, 2026-06-06-plor-makes-tail-latency-a-conflict-priority-problem-not-only-a-lock-cost-problem
+- `paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases` (2 entries): 2026-06-05-chardonnay-turns-cold-data-reads-into-pre-lock-admission-work, 2026-06-07-chardonnay-turns-epoch-snapshots-into-pre-lock-admission
+- `paper-2023-polaris-enabling-transaction-priority-in-optimistic-concurrency-control` (2 entries): 2026-06-03-polaris-priority-aware-optimistic-concurrency-control, 2026-06-04-polaris-adds-priority-without-abandoning-optimistic-execution
+- `paper-2023-rtindex-exploiting-hardware-accelerated-gpu-raytracing-for-database-indexing` (2 entries): 2026-06-04-rtindex-maps-resident-indexes-onto-rtx-bvh-traversal, 2026-06-04-rtindex-turns-rt-cores-into-a-read-mostly-gpu-secondary-index
+- `paper-2023-transaction-scheduling-from-conflicts-to-runtime-conflicts` (2 entries): 2026-06-03-runtime-conflict-transaction-scheduling, 2026-06-04-runtime-conflicts-make-transaction-order-a-measurable-resource
+- `paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-` (2 entries): 2026-06-03-modern-nvme-storage-engine-exploitation, 2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem
+- `paper-2024-bf-tree-a-modern-read-write-optimized-concurrent-larger-than-memory-range-index` (2 entries): 2026-06-03-bf-tree-variable-length-mini-pages-for-larger-than-memory-indexes, 2026-06-04-bf-tree-variable-length-mini-pages-for-larger-than-memory-indexes
+- `paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems` (2 entries): 2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency, 2026-06-07-chablis-splits-fast-local-commits-from-global-snapshot-publication
+- `paper-2024-towards-buffer-management-with-tiered-main-memory` (2 entries): 2026-06-03-towards-buffer-management-with-tiered-main-memory, 2026-06-04-three-tree-makes-intermediate-memory-a-first-class-buffer-tier
+- `paper-2024-towards-optimal-transaction-scheduling` (4 entries): 2026-06-03-smf-schedule-first-transaction-ordering, 2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem, 2026-06-04-schedule-first-oltp-turns-hot-key-conflict-order-into-an-admission-primitive, 2026-06-04-smf-schedules-hot-conflicts-before-concurrency-control-sees-them
+- `paper-2025-a-hybrid-approach-to-integrating-deterministic-and-non-deterministic-concurrency-control-in-data` (2 entries): 2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes, 2026-06-05-hdcc-mixes-deterministic-batches-and-optimistic-transactions-with-explicit-proof-points
+- `paper-2025-concurrency-control-as-a-service` (2 entries): 2026-06-04-ccaas-separates-conflict-resolution-from-execution-and-storage, 2026-06-05-ccaas-separates-conflict-metadata-from-execution-and-storage
+- `paper-2025-low-latency-transaction-scheduling-via-userspace-interrupts-why-wait-or-yield-when-you-can-preem` (2 entries): 2026-06-03-low-latency-transaction-scheduling-via-userspace-interrupts, 2026-06-05-preemptdb-uses-userspace-interrupts-for-low-latency-transaction-scheduling
+- `paper-2025-no-cap-this-memory-slaps-breaking-through-the-memory-wall-of-transactional-database-systems-with` (2 entries): 2026-06-04-oltpim-near-memory-placement-for-oltp-indexes-and-mvcc-metadata, 2026-06-05-oltpim-splits-pointer-chasing-metadata-from-tuple-payloads-for-near-memory-oltp
+- `paper-2026-gpu-accelerated-oltp-an-in-depth-analysis-of-concurrency-control-schemes` (4 entries): 2026-06-03-gcctb-gpu-oltp-concurrency-control-study, 2026-06-04-gpu-oltp-concurrency-control-needs-conflict-aware-launch-policy, 2026-06-05-gpu-oltp-concurrency-is-launch-shape-and-conflict-resolution-bound, 2026-06-06-gpu-accelerated-oltp-shows-concurrency-control-is-a-route-shape
+- `paper-2026-modeling-concurrency-control-as-a-learnable-function` (2 entries): 2026-06-03-modeling-concurrency-control-as-a-learnable-function, 2026-06-05-neurcc-makes-concurrency-control-a-learned-action-table
+
 ## Evidence Spans
 
 - links with evidence span: 4671 / 4671

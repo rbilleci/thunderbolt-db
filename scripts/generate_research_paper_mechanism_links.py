@@ -13,6 +13,11 @@ CATEGORY_RE = re.compile(r"^\*\*Category:\*\*\s*(?P<value>.+)$|^Category:\s*(?P<
 TAGS_RE = re.compile(r"^\*\*Relevance tags:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 CITATION_RE = re.compile(r"^\*\*Citation:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`])")
+DOI_RE = re.compile(r"(?:doi:\s*|doi\.org/)(?P<doi>10\.\d{4,9}/[^\s`]+)", re.IGNORECASE)
+ARXIV_RE = re.compile(r"(?:arxiv:|arxiv\.org/(?:abs|pdf)/)(?P<arxiv>\d{4}\.\d{4,5}(?:v\d+)?)", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s`)>]+")
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+QUOTED_TITLE_RE = re.compile(r'"(?P<title>[^"]+)"')
 
 METADATA_SNIPPET_PREFIXES = (
     "**citation:**",
@@ -12692,6 +12697,91 @@ def slugify(value: str) -> str:
     return value[:96] or "entry"
 
 
+def clean_citation_value(value: str) -> str:
+    value = value.replace("\n", " ")
+    value = value.replace("`", "")
+    return compact_whitespace(value)
+
+
+def citation_title(citation: str, fallback_title: str) -> str:
+    match = QUOTED_TITLE_RE.search(citation)
+    if match:
+        return compact_whitespace(match.group("title"))
+    return fallback_title
+
+
+def citation_authors(citation: str) -> list[str]:
+    if not citation:
+        return []
+    before_title = citation.split('"', 1)[0]
+    before_title = re.sub(r"\bet al\.\s*$", "et al.", before_title).strip(" .")
+    if not before_title:
+        return []
+    before_title = before_title.replace(" and ", ", ")
+    return [part.strip() for part in before_title.split(",") if part.strip()]
+
+
+def citation_venue(citation: str) -> str:
+    if not citation:
+        return ""
+    after_title = citation.split('"', 2)[2] if citation.count('"') >= 2 else citation
+    after_title = re.sub(r"\bDOI:\s*.*$", "", after_title, flags=re.IGNORECASE)
+    after_title = re.sub(r"\bRetrieved\s+\d{4}-\d{2}-\d{2}.*$", "", after_title, flags=re.IGNORECASE)
+    after_title = URL_RE.sub("", after_title)
+    after_title = re.sub(r"\b(19|20)\d{2}\b.*$", "", after_title)
+    return compact_whitespace(after_title.strip(" .,:;"))
+
+
+def normalize_identifier(value: str) -> str:
+    return value.strip().rstrip(".,;").lower()
+
+
+def normalize_arxiv(value: str) -> str:
+    return re.sub(r"v\d+$", "", normalize_identifier(value))
+
+
+def citation_year(citation: str, entry_date: str) -> str:
+    citation_without_urls = re.sub(r"\bRetrieved\s+\d{4}-\d{2}-\d{2}.*$", "", citation, flags=re.IGNORECASE)
+    citation_without_urls = URL_RE.sub("", citation_without_urls)
+    citation_without_urls = re.sub(r"\barxiv:?\s*\d{4}\.\d{4,5}(?:v\d+)?", "", citation_without_urls, flags=re.IGNORECASE)
+    found = [
+        match.group(0)
+        for match in YEAR_RE.finditer(citation_without_urls)
+        if 1990 <= int(match.group(0)) <= int(entry_date[:4])
+    ]
+    if found:
+        return max(found)
+    return entry_date[:4]
+
+
+def build_paper_identity(entry: dict) -> dict | None:
+    if entry["entry_type"] != "paper":
+        return None
+    citation = clean_citation_value(entry.get("citation", ""))
+    title = citation_title(citation, entry["title"])
+    doi_match = DOI_RE.search(citation)
+    arxiv_match = ARXIV_RE.search(citation)
+    urls = [url.rstrip(".,;") for url in URL_RE.findall(citation)]
+    doi = normalize_identifier(doi_match.group("doi")) if doi_match else ""
+    arxiv = normalize_arxiv(arxiv_match.group("arxiv")) if arxiv_match else ""
+    year = citation_year(citation, entry["date"])
+    identity_key = f"title:{slugify(title)}"
+    return {
+        "paper_id": f"paper-{year}-{slugify(title)}",
+        "identity_key": identity_key,
+        "title": title,
+        "authors": citation_authors(citation),
+        "venue": citation_venue(citation),
+        "year": year,
+        "doi": doi,
+        "arxiv": arxiv,
+        "url": urls[0] if urls else "",
+        "journal_entry_id": entry["id"],
+        "source": "generated_from_journal_citation",
+        "review_status": "generated_identity",
+    }
+
+
 def split_entries(journal: str) -> list[dict]:
     matches = list(HEADING_RE.finditer(journal))
     entries: list[dict] = []
@@ -12703,7 +12793,7 @@ def split_entries(journal: str) -> list[dict]:
         date = match.group("date")
         category = extract_match(CATEGORY_RE, body)
         tags = split_tags(extract_match(TAGS_RE, body))
-        citation = extract_match(CITATION_RE, body)
+        citation = extract_citation(body)
         entries.append(
             {
                 "id": f"{date}-{slugify(title)}",
@@ -12717,6 +12807,25 @@ def split_entries(journal: str) -> list[dict]:
             }
         )
     return entries
+
+
+def extract_citation(body: str) -> str:
+    lines = body.splitlines()
+    citation_lines: list[str] = []
+    in_citation = False
+    for line in lines:
+        if line.startswith("**Citation:**"):
+            in_citation = True
+            citation_lines.append(line.removeprefix("**Citation:**").strip())
+            continue
+        if not in_citation:
+            continue
+        if not line.strip():
+            break
+        if line.startswith("**Category:**") or line.startswith("Category:"):
+            break
+        citation_lines.append(line.strip())
+    return compact_whitespace(" ".join(part for part in citation_lines if part))
 
 
 def extract_match(pattern: re.Pattern, body: str) -> str:
@@ -13042,6 +13151,50 @@ def apply_review_overrides(entry: dict, links: list[dict]) -> list[dict]:
     return reviewed
 
 
+def normalize_paper_records(paper_identities: list[dict]) -> tuple[list[dict], list[dict]]:
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for identity in paper_identities:
+        groups[identity["identity_key"]].append(identity)
+
+    paper_records: list[dict] = []
+    duplicate_groups: list[dict] = []
+    for _, identities in sorted(groups.items(), key=lambda item: item[1][0]["paper_id"]):
+        identities = sorted(identities, key=lambda item: item["journal_entry_id"])
+        canonical = identities[0]
+        with_doi = next((identity for identity in identities if identity["doi"]), canonical)
+        with_arxiv = next((identity for identity in identities if identity["arxiv"]), canonical)
+        with_url = next((identity for identity in identities if identity["url"]), canonical)
+        with_venue = next((identity for identity in identities if identity["venue"]), canonical)
+        with_authors = next((identity for identity in identities if identity["authors"]), canonical)
+        journal_entry_ids = [identity["journal_entry_id"] for identity in identities]
+        record = {
+            "paper_id": canonical["paper_id"],
+            "title": canonical["title"],
+            "authors": with_authors["authors"],
+            "venue": with_venue["venue"],
+            "year": canonical["year"],
+            "doi": with_doi["doi"],
+            "arxiv": with_arxiv["arxiv"],
+            "url": with_url["url"],
+            "journal_entry_ids": journal_entry_ids,
+            "identity_key": canonical["identity_key"],
+            "duplicate_of": "",
+            "source": canonical["source"],
+            "review_status": canonical["review_status"],
+        }
+        paper_records.append(record)
+        if len(identities) > 1:
+            duplicate_groups.append(
+                {
+                    "paper_id": canonical["paper_id"],
+                    "journal_entry_ids": journal_entry_ids,
+                    "duplicate_count": len(identities),
+                    "identity_key": canonical["identity_key"],
+                }
+            )
+    return paper_records, duplicate_groups
+
+
 def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanism_ids = {item["id"] for item in mechanisms["mechanisms"]}
     mechanism_names = {item["id"]: item["name"] for item in mechanisms["mechanisms"]}
@@ -13057,9 +13210,32 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     review_status_counts: Counter = Counter()
     review_priority_counts: Counter = Counter()
     type_counts: Counter = Counter()
+    paper_identity_counts: Counter = Counter()
+    paper_identity_missing_counts: Counter = Counter()
+    paper_identities: list[dict] = []
     unlinked: list[str] = []
 
     for entry in entries:
+        paper_identity = build_paper_identity(entry)
+        if paper_identity:
+            paper_identities.append(paper_identity)
+            paper_identity_counts["paper_entries_with_identity"] += 1
+            if paper_identity["doi"]:
+                paper_identity_counts["paper_entries_with_doi"] += 1
+            else:
+                paper_identity_missing_counts["missing_doi"] += 1
+            if paper_identity["arxiv"]:
+                paper_identity_counts["paper_entries_with_arxiv"] += 1
+            else:
+                paper_identity_missing_counts["missing_arxiv"] += 1
+            if paper_identity["url"]:
+                paper_identity_counts["paper_entries_with_url"] += 1
+            else:
+                paper_identity_missing_counts["missing_url"] += 1
+            if paper_identity["venue"]:
+                paper_identity_counts["paper_entries_with_venue"] += 1
+            else:
+                paper_identity_missing_counts["missing_venue"] += 1
         links = link_entry(entry, mechanism_ids)
         for link in links:
             confidence = link["confidence"]
@@ -13094,14 +13270,16 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
                 "category": entry.get("category", ""),
                 "relevance_tags": entry.get("relevance_tags", []),
                 "citation": entry.get("citation", ""),
+                "paper_identity": paper_identity,
                 "mechanism_links": links,
             }
         )
 
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
+    paper_records, duplicate_groups = normalize_paper_records(paper_identities)
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v4",
-        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, and typed paper-mechanism relations. Review low-confidence and fallback links before making architectural commitments.",
+        "schema": "gpu-db-research-paper-mechanism-links-v5",
+        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, and normalized paper identity records. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
         "relation_types": {
@@ -13125,6 +13303,10 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "relation_review_status_counts": dict(sorted(relation_review_status_counts.items())),
             "review_status_counts": dict(sorted(review_status_counts.items())),
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
+            "paper_identity_counts": dict(sorted(paper_identity_counts.items())),
+            "paper_identity_missing_counts": dict(sorted(paper_identity_missing_counts.items())),
+            "paper_records": len(paper_records),
+            "paper_duplicate_groups": len(duplicate_groups),
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
             + review_status_counts["manual_review_required"],
             "low_confidence_links": confidence_counts["low"],
@@ -13140,6 +13322,8 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
         "mechanism_counts": dict(sorted(mechanism_counts.items())),
         "mechanisms_without_links": mechanisms_without_links,
         "unlinked_entry_ids": unlinked,
+        "paper_records": paper_records,
+        "paper_duplicate_groups": duplicate_groups,
         "records": records,
     }
 
@@ -13156,6 +13340,8 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     relation_review_status_counts = index["summary"]["relation_review_status_counts"]
     review_status_counts = index["summary"]["review_status_counts"]
     review_priority_counts = index["summary"]["review_priority_counts"]
+    paper_identity_counts = index["summary"]["paper_identity_counts"]
+    paper_identity_missing_counts = index["summary"]["paper_identity_missing_counts"]
     records = index["records"]
     fallback_records = [
         record
@@ -13230,6 +13416,29 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     ]
     for confidence, count in sorted(confidence_counts.items()):
         lines.append(f"- {confidence}: {count}")
+
+    lines.extend(["", "## Paper Identity Records", ""])
+    lines.append(f"- normalized paper records: {index['summary']['paper_records']}")
+    lines.append(f"- paper entries with generated identity: {paper_identity_counts.get('paper_entries_with_identity', 0)}")
+    lines.append(f"- duplicate identity groups: {index['summary']['paper_duplicate_groups']}")
+    lines.append("")
+    lines.append("Generated identity field counts:")
+    for field, count in sorted(paper_identity_counts.items()):
+        lines.append(f"- {field}: {count}")
+    lines.append("")
+    lines.append("Generated identity missing-field counts:")
+    for field, count in sorted(paper_identity_missing_counts.items()):
+        lines.append(f"- {field}: {count}")
+    lines.append("")
+    lines.append("Duplicate identity audit:")
+    if index["paper_duplicate_groups"]:
+        for group in index["paper_duplicate_groups"][:80]:
+            entries = ", ".join(group["journal_entry_ids"])
+            lines.append(f"- `{group['paper_id']}` ({group['duplicate_count']} entries): {entries}")
+        if len(index["paper_duplicate_groups"]) > 80:
+            lines.append(f"- ... {len(index['paper_duplicate_groups']) - 80} more")
+    else:
+        lines.append("- none")
 
     lines.extend(["", "## Evidence Spans", ""])
     total_links = sum(confidence_counts.values())
