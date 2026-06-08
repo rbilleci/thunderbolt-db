@@ -6874,6 +6874,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Owner-message queue layouts need proof-gate validation that unplanned access restarts or falls back before visibility changes.",
     },
+    (
+        "2026-06-04-orthrus-separates-contention-control-from-transaction-execution",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "ORTHRUS is a contention-control prototype rather than a full DBMS, so hot-write template transfer needs database-path benchmarks.",
+    },
+    (
+        "2026-06-04-strife-turns-contention-into-batch-time-conflict-free-lanes",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts logical sessions with execution threads, while the evidence supports compact owner-drained request queues.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner queue and priority-lane interactions need active-window benchmarks before choosing the write lane.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CXL placement and object-family tier classes are named measurement inputs for active-window certificate routing.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane",
+        "db_owned_cold_objects",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cold-object participation in active-window lane choice requires measured tier classes and certificate validation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-active-window-certificates-should-choose-the-write-lane",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Conflict-graph write-lane selection is explicitly a measurement gate before runtime ordering policy adoption.",
+    },
+    (
+        "2026-06-04-t-part-partitions-transactions-then-pushes-writes-forward",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "T-Part partitions pending transactions from a dependency graph instead of using per-route dependency witness admission.",
+    },
+    (
+        "2026-06-04-btrblocks-chooses-compression-per-block-by-measured-decode-value",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The compression evidence transfers only through measured tier metrics for bytes, decode cost, and route time.",
+    },
+    (
+        "2026-06-04-btrblocks-chooses-compression-per-block-by-measured-decode-value",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner handoff for decoded, compressed, or pinned batches depends on measured route cost rather than a proven queue policy.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Aurora-style redo and consistency boundaries are presented as an alternative to implicit freshness from page state.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained GPU snapshot route certificates need commit-to-readable and codec-refresh benchmarks before adoption.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-codec-facts",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Ordered redo and consistency boundaries are framed as an alternative proof source to implicit page-state dependency tracking.",
+    },
+    (
+        "2026-06-04-fpsi-makes-freshness-a-first-contact-snapshot-policy",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "FPSI warns against treating snapshot generation as one global scalar across multiple owner and worker domains.",
+    },
+    (
+        "2026-06-04-fpsi-makes-freshness-a-first-contact-snapshot-policy",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "FPSI cautions that retained snapshot freshness must be chosen at first contact rather than guessed from a single generation.",
+    },
+    (
+        "2026-06-04-memory-centric-databases-make-pooled-memory-a-query-route-resource",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Pooled-memory routes require proof gates for canonical WAL/MVCC recovery source and deterministic invalidation paths.",
+    },
+    (
+        "2026-06-04-cxl-pooling-is-a-costed-route-not-transparent-memory",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Stable handles may cross into CXL or remote memory only when measurements prove the path is not correctness-critical hot state.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Future-tier placement needs route-certificate prototypes and far-memory sensitivity tests before policy adoption.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "First-contact freshness certificates are presented as an alternative to guessing route freshness later.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-future-tiers-need-local-hot-remote-cold-contracts",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Active memory leases must prove idle logical sessions reserve no tier payload before shaping session-count policy.",
+    },
+    (
+        "2026-06-04-demystifying-cxl-memory-with-genuine-cxl-ready-systems-and-devices",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "CXL placement is valid only when route decisions account for access mode, cache behavior, promotion bytes, and local control state.",
+    },
+    (
+        "2026-06-04-demystifying-cxl-memory-with-genuine-cxl-ready-systems-and-devices",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The CXL evaluation omits WAL, MVCC, recovery, and GPU transfer paths, so WAL-before-visibility needs direct validation.",
+    },
+    (
+        "2026-06-04-homa-makes-receiver-admission-a-latency-control-surface",
+        "deficit_fairness",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Homa's priority thresholds were precomputed, so deficit fairness needs online message-size and latency benchmarks.",
+    },
+    (
+        "2026-06-04-homa-makes-receiver-admission-a-latency-control-surface",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Session counting is valid only if memory and queue slots scale with outstanding fragments rather than fan-out width.",
+    },
+    (
+        "2026-06-04-homa-makes-receiver-admission-a-latency-control-surface",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-priority lanes need p50/p99, buffered-byte, overload, and fallback measurements before placement policy transfer.",
+    },
+    (
+        "2026-06-04-octopus-uses-semantic-fast-paths-with-gpu-dag-fallback",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "contradicts",
+        "relation_review_note": "Octopus fallback DAG order and always-success compensation conflict with ordinary SQL conflict-ordering assumptions.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-placement-credits-and-semantic-proof",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained snapshots may move across future tiers only when route latency and receiver-owned credit proofs allow it.",
+    },
+    (
+        "2026-06-04-hybench-frames-htap-as-freshness-bound-mixed-pressure-not-olap-plus-oltp-in-isolation",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "HyBench frames freshness as a benchmark dimension, so the freshness router needs workload-specific measurement gates.",
+    },
+    (
+        "2026-06-04-f1-lightning-turns-htap-into-safe-time-routing-over-a-replicated-analytical-lsm",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Resident read descriptors are safe only when the requested timestamp or freshness SLO stays inside the safe window.",
+    },
+    (
+        "2026-06-04-d2pc-decentralizes-commit-coordination-to-shorten-conflict-windows",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "D2PC-style templates assume an existing OCC or 2PL store with replicated transaction logs and votes.",
+    },
+    (
+        "2026-06-04-d2pc-decentralizes-commit-coordination-to-shorten-conflict-windows",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Dependency witnesses transfer only if prepared ordering and WAL reservation reduce hidden owner hold time.",
+    },
 }
 
 
