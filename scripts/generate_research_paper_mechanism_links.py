@@ -1415,6 +1415,216 @@ RELATION_CANDIDATE_PRIORITY = [
 
 RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
     (
+        "2026-06-05-cross-paper-synthesis-tail-contracts-need-age-fan-out-and-accelerator-budget",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-visible priority lanes are tied to measured bounds for long GPU, refresh, and decompression work.",
+    },
+    (
+        "2026-06-05-ocean-vista-turns-visibility-into-batched-watermark-gossip",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Batched watermark gossip is presented as an alternative to synchronous per-transaction visibility coordination.",
+    },
+    (
+        "2026-06-05-ocean-vista-turns-visibility-into-batched-watermark-gossip",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback below durable boundaries is explicitly framed as a comparison/prototype gate.",
+    },
+    (
+        "2026-06-05-ocean-vista-turns-visibility-into-batched-watermark-gossip",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Invisible multi-version placeholders and gossiped watermarks are an alternative to immediate conflict resolution.",
+    },
+    (
+        "2026-06-05-tmo-makes-tiering-a-pressure-controlled-feedback-loop",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Session-memory classification is valid only if it avoids write-cap violations and unrelated cold-tier p99 inflation.",
+    },
+    (
+        "2026-06-05-tmo-makes-tiering-a-pressure-controlled-feedback-loop",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evidence requires proof gates and refault benchmarks before tiering WAL or visibility-adjacent state.",
+    },
+    (
+        "2026-06-05-tmo-makes-tiering-a-pressure-controlled-feedback-loop",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback choices under pressure annotations are explicitly driven by measured stall budgets.",
+    },
+    (
+        "2026-06-05-htm-is-a-primitive-for-tiny-atomic-publications-not-a-general-index-concurrency-plan",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "HTM-protected traversal is valid only if retained snapshot tracking survives realistic key and payload shapes.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-publish-small-retire-explicitly-place-by-pressure",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor publication and retirement are routed through route-certificate and retained-snapshot benchmarks.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-publish-small-retire-explicitly-place-by-pressure",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots need publication benchmarks across CAS, owner-message, and optional HTM mechanisms.",
+    },
+    (
+        "2026-06-05-flexpushdowndb-hybrid-pushdown-and-caching-in-a-cloud-dbms",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hybrid placement is gated on merge cost, transfer bytes, queue wait, and latency measurements.",
+    },
+    (
+        "2026-06-05-flexpushdowndb-hybrid-pushdown-and-caching-in-a-cloud-dbms",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cache-miss admission choices between promotion, cold routes, CPU fallback, and rejection must be tested.",
+    },
+    (
+        "2026-06-05-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evidence is GPU-compute benchmarking, so SQL placement transfer needs database-specific validation.",
+    },
+    (
+        "2026-06-05-occ-batching-makes-commit-order-a-bounded-optimization-problem",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Batch-size sweet spots for hot writes, point lookups, refresh, and fallback are explicit measurement gates.",
+    },
+    (
+        "2026-06-05-crystal-resident-gpu-execution-wins-when-transfer-is-not-the-bottleneck",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route choice must match measured winners across selectivity and resident-state changes.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-resident-routes-need-fairness-resource-class-and-transfer-proof",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained query routing is gated on route-certificate benchmarks that log residency, transfer, and pressure.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-resident-routes-need-fairness-resource-class-and-transfer-proof",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Micro-batch adoption is tied to four-route comparator and mixed-workload benchmarks.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-resident-routes-need-fairness-resource-class-and-transfer-proof",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Useful reordering and fusion are valid only inside bounded validation windows and compatible visibility boundaries.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-resident-routes-need-fairness-resource-class-and-transfer-proof",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that fast routes need current certificates, not isolated hot-write assumptions.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-resident-routes-need-fairness-resource-class-and-transfer-proof",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner routing is valid only when route certificates prove resource class, queue wait, and co-run pressure.",
+    },
+    (
+        "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Optimizer metadata should not be judged by one lock-count or throughput benchmark.",
+    },
+    (
+        "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback metadata needs accepted-schedule, retry, latency, allocation, and stale-route measurements.",
+    },
+    (
+        "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained lookup fallback is explicitly routed through interleaving, retry, latency, and stale-route tests.",
+    },
+    (
+        "2026-06-05-index-checkpoints-move-recovery-risk-from-rebuild-time-to-derived-state-correctness",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Logical node indirection provides an alternative to direct child pointers and full root-to-leaf copying.",
+    },
+    (
+        "2026-06-05-adaptive-execution-makes-compilation-a-runtime-route-not-a-startup-tax",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Short retained reads and first-run statements need route tests before choosing compilation or batching.",
+    },
+    (
+        "2026-06-05-adaptive-execution-makes-compilation-a-runtime-route-not-a-startup-tax",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Compilation and specialization are valid only when they do not starve network IO, owners, or GPU queues.",
+    },
+    (
+        "2026-06-05-transaction-triaging-turns-admission-metadata-into-execution-locality",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The evidence warns that generic load-balanced ingress can create wrong-owner hops and cold metadata paths.",
+    },
+    (
+        "2026-06-05-transaction-triaging-turns-admission-metadata-into-execution-locality",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Silo evaluation does not cover pgwire, MVCC, WAL, recovery, or GPU-resident snapshots.",
+    },
+    (
+        "2026-06-05-transaction-triaging-turns-admission-metadata-into-execution-locality",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The wrong-owner risk cautions against placement policies that add cross-owner hops and cold indirection.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-metadata-must-prove-both-correctness-and-pressure-shape",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner routing is valid only when the pressure proof names owner, budgets, setup cost, fallback, and timeout.",
+    },
+    (
         "2026-06-07-taurus-mm-makes-multi-master-snapshots-cheap-enough-for-shared-storage",
         "snapshot_frontier_vectors",
     ): {
