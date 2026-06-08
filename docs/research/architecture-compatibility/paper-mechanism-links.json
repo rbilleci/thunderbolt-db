@@ -115309,12 +115309,13 @@
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: benchmark",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Elle-style history witnesses require benchmark transactions that record snapshot and WAL frontier evidence.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 12
@@ -115399,12 +115400,13 @@
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: evaluate",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "TMTS tiering transfer depends on evaluated latency-pressure behavior before GPU DB placement adoption.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 136
@@ -115719,12 +115721,13 @@
           "link_basis": "keyword",
           "mechanism_id": "gpu_oltp_conflict_ordering",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: evaluate",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "HDCC conflict ordering is tied to Deneva evaluations, so GPU DB adoption needs comparable workload gates.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 16
@@ -115785,12 +115788,13 @@
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: proof gate",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Snapshot-frontier use is explicitly a replay proof gate for live order and visibility reconstruction.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 11
@@ -115834,12 +115838,13 @@
           "link_basis": "keyword",
           "mechanism_id": "learned_optimizer_advisor",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: instead of",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "alternative_to"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence describes an alternative to this mechanism",
+          "relation_review_note": "PACE's progressive generator-surrogate loop is an adversarial alternative to trusted learned advisors.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "alternative_to",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 73
@@ -115873,12 +115878,13 @@
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: risk",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "warns_against"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence warns against adopting this mechanism without constraints",
+          "relation_review_note": "PACE does not study placement or GPU queues, warning against inferring tier-placement support from it.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "warns_against",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 19
@@ -115939,12 +115945,13 @@
           "link_basis": "keyword",
           "mechanism_id": "bounded_descriptor_reclamation",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: rather than",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "alternative_to"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence describes an alternative to this mechanism",
+          "relation_review_note": "PACE transfers as defensive mutable optimizer state rather than descriptor reclamation machinery.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "alternative_to",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 15
@@ -116050,12 +116057,13 @@
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: unless",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "only_valid_if"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence supports this mechanism only under named conditions",
+          "relation_review_note": "The synthesis calls for placement work only after stronger networking, admission, or cold-tier evidence.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "only_valid_if",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 13
@@ -116083,12 +116091,13 @@
           "link_basis": "keyword",
           "mechanism_id": "deficit_fairness",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: benchmark",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Deficit fairness needs route-safety benchmarks under pressure, slow-tier neighbors, and poisoning workloads.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 6
@@ -116656,12 +116665,13 @@
           "link_basis": "keyword",
           "mechanism_id": "htap_freshness_router",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: test ",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "HTAP freshness routing needs explicit WAL/COPY chunk and queue-depth tests before adoption.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 7
@@ -116705,12 +116715,13 @@
           "link_basis": "keyword",
           "mechanism_id": "bounded_descriptor_reclamation",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: instead of",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "alternative_to"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence describes an alternative to this mechanism",
+          "relation_review_note": "Bamboo's early-retirement dependency path is an alternative to occupying descriptor-owner wait slots.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "alternative_to",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 52
@@ -116777,12 +116788,13 @@
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: instead of",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "alternative_to"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence describes an alternative to this mechanism",
+          "relation_review_note": "Bamboo replaces serialized waiting with commit-dependency proofs for retired hot-key updates.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "alternative_to",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 24
@@ -116841,12 +116853,13 @@
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: warning",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "warns_against"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence warns against adopting this mechanism without constraints",
+          "relation_review_note": "Bamboo warns that retained GPU snapshots must not observe retired but uncommitted versions.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "warns_against",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 16
@@ -116920,12 +116933,13 @@
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: not just",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "warns_against"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence warns against adopting this mechanism without constraints",
+          "relation_review_note": "The synthesis warns that hot-write routes need dependency and cascade-abort shape, not just write labels.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "warns_against",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 8
@@ -116951,12 +116965,13 @@
           "link_basis": "keyword",
           "mechanism_id": "owner_ring_bundling",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: benchmark",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Owner-ring bundling needs active-window benchmarks with response, WAL, NVMe, and dependency pressure.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 7
@@ -117017,12 +117032,13 @@
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: not just",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "warns_against"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence warns against adopting this mechanism without constraints",
+          "relation_review_note": "The synthesis warns that dependency witnesses must expose dependency and cascade-abort shape explicitly.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "warns_against",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
@@ -117052,12 +117068,13 @@
           "link_basis": "keyword",
           "mechanism_id": "multi_tier_placement",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: not just",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "warns_against"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence warns against adopting this mechanism without constraints",
+          "relation_review_note": "Cold-tier placement must expose IO shape and flush cadence rather than hide behind generic admission.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "warns_against",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 5
@@ -117083,12 +117100,13 @@
           "link_basis": "keyword",
           "mechanism_id": "effective_session_counting",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: benchmark",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Effective session counting needs active-window benchmarks with idle sessions and backpressure.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_note": "The benchmark priority explicitly holds many logical sessions idle while active work consumes bounded route resources.",
           "review_priority": "none",
           "review_status": "reviewed_supported",
@@ -117268,12 +117286,13 @@
           "link_basis": "keyword",
           "mechanism_id": "dependency_witnesses",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: rather than",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "alternative_to"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence describes an alternative to this mechanism",
+          "relation_review_note": "Gria's deterministic epoch ordering is an alternative to per-transaction dependency witness coordination.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "alternative_to",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 14
@@ -117537,12 +117556,13 @@
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: alternative",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "alternative_to"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence describes an alternative to this mechanism",
+          "relation_review_note": "Horae frames device persistence choices as alternatives to normal cost-based route optimization.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "alternative_to",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 14
@@ -117623,12 +117643,13 @@
           "link_basis": "keyword",
           "mechanism_id": "effective_session_counting",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: benchmark",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Electrode motivates protocol-edge wakeup benchmarks at 10K to 1M logical sessions.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 17
@@ -117933,12 +117954,13 @@
           "link_basis": "keyword",
           "mechanism_id": "deterministic_hot_write_templates",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: instead of",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "alternative_to"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence describes an alternative to this mechanism",
+          "relation_review_note": "GenericVC offers configurable commit validation as an alternative to fixed deterministic abort rules.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "alternative_to",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 11
@@ -118015,12 +118037,13 @@
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: benchmark",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Snapshot frontier vectors need active-window benchmarks covering conflict policy and retained visibility.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 6
@@ -118080,12 +118103,13 @@
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: benchmark",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "WAL-before-visibility needs active-window benchmarks across control frontiers and completion cells.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_note": "Durable frontier, deterministic replay, and no exposure of non-public batch versions are required.",
           "review_priority": "none",
           "review_status": "reviewed_supported",
@@ -118217,12 +118241,13 @@
           "link_basis": "keyword",
           "mechanism_id": "cost_based_route_optimizer",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: condition",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "only_valid_if"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence supports this mechanism only under named conditions",
+          "relation_review_note": "MindPalace-style conflict predicates are useful only when route conditions can be derived and evaluated.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "only_valid_if",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 23
@@ -118314,12 +118339,13 @@
           "link_basis": "keyword",
           "mechanism_id": "wal_before_visibility",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: evaluate",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "MindPalace omits high-concurrency WAL, crash replay, and serializable predicate evaluations.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 9
@@ -118347,12 +118373,13 @@
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: evaluate",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Retained snapshot transfer needs evaluation against CPU row state and GPU-resident summaries.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 8
@@ -118529,12 +118556,13 @@
           "link_basis": "keyword",
           "mechanism_id": "db_owned_cold_objects",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: risk",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "warns_against"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence warns against adopting this mechanism without constraints",
+          "relation_review_note": "HybridTier is transparent page tiering, warning against treating it as DB-owned cold-object placement.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "warns_against",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 10
@@ -118639,12 +118667,13 @@
           "link_basis": "keyword",
           "mechanism_id": "snapshot_frontier_vectors",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: rather than",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "alternative_to"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence describes an alternative to this mechanism",
+          "relation_review_note": "Skeena's cross-engine snapshot registry is an alternative to a single GPU DB frontier vector design.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "alternative_to",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 49
@@ -118715,12 +118744,13 @@
           "link_basis": "keyword",
           "mechanism_id": "retained_gpu_snapshots",
           "relation_candidate": {
-            "candidate_reason": "evidence snippet contains relation cue: measure",
+            "candidate_reason": "already classified as a non-support relation",
             "candidate_relation_type": "benchmark_required"
           },
-          "relation_reason": "paper evidence supports or motivates this mechanism",
-          "relation_review_status": "candidate_pending_review",
-          "relation_type": "supports",
+          "relation_reason": "paper evidence is inconclusive without a benchmark or proof gate",
+          "relation_review_note": "Retained GPU snapshots need table and segment placement experiments modeled on Skeena-style mixes.",
+          "relation_review_status": "reviewed_reclassified",
+          "relation_type": "benchmark_required",
           "review_priority": "none",
           "review_status": "auto_accepted",
           "score": 31
@@ -171185,18 +171215,18 @@
       "warns_against": 149
     },
     "relation_review_status_counts": {
-      "candidate_pending_review": 402,
+      "candidate_pending_review": 372,
       "not_required": 3399,
-      "reviewed_reclassified": 736,
+      "reviewed_reclassified": 766,
       "reviewed_support_candidate": 134
     },
     "relation_type_counts": {
-      "alternative_to": 100,
-      "benchmark_required": 370,
+      "alternative_to": 108,
+      "benchmark_required": 384,
       "contradicts": 3,
-      "only_valid_if": 179,
-      "supports": 3935,
-      "warns_against": 84
+      "only_valid_if": 181,
+      "supports": 3905,
+      "warns_against": 90
     },
     "removed_low_confidence_links": 48,
     "review_priority_counts": {

@@ -7504,6 +7504,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "alternative_to",
         "relation_review_note": "Retained snapshot failures should produce direct witnesses rather than only mismatch counters.",
     },
+    (
+        "2026-06-05-elle-turns-isolation-claims-into-generated-history-witnesses",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Elle-style history witnesses require benchmark transactions that record snapshot and WAL frontier evidence.",
+    },
+    (
+        "2026-06-05-tmts-makes-far-memory-tiering-an-slo-controlled-admission-problem",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "TMTS tiering transfer depends on evaluated latency-pressure behavior before GPU DB placement adoption.",
+    },
+    (
+        "2026-06-05-hdcc-mixes-deterministic-batches-and-optimistic-transactions-with-explicit-proof-points",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "HDCC conflict ordering is tied to Deneva evaluations, so GPU DB adoption needs comparable workload gates.",
+    },
+    (
+        "2026-06-05-hdcc-mixes-deterministic-batches-and-optimistic-transactions-with-explicit-proof-points",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot-frontier use is explicitly a replay proof gate for live order and visibility reconstruction.",
+    },
+    (
+        "2026-06-05-pace-treats-learned-route-models-as-poisonable-state",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "PACE's progressive generator-surrogate loop is an adversarial alternative to trusted learned advisors.",
+    },
+    (
+        "2026-06-05-pace-treats-learned-route-models-as-poisonable-state",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "PACE does not study placement or GPU queues, warning against inferring tier-placement support from it.",
+    },
+    (
+        "2026-06-05-pace-treats-learned-route-models-as-poisonable-state",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "PACE transfers as defensive mutable optimizer state rather than descriptor reclamation machinery.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-influence-control",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "The synthesis calls for placement work only after stronger networking, admission, or cold-tier evidence.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-influence-control",
+        "deficit_fairness",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Deficit fairness needs route-safety benchmarks under pressure, slow-tier neighbors, and poisoning workloads.",
+    },
+    (
+        "2026-06-05-new-storage-devices-need-route-visible-io-shape-contracts",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "HTAP freshness routing needs explicit WAL/COPY chunk and queue-depth tests before adoption.",
+    },
+    (
+        "2026-06-05-bamboo-retires-hotspot-locks-before-transaction-commit",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Bamboo's early-retirement dependency path is an alternative to occupying descriptor-owner wait slots.",
+    },
+    (
+        "2026-06-05-bamboo-retires-hotspot-locks-before-transaction-commit",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Bamboo replaces serialized waiting with commit-dependency proofs for retired hot-key updates.",
+    },
+    (
+        "2026-06-05-bamboo-retires-hotspot-locks-before-transaction-commit",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Bamboo warns that retained GPU snapshots must not observe retired but uncommitted versions.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-needs-pressure-shaped-contracts-across-rings-io-and-hot-keys",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that hot-write routes need dependency and cascade-abort shape, not just write labels.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-needs-pressure-shaped-contracts-across-rings-io-and-hot-keys",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring bundling needs active-window benchmarks with response, WAL, NVMe, and dependency pressure.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-needs-pressure-shaped-contracts-across-rings-io-and-hot-keys",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that dependency witnesses must expose dependency and cascade-abort shape explicitly.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-needs-pressure-shaped-contracts-across-rings-io-and-hot-keys",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Cold-tier placement must expose IO shape and flush cadence rather than hide behind generic admission.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-needs-pressure-shaped-contracts-across-rings-io-and-hot-keys",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Effective session counting needs active-window benchmarks with idle sessions and backpressure.",
+    },
+    (
+        "2026-06-05-gria-makes-deterministic-batches-adaptive-and-multi-versioned",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Gria's deterministic epoch ordering is an alternative to per-transaction dependency witness coordination.",
+    },
+    (
+        "2026-06-05-horae-separates-durable-order-control-from-parallel-data-writes",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Horae frames device persistence choices as alternatives to normal cost-based route optimization.",
+    },
+    (
+        "2026-06-05-electrode-keeps-protocol-fast-paths-in-the-kernel-not-full-logic",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Electrode motivates protocol-edge wakeup benchmarks at 10K to 1M logical sessions.",
+    },
+    (
+        "2026-06-05-genericvc-turns-mvcc-conflicts-into-configurable-validation-work",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "GenericVC offers configurable commit validation as an alternative to fixed deterministic abort rules.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-semantic-conflict-shape-not-only-resource-shape",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot frontier vectors need active-window benchmarks covering conflict policy and retained visibility.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-need-semantic-conflict-shape-not-only-resource-shape",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL-before-visibility needs active-window benchmarks across control frontiers and completion cells.",
+    },
+    (
+        "2026-06-05-mindpalace-makes-auto-mergeability-an-instance-specific-validation-target",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "MindPalace-style conflict predicates are useful only when route conditions can be derived and evaluated.",
+    },
+    (
+        "2026-06-05-mindpalace-makes-auto-mergeability-an-instance-specific-validation-target",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MindPalace omits high-concurrency WAL, crash replay, and serializable predicate evaluations.",
+    },
+    (
+        "2026-06-05-mindpalace-makes-auto-mergeability-an-instance-specific-validation-target",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshot transfer needs evaluation against CPU row state and GPU-resident summaries.",
+    },
+    (
+        "2026-06-05-hybridtier-tracks-both-long-term-heat-and-short-term-momentum-for-cxl-tiering",
+        "db_owned_cold_objects",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "HybridTier is transparent page tiering, warning against treating it as DB-owned cold-object placement.",
+    },
+    (
+        "2026-06-05-skeena-coordinates-snapshots-and-commits-across-autonomous-engines",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Skeena's cross-engine snapshot registry is an alternative to a single GPU DB frontier vector design.",
+    },
+    (
+        "2026-06-05-skeena-coordinates-snapshots-and-commits-across-autonomous-engines",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained GPU snapshots need table and segment placement experiments modeled on Skeena-style mixes.",
+    },
 }
 
 
