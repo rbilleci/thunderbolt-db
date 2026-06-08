@@ -8344,6 +8344,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "The WAL interaction must be measured to see whether append or flush work extends hot-key owner hold time.",
     },
+    (
+        "2026-06-05-cross-paper-synthesis-commit-decisions-need-a-recoverable-visibility-contract",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The only-if phrase is corpus-planning guidance; the retained synthesis still supports tiering as a visibility-contract topic.",
+    },
+    (
+        "2026-06-05-deuteronomy-makes-range-mvcc-a-logical-route-certificate",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than clause describes partition initialization; the retained evidence still supports range-owned routing metadata.",
+    },
+    (
+        "2026-06-05-deuteronomy-turns-the-recovery-log-into-a-version-cache-and-delivery-queue",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained snapshots are valid only if recovery cannot remove versions that have already been exposed to clients.",
+    },
+    (
+        "2026-06-05-krisp-makes-gpu-partitions-a-per-kernel-admission-decision",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "KRISP's per-kernel partition admission is an alternative to fixed process-wide or batch-wide GPU allocation.",
+    },
+    (
+        "2026-06-05-krisp-makes-gpu-partitions-a-per-kernel-admission-decision",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Descriptor policy can use KRISP-style partition cues only when per-kernel restriction state remains bounded and explicit.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-and-schedulers-must-become-stage-level-contracts",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Stage-level resource scheduling is explicitly routed through p50/p99 retained-lookup and co-scheduling stressors.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-and-schedulers-must-become-stage-level-contracts",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Logical range-visibility certificates are framed as an alternative to treating visibility as storage-side aftermath.",
+    },
+    (
+        "2026-06-05-hetexchange-turns-cpu-gpu-routing-into-optimizer-visible-operators",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback adoption needs the named proof gate that every route decision explains resident, transfer, fallback, or rejection.",
+    },
+    (
+        "2026-06-05-hetexchange-turns-cpu-gpu-routing-into-optimizer-visible-operators",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "HetExchange uses heuristic insertion, so optimizer-driven heterogeneous route search remains prototype work.",
+    },
+    (
+        "2026-06-05-performance-optimal-filters-need-route-specific-false-positive-budgets",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-local filter summaries require measured lookup cost and false-positive budgets before optimizer adoption.",
+    },
+    (
+        "2026-06-05-performance-optimal-filters-need-route-specific-false-positive-budgets",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Filter-descriptor transfer depends on evaluating false-positive precision, SIMD lookup cost, and practical filter sizes.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-choice-now-needs-cost-resource-and-conflict-certificates",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained lookup certificates need measured construction overhead and mixed-workload outcomes before adoption.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-choice-now-needs-cost-resource-and-conflict-certificates",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier placement depends on measuring continuation cost across GPU memory, CPU DRAM, pinned host buffers, NVMe, and future tiers.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-choice-now-needs-cost-resource-and-conflict-certificates",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback policy is explicitly included in the route-certificate and mixed-workload benchmark gate.",
+    },
+    (
+        "2026-06-05-gpu-joins-need-partitioning-placement-and-skew-as-explicit-route-traits",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Join fallback needs proof-gate comparisons across resident, streamed, co-processed, CPU fallback, and rejected routes.",
+    },
+    (
+        "2026-06-05-polardb-imci-makes-freshness-a-replay-pipeline-not-a-side-channel",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "WAL visibility routing is valid only if skipped segments and false-positive continuation costs remain explainable.",
+    },
+    (
+        "2026-06-05-polardb-imci-makes-freshness-a-replay-pipeline-not-a-side-channel",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Insertion-ordered column-index row groups are an alternative physical route shape to primary-key-ordered planning assumptions.",
+    },
+    (
+        "2026-06-05-fiting-tree-makes-resident-index-memory-a-tunable-error-budget",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Resident index placement needs HBM-benefit and stale-generation retirement measurements before snapshot adoption.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-freshness-windows-need-compact-proof-indexes",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots need freshness, index-proof, delete-density, and fallback measurements before adding GPU index families.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-freshness-windows-need-compact-proof-indexes",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback is part of the resident lookup proof route and must be measured under skew before adoption.",
+    },
+    (
+        "2026-06-05-ccaas-separates-conflict-metadata-from-execution-and-storage",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Conflict-metadata ownership is explicitly a prototype gate tied to p95 saturated-owner latency attribution.",
+    },
+    (
+        "2026-06-05-deuteronomy-2-0-turns-cache-granularity-into-a-hot-path-contract",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor reclamation needs stale-reader retirement tests over rebuild waste, stalls, latency, and retained memory.",
+    },
+    (
+        "2026-06-05-deuteronomy-2-0-turns-cache-granularity-into-a-hot-path-contract",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot frontier transfer depends on stale-reader tests proving old generations retire only after compatible readers drain.",
+    },
+    (
+        "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "BarrierFS-style ordering boundaries are an alternative to treating every visibility-adjacent route boundary as flush-and-wait.",
+    },
+    (
+        "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cold-tier IO ownership needs queue-depth benchmarks that preserve dependency epochs and crash-safe route freshness.",
+    },
+    (
+        "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Ordering boundaries are an alternative witness shape to immediate durability waits at every route boundary.",
+    },
+    (
+        "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cold-tier placement needs IO-owner queue-depth benchmarks while preserving dependency and freshness epochs.",
+    },
+    (
+        "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Ordered storage boundaries are an alternative to requiring immutable route roots to wait on every durability edge.",
+    },
+    (
+        "2026-06-05-epoxy-makes-snapshot-metadata-a-cross-engine-contract",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Epoxy frames CPU truth, GPU snapshots, route metadata, and cold tiers as separate engines with explicit snapshot boundaries.",
+    },
+    (
+        "2026-06-05-epoxy-makes-snapshot-metadata-a-cross-engine-contract",
+        "isolation_trace_oracle",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Epoxy provides snapshot isolation, so it cautions against treating its metadata contract as serializable trace evidence.",
+    },
 }
 
 
