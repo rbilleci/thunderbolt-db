@@ -6454,6 +6454,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "supports",
         "relation_review_note": "The unless cue is a source-priority note; the synthesis still preserves multi-tier placement as a relevant publication-certificate gap.",
     },
+    (
+        "2026-06-04-price-separates-portable-cardinality-priors-from-database-specific-tuning",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "PRICE-style priors are useful only when join-condition features and route-specific costs stay visible to the optimizer.",
+    },
+    (
+        "2026-06-04-price-separates-portable-cardinality-priors-from-database-specific-tuning",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Transferable feature summaries are an alternative to training a new opaque model for every database deployment.",
+    },
+    (
+        "2026-06-04-price-separates-portable-cardinality-priors-from-database-specific-tuning",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue concerns model training; bounded feature descriptors still support explicit route metadata.",
+    },
+    (
+        "2026-06-04-price-separates-portable-cardinality-priors-from-database-specific-tuning",
+        "effective_session_counting",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The entry explicitly warns against per-session learned state at the 1M logical-session target.",
+    },
+    (
+        "2026-06-04-adaptive-htap-makes-freshness-a-resource-scheduling-input",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hardware accelerators are future work, so GPU tier placement needs direct HBM, transfer, and launch measurements.",
+    },
+    (
+        "2026-06-04-cd-search-makes-gpu-co-scheduling-a-classified-resource-partition-problem",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Freshness co-scheduling is valid only when measured resource pairs preserve p95 latency and write-path freshness.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Freshness estimates and dirty-frontier coverage need route-certificate measurements before policy adoption.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless clause is source-priority guidance; the retained certificate evidence still supports tier-placement routing.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Measured GPU resource classes must be validated before they can drive resource-DAG co-scheduling.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot-generation and dirty-frontier fields need measured route-certificate validation before transfer.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-should-combine-freshness-estimates-and-measured-resourc",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fallback is valid only when the recorded certificate explains stale-snapshot rejection and route choice.",
+    },
+    (
+        "2026-06-04-mako-decouples-fast-speculative-certification-from-slow-durable-replication",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Speculative writes may feed retained snapshots only when the durable visibility boundary proves client-visible safety.",
+    },
+    (
+        "2026-06-04-mako-decouples-fast-speculative-certification-from-slow-durable-replication",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Partition-local append lanes and visibility watermarks require retained-snapshot coverage benchmarks.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-durability-shape-and-tier-state",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The three-state publication path requires a benchmark before GPU-resident retained snapshots can rely on it.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-durability-shape-and-tier-state",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner queue and visibility trace fields are explicitly benchmark inputs rather than established owner policy.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-durability-shape-and-tier-state",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-root publication needs certificate benchmarks covering tier source, snapshot generation, and durable visibility.",
+    },
+    (
+        "2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Cold-fetched data can feed retained GPU snapshots only when it proves the requested visibility boundary.",
+    },
+    (
+        "2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The million-TPC-C result weakens logging and isolation, so it warns against direct conflict-ordering transfer.",
+    },
+    (
+        "2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Session scaling is valid only if cold-tier queues and memory growth remain bounded and visible.",
+    },
+    (
+        "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Write-behind logging proposes compact visibility certificates as an alternative to replaying a large physical log.",
+    },
+    (
+        "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "GPU-resident snapshots may include gap-era rows only when the route certificate marks and enforces invisibility.",
+    },
+    (
+        "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
+        "log_structured_warm_tier",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Changed-state-first persistence is an alternative warm-tier logging shape to tuple after-image logging.",
+    },
+    (
+        "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Clean and uncertain timestamp ranges are an alternative frontier representation to ordinary WAL-derived vectors.",
+    },
+    (
+        "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Compact durability certificates are presented as an alternative publication root for future persistent tiers.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Tier placement is valid only when freshness and visibility gaps are explicit certificate fields.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fast local freshness is safe only when the route proves convergence back to a durable global prefix.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Freshness routing is valid only when transient local order and stable publication boundaries are both proved.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback needs controlled refresh-lag benchmarks before certificate decisions are trusted.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-is-now-a-route-certificate-dimension",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained GPU reads require refresh-lag and crash/restart benchmarks across stable and delta-merge routes.",
+    },
+    (
+        "2026-06-04-mvrc-robustness-turns-route-isolation-into-a-static-template-property",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Static route certification must measure template retirement, fallback, abort/retry, and p99 behavior before adoption.",
+    },
 }
 
 
