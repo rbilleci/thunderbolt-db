@@ -10234,6 +10234,90 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "alternative_to",
         "relation_review_note": "Appending a new physical copy and publishing a mapping is an alternative to fixed-home warm-tier updates.",
     },
+    (
+        "2026-06-07-cross-paper-synthesis-warm-tiers-need-logical-witnesses-and-movable-homes",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Movable warm-tier homes need stable-id, publication, cleaner, retained-snapshot, and route-holon benchmarks before adoption.",
+    },
+    (
+        "2026-06-07-hostcc-makes-host-congestion-a-local-control-loop",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Host-local owner-ring pressure control needs measured admission changes before NIC, PCIe, pinned-buffer, or memory queues saturate.",
+    },
+    (
+        "2026-06-07-vweaver-turns-mvcc-scan-visibility-into-an-access-path",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "vWeaver cautions that immutable resident snapshots also need a compact visibility directory, not only route-root buffers.",
+    },
+    (
+        "2026-06-07-vweaver-turns-mvcc-scan-visibility-into-an-access-path",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "vWeaver warns that WAL/catalog/resident generations are insufficient unless MVCC visibility search metadata is explicit.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-freshness-needs-explicit-search-metadata",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback routing needs route-witness, visibility-directory, and mixed-pressure benchmarks before freshness policy adoption.",
+    },
+    (
+        "2026-06-07-zen-minimizes-persistent-write-amplification-by-moving-cc-metadata-out-of-nvm",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "ZEN's split durable-payload and volatile-CC design requires route-cost tests before optimizer policy can transfer.",
+    },
+    (
+        "2026-06-07-mod-makes-durability-fast-by-minimizing-ordered-persist-barriers",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MOD-style structural sharing needs cross-owner catalog and residency metadata measurements before owner bundling adoption.",
+    },
+    (
+        "2026-06-07-mod-makes-durability-fast-by-minimizing-ordered-persist-barriers",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Out-of-place durable shadow publication is an alternative to dependency witnesses built around undo/redo overwrite recovery.",
+    },
+    (
+        "2026-06-07-graphene-schedules-scarce-resources-by-troublesome-work-first",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Bounded troublesome-work selection is an alternative to rescoring an entire owner-ring backlog on every wakeup.",
+    },
+    (
+        "2026-06-07-graphene-schedules-scarce-resources-by-troublesome-work-first",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Graphene frames parsed route work as a resource DAG rather than independent freshness-router queue entries.",
+    },
+    (
+        "2026-06-07-asap-moves-persistence-waits-behind-dependency-witnesses",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor compaction and chain collapse need measurements that preserve recovery order while bounding retired metadata.",
+    },
+    (
+        "2026-06-07-tfc-makes-credits-the-queueing-boundary",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Per-boundary token budgets for owner, retained-read, GPU, refresh, and response rings require prototype validation.",
+    },
 }
 
 
