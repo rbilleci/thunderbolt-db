@@ -1624,6 +1624,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Learned policy output is valid only when published as immutable generations that hot workers evaluate cheaply.",
     },
+    (
+        "2026-06-07-pilotscope-turns-learned-planning-into-bounded-push-pull-drivers",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Learned policy publication is useful only if retired metadata remains bounded and readers are not stalled.",
+    },
+    (
+        "2026-06-07-asap-treats-persist-ordering-as-recoverable-speculation",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The entry explicitly requires owner queue, descriptor publication, stale-route, and two-device speculation measurements.",
+    },
+    (
+        "2026-06-07-steam-prunes-mvcc-garbage-on-the-write-path-before-chains-grow",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Steam reports active-list snapshot costs, but GPU DB still needs a retained-snapshot frontier benchmark.",
+    },
+    (
+        "2026-06-07-steam-prunes-mvcc-garbage-on-the-write-path-before-chains-grow",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The proposed transfer is gated on write/read latency, cleanup debt, retired bytes, and snapshot-age measurements.",
+    },
+    (
+        "2026-06-07-rapidlane-turns-hot-shared-counters-into-deferred-commit-time-deltas",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Deferred object operations avoid immediate read-modify-write descriptor churn for narrow hot-counter cases.",
+    },
+    (
+        "2026-06-07-rapidlane-turns-hot-shared-counters-into-deferred-commit-time-deltas",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "The hot-key fast path is valid only with typed deferred deltas, explicit preconditions, and commit-time proof.",
+    },
+    (
+        "2026-06-07-tips-keeps-persistent-indexes-out-of-the-request-s-critical-path",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Rebuildable resident metadata is acceptable only if normal SQL commits still obey WAL-before-visibility.",
+    },
+    (
+        "2026-06-07-tips-keeps-persistent-indexes-out-of-the-request-s-critical-path",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Overlay-based retained reads need explicit fallback when pending overlay depth would exceed the route SLO.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-persistent-metadata-needs-overlay-replay-and-witnesses",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis names overlay-depth, crash-state, replay-lag, and snapshot-correct range/pruning benchmarks.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-durable-metadata-needs-recoverable-shape",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner handoff is supported only when the communication and commit boundary are worth making explicit.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-durable-metadata-needs-recoverable-shape",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The only-if phrase is corpus-planning guidance; the mechanism evidence supports immutable retained snapshots.",
+    },
+    (
+        "2026-06-06-splinterdb-turns-nvme-storage-into-a-cpu-efficiency-problem",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Branch-sized sequential rebuilds are presented as an alternative to scattered tuple-chain reads.",
+    },
+    (
+        "2026-06-06-memstrata-makes-cxl-tiering-an-isolation-and-outlier-control-problem",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Hardware-managed tiering is useful only if route-critical object placement is not treated as stable by assumption.",
+    },
+    (
+        "2026-06-06-colloid-balances-loaded-tier-latency-instead-of-hoarding-hot-pages",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The loaded-latency evidence motivates measuring contention-sensitive hot-write placement choices.",
+    },
+    (
+        "2026-06-06-dumbo-makes-durable-read-only-transactions-wait-only-for-older-non-durable-writes",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The marker-array design is explicitly framed as a GPU DB WAL metadata benchmark.",
+    },
+    (
+        "2026-06-06-dumbo-makes-durable-read-only-transactions-wait-only-for-older-non-durable-writes",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Compact per-owner publication arrays are proposed instead of every read touching a heavyweight transaction table.",
+    },
+    (
+        "2026-06-06-dumbo-makes-durable-read-only-transactions-wait-only-for-older-non-durable-writes",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Per-owner compact state arrays require read, writer-publication, stale-generation, and retired-token measurements.",
+    },
+    (
+        "2026-06-06-leon-keeps-learned-route-choice-behind-an-expert-optimizer",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "LEON frames learned planning as assistance to, not replacement for, mature optimizer enumeration and costing.",
+    },
+    (
+        "2026-06-06-leon-keeps-learned-route-choice-behind-an-expert-optimizer",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "ML-guided exploration is valid only if it does not consume GPU or pinned-buffer credits needed by admitted work.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-durable-publication-needs-small-proofs-with-bounded-fallback",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained lookup, mutation, refresh, retired-metadata, and p99 route behavior are named measurement gates.",
+    },
+    (
+        "2026-06-06-dhtm-treats-durability-as-part-of-the-transaction-fast-path",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The durability fast path needs write latency, retained-read fallback, staleness, and recovery replay measurements.",
+    },
+    (
+        "2026-06-06-dhtm-treats-durability-as-part-of-the-transaction-fast-path",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Silent fast-path expansion risks unbounded tail latency without typed overflow and fallback outcomes.",
+    },
+    (
+        "2026-06-06-dhtm-treats-durability-as-part-of-the-transaction-fast-path",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots need durability-bandwidth stress tests for WAL, invalidation, descriptors, and GPU staging.",
+    },
+    (
+        "2026-06-06-drtm-turns-hardware-transactions-into-a-local-fast-path-with-remote-locks-as-proof",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Local fast execution is valid only after remote, cold, resident, WAL, and invalidation dependencies become bounded proofs.",
+    },
+    (
+        "2026-06-06-drtm-turns-hardware-transactions-into-a-local-fast-path-with-remote-locks-as-proof",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained-route execution is valid only when every remote and resident dependency has a bounded proof.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-proof-before-execution-not-cleanup-after-failure",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis requires queue wait, retained latency, refresh starvation, WAL reservation, stale-generation, and safety measurements.",
+    },
+    (
+        "2026-06-06-nvwal-makes-durable-logging-a-byte-granular-persistent-memory-protocol",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "NVWAL targets SQLite-style mobile logging and warns against direct adoption for multi-session GPU-resident snapshots.",
+    },
+    (
+        "2026-06-06-nvwal-makes-durable-logging-a-byte-granular-persistent-memory-protocol",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Byte-addressable logging argues for transaction-shaped records rather than page-write shaped owner coordination.",
+    },
+    (
+        "2026-06-06-nvwal-makes-durable-logging-a-byte-granular-persistent-memory-protocol",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The evidence favors semantic log and allocator proofs rather than page-write dependency tracking.",
+    },
+    (
+        "2026-06-06-lance-makes-random-columnar-access-a-structural-encoding-problem",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Lance is not a transactional WAL/MVCC/recovery design, so it cautions against inferring WAL-before-visibility support.",
+    },
 }
 
 
