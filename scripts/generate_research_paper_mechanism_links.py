@@ -7714,6 +7714,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Retained GPU snapshots need table and segment placement experiments modeled on Skeena-style mixes.",
     },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-now-need-tier-merge-and-snapshot-contracts",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The synthesis replaces a single GPU-route eligibility flag with explicit semantic, placement, and freshness fields.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-certificates-now-need-tier-merge-and-snapshot-contracts",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The route-certificate framing shifts conflict handling from a generic GPU-eligible decision to explicit proof and fallback fields.",
+    },
+    (
+        "2026-06-05-oltpim-splits-pointer-chasing-metadata-from-tuple-payloads-for-near-memory-oltp",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "OLTPim latency and throughput results do not directly transfer to durable WAL, fsync, archive, checkpoint, or cold-tier paths.",
+    },
+    (
+        "2026-06-05-oltpim-splits-pointer-chasing-metadata-from-tuple-payloads-for-near-memory-oltp",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained lookup transfer is explicitly gated on replaying CPU truth, rebuilding metadata, and skew benchmarks.",
+    },
+    (
+        "2026-06-05-mot-productionizes-many-core-occ-inside-a-full-sql-engine",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "MOT is CPU main-memory OLTP and omits GPU execution, retained MVCC snapshots, over-resident analytics, and heterogeneous tiers.",
+    },
+    (
+        "2026-06-05-mot-productionizes-many-core-occ-inside-a-full-sql-engine",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "MOT does not evaluate NVMe, CXL, GPU memory, or over-resident tiering, so its results caution against direct placement transfer.",
+    },
+    (
+        "2026-06-05-pim-tree-makes-near-data-ordered-indexes-skew-resistant",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "GPU-resident keys or summaries are useful only when hot ranges and hot keys are measured and routed through cheap fallback.",
+    },
+    (
+        "2026-06-05-reef-protects-urgent-gpu-work-by-resetting-idempotent-best-effort-kernels",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Restartable GPU work can support WAL boundaries only if killed refresh/statistics kernels rebuild from CPU truth safely.",
+    },
+    (
+        "2026-06-05-flexmem-adapts-tier-migration-to-emerging-hot-pages-and-promotion-failures",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "FlexMem transfer depends on proving route telemetry can attribute latency to migration or tier misses.",
+    },
+    (
+        "2026-06-05-flexmem-adapts-tier-migration-to-emerging-hot-pages-and-promotion-failures",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Warm-segment protection for retained snapshots is gated on p95/p99 latency, hit ratio, transfer bytes, refresh bytes, and churn.",
+    },
+    (
+        "2026-06-05-flexmem-adapts-tier-migration-to-emerging-hot-pages-and-promotion-failures",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "FlexMem warns against treating CXL, far memory, host DRAM, or HBM residency as simple LRU or hotness-threshold state.",
+    },
+    (
+        "2026-06-05-flexmem-adapts-tier-migration-to-emerging-hot-pages-and-promotion-failures",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The memory-benchmark evidence needs mixed OLTP/HTAP workload measurement before informing freshness-sensitive routing.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-accelerator-routes-need-adaptive-tier-confidence",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained GPU placement is supported only when recent batches and failed admissions justify the memory they displace.",
+    },
+    (
+        "2026-06-05-gpu-joins-need-hardware-shaped-partition-and-output-contracts",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Resident join routing is valid only when reuse and output-buffer capacity can hide transfer behind useful GPU work.",
+    },
+    (
+        "2026-06-05-gpu-joins-need-hardware-shaped-partition-and-output-contracts",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Tiered join placement works only when planner-visible reuse and output capacity justify HBM residency or cold streaming.",
+    },
+    (
+        "2026-06-05-gpu-joins-need-hardware-shaped-partition-and-output-contracts",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Block or thread output allocation supports deterministic templates only under fill and skew conditions that preserve useful work.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-fallback-lanes-and-gpu-route-contracts",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis names end-to-end mixed write, resident join, long-snapshot, and high-session benchmarks as the remaining gate.",
+    },
+    (
+        "2026-06-05-deferred-runtime-pipelining-turns-hot-writes-into-ordered-intentions",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Deferred runtime intentions avoid immediate execution and descriptor churn through explicit dependency records.",
+    },
+    (
+        "2026-06-05-larger-than-memory-oltp-needs-device-specific-cold-paths",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Compact cold summaries are valid only if false-positive cold reads do not dominate p99 across measured device paths.",
+    },
+    (
+        "2026-06-05-gpu-oltp-concurrency-is-launch-shape-and-conflict-resolution-bound",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The gCCTB evidence is benchmark-centered and requires comparable GPU DB concurrency evaluation before policy adoption.",
+    },
+    (
+        "2026-06-05-gpu-oltp-concurrency-is-launch-shape-and-conflict-resolution-bound",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring transfer depends on measuring GPU DB launch shape and conflict-resolution behavior against the evaluated schemes.",
+    },
+    (
+        "2026-06-05-zero-shot-cost-models-separate-route-shape-from-database-state",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Zero-shot cost predictions are useful only when observed Q-error and bad-route rate remain under deterministic thresholds.",
+    },
+    (
+        "2026-06-05-taobench-turns-session-scale-into-correlated-request-pressure",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained read benchmarks must model correlated fan-out and partial invalidation rather than repeated identical point lookups.",
+    },
+    (
+        "2026-06-05-taobench-turns-session-scale-into-correlated-request-pressure",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "TAOBench provides a better 1M logical-session target, but the GPU DB session policy still needs benchmark validation.",
+    },
+    (
+        "2026-06-05-taobench-turns-session-scale-into-correlated-request-pressure",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "TAOBench's high fan-out transactions warn that hot-write templates must account for tail latency and contention risk.",
+    },
+    (
+        "2026-06-05-taobench-turns-session-scale-into-correlated-request-pressure",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring transfer needs measurements for logical sessions, active requests, fan-out, response bytes, pressure, and contamination.",
+    },
+    (
+        "2026-06-05-taobench-turns-session-scale-into-correlated-request-pressure",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained snapshots are valid only if benchmarks include correlated bursts, tenant sharing, and partial generation invalidation.",
+    },
+    (
+        "2026-06-05-lithos-treats-gpu-sharing-as-an-os-scheduling-problem",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The TPC scheduler maps to owner-held resource budgets rather than a single FIFO stream scheduling model.",
+    },
+    (
+        "2026-06-05-plor-gives-aborted-hot-transactions-timestamp-priority",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "PLOR transfer needs mixed hot-write, fan-out, and retained-read measurements before changing owner-ring priorities.",
+    },
+    (
+        "2026-06-05-plor-gives-aborted-hot-transactions-timestamp-priority",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The WAL interaction must be measured to see whether append or flush work extends hot-key owner hold time.",
+    },
 }
 
 
