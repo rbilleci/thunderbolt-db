@@ -3094,6 +3094,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Promotion to CPU or GPU cache is worthwhile only when reuse repays the tier-resource cost.",
     },
+    (
+        "2026-06-03-path-to-gpu-initiated-i-o-for-data-intensive-systems",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Random-read microbenchmarks do not prove SQL, MVCC, WAL, response-ring, or session-scale safety.",
+    },
+    (
+        "2026-06-03-path-to-gpu-initiated-i-o-for-data-intensive-systems",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The accessible evidence is only a publication record and slides, so route-root transfer needs caution.",
+    },
+    (
+        "2026-06-03-aria-deterministic-oltp-batches",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Aria's conflict-class reordering is an alternative to treating every hot overlap as abort or owner routing.",
+    },
+    (
+        "2026-06-03-aria-deterministic-oltp-batches",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner routing is explicitly gated on conflict-rate crossover, tail latency, queue wait, and abort measurements.",
+    },
+    (
+        "2026-06-03-aria-deterministic-oltp-batches",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Aria probes read/write reservation metadata rather than building one global serial dependency witness graph.",
+    },
+    (
+        "2026-06-03-empirical-in-memory-mvcc-design-tradeoffs",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Generation-root publication is proposed as prototype work with CPU build, cache, GPU-byte, and latency metrics.",
+    },
+    (
+        "2026-06-03-chiller-contention-centric-transaction-partitioning",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The entry requires a hot-record benchmark comparing owner-order routing against optimistic retry.",
+    },
+    (
+        "2026-06-03-chiller-contention-centric-transaction-partitioning",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Chiller is 2PL-centered and does not directly solve MVCC snapshot or GPU-resident visibility correctness.",
+    },
+    (
+        "2026-06-03-memtis-access-distribution-memory-tiering",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "MEMTIS is OS memory tiering, not DBMS-owned WAL, MVCC, or GPU-resident snapshot management.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-visibility-contention-and-placement-need-distribution-summaries",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis names distribution-aware placement, anti-thrash behavior, and sub-segment benchmarks as required gates.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-visibility-contention-and-placement-need-distribution-summaries",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Admission policy is routed through measured chain length, conflict heat, placement, and session-memory probes.",
+    },
+    (
+        "2026-06-03-tas-tcp-acceleration-as-an-os-service",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evaluated 64K-connection scale is below the 1M logical-session target and needs session-scale validation.",
+    },
+    (
+        "2026-06-03-hint-qpt-hints-for-robust-query-performance-tuning",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback reasons and route-fragility handling are framed as a proof gate for bad-choice reduction.",
+    },
+    (
+        "2026-06-03-hint-qpt-hints-for-robust-query-performance-tuning",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Bad cardinality, byte, queue, response, or refresh estimates can turn retained GPU routes into slow fallbacks.",
+    },
+    (
+        "2026-06-03-hint-qpt-hints-for-robust-query-performance-tuning",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Route-risk evidence warns that owner routing needs estimate and queue-risk constraints before adoption.",
+    },
+    (
+        "2026-06-03-hint-qpt-hints-for-robust-query-performance-tuning",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Hint-QPT is an interactive tuning demonstration, not production descriptor-lifetime evidence.",
+    },
+    (
+        "2026-06-03-taurus-lightweight-parallel-logging",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Dependency-vector transfer is gated on throughput, commit wait, fsync bytes, recovery time, and replay proof.",
+    },
+    (
+        "2026-06-03-taurus-lightweight-parallel-logging",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Command logging is cleanest only under deterministic stored-procedure replay, narrower than ad hoc SQL.",
+    },
+    (
+        "2026-06-03-bounded-delay-multiversion-concurrency-and-precise-gc",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Session counting is valid only if retention follows active holders, not idle connection count.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-roots-frontiers-and-active-holders",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The synthesis redirects next work toward production MVCC GC and dual-snapshot HTAP rather than GPU-OLAP pipelines.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-roots-frontiers-and-active-holders",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The evidence favors small route, queue, and dependency tokens over broad mutable WAL-related state movement.",
+    },
+    (
+        "2026-06-03-ankerdb-fine-granular-virtual-snapshotting",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot frontiers need proof that old generations retire when the last holder releases.",
+    },
+    (
+        "2026-06-03-ankerdb-fine-granular-virtual-snapshotting",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "VM snapshot microbenchmarks motivate but do not replace GPU DB old-version GC measurements.",
+    },
+    (
+        "2026-06-03-ankerdb-fine-granular-virtual-snapshotting",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Column-generation route roots are explicitly proposed as a CPU-side prototype before adoption.",
+    },
+    (
+        "2026-06-03-ankerdb-fine-granular-virtual-snapshotting",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Generation retirement after holder release is an alternative to scanning every row-version descriptor.",
+    },
+    (
+        "2026-06-03-ankerdb-fine-granular-virtual-snapshotting",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Refresh-cost versus route-freshness behavior is named as the deciding benchmark.",
+    },
+    (
+        "2026-06-03-lero-learning-to-rank-query-optimization",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Learning-to-rank transfer requires route-choice evaluation under cardinality error and bounded candidate growth.",
+    },
+    (
+        "2026-06-03-lero-learning-to-rank-query-optimization",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Reported optimizer gains still require GPU DB benchmark validation before learned advice is trusted.",
+    },
+    (
+        "2026-06-03-lero-learning-to-rank-query-optimization",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "A retained GPU route is fast only if generation validity, queue capacity, holders, and memory budgets hold.",
+    },
+    (
+        "2026-06-03-lero-learning-to-rank-query-optimization",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Tier placement advice is useful only if resident validity, GPU capacity, snapshot holders, and budgets hold.",
+    },
 }
 
 
