@@ -9394,6 +9394,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "POP-style reclamation needs database descriptor benchmarks beyond the public safe-memory-reclamation suites.",
     },
+    (
+        "2026-06-06-publish-on-ping-makes-reclamation-demand-driven-instead-of-read-path-pessimistic",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained-snapshot publication needs a long-reader stress benchmark before snapshot-frontier transfer is trusted.",
+    },
+    (
+        "2026-06-06-publish-on-ping-makes-reclamation-demand-driven-instead-of-read-path-pessimistic",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "POP's CPU safe-memory-reclamation scope cautions against direct MVCC GC frontier inference.",
+    },
+    (
+        "2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Chain-ordered replica acknowledgements are an alternative witness shape to leader fan-in dependency tracking.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-retirement-freshness-and-replication-all-need-explicit-fences",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Dependency witnesses are supported only when each owner publishes the named fence for its route boundary.",
+    },
+    (
+        "2026-06-06-fineline-turns-durable-storage-into-an-indexed-recovery-log",
+        "log_structured_warm_tier",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "FineLine's single indexed log is an alternative to maintaining separate synchronized persistent tier representations.",
+    },
+    (
+        "2026-06-06-fineline-turns-durable-storage-into-an-indexed-recovery-log",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Indexed-log recovery must be benchmarked for commit p99 and resident snapshot reconstruction before frontier adoption.",
+    },
+    (
+        "2026-06-06-occ-batching-turns-contention-into-a-reorderable-route-batch",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Batch reordering uses a validator dependency graph as an alternative to committing in arrival order.",
+    },
+    (
+        "2026-06-06-occ-batching-turns-contention-into-a-reorderable-route-batch",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Semantic OCC batching is an alternative to treating same-shape microbatching as only amortized execution.",
+    },
+    (
+        "2026-06-06-occ-batching-turns-contention-into-a-reorderable-route-batch",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU OLTP conflict ordering needs prototype measurements for reorder cost, validation bottlenecks, and abort behavior.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-publication-needs-explicit-fences",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fast publication paths support dependency witnesses only when the safe fence is explicitly named.",
+    },
+    (
+        "2026-06-06-self-tuning-scheduling-makes-route-priority-a-measured-control-loop",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Database-owned scheduling is an alternative control loop rather than evidence for descriptor reclamation itself.",
+    },
+    (
+        "2026-06-06-hdtx-coalesces-remote-transaction-fences-without-giving-up-priority",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Aggressive route admission is valid only if WAL, visibility, residency, and retirement fences stay observable.",
+    },
+    (
+        "2026-06-06-verlib-makes-snapshot-handles-a-pointer-primitive",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "VERLIB-style indirection supports stable handles only when metadata reuse is proven safe for old snapshots.",
+    },
+    (
+        "2026-06-06-verlib-makes-snapshot-handles-a-pointer-primitive",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route costing can use VERLIB-like indirection only when sharing and shortcut conditions are explicit.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-publication-primitives-need-retry-safe-handles",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MVCC frontiers need stale-read, double-publication, rollback, and long-reader stress gates.",
+    },
+    (
+        "2026-06-06-viper-turns-snapshot-isolation-into-begin-commit-graph-acyclicity",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Viper-style begin/commit graph logging is an alternative proof path to treating retained reads as fast-path success.",
+    },
+    (
+        "2026-06-06-alock-splits-local-and-remote-lock-cohorts-instead-of-forcing-loopback",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Bounded descriptor reclamation needs stale remote handoff and hot local read contention tests.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-remote-routes-need-tiny-authorities-and-external-witnesses",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Compact route authorities are valid only when obsolete route generations cannot wake work.",
+    },
+    (
+        "2026-06-06-star-moves-rdma-connection-state-off-the-fan-in-bottleneck",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route descriptors need state-cache, queue-depth, pinned-buffer, and response-backlog measurements before adoption.",
+    },
+    (
+        "2026-06-06-star-moves-rdma-connection-state-off-the-fan-in-bottleneck",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Compact request descriptors are an alternative to retaining every session's full state in owners or GPU workers.",
+    },
+    (
+        "2026-06-06-srnic-minimizes-nic-resident-per-connection-state",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Descriptor admission is valid only with snapshot, resident, output-buffer, and execution-credit proofs.",
+    },
+    (
+        "2026-06-06-srnic-minimizes-nic-resident-per-connection-state",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Immutable route roots are valid only when each read route carries generation and credit proofs.",
+    },
+    (
+        "2026-06-06-dcos-schedules-hot-transaction-pieces-without-making-every-transaction-fine-grained",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "DCoS supports conflict ordering only with an underlying serializable CC and runtime-pipelining mechanism.",
+    },
+    (
+        "2026-06-06-dcos-schedules-hot-transaction-pieces-without-making-every-transaction-fine-grained",
+        "effective_session_counting",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Hot-transaction cohort scheduling is an alternative to per-session cleverness at million-session scale.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-hot-paths-need-compact-authorities-and-schedulable-residuals",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The synthesis names write-path storage-tiering gaps rather than directly supporting current multi-tier placement.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-hot-paths-need-compact-authorities-and-schedulable-residuals",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring bundling needs fast-authority and residual-scheduling benchmarks before adoption.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-hot-paths-need-compact-authorities-and-schedulable-residuals",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU OLTP conflict cohorts must be benchmarked before adopting global minima, queues, or learned policies.",
+    },
+    (
+        "2026-06-06-template-robustness-certifies-cheap-read-committed-routes-before-runtime",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Deterministic template adoption needs certificate and measurement gates for rare or write-heavy routes.",
+    },
+    (
+        "2026-06-06-vortex-makes-streaming-ingest-the-storage-authority-then-continuously-reshapes-it-for-reads",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Fragment-generation unions are an alternative to whole-table invalidation for retained resident reads.",
+    },
+    (
+        "2026-06-06-vortex-makes-streaming-ingest-the-storage-authority-then-continuously-reshapes-it-for-reads",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Vortex's BigQuery-scale analytics scope cautions against direct OLTP GPU placement transfer.",
+    },
 }
 
 
