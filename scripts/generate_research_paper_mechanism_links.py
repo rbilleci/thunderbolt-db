@@ -1415,6 +1415,216 @@ RELATION_CANDIDATE_PRIORITY = [
 
 RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
     (
+        "2026-06-05-cross-paper-synthesis-route-metadata-must-prove-both-correctness-and-pressure-shape",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The three-lane admission benchmark is the named proof gate for hot-write template adoption.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-metadata-must-prove-both-correctness-and-pressure-shape",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fallback is valid only when the pressure proof names owner, queue budget, setup cost, fallback lane, and timeout condition.",
+    },
+    (
+        "2026-06-05-gpu-locality-is-a-bandwidth-contract-not-just-a-cache-hint",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Placement policy must model and measure local/remote GPU bandwidth symptoms before assuming direct hardware control.",
+    },
+    (
+        "2026-06-05-gpu-locality-is-a-bandwidth-contract-not-just-a-cache-hint",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner assignment for resident chunks, key vectors, and CUDA queues is explicitly framed as the benchmarkable analogue.",
+    },
+    (
+        "2026-06-05-learned-route-hints-should-be-bounded-inspectable-and-opt-in",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Bao-style route hints require latency and regret evaluation before informing cost-based route optimization.",
+    },
+    (
+        "2026-06-05-learned-route-hints-should-be-bounded-inspectable-and-opt-in",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Learned route planning must be measured for competition with owner queues before owner bundling can rely on it.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-schedulers-need-class-proof-and-completion-locality",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Resource scheduling fields and completion-locality measurements are explicit proof gates for route scheduling.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-schedulers-need-class-proof-and-completion-locality",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring completion locality must be measured across cold-tier, GPU, and CPU fallback completions.",
+    },
+    (
+        "2026-06-05-sap-hana-nse-makes-warm-data-a-first-class-column-store-load-unit",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "NSE targets CPU column-store warm storage and cautions against direct GPU-resident MVCC snapshot transfer.",
+    },
+    (
+        "2026-06-05-sap-hana-nse-makes-warm-data-a-first-class-column-store-load-unit",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Warm-buffer policy is safe only if recovery and WAL replay have a distinct emergency path from user-query buffers.",
+    },
+    (
+        "2026-06-05-sap-hana-nse-makes-warm-data-a-first-class-column-store-load-unit",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Mutable-delta plus immutable-main freshness routing needs write-throughput, freshness-lag, and replay progress measurements.",
+    },
+    (
+        "2026-06-05-sql-server-real-time-analytics-overlays-columnar-reads-onto-oltp-storage",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The mutable-delta plus immutable-resident-main read path is explicitly prototype work for retained snapshots.",
+    },
+    (
+        "2026-06-05-sql-server-real-time-analytics-overlays-columnar-reads-onto-oltp-storage",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "CPU delta stores and compressed row groups are an alternative tiering shape to immediate resident-row position scans.",
+    },
+    (
+        "2026-06-05-sql-server-real-time-analytics-overlays-columnar-reads-onto-oltp-storage",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The SQL Server CPU columnstore scope cautions against direct descriptor-reclamation transfer to GPU execution.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-htap-freshness-and-modular-transaction-lanes-are-converging",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Adaptive fallback from optimistic hot-write paths is named as a measured route-certificate gate.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-htap-freshness-and-modular-transaction-lanes-are-converging",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hot-write template adoption depends on measured conflict telemetry across retained reads, refresh, and fallback.",
+    },
+    (
+        "2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Snapshot frontiers are needed only when retained snapshots or cross-owner routes require broader visibility coordination.",
+    },
+    (
+        "2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Two-level publication needs benchmarking before replacing per-transaction owner or residency-domain queries.",
+    },
+    (
+        "2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Lock-free retained reads need stale-certificate and overlapping-writer benchmarks before descriptor adoption.",
+    },
+    (
+        "2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained snapshots should join broader frontier coordination only when cross-owner or retained-read routes need it.",
+    },
+    (
+        "2026-06-05-slog-keeps-local-transactions-fast-with-lock-only-cross-owner-ordering",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring bundling needs p50/p99, queue-wait, and cross-owner write measurements under the same session load.",
+    },
+    (
+        "2026-06-05-chardonnay-turns-cold-data-reads-into-pre-lock-admission-work",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cold-page admission must measure lock hold time and p99 before tier placement can rely on pre-lock routing.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-frontiers-must-preflight-both-ownership-and-tiers",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MVCC frontiers require route-preflight, stale-certificate, and old-version GC measurements before adoption.",
+    },
+    (
+        "2026-06-05-hermes-keeps-htap-freshness-cheap-with-row-id-deltas-and-mergeable-columnar-generations",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Descriptor reclamation is valid only if changed-row overlays prove filtered main-segment rows after compaction or snapshot retirement.",
+    },
+    (
+        "2026-06-05-hermes-keeps-htap-freshness-cheap-with-row-id-deltas-and-mergeable-columnar-generations",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hermes omits CUDA, GPU pressure, pinned buffers, transfers, NVMe tiers, and session-scale admission evaluation.",
+    },
+    (
+        "2026-06-05-page-as-you-go-makes-columnar-residency-page-granular-without-abandoning-vectorized-execution",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Same-shape batching needs warm-column point lookup and micro-batch pinning benchmarks across resident and paged dictionaries.",
+    },
+    (
+        "2026-06-05-relaxed-operator-fusion-makes-materialization-a-route-shape-decision",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Micro-batch sizing must pass a proof gate showing planner staging is avoided when overhead dominates.",
+    },
+    (
+        "2026-06-05-easycommit-makes-non-blocking-commit-a-message-redundancy-tradeoff",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "MVCC cleanup transfer is gated on durable-write, owner-cleanup, coordinator-failure, and resource-retention measurements.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-commit-decisions-need-a-recoverable-visibility-contract",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The only-if phrase is corpus-planning guidance; the retained evidence still supports owner-ring visibility contracts.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-commit-decisions-need-a-recoverable-visibility-contract",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The only-if phrase names future reading priorities, while the retained synthesis supports recoverable visibility frontiers.",
+    },
+    (
         "2026-06-05-cross-paper-synthesis-tail-contracts-need-age-fan-out-and-accelerator-budget",
         "owner_ring_bundling",
     ): {
