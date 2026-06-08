@@ -7084,6 +7084,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Dependency witnesses transfer only if prepared ordering and WAL reservation reduce hidden owner hold time.",
     },
+    (
+        "2026-06-04-d2pc-decentralizes-commit-coordination-to-shorten-conflict-windows",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "D2PC's geo-distributed design warns against inferring single-node GPU descriptor reclamation directly.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-safe-routes-and-short-commit-windows",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Freshness-safe routing is explicitly framed as a HyBench-style workload dimension that needs measurement.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-freshness-safe-routes-and-short-commit-windows",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Shorter commit windows must be measured against owner hold time before changing owner-ring boundaries.",
+    },
+    (
+        "2026-06-04-md-mvcc-makes-schema-metadata-snapshot-visible-instead-of-globally-blocking",
+        "db_owned_cold_objects",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Versioned schema metadata is an alternative control-object shape to a single mutable database-owned object.",
+    },
+    (
+        "2026-06-04-md-mvcc-makes-schema-metadata-snapshot-visible-instead-of-globally-blocking",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Snapshot-visible metadata versions are presented instead of in-place cache mutation for placement authority.",
+    },
+    (
+        "2026-06-04-md-mvcc-makes-schema-metadata-snapshot-visible-instead-of-globally-blocking",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The entry warns that global metadata overwrite can break long readers unless MVCC frontiers protect schema state.",
+    },
+    (
+        "2026-06-04-md-mvcc-makes-schema-metadata-snapshot-visible-instead-of-globally-blocking",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Old route-version and payload-reference retirement is explicitly a long-snapshot proof gate.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-admission-needs-compact-frontiers-and-sampled-queues",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Session counting needs the proposed 1M-idle-session admission harness before policy adoption.",
+    },
+    (
+        "2026-06-05-gpu-multitasking-needs-explicit-compute-memory-and-fault-isolation-contracts",
+        "isolation_trace_oracle",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The GPU multitasking paper maps requirements but lacks database speedup and isolation measurements.",
+    },
+    (
+        "2026-06-05-tidb-makes-htap-freshness-a-consensus-derived-route-property",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The TiDB transfer explicitly requires freshness-lag telemetry and CH-benCHmark-derived HTAP gates.",
+    },
+    (
+        "2026-06-05-tidb-makes-htap-freshness-a-consensus-derived-route-property",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "CPU fallback is needed only when freshness catch-up is too slow for tail-sensitive GPU lookup routes.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-gpu-htap-routes-need-freshness-frontiers-plus-resource-contracts",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Fresh analytical routes depend on source-log frontiers rather than an unqualified replica or cache hit.",
+    },
+    (
+        "2026-06-05-fw-kv-improves-psi-freshness-with-version-access-metadata",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Hot-write templates are safe only when route-token partitions reject incompatible generations or fall back.",
+    },
+    (
+        "2026-06-05-corobase-hides-pointer-stalls-by-batching-transactions-as-coroutines",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained point-read windows require p50/p99, stall, queue-wait, and throughput measurement.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-scheduling-needs-both-urgency-and-stall-hiding",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cleanup lag and route-local memory for retired snapshots and buffers are explicit measurement gates.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-route-scheduling-needs-both-urgency-and-stall-hiding",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The selection note is a reviewed support cue for direct cache and tier-placement coverage, not a caution relation.",
+    },
+    (
+        "2026-06-05-waltz-moves-wal-write-serialization-into-the-zns-device",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Reserve-before-visibility WAL admission is valid only if background allocation and rewrite stalls stay bounded.",
+    },
+    (
+        "2026-06-05-waltz-moves-wal-write-serialization-into-the-zns-device",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner serialization changes need write-vs-append tail measurements before replacing host-side coordination.",
+    },
+    (
+        "2026-06-05-hermes-routes-near-future-transactions-to-avoid-partition-ping-pong",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Hermes uses near-future queued work to guide movement rather than only the current owner queue head.",
+    },
+    (
+        "2026-06-05-hermes-routes-near-future-transactions-to-avoid-partition-ping-pong",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Hermes-style routing assumes read/write sets are available before deterministic execution.",
+    },
+    (
+        "2026-06-05-cpu-prefetching-only-hides-future-tier-latency-when-fill-buffer-pressure-is-bounded",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The paper omits retained GPU snapshot correctness and protocol concurrency, so the transfer needs evaluation.",
+    },
+    (
+        "2026-06-05-cpu-prefetching-only-hides-future-tier-latency-when-fill-buffer-pressure-is-bounded",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor generation, segment-map, MVCC-header, and host-index probes are proposed as a microbenchmark.",
+    },
+    (
+        "2026-06-05-cpu-prefetching-only-hides-future-tier-latency-when-fill-buffer-pressure-is-bounded",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Immutable route-root metadata prefetching needs generation-table and segment-map lookup benchmarks.",
+    },
+    (
+        "2026-06-05-count-sketch-multi-join-estimates-should-be-route-budget-inputs-not-oracle-costs",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Sketch-driven tier placement is valid only when underestimated routes have explicit HBM and fallback guards.",
+    },
+    (
+        "2026-06-05-amac-makes-pointer-stall-hiding-a-bounded-state-machine-lane",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "AMAC's scaling result warns that optimized CPU fallback routes can raise tail latency for shared resources.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-active-windows-need-dependency-evidence",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of clause supports dependency evidence as the replacement for blind speculative retry.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-active-windows-need-dependency-evidence",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The active-window synthesis favors dependency and budget certificates over cost estimation alone.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-active-windows-need-dependency-evidence",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The WAL relation is explicitly a proof gate for replay equivalence, deterministic visibility, and bounded p99.",
+    },
+    (
+        "2026-06-05-asynchronized-concurrency-the-secret-to-scaling-concurrent-search-data-structures",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "ASCYLIB transfer to descriptor metadata requires read/write workload evaluation before reclamation policy use.",
+    },
+    (
+        "2026-06-05-asynchronized-concurrency-the-secret-to-scaling-concurrent-search-data-structures",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-serialized route metadata needs the proposed concurrent-map versus owner-map microbenchmark.",
+    },
 }
 
 
