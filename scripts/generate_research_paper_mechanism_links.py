@@ -3934,6 +3934,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Paced retained reads require overload benchmarks reporting GPU queue, response queue, socket credit, HBM residency, and cold-tier wait separately.",
     },
+    (
+        "2026-06-03-pacman-parallel-command-log-recovery",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The risk cue names PACMAN's dependency on deterministic templates; that dependency supports the mechanism rather than warning against it.",
+    },
+    (
+        "2026-06-03-bounded-multiversion-garbage-collection",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained GPU generations are supported only when active handles bound reclamation and preserve correct snapshot reads.",
+    },
+    (
+        "2026-06-03-vortex-over-resident-multi-gpu-io-forwarding",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Vortex-style over-resident execution is valid only under an explicit streaming model where GPU memory is not assumed resident.",
+    },
+    (
+        "2026-06-03-vortex-over-resident-multi-gpu-io-forwarding",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts ad hoc copies with owned stream and transfer scheduling, which supports owner-ring bundling.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-snapshot-bounded-io-bounded-execution",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis explicitly routes retained snapshot pressure through long-reader, recovery, residency, and pinned-buffer measurements.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-snapshot-bounded-io-bounded-execution",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless cue is corpus-planning guidance, not a caution about owner-ring bundling.",
+    },
+    (
+        "2026-06-03-learned-cost-models-need-optimizer-task-proof",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Learned cost-model transfer is gated on task-specific optimizer evaluation before it can shape GPU DB routing.",
+    },
+    (
+        "2026-06-03-learned-cost-models-need-optimizer-task-proof",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Learned advising is supported only as a hybrid that preserves traditional optimizer estimates and task-specific metrics.",
+    },
+    (
+        "2026-06-03-learned-cost-models-need-optimizer-task-proof",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback costing must be validated with measured endpoint telemetry rather than assumed transfer, launch, and queue costs.",
+    },
+    (
+        "2026-06-03-learned-cost-models-need-optimizer-task-proof",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The fragile-route cue applies to fallback selection; the reviewed evidence does not make owner-ring bundling a caution relation.",
+    },
+    (
+        "2026-06-03-learned-cost-models-need-optimizer-task-proof",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Optimizer-task evidence is not enough to set descriptor lifetime policy without GPU DB descriptor measurements.",
+    },
+    (
+        "2026-06-03-learned-cost-models-need-optimizer-task-proof",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The retained route matrix is explicitly framed as a benchmark over CPU, resident GPU, streamed GPU, and rejection paths.",
+    },
+    (
+        "2026-06-03-adaptive-multi-tier-buffer-management-for-nvm",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The NVM hierarchy motivates multi-tier placement only after GPU DB measures HBM, host, CXL-like memory, and NVMe behavior.",
+    },
+    (
+        "2026-06-03-adaptive-multi-tier-buffer-management-for-nvm",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The paper studies CPU-visible NVM and SSD without GPU snapshot publication, MVCC visibility, WAL, or session pressure.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-tier-aware-memory-fronts",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained point reads under a small HBM budget are explicitly listed as benchmark work.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-tier-aware-memory-fronts",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback policy is gated on latency, drop, queue-depth, slowdown, eviction, demotion, and stale-generation measurements.",
+    },
+    (
+        "2026-06-03-foedus-thousand-core-oltp-with-dual-pages",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts refresh paths; publication is still explicitly gated by WAL-before-visibility.",
+    },
+    (
+        "2026-06-03-caracal-deterministic-contention-management",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Short read-snapshot batches and mutation epochs need measured ceilings before deterministic placeholders are adopted.",
+    },
+    (
+        "2026-06-03-prismdb-multi-tier-compaction",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "PrismDB's compaction condition is not WAL-based and the entry explicitly notes that crash recovery is outside its design.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-needs-costed-generations",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Immutable generations are useful only when build, publication, and retirement costs are explicit.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-needs-costed-generations",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Descriptor reclamation is supported only when generation retirement costs remain visible and bounded.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-needs-costed-generations",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Mutable work is fast only when it has a scoped owner and explicit costs for publication and retirement.",
+    },
+    (
+        "2026-06-03-caerus-partial-order-transaction-sequencing",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Partial-order sequencing argues against unnecessary total ordering and offers owner-local ordering as an alternative.",
+    },
+    (
+        "2026-06-03-caerus-partial-order-transaction-sequencing",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-local partial sequences need graph-size, SCC, queue-delay, abort, throttle, and p99 latency measurements.",
+    },
+    (
+        "2026-06-03-caerus-partial-order-transaction-sequencing",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Owner-boundary vectors are presented as an alternative to one monolithic LSN for published snapshots.",
+    },
+    (
+        "2026-06-03-caerus-partial-order-transaction-sequencing",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL-before-visibility must be tested against replay-equivalent visibility boundaries and owner-sequence snapshot handles.",
+    },
+    (
+        "2026-06-03-kepler-robust-parametric-query-optimization",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Kepler-style advisor transfer requires isolated candidate execution and template-specific validation before GPU DB adoption.",
+    },
+    (
+        "2026-06-03-bmc-safe-in-kernel-pre-stack-caching",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The XDP cache is an alternative fast-path placement shape rather than a full database-owned tiering mechanism.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-paths-need-declared-boundaries",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Typed route descriptors and undeclared-side-effect rejection need validation against injected fast-path checks.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-paths-need-declared-boundaries",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Immutable route publication needs benchmarks comparing exact-response and retained-snapshot fast paths with validation cost.",
+    },
 }
 
 
