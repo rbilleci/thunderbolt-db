@@ -331,114 +331,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators",
-      "paper_id": "paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores",
-      "title": "A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-tectonic-turns-cold-tier-efficiency-into-explicit-traffic-classes-and-sealed-metadata",
-      "paper_id": "paper-2021-facebook-s-tectonic-filesystem-efficiency-from-exascale",
-      "title": "Facebook's Tectonic Filesystem: Efficiency from Exascale."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
-      "paper_id": "paper-2016-write-behind-logging",
-      "title": "Write-Behind Logging."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded",
-      "paper_id": "paper-2022-backpressure-flow-control",
-      "title": "Backpressure Flow Control."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
-      "paper_id": "paper-2018-barrier-enabled-io-stack-for-flash-storage",
-      "title": "Barrier-Enabled IO Stack for Flash Storage."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-blk-switch-treats-storage-io-as-switch-scheduled-work",
-      "paper_id": "paper-2021-rearchitecting-linux-storage-stack-for-microsecond-latency-and-high-throughput",
-      "title": "Rearchitecting Linux Storage Stack for microsecond Latency and High Throughput."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency",
-      "paper_id": "paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems",
-      "title": "Chablis: Fast and General Transactions in Geo-Distributed Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-chardonnay-turns-cold-data-reads-into-pre-lock-admission-work",
-      "paper_id": "paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases",
-      "title": "Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-cpu-fallback-scans-need-route-specific-code-shapes",
-      "paper_id": "paper-2017-hardware-sensitive-scan-operator-variants-for-compiled-selection-pipelines",
-      "title": "Hardware-Sensitive Scan Operator Variants for Compiled Selection Pipelines."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-deuteronomy-turns-the-recovery-log-into-a-version-cache-and-delivery-queue",
-      "paper_id": "paper-2015-high-performance-transactions-in-deuteronomy",
-      "title": "High Performance Transactions in Deuteronomy."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-electrode-keeps-protocol-fast-paths-in-the-kernel-not-full-logic",
-      "paper_id": "paper-2023-electrode-accelerating-distributed-protocols-with-ebpf",
-      "title": "Electrode: Accelerating Distributed Protocols with eBPF."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-flexmem-adapts-tier-migration-to-emerging-hot-pages-and-promotion-failures",
-      "paper_id": "paper-2024-flexmem-adaptive-page-profiling-and-migration-for-tiered-memory",
-      "title": "FlexMem: Adaptive Page Profiling and Migration for Tiered Memory."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-05-genericvc-turns-mvcc-conflicts-into-configurable-validation-work",
       "paper_id": "paper-2025-generic-version-control-configurable-versioning-for-application-specific-requirements",
       "title": "Generic Version Control: Configurable Versioning for Application-Specific Requirements."
@@ -4744,6 +4636,25 @@
       "title": "Serval: A Wait-free Multi-version Deterministic Concurrency Control Scheme."
     },
     {
+      "citation": "Kayhan Dursun, Carsten Binnig, Ugur Cetintemel, Garret Swart, and Weiwei Gong. \"A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores.\" PVLDB 12(12), 2019. Retrieved 2026-06-04 from the PVLDB PDF: `https://www.vldb.org/pvldb/vol12/p2218-dursun.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3352063.3352137",
+        "review_status": "reviewed_identifier_repair",
+        "title": "A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores."
+      },
+      "journal_entry_id": "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores",
+      "title": "A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores."
+    },
+    {
       "citation": "Tommaso Bonato, Abdul Kabbani, Ahmad Ghalayini, Anup Agarwal, Daniele De Sensi, Rong Pan, Costin Raiciu, Mark Handley, Mihai Brodschi, Timo Schneider, Nils Blach, Daniel Santos Ferreira Alves, and Torsten Hoefler. \"SMaRTT: Sender-based Marked Rapidly-adapting Trimmed & Timed Transport.\" arXiv:2404.01630v4, 2024/2026. Retrieved 2026-06-04 from `https://arxiv.org/abs/2404.01630` and `https://arxiv.org/pdf/2404.01630`.",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
@@ -4978,6 +4889,25 @@
       "title": "Totally-Ordered Prefix Parallel Snapshot Isolation."
     },
     {
+      "citation": "Joy Arulraj, Matthew Perron, and Andrew Pavlo. \"Write-Behind Logging.\" PVLDB 10(4), 2016. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol10/p337-arulraj.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3025111.3025116",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Write-Behind Logging."
+      },
+      "journal_entry_id": "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2016-write-behind-logging",
+      "title": "Write-Behind Logging."
+    },
+    {
       "citation": "Sangjin Lee, Alberto Lerner, Andre Ryser, Kibin Park, Chanyoung Jeon, Jinsub Park, Yong Ho Song, and Philippe Cudre-Mauroux. \"X-SSD: A Storage System with Native Support for Database Logging and Replication.\" SIGMOD 2022, pages 988-1002. DOI `10.1145/3514221.3526188`. Retrieved 2026-06-04 from the author-hosted PDF, `https://exascale.info/assets/pdf/lee2022sigmod.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -5104,6 +5034,25 @@
       "title": "Asynchronized Concurrency: The Secret to Scaling Concurrent Search Data Structures."
     },
     {
+      "citation": "Prateesh Goyal, Preey Shah, Kevin Zhao, Georgios Nikolaidis, Mohammad Alizadeh, and Thomas E. Anderson. \"Backpressure Flow Control.\" NSDI 2022, pp. 779-805. Retrieved 2026-06-05 from the official USENIX page and PDF: `https://www.usenix.org/conference/nsdi22/presentation/goyal` and `https://www.usenix.org/system/files/nsdi22-paper-goyal.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/1909.09923",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Backpressure Flow Control."
+      },
+      "journal_entry_id": "2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2022-backpressure-flow-control",
+      "title": "Backpressure Flow Control."
+    },
+    {
       "citation": "Zhihan Guo, Kan Wu, Cong Yan, and Xiangyao Yu. \"Releasing Locks As Early As You Can: Reducing Contention of Hotspots by Violating Two-Phase Locking.\" SIGMOD 2021, pages 658-670. doi:10.1145/3448016.3457294. Retrieved 2026-06-05 from the author-hosted SIGMOD PDF, `https://pages.cs.wisc.edu/~yxy/pubs/bamboo.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -5120,6 +5069,25 @@
       ],
       "paper_id": "paper-2021-releasing-locks-as-early-as-you-can-reducing-contention-of-hotspots-by-violating-two-phase-locki",
       "title": "Releasing Locks As Early As You Can: Reducing Contention of Hotspots by Violating Two-Phase Locking."
+    },
+    {
+      "citation": "Youjip Won, Jaemin Jung, Gyeongyeol Choi, Joontaek Oh, Seongbae Son, Jooyoung Hwang, and Sangyeun Cho. \"Barrier-Enabled IO Stack for Flash Storage.\" FAST 2018, pp. 211-226. Retrieved 2026-06-05 from the USENIX publication page and PDF, `https://www.usenix.org/conference/fast18/presentation/won` and `https://www.usenix.org/system/files/conference/fast18/fast18-won.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/1711.02258",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Barrier-Enabled IO Stack for Flash Storage."
+      },
+      "journal_entry_id": "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2018-barrier-enabled-io-stack-for-flash-storage",
+      "title": "Barrier-Enabled IO Stack for Flash Storage."
     },
     {
       "citation": "Yuan Yuan, Kaibo Wang, Rubao Lee, Xiaoning Ding, Jing Xing, Spyros Blanas, and Xiaodong Zhang. \"BCC: Reducing False Aborts in Optimistic Concurrency Control with Low Cost for In-Memory Databases.\" PVLDB 9(6), 2016, pp. 504-515. doi:10.14778/2904121.2904126. Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol9/p504-yuan.pdf`.",
@@ -9714,33 +9682,15 @@
       "title": "Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures."
     },
     {
-      "citation": "Kayhan Dursun, Carsten Binnig, Ugur Cetintemel, Garret Swart, and Weiwei Gong. \"A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores.\" PVLDB 12(12), 2019. Retrieved 2026-06-04 from the PVLDB PDF: `https://www.vldb.org/pvldb/vol12/p2218-dursun.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores."
-      },
-      "journal_entry_id": "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores",
-      "title": "A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores."
-    },
-    {
       "citation": "Satadru Pan, Theano Stavrinos, Yunqiao Zhang, Atul Sikaria, Pavel Zakharov, Abhinav Sharma, Shiva Shankar P, Mike Shuey, Richard Wareing, Monika Gangapuram, Guanglei Cao, Christian Preseau, Pratap Singh, Kestutis Patiejunas, JR Tipton, Ethan Katz-Bassett, and Wyatt Lloyd. \"Facebook's Tectonic Filesystem: Efficiency from Exascale.\" FAST 2021. Retrieved 2026-06-04 from the USENIX page and official PDF: `https://www.usenix.org/conference/fast21/presentation/pan` and `https://www.usenix.org/system/files/fast21-pan.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/fast/PanSZSZSPSWGCPS21",
+        "review_status": "reviewed_identifier_repair",
         "title": "Facebook's Tectonic Filesystem: Efficiency from Exascale."
       },
       "journal_entry_id": "2026-06-04-tectonic-turns-cold-tier-efficiency-into-explicit-traffic-classes-and-sealed-metadata",
@@ -9752,71 +9702,15 @@
       "title": "Facebook's Tectonic Filesystem: Efficiency from Exascale."
     },
     {
-      "citation": "Joy Arulraj, Matthew Perron, and Andrew Pavlo. \"Write-Behind Logging.\" PVLDB 10(4), 2016. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol10/p337-arulraj.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Write-Behind Logging."
-      },
-      "journal_entry_id": "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2016-write-behind-logging",
-      "title": "Write-Behind Logging."
-    },
-    {
-      "citation": "Prateesh Goyal, Preey Shah, Kevin Zhao, Georgios Nikolaidis, Mohammad Alizadeh, and Thomas E. Anderson. \"Backpressure Flow Control.\" NSDI 2022, pp. 779-805. Retrieved 2026-06-05 from the official USENIX page and PDF: `https://www.usenix.org/conference/nsdi22/presentation/goyal` and `https://www.usenix.org/system/files/nsdi22-paper-goyal.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Backpressure Flow Control."
-      },
-      "journal_entry_id": "2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2022-backpressure-flow-control",
-      "title": "Backpressure Flow Control."
-    },
-    {
-      "citation": "Youjip Won, Jaemin Jung, Gyeongyeol Choi, Joontaek Oh, Seongbae Son, Jooyoung Hwang, and Sangyeun Cho. \"Barrier-Enabled IO Stack for Flash Storage.\" FAST 2018, pp. 211-226. Retrieved 2026-06-05 from the USENIX publication page and PDF, `https://www.usenix.org/conference/fast18/presentation/won` and `https://www.usenix.org/system/files/conference/fast18/fast18-won.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Barrier-Enabled IO Stack for Flash Storage."
-      },
-      "journal_entry_id": "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2018-barrier-enabled-io-stack-for-flash-storage",
-      "title": "Barrier-Enabled IO Stack for Flash Storage."
-    },
-    {
       "citation": "Jaehyun Hwang, Midhul Vuppalapati, Simon Peter, and Rachit Agarwal. \"Rearchitecting Linux Storage Stack for microsecond Latency and High Throughput.\" OSDI 2021. Retrieved 2026-06-05 from the USENIX paper page and PDF, `https://www.usenix.org/conference/osdi21/presentation/hwang` and `https://www.usenix.org/system/files/osdi21-hwang.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/osdi/HwangVP021",
+        "review_status": "reviewed_identifier_repair",
         "title": "Rearchitecting Linux Storage Stack for microsecond Latency and High Throughput."
       },
       "journal_entry_id": "2026-06-05-blk-switch-treats-storage-io-as-switch-scheduled-work",
@@ -9830,12 +9724,13 @@
     {
       "citation": "Tamer Eldeeb, Philip A. Bernstein, Asaf Cidon, and Junfeng Yang. \"Chablis: Fast and General Transactions in Geo-Distributed Systems.\" CIDR 2024. Retrieved 2026-06-05 from `https://vldb.org/cidrdb/papers/2024/p4-eldeeb.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://vldb.org/cidrdb/2024/chablis-fast-and-general-transactions-in-geo-distributed-systems.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "Chablis: Fast and General Transactions in Geo-Distributed Systems."
       },
       "journal_entry_id": "2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency",
@@ -9849,12 +9744,13 @@
     {
       "citation": "Tamer Eldeeb, Xincheng Xie, Philip A. Bernstein, Asaf Cidon, and Junfeng Yang. \"Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases.\" OSDI 2023, pp. 343-360. Retrieved 2026-06-05 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi23/presentation/eldeeb`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/osdi/EldeebXBCY23",
+        "review_status": "reviewed_identifier_repair",
         "title": "Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases."
       },
       "journal_entry_id": "2026-06-05-chardonnay-turns-cold-data-reads-into-pre-lock-admission-work",
@@ -9868,12 +9764,13 @@
     {
       "citation": "David Broneske, Andreas Meister, and Gunter Saake. \"Hardware-Sensitive Scan Operator Variants for Compiled Selection Pipelines.\" In Datenbanksysteme fuer Business, Technologie und Web (BTW 2017), LNI P-265, pp. 403-412. Retrieved 2026-06-05 from the GI Digital Library handle `https://dl.gi.de/handle/20.500.12116/642` and PDF `https://dl.gi.de/bitstreams/6553ed86-57b6-4dad-a5ab-f8d25c646f2e/download`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_gi_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_gi_records_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dl.gi.de/handle/20.500.12116/642",
+        "review_status": "reviewed_identifier_repair",
         "title": "Hardware-Sensitive Scan Operator Variants for Compiled Selection Pipelines."
       },
       "journal_entry_id": "2026-06-05-cpu-fallback-scans-need-route-specific-code-shapes",
@@ -9887,12 +9784,13 @@
     {
       "citation": "Justin Levandoski, David Lomet, Sudipta Sengupta, Ryan Stutsman, and Rui Wang. \"High Performance Transactions in Deuteronomy.\" CIDR 2015. Retrieved 2026-06-05 from `https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper15.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_microsoft_research_and_cidr_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_microsoft_research_and_cidr_records_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.microsoft.com/en-us/research/publication/high-performance-transactions-in-deuteronomy/",
+        "review_status": "reviewed_identifier_repair",
         "title": "High Performance Transactions in Deuteronomy."
       },
       "journal_entry_id": "2026-06-05-deuteronomy-turns-the-recovery-log-into-a-version-cache-and-delivery-queue",
@@ -9906,12 +9804,13 @@
     {
       "citation": "Yang Zhou, Zezhou Wang, Sowmya Dharanipragada, and Minlan Yu. \"Electrode: Accelerating Distributed Protocols with eBPF.\" NSDI 2023, pages 1391-1406. Retrieved 2026-06-05 from the USENIX publication page and PDF, `https://www.usenix.org/conference/nsdi23/presentation/zhou`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/nsdi23/presentation/zhou",
+        "review_status": "reviewed_identifier_repair",
         "title": "Electrode: Accelerating Distributed Protocols with eBPF."
       },
       "journal_entry_id": "2026-06-05-electrode-keeps-protocol-fast-paths-in-the-kernel-not-full-logic",
@@ -9925,12 +9824,13 @@
     {
       "citation": "Dong Xu, Junhee Ryu, Jinho Baek, Kwangsik Shin, Pengfei Su, and Dong Li. \"FlexMem: Adaptive Page Profiling and Migration for Tiered Memory.\" USENIX ATC 2024, pp. 817-833. Retrieved 2026-06-05 from the USENIX page and PDF, `https://www.usenix.org/conference/atc24/presentation/xu-dong`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/usenix/XuRSS024",
+        "review_status": "reviewed_identifier_repair",
         "title": "FlexMem: Adaptive Page Profiling and Migration for Tiered Memory."
       },
       "journal_entry_id": "2026-06-05-flexmem-adapts-tier-migration-to-emerging-hot-pages-and-promotion-failures",
@@ -11163,11 +11063,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_microsoft_research_and_cidr_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_microsoft_research_and_cidr_records_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:high-performance-transactions-in-deuteronomy",
@@ -12854,14 +12754,14 @@
         "Matthew Perron",
         "Andrew Pavlo"
       ],
-      "doi": "",
+      "doi": "10.14778/3025111.3025116",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:write-behind-logging",
@@ -12869,7 +12769,6 @@
         "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2016-write-behind-logging",
@@ -13386,11 +13285,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_gi_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_gi_records_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:hardware-sensitive-scan-operator-variants-for-compiled-selection-pipelines",
@@ -13852,7 +13751,7 @@
       "year": "2018"
     },
     {
-      "arxiv": "",
+      "arxiv": "1711.02258",
       "authors": [
         "Youjip Won",
         "Jaemin Jung",
@@ -13865,11 +13764,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:barrier-enabled-io-stack-for-flash-storage",
@@ -13877,8 +13776,7 @@
         "2026-06-05-barrierfs-separates-storage-order-from-durability-waits"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2018-barrier-enabled-io-stack-for-flash-storage",
       "review_status": "generated_identity",
@@ -14696,14 +14594,14 @@
         "Garret Swart",
         "Weiwei Gong"
       ],
-      "doi": "",
+      "doi": "10.14778/3352063.3352137",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores",
@@ -14711,7 +14609,6 @@
         "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores",
@@ -18387,11 +18284,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:facebook-s-tectonic-filesystem-efficiency-from-exascale",
@@ -18812,11 +18709,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:rearchitecting-linux-storage-stack-for-microsecond-latency-and-high-throughput",
@@ -19801,7 +19698,7 @@
       "year": "2022"
     },
     {
-      "arxiv": "",
+      "arxiv": "1909.09923",
       "authors": [
         "Prateesh Goyal",
         "Preey Shah",
@@ -19813,11 +19710,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:backpressure-flow-control",
@@ -19825,8 +19722,7 @@
         "2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2022-backpressure-flow-control",
       "review_status": "generated_identity",
@@ -21727,11 +21623,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases",
@@ -22225,11 +22121,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:electrode-accelerating-distributed-protocols-with-ebpf",
@@ -24617,11 +24513,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:chablis-fast-and-general-transactions-in-geo-distributed-systems",
@@ -25233,11 +25129,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:flexmem-adaptive-page-profiling-and-migration-for-tiered-memory",
@@ -115310,12 +115206,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/fast/PanSZSZSPSWGCPS21",
+          "review_status": "reviewed_identifier_repair",
           "title": "Facebook's Tectonic Filesystem: Efficiency from Exascale."
         },
         "identity_key": "title:facebook-s-tectonic-filesystem-efficiency-from-exascale",
@@ -116029,20 +115926,20 @@
           "Garret Swart",
           "Weiwei Gong"
         ],
-        "doi": "",
+        "doi": "10.14778/3352063.3352137",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3352063.3352137",
+          "review_status": "reviewed_identifier_repair",
           "title": "A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores."
         },
         "identity_key": "title:a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores",
         "journal_entry_id": "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores",
@@ -139160,20 +139057,20 @@
           "Matthew Perron",
           "Andrew Pavlo"
         ],
-        "doi": "",
+        "doi": "10.14778/3025111.3025116",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3025111.3025116",
+          "review_status": "reviewed_identifier_repair",
           "title": "Write-Behind Logging."
         },
         "identity_key": "title:write-behind-logging",
         "journal_entry_id": "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2016-write-behind-logging",
@@ -161689,12 +161586,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/nsdi23/presentation/zhou",
+          "review_status": "reviewed_identifier_repair",
           "title": "Electrode: Accelerating Distributed Protocols with eBPF."
         },
         "identity_key": "title:electrode-accelerating-distributed-protocols-with-ebpf",
@@ -164814,12 +164712,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/usenix/XuRSS024",
+          "review_status": "reviewed_identifier_repair",
           "title": "FlexMem: Adaptive Page Profiling and Migration for Tiered Memory."
         },
         "identity_key": "title:flexmem-adaptive-page-profiling-and-migration-for-tiered-memory",
@@ -172368,12 +172267,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/osdi/HwangVP021",
+          "review_status": "reviewed_identifier_repair",
           "title": "Rearchitecting Linux Storage Stack for microsecond Latency and High Throughput."
         },
         "identity_key": "title:rearchitecting-linux-storage-stack-for-microsecond-latency-and-high-throughput",
@@ -173780,12 +173680,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://vldb.org/cidrdb/2024/chablis-fast-and-general-transactions-in-geo-distributed-systems.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "Chablis: Fast and General Transactions in Geo-Distributed Systems."
         },
         "identity_key": "title:chablis-fast-and-general-transactions-in-geo-distributed-systems",
@@ -174267,12 +174168,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/osdi/EldeebXBCY23",
+          "review_status": "reviewed_identifier_repair",
           "title": "Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases."
         },
         "identity_key": "title:chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases",
@@ -176904,12 +176806,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_microsoft_research_and_cidr_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_microsoft_research_and_cidr_records_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.microsoft.com/en-us/research/publication/high-performance-transactions-in-deuteronomy/",
+          "review_status": "reviewed_identifier_repair",
           "title": "High Performance Transactions in Deuteronomy."
         },
         "identity_key": "title:high-performance-transactions-in-deuteronomy",
@@ -180348,7 +180251,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "1711.02258",
         "authors": [
           "Youjip Won",
           "Jaemin Jung",
@@ -180360,19 +180263,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/1711.02258",
+          "review_status": "reviewed_identifier_repair",
           "title": "Barrier-Enabled IO Stack for Flash Storage."
         },
         "identity_key": "title:barrier-enabled-io-stack-for-flash-storage",
         "journal_entry_id": "2026-06-05-barrierfs-separates-storage-order-from-durability-waits",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2018-barrier-enabled-io-stack-for-flash-storage",
         "review_status": "generated_identity",
@@ -181742,12 +181645,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_gi_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_gi_records_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dl.gi.de/handle/20.500.12116/642",
+          "review_status": "reviewed_identifier_repair",
           "title": "Hardware-Sensitive Scan Operator Variants for Compiled Selection Pipelines."
         },
         "identity_key": "title:hardware-sensitive-scan-operator-variants-for-compiled-selection-pipelines",
@@ -191486,7 +191390,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "1909.09923",
         "authors": [
           "Prateesh Goyal",
           "Preey Shah",
@@ -191497,19 +191401,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/1909.09923",
+          "review_status": "reviewed_identifier_repair",
           "title": "Backpressure Flow Control."
         },
         "identity_key": "title:backpressure-flow-control",
         "journal_entry_id": "2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2022-backpressure-flow-control",
         "review_status": "generated_identity",
@@ -221721,31 +221625,31 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 60,
-      "arxiv_present": 124,
-      "arxiv_reviewed_absent": 37,
-      "arxiv_secondary_missing": 381,
-      "doi_needs_identifier_review": 60,
+      "arxiv_needs_identifier_review": 48,
+      "arxiv_present": 126,
+      "arxiv_reviewed_absent": 45,
+      "arxiv_secondary_missing": 383,
+      "doi_needs_identifier_review": 48,
       "doi_not_expected_yet": 52,
-      "doi_present": 437,
-      "doi_reviewed_absent": 43,
+      "doi_present": 439,
+      "doi_reviewed_absent": 53,
       "doi_secondary_missing": 10
     },
     "paper_identity_counts": {
-      "paper_entries_with_arxiv": 124,
-      "paper_entries_with_doi": 437,
+      "paper_entries_with_arxiv": 126,
+      "paper_entries_with_doi": 439,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
-      "missing_arxiv": 478,
-      "missing_doi": 165
+      "missing_arxiv": 476,
+      "missing_doi": 163
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 381,
-      "doi": 68,
-      "doi,arxiv": 97,
+      "arxiv": 383,
+      "doi": 70,
+      "doi,arxiv": 93,
       "none": 56
     },
     "paper_records": 563,

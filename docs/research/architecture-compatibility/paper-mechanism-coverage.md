@@ -33,47 +33,35 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - duplicate identity groups: 32
 
 Generated identity field counts:
-- paper_entries_with_arxiv: 124
-- paper_entries_with_doi: 437
+- paper_entries_with_arxiv: 126
+- paper_entries_with_doi: 439
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
-- missing_arxiv: 478
-- missing_doi: 165
+- missing_arxiv: 476
+- missing_doi: 163
 
 Generated identity missing-field sets:
-- arxiv: 381
-- doi: 68
-- doi,arxiv: 97
+- arxiv: 383
+- doi: 70
+- doi,arxiv: 93
 - none: 56
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 60
-- arxiv_present: 124
-- arxiv_reviewed_absent: 37
-- arxiv_secondary_missing: 381
-- doi_needs_identifier_review: 60
+- arxiv_needs_identifier_review: 48
+- arxiv_present: 126
+- arxiv_reviewed_absent: 45
+- arxiv_secondary_missing: 383
+- doi_needs_identifier_review: 48
 - doi_not_expected_yet: 52
-- doi_present: 437
-- doi_reviewed_absent: 43
+- doi_present: 439
+- doi_reviewed_absent: 53
 - doi_secondary_missing: 10
-- actionable_identifier_review: 60
+- actionable_identifier_review: 48
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators` -> `paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores`: doi=needs_identifier_review, arxiv=needs_identifier_review: A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores.
-- `2026-06-04-tectonic-turns-cold-tier-efficiency-into-explicit-traffic-classes-and-sealed-metadata` -> `paper-2021-facebook-s-tectonic-filesystem-efficiency-from-exascale`: doi=needs_identifier_review, arxiv=needs_identifier_review: Facebook's Tectonic Filesystem: Efficiency from Exascale.
-- `2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract` -> `paper-2016-write-behind-logging`: doi=needs_identifier_review, arxiv=needs_identifier_review: Write-Behind Logging.
-- `2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded` -> `paper-2022-backpressure-flow-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: Backpressure Flow Control.
-- `2026-06-05-barrierfs-separates-storage-order-from-durability-waits` -> `paper-2018-barrier-enabled-io-stack-for-flash-storage`: doi=needs_identifier_review, arxiv=needs_identifier_review: Barrier-Enabled IO Stack for Flash Storage.
-- `2026-06-05-blk-switch-treats-storage-io-as-switch-scheduled-work` -> `paper-2021-rearchitecting-linux-storage-stack-for-microsecond-latency-and-high-throughput`: doi=needs_identifier_review, arxiv=needs_identifier_review: Rearchitecting Linux Storage Stack for microsecond Latency and High Throughput.
-- `2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency` -> `paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chablis: Fast and General Transactions in Geo-Distributed Systems.
-- `2026-06-05-chardonnay-turns-cold-data-reads-into-pre-lock-admission-work` -> `paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases.
-- `2026-06-05-cpu-fallback-scans-need-route-specific-code-shapes` -> `paper-2017-hardware-sensitive-scan-operator-variants-for-compiled-selection-pipelines`: doi=needs_identifier_review, arxiv=needs_identifier_review: Hardware-Sensitive Scan Operator Variants for Compiled Selection Pipelines.
-- `2026-06-05-deuteronomy-turns-the-recovery-log-into-a-version-cache-and-delivery-queue` -> `paper-2015-high-performance-transactions-in-deuteronomy`: doi=needs_identifier_review, arxiv=needs_identifier_review: High Performance Transactions in Deuteronomy.
-- `2026-06-05-electrode-keeps-protocol-fast-paths-in-the-kernel-not-full-logic` -> `paper-2023-electrode-accelerating-distributed-protocols-with-ebpf`: doi=needs_identifier_review, arxiv=needs_identifier_review: Electrode: Accelerating Distributed Protocols with eBPF.
-- `2026-06-05-flexmem-adapts-tier-migration-to-emerging-hot-pages-and-promotion-failures` -> `paper-2024-flexmem-adaptive-page-profiling-and-migration-for-tiered-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: FlexMem: Adaptive Page Profiling and Migration for Tiered Memory.
 - `2026-06-05-genericvc-turns-mvcc-conflicts-into-configurable-validation-work` -> `paper-2025-generic-version-control-configurable-versioning-for-application-specific-requirements`: doi=needs_identifier_review, arxiv=needs_identifier_review: Generic Version Control: Configurable Versioning for Application-Specific Requirements.
 - `2026-06-05-horae-separates-durable-order-control-from-parallel-data-writes` -> `paper-2020-write-dependency-disentanglement-with-horae`: doi=needs_identifier_review, arxiv=needs_identifier_review: Write Dependency Disentanglement with Horae.
 - `2026-06-05-hsm-a-hybrid-slowdown-model-for-multitasking-gpus` -> `paper-2020-hsm-a-hybrid-slowdown-model-for-multitasking-gpus`: doi=needs_identifier_review, arxiv=needs_identifier_review: HSM: A Hybrid Slowdown Model for Multitasking GPUs.
@@ -102,7 +90,19 @@ Actionable DOI/arXiv identifier audit:
 - `2026-06-06-pangu-makes-rdma-a-fast-path-with-tcp-as-the-safety-valve` -> `paper-2021-when-cloud-storage-meets-rdma`: doi=needs_identifier_review, arxiv=needs_identifier_review: When Cloud Storage Meets RDMA.
 - `2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy` -> `paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: Polyjuice: High-Performance Transactions via Learned Concurrency Control.
 - `2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues` -> `paper-2025-shiftlock-mitigate-one-sided-rdma-lock-contention-via-handover`: doi=needs_identifier_review, arxiv=needs_identifier_review: ShiftLock: Mitigate One-sided RDMA Lock Contention via Handover.
-- ... 20 more
+- `2026-06-06-silk-makes-compaction-a-foreground-slo-scheduling-problem` -> `paper-2019-silk-preventing-latency-spikes-in-log-structured-merge-key-value-stores`: doi=needs_identifier_review, arxiv=needs_identifier_review: SILK: Preventing Latency Spikes in Log-Structured Merge Key-Value Stores.
+- `2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan` -> `paper-2023-skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays`: doi=needs_identifier_review, arxiv=needs_identifier_review: Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays.
+- `2026-06-06-smart-makes-remote-index-traversal-a-cache-validation-and-iops-shaping-problem` -> `paper-2023-smart-a-high-performance-adaptive-radix-tree-for-disaggregated-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: SMART: A High-Performance Adaptive Radix Tree for Disaggregated Memory.
+- `2026-06-06-splinterdb-turns-nvme-storage-into-a-cpu-efficiency-problem` -> `paper-2020-splinterdb-closing-the-bandwidth-gap-for-nvme-key-value-stores`: doi=needs_identifier_review, arxiv=needs_identifier_review: SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value Stores.
+- `2026-06-06-srnic-minimizes-nic-resident-per-connection-state` -> `paper-2023-srnic-a-scalable-architecture-for-rdma-nics`: doi=needs_identifier_review, arxiv=needs_identifier_review: SRNIC: A Scalable Architecture for RDMA NICs.
+- `2026-06-07-aifm-turns-far-memory-into-data-structure-policy` -> `paper-2020-aifm-high-performance-application-integrated-far-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: AIFM: High-Performance, Application-Integrated Far Memory.
+- `2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation` -> `paper-2018-finding-crash-consistency-bugs-with-bounded-black-box-crash-testing`: doi=needs_identifier_review, arxiv=needs_identifier_review: Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing.
+- `2026-06-07-bullion-makes-column-layout-follow-access-shape-compliance-and-precision` -> `paper-2025-bullion-a-column-store-for-machine-learning`: doi=needs_identifier_review, arxiv=needs_identifier_review: Bullion: A Column Store for Machine Learning.
+- `2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract` -> `paper-2017-application-crash-consistency-and-performance-with-ccfs`: doi=needs_identifier_review, arxiv=needs_identifier_review: Application Crash Consistency and Performance with CCFS.
+- `2026-06-07-chablis-splits-fast-local-commits-from-global-snapshot-publication` -> `paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chablis: Fast and General Transactions in Geo-Distributed Systems.
+- `2026-06-07-chardonnay-turns-epoch-snapshots-into-pre-lock-admission` -> `paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases.
+- `2026-06-07-cloud-five-minute-rule-turns-tiering-into-an-access-frequency-budget` -> `paper-2025-the-five-minute-rule-for-the-cloud-caching-in-analytics-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: The Five-Minute Rule for the Cloud: Caching in Analytics Systems.
+- ... 8 more
 
 Missing identity metadata audit:
 - `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus` missing arxiv: Concurrent Analytical Query Processing with GPUs.
