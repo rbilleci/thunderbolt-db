@@ -331,114 +331,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-genericvc-turns-mvcc-conflicts-into-configurable-validation-work",
-      "paper_id": "paper-2025-generic-version-control-configurable-versioning-for-application-specific-requirements",
-      "title": "Generic Version Control: Configurable Versioning for Application-Specific Requirements."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-horae-separates-durable-order-control-from-parallel-data-writes",
-      "paper_id": "paper-2020-write-dependency-disentanglement-with-horae",
-      "title": "Write Dependency Disentanglement with Horae."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
-      "paper_id": "paper-2020-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
-      "title": "HSM: A Hybrid Slowdown Model for Multitasking GPUs."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-krisp-makes-gpu-partitions-a-per-kernel-admission-decision",
-      "paper_id": "paper-2023-krisp-enabling-kernel-wise-right-sizing-for-spatial-partitioned-gpu-inference-servers",
-      "title": "KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-occ-batching-makes-commit-order-a-bounded-optimization-problem",
-      "paper_id": "paper-2018-improving-optimistic-concurrency-control-through-transaction-batching-and-operation-reordering",
-      "title": "Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks",
-      "paper_id": "paper-2016-in-the-search-for-optimal-concurrency",
-      "title": "In the Search for Optimal Concurrency."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-racksched-makes-request-routing-a-line-rate-admission-layer",
-      "paper_id": "paper-2020-racksched-a-microsecond-scale-scheduler-for-rack-scale-computers",
-      "title": "RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-reef-protects-urgent-gpu-work-by-resetting-idempotent-best-effort-kernels",
-      "paper_id": "paper-2022-microsecond-scale-preemption-for-concurrent-gpu-accelerated-dnn-inferences",
-      "title": "Microsecond-scale Preemption for Concurrent GPU-accelerated DNN Inferences."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-rocksdb-production-traces-show-locality-is-a-benchmark-input-not-noise",
-      "paper_id": "paper-2020-characterizing-modeling-and-benchmarking-rocksdb-key-value-workloads-at-facebook",
-      "title": "Characterizing, Modeling, and Benchmarking RocksDB Key-Value Workloads at Facebook."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-skq-makes-event-delivery-a-schedulable-resource",
-      "paper_id": "paper-2021-skq-event-scheduling-for-optimizing-tail-latency-in-a-traditional-os-kernel",
-      "title": "SKQ: Event Scheduling for Optimizing Tail Latency in a Traditional OS Kernel."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-unimem-makes-far-memory-useful-by-separating-addressability-filtering-and-promotion",
-      "paper_id": "paper-2024-unimem-redesigning-disaggregated-memory-within-a-unified-local-remote-memory-hierarchy",
-      "title": "UniMem: Redesigning Disaggregated Memory within A Unified Local-Remote Memory Hierarchy."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-vegito-turns-ha-backups-into-fresh-columnar-htap-replicas",
-      "paper_id": "paper-2021-retrofitting-high-availability-mechanism-to-tame-hybrid-transaction-analytical-processing",
-      "title": "Retrofitting High Availability Mechanism to Tame Hybrid Transaction/Analytical Processing."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-06-archtm-makes-persistent-writes-a-locality-contract",
       "paper_id": "paper-2021-archtm-architecture-aware-high-performance-transaction-for-persistent-memory",
       "title": "ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory."
@@ -5936,6 +5828,25 @@
       "title": "HPCC: High Precision Congestion Control."
     },
     {
+      "citation": "Xia Zhao, Magnus Jahre, and Lieven Eeckhout. \"HSM: A Hybrid Slowdown Model for Multitasking GPUs.\" ASPLOS 2020, pp. 1371-1385. Retrieved 2026-06-05 from `https://users.elis.ugent.be/~leeckhou/papers/asplos2020.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1145/3373376.3378457",
+        "review_status": "reviewed_identifier_repair",
+        "title": "HSM: A Hybrid Slowdown Model for Multitasking GPUs."
+      },
+      "journal_entry_id": "2026-06-05-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2020-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
+      "title": "HSM: A Hybrid Slowdown Model for Multitasking GPUs."
+    },
+    {
       "citation": "Darko Makreshanski, Justin Levandoski, and Ryan Stutsman. \"To Lock, Swap, or Elide: On the Interplay of Hardware Transactional Memory and Lock-Free Indexing.\" PVLDB 8(11), 2015, pp. 1298-1309. doi:10.14778/2809974.2809990. Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol8/p1298-makreshanski.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -6024,6 +5935,25 @@
       ],
       "paper_id": "paper-2020-isodiff-debugging-anomalies-caused-by-weak-isolation",
       "title": "IsoDiff: Debugging Anomalies Caused by Weak Isolation."
+    },
+    {
+      "citation": "Marcus Chow, Ali Jahanshahi, and Daniel Wong. \"KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers.\" HPCA 2023. Retrieved 2026-06-05 from `https://www.cs.ucr.edu/~ajaha004/files/KRISP.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_ieee_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1109/HPCA56546.2023.10071121",
+        "review_status": "reviewed_identifier_repair",
+        "title": "KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers."
+      },
+      "journal_entry_id": "2026-06-05-krisp-makes-gpu-partitions-a-per-kernel-admission-decision",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2023-krisp-enabling-kernel-wise-right-sizing-for-spatial-partitioned-gpu-inference-servers",
+      "title": "KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers."
     },
     {
       "citation": "Mohammad Sadoghi, Souvik Bhattacherjee, Bishwaranjan Bhattacharjee, and Mustafa Canim. \"L-Store: A Real-time OLTP and OLAP System.\" arXiv:1601.04084v2, 2017; EDBT 2018 candidate queue context. Retrieved 2026-06-05 from `https://arxiv.org/abs/1601.04084`.",
@@ -6260,6 +6190,25 @@
       "title": "When Database Meets New Storage Devices: Understanding and Exposing Performance Mismatches via Configurations."
     },
     {
+      "citation": "Bailu Ding, Lucja Kot, and Johannes Gehrke. \"Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering.\" PVLDB 12(2), 2018, pp. 169-182. Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3282495.3282502",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering."
+      },
+      "journal_entry_id": "2026-06-05-occ-batching-makes-commit-order-a-bounded-optimization-problem",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2018-improving-optimistic-concurrency-control-through-transaction-batching-and-operation-reordering",
+      "title": "Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering."
+    },
+    {
       "citation": "Hua Fan and Wojciech Golab. \"Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions.\" PVLDB 12(11):1471-1484, 2019. DOI `10.14778/3342263.3342627`. Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol12/p1471-fan.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -6294,6 +6243,25 @@
       ],
       "paper_id": "paper-2025-no-cap-this-memory-slaps-breaking-through-the-memory-wall-of-transactional-database-systems-with",
       "title": "No Cap, This Memory Slaps: Breaking Through the Memory Wall of Transactional Database Systems with Processing-in-Memory."
+    },
+    {
+      "citation": "Vincent Gramoli, Petr Kuznetsov, and Srivatsan Ravi. \"In the Search for Optimal Concurrency.\" SIROCCO 2016 preproceedings. Retrieved 2026-06-05 from `http://sirocco2016.hiit.fi/preproceedings/In_the_Search_for_Optimal_Concurrency.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_sirocco_and_arxiv_records_have_no_publisher_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/1603.01384",
+        "review_status": "reviewed_identifier_repair",
+        "title": "In the Search for Optimal Concurrency."
+      },
+      "journal_entry_id": "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2016-in-the-search-for-optimal-concurrency",
+      "title": "In the Search for Optimal Concurrency."
     },
     {
       "citation": "Rachid Guerraoui and Vasileios Trigonakis. \"Optimistic Concurrency with OPTIK.\" PPoPP 2016. doi:10.1145/2851141.2851146. Retrieved 2026-06-05 from the EPFL Infoscience PDF, `https://infoscience.epfl.ch/record/217219/files/PPoPP16_OPTIK.pdf`.",
@@ -6492,6 +6460,25 @@
       ],
       "paper_id": "paper-2025-low-latency-transaction-scheduling-via-userspace-interrupts-why-wait-or-yield-when-you-can-preem",
       "title": "Low-Latency Transaction Scheduling via Userspace Interrupts: Why Wait or Yield When You Can Preempt?"
+    },
+    {
+      "citation": "Hang Zhu, Kostis Kaffes, Zixu Chen, Zhenming Liu, Christos Kozyrakis, Ion Stoica, and Xin Jin. \"RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers.\" OSDI 2020, pp. 1225-1240. Retrieved 2026-06-05 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi20/presentation/zhu` and `https://www.usenix.org/system/files/osdi20-zhu.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/2010.05969",
+        "review_status": "reviewed_identifier_repair",
+        "title": "RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers."
+      },
+      "journal_entry_id": "2026-06-05-racksched-makes-request-routing-a-line-rate-admission-layer",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2020-racksched-a-microsecond-scale-scheduler-for-rack-scale-computers",
+      "title": "RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers."
     },
     {
       "citation": "Hongyao Zhao, Jingyao Li, Wei Lu, Qian Zhang, Wanqing Yang, Jiajia Zhong, Meihui Zhang, Haixiang Li, Xiaoyong Du, and Anqun Pan. \"RCBench: an RDMA-enabled transaction framework for analyzing concurrency control algorithms.\" The VLDB Journal 33(2), 2024, pp. 543-567; published online 2023-12-14. doi:10.1007/s00778-023-00821-0. Retrieved 2026-06-05 from `https://doi.org/10.1007/s00778-023-00821-0`, the Springer page, and the project technical-report PDF at `https://github.com/dbiir/RCBench`.",
@@ -9844,12 +9831,13 @@
     {
       "citation": "Gunce Su Yilmaz and Jens Dittrich. \"Generic Version Control: Configurable Versioning for Application-Specific Requirements.\" CIDR 2025. Retrieved 2026-06-05 from the CIDR publication page and PDF, `https://mail.vldb.org/cidrdb/papers/2025/p24-yilmaz.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://mail.vldb.org/cidrdb/2025/generic-version-control-configurable-versioning-for-application-specific-requirements.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "Generic Version Control: Configurable Versioning for Application-Specific Requirements."
       },
       "journal_entry_id": "2026-06-05-genericvc-turns-mvcc-conflicts-into-configurable-validation-work",
@@ -9863,12 +9851,13 @@
     {
       "citation": "Xiaojian Liao, Youyou Lu, Erci Xu, and Jiwu Shu. \"Write Dependency Disentanglement with Horae.\" OSDI 2020, pages 549-565. Retrieved 2026-06-05 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi20/presentation/liao`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi20/presentation/liao",
+        "review_status": "reviewed_identifier_repair",
         "title": "Write Dependency Disentanglement with Horae."
       },
       "journal_entry_id": "2026-06-05-horae-separates-durable-order-control-from-parallel-data-writes",
@@ -9880,109 +9869,15 @@
       "title": "Write Dependency Disentanglement with Horae."
     },
     {
-      "citation": "Xia Zhao, Magnus Jahre, and Lieven Eeckhout. \"HSM: A Hybrid Slowdown Model for Multitasking GPUs.\" ASPLOS 2020, pp. 1371-1385. Retrieved 2026-06-05 from `https://users.elis.ugent.be/~leeckhou/papers/asplos2020.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "HSM: A Hybrid Slowdown Model for Multitasking GPUs."
-      },
-      "journal_entry_id": "2026-06-05-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2020-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
-      "title": "HSM: A Hybrid Slowdown Model for Multitasking GPUs."
-    },
-    {
-      "citation": "Marcus Chow, Ali Jahanshahi, and Daniel Wong. \"KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers.\" HPCA 2023. Retrieved 2026-06-05 from `https://www.cs.ucr.edu/~ajaha004/files/KRISP.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers."
-      },
-      "journal_entry_id": "2026-06-05-krisp-makes-gpu-partitions-a-per-kernel-admission-decision",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2023-krisp-enabling-kernel-wise-right-sizing-for-spatial-partitioned-gpu-inference-servers",
-      "title": "KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers."
-    },
-    {
-      "citation": "Bailu Ding, Lucja Kot, and Johannes Gehrke. \"Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering.\" PVLDB 12(2), 2018, pp. 169-182. Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering."
-      },
-      "journal_entry_id": "2026-06-05-occ-batching-makes-commit-order-a-bounded-optimization-problem",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2018-improving-optimistic-concurrency-control-through-transaction-batching-and-operation-reordering",
-      "title": "Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering."
-    },
-    {
-      "citation": "Vincent Gramoli, Petr Kuznetsov, and Srivatsan Ravi. \"In the Search for Optimal Concurrency.\" SIROCCO 2016 preproceedings. Retrieved 2026-06-05 from `http://sirocco2016.hiit.fi/preproceedings/In_the_Search_for_Optimal_Concurrency.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "In the Search for Optimal Concurrency."
-      },
-      "journal_entry_id": "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2016-in-the-search-for-optimal-concurrency",
-      "title": "In the Search for Optimal Concurrency."
-    },
-    {
-      "citation": "Hang Zhu, Kostis Kaffes, Zixu Chen, Zhenming Liu, Christos Kozyrakis, Ion Stoica, and Xin Jin. \"RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers.\" OSDI 2020, pp. 1225-1240. Retrieved 2026-06-05 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi20/presentation/zhu` and `https://www.usenix.org/system/files/osdi20-zhu.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers."
-      },
-      "journal_entry_id": "2026-06-05-racksched-makes-request-routing-a-line-rate-admission-layer",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2020-racksched-a-microsecond-scale-scheduler-for-rack-scale-computers",
-      "title": "RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers."
-    },
-    {
       "citation": "Mingcong Han, Hanze Zhang, Rong Chen, and Haibo Chen. \"Microsecond-scale Preemption for Concurrent GPU-accelerated DNN Inferences.\" OSDI 2022, pp. 539-558. Retrieved 2026-06-05 from `https://www.usenix.org/system/files/osdi22-han.pdf`. Artifact: `https://github.com/SJTU-IPADS/reef`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi22/presentation/han",
+        "review_status": "reviewed_identifier_repair",
         "title": "Microsecond-scale Preemption for Concurrent GPU-accelerated DNN Inferences."
       },
       "journal_entry_id": "2026-06-05-reef-protects-urgent-gpu-work-by-resetting-idempotent-best-effort-kernels",
@@ -9996,12 +9891,13 @@
     {
       "citation": "Zhichao Cao, Siying Dong, Sagar Vemuri, and David H.C. Du. \"Characterizing, Modeling, and Benchmarking RocksDB Key-Value Workloads at Facebook.\" FAST 2020, pp. 209-223. Retrieved 2026-06-05 from the official USENIX page and PDF: `https://www.usenix.org/conference/fast20/presentation/cao-zhichao` and `https://www.usenix.org/system/files/fast20-cao_zhichao.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/fast/CaoDVD20.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "Characterizing, Modeling, and Benchmarking RocksDB Key-Value Workloads at Facebook."
       },
       "journal_entry_id": "2026-06-05-rocksdb-production-traces-show-locality-is-a-benchmark-input-not-noise",
@@ -10015,12 +9911,13 @@
     {
       "citation": "Siyao Zhao, Haoyu Gu, and Ali Jose Mashtizadeh. \"SKQ: Event Scheduling for Optimizing Tail Latency in a Traditional OS Kernel.\" USENIX ATC 2021, pp. 759-772. Retrieved 2026-06-05 from USENIX, `https://www.usenix.org/conference/atc21/presentation/zhao-siyao` and `https://www.usenix.org/system/files/atc21-zhao.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc21/presentation/zhao-siyao",
+        "review_status": "reviewed_identifier_repair",
         "title": "SKQ: Event Scheduling for Optimizing Tail Latency in a Traditional OS Kernel."
       },
       "journal_entry_id": "2026-06-05-skq-makes-event-delivery-a-schedulable-resource",
@@ -10034,12 +9931,13 @@
     {
       "citation": "Yijie Zhong, Minqiang Zhou, Zhirong Shen, and Jiwu Shu. \"UniMem: Redesigning Disaggregated Memory within A Unified Local-Remote Memory Hierarchy.\" USENIX ATC 2024, pp. 463-474. Retrieved 2026-06-05 from the official USENIX PDF: `https://www.usenix.org/system/files/atc24-zhong.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc24/presentation/zhong",
+        "review_status": "reviewed_identifier_repair",
         "title": "UniMem: Redesigning Disaggregated Memory within A Unified Local-Remote Memory Hierarchy."
       },
       "journal_entry_id": "2026-06-05-unimem-makes-far-memory-useful-by-separating-addressability-filtering-and-promotion",
@@ -10053,12 +9951,13 @@
     {
       "citation": "Sijie Shen, Rong Chen, Haibo Chen, and Binyu Zang. \"Retrofitting High Availability Mechanism to Tame Hybrid Transaction/Analytical Processing.\" OSDI 2021, pp. 219-238. Retrieved 2026-06-05 from the USENIX page and PDF: `https://www.usenix.org/conference/osdi21/presentation/shen` and `https://www.usenix.org/system/files/osdi21-shen.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi21/presentation/shen",
+        "review_status": "reviewed_identifier_repair",
         "title": "Retrofitting High Availability Mechanism to Tame Hybrid Transaction/Analytical Processing."
       },
       "journal_entry_id": "2026-06-05-vegito-turns-ha-backups-into-fresh-columnar-htap-replicas",
@@ -12071,7 +11970,7 @@
       "year": "2016"
     },
     {
-      "arxiv": "",
+      "arxiv": "1603.01384",
       "authors": [
         "Vincent Gramoli",
         "Petr Kuznetsov",
@@ -12080,11 +11979,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_sirocco_and_arxiv_records_have_no_publisher_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:in-the-search-for-optimal-concurrency",
@@ -12092,8 +11991,7 @@
         "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2016-in-the-search-for-optimal-concurrency",
       "review_status": "generated_identity",
@@ -16491,11 +16389,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:characterizing-modeling-and-benchmarking-rocksdb-key-value-workloads-at-facebook",
@@ -16744,14 +16642,14 @@
         "Magnus Jahre",
         "Lieven Eeckhout"
       ],
-      "doi": "",
+      "doi": "10.1145/3373376.3378457",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
@@ -16759,7 +16657,6 @@
         "2026-06-05-hsm-a-hybrid-slowdown-model-for-multitasking-gpus"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2020-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
@@ -17223,7 +17120,7 @@
       "year": "2020"
     },
     {
-      "arxiv": "",
+      "arxiv": "2010.05969",
       "authors": [
         "Hang Zhu",
         "Kostis Kaffes",
@@ -17236,11 +17133,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:racksched-a-microsecond-scale-scheduler-for-rack-scale-computers",
@@ -17248,8 +17145,7 @@
         "2026-06-05-racksched-makes-request-routing-a-line-rate-admission-layer"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2020-racksched-a-microsecond-scale-scheduler-for-rack-scale-computers",
       "review_status": "generated_identity",
@@ -17671,11 +17567,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:write-dependency-disentanglement-with-horae",
@@ -18810,11 +18706,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:retrofitting-high-availability-mechanism-to-tame-hybrid-transaction-analytical-processing",
@@ -18963,11 +18859,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:skq-event-scheduling-for-optimizing-tail-latency-in-a-traditional-os-kernel",
@@ -20535,11 +20431,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:microsecond-scale-preemption-for-concurrent-gpu-accelerated-dnn-inferences",
@@ -22626,14 +22522,14 @@
         "Ali Jahanshahi",
         "Daniel Wong"
       ],
-      "doi": "",
+      "doi": "10.1109/hpca56546.2023.10071121",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_ieee_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:krisp-enabling-kernel-wise-right-sizing-for-spatial-partitioned-gpu-inference-servers",
@@ -22641,7 +22537,6 @@
         "2026-06-05-krisp-makes-gpu-partitions-a-per-kernel-admission-decision"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2023-krisp-enabling-kernel-wise-right-sizing-for-spatial-partitioned-gpu-inference-servers",
@@ -26925,11 +26820,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:unimem-redesigning-disaggregated-memory-within-a-unified-local-remote-memory-hierarchy",
@@ -28077,11 +27972,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:generic-version-control-configurable-versioning-for-application-specific-requirements",
@@ -149437,7 +149332,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "2010.05969",
         "authors": [
           "Hang Zhu",
           "Kostis Kaffes",
@@ -149449,19 +149344,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/2010.05969",
+          "review_status": "reviewed_identifier_repair",
           "title": "RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers."
         },
         "identity_key": "title:racksched-a-microsecond-scale-scheduler-for-rack-scale-computers",
         "journal_entry_id": "2026-06-05-racksched-makes-request-routing-a-line-rate-admission-layer",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2020-racksched-a-microsecond-scale-scheduler-for-rack-scale-computers",
         "review_status": "generated_identity",
@@ -161337,12 +161232,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi20/presentation/liao",
+          "review_status": "reviewed_identifier_repair",
           "title": "Write Dependency Disentanglement with Horae."
         },
         "identity_key": "title:write-dependency-disentanglement-with-horae",
@@ -161831,12 +161727,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://mail.vldb.org/cidrdb/2025/generic-version-control-configurable-versioning-for-application-specific-requirements.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "Generic Version Control: Configurable Versioning for Application-Specific Requirements."
         },
         "identity_key": "title:generic-version-control-configurable-versioning-for-application-specific-requirements",
@@ -164201,12 +164098,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi22/presentation/han",
+          "review_status": "reviewed_identifier_repair",
           "title": "Microsecond-scale Preemption for Concurrent GPU-accelerated DNN Inferences."
         },
         "identity_key": "title:microsecond-scale-preemption-for-concurrent-gpu-accelerated-dnn-inferences",
@@ -169556,20 +169454,20 @@
           "Magnus Jahre",
           "Lieven Eeckhout"
         ],
-        "doi": "",
+        "doi": "10.1145/3373376.3378457",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_acm_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1145/3373376.3378457",
+          "review_status": "reviewed_identifier_repair",
           "title": "HSM: A Hybrid Slowdown Model for Multitasking GPUs."
         },
         "identity_key": "title:hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
         "journal_entry_id": "2026-06-05-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2020-hsm-a-hybrid-slowdown-model-for-multitasking-gpus",
@@ -169815,20 +169713,20 @@
           "Lucja Kot",
           "Johannes Gehrke"
         ],
-        "doi": "",
+        "doi": "10.14778/3282495.3282502",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3282495.3282502",
+          "review_status": "reviewed_identifier_repair",
           "title": "Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering."
         },
         "identity_key": "title:improving-optimistic-concurrency-control-through-transaction-batching-and-operation-reordering",
         "journal_entry_id": "2026-06-05-occ-batching-makes-commit-order-a-bounded-optimization-problem",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2018-improving-optimistic-concurrency-control-through-transaction-batching-and-operation-reordering",
@@ -170530,7 +170428,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "1603.01384",
         "authors": [
           "Vincent Gramoli",
           "Petr Kuznetsov",
@@ -170538,19 +170436,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_sirocco_and_arxiv_records_have_no_publisher_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/1603.01384",
+          "review_status": "reviewed_identifier_repair",
           "title": "In the Search for Optimal Concurrency."
         },
         "identity_key": "title:in-the-search-for-optimal-concurrency",
         "journal_entry_id": "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2016-in-the-search-for-optimal-concurrency",
         "review_status": "generated_identity",
@@ -177043,20 +176941,20 @@
           "Ali Jahanshahi",
           "Daniel Wong"
         ],
-        "doi": "",
+        "doi": "10.1109/hpca56546.2023.10071121",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_ieee_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1109/HPCA56546.2023.10071121",
+          "review_status": "reviewed_identifier_repair",
           "title": "KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers."
         },
         "identity_key": "title:krisp-enabling-kernel-wise-right-sizing-for-spatial-partitioned-gpu-inference-servers",
         "journal_entry_id": "2026-06-05-krisp-makes-gpu-partitions-a-per-kernel-admission-decision",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2023-krisp-enabling-kernel-wise-right-sizing-for-spatial-partitioned-gpu-inference-servers",
@@ -187007,12 +186905,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc21/presentation/zhao-siyao",
+          "review_status": "reviewed_identifier_repair",
           "title": "SKQ: Event Scheduling for Optimizing Tail Latency in a Traditional OS Kernel."
         },
         "identity_key": "title:skq-event-scheduling-for-optimizing-tail-latency-in-a-traditional-os-kernel",
@@ -190962,12 +190861,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc24/presentation/zhong",
+          "review_status": "reviewed_identifier_repair",
           "title": "UniMem: Redesigning Disaggregated Memory within A Unified Local-Remote Memory Hierarchy."
         },
         "identity_key": "title:unimem-redesigning-disaggregated-memory-within-a-unified-local-remote-memory-hierarchy",
@@ -191656,12 +191556,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/fast/CaoDVD20.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "Characterizing, Modeling, and Benchmarking RocksDB Key-Value Workloads at Facebook."
         },
         "identity_key": "title:characterizing-modeling-and-benchmarking-rocksdb-key-value-workloads-at-facebook",
@@ -193462,12 +193363,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi21/presentation/shen",
+          "review_status": "reviewed_identifier_repair",
           "title": "Retrofitting High Availability Mechanism to Tame Hybrid Transaction/Analytical Processing."
         },
         "identity_key": "title:retrofitting-high-availability-mechanism-to-tame-hybrid-transaction-analytical-processing",
@@ -221625,31 +221527,31 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 48,
-      "arxiv_present": 126,
-      "arxiv_reviewed_absent": 45,
-      "arxiv_secondary_missing": 383,
-      "doi_needs_identifier_review": 48,
+      "arxiv_needs_identifier_review": 36,
+      "arxiv_present": 128,
+      "arxiv_reviewed_absent": 52,
+      "arxiv_secondary_missing": 386,
+      "doi_needs_identifier_review": 36,
       "doi_not_expected_yet": 52,
-      "doi_present": 439,
-      "doi_reviewed_absent": 53,
+      "doi_present": 442,
+      "doi_reviewed_absent": 62,
       "doi_secondary_missing": 10
     },
     "paper_identity_counts": {
-      "paper_entries_with_arxiv": 126,
-      "paper_entries_with_doi": 439,
+      "paper_entries_with_arxiv": 128,
+      "paper_entries_with_doi": 442,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
-      "missing_arxiv": 476,
-      "missing_doi": 163
+      "missing_arxiv": 474,
+      "missing_doi": 160
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 383,
-      "doi": 70,
-      "doi,arxiv": 93,
+      "arxiv": 386,
+      "doi": 72,
+      "doi,arxiv": 88,
       "none": 56
     },
     "paper_records": 563,

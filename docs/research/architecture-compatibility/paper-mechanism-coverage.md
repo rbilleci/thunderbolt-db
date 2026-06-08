@@ -33,47 +33,35 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - duplicate identity groups: 32
 
 Generated identity field counts:
-- paper_entries_with_arxiv: 126
-- paper_entries_with_doi: 439
+- paper_entries_with_arxiv: 128
+- paper_entries_with_doi: 442
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
-- missing_arxiv: 476
-- missing_doi: 163
+- missing_arxiv: 474
+- missing_doi: 160
 
 Generated identity missing-field sets:
-- arxiv: 383
-- doi: 70
-- doi,arxiv: 93
+- arxiv: 386
+- doi: 72
+- doi,arxiv: 88
 - none: 56
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 48
-- arxiv_present: 126
-- arxiv_reviewed_absent: 45
-- arxiv_secondary_missing: 383
-- doi_needs_identifier_review: 48
+- arxiv_needs_identifier_review: 36
+- arxiv_present: 128
+- arxiv_reviewed_absent: 52
+- arxiv_secondary_missing: 386
+- doi_needs_identifier_review: 36
 - doi_not_expected_yet: 52
-- doi_present: 439
-- doi_reviewed_absent: 53
+- doi_present: 442
+- doi_reviewed_absent: 62
 - doi_secondary_missing: 10
-- actionable_identifier_review: 48
+- actionable_identifier_review: 36
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-05-genericvc-turns-mvcc-conflicts-into-configurable-validation-work` -> `paper-2025-generic-version-control-configurable-versioning-for-application-specific-requirements`: doi=needs_identifier_review, arxiv=needs_identifier_review: Generic Version Control: Configurable Versioning for Application-Specific Requirements.
-- `2026-06-05-horae-separates-durable-order-control-from-parallel-data-writes` -> `paper-2020-write-dependency-disentanglement-with-horae`: doi=needs_identifier_review, arxiv=needs_identifier_review: Write Dependency Disentanglement with Horae.
-- `2026-06-05-hsm-a-hybrid-slowdown-model-for-multitasking-gpus` -> `paper-2020-hsm-a-hybrid-slowdown-model-for-multitasking-gpus`: doi=needs_identifier_review, arxiv=needs_identifier_review: HSM: A Hybrid Slowdown Model for Multitasking GPUs.
-- `2026-06-05-krisp-makes-gpu-partitions-a-per-kernel-admission-decision` -> `paper-2023-krisp-enabling-kernel-wise-right-sizing-for-spatial-partitioned-gpu-inference-servers`: doi=needs_identifier_review, arxiv=needs_identifier_review: KRISP: Enabling Kernel-wise Right-sizing for Spatial Partitioned GPU Inference Servers.
-- `2026-06-05-occ-batching-makes-commit-order-a-bounded-optimization-problem` -> `paper-2018-improving-optimistic-concurrency-control-through-transaction-batching-and-operation-reordering`: doi=needs_identifier_review, arxiv=needs_identifier_review: Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering.
-- `2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks` -> `paper-2016-in-the-search-for-optimal-concurrency`: doi=needs_identifier_review, arxiv=needs_identifier_review: In the Search for Optimal Concurrency.
-- `2026-06-05-racksched-makes-request-routing-a-line-rate-admission-layer` -> `paper-2020-racksched-a-microsecond-scale-scheduler-for-rack-scale-computers`: doi=needs_identifier_review, arxiv=needs_identifier_review: RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers.
-- `2026-06-05-reef-protects-urgent-gpu-work-by-resetting-idempotent-best-effort-kernels` -> `paper-2022-microsecond-scale-preemption-for-concurrent-gpu-accelerated-dnn-inferences`: doi=needs_identifier_review, arxiv=needs_identifier_review: Microsecond-scale Preemption for Concurrent GPU-accelerated DNN Inferences.
-- `2026-06-05-rocksdb-production-traces-show-locality-is-a-benchmark-input-not-noise` -> `paper-2020-characterizing-modeling-and-benchmarking-rocksdb-key-value-workloads-at-facebook`: doi=needs_identifier_review, arxiv=needs_identifier_review: Characterizing, Modeling, and Benchmarking RocksDB Key-Value Workloads at Facebook.
-- `2026-06-05-skq-makes-event-delivery-a-schedulable-resource` -> `paper-2021-skq-event-scheduling-for-optimizing-tail-latency-in-a-traditional-os-kernel`: doi=needs_identifier_review, arxiv=needs_identifier_review: SKQ: Event Scheduling for Optimizing Tail Latency in a Traditional OS Kernel.
-- `2026-06-05-unimem-makes-far-memory-useful-by-separating-addressability-filtering-and-promotion` -> `paper-2024-unimem-redesigning-disaggregated-memory-within-a-unified-local-remote-memory-hierarchy`: doi=needs_identifier_review, arxiv=needs_identifier_review: UniMem: Redesigning Disaggregated Memory within A Unified Local-Remote Memory Hierarchy.
-- `2026-06-05-vegito-turns-ha-backups-into-fresh-columnar-htap-replicas` -> `paper-2021-retrofitting-high-availability-mechanism-to-tame-hybrid-transaction-analytical-processing`: doi=needs_identifier_review, arxiv=needs_identifier_review: Retrofitting High Availability Mechanism to Tame Hybrid Transaction/Analytical Processing.
 - `2026-06-06-archtm-makes-persistent-writes-a-locality-contract` -> `paper-2021-archtm-architecture-aware-high-performance-transaction-for-persistent-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: ArchTM: Architecture-Aware, High Performance Transaction for Persistent Memory.
 - `2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem` -> `paper-2022-high-throughput-replication-with-integrated-membership-management`: doi=needs_identifier_review, arxiv=needs_identifier_review: High Throughput Replication with Integrated Membership Management.
 - `2026-06-06-citron-makes-remote-range-locks-a-static-metadata-protocol` -> `paper-2023-citron-distributed-range-lock-management-with-one-sided-rdma`: doi=needs_identifier_review, arxiv=needs_identifier_review: Citron: Distributed Range Lock Management with One-sided RDMA.
@@ -102,7 +90,14 @@ Actionable DOI/arXiv identifier audit:
 - `2026-06-07-chablis-splits-fast-local-commits-from-global-snapshot-publication` -> `paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chablis: Fast and General Transactions in Geo-Distributed Systems.
 - `2026-06-07-chardonnay-turns-epoch-snapshots-into-pre-lock-admission` -> `paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases.
 - `2026-06-07-cloud-five-minute-rule-turns-tiering-into-an-access-frequency-budget` -> `paper-2025-the-five-minute-rule-for-the-cloud-caching-in-analytics-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: The Five-Minute Rule for the Cloud: Caching in Analytics Systems.
-- ... 8 more
+- `2026-06-07-durinn-turns-visibility-vs-durability-gaps-into-adversarial-tests` -> `paper-2022-durinn-adversarial-memory-and-thread-interleaving-for-detecting-durable-linearizability-bugs`: doi=needs_identifier_review, arxiv=needs_identifier_review: DURINN: Adversarial Memory and Thread Interleaving for Detecting Durable Linearizability Bugs.
+- `2026-06-07-firmament-makes-global-admission-cheap-enough-to-keep-centralized` -> `paper-2016-firmament-fast-centralized-cluster-scheduling-at-scale`: doi=needs_identifier_review, arxiv=needs_identifier_review: Firmament: Fast, Centralized Cluster Scheduling at Scale.
+- `2026-06-07-fsync-failures-make-durability-a-failure-state-contract` -> `paper-2020-can-applications-recover-from-fsync-failures`: doi=needs_identifier_review, arxiv=needs_identifier_review: Can Applications Recover from fsync Failures?
+- `2026-06-07-graphene-schedules-scarce-resources-by-troublesome-work-first` -> `paper-2016-graphene-packing-and-dependency-aware-scheduling-for-data-parallel-clusters`: doi=needs_identifier_review, arxiv=needs_identifier_review: Graphene: Packing and Dependency-Aware Scheduling for Data-Parallel Clusters.
+- `2026-06-07-hostping-makes-host-interconnect-health-a-route-precondition` -> `paper-2023-hostping-diagnosing-intra-host-network-bottlenecks-in-rdma-servers`: doi=needs_identifier_review, arxiv=needs_identifier_review: Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA Servers.
+- `2026-06-07-leopard-turns-isolation-semantics-into-an-online-verifier` -> `paper-2024-leopard-a-general-test-suite-for-isolation-level-verification`: doi=needs_identifier_review, arxiv=needs_identifier_review: Leopard: A General Test Suite for Isolation Level Verification.
+- `2026-06-07-lsnvmm-makes-the-log-the-home-location` -> `paper-2017-log-structured-non-volatile-main-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: Log-Structured Non-Volatile Main Memory.
+- `2026-06-07-tips-keeps-persistent-indexes-out-of-the-request-s-critical-path` -> `paper-2021-tips-making-volatile-index-structures-persistent-with-dram-nvmm-tiering`: doi=needs_identifier_review, arxiv=needs_identifier_review: TIPS: Making Volatile Index Structures Persistent with DRAM-NVMM Tiering.
 
 Missing identity metadata audit:
 - `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus` missing arxiv: Concurrent Analytical Query Processing with GPUs.
