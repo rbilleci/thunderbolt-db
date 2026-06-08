@@ -3724,6 +3724,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Large-object tiering transfer depends on measured object throughput and metadata scans rather than filesystem-style assumptions.",
     },
+    (
+        "2026-06-03-dbms-owned-large-objects-instead-of-files",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-time and queue-wait benefits need DBMS metadata-path measurements before owner bundling can rely on large-object catalog routing.",
+    },
+    (
+        "2026-06-03-scalerpc-reliable-connection-resource-sharing",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Reliable-connection sharing must be measured with logical, admitted, request-slot, response-slot, and staging-slot counters.",
+    },
+    (
+        "2026-06-03-scalerpc-reliable-connection-resource-sharing",
+        "deficit_fairness",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fairness transfer requires p50/p99, queue-wait, starvation, and mixed hot/idle client measurements.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-logical-scale-needs-active-resource-budgets",
+        "deficit_fairness",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Read-priority lanes and virtualized slots need mixed read/write/cold-miss stress measurements before fairness policy adoption.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-logical-scale-needs-active-resource-budgets",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner bundling is gated on runtime reports that separate logical sessions, active queues, buffers, snapshots, and dirty backlog.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-logical-scale-needs-active-resource-budgets",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot frontier vectors require stress reports proving bounded snapshot and descriptor counts under active resource budgets.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-logical-scale-needs-active-resource-budgets",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis explicitly calls for evaluation of scheduling, storage ownership, routing, and MVCC signals together under SQL or HTAP workloads.",
+    },
+    (
+        "2026-06-03-natto-distributed-transaction-prioritization",
+        "deficit_fairness",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Priority abort supports fairness only when retry-age promotion, budget caps, or fairness windows prevent low-priority starvation.",
+    },
+    (
+        "2026-06-03-natto-distributed-transaction-prioritization",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "contradicts",
+        "relation_review_note": "Late high-priority transactions can abort already queued smaller-timestamp work, conflicting with deterministic hot-write ordering.",
+    },
+    (
+        "2026-06-03-natto-distributed-transaction-prioritization",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Natto's two priority levels are too narrow for GPU DB freshness classes without class-count and latency evaluation.",
+    },
+    (
+        "2026-06-03-natto-distributed-transaction-prioritization",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained read preparation is valid only when publication remains conditional on mutation abort, completion, invalidation, or WAL-visible generation.",
+    },
+    (
+        "2026-06-03-hybridgc-production-mvcc-garbage-collection-in-sap-hana",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "HybridGC motivates WAL replay correctness, but commit-path overhead and GC scan work must be measured in the MVCC harness.",
+    },
+    (
+        "2026-06-03-dana-directly-attached-nvme-arrays",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than clause rejects treating NVMe as resident OLTP memory; the retained evidence still supports explicit tiering mechanics.",
+    },
+    (
+        "2026-06-03-dana-directly-attached-nvme-arrays",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "DANA's transferable queue mechanics support owner-ring bundling despite the resident-memory contrast.",
+    },
+    (
+        "2026-06-03-dana-directly-attached-nvme-arrays",
+        "log_structured_warm_tier",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The not-just cue describes richer NVMe-tier behavior, not a warning against log-structured warm-tier design.",
+    },
+    (
+        "2026-06-03-dana-directly-attached-nvme-arrays",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The paper's scan-oriented OLAP/HTAP focus is an alternative workload shape to pure retained OLTP freshness routing.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-scoped-fronts-must-include-storage",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue broadens robust route choice beyond cardinality error and supports resource-aware cost routing.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-scoped-fronts-must-include-storage",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Conditional fronts are valid only when prepared work cannot publish unsafe visibility.",
+    },
+    (
+        "2026-06-03-bf-tree-variable-length-mini-pages-for-larger-than-memory-indexes",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Variable-size cache objects need concurrency tests for growth, shrink, eviction, and retirement under retained snapshots.",
+    },
+    (
+        "2026-06-03-bf-tree-variable-length-mini-pages-for-larger-than-memory-indexes",
+        "db_owned_cold_objects",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "LSM-style and delta-chain cold-object layouts are alternatives with different read, scan, and compaction costs.",
+    },
+    (
+        "2026-06-03-ermia-snapshot-friendly-mixed-workload-oltp",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Resident GPU snapshots should be evaluated against ERMIA-style indirection to prove the extra hop is flattened before kernel execution.",
+    },
+    (
+        "2026-06-03-zicio-db-os-prefetch-for-rapid-ingestion",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue directly supports owner-published timing descriptors in bounded shared rings.",
+    },
+    (
+        "2026-06-03-predicate-transfer-for-multi-join-pre-filtering",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue motivates joining an existing same-shape filter-build phase instead of duplicating per-session work.",
+    },
+    (
+        "2026-06-03-query-fresh-synchronous-log-shipping-with-fresh-replicas",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Cheap indirection and generation updates after durable batches directly support immutable route-root publication.",
+    },
+    (
+        "2026-06-03-query-fresh-synchronous-log-shipping-with-fresh-replicas",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue supports bounded generation updates rather than repeated secondary-structure rematerialization.",
+    },
+    (
+        "2026-06-03-concord-approximate-optimal-scheduling-for-microsecond-tails",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Bounded local owner queues are valid only when queue depth remains part of the tail-latency contract.",
+    },
+    (
+        "2026-06-03-carousel-time-indexed-shaping-for-bounded-session-admission",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The not-just cue supports ownership and bounded queued work as required complements to scalable admission.",
+    },
+    (
+        "2026-06-03-carousel-time-indexed-shaping-for-bounded-session-admission",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Credit admission is valid only with bounded queued work, producer backpressure, and ownership that avoids shared hot locks.",
+    },
+    (
+        "2026-06-03-carousel-time-indexed-shaping-for-bounded-session-admission",
+        "deficit_fairness",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Time-slot granularity and horizon choices need p50 and fairness tests across tiny lookups and large result sets.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-placement-still-needs-paced-fronts",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Paced retained reads require overload benchmarks reporting GPU queue, response queue, socket credit, HBM residency, and cold-tier wait separately.",
+    },
 }
 
 
