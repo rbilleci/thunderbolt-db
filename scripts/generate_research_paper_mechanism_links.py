@@ -3304,6 +3304,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Tier placement advice is useful only if resident validity, GPU capacity, snapshot holders, and budgets hold.",
     },
+    (
+        "2026-06-03-plor-predictable-low-tail-transactions",
+        "effective_session_counting",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Worker-count-oriented lock metadata cautions that logical sessions must be multiplexed through bounded workers.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-explicit-winners",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Explicit commit-priority selection is presented as an alternative to letting abort/retry behavior decide tail latency.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-explicit-winners",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "The synthesis keeps tiered placement as future work unless new MVCC or write-path evidence changes the priority.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-admission-needs-explicit-winners",
+        "deficit_fairness",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Conflict-priority admission is framed as an explicit winner policy rather than fairness emerging from repeated aborts.",
+    },
+    (
+        "2026-06-03-mmap-is-not-a-buffer-pool-substitute",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Mapped immutable-file routing needs WAL ordering, checksum, mutation invalidation, and stale-byte tests before adoption.",
+    },
+    (
+        "2026-06-03-mmap-is-not-a-buffer-pool-substitute",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Resident GPU inputs are valid only when physical residency and fault behavior are proven, not merely addressable.",
+    },
+    (
+        "2026-06-03-tpp-transparent-cxl-page-placement",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Transparent placement must not admit retained routes unless WAL, visibility, generation, tier, latency, and migration risk are provable.",
+    },
+    (
+        "2026-06-03-zygos-work-conserving-microsecond-scheduler",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The ZygOS transfer is explicitly gated on retained-read micro-batch latency, queue-wait, idle-worker, and ordering measurements.",
+    },
+    (
+        "2026-06-03-zygos-work-conserving-microsecond-scheduler",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than clause limits throughput extrapolation; the evidence still supports scheduling as a resource contract.",
+    },
+    (
+        "2026-06-03-gacco-gpu-accelerated-oltp-co-execution",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Same-type GPU OLTP lanes are valid only under stored-procedure assumptions and static type-to-device routing.",
+    },
+    (
+        "2026-06-03-gacco-gpu-accelerated-oltp-co-execution",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The OLTP-rather-than-analytics contrast is scope context; bounded per-template queues still support descriptor shaping.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-batch-lanes-need-visibility-fences",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring batching is gated on same-template lane, visibility-fenced write-batch, and tier-aware route admission tests.",
+    },
+    (
+        "2026-06-03-bam-gpu-initiated-storage-access",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "GPU-side cold-tier request lanes are presented as an alternative to hiding IO behind CPU page faults.",
+    },
+    (
+        "2026-06-03-bam-gpu-initiated-storage-access",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "GPU-initiated NVMe queues are an alternative to CPU tiling, page-fault service, and repeated copy/compute phases.",
+    },
+    (
+        "2026-06-03-paramtree-learned-cost-model-calibration",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Parameterized cost transfer is useful only after GPU DB has explicit formula terms for validity, residency, queueing, and transfer cost.",
+    },
+    (
+        "2026-06-03-paramtree-learned-cost-model-calibration",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner queue wait, fallback penalty, invalidation risk, and transfer costs must be measured before owner routing decisions rely on the model.",
+    },
+    (
+        "2026-06-03-arachne-core-aware-thread-management",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Session multiplexing is useful only if tail-latency gains do not starve write visibility, refresh, or response delivery.",
+    },
+    (
+        "2026-06-03-arachne-core-aware-thread-management",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Tier work is valid in cooperative scheduling only when long scans, page faults, fallback joins, and cold reads are isolated or preemptible.",
+    },
+    (
+        "2026-06-03-arachne-core-aware-thread-management",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "CPU fallback is compatible with cooperative workers only when blocking or long fallback work is isolated or made preemptible.",
+    },
+    (
+        "2026-06-03-arachne-core-aware-thread-management",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Arachne-style resource exposure is presented as an alternative to one OS thread per client or one generic work queue.",
+    },
+    (
+        "2026-06-03-rebirth-retire-adaptive-contention-control",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hot-write ordering needs a benchmark comparing first-writer-wins, abort/retry, deterministic batch order, and rebirth-style demotion.",
+    },
+    (
+        "2026-06-03-rebirth-retire-adaptive-contention-control",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The conflicts-with cue names transaction conflicts; retired-owner metadata and latch-free dependency tracking still support bounded descriptor state.",
+    },
+    (
+        "2026-06-03-rebirth-retire-adaptive-contention-control",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Bounded rebirth checks with fallback are presented as an alternative to unbounded dependency graph work.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-control-planes-should-stay-explicit",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Dependency witnesses are gated on control-plane measurements for owner generations, conflict metadata, storage transfer, and fallback controls.",
+    },
+    (
+        "2026-06-03-umbra-variable-size-pages-for-ssd-backed-hot-working-sets",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner handoff must be tested under IO pressure, GPU saturation, pause behavior, and transient result-lifetime correctness.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-paths-need-fast-handles-and-slow-path-regulators",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier placement depends on measurements for cold-state pressure, stale generations, HBM cooling, host spill, and retained-route validation cost.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-paths-need-fast-handles-and-slow-path-regulators",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Owner-published generation handles directly support immutable route roots despite the rather-than cue.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-paths-need-fast-handles-and-slow-path-regulators",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The evidence supports bounded descriptor lifetimes by separating hot handles from cold cleanup and transient state.",
+    },
+    (
+        "2026-06-03-oltp-through-the-looking-glass-16-years-later",
+        "isolation_trace_oracle",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Whole-stack OLTP isolation evidence needs GPU DB validation against stored procedures, client logic, and PostgreSQL-style baselines.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-devices-require-explicit-service-ownership",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fast-device placement requires measured service-owned buffers, saturation counters, session backpressure, and async cold-tier behavior.",
+    },
 }
 
 
