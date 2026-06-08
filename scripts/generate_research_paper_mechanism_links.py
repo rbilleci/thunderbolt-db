@@ -10024,6 +10024,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Learned reuse is valid only when hot-path state lifetime, reuse, and retirement contracts are explicit.",
     },
+    (
+        "2026-06-06-geminifs-makes-gpu-storage-metadata-explicit-enough-for-device-side-io",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Device-side IO publication needs crash tests around WAL/checkpoint fences before route visibility can rely on it.",
+    },
+    (
+        "2026-06-06-geminifs-makes-gpu-storage-metadata-explicit-enough-for-device-side-io",
+        "db_owned_cold_objects",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "DB-owned segment files are benchmarkable but require stale-descriptor tests across moves, resizes, and compaction.",
+    },
+    (
+        "2026-06-06-geminifs-makes-gpu-storage-metadata-explicit-enough-for-device-side-io",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Segment-map publication needs latency and crash-boundary measurements before becoming an immutable route-root contract.",
+    },
+    (
+        "2026-06-07-nemo-treats-partial-write-set-knowledge-as-a-contention-throttle",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The conflict cue describes what NEMO schedules around; retained evidence supports dependency-aware resource ordering.",
+    },
+    (
+        "2026-06-07-nemo-treats-partial-write-set-knowledge-as-a-contention-throttle",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "NEMO-style dependency witnesses apply only under deterministic serializability, lazy block commit, and smart-contract objects.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-route-hints-need-measured-trust",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hint-driven fallback needs measured precision, retry, stale-route rejection, fallback count, and p99 degradation evidence.",
+    },
+    (
+        "2026-06-07-falcon-makes-persistent-cache-durability-a-write-amplification-problem",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Durable route descriptors need a measured commit window before forcing every route or manifest update to media.",
+    },
+    (
+        "2026-06-07-falcon-makes-persistent-cache-durability-a-write-amplification-problem",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-local durable windows require write-amplification and latency benchmarks before owner bundling adopts them.",
+    },
+    (
+        "2026-06-07-wfe-bounds-descriptor-retirement-with-helper-assisted-eras",
+        "deficit_fairness",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Helper-assisted fairness applies only if allocation and retirement paths help slow readers before era advancement.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-tier-movement-needs-semantic-guards",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Tier movement is valid only when snapshot correctness, reclamation protection, and intended-tier admission all agree.",
+    },
+    (
+        "2026-06-07-polysi-makes-snapshot-claims-black-box-testable",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshot claims require external witness histories and stress runs before adoption.",
+    },
+    (
+        "2026-06-07-polysi-makes-snapshot-claims-black-box-testable",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL visibility boundaries need route-audit stress histories before the mechanism can be trusted.",
+    },
+    (
+        "2026-06-07-host-interconnects-need-route-credits-not-just-bandwidth-counters",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-ring routing needs queue wait, topology contention, response backlog, and p99 benchmark telemetry.",
+    },
+    (
+        "2026-06-07-host-interconnects-need-route-credits-not-just-bandwidth-counters",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Logical-session scaling requires stress tests that expose topology-induced latency inflation.",
+    },
+    (
+        "2026-06-07-deferred-reference-counting-makes-descriptor-lifetime-automatic-but-bounded",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor reclamation requires route-lookup, atomic-write, retired-backlog, and invalidation-latency benchmarks.",
+    },
+    (
+        "2026-06-07-deferred-reference-counting-makes-descriptor-lifetime-automatic-but-bounded",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Effective session counting needs 1M logical-session benchmarks over bounded workers before adopting deferred counts.",
+    },
+    (
+        "2026-06-07-deferred-reference-counting-makes-descriptor-lifetime-automatic-but-bounded",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot protection benefits are benchmark evidence and need GPU DB validation before shaping frontier policy.",
+    },
+    (
+        "2026-06-07-deferred-reference-counting-makes-descriptor-lifetime-automatic-but-bounded",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The retained evidence supports bounded owner-accounted cleanup instead of hiding cleanup in latency-sensitive reads.",
+    },
+    (
+        "2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation",
+        "semantic_crash_oracle",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Crash consistency depends on generated operation sequences, recovery, and oracle comparison tests.",
+    },
+    (
+        "2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Catalog generations and route descriptors need crash-test coverage before informing reclamation policy.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-recovery-needs-compact-witnesses",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The recovery synthesis names WAL and manifest crash recovery as explicit benchmark gates.",
+    },
+    (
+        "2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract",
+        "semantic_crash_oracle",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Per-stream durability evidence is valid only if durable free-and-retire boundaries prevent reused-id observations.",
+    },
+    (
+        "2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "False-dependency behavior needs benchmarks before dependency-stream separation can inform route witnesses.",
+    },
+    (
+        "2026-06-07-chardonnay-turns-epoch-snapshots-into-pre-lock-admission",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier admission needs retained-read latency, write throughput, version retention, publisher overhead, and stale-read risk measurements.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-recovery-needs-semantic-state-spaces",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Semantic crash-state grouping is an alternative evidence shape to raw snapshot frontier state enumeration.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-recovery-needs-semantic-state-spaces",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Semantic stream separation needs hot-commit p99 measurement under checkpoint and cold-tier compaction pressure.",
+    },
+    (
+        "2026-06-07-holon-turns-independent-tuning-knobs-into-joint-route-actions",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Holon does not evaluate GPU memory, pinned buffers, NVMe tiers, or logical-session admission, so transfer requires benchmarks.",
+    },
+    (
+        "2026-06-07-lsnvmm-makes-the-log-the-home-location",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Log-structured reclamation is valid only if no snapshot, DMA, replay cursor, or route descriptor can reach recycled chunks.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-warm-tiers-need-logical-witnesses-and-movable-homes",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Warm-tier movement requires crash and recovery benchmarks proving physical movement never breaks logical records.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-warm-tiers-need-logical-witnesses-and-movable-homes",
+        "log_structured_warm_tier",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Appending a new physical copy and publishing a mapping is an alternative to fixed-home warm-tier updates.",
+    },
 }
 
 
