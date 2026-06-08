@@ -34,46 +34,33 @@ python3 scripts/generate_research_paper_mechanism_links.py
 
 Generated identity field counts:
 - paper_entries_with_arxiv: 133
-- paper_entries_with_doi: 442
+- paper_entries_with_doi: 444
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
 - missing_arxiv: 469
-- missing_doi: 160
+- missing_doi: 158
 
 Generated identity missing-field sets:
-- arxiv: 386
+- arxiv: 388
 - doi: 77
-- doi,arxiv: 83
+- doi,arxiv: 81
 - none: 56
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 12
 - arxiv_present: 133
-- arxiv_reviewed_absent: 71
-- arxiv_secondary_missing: 386
-- doi_needs_identifier_review: 12
+- arxiv_reviewed_absent: 81
+- arxiv_secondary_missing: 388
 - doi_not_expected_yet: 52
-- doi_present: 442
-- doi_reviewed_absent: 86
+- doi_present: 444
+- doi_reviewed_absent: 96
 - doi_secondary_missing: 10
-- actionable_identifier_review: 12
+- actionable_identifier_review: 0
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract` -> `paper-2017-application-crash-consistency-and-performance-with-ccfs`: doi=needs_identifier_review, arxiv=needs_identifier_review: Application Crash Consistency and Performance with CCFS.
-- `2026-06-07-chablis-splits-fast-local-commits-from-global-snapshot-publication` -> `paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chablis: Fast and General Transactions in Geo-Distributed Systems.
-- `2026-06-07-chardonnay-turns-epoch-snapshots-into-pre-lock-admission` -> `paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases.
-- `2026-06-07-cloud-five-minute-rule-turns-tiering-into-an-access-frequency-budget` -> `paper-2025-the-five-minute-rule-for-the-cloud-caching-in-analytics-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: The Five-Minute Rule for the Cloud: Caching in Analytics Systems.
-- `2026-06-07-durinn-turns-visibility-vs-durability-gaps-into-adversarial-tests` -> `paper-2022-durinn-adversarial-memory-and-thread-interleaving-for-detecting-durable-linearizability-bugs`: doi=needs_identifier_review, arxiv=needs_identifier_review: DURINN: Adversarial Memory and Thread Interleaving for Detecting Durable Linearizability Bugs.
-- `2026-06-07-firmament-makes-global-admission-cheap-enough-to-keep-centralized` -> `paper-2016-firmament-fast-centralized-cluster-scheduling-at-scale`: doi=needs_identifier_review, arxiv=needs_identifier_review: Firmament: Fast, Centralized Cluster Scheduling at Scale.
-- `2026-06-07-fsync-failures-make-durability-a-failure-state-contract` -> `paper-2020-can-applications-recover-from-fsync-failures`: doi=needs_identifier_review, arxiv=needs_identifier_review: Can Applications Recover from fsync Failures?
-- `2026-06-07-graphene-schedules-scarce-resources-by-troublesome-work-first` -> `paper-2016-graphene-packing-and-dependency-aware-scheduling-for-data-parallel-clusters`: doi=needs_identifier_review, arxiv=needs_identifier_review: Graphene: Packing and Dependency-Aware Scheduling for Data-Parallel Clusters.
-- `2026-06-07-hostping-makes-host-interconnect-health-a-route-precondition` -> `paper-2023-hostping-diagnosing-intra-host-network-bottlenecks-in-rdma-servers`: doi=needs_identifier_review, arxiv=needs_identifier_review: Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA Servers.
-- `2026-06-07-leopard-turns-isolation-semantics-into-an-online-verifier` -> `paper-2024-leopard-a-general-test-suite-for-isolation-level-verification`: doi=needs_identifier_review, arxiv=needs_identifier_review: Leopard: A General Test Suite for Isolation Level Verification.
-- `2026-06-07-lsnvmm-makes-the-log-the-home-location` -> `paper-2017-log-structured-non-volatile-main-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: Log-Structured Non-Volatile Main Memory.
-- `2026-06-07-tips-keeps-persistent-indexes-out-of-the-request-s-critical-path` -> `paper-2021-tips-making-volatile-index-structures-persistent-with-dram-nvmm-tiering`: doi=needs_identifier_review, arxiv=needs_identifier_review: TIPS: Making Volatile Index Structures Persistent with DRAM-NVMM Tiering.
+- none
 
 Missing identity metadata audit:
 - `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus` missing arxiv: Concurrent Analytical Query Processing with GPUs.

@@ -325,116 +325,7 @@
       "paper_id": "paper-2026-modeling-concurrency-control-as-a-learnable-function"
     }
   ],
-  "paper_identifier_review_audit": [
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract",
-      "paper_id": "paper-2017-application-crash-consistency-and-performance-with-ccfs",
-      "title": "Application Crash Consistency and Performance with CCFS."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-chablis-splits-fast-local-commits-from-global-snapshot-publication",
-      "paper_id": "paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems",
-      "title": "Chablis: Fast and General Transactions in Geo-Distributed Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-chardonnay-turns-epoch-snapshots-into-pre-lock-admission",
-      "paper_id": "paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases",
-      "title": "Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-cloud-five-minute-rule-turns-tiering-into-an-access-frequency-budget",
-      "paper_id": "paper-2025-the-five-minute-rule-for-the-cloud-caching-in-analytics-systems",
-      "title": "The Five-Minute Rule for the Cloud: Caching in Analytics Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-durinn-turns-visibility-vs-durability-gaps-into-adversarial-tests",
-      "paper_id": "paper-2022-durinn-adversarial-memory-and-thread-interleaving-for-detecting-durable-linearizability-bugs",
-      "title": "DURINN: Adversarial Memory and Thread Interleaving for Detecting Durable Linearizability Bugs."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-firmament-makes-global-admission-cheap-enough-to-keep-centralized",
-      "paper_id": "paper-2016-firmament-fast-centralized-cluster-scheduling-at-scale",
-      "title": "Firmament: Fast, Centralized Cluster Scheduling at Scale."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-fsync-failures-make-durability-a-failure-state-contract",
-      "paper_id": "paper-2020-can-applications-recover-from-fsync-failures",
-      "title": "Can Applications Recover from fsync Failures?"
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-graphene-schedules-scarce-resources-by-troublesome-work-first",
-      "paper_id": "paper-2016-graphene-packing-and-dependency-aware-scheduling-for-data-parallel-clusters",
-      "title": "Graphene: Packing and Dependency-Aware Scheduling for Data-Parallel Clusters."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-hostping-makes-host-interconnect-health-a-route-precondition",
-      "paper_id": "paper-2023-hostping-diagnosing-intra-host-network-bottlenecks-in-rdma-servers",
-      "title": "Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA Servers."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-leopard-turns-isolation-semantics-into-an-online-verifier",
-      "paper_id": "paper-2024-leopard-a-general-test-suite-for-isolation-level-verification",
-      "title": "Leopard: A General Test Suite for Isolation Level Verification."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-lsnvmm-makes-the-log-the-home-location",
-      "paper_id": "paper-2017-log-structured-non-volatile-main-memory",
-      "title": "Log-Structured Non-Volatile Main Memory."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-tips-keeps-persistent-indexes-out-of-the-request-s-critical-path",
-      "paper_id": "paper-2021-tips-making-volatile-index-structures-persistent-with-dram-nvmm-tiering",
-      "title": "TIPS: Making Volatile Index Structures Persistent with DRAM-NVMM Tiering."
-    }
-  ],
+  "paper_identifier_review_audit": [],
   "paper_identity_missing_audit": [
     {
       "citation": "Kaibo Wang, Kai Zhang, Yuan Yuan, Siyuan Ma, Rubao Lee, Xiaoning Ding, and Xiaodong Zhang. \"Concurrent Analytical Query Processing with GPUs.\" PVLDB 7(11), 2014. Retrieved 2026-06-02 from `https://www.vldb.org/pvldb/vol7/p1011-wang.pdf`.",
@@ -8376,6 +8267,25 @@
       "title": "Bullion: A Column Store for Machine Learning."
     },
     {
+      "citation": "Thanumalayan Sankaranarayana Pillai, Ramnatthan Alagappan, Lanyue Lu, Vijay Chidambaram, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. \"Application Crash Consistency and Performance with CCFS.\" FAST 2017, 181-196. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/pillai`, `https://www.usenix.org/system/files/conference/fast17/fast17_pillai.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_tos_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1145/3119897",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Application Crash Consistency and Performance with CCFS."
+      },
+      "journal_entry_id": "2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2017-application-crash-consistency-and-performance-with-ccfs",
+      "title": "Application Crash Consistency and Performance with CCFS."
+    },
+    {
       "citation": "Chen Chen, Xingbo Wu, Wenshao Zhong, and Jakob Eriksson. \"Fast Abort-Freedom for Deterministic Transactions.\" IPDPS 2024. DOI: `https://doi.org/10.1109/IPDPS57955.2024.00067`. Retrieved 2026-06-07 from the NSF PAR PDF: `https://par.nsf.gov/servlets/purl/10548863`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -8482,6 +8392,25 @@
       ],
       "paper_id": "paper-2023-falcon-fast-oltp-engine-for-persistent-cache-and-non-volatile-memory",
       "title": "Falcon: Fast OLTP Engine for Persistent Cache and Non-Volatile Memory."
+    },
+    {
+      "citation": "Anthony Rebello, Yuvraj Patel, Ramnatthan Alagappan, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. \"Can Applications Recover from fsync Failures?\" USENIX ATC 2020, pages 753-767. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/atc20/presentation/rebello`, `https://www.usenix.org/system/files/atc20-rebello.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_tos_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1145/3450338",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Can Applications Recover from fsync Failures?"
+      },
+      "journal_entry_id": "2026-06-07-fsync-failures-make-durability-a-failure-state-contract",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2020-can-applications-recover-from-fsync-failures",
+      "title": "Can Applications Recover from fsync Failures?"
     },
     {
       "citation": "William Zhang, Wan Shen Lim, Matthew Butrovich, and Andrew Pavlo. \"The Holon Approach for Simultaneously Tuning Multiple Components in a Self-Driving Database Management System with Machine Learning via Synthesized Proto-Actions.\" PVLDB 17(11):3373-3387, 2024. Retrieved 2026-06-07 from `https://www.vldb.org/pvldb/vol17/p3373-zhang.pdf`. DOI: `https://doi.org/10.14778/3681954.3682007`. Artifact: `https://github.com/17zhangw/protox`.",
@@ -10228,33 +10157,15 @@
       "title": "AIFM: High-Performance, Application-Integrated Far Memory."
     },
     {
-      "citation": "Thanumalayan Sankaranarayana Pillai, Ramnatthan Alagappan, Lanyue Lu, Vijay Chidambaram, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. \"Application Crash Consistency and Performance with CCFS.\" FAST 2017, 181-196. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/pillai`, `https://www.usenix.org/system/files/conference/fast17/fast17_pillai.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Application Crash Consistency and Performance with CCFS."
-      },
-      "journal_entry_id": "2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2017-application-crash-consistency-and-performance-with-ccfs",
-      "title": "Application Crash Consistency and Performance with CCFS."
-    },
-    {
       "citation": "Tamer Eldeeb, Philip A. Bernstein, Asaf Cidon, and Junfeng Yang. \"Chablis: Fast and General Transactions in Geo-Distributed Systems.\" CIDR 2024. Retrieved 2026-06-07 from the CIDR proceedings and PDF: `https://www.vldb.org/cidrdb/2024/`, `https://www.vldb.org/cidrdb/papers/2024/p4-eldeeb.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://vldb.org/cidrdb/2024/chablis-fast-and-general-transactions-in-geo-distributed-systems.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "Chablis: Fast and General Transactions in Geo-Distributed Systems."
       },
       "journal_entry_id": "2026-06-07-chablis-splits-fast-local-commits-from-global-snapshot-publication",
@@ -10268,12 +10179,13 @@
     {
       "citation": "Tamer Eldeeb, Xincheng Xie, Philip A. Bernstein, Asaf Cidon, and Junfeng Yang. \"Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases.\" OSDI 2023. Retrieved 2026-06-07 from `https://www.usenix.org/system/files/osdi23-eldeeb.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/osdi/EldeebXBCY23",
+        "review_status": "reviewed_identifier_repair",
         "title": "Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases."
       },
       "journal_entry_id": "2026-06-07-chardonnay-turns-epoch-snapshots-into-pre-lock-admission",
@@ -10287,12 +10199,13 @@
     {
       "citation": "Kira Duwe, Angelos Anadiotis, Andrew Lamb, Lucas Lersch, Boaz Leskes, Daniel Ritter, and Pinar Tozun. \"The Five-Minute Rule for the Cloud: Caching in Analytics Systems.\" CIDR 2025. Retrieved 2026-06-07 from the CIDR/VLDB PDF: `https://www.vldb.org/cidrdb/papers/2025/p4-duwe.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_publisher_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://mail.vldb.org/cidrdb/2025/the-five-minute-rule-for-the-cloud-caching-in-analytics-systems.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "The Five-Minute Rule for the Cloud: Caching in Analytics Systems."
       },
       "journal_entry_id": "2026-06-07-cloud-five-minute-rule-turns-tiering-into-an-access-frequency-budget",
@@ -10306,12 +10219,13 @@
     {
       "citation": "Xinwei Fu, Dongyoon Lee, and Changwoo Min. \"DURINN: Adversarial Memory and Thread Interleaving for Detecting Durable Linearizability Bugs.\" OSDI 2022, 195-211. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/osdi22/presentation/fu`, `https://www.usenix.org/system/files/osdi22-fu.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_nsf_and_official_usenix_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_nsf_and_official_usenix_records_have_no_available_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://par.nsf.gov/biblio/10380631-durinn-adversarial-memory-thread-interleaving-detecting-durable-linearizability-bugs",
+        "review_status": "reviewed_identifier_repair",
         "title": "DURINN: Adversarial Memory and Thread Interleaving for Detecting Durable Linearizability Bugs."
       },
       "journal_entry_id": "2026-06-07-durinn-turns-visibility-vs-durability-gaps-into-adversarial-tests",
@@ -10325,12 +10239,13 @@
     {
       "citation": "Ionel Gog, Malte Schwarzkopf, Adam Gleave, Robert N. M. Watson, and Steven Hand. \"Firmament: Fast, Centralized Cluster Scheduling at Scale.\" OSDI 2016, 99-115. Retrieved 2026-06-07 from the USENIX page and author PDF: `https://www.usenix.org/conference/osdi16/technical-sessions/presentation/gog`, `https://pdos.csail.mit.edu/papers/firmament:osdi16.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/osdi/GogSGWH16",
+        "review_status": "reviewed_identifier_repair",
         "title": "Firmament: Fast, Centralized Cluster Scheduling at Scale."
       },
       "journal_entry_id": "2026-06-07-firmament-makes-global-admission-cheap-enough-to-keep-centralized",
@@ -10342,33 +10257,15 @@
       "title": "Firmament: Fast, Centralized Cluster Scheduling at Scale."
     },
     {
-      "citation": "Anthony Rebello, Yuvraj Patel, Ramnatthan Alagappan, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. \"Can Applications Recover from fsync Failures?\" USENIX ATC 2020, pages 753-767. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/atc20/presentation/rebello`, `https://www.usenix.org/system/files/atc20-rebello.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Can Applications Recover from fsync Failures?"
-      },
-      "journal_entry_id": "2026-06-07-fsync-failures-make-durability-a-failure-state-contract",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2020-can-applications-recover-from-fsync-failures",
-      "title": "Can Applications Recover from fsync Failures?"
-    },
-    {
       "citation": "Robert Grandl, Srikanth Kandula, Sriram Rao, Aditya Akella, and Janardhan Kulkarni. \"Graphene: Packing and Dependency-Aware Scheduling for Data-Parallel Clusters.\" OSDI 2016. Retrieved 2026-06-07 from the USENIX open-access PDF: `https://www.usenix.org/system/files/conference/osdi16/osdi16-grandl-graphene.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/osdi/GrandlKRAK16",
+        "review_status": "reviewed_identifier_repair",
         "title": "Graphene: Packing and Dependency-Aware Scheduling for Data-Parallel Clusters."
       },
       "journal_entry_id": "2026-06-07-graphene-schedules-scarce-resources-by-troublesome-work-first",
@@ -10382,12 +10279,13 @@
     {
       "citation": "Kefei Liu, Zhuo Jiang, Jiao Zhang, Haoran Wei, Xiaolong Zhong, Lizhuang Tan, Tian Pan, and Tao Huang. \"Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA Servers.\" NSDI 2023. Retrieved 2026-06-07 from the USENIX open-access PDF: `https://www.usenix.org/system/files/nsdi23-liu-kefei.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/nsdi/0004J0WZT0023",
+        "review_status": "reviewed_identifier_repair",
         "title": "Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA Servers."
       },
       "journal_entry_id": "2026-06-07-hostping-makes-host-interconnect-health-a-route-precondition",
@@ -10401,12 +10299,13 @@
     {
       "citation": "Peiyuan Liu, Siyang Weng, Keqiang Li, Lyu Ni, Chengcheng Yang, Rong Zhang, Weining Qian, and Dian Qiao. \"Leopard: A General Test Suite for Isolation Level Verification.\" CIDR 2024. Retrieved 2026-06-07 from the CIDR proceedings PDF: `https://vldb.org/cidrdb/papers/2024/p44-liu.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_cidr_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_cidr_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/cidr/LiuWLNY0QQ24",
+        "review_status": "reviewed_identifier_repair",
         "title": "Leopard: A General Test Suite for Isolation Level Verification."
       },
       "journal_entry_id": "2026-06-07-leopard-turns-isolation-semantics-into-an-online-verifier",
@@ -10420,12 +10319,13 @@
     {
       "citation": "Qingda Hu, Jinglei Ren, Anirudh Badam, Jiwu Shu, and Thomas Moscibroda. \"Log-Structured Non-Volatile Main Memory.\" USENIX ATC 2017. Retrieved 2026-06-07 from `https://www.usenix.org/system/files/conference/atc17/atc17-hu.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/usenix/HuRBSM17",
+        "review_status": "reviewed_identifier_repair",
         "title": "Log-Structured Non-Volatile Main Memory."
       },
       "journal_entry_id": "2026-06-07-lsnvmm-makes-the-log-the-home-location",
@@ -10439,12 +10339,13 @@
     {
       "citation": "R. Madhava Krishnan, Wook-Hee Kim, Xinwei Fu, Sumit Kumar Monga, Hee Won Lee, Minsung Jang, Ajit Mathew, and Changwoo Min. \"TIPS: Making Volatile Index Structures Persistent with DRAM-NVMM Tiering.\" USENIX ATC 2021, 773-787. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/atc21/presentation/krishnan`, `https://www.usenix.org/system/files/atc21-krishnan.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/usenix/RamanathanKFMLJ21",
+        "review_status": "reviewed_identifier_repair",
         "title": "TIPS: Making Volatile Index Structures Persistent with DRAM-NVMM Tiering."
       },
       "journal_entry_id": "2026-06-07-tips-keeps-persistent-indexes-out-of-the-request-s-critical-path",
@@ -11643,11 +11544,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:firmament-fast-centralized-cluster-scheduling-at-scale",
@@ -11712,11 +11613,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:graphene-packing-and-dependency-aware-scheduling-for-data-parallel-clusters",
@@ -12658,14 +12559,14 @@
         "Andrea C. Arpaci-Dusseau",
         "Remzi H. Arpaci-Dusseau"
       ],
-      "doi": "",
+      "doi": "10.1145/3119897",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_tos_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:application-crash-consistency-and-performance-with-ccfs",
@@ -12673,7 +12574,6 @@
         "2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2017-application-crash-consistency-and-performance-with-ccfs",
@@ -13088,11 +12988,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:log-structured-non-volatile-main-memory",
@@ -16154,14 +16054,14 @@
         "Andrea C. Arpaci-Dusseau",
         "Remzi H. Arpaci-Dusseau"
       ],
-      "doi": "",
+      "doi": "10.1145/3450338",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_tos_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:can-applications-recover-from-fsync-failures",
@@ -16169,7 +16069,6 @@
         "2026-06-07-fsync-failures-make-durability-a-failure-state-contract"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2020-can-applications-recover-from-fsync-failures",
@@ -18874,11 +18773,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:tips-making-volatile-index-structures-persistent-with-dram-nvmm-tiering",
@@ -19736,11 +19635,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_nsf_and_official_usenix_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_nsf_and_official_usenix_records_have_no_available_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:durinn-adversarial-memory-and-thread-interleaving-for-detecting-durable-linearizability-bugs",
@@ -22188,11 +22087,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:hostping-diagnosing-intra-host-network-bottlenecks-in-rdma-servers",
@@ -25297,11 +25196,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_cidr_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_cidr_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:leopard-a-general-test-suite-for-isolation-level-verification",
@@ -29219,11 +29118,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_publisher_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:the-five-minute-rule-for-the-cloud-caching-in-analytics-systems",
@@ -30413,12 +30312,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_cidr_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_cidr_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/cidr/LiuWLNY0QQ24",
+          "review_status": "reviewed_identifier_repair",
           "title": "Leopard: A General Test Suite for Isolation Level Verification."
         },
         "identity_key": "title:leopard-a-general-test-suite-for-isolation-level-verification",
@@ -31428,12 +31328,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/nsdi/0004J0WZT0023",
+          "review_status": "reviewed_identifier_repair",
           "title": "Hostping: Diagnosing Intra-host Network Bottlenecks in RDMA Servers."
         },
         "identity_key": "title:hostping-diagnosing-intra-host-network-bottlenecks-in-rdma-servers",
@@ -32911,12 +32812,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/osdi/GogSGWH16",
+          "review_status": "reviewed_identifier_repair",
           "title": "Firmament: Fast, Centralized Cluster Scheduling at Scale."
         },
         "identity_key": "title:firmament-fast-centralized-cluster-scheduling-at-scale",
@@ -33185,12 +33087,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_nsf_and_official_usenix_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_nsf_and_official_usenix_records_have_no_available_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://par.nsf.gov/biblio/10380631-durinn-adversarial-memory-thread-interleaving-detecting-durable-linearizability-bugs",
+          "review_status": "reviewed_identifier_repair",
           "title": "DURINN: Adversarial Memory and Thread Interleaving for Detecting Durable Linearizability Bugs."
         },
         "identity_key": "title:durinn-adversarial-memory-and-thread-interleaving-for-detecting-durable-linearizability-bugs",
@@ -34442,12 +34345,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_publisher_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://mail.vldb.org/cidrdb/2025/the-five-minute-rule-for-the-cloud-caching-in-analytics-systems.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "The Five-Minute Rule for the Cloud: Caching in Analytics Systems."
         },
         "identity_key": "title:the-five-minute-rule-for-the-cloud-caching-in-analytics-systems",
@@ -35708,12 +35612,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://vldb.org/cidrdb/2024/chablis-fast-and-general-transactions-in-geo-distributed-systems.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "Chablis: Fast and General Transactions in Geo-Distributed Systems."
         },
         "identity_key": "title:chablis-fast-and-general-transactions-in-geo-distributed-systems",
@@ -36233,12 +36138,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/usenix/RamanathanKFMLJ21",
+          "review_status": "reviewed_identifier_repair",
           "title": "TIPS: Making Volatile Index Structures Persistent with DRAM-NVMM Tiering."
         },
         "identity_key": "title:tips-making-volatile-index-structures-persistent-with-dram-nvmm-tiering",
@@ -215453,20 +215359,20 @@
           "Andrea C. Arpaci-Dusseau",
           "Remzi H. Arpaci-Dusseau"
         ],
-        "doi": "",
+        "doi": "10.1145/3450338",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_acm_tos_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1145/3450338",
+          "review_status": "reviewed_identifier_repair",
           "title": "Can Applications Recover from fsync Failures?"
         },
         "identity_key": "title:can-applications-recover-from-fsync-failures",
         "journal_entry_id": "2026-06-07-fsync-failures-make-durability-a-failure-state-contract",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2020-can-applications-recover-from-fsync-failures",
@@ -216928,20 +216834,20 @@
           "Andrea C. Arpaci-Dusseau",
           "Remzi H. Arpaci-Dusseau"
         ],
-        "doi": "",
+        "doi": "10.1145/3119897",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_acm_tos_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1145/3119897",
+          "review_status": "reviewed_identifier_repair",
           "title": "Application Crash Consistency and Performance with CCFS."
         },
         "identity_key": "title:application-crash-consistency-and-performance-with-ccfs",
         "journal_entry_id": "2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2017-application-crash-consistency-and-performance-with-ccfs",
@@ -217190,12 +217096,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/osdi/EldeebXBCY23",
+          "review_status": "reviewed_identifier_repair",
           "title": "Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases."
         },
         "identity_key": "title:chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases",
@@ -218476,12 +218383,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/usenix/HuRBSM17",
+          "review_status": "reviewed_identifier_repair",
           "title": "Log-Structured Non-Volatile Main Memory."
         },
         "identity_key": "title:log-structured-non-volatile-main-memory",
@@ -220505,12 +220413,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/osdi/GrandlKRAK16",
+          "review_status": "reviewed_identifier_repair",
           "title": "Graphene: Packing and Dependency-Aware Scheduling for Data-Parallel Clusters."
         },
         "identity_key": "title:graphene-packing-and-dependency-aware-scheduling-for-data-parallel-clusters",
@@ -221345,31 +221254,29 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 12,
       "arxiv_present": 133,
-      "arxiv_reviewed_absent": 71,
-      "arxiv_secondary_missing": 386,
-      "doi_needs_identifier_review": 12,
+      "arxiv_reviewed_absent": 81,
+      "arxiv_secondary_missing": 388,
       "doi_not_expected_yet": 52,
-      "doi_present": 442,
-      "doi_reviewed_absent": 86,
+      "doi_present": 444,
+      "doi_reviewed_absent": 96,
       "doi_secondary_missing": 10
     },
     "paper_identity_counts": {
       "paper_entries_with_arxiv": 133,
-      "paper_entries_with_doi": 442,
+      "paper_entries_with_doi": 444,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
       "missing_arxiv": 469,
-      "missing_doi": 160
+      "missing_doi": 158
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 386,
+      "arxiv": 388,
       "doi": 77,
-      "doi,arxiv": 83,
+      "doi,arxiv": 81,
       "none": 56
     },
     "paper_records": 563,
