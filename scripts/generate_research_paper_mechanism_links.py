@@ -1350,6 +1350,68 @@ RELATION_TYPE_DESCRIPTIONS = {
     "benchmark_required": "paper evidence is inconclusive without a benchmark or proof gate",
 }
 
+RELATION_CANDIDATE_CUES = {
+    "contradicts": [
+        "contradicts",
+        "conflicts with",
+        "incompatible",
+        "violates",
+    ],
+    "warns_against": [
+        "risk",
+        "risks and mismatches",
+        "warning",
+        "fragile",
+        "does not automatically",
+        "does not fit",
+        "not directly",
+        "not enough",
+        "not generally",
+        "not just",
+        "too strict",
+    ],
+    "only_valid_if": [
+        "only if",
+        "only when",
+        "unless",
+        "precondition",
+        "valid but",
+        "validity constraints",
+        "requires proof",
+        "requires all",
+        "must prove",
+        "must reject",
+        "must restore",
+        "condition",
+        "assumes",
+        "restrict",
+    ],
+    "benchmark_required": [
+        "benchmark",
+        "microbenchmark",
+        "measure",
+        "proof gate",
+        "stress",
+        "evaluate",
+        "prototype",
+        "test ",
+    ],
+    "alternative_to": [
+        "alternative",
+        "alternatives",
+        "instead of",
+        "rather than",
+    ],
+}
+
+RELATION_CANDIDATE_PRIORITY = [
+    "contradicts",
+    "warns_against",
+    "only_valid_if",
+    "benchmark_required",
+    "alternative_to",
+]
+
 
 REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
     (
@@ -3956,6 +4018,18 @@ def attach_relation_type(link: dict) -> None:
     link["relation_reason"] = RELATION_TYPE_DESCRIPTIONS[relation_type]
 
 
+def relation_candidate_details(link: dict) -> tuple[str, str]:
+    if link["relation_type"] != "supports":
+        return link["relation_type"], "already classified as a non-support relation"
+
+    snippet = link["evidence_span"].get("snippet", "").lower()
+    for relation_type in RELATION_CANDIDATE_PRIORITY:
+        for cue in RELATION_CANDIDATE_CUES[relation_type]:
+            if cue in snippet:
+                return relation_type, f"evidence snippet contains relation cue: {cue}"
+    return "supports", "no generated non-support relation cue found"
+
+
 def attach_evidence_span(entry: dict, link: dict, mechanism_name: str) -> None:
     attach_relation_type(link)
     link["evidence_span"] = {
@@ -3968,6 +4042,11 @@ def attach_evidence_span(entry: dict, link: dict, mechanism_name: str) -> None:
     quality, reason = evidence_quality_details(link)
     link["evidence_span"]["quality"] = quality
     link["evidence_span"]["quality_reason"] = reason
+    candidate_type, candidate_reason = relation_candidate_details(link)
+    link["relation_candidate"] = {
+        "candidate_relation_type": candidate_type,
+        "candidate_reason": candidate_reason,
+    }
 
 
 def fallback_mechanisms(category: str, text: str) -> list[str]:
@@ -4049,6 +4128,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     evidence_quality_counts: Counter = Counter()
     evidence_quality_reason_counts: Counter = Counter()
     relation_type_counts: Counter = Counter()
+    relation_candidate_counts: Counter = Counter()
     review_status_counts: Counter = Counter()
     review_priority_counts: Counter = Counter()
     type_counts: Counter = Counter()
@@ -4075,6 +4155,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             evidence_quality_counts[link["evidence_span"]["quality"]] += 1
             evidence_quality_reason_counts[link["evidence_span"]["quality_reason"]] += 1
             relation_type_counts[link["relation_type"]] += 1
+            relation_candidate_counts[link["relation_candidate"]["candidate_relation_type"]] += 1
             review_status_counts[link["review_status"]] += 1
             review_priority_counts[link["review_priority"]] += 1
         type_counts[entry["entry_type"]] += 1
@@ -4114,6 +4195,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "evidence_quality_counts": dict(sorted(evidence_quality_counts.items())),
             "evidence_quality_reason_counts": dict(sorted(evidence_quality_reason_counts.items())),
             "relation_type_counts": dict(sorted(relation_type_counts.items())),
+            "relation_candidate_counts": dict(sorted(relation_candidate_counts.items())),
             "review_status_counts": dict(sorted(review_status_counts.items())),
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
@@ -4143,6 +4225,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     evidence_quality_counts = index["summary"]["evidence_quality_counts"]
     evidence_quality_reason_counts = index["summary"]["evidence_quality_reason_counts"]
     relation_type_counts = index["summary"]["relation_type_counts"]
+    relation_candidate_counts = index["summary"]["relation_candidate_counts"]
     review_status_counts = index["summary"]["review_status_counts"]
     review_priority_counts = index["summary"]["review_priority_counts"]
     records = index["records"]
@@ -4178,6 +4261,12 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
         for record in records
         for link in record["mechanism_links"]
         if link["relation_type"] != "supports"
+    ]
+    non_support_relation_candidate_records = [
+        (record, link)
+        for record in records
+        for link in record["mechanism_links"]
+        if link["relation_candidate"]["candidate_relation_type"] != "supports"
     ]
 
     lines = [
@@ -4227,6 +4316,30 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     for relation_type, count in sorted(relation_type_counts.items()):
         description = RELATION_TYPE_DESCRIPTIONS.get(relation_type, "")
         lines.append(f"- {relation_type}: {count} ({description})")
+
+    lines.extend(["", "## Generated Non-Support Relation Candidates", ""])
+    lines.append(
+        "These are generated audit candidates only; relation types remain unchanged until a later reviewed slice reclassifies them."
+    )
+    lines.append("")
+    lines.append("Candidate relation counts:")
+    for relation_type, count in sorted(relation_candidate_counts.items()):
+        description = RELATION_TYPE_DESCRIPTIONS.get(relation_type, "")
+        lines.append(f"- {relation_type}: {count} ({description})")
+    lines.append("")
+    lines.append("Candidate audit queue:")
+    if non_support_relation_candidate_records:
+        for record, link in non_support_relation_candidate_records[:80]:
+            span = link["evidence_span"]
+            candidate = link["relation_candidate"]
+            snippet = span["snippet"].replace("|", "\\|")
+            lines.append(
+                f"- `{record['id']}` -> {link['mechanism_id']}:{candidate['candidate_relation_type']} ({candidate['candidate_reason']}): {snippet}"
+            )
+        if len(non_support_relation_candidate_records) > 80:
+            lines.append(f"- ... {len(non_support_relation_candidate_records) - 80} more")
+    else:
+        lines.append("- none")
 
     lines.extend(["", "## Non-Support Relation Audit", ""])
     if non_support_relation_records:
