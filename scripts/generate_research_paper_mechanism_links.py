@@ -6664,6 +6664,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Static route certification must measure template retirement, fallback, abort/retry, and p99 behavior before adoption.",
     },
+    (
+        "2026-06-04-mvrc-robustness-turns-route-isolation-into-a-static-template-property",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The robustness claim is backed by proof-of-concept benchmarks and needs GPU DB conflict-order validation before adoption.",
+    },
+    (
+        "2026-06-04-three-tree-makes-intermediate-memory-a-first-class-buffer-tier",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Page movement can transfer only if each movement is tied to immutable publication and WAL-before-visibility ordering.",
+    },
+    (
+        "2026-06-04-three-tree-makes-intermediate-memory-a-first-class-buffer-tier",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Intermediate-buffer movement is valid only when route roots publish immutable snapshot and resident-state boundaries.",
+    },
+    (
+        "2026-06-04-schedule-first-oltp-turns-hot-key-conflict-order-into-an-admission-primitive",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hot-key scheduling has published evaluations, but GPU DB deterministic templates still need workload-specific latency and abort benchmarks.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-scheduling-intent",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The bounded active-request window is proposed as an alternative to global reordering for dependency control.",
+    },
+    (
+        "2026-06-04-dint-keeps-frequent-transaction-steps-inside-the-kernel-datapath",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Kernel datapath admission needs p50/p99 latency and false-delay measurements under hot-key skew before it can guide session counting.",
+    },
+    (
+        "2026-06-04-dint-keeps-frequent-transaction-steps-inside-the-kernel-datapath",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "DINT keeps fast operations in eBPF maps instead of using ordinary user-space descriptor traffic.",
+    },
+    (
+        "2026-06-04-runtime-conflicts-make-transaction-order-a-measurable-resource",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Runtime-conflict ordering remains coupled to the underlying CC protocol and needs GPU DB prototype measurements.",
+    },
+    (
+        "2026-06-04-runtime-conflicts-make-transaction-order-a-measurable-resource",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Runtime-conflict templates are useful only when probe cost stays below saved abort, fallback, and refresh cost.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-admission-needs-active-window-state",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The admission design is explicitly routed through a simulator benchmark across edge classification, priority, and deferment policies.",
+    },
+    (
+        "2026-06-04-cardood-treats-route-estimator-drift-as-a-first-class-optimizer-risk",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The test-query phrase describes estimator drift evaluation, while the evidence still supports learned optimizer risk tracking.",
+    },
+    (
+        "2026-06-04-cardood-treats-route-estimator-drift-as-a-first-class-optimizer-risk",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback decisions need explicit cross-group evaluation across resident state, freshness, lookup shape, queue pressure, and tenants.",
+    },
+    (
+        "2026-06-04-cardood-treats-route-estimator-drift-as-a-first-class-optimizer-risk",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Distribution-alignment methods are optimizer-side alternatives to replacing execution with deterministic hot-write templates.",
+    },
+    (
+        "2026-06-04-cockroachdb-makes-transaction-routing-an-ownership-problem",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "CockroachDB's distributed CPU/RocksDB/Raft setting cautions against directly inferring retained GPU snapshot behavior.",
+    },
+    (
+        "2026-06-04-cockroachdb-makes-transaction-routing-an-ownership-problem",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Adaptive ownership movement can improve average latency while worsening tail latency and fallback unpredictability.",
+    },
+    (
+        "2026-06-04-cockroachdb-makes-transaction-routing-an-ownership-problem",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Freshness routing needs benchmark evidence for snapshot age, owner contention, invalidation races, and freshness-sensitive fallbacks.",
+    },
+    (
+        "2026-06-04-geogauss-batches-replica-consistency-without-per-transaction-coordination",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Commit-generation publication is promising but needs mutation, refresh, invalidation, and read-snapshot release measurements.",
+    },
+    (
+        "2026-06-04-geogauss-batches-replica-consistency-without-per-transaction-coordination",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Same-generation write merge policies require throughput, latency, abort/retry, and WAL flush grouping benchmarks.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publish-certified-generations-not-mutable-shortcuts",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless clause is source-priority guidance; the synthesis still preserves GPU/CPU route execution as relevant evidence.",
+    },
+    (
+        "2026-06-04-cxl-memory-should-be-placed-by-object-behavior-not-by-capacity-alone",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Object-behavior placement needs direct resident-scan, lookup, visibility-check, temp-table, and response-buffer tests.",
+    },
+    (
+        "2026-06-04-cxl-memory-should-be-placed-by-object-behavior-not-by-capacity-alone",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "SAP HANA on commercial CXL memory is a CPU in-memory setting, cautioning against direct retained-GPU snapshot transfer.",
+    },
+    (
+        "2026-06-04-cxl-memory-should-be-placed-by-object-behavior-not-by-capacity-alone",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CXL expansion and shared-memory failover evidence needs GPU DB session-scale evaluation before shaping session counting.",
+    },
+    (
+        "2026-06-04-q-store-turns-transaction-execution-into-ordered-operation-queues",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Ordered operation queues need throughput, latency, abort/retry, owner-depth, and visibility-lag benchmarks for hot-write templates.",
+    },
+    (
+        "2026-06-04-q-store-turns-transaction-execution-into-ordered-operation-queues",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots require proof-gate validation that mutation fragments are observed before newer read snapshots publish.",
+    },
+    (
+        "2026-06-04-grasp-makes-imperfect-route-logs-useful-for-cardinality-estimates",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Composable per-table primitive models are presented as an alternative to one global or per-template learned estimator.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-tier-schedule-and-estimate-provenance",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Admission telemetry remains benchmarkable rather than proven, especially for queueing, eviction, and storage-tier scheduling.",
+    },
+    (
+        "2026-06-04-quecc-turns-hot-transactions-into-planned-priority-queues",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner queue certification needs WAL-before-visibility, invalidation-order, and micro-batch trigger benchmarks.",
+    },
+    (
+        "2026-06-04-cxl-memory-needs-workload-shaped-placement-not-capacity-only-tiering",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Workload-shaped placement requires prototype route-certificate measurements across access patterns and tier classes.",
+    },
+    (
+        "2026-06-04-cxl-memory-needs-workload-shaped-placement-not-capacity-only-tiering",
+        "effective_session_counting",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The CXL placement evidence warns against unbounded per-session and per-route state at the 1M logical-session target.",
+    },
+    (
+        "2026-06-04-orthrus-separates-contention-control-from-transaction-execution",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-message queue layouts need proof-gate validation that unplanned access restarts or falls back before visibility changes.",
+    },
 }
 
 
