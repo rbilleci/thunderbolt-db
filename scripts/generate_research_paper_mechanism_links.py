@@ -2674,6 +2674,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "The synthesis requires a route-decision record and CPU-vs-retained-GPU policy comparison before adoption.",
     },
+    (
+        "2026-06-02-third-modern-batch-synthesis",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Fallback policy is explicitly routed through route-decision records and a CPU-vs-retained-GPU comparison harness.",
+    },
+    (
+        "2026-06-02-third-modern-batch-synthesis",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-root adoption is gated on recorded snapshot, residency, tier, queue, transfer, and fallback facts.",
+    },
+    (
+        "2026-06-02-third-modern-batch-synthesis",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The risk wording names route-risk metadata, while the retained evidence supports measured owner-domain request paths.",
+    },
+    (
+        "2026-06-03-tictoc-data-driven-timestamp-occ",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Timestamp-history and validation checks need GPU DB visibility-frontier measurements before transfer.",
+    },
+    (
+        "2026-06-03-tictoc-data-driven-timestamp-occ",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Data-driven timestamps support visibility only if WAL, CPU indexes, GPU generations, publication, and replay agree.",
+    },
+    (
+        "2026-06-03-tictoc-data-driven-timestamp-occ",
+        "isolation_trace_oracle",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evidence says evaluated workloads showed no measurable gain, so trace-oracle transfer needs explicit evaluation.",
+    },
+    (
+        "2026-06-03-shirakami-hybrid-long-transaction-mvcc-and-short-transaction-occ",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The entry directly calls for a CPU-only prototype and conflict, latency, retry, and queue metrics.",
+    },
+    (
+        "2026-06-03-memory-optimized-mvcc-for-disk-backed-storage",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Page-reference epochs and read repetition are presented as a different visibility-tracking shape than frontier vectors.",
+    },
+    (
+        "2026-06-03-memory-optimized-mvcc-for-disk-backed-storage",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "ARIES-style rollback and rebuildable MVCC state require WAL replay and bulk-operation validation before GPU DB transfer.",
+    },
+    (
+        "2026-06-03-memory-optimized-mvcc-for-disk-backed-storage",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Rebuildable CPU-side MVCC auxiliaries are a structural alternative to durable retained GPU snapshot state.",
+    },
+    (
+        "2026-06-03-fourth-modern-batch-synthesis",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis explicitly requires measuring logical-clock choices for WAL-before-visibility publication.",
+    },
+    (
+        "2026-06-03-low-latency-transaction-scheduling-via-userspace-interrupts",
+        "deficit_fairness",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Pausing and resuming urgent work is presented as an alternative fairness mechanism to aborting long transactions.",
+    },
+    (
+        "2026-06-03-resource-adaptive-query-execution-with-paged-memory-management",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The paper omits GPU memory, pinned memory, NVMe tiering, WAL/MVCC, and million-session admission evaluation.",
+    },
+    (
+        "2026-06-03-resource-adaptive-query-execution-with-paged-memory-management",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Resizable buffer-pool pages are an alternative state-management shape to serialized heap descriptor objects.",
+    },
+    (
+        "2026-06-03-resource-adaptive-query-execution-with-paged-memory-management",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The preliminary design/exploration status cautions against treating it as mature hot-write template evidence.",
+    },
+    (
+        "2026-06-03-resource-adaptive-query-execution-with-paged-memory-management",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts invisible heap growth while supporting explicit observable memory admission and backpressure.",
+    },
+    (
+        "2026-06-03-polaris-priority-aware-optimistic-concurrency-control",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Priority-aware conflict ordering is gated on throughput, tail latency, abort distribution, and starvation measurements.",
+    },
+    (
+        "2026-06-03-polaris-priority-aware-optimistic-concurrency-control",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The paper omits durable WAL flush, checkpoint, recovery, GPU execution, protocol-state, and session-scale evaluation.",
+    },
+    (
+        "2026-06-03-polaris-priority-aware-optimistic-concurrency-control",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Session-counting transfer needs benchmarks because the evaluated system omits PostgreSQL protocol state and million-session admission.",
+    },
+    (
+        "2026-06-03-fifth-modern-batch-synthesis",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis names tier and resource-admission measurements as the gate for placement choices.",
+    },
+    (
+        "2026-06-03-fifth-modern-batch-synthesis",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The class-aware work contrast supports owner-local queues over a single global queue.",
+    },
+    (
+        "2026-06-03-fifth-modern-batch-synthesis",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Priority conflict metadata is contrasted with retry luck and supports explicit conflict-ordering policy.",
+    },
+    (
+        "2026-06-03-scalable-garbage-collection-for-in-memory-mvcc",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue describes GC pruning policy, not an optimizer alternative, and remains route-cost support.",
+    },
+    (
+        "2026-06-03-par2qo-parametric-penalty-aware-robust-query-optimization",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Penalty-profile plan caching is an optimizer-side alternative to specializing a single parameterized template path.",
+    },
+    (
+        "2026-06-03-par2qo-parametric-penalty-aware-robust-query-optimization",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The retained evidence explicitly stresses GPU resident execution versus CPU fallback decisions.",
+    },
+    (
+        "2026-06-03-sixth-modern-batch-synthesis",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis requires measuring recovery-bound route metadata and penalty-aware route choice before adoption.",
+    },
+    (
+        "2026-06-03-sixth-modern-batch-synthesis",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The LeanStore, Steam, and PAR2QO synthesis names MVCC cleanup as a next test target.",
+    },
+    (
+        "2026-06-03-sixth-modern-batch-synthesis",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots are gated on recovery-to-first-GPU-route and long-snapshot cleanup measurements.",
+    },
+    (
+        "2026-06-03-sixth-modern-batch-synthesis",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis routes durable write-path authority through WAL/recovery tests before architectural adoption.",
+    },
+    (
+        "2026-06-03-sixth-modern-batch-synthesis",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-local GC and route planning require queue, cleanup-debt, retained-read, and write-tail measurements.",
+    },
 }
 
 
