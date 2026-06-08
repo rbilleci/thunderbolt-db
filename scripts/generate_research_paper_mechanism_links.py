@@ -4774,6 +4774,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Retained snapshots need visibility-generation metrics under mixed reads, scans, refreshes, and write batches.",
     },
+    (
+        "2026-06-03-cross-paper-synthesis-frontier-metrics-make-tradeoffs-visible",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that owner bundling must expose winners, losers, and correctness boundaries, not only throughput.",
+    },
+    (
+        "2026-06-03-2-tree-record-level-hot-cold-migration-for-skewed-indexes",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Hot/cold migration is valid only if write-back and recovery complexity still preserve WAL-before-visibility and latency targets.",
+    },
+    (
+        "2026-06-03-2-tree-record-level-hot-cold-migration-for-skewed-indexes",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The hot/cold tree structure is presented as an alternative to a separate cached-row dependency shape.",
+    },
+    (
+        "2026-06-03-ncc-response-timed-strict-serializability-for-naturally-ordered-transactions",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "NCC targets distributed participant/coordinator stores, cautioning against direct transfer to single-node GPU-resident snapshots.",
+    },
+    (
+        "2026-06-03-ncc-response-timed-strict-serializability-for-naturally-ordered-transactions",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "NCC verifies naturally ordered execution after the fact instead of paying dependency fences before every transaction.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-routes-need-measurable-boundaries",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier placement is explicitly routed through mixed-frontier benchmarks with bytes-by-tier and fallback measurements.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-fast-routes-need-measurable-boundaries",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot frontier transfer needs mixed read/write benchmarks and correctness traces before architecture adoption.",
+    },
+    (
+        "2026-06-04-eiffel-software-packet-scheduling-for-request-admission",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts priority-queue implementations; the bounded integer queue evidence still supports compact descriptors.",
+    },
+    (
+        "2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue rejects ad hoc cleanup while supporting gated hot/cold conversion and tier maintenance lanes.",
+    },
+    (
+        "2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Deferred cleanup is valid only when old CPU, catalog, and GPU-resident metadata cannot be freed too early.",
+    },
+    (
+        "2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshot cleanup needs mutation throughput, read latency, queue-depth, oldest-reader, and version-chain measurements.",
+    },
+    (
+        "2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Queue and timestamp discipline supports owner-managed maintenance ordering rather than undermining owner bundling.",
+    },
+    (
+        "2026-06-04-hybridlog-for-hot-in-place-point-updates-over-cold-storage",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "HybridLog-style mutable tails are useful only for narrow hot key/value or MVCC metadata tables with cold spill boundaries.",
+    },
+    (
+        "2026-06-04-hybridlog-for-hot-in-place-point-updates-over-cold-storage",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "FASTER's WAL-elimination sketch is not directly transferable to SQL durability without a stronger recovery proof.",
+    },
+    (
+        "2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Cold-chunk route optimization is valid only when workload knowledge and frozen metadata can improve future predicates.",
+    },
+    (
+        "2026-06-04-kvell-the-design-and-implementation-of-a-fast-persistent-key-value-store",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "KVell scans can inform retained snapshots only after consistent MVCC visibility boundaries are added.",
+    },
+    (
+        "2026-06-04-bf-tree-variable-length-mini-pages-for-larger-than-memory-indexes",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner serialization, lock-free metadata, and partition-local locks must be measured against WAL-before-visibility constraints.",
+    },
+    (
+        "2026-06-04-bf-tree-variable-length-mini-pages-for-larger-than-memory-indexes",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Explicit mini-segment misses are proposed as an alternative to rediscovering repeated misses through CPU fallback.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-warm-state-should-be-bounded-semantic-and-visible",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Partition-owned, batched, queue-limited cold-tier IO supports explicit multi-tier placement rather than hidden mmap behavior.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-warm-state-should-be-bounded-semantic-and-visible",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The partition-owned cold-tier IO evidence supports owner bundling despite the rather-than cue.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-warm-state-should-be-bounded-semantic-and-visible",
+        "deficit_fairness",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cross-route accounting is explicitly framed as a mixed-workload benchmark for fairness and owner-pool contention.",
+    },
+    (
+        "2026-06-04-oltpim-near-memory-placement-for-oltp-indexes-and-mvcc-metadata",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "OLTPim's placement transfer is explicitly a near-memory/HBM/host/NVMe placement test for GPU DB.",
+    },
+    (
+        "2026-06-04-oltpim-near-memory-placement-for-oltp-indexes-and-mvcc-metadata",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue concerns rebuildable metadata; the evidence still supports WAL/checkpoint recovery as durable truth.",
+    },
+    (
+        "2026-06-04-oltpim-near-memory-placement-for-oltp-indexes-and-mvcc-metadata",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "GPU-resident metadata is useful only for small payloads and compact visibility-qualified outputs.",
+    },
+    (
+        "2026-06-04-revisiting-gpu-db-query-performance-and-resource-allocation",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Placement classification is valid only with queueing, cache interference, pinned-buffer, and invalidation-cost metrics.",
+    },
+    (
+        "2026-06-04-revisiting-gpu-db-query-performance-and-resource-allocation",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Required-column residency must be tested against full resident segments, refresh cost, and retained-query latency.",
+    },
+    (
+        "2026-06-04-revisiting-gpu-db-query-performance-and-resource-allocation",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evaluated systems are mostly analytical, so learned route advice needs retained-snapshot model evaluation.",
+    },
+    (
+        "2026-06-04-gpu-oltp-concurrency-control-needs-conflict-aware-launch-policy",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The GPU OLTP evaluation omits WAL flush, recovery, DDL, transfers, and dynamic maintenance, limiting WAL inference.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-gpu-routes-need-separate-resource-conflict-and-visibility-classes",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL-safe retained mutation needs publication-lag, conflict-cost, and visibility-summary benchmark proof.",
+    },
+    (
+        "2026-06-04-rcsi-scale-comes-from-treating-time-and-versions-as-first-class-routing-keys",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Approximate owner queues are valid only if internal ordering is not confused with SQL-visible correctness semantics.",
+    },
 }
 
 
