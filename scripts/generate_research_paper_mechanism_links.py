@@ -1332,6 +1332,24 @@ REVIEW_PRIORITY_BY_CONFIDENCE = {
     "needs_review": "high",
 }
 
+RELATION_TYPES = {
+    "supports",
+    "warns_against",
+    "contradicts",
+    "alternative_to",
+    "only_valid_if",
+    "benchmark_required",
+}
+
+RELATION_TYPE_DESCRIPTIONS = {
+    "supports": "paper evidence supports or motivates this mechanism",
+    "warns_against": "paper evidence warns against adopting this mechanism without constraints",
+    "contradicts": "paper evidence conflicts with this mechanism",
+    "alternative_to": "paper evidence describes an alternative to this mechanism",
+    "only_valid_if": "paper evidence supports this mechanism only under named conditions",
+    "benchmark_required": "paper evidence is inconclusive without a benchmark or proof gate",
+}
+
 
 REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
     (
@@ -3930,7 +3948,16 @@ def evidence_support_reason(link: dict, mechanism_name: str) -> str:
     return f"Category fallback mapped this journal entry to {mechanism_name}; review before relying on the link."
 
 
+def attach_relation_type(link: dict) -> None:
+    relation_type = link.get("relation_type", "supports")
+    if relation_type not in RELATION_TYPES:
+        raise ValueError(f"unknown paper-mechanism relation type: {relation_type}")
+    link["relation_type"] = relation_type
+    link["relation_reason"] = RELATION_TYPE_DESCRIPTIONS[relation_type]
+
+
 def attach_evidence_span(entry: dict, link: dict, mechanism_name: str) -> None:
+    attach_relation_type(link)
     link["evidence_span"] = {
         "journal_entry_id": entry["id"],
         "journal_anchor": f"### {entry['date']} - {entry['title']}",
@@ -4021,6 +4048,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     evidence_span_counts: Counter = Counter()
     evidence_quality_counts: Counter = Counter()
     evidence_quality_reason_counts: Counter = Counter()
+    relation_type_counts: Counter = Counter()
     review_status_counts: Counter = Counter()
     review_priority_counts: Counter = Counter()
     type_counts: Counter = Counter()
@@ -4046,6 +4074,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
                 evidence_span_counts["links_with_support_reason"] += 1
             evidence_quality_counts[link["evidence_span"]["quality"]] += 1
             evidence_quality_reason_counts[link["evidence_span"]["quality_reason"]] += 1
+            relation_type_counts[link["relation_type"]] += 1
             review_status_counts[link["review_status"]] += 1
             review_priority_counts[link["review_priority"]] += 1
         type_counts[entry["entry_type"]] += 1
@@ -4064,10 +4093,14 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
 
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v3",
-        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans and evidence quality reasons. Review low-confidence and fallback links before making architectural commitments.",
+        "schema": "gpu-db-research-paper-mechanism-links-v4",
+        "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, and typed paper-mechanism relations. Review low-confidence and fallback links before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
+        "relation_types": {
+            relation_type: RELATION_TYPE_DESCRIPTIONS[relation_type]
+            for relation_type in sorted(RELATION_TYPES)
+        },
         "summary": {
             "entries": len(records),
             "paper_entries": type_counts["paper"],
@@ -4080,6 +4113,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "evidence_span_counts": dict(sorted(evidence_span_counts.items())),
             "evidence_quality_counts": dict(sorted(evidence_quality_counts.items())),
             "evidence_quality_reason_counts": dict(sorted(evidence_quality_reason_counts.items())),
+            "relation_type_counts": dict(sorted(relation_type_counts.items())),
             "review_status_counts": dict(sorted(review_status_counts.items())),
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
@@ -4108,6 +4142,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     evidence_span_counts = index["summary"]["evidence_span_counts"]
     evidence_quality_counts = index["summary"]["evidence_quality_counts"]
     evidence_quality_reason_counts = index["summary"]["evidence_quality_reason_counts"]
+    relation_type_counts = index["summary"]["relation_type_counts"]
     review_status_counts = index["summary"]["review_status_counts"]
     review_priority_counts = index["summary"]["review_priority_counts"]
     records = index["records"]
@@ -4137,6 +4172,12 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
         for record in records
         for link in record["mechanism_links"]
         if link["evidence_span"]["quality"] == "reviewed_weak_signal"
+    ]
+    non_support_relation_records = [
+        (record, link)
+        for record in records
+        for link in record["mechanism_links"]
+        if link["relation_type"] != "supports"
     ]
 
     lines = [
@@ -4181,6 +4222,24 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     lines.append("Evidence quality reason counts:")
     for reason, count in sorted(evidence_quality_reason_counts.items()):
         lines.append(f"- {reason}: {count}")
+
+    lines.extend(["", "## Link Relation Types", ""])
+    for relation_type, count in sorted(relation_type_counts.items()):
+        description = RELATION_TYPE_DESCRIPTIONS.get(relation_type, "")
+        lines.append(f"- {relation_type}: {count} ({description})")
+
+    lines.extend(["", "## Non-Support Relation Audit", ""])
+    if non_support_relation_records:
+        for record, link in non_support_relation_records[:80]:
+            span = link["evidence_span"]
+            snippet = span["snippet"].replace("|", "\\|")
+            lines.append(
+                f"- `{record['id']}` -> {link['mechanism_id']}:{link['relation_type']} ({link['relation_reason']}): {snippet}"
+            )
+        if len(non_support_relation_records) > 80:
+            lines.append(f"- ... {len(non_support_relation_records) - 80} more")
+    else:
+        lines.append("- none")
 
     lines.extend(["", "## Evidence Span Quality Audit", ""])
     if evidence_quality_audit:
@@ -4277,7 +4336,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     lines.extend(["", "## Paper Entries", ""])
     for record in records:
         link_text = ", ".join(
-            f"{link['mechanism_id']}:{link['confidence']}:{link['review_status']}"
+            f"{link['mechanism_id']}:{link['relation_type']}:{link['confidence']}:{link['review_status']}"
             for link in record["mechanism_links"]
         )
         lines.append(f"- `{record['id']}` ({record['entry_type']}): {link_text}")
