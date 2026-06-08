@@ -4144,6 +4144,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Immutable route publication needs benchmarks comparing exact-response and retained-snapshot fast paths with validation cost.",
     },
+    (
+        "2026-06-03-pwv-early-write-visibility",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Piece-level early visibility is explicitly framed as a narrower benchmark track before template adoption.",
+    },
+    (
+        "2026-06-03-pwv-early-write-visibility",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Piece-level owner coordination is valid only if no read can observe pre-WAL or rollbackable state.",
+    },
+    (
+        "2026-06-03-vessel-fast-userspace-core-scheduling",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Vessel's global CPU-resource scheduler is an alternative to application-local DAG scheduling first.",
+    },
+    (
+        "2026-06-03-vessel-fast-userspace-core-scheduling",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Moving CPU time among sessions, retained reads, write owners, refresh jobs, and fallback needs direct runtime measurement.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-declared-boundaries-need-schedulable-budgets",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless clause is corpus-planning guidance; the retained evidence still supports schedulable tier boundaries.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-declared-boundaries-need-schedulable-budgets",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Worker-budget movement between typed runtime rings is explicitly named as benchmark work.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-declared-boundaries-need-schedulable-budgets",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The synthesis favors runtime-state route ranking over black-box route production.",
+    },
+    (
+        "2026-06-03-space-and-time-bounded-multiversion-garbage-collection",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "A cross-tier GC policy is presented as an alternative to separate ad hoc watermarks.",
+    },
+    (
+        "2026-06-03-space-and-time-bounded-multiversion-garbage-collection",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Bounded reclamation is valid only when retained versions do not grow beyond active sparse snapshot needs.",
+    },
+    (
+        "2026-06-03-space-and-time-bounded-multiversion-garbage-collection",
+        "db_owned_cold_objects",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Range-tracking objects and restricted version lists support database-owned cold-object metadata.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-data-needs-interval-ownership",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier-intent metadata and separated resident/cold budgets are explicitly routed through benchmark comparison.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-hot-data-needs-interval-ownership",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Long-snapshot and skewed-update behavior must be measured before relying on retained generation placement.",
+    },
+    (
+        "2026-06-03-leveraging-lock-contention-to-improve-oltp-application-performance",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Contention-aware reordering is valid only under dependency constraints that preserve legal unit positions.",
+    },
+    (
+        "2026-06-03-efficient-scheduling-policies-for-microsecond-scale-tasks",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The workload is datacenter task scheduling, not SQL, WAL, MVCC, GPU kernels, or NVMe tiering.",
+    },
+    (
+        "2026-06-03-free-join-unified-binary-and-worst-case-optimal-joins",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The paper motivates a join-route spectrum rather than a binary GPU-hash-join versus CPU-fallback decision.",
+    },
+    (
+        "2026-06-03-free-join-unified-binary-and-worst-case-optimal-joins",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Free Join's variable-order plan form is an alternative query execution shape, not a hot-write template.",
+    },
+    (
+        "2026-06-03-free-join-unified-binary-and-worst-case-optimal-joins",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The evidence argues for a route-choice spectrum instead of a binary GPU/CPU fallback split.",
+    },
+    (
+        "2026-06-03-timely-rtt-based-congestion-control-for-the-datacenter",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "RTT and queueing signals need measurement before they can become vector admission credits.",
+    },
+    (
+        "2026-06-03-timely-rtt-based-congestion-control-for-the-datacenter",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "TIMELY-style signals are usable only if required NIC timestamp and ACK assumptions hold for the database path.",
+    },
+    (
+        "2026-06-03-powertcp-power-based-congestion-control",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Synthetic session-incast and boundary-dominance reporting are named as the proof gate for session counting.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-schedulers-need-level-and-slope",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The synthesis presents declared-boundary scheduling choices instead of global concurrency guesses.",
+    },
+    (
+        "2026-06-03-accelerating-gpu-data-processing-with-fastlanes-compression",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Compressed cold-partition GPU decoding must be measured against dense transfers and CPU fallback.",
+    },
+    (
+        "2026-06-03-polyjuice-learned-concurrency-control-policies",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Polyjuice's limited workload coverage requires GPU DB conflict-shape benchmarking before transfer.",
+    },
+    (
+        "2026-06-03-polyjuice-learned-concurrency-control-policies",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Polyjuice is in-memory multicore OLTP and does not provide GPU, WAL/recovery, or multi-tier storage guarantees.",
+    },
+    (
+        "2026-06-03-btrim-hybrid-in-memory-row-store-for-extreme-oltp",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The hot-row lesson is explicitly that contention should be measured at the resource where it occurs.",
+    },
+    (
+        "2026-06-03-libpreemptible-hardware-assisted-user-space-scheduling",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-specific deadline admission and chunked refresh behavior are explicit test requirements.",
+    },
+    (
+        "2026-06-03-syrup-user-defined-scheduling-across-the-stack",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Syrup's compact route descriptor across boundaries is an alternative to isolated local scheduling decisions.",
+    },
+    (
+        "2026-06-03-syrup-user-defined-scheduling-across-the-stack",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Passing compact descriptors across layers is an alternative to relying only on immutable route-root publication.",
+    },
+    (
+        "2026-06-03-gmt-gpu-orchestrated-memory-tiering-for-the-big-data-era",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "GPU-side tier orchestration is SQL-visible only if CPU owners establish visibility and generation boundaries first.",
+    },
+    (
+        "2026-06-03-gmt-gpu-orchestrated-memory-tiering-for-the-big-data-era",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Direct GPU promotion requests versus residency-owner rings need H2D, NVMe, host-memory, latency, and interference measurements.",
+    },
 }
 
 
