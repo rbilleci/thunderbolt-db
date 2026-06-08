@@ -6244,6 +6244,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Fallback policy is valid only when descriptors expose predicted queue, GPU, pinned-buffer, resident-age, and fallback costs.",
     },
+    (
+        "2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Mixed-isolation route templates require owner-queue, retained-read throughput, abort/retry, and p95/p99 validation.",
+    },
+    (
+        "2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default",
+        "effective_session_counting",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The abstract workload model cautions against inferring arbitrary SQL behavior at million-session scale.",
+    },
+    (
+        "2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Learned-index batching needs throughput, latency, launch-count, CPU last-mile, result-byte, and queue-wait measurements.",
+    },
+    (
+        "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Opportunistic multi-owner ordering requires SCC stability, delayed-command, queue-wait, retry, and tail-latency measurements.",
+    },
+    (
+        "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Detock rewrites stable ordering cycles instead of relying on globally ordered hot-write templates.",
+    },
+    (
+        "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Detock's replicated conflict-graph repair is an alternative to per-route dependency witness admission.",
+    },
+    (
+        "2026-06-04-pgm-gives-learned-indexes-a-bounded-route-certificate",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Learned index advice is valid only when exposed through bounded route certificates rather than opaque model output.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-fast-routes-now-need-certificates-not-hints",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-root publication needs retained lookup, refresh, stale-visibility, conflict, and DDL invalidation benchmarks.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-fast-routes-now-need-certificates-not-hints",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Multi-owner conflict, invalidation, and refresh handoff require explicit certificate benchmarks before adoption.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-fast-routes-now-need-certificates-not-hints",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Conservative owner fallback must be benchmarked against CPU and GPU PGM retained point-lookup routes.",
+    },
+    (
+        "2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner bundling is valid only when stream packing preserves ordering, visibility, result-scatter ownership, and measured certificate fields.",
+    },
+    (
+        "2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Explicit retained-route co-scheduling is presented as an alternative to hoping concurrent CUDA streams overlap usefully.",
+    },
+    (
+        "2026-06-04-snapshot-reconstruction-as-an-optimizable-route",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot reconstruction placement needs native/cold-tier benchmarks with retained-generation, old-byte, rebuild, and fallback telemetry.",
+    },
+    (
+        "2026-06-04-snapshot-reconstruction-as-an-optimizable-route",
+        "isolation_trace_oracle",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Snapshot reconstruction evidence transfers only under full SI/MVCC assumptions focused on read-path reconstruction.",
+    },
+    (
+        "2026-06-04-gpu-sharing-should-be-measured-not-guessed",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The evidence says same-shape batching alone is insufficient without measured route-pair compatibility and interference constraints.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless cue is a research-queue priority note; the entry still identifies metadata and tier placement as live control-loop gaps.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Live route-class compatibility telemetry is proposed as an alternative to relying only on static same-shape batching.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU scheduling policy needs route-certificate tests, co-run compatibility measurements, and latency-budget gates.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-need-live-control-loops",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fast measured routes are valid only when snapshot certificates prove the requested read boundary.",
+    },
+    (
+        "2026-06-04-x-ssd-moves-wal-propagation-into-the-storage-device",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL credit admission needs COPY/INSERT microbenchmarks and durability-counter proof before visibility publication.",
+    },
+    (
+        "2026-06-04-correct-remote-durability-depends-on-the-whole-path",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Replayable ingress rings are valid only if recovery can interpret them without volatile context and recycling is bounded.",
+    },
+    (
+        "2026-06-04-correct-remote-durability-depends-on-the-whole-path",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Dependency publication is valid only when the route certificate proves the selected remote durability policy is complete.",
+    },
+    (
+        "2026-06-04-correct-remote-durability-depends-on-the-whole-path",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Whole-path durability requirements caution against treating descriptor cleanup as an API-local reclamation problem.",
+    },
+    (
+        "2026-06-04-bindex-turns-predicate-scans-into-a-memory-budgeted-route",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "BinDex-style route choice is valid only when memory is sufficient and selection dominates transfer, queue, visibility, and join costs.",
+    },
+    (
+        "2026-06-04-bindex-turns-predicate-scans-into-a-memory-budgeted-route",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained predicate indexes are useful only where selectivity and update behavior avoid fragile random-access tree costs.",
+    },
+    (
+        "2026-06-04-bindex-turns-predicate-scans-into-a-memory-budgeted-route",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Segment-local tier placement is valid only if bitmap count does not make route planning or result merging dominate.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-memory-budgeted-predicate-routes",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Durability counters and read-route memory budgets need benchmark gates before accelerator shortcuts publish visibility.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-memory-budgeted-predicate-routes",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback must be measured in the predicate-route matrix across selectivity, update rate, HBM pressure, and queue depth.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-certificates-now-need-memory-budgeted-predicate-routes",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained GPU predicate routes require resident scan, sketch, bitmap/refine, GPU tree, and fallback benchmarks.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-publication-certificates-need-local-staging-and-explicit-durability-clocks",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless cue is a source-priority note; the synthesis still preserves multi-tier placement as a relevant publication-certificate gap.",
+    },
 }
 
 
