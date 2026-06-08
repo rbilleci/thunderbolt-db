@@ -25,10 +25,12 @@ Sources:
   `docs/architecture/11-high-throughput-query-runtime.md`, and
   `docs/architecture/12-acid-isolation-and-gpu-memory.md`
 
-This draft does not claim a global optimum. It defines five valid architecture
-families that pass the P1/P2 hard filters under named assumptions. P4 will score
-these families, identify the Pareto frontier, and name the preferred
-defensible architecture under explicit constraints.
+This document does not claim a global optimum. It defines five valid
+architecture families that pass the P1/P2 hard filters under named assumptions
+and scores them under the objective weights in
+`end-to-end-architecture-design-space.md`. The preferred architecture is a
+defensible near-term choice under those constraints, not a proof that no other
+workload weighting can prefer another frontier candidate.
 
 ## Shared Validity Spine
 
@@ -634,22 +636,157 @@ First gates:
 | D - Multi-tier freshness router | HBM/DRAM/NVMe/object routing | Long-range over-resident architecture | `A6`, `A7`, `A10` | Warm/cold metadata cannot recover or route benefit loses to CPU fallback. |
 | E - Runtime-first 1M-session architecture | Active-flow accounting and response backpressure | Production runtime foundation | `A4`, `A8`, `A5` | Standing queues or response pressure remain hidden under logical-session counts. |
 
-## P4 Inputs
+## P4 Comparison And Selection
 
-P4 should score these families without adding new broad mechanisms. The likely
-comparison questions are:
+P4 scores the five candidates without adding new broad mechanisms. All five
+pass the hard filters because they keep CPU/WAL/MVCC authority, immutable
+publication, explicit fallback, bounded admission, crash proof, and isolation
+traceability in the shared validity spine. The scores below use the objective
+weights from `docs/research/end-to-end-architecture-design-space.md`; higher
+weighted totals are better, but totals are not treated as mathematical
+optimality.
 
-- Does Candidate A already dominate near-term implementation because it
-  advances the GPU value proposition while preserving the current correctness
-  spine?
-- Does Candidate E need to be treated as a prerequisite layer for A rather than
-  a competing architecture?
-- Is Candidate B the natural fallback or next-stage architecture once
-  partition and tier measurements exist?
-- Should Candidate D be ranked as a long-range architecture rather than the
-  preferred near-term path because recovery and tiering proof gates are large?
-- Should Candidate C remain explicitly benchmark-only unless write-lab
-  containment and scheduling gates pass?
+### Weighted Scorecard
 
-P4 must name the preferred and fallback architecture under explicit workload
-weights. It should not collapse all axes into a false global optimum.
+| Axis | Weight | A Conservative | B Partition Owner | C Write Lab | D Multi-Tier | E Runtime First |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Write throughput | 12 | 3 | 3 | 4 | 3 | 3 |
+| Retained-read p50/p99 | 14 | 4 | 4 | 4 | 4 | 3 |
+| Mixed workload stability | 12 | 4 | 4 | 3 | 4 | 3 |
+| 1M logical-session viability | 10 | 4 | 3 | 3 | 3 | 5 |
+| Recovery time and proof quality | 10 | 4 | 4 | 3 | 3 | 4 |
+| HBM/DRAM/NVMe efficiency | 10 | 2 | 4 | 2 | 5 | 2 |
+| Implementation complexity | 8 | 5 | 3 | 2 | 2 | 4 |
+| Operational clarity | 8 | 5 | 4 | 3 | 3 | 5 |
+| Benchmarkability | 8 | 5 | 4 | 3 | 3 | 4 |
+| Extensibility | 8 | 4 | 5 | 3 | 5 | 3 |
+| Weighted total | 100 | 392 | 378 | 308 | 354 | 352 |
+| Current confidence | - | prototype-backed with direct P8 fit | prototype-backed | benchmark-only | prototype-backed, long-range | adopted-invariant plus prototype gates |
+| Risk penalty | - | -1 | -2 | -3 | -3 | -1 |
+| Net architecture posture | - | preferred baseline | fallback and next stage | deferred write lab | long-range frontier | prerequisite runtime layer |
+
+### Score Rationale
+
+Candidate A scores highest under the current weights because it advances the
+measured P8 retained-read direction while preserving the existing correctness
+and runtime contracts. It has direct fit with the accepted 10% identical
+pgwire retained execution evidence in `docs/testing/benchmarks/README.md`, and
+its first unknowns map to bounded gates: retained refresh latency, MVCC and
+descriptor lifetime, and micro-batch p99 control.
+
+Candidate B remains close because partition ownership is the natural next
+architecture once over-resident and partition-local measurements become
+decisive. It beats A on HBM/DRAM/NVMe efficiency and extensibility, but loses
+near-term points on implementation complexity and cross-owner preflight risk.
+The current benchmark README still lists the 125% over-resident tier as blocked
+on partitioned resident route execution, which makes B a fallback/next-stage
+architecture rather than the first implementation thesis.
+
+Candidate C is intentionally scored as a benchmark-only architecture family.
+Known-shape GPU write preprocessing could improve write throughput, but the
+mechanisms are not allowed to displace CPU/WAL/MVCC authority and have high
+scheduling, isolation, and validation cost. It should not shape the preferred
+baseline until `A9-write-lab-containment` and p99 interference gates pass.
+
+Candidate D is on the frontier for data larger than HBM. It has the strongest
+tier-efficiency and long-range extensibility score, but its recovery,
+dependency-witness, DB-owned cold-object, and route-cost gates are too broad
+for the first preferred architecture. It is a long-range architecture to keep
+visible, not the near-term baseline.
+
+Candidate E is not a loser so much as a prerequisite layer. Its runtime model
+dominates session viability and operational clarity, and Candidate A should
+absorb E's active-flow accounting, vector credits, response credits,
+owner-ring telemetry, and deficit-fairness caps before claiming production
+read acceleration. E is therefore a required implementation posture inside the
+preferred A path, while remaining a standalone fallback if retained-read gates
+fail.
+
+### Pareto Frontier
+
+The Pareto frontier is:
+
+- Candidate A for near-term retained-read value, implementation tractability,
+  operator clarity, benchmarkability, and current P8 fit.
+- Candidate B for partition-local and over-resident workloads once
+  `A2-frontier-preflight-cost` and `A6-tier-route-benefit` are proven.
+- Candidate D for larger-than-HBM data if warm/cold placement and recovery
+  gates become more valuable than near-term complexity.
+- Candidate E for session-scale runtime stability and as the required runtime
+  layer under A.
+
+Candidate C is not on the baseline frontier. It remains a contained experiment
+lane because write acceleration is useful only if it proves it cannot bypass
+WAL-before-visibility, isolation tracing, CPU/MVCC apply, or retained-read
+tail-latency budgets.
+
+### Preferred Architecture
+
+The preferred architecture is Candidate A, Conservative Retained-Read
+Evolution, with Candidate E's runtime discipline treated as mandatory
+implementation posture. The concise thesis is:
+
+Keep CPU/WAL/MVCC as durable authority; publish immutable retained GPU read
+generations for measured hot shapes; route every read through explicit
+freshness, cost, fallback, and isolation decisions; and admit all read, write,
+refresh, GPU, pinned-buffer, WAL, and response work through vector credits with
+owner-ring and fairness telemetry.
+
+This choice is preferred under these constraints:
+
+- near-term work should build on the accepted P8 retained endpoint and current
+  architecture docs rather than starting with over-resident tiering;
+- write acceleration must remain benchmark-only until containment is proven;
+- the first production-facing path must expose fallback reasons and hidden
+  queues before widening GPU scope;
+- benchmark gates should be small enough for focused worker packets.
+
+### Fallback Architecture
+
+The fallback architecture is Candidate E if retained GPU snapshot gates fail
+before runtime/admission gates fail. In that fallback, the engine should first
+complete the vector-credit, effective-session, response-backpressure,
+owner-ring, and fairness contracts, then reintroduce retained reads only for
+route shapes that pass p50/p99 and reclamation gates.
+
+Candidate B is the next-stage fallback if retained reads succeed but
+over-resident pressure or partition locality becomes the dominant product
+constraint. Candidate D should be promoted only after B's partition proof,
+stable-handle proof, and movement-cost proof show that warm/cold routing can
+beat CPU fallback without expanding recovery risk beyond the crash oracle.
+
+### Decisive Proof Gates
+
+The first gates that can change the selection are:
+
+| Gate | Assumption decided | Selection impact if it fails |
+| --- | --- | --- |
+| `benchmark-retained_gpu_snapshots` plus `benchmark-htap_freshness_router` | `A1-retained-refresh-latency` | Demote Candidate A; use Candidate E as the baseline while retained routes are narrowed or removed. |
+| `benchmark-mvcc_gc_frontiers` plus `benchmark-bounded_descriptor_reclamation` | `A3-version-retention-bound` | Keep A only for short-lived retained generations; defer long retained reads and partition promotion. |
+| `benchmark-vector_credit_admission` plus `benchmark-effective_session_counting` | `A4-vector-credit-sufficiency` | Block all production-facing candidates; fix runtime admission before adding GPU scope. |
+| `benchmark-same_shape_microbatching` plus `benchmark-deficit_fairness` | `A5-microbatch-latency-cap` | Disable or sharply cap micro-batching; keep retained single-route execution if still beneficial. |
+| `benchmark-snapshot_frontier_vectors` plus `benchmark-isolation_trace_oracle` | `A2-frontier-preflight-cost` | Prevent Candidate B promotion; keep scalar/single-owner retained paths and CPU fallback for cross-owner reads. |
+| `benchmark-stable_handle_indirection`, `benchmark-multi_tier_placement`, and `benchmark-cost_based_route_optimizer` | `A6-tier-route-benefit` | Keep Candidate D deferred; do not claim 125% over-resident retained execution. |
+| `benchmark-db_owned_cold_objects`, `benchmark-dependency_witnesses`, and `benchmark-semantic_crash_oracle` | `A7-cold-object-recovery`, `A10-dependency-witness-cost` | Prevent DB-owned cold objects or log-structured warm-tier metadata from becoming route-eligible. |
+| `benchmark-deterministic_hot_write_templates` or `benchmark-gpu_oltp_conflict_ordering` plus `benchmark-wal_before_visibility` | `A9-write-lab-containment` | Keep Candidate C out of baseline; remove write lab from scheduling and route-cost assumptions. |
+
+### Deferred Ideas
+
+The following ideas should not shape current implementation packets:
+
+- learned optimizer advice before deterministic route telemetry, CPU fallback
+  reasons, and isolation traces are stable;
+- GPU OLTP conflict ordering as a correctness authority path;
+- DB-owned cold objects as durable truth rather than rebuildable acceleration
+  state;
+- log-structured warm-tier publication before dependency witnesses and crash
+  oracle cases pass;
+- full 125% over-resident benchmark claims before partitioned resident route
+  execution and movement-cost gates pass.
+
+## P4 Output Boundary
+
+P4 is complete. The preferred defensible architecture is Candidate A with
+Candidate E runtime discipline embedded. Candidate B is the next-stage
+fallback for partition/over-resident pressure, Candidate D is the long-range
+tiered frontier, and Candidate C remains a bounded benchmark-only write lab.
