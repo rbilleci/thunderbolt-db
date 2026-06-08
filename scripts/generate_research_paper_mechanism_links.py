@@ -13,7 +13,7 @@ CATEGORY_RE = re.compile(r"^\*\*Category:\*\*\s*(?P<value>.+)$|^Category:\s*(?P<
 TAGS_RE = re.compile(r"^\*\*Relevance tags:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 CITATION_RE = re.compile(r"^\*\*Citation:\*\*\s*(?P<value>.+)$", re.MULTILINE)
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`])")
-DOI_RE = re.compile(r"(?:doi:\s*|doi\.org/)(?P<doi>10\.\d{4,9}/[^\s`]+)", re.IGNORECASE)
+DOI_RE = re.compile(r"(?:doi:?\s*`?|doi\.org/)(?P<doi>10\.\d{4,9}/[^\s`]+)", re.IGNORECASE)
 ARXIV_RE = re.compile(r"(?:arxiv[:\s]+|arxiv\.org/(?:abs|pdf)/)(?P<arxiv>\d{4}\.\d{4,5}(?:v\d+)?)", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s`)>]+")
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")

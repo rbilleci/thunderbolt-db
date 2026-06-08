@@ -340,42 +340,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts",
-      "paper_id": "paper-2024-g-learned-index-enabling-efficient-learned-index-on-gpu",
-      "title": "G-Learned Index: Enabling Efficient Learned Index on GPU."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem",
-      "paper_id": "paper-2019-concurrent-query-processing-in-a-gpu-based-database-system",
-      "title": "Concurrent query processing in a GPU-based database system."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-gpu-sharing-should-be-measured-not-guessed",
-      "paper_id": "paper-2017-dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus",
-      "title": "Dynamic Resource Management for Efficient Utilization of Multitasking GPUs."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
-      "paper_id": "paper-2025-a-hybrid-approach-to-integrating-deterministic-and-non-deterministic-concurrency-control-in-data",
-      "title": "A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-04-hetcache-makes-cache-placement-execution-centric-across-cpu-gpu-and-nvme",
       "paper_id": "paper-2023-hetcache-synergising-nvme-storage-and-gpu-acceleration-for-memory-efficient-analytics",
       "title": "HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics."
@@ -394,27 +358,9 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-hyperion-treats-gpu-storage-access-as-a-schedulable-pipeline",
-      "paper_id": "paper-2025-hyperion-co-optimizing-ssd-access-and-gpu-computation-for-cost-efficient-gnn-training",
-      "title": "Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-04-kvell-propagates-old-scan-versions-instead-of-retaining-snapshots",
       "paper_id": "paper-2020-kvell-snapshot-isolation-without-snapshots",
       "title": "KVell+: Snapshot Isolation without Snapshots."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-learned-gpu-indexes-need-batch-shaped-admission-not-single-query-routing",
-      "paper_id": "paper-2022-learned-index-on-gpu",
-      "title": "Learned Index on GPU."
     },
     {
       "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -448,15 +394,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default",
-      "paper_id": "paper-2023-allocating-isolation-levels-to-transactions-in-a-multiversion-setting",
-      "title": "Allocating Isolation Levels to Transactions in a Multiversion Setting."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem",
       "paper_id": "paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-",
       "title": "What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines."
@@ -466,45 +403,9 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-moneyball-keeps-serverless-databases-warm-only-when-history-pays-for-it",
-      "paper_id": "paper-2022-moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless",
-      "title": "Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-namespace-metadata-is-a-route-cache-design-problem",
-      "paper_id": "paper-2015-shardfs-vs-indexfs-replication-vs-caching-strategies-for-distributed-metadata-management-in-clou",
-      "title": "ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-04-numa-placement-should-follow-measured-route-pressure-not-static-partitioning",
       "paper_id": "paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
       "title": "Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-pgm-gives-learned-indexes-a-bounded-route-certificate",
-      "paper_id": "paper-2020-the-pgm-index-a-fully-dynamic-compressed-learned-index-with-provable-worst-case-bounds",
-      "title": "The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-production-workload-management-needs-cheap-predictions-plus-hard-guardrails",
-      "paper_id": "paper-2023-auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshift",
-      "title": "Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift."
     },
     {
       "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -529,42 +430,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem",
-      "paper_id": "paper-2024-towards-optimal-transaction-scheduling",
-      "title": "Towards Optimal Transaction Scheduling."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-seagull-makes-prediction-useful-by-optimizing-the-decision-not-the-whole-curve",
-      "paper_id": "paper-2021-seagull-an-infrastructure-for-load-prediction-and-optimized-resource-allocation",
-      "title": "Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-semantic-conflict-removal-beats-protocol-switching-alone",
-      "paper_id": "paper-2020-opportunities-for-optimism-in-contended-main-memory-multicore-transactions",
-      "title": "Opportunities for Optimism in Contended Main-Memory Multicore Transactions."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-semantic-repair-beats-full-occ-restart-when-conflict-scope-is-small",
-      "paper_id": "paper-2016-transaction-healing-scaling-optimistic-concurrency-control-on-multicores",
-      "title": "Transaction Healing: Scaling Optimistic Concurrency Control on Multicores."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-04-shared-cache-oltp-reframes-hot-data-as-coherent-acceleration-state",
       "paper_id": "paper-2023-is-scalable-oltp-in-the-cloud-a-solved-problem-analyzing-data-access-for-distributed-oltp-archit",
       "title": "Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures."
@@ -583,24 +448,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-snapshot-reconstruction-as-an-optimizable-route",
-      "paper_id": "paper-2021-towards-generic-fine-grained-transaction-isolation-in-polystores",
-      "title": "Towards Generic Fine-Grained Transaction Isolation in Polystores."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model",
-      "paper_id": "paper-2024-stage-query-execution-time-prediction-in-amazon-redshift",
-      "title": "Stage: Query Execution Time Prediction in Amazon Redshift."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-04-tectonic-turns-cold-tier-efficiency-into-explicit-traffic-classes-and-sealed-metadata",
       "paper_id": "paper-2021-facebook-s-tectonic-filesystem-efficiency-from-exascale",
       "title": "Facebook's Tectonic Filesystem: Efficiency from Exascale."
@@ -613,15 +460,6 @@
       "journal_entry_id": "2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract",
       "paper_id": "paper-2016-write-behind-logging",
       "title": "Write-Behind Logging."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-x-ssd-moves-wal-propagation-into-the-storage-device",
-      "paper_id": "paper-2022-x-ssd-a-storage-system-with-native-support-for-database-logging-and-replication",
-      "title": "X-SSD: A Storage System with Native Support for Database Logging and Replication."
     },
     {
       "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -754,27 +592,9 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-ocean-vista-turns-visibility-into-batched-watermark-gossip",
-      "paper_id": "paper-2019-ocean-vista-gossip-based-visibility-control-for-speedy-geo-distributed-transactions",
-      "title": "Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-05-optimal-concurrency-is-accepted-correct-schedules-not-just-fewer-locks",
       "paper_id": "paper-2016-in-the-search-for-optimal-concurrency",
       "title": "In the Search for Optimal Concurrency."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-plor-gives-aborted-hot-transactions-timestamp-priority",
-      "paper_id": "paper-2022-plor-general-transactions-with-predictable-low-tail-latency",
-      "title": "Plor: General Transactions with Predictable, Low Tail Latency."
     },
     {
       "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -811,15 +631,6 @@
       "journal_entry_id": "2026-06-05-skq-makes-event-delivery-a-schedulable-resource",
       "paper_id": "paper-2021-skq-event-scheduling-for-optimizing-tail-latency-in-a-traditional-os-kernel",
       "title": "SKQ: Event Scheduling for Optimizing Tail Latency in a Traditional OS Kernel."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-05-tmo-makes-tiering-a-pressure-controlled-feedback-loop",
-      "paper_id": "paper-2022-tmo-transparent-memory-offloading-in-datacenters",
-      "title": "TMO: Transparent Memory Offloading in Datacenters."
     },
     {
       "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -2161,24 +1972,6 @@
       "title": "LeanStore: In-Memory Data Management Beyond Main Memory."
     },
     {
-      "citation": "Rong Zhu, Wei Chen, Bolin Ding, Xingguang Chen, Andreas Pfadler, Ziniu Wu, and Jingren Zhou. \"Lero: A Learning-to-Rank Query Optimizer.\" PVLDB 16(6):1466-1479, 2023. DOI `10.14778/3583140.3583160`. Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol16/p1466-zhu.pdf`; arXiv version: `https://arxiv.org/abs/2302.06873`.",
-      "identifier_audit": {
-        "arxiv_review": "citation_supplies_arxiv",
-        "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
-        "needs_identifier_review": false,
-        "review_status": "generated_identifier_audit",
-        "title": "Lero: A Learning-to-Rank Query Optimizer."
-      },
-      "journal_entry_id": "2026-06-03-lero-learning-to-rank-query-optimization",
-      "missing_fields": [
-        "doi"
-      ],
-      "paper_id": "paper-2023-lero-a-learning-to-rank-query-optimizer",
-      "title": "Lero: A Learning-to-Rank Query Optimizer."
-    },
-    {
       "citation": "Cong Yan and Alvin Cheung. \"Leveraging Lock Contention to Improve OLTP Application Performance.\" Proceedings of the VLDB Endowment 9(5), 2016. Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -3358,24 +3151,6 @@
       "title": "Adaptive Logging: Optimizing Logging and Recovery Costs in Distributed In-memory Databases."
     },
     {
-      "citation": "Dominik Durner, Viktor Leis, and Thomas Neumann. \"On the Impact of Memory Allocation on High-Performance Query Processing.\" DaMoN 2019. DOI `10.1145/3329785.3329918`. Retrieved 2026-06-04 from the author PDF, `https://db.in.tum.de/~durner/papers/memory-allocation-impact-damon2019.pdf`, and the extended arXiv version, `https://arxiv.org/abs/1905.01135`.",
-      "identifier_audit": {
-        "arxiv_review": "citation_supplies_arxiv",
-        "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
-        "needs_identifier_review": false,
-        "review_status": "generated_identifier_audit",
-        "title": "On the Impact of Memory Allocation on High-Performance Query Processing."
-      },
-      "journal_entry_id": "2026-06-04-allocator-behavior-is-part-of-the-query-route-contract",
-      "missing_fields": [
-        "doi"
-      ],
-      "paper_id": "paper-2019-on-the-impact-of-memory-allocation-on-high-performance-query-processing",
-      "title": "On the Impact of Memory Allocation on High-Performance Query Processing."
-    },
-    {
       "citation": "Alexandre Verbitski, Anurag Gupta, Debanjan Saha, Murali Brahmadesam, Kamal Gupta, Raman Mittal, Sailesh Krishnamurthy, Sandor Maurice, Tengiz Kharatishvili, and Xiaofeng Bao. \"Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases.\" SIGMOD 2017:1041-1052. doi:10.1145/3035918.3056101. Retrieved 2026-06-04 from `https://cdn.amazon.science/dc/2b/4ef2b89649f9a393d37d3e042f4e/amazon-aurora-design-considerations-for-high-throughput-cloud-native-relational-databases.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -3410,24 +3185,6 @@
       ],
       "paper_id": "paper-2024-bf-tree-a-modern-read-write-optimized-concurrent-larger-than-memory-range-index",
       "title": "Bf-Tree: A Modern Read-Write-Optimized Concurrent Larger-Than-Memory Range Index."
-    },
-    {
-      "citation": "Muhammad A. Awad, Saman Ashkiani, Serban D. Porumbescu, Martin Farach-Colton, and John D. Owens. \"Analyzing and Implementing GPU Hash Tables.\" APOCS 2023, pp. 33-50. DOI `10.1137/1.9781611977578.ch3`. Also available as \"Better GPU Hash Tables,\" arXiv:2108.07232v3, 2022. Retrieved 2026-06-04 from `https://arxiv.org/abs/2108.07232` and the authors' artifact page `https://owensgroup.github.io/BGHT/`.",
-      "identifier_audit": {
-        "arxiv_review": "citation_supplies_arxiv",
-        "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
-        "needs_identifier_review": false,
-        "review_status": "generated_identifier_audit",
-        "title": "Analyzing and Implementing GPU Hash Tables."
-      },
-      "journal_entry_id": "2026-06-04-bght-makes-gpu-hash-indexes-a-probe-budgeted-route-not-just-a-lookup-primitive",
-      "missing_fields": [
-        "doi"
-      ],
-      "paper_id": "paper-2023-analyzing-and-implementing-gpu-hash-tables",
-      "title": "Analyzing and Implementing GPU Hash Tables."
     },
     {
       "citation": "Linwei Li, Kai Zhang, Jiading Guo, Wen He, Zhenying He, Yinan Jing, Weili Han, and X. Sean Wang. \"BinDex: A Two-Layered Index for Fast and Robust Scans.\" SIGMOD 2020, pp. 569-584. doi:10.1145/3318464.3380563. Retrieved 2026-06-04 from `https://kay21s.github.io/Bindex2020.pdf`.",
@@ -3536,24 +3293,6 @@
       ],
       "paper_id": "paper-2015-centiman-elastic-high-performance-optimistic-concurrency-control-by-watermarking",
       "title": "Centiman: Elastic, High Performance Optimistic Concurrency Control by Watermarking."
-    },
-    {
-      "citation": "Justus Henneberg, Felix Schuhknecht, Rosina Kharal, and Trevor Brown. \"More Bang For Your Buck(et): Fast and Space-efficient Hardware-accelerated Coarse-granular Indexing on GPUs.\" arXiv:2406.03965v2, 2025 revision of 2024 preprint. DOI `10.48550/arXiv.2406.03965`. Retrieved 2026-06-04 from `https://arxiv.org/pdf/2406.03965`.",
-      "identifier_audit": {
-        "arxiv_review": "citation_supplies_arxiv",
-        "arxiv_status": "present",
-        "doi_review": "arxiv_preprint_without_final_doi",
-        "doi_status": "not_expected_yet",
-        "needs_identifier_review": false,
-        "review_status": "generated_identifier_audit",
-        "title": "More Bang For Your Buck(et): Fast and Space-efficient Hardware-accelerated Coarse-granular Indexing on GPUs."
-      },
-      "journal_entry_id": "2026-06-04-cgrx-trades-exact-gpu-index-entries-for-bucketed-rt-core-lookups",
-      "missing_fields": [
-        "doi"
-      ],
-      "paper_id": "paper-2025-more-bang-for-your-buck-et-fast-and-space-efficient-hardware-accelerated-coarse-granular-indexin",
-      "title": "More Bang For Your Buck(et): Fast and Space-efficient Hardware-accelerated Coarse-granular Indexing on GPUs."
     },
     {
       "citation": "Rebecca Taft, Irfan Sharif, Andrei Matei, Nathan VanBenschoten, Jordan Lewis, Tobias Grieger, Kai Niemi, Andy Woods, Anne Birzin, Raphael Poss, Paul Bardea, Amruta Ranade, Ben Darnell, Bram Gruneir, Justin Jaffray, Lucy Zhang, and Peter Mattis. \"CockroachDB: The Resilient Geo-Distributed SQL Database.\" SIGMOD 2020, pp. 1493-1509. doi:10.1145/3318464.3386134. Retrieved 2026-06-04 from the ACM DOI page and Cockroach Labs PDF, `https://www.cockroachlabs.com/pdf/cockroachdb-the-resilient-geo-distributed-sql-database-sigmod-2020.pdf`.",
@@ -3791,24 +3530,6 @@
       ],
       "paper_id": "paper-2022-dbos-a-dbms-oriented-operating-system",
       "title": "DBOS: A DBMS-oriented Operating System."
-    },
-    {
-      "citation": "Jingwei Xu, Mingkai Dong, Qiulin Tian, Ziyi Tian, Tong Xin, and Haibo Chen. \"SwitchFS: Asynchronous Metadata Updates for Distributed Filesystems with In-Network Coordination.\" EuroSys 2026; arXiv `2410.08618`, version 3 dated 2025-12-30. DOI `10.1145/3767295.3769349`. Retrieved 2026-06-04 from arXiv, `https://arxiv.org/abs/2410.08618`.",
-      "identifier_audit": {
-        "arxiv_review": "citation_supplies_arxiv",
-        "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
-        "needs_identifier_review": false,
-        "review_status": "generated_identifier_audit",
-        "title": "SwitchFS: Asynchronous Metadata Updates for Distributed Filesystems with In-Network Coordination."
-      },
-      "journal_entry_id": "2026-06-04-delayed-metadata-updates-need-a-dirty-state-visibility-oracle",
-      "missing_fields": [
-        "doi"
-      ],
-      "paper_id": "paper-2026-switchfs-asynchronous-metadata-updates-for-distributed-filesystems-with-in-network-coordination",
-      "title": "SwitchFS: Asynchronous Metadata Updates for Distributed Filesystems with In-Network Coordination."
     },
     {
       "citation": "Niclas Hedam, Morten Tychsen Clausen, Philippe Bonnet, Sangin Lee, and Ken Friis Larsen. \"Delilah: eBPF-offload on Computational Storage.\" DaMoN 2023, pp. 70-76. doi:10.1145/3592980.3595319. Retrieved 2026-06-04 from the author PDF, `https://hed.am/papers/2023-DaMoN.pdf`.",
@@ -4065,6 +3786,24 @@
       "title": "GaccO - A GPU-accelerated OLTP DBMS."
     },
     {
+      "citation": "Jiesong Liu, Feng Zhang, Lv Lu, Chang Qi, Xiaoguang Guo, Dong Deng, Guoliang Li, Huanchen Zhang, Jidong Zhai, Hechen Zhang, Yuxing Chen, Anqun Pan, and Xiaoyong Du. \"G-Learned Index: Enabling Efficient Learned Index on GPU.\" IEEE Transactions on Parallel and Distributed Systems 35(6), June 2024, pp. 795-812. DOI `10.1109/TPDS.2024.3381214`. Retrieved 2026-06-04 from the author PDF, `https://fred1031.github.io/files/2024_tpds.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "G-Learned Index: Enabling Efficient Learned Index on GPU."
+      },
+      "journal_entry_id": "2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2024-g-learned-index-enabling-efficient-learned-index-on-gpu",
+      "title": "G-Learned Index: Enabling Efficient Learned Index on GPU."
+    },
+    {
       "citation": "Muhammad A. Awad, Serban D. Porumbescu, and John D. Owens. \"A GPU Multiversion B-Tree.\" PACT 2022, pp. 481-493. Retrieved 2026-06-04 from the OpenReview/DOI page, author publication page, author-hosted PACT slides, and artifact repository: `https://openreview.net/forum?id=RJ95nyPhcp`, `https://doi.org/10.1145/3559009.3569681`, `https://maawad.github.io/`, and `https://github.com/owensgroup/MVGpuBTree`. The eScholarship landing page was reachable through the author page, but direct PDF retrieval was blocked/empty in this worker; the entry therefore uses the OpenReview abstract plus primary author slides and artifact documentation for mechanism details.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4099,6 +3838,42 @@
       ],
       "paper_id": "paper-2026-gpu-accelerated-oltp-an-in-depth-analysis-of-concurrency-control-schemes",
       "title": "GPU-Accelerated OLTP: An In-Depth Analysis of Concurrency Control Schemes."
+    },
+    {
+      "citation": "Hao Li, Yi-Cheng Tu, and Bo Zeng. \"Concurrent query processing in a GPU-based database system.\" PLOS ONE 14(4), 2019, e0214720. DOI `10.1371/journal.pone.0214720`. Retrieved 2026-06-04 from the PMC full text, `https://pmc.ncbi.nlm.nih.gov/articles/PMC6467383/`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Concurrent query processing in a GPU-based database system."
+      },
+      "journal_entry_id": "2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2019-concurrent-query-processing-in-a-gpu-based-database-system",
+      "title": "Concurrent query processing in a GPU-based database system."
+    },
+    {
+      "citation": "Jason Jong Kyu Park, Yongjun Park, and Scott Mahlke. \"Dynamic Resource Management for Efficient Utilization of Multitasking GPUs.\" ASPLOS 2017, pages 527-540. DOI `10.1145/3037697.3037707`. Retrieved 2026-06-04 from the University of Michigan author/project PDF, `https://cccp.eecs.umich.edu/papers/jasonjk-asplos17.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Dynamic Resource Management for Efficient Utilization of Multitasking GPUs."
+      },
+      "journal_entry_id": "2026-06-04-gpu-sharing-should-be-measured-not-guessed",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2017-dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus",
+      "title": "Dynamic Resource Management for Efficient Utilization of Multitasking GPUs."
     },
     {
       "citation": "Lan Gao, Yunlong Xu, Rui Wang, Hailong Yang, Zhongzhi Luan, and Depei Qian. \"Accelerating in-memory transaction processing using general purpose graphics processing units.\" Future Generation Computer Systems 97, 2019, pp. 836-848. doi:10.1016/j.future.2019.03.034. Retrieved 2026-06-04 from the ScienceDirect DOI page `https://doi.org/10.1016/j.future.2019.03.034`.",
@@ -4137,6 +3912,24 @@
       "title": "Data-Agnostic Cardinality Learning from Imperfect Workloads."
     },
     {
+      "citation": "Yinhao Hong, Hongyao Zhao, Wei Lu, Xiaoyong Du, Yuxing Chen, Anqun Pan, and Lixiong Zheng. \"A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems.\" PVLDB 18(5), 2025. DOI `10.14778/3718057.3718066`. Retrieved 2026-06-04 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol18/p1376-lu.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems."
+      },
+      "journal_entry_id": "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2025-a-hybrid-approach-to-integrating-deterministic-and-non-deterministic-concurrency-control-in-data",
+      "title": "A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems."
+    },
+    {
       "citation": "Artem Kroviakov, Petr Kurapov, Christoph Anneser, and Jana Giceva. \"Heterogeneous Intra-Pipeline Device-Parallel Aggregations.\" DaMoN 2024. Retrieved 2026-06-04 from the TUM author PDF, `https://www-db.cs.tum.edu/~anneser/heterogeneous_aggregations.pdf`; DOI: `https://doi.org/10.1145/3662010.3663441`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4173,24 +3966,6 @@
       "title": "HyBench: A New Benchmark for HTAP Databases."
     },
     {
-      "citation": "Guoxin Kang, Lei Wang, Wanling Gao, Fei Tang, and Jianfeng Zhan. \"OLxPBench: Real-time, Semantically Consistent, and Domain-specific are Essential in Benchmarking, Designing, and Implementing HTAP Systems.\" ICDE 2022. DOI `10.1109/ICDE53745.2022.00182`. Retrieved 2026-06-04 from arXiv, `https://arxiv.org/abs/2203.16095`.",
-      "identifier_audit": {
-        "arxiv_review": "citation_supplies_arxiv",
-        "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
-        "needs_identifier_review": false,
-        "review_status": "generated_identifier_audit",
-        "title": "OLxPBench: Real-time, Semantically Consistent, and Domain-specific are Essential in Benchmarking, Designing, and Implementing HTAP Systems."
-      },
-      "journal_entry_id": "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path",
-      "missing_fields": [
-        "doi"
-      ],
-      "paper_id": "paper-2022-olxpbench-real-time-semantically-consistent-and-domain-specific-are-essential-in-benchmarking-de",
-      "title": "OLxPBench: Real-time, Semantically Consistent, and Domain-specific are Essential in Benchmarking, Designing, and Implementing HTAP Systems."
-    },
-    {
       "citation": "Badrish Chandramouli, Guna Prasaad, Donald Kossmann, Justin Levandoski, James Hunter, and Mike Barnett. \"FASTER: A Concurrent Key-Value Store with In-Place Updates.\" SIGMOD 2018, pp. 275-290. doi:10.1145/3183713.3196898. Retrieved 2026-06-04 from the Microsoft Research publication page and PDF at `https://www.microsoft.com/en-us/research/publication/faster-a-concurrent-key-value-store-with-in-place-updates/` and `https://microsoft.com/en-us/research/uploads/prod/2018/03/faster-sigmod18.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4225,6 +4000,24 @@
       ],
       "paper_id": "paper-2022-cost-based-or-learning-based-a-hybrid-query-optimizer-for-query-plan-selection",
       "title": "Cost-based or Learning-based? A Hybrid Query Optimizer for Query Plan Selection."
+    },
+    {
+      "citation": "Jie Sun, Mo Sun, Zheng Zhang, Zuocheng Shi, Jun Xie, Zihan Yang, Jie Zhang, Fei Wu, and Zeke Wang. \"Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training.\" ICDE 2025, pages 321-335. DOI `10.1109/ICDE65448.2025.00031`. Retrieved 2026-06-04 from the author-hosted PDF, `https://jiesun233.github.io/files/Hyperion_ICDE_25_final.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training."
+      },
+      "journal_entry_id": "2026-06-04-hyperion-treats-gpu-storage-access-as-a-schedulable-pipeline",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2025-hyperion-co-optimizing-ssd-access-and-gpu-computation-for-cost-efficient-gnn-training",
+      "title": "Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training."
     },
     {
       "citation": "Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy Zwaenepoel. \"KVell: The Design and Implementation of a Fast Persistent Key-Value Store.\" SOSP 2019, pp. 447-461. doi:10.1145/3341301.3359628. Retrieved 2026-06-04 from the ACM/SOSP listing and the author-hosted PDF linked from `https://sites.google.com/view/baptiste-lepers`.",
@@ -4281,6 +4074,24 @@
       "title": "LeanStore: A High-Performance Storage Engine for NVMe SSDs."
     },
     {
+      "citation": "Xun Zhong, Yong Zhang, Yu Chen, Chao Li, and Chunxiao Xing. \"Learned Index on GPU.\" ICDE Workshops / HardBDActive 2022. DOI `10.1109/ICDEW55742.2022.00024`. Retrieved 2026-06-04 from the HardBDActive PDF, `https://hardbd-active.github.io/2022/papers/HardBDActive22-Zhong.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Learned Index on GPU."
+      },
+      "journal_entry_id": "2026-06-04-learned-gpu-indexes-need-batch-shaped-admission-not-single-query-routing",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2022-learned-index-on-gpu",
+      "title": "Learned Index on GPU."
+    },
+    {
       "citation": "Xinjing Zhou, Xiangyao Yu, Goetz Graefe, and Michael Stonebraker. \"Lotus: Scalable Multi-Partition Transactions on Single-Threaded Partitioned Databases.\" PVLDB 15(11):2939-2952, 2022. doi:10.14778/3551793.3551843. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol15/p2939-zhou.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4335,6 +4146,24 @@
       "title": "MD-MVCC: Multi-version Concurrency Control for Schema Changes in Azure SQL Database."
     },
     {
+      "citation": "Brecht Vandevoort, Bas Ketsman, and Frank Neven. \"Allocating Isolation Levels to Transactions in a Multiversion Setting.\" PODS 2023, pp. 69-78. DOI `10.1145/3584372.3588672`. Retrieved 2026-06-04 from the UHasselt peer-reviewed author version, `https://documentserver.uhasselt.be/bitstream/1942/42231/2/main%20%281%29.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Allocating Isolation Levels to Transactions in a Multiversion Setting."
+      },
+      "journal_entry_id": "2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2023-allocating-isolation-levels-to-transactions-in-a-multiversion-setting",
+      "title": "Allocating Isolation Levels to Transactions in a Multiversion Setting."
+    },
+    {
       "citation": "Tianzheng Wang and Hideaki Kimura. \"Mostly-Optimistic Concurrency Control for Highly Contended Dynamic Workloads on a Thousand Cores.\" PVLDB 10(2), 2016, pp. 49-60. doi:10.14778/3015274.3015276. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol10/p49-wang.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4353,6 +4182,24 @@
       "title": "Mostly-Optimistic Concurrency Control for Highly Contended Dynamic Workloads on a Thousand Cores."
     },
     {
+      "citation": "Olga Poppe, Qun Guo, Willis Lang, Pankaj Arora, Morgan Oslake, Shize Xu, and Ajay Kalhan. \"Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless.\" PVLDB 15(6):1279-1287, 2022. DOI `10.14778/3514061.3514073`. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol15/p1279-poppe.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless."
+      },
+      "journal_entry_id": "2026-06-04-moneyball-keeps-serverless-databases-warm-only-when-history-pays-for-it",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2022-moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless",
+      "title": "Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless."
+    },
+    {
       "citation": "Brecht Vandevoort, Bas Ketsman, Christoph Koch, and Frank Neven. \"Detecting Robustness against MVRC for Transaction Programs with Predicate Reads.\" EDBT 2023, pages 565-577. doi:10.48786/edbt.2023.48. Retrieved 2026-06-04 from `https://openproceedings.org/2023/conf/edbt/3-paper-54.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4369,6 +4216,24 @@
       ],
       "paper_id": "paper-2023-detecting-robustness-against-mvrc-for-transaction-programs-with-predicate-reads",
       "title": "Detecting Robustness against MVRC for Transaction Programs with Predicate Reads."
+    },
+    {
+      "citation": "Lin Xiao, Kai Ren, Qing Zheng, and Garth A. Gibson. \"ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems.\" SoCC 2015, pp. 236-247. DOI `10.1145/2806777.2806844`. Retrieved 2026-06-04 from the CMU ISTC/PDL PDF, `https://istc-cc.cmu.edu/publications/papers/2015/p236-xiao-SoCC15.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems."
+      },
+      "journal_entry_id": "2026-06-04-namespace-metadata-is-a-route-cache-design-problem",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2015-shardfs-vs-indexfs-replication-vs-caching-strategies-for-distributed-metadata-management-in-clou",
+      "title": "ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems."
     },
     {
       "citation": "Dominik Durner and Thomas Neumann. \"No False Negatives: Accepting All Useful Schedules in a Fast Serializable Many-Core System.\" ICDE 2019, pp. 734-745. DOI: `https://doi.org/10.1109/ICDE.2019.00071`. Retrieved 2026-06-04 from the author PDF, `https://db.cs.tum.edu/~durner/papers/no-false-negatives-icde19.pdf`.",
@@ -4461,6 +4326,24 @@
       "title": "Design Principles for Scaling Multi-core OLTP Under High Contention."
     },
     {
+      "citation": "Paolo Ferragina and Giorgio Vinciguerra. \"The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds.\" PVLDB 13(8), 2020, pp. 1162-1175. DOI `10.14778/3389133.3389135`. Retrieved 2026-06-04 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p1162-ferragina.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds."
+      },
+      "journal_entry_id": "2026-06-04-pgm-gives-learned-indexes-a-bounded-route-certificate",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2020-the-pgm-index-a-fully-dynamic-compressed-learned-index-with-provable-worst-case-bounds",
+      "title": "The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds."
+    },
+    {
       "citation": "Anirudh Sivaraman, Suvinay Subramanian, Mohammad Alizadeh, Sharad Chole, Shang-Tse Chuang, Anurag Agrawal, Hari Balakrishnan, Tom Edsall, Sachin Katti, and Nick McKeown. \"Programmable Packet Scheduling at Line Rate.\" SIGCOMM 2016. Retrieved 2026-06-04 from the author PDF, `https://people.csail.mit.edu/alizadeh/papers/pifo-sigcomm16.pdf`; DOI: `https://doi.org/10.1145/2934872.2934899`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4531,6 +4414,24 @@
       ],
       "paper_id": "paper-2023-knock-out-2pc-with-practicality-intact-a-high-performance-and-general-distributed-transaction-pr",
       "title": "Knock Out 2PC with Practicality Intact: A High-performance and General Distributed Transaction Protocol."
+    },
+    {
+      "citation": "Gaurav Saxena, Mohammad Rahman, Naresh Chainani, Chunbin Lin, George Caragea, Fahim Chowdhury, Ryan Marcus, Tim Kraska, Ippokratis Pandis, and Balakrishnan Narayanaswamy. \"Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift.\" SIGMOD Companion 2023, pp. 225-237. DOI `10.1145/3555041.3589677`. Retrieved 2026-06-04 from Amazon Science, `https://assets.amazon.science/5a/9d/338478254f9a9dde672fa84da2b7/auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshif.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift."
+      },
+      "journal_entry_id": "2026-06-04-production-workload-management-needs-cheap-predictions-plus-hard-guardrails",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2023-auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshift",
+      "title": "Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift."
     },
     {
       "citation": "Thamir M. Qadah, Suyash Gupta, and Mohammad Sadoghi. \"Q-Store: Distributed, Multi-partition Transactions via Queue-oriented Execution and Communication.\" EDBT 2020, pp. 73-84. doi:10.5441/002/edbt.2020.08. Retrieved 2026-06-04 from `https://openproceedings.org/2020/conf/edbt/paper_39.pdf`.",
@@ -4767,6 +4668,24 @@
       "title": "ScaleStore: A Fast and Cost-Efficient Storage Engine using DRAM, NVMe, and RDMA."
     },
     {
+      "citation": "Audrey Cheng, Aaron Kabcenell, Jason Chan, Xiao Shi, Peter Bailis, Natacha Crooks, and Ion Stoica. \"Towards Optimal Transaction Scheduling.\" PVLDB 17(11), 2024, pp. 2694-2707. DOI `10.14778/3681954.3681956`. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`. Artifact: `https://github.com/audreyccheng/transaction-scheduling`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Towards Optimal Transaction Scheduling."
+      },
+      "journal_entry_id": "2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2024-towards-optimal-transaction-scheduling",
+      "title": "Towards Optimal Transaction Scheduling."
+    },
+    {
       "citation": "Audrey Cheng, Aaron Kabcenell, Jason Chan, Xiao Shi, Peter Bailis, Natacha Crooks, and Ion Stoica. \"Towards Optimal Transaction Scheduling.\" PVLDB 17(11), 2024, pp. 2694-2707. doi:10.14778/3681954.3681956. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4785,22 +4704,58 @@
       "title": "Towards Optimal Transaction Scheduling."
     },
     {
-      "citation": "Tim Lessner, Fritz Laux, and Thomas M. Connolly. \"O|R|P|E - A Data Semantics Driven Concurrency Control.\" International Journal On Advances in Software, volume 9, numbers 1 and 2, 2016; arXiv `2308.09121`, submitted 2023. DOI `10.48550/arXiv.2308.09121`. Retrieved 2026-06-04 from arXiv, `https://arxiv.org/abs/2308.09121`.",
+      "citation": "Olga Poppe, Tayo Amuneke, Dalitso Banda, Aritra De, Ari Green, Manon Knoertzer, Ehi Nosakhare, Karthik Rajendran, Deepak Shankargouda, Meina Wang, Alan Au, Carlo Curino, Qun Guo, Alekh Jindal, Ajay Kalhan, Morgan Oslake, Sonia Parchani, Vijay Ramani, Raj Sellappan, Saikat Sen, Sheetal Shrotri, Soundararajan Srinivasan, Ping Xia, Shize Xu, Alicia Yang, and Yiwen Zhu. \"Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation.\" PVLDB 14(2):154-162, 2021. DOI `10.14778/3425879.3425886`. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol14/p154-poppe.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "citation_supplies_arxiv",
-        "arxiv_status": "present",
-        "doi_review": "arxiv_preprint_without_final_doi",
-        "doi_status": "not_expected_yet",
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit",
-        "title": "O|R|P|E - A Data Semantics Driven Concurrency Control."
+        "title": "Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation."
       },
-      "journal_entry_id": "2026-06-04-semantic-data-classes-can-make-concurrency-admission-route-aware",
+      "journal_entry_id": "2026-06-04-seagull-makes-prediction-useful-by-optimizing-the-decision-not-the-whole-curve",
       "missing_fields": [
-        "doi"
+        "arxiv"
       ],
-      "paper_id": "paper-2023-o-r-p-e-a-data-semantics-driven-concurrency-control",
-      "title": "O|R|P|E - A Data Semantics Driven Concurrency Control."
+      "paper_id": "paper-2021-seagull-an-infrastructure-for-load-prediction-and-optimized-resource-allocation",
+      "title": "Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation."
+    },
+    {
+      "citation": "Yihe Huang, William Qian, Eddie Kohler, Barbara Liskov, and Liuba Shrira. \"Opportunities for Optimism in Contended Main-Memory Multicore Transactions.\" PVLDB 13(5), 2020, pp. 629-642. DOI `10.14778/3377369.3377373`. Retrieved 2026-06-04 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p629-huang.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Opportunities for Optimism in Contended Main-Memory Multicore Transactions."
+      },
+      "journal_entry_id": "2026-06-04-semantic-conflict-removal-beats-protocol-switching-alone",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2020-opportunities-for-optimism-in-contended-main-memory-multicore-transactions",
+      "title": "Opportunities for Optimism in Contended Main-Memory Multicore Transactions."
+    },
+    {
+      "citation": "Yingjun Wu, Chee-Yong Chan, and Kian-Lee Tan. \"Transaction Healing: Scaling Optimistic Concurrency Control on Multicores.\" SIGMOD 2016, pp. 1689-1704. DOI `10.1145/2882903.2915202`. Retrieved 2026-06-04 from the author PDF, `https://yingjunwu.github.io/papers/sigmod2016.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Transaction Healing: Scaling Optimistic Concurrency Control on Multicores."
+      },
+      "journal_entry_id": "2026-06-04-semantic-repair-beats-full-occ-restart-when-conflict-scope-is-small",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2016-transaction-healing-scaling-optimistic-concurrency-control-on-multicores",
+      "title": "Transaction Healing: Scaling Optimistic Concurrency Control on Multicores."
     },
     {
       "citation": "Haowen Li, Rina Onishi, and Hideyuki Kawashima. \"Serval: A Wait-free Multi-version Deterministic Concurrency Control Scheme.\" CANDAR 2024, pages 169-175. Retrieved 2026-06-04 from `https://doi.org/10.1109/CANDAR64496.2024.00028`, metadata page `https://keio.elsevierpure.com/ja/publications/serval-a-wait-free-multi-version-deterministic-concurrency-contro/`, and APsys 2024 poster `https://apsys2024.github.io/posters/apsys24posters-paper58.pdf`. The IEEE PDF endpoint listed by CiNii returned HTTP 418 during this run, so concrete details below are limited to the public metadata abstract and poster.",
@@ -4857,6 +4812,24 @@
       "title": "Towards Optimal Transaction Scheduling."
     },
     {
+      "citation": "Nuno Faria, Jose Pereira, Ana Nunes Alonso, and Ricardo Vilaca. \"Towards Generic Fine-Grained Transaction Isolation in Polystores.\" Poly 2021, co-located with VLDB 2021, revised selected papers, LNCS 12921, pages 29-42. DOI `10.1007/978-3-030-93663-1_3`. Retrieved 2026-06-04 from the author-hosted PDF, `https://rmpvilaca.github.io/assets/pdf/FPAV21.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Towards Generic Fine-Grained Transaction Isolation in Polystores."
+      },
+      "journal_entry_id": "2026-06-04-snapshot-reconstruction-as-an-optimizable-route",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2021-towards-generic-fine-grained-transaction-isolation-in-polystores",
+      "title": "Towards Generic Fine-Grained Transaction Isolation in Polystores."
+    },
+    {
       "citation": "Niv Dayan, Tamar Weiss, Shmuel Dashevsky, Michael Pan, Edward Bortnikov, and Moshe Twitto. \"Spooky: Granulating LSM-Tree Compactions Correctly.\" PVLDB 15(11): 3071-3084, 2022. Retrieved 2026-06-04 from the VLDB PDF, `https://www.vldb.org/pvldb/vol15/p3071-dayan.pdf`; DOI `https://doi.org/10.14778/3551793.3551853`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4873,6 +4846,24 @@
       ],
       "paper_id": "paper-2022-spooky-granulating-lsm-tree-compactions-correctly",
       "title": "Spooky: Granulating LSM-Tree Compactions Correctly."
+    },
+    {
+      "citation": "Ziniu Wu, Ryan Marcus, Zhengchun Liu, Parimarjan Negi, Vikram Nathan, Pascal Pfeil, Gaurav Saxena, Mohammad Rahman, Balakrishnan (Murali) Narayanaswamy, and Tim Kraska. \"Stage: Query Execution Time Prediction in Amazon Redshift.\" SIGMOD 2024. DOI `10.1145/3626246.3653391`. Retrieved 2026-06-04 from the Amazon Science PDF, `https://assets.amazon.science/e6/a8/0f59e3b14ffdbe68f419b3682edb/stage-query-execution-time-prediction-in-amazon-redshift.pdf`. The ACM landing page returned HTTP 403 during this run, so the journal entry uses the author/vendor-hosted ACM paper PDF.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Stage: Query Execution Time Prediction in Amazon Redshift."
+      },
+      "journal_entry_id": "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2024-stage-query-execution-time-prediction-in-amazon-redshift",
+      "title": "Stage: Query Execution Time Prediction in Amazon Redshift."
     },
     {
       "citation": "Yi Lu, Xiangyao Yu, and Samuel Madden. \"STAR: Scaling Transactions through Asymmetric Replication.\" PVLDB 12(11), 2019, pp. 1316-1329. doi:10.14778/3342263.3342270. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol12/p1316-lu.pdf`.",
@@ -5019,22 +5010,22 @@
       "title": "Totally-Ordered Prefix Parallel Snapshot Isolation."
     },
     {
-      "citation": "Brecht Vandevoort, Bas Ketsman, and Frank Neven. \"When View- and Conflict-Robustness Coincide for Multiversion Concurrency Control.\" Proceedings of the ACM on Management of Data 2(2), Article 91, PACMMOD/SIGMOD 2024. DOI `10.1145/3651592`. Retrieved 2026-06-04 from arXiv, `https://arxiv.org/abs/2403.17665`.",
+      "citation": "Sangjin Lee, Alberto Lerner, Andre Ryser, Kibin Park, Chanyoung Jeon, Jinsub Park, Yong Ho Song, and Philippe Cudre-Mauroux. \"X-SSD: A Storage System with Native Support for Database Logging and Replication.\" SIGMOD 2022, pages 988-1002. DOI `10.1145/3514221.3526188`. Retrieved 2026-06-04 from the author-hosted PDF, `https://exascale.info/assets/pdf/lee2022sigmod.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "citation_supplies_arxiv",
-        "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit",
-        "title": "When View- and Conflict-Robustness Coincide for Multiversion Concurrency Control."
+        "title": "X-SSD: A Storage System with Native Support for Database Logging and Replication."
       },
-      "journal_entry_id": "2026-06-04-view-serializability-does-not-buy-extra-safe-mvcc-route-templates-for-rc-si-ssi",
+      "journal_entry_id": "2026-06-04-x-ssd-moves-wal-propagation-into-the-storage-device",
       "missing_fields": [
-        "doi"
+        "arxiv"
       ],
-      "paper_id": "paper-2024-when-view-and-conflict-robustness-coincide-for-multiversion-concurrency-control",
-      "title": "When View- and Conflict-Robustness Coincide for Multiversion Concurrency Control."
+      "paper_id": "paper-2022-x-ssd-a-storage-system-with-native-support-for-database-logging-and-replication",
+      "title": "X-SSD: A Storage System with Native Support for Database Logging and Replication."
     },
     {
       "citation": "Matthias Jasny, Lasse Thostrup, Sajjad Tamimi, Andreas Koch, Zsolt Istvan, and Carsten Binnig. \"Zero-sided RDMA: Network-driven Data Shuffling for Disaggregated Heterogeneous Cloud DBMSs.\" Proceedings of the ACM on Management of Data 2(1), Article 36, 2024, pp. 36:1-36:28. doi:10.1145/3639291. Retrieved 2026-06-04 from the TU Darmstadt PDF `https://www.informatik.tu-darmstadt.de/media/systems/pdf_publications/zerosided_rdma_sigmod.pdf` and DFKI metadata page `https://www.dfki.de/web/forschung/projekte-publikationen/publikation/16460`.",
@@ -6333,6 +6324,24 @@
       "title": "When Database Meets New Storage Devices: Understanding and Exposing Performance Mismatches via Configurations."
     },
     {
+      "citation": "Hua Fan and Wojciech Golab. \"Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions.\" PVLDB 12(11):1471-1484, 2019. DOI `10.14778/3342263.3342627`. Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol12/p1471-fan.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions."
+      },
+      "journal_entry_id": "2026-06-05-ocean-vista-turns-visibility-into-batched-watermark-gossip",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2019-ocean-vista-gossip-based-visibility-control-for-speedy-geo-distributed-transactions",
+      "title": "Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions."
+    },
+    {
       "citation": "Hyoungjoo Kim, Yiwei Zhao, Andrew Pavlo, and Phillip B. Gibbons. \"No Cap, This Memory Slaps: Breaking Through the Memory Wall of Transactional Database Systems with Processing-in-Memory.\" PVLDB 18(11), 2025, pp. 4241-4254. doi:10.14778/3749646.3749690. Retrieved 2026-06-05 from `https://www.pdl.cmu.edu/PDL-FTP/associated/p4241-kim.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -6493,6 +6502,24 @@
       ],
       "paper_id": "paper-2022-pim-tree-a-skew-resistant-index-for-processing-in-memory",
       "title": "PIM-tree: A Skew-resistant Index for Processing-in-Memory."
+    },
+    {
+      "citation": "Youmin Chen, Xiangyao Yu, Paraschos Koutris, Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau, and Jiwu Shu. \"Plor: General Transactions with Predictable, Low Tail Latency.\" SIGMOD 2022. DOI `10.1145/3514221.3517879`. Retrieved 2026-06-05 from `https://storage.cs.tsinghua.edu.cn/papers/sigmod22plor.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "Plor: General Transactions with Predictable, Low Tail Latency."
+      },
+      "journal_entry_id": "2026-06-05-plor-gives-aborted-hot-transactions-timestamp-priority",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2022-plor-general-transactions-with-predictable-low-tail-latency",
+      "title": "Plor: General Transactions with Predictable, Low Tail Latency."
     },
     {
       "citation": "Jianying Wang, Tongliang Li, Haoze Song, Xinjun Yang, Wenchao Zhou, Feifei Li, Baoyue Yan, Qianqian Wu, Yukun Liang, Chengjun Ying, Yujie Wang, Baokai Chen, Chang Cai, Yubin Ruan, Xiaoyi Weng, Shibin Chen, Liang Yin, Chengzhong Yang, Xin Cai, Hongyan Xing, Nanlong Yu, Xiaofei Chen, Dapeng Huang, and Jianling Sun. \"PolarDB-IMCI: A Cloud-Native HTAP Database System at Alibaba.\" PACMMOD/SIGMOD 2023. Retrieved 2026-06-05 from `https://haozesong.github.io/data/sigmod23-polar.pdf`. DOI: `https://doi.org/10.1145/3589785`.",
@@ -6925,6 +6952,24 @@
       ],
       "paper_id": "paper-2020-tidb-a-raft-based-htap-database",
       "title": "TiDB: A Raft-based HTAP Database."
+    },
+    {
+      "citation": "Johannes Weiner, Niket Agarwal, Dan Schatzberg, Leon Yang, Hao Wang, Blaise Sanouillet, Bikash Sharma, Tejun Heo, Mayank Jain, Chunqiang Tang, and Dimitrios Skarlatos. \"TMO: Transparent Memory Offloading in Datacenters.\" ASPLOS 2022. DOI `10.1145/3503222.3507731`. Retrieved 2026-06-05 from author PDF `https://www.cs.cmu.edu/~dskarlat/publications/tmo_asplos22.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_status": "generated_identifier_audit",
+        "title": "TMO: Transparent Memory Offloading in Datacenters."
+      },
+      "journal_entry_id": "2026-06-05-tmo-makes-tiering-a-pressure-controlled-feedback-loop",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2022-tmo-transparent-memory-offloading-in-datacenters",
+      "title": "TMO: Transparent Memory Offloading in Datacenters."
     },
     {
       "citation": "Padmapriya Duraisamy, Wei Xu, Scott Hare, Ravi Rajwar, David Culler, Zhiyi Xu, Jianing Fan, Christopher Kennelly, Bill McCloskey, Danijela Mijailovic, Brian Morris, Chiranjit Mukherjee, Jingliang Ren, Greg Thelen, Paul Turner, Carlos Villavieja, Parthasarathy Ranganathan, and Amin Vahdat. \"Towards an Adaptable Systems Architecture for Memory Tiering at Warehouse-Scale.\" ASPLOS 2023, pp. 727-741. doi:10.1145/3582016.3582031. Retrieved 2026-06-05 from `https://www.micahlerner.com/assets/pdf/adaptable.pdf` and the DOI page.",
@@ -9560,82 +9605,6 @@
       "title": "Engineering a High-Performance GPU B-Tree."
     },
     {
-      "citation": "Jiesong Liu, Feng Zhang, Lv Lu, Chang Qi, Xiaoguang Guo, Dong Deng, Guoliang Li, Huanchen Zhang, Jidong Zhai, Hechen Zhang, Yuxing Chen, Anqun Pan, and Xiaoyong Du. \"G-Learned Index: Enabling Efficient Learned Index on GPU.\" IEEE Transactions on Parallel and Distributed Systems 35(6), June 2024, pp. 795-812. DOI `10.1109/TPDS.2024.3381214`. Retrieved 2026-06-04 from the author PDF, `https://fred1031.github.io/files/2024_tpds.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "G-Learned Index: Enabling Efficient Learned Index on GPU."
-      },
-      "journal_entry_id": "2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2024-g-learned-index-enabling-efficient-learned-index-on-gpu",
-      "title": "G-Learned Index: Enabling Efficient Learned Index on GPU."
-    },
-    {
-      "citation": "Hao Li, Yi-Cheng Tu, and Bo Zeng. \"Concurrent query processing in a GPU-based database system.\" PLOS ONE 14(4), 2019, e0214720. DOI `10.1371/journal.pone.0214720`. Retrieved 2026-06-04 from the PMC full text, `https://pmc.ncbi.nlm.nih.gov/articles/PMC6467383/`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Concurrent query processing in a GPU-based database system."
-      },
-      "journal_entry_id": "2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2019-concurrent-query-processing-in-a-gpu-based-database-system",
-      "title": "Concurrent query processing in a GPU-based database system."
-    },
-    {
-      "citation": "Jason Jong Kyu Park, Yongjun Park, and Scott Mahlke. \"Dynamic Resource Management for Efficient Utilization of Multitasking GPUs.\" ASPLOS 2017, pages 527-540. DOI `10.1145/3037697.3037707`. Retrieved 2026-06-04 from the University of Michigan author/project PDF, `https://cccp.eecs.umich.edu/papers/jasonjk-asplos17.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Dynamic Resource Management for Efficient Utilization of Multitasking GPUs."
-      },
-      "journal_entry_id": "2026-06-04-gpu-sharing-should-be-measured-not-guessed",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2017-dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus",
-      "title": "Dynamic Resource Management for Efficient Utilization of Multitasking GPUs."
-    },
-    {
-      "citation": "Yinhao Hong, Hongyao Zhao, Wei Lu, Xiaoyong Du, Yuxing Chen, Anqun Pan, and Lixiong Zheng. \"A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems.\" PVLDB 18(5), 2025. DOI `10.14778/3718057.3718066`. Retrieved 2026-06-04 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol18/p1376-lu.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems."
-      },
-      "journal_entry_id": "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2025-a-hybrid-approach-to-integrating-deterministic-and-non-deterministic-concurrency-control-in-data",
-      "title": "A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems."
-    },
-    {
       "citation": "Hamish Nicholson, Aunn Raza, Periklis Chrysogelos, and Anastasia Ailamaki. \"HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics.\" CIDR 2023. Retrieved 2026-06-04 from the CIDR proceedings PDF: `https://www.cidrdb.org/cidr2023/papers/p84-nicholson.pdf`.",
       "identifier_audit": {
         "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -9674,25 +9643,6 @@
       "title": "HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases."
     },
     {
-      "citation": "Jie Sun, Mo Sun, Zheng Zhang, Zuocheng Shi, Jun Xie, Zihan Yang, Jie Zhang, Fei Wu, and Zeke Wang. \"Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training.\" ICDE 2025, pages 321-335. DOI `10.1109/ICDE65448.2025.00031`. Retrieved 2026-06-04 from the author-hosted PDF, `https://jiesun233.github.io/files/Hyperion_ICDE_25_final.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training."
-      },
-      "journal_entry_id": "2026-06-04-hyperion-treats-gpu-storage-access-as-a-schedulable-pipeline",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2025-hyperion-co-optimizing-ssd-access-and-gpu-computation-for-cost-efficient-gnn-training",
-      "title": "Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training."
-    },
-    {
       "citation": "Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy Zwaenepoel. \"KVell+: Snapshot Isolation without Snapshots.\" OSDI 2020, pp. 425-441. Retrieved 2026-06-04 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi20/presentation/lepers`.",
       "identifier_audit": {
         "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -9710,25 +9660,6 @@
       ],
       "paper_id": "paper-2020-kvell-snapshot-isolation-without-snapshots",
       "title": "KVell+: Snapshot Isolation without Snapshots."
-    },
-    {
-      "citation": "Xun Zhong, Yong Zhang, Yu Chen, Chao Li, and Chunxiao Xing. \"Learned Index on GPU.\" ICDE Workshops / HardBDActive 2022. DOI `10.1109/ICDEW55742.2022.00024`. Retrieved 2026-06-04 from the HardBDActive PDF, `https://hardbd-active.github.io/2022/papers/HardBDActive22-Zhong.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Learned Index on GPU."
-      },
-      "journal_entry_id": "2026-06-04-learned-gpu-indexes-need-batch-shaped-admission-not-single-query-routing",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2022-learned-index-on-gpu",
-      "title": "Learned Index on GPU."
     },
     {
       "citation": "Weihai Shen, Yang Cui, Siddhartha Sen, Sebastian Angel, and Shuai Mu. \"Mako: Speculative Distributed Transactions with Geo-Replication.\" OSDI 2025. Retrieved 2026-06-04 from `https://www.usenix.org/system/files/osdi25-shen-weihai.pdf`.",
@@ -9788,25 +9719,6 @@
       "title": "Databases in the Era of Memory-Centric Computing."
     },
     {
-      "citation": "Brecht Vandevoort, Bas Ketsman, and Frank Neven. \"Allocating Isolation Levels to Transactions in a Multiversion Setting.\" PODS 2023, pp. 69-78. DOI `10.1145/3584372.3588672`. Retrieved 2026-06-04 from the UHasselt peer-reviewed author version, `https://documentserver.uhasselt.be/bitstream/1942/42231/2/main%20%281%29.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Allocating Isolation Levels to Transactions in a Multiversion Setting."
-      },
-      "journal_entry_id": "2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2023-allocating-isolation-levels-to-transactions-in-a-multiversion-setting",
-      "title": "Allocating Isolation Levels to Transactions in a Multiversion Setting."
-    },
-    {
       "citation": "Gabriel Haas and Viktor Leis. \"What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines.\" PVLDB 16(9), 2023. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`.",
       "identifier_audit": {
         "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -9826,44 +9738,6 @@
       "title": "What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines."
     },
     {
-      "citation": "Olga Poppe, Qun Guo, Willis Lang, Pankaj Arora, Morgan Oslake, Shize Xu, and Ajay Kalhan. \"Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless.\" PVLDB 15(6):1279-1287, 2022. DOI `10.14778/3514061.3514073`. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol15/p1279-poppe.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless."
-      },
-      "journal_entry_id": "2026-06-04-moneyball-keeps-serverless-databases-warm-only-when-history-pays-for-it",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2022-moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless",
-      "title": "Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless."
-    },
-    {
-      "citation": "Lin Xiao, Kai Ren, Qing Zheng, and Garth A. Gibson. \"ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems.\" SoCC 2015, pp. 236-247. DOI `10.1145/2806777.2806844`. Retrieved 2026-06-04 from the CMU ISTC/PDL PDF, `https://istc-cc.cmu.edu/publications/papers/2015/p236-xiao-SoCC15.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems."
-      },
-      "journal_entry_id": "2026-06-04-namespace-metadata-is-a-route-cache-design-problem",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2015-shardfs-vs-indexfs-replication-vs-caching-strategies-for-distributed-metadata-management-in-clou",
-      "title": "ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems."
-    },
-    {
       "citation": "Iraklis Psaroudakis, Tobias Scheuer, Norman May, Abdelkader Sellami, and Anastasia Ailamaki. \"Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores.\" PVLDB 10(2), 2016, pp. 37-48. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol10/p37-psaroudakis.pdf`.",
       "identifier_audit": {
         "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -9881,44 +9755,6 @@
       ],
       "paper_id": "paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
       "title": "Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores."
-    },
-    {
-      "citation": "Paolo Ferragina and Giorgio Vinciguerra. \"The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds.\" PVLDB 13(8), 2020, pp. 1162-1175. DOI `10.14778/3389133.3389135`. Retrieved 2026-06-04 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p1162-ferragina.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds."
-      },
-      "journal_entry_id": "2026-06-04-pgm-gives-learned-indexes-a-bounded-route-certificate",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2020-the-pgm-index-a-fully-dynamic-compressed-learned-index-with-provable-worst-case-bounds",
-      "title": "The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds."
-    },
-    {
-      "citation": "Gaurav Saxena, Mohammad Rahman, Naresh Chainani, Chunbin Lin, George Caragea, Fahim Chowdhury, Ryan Marcus, Tim Kraska, Ippokratis Pandis, and Balakrishnan Narayanaswamy. \"Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift.\" SIGMOD Companion 2023, pp. 225-237. DOI `10.1145/3555041.3589677`. Retrieved 2026-06-04 from Amazon Science, `https://assets.amazon.science/5a/9d/338478254f9a9dde672fa84da2b7/auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshif.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift."
-      },
-      "journal_entry_id": "2026-06-04-production-workload-management-needs-cheap-predictions-plus-hard-guardrails",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2023-auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshift",
-      "title": "Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift."
     },
     {
       "citation": "Marios Kogias, George Prekas, Adrien Ghosn, Jonas Fietz, and Edouard Bugnion. \"R2P2: Making RPCs First-Class Datacenter Citizens.\" USENIX ATC 2019, pp. 863-880. Retrieved 2026-06-04 from `https://www.usenix.org/conference/atc19/presentation/kogias-r2p2` and `https://www.usenix.org/system/files/atc19-kogias-r2p2_0.pdf`.",
@@ -9959,82 +9795,6 @@
       "title": "Scalable OLTP in the Cloud: What's the BIG DEAL? The Database AND the Application Have a BIG DEAL: Their Isolation Semantics."
     },
     {
-      "citation": "Audrey Cheng, Aaron Kabcenell, Jason Chan, Xiao Shi, Peter Bailis, Natacha Crooks, and Ion Stoica. \"Towards Optimal Transaction Scheduling.\" PVLDB 17(11), 2024, pp. 2694-2707. DOI `10.14778/3681954.3681956`. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`. Artifact: `https://github.com/audreyccheng/transaction-scheduling`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Towards Optimal Transaction Scheduling."
-      },
-      "journal_entry_id": "2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2024-towards-optimal-transaction-scheduling",
-      "title": "Towards Optimal Transaction Scheduling."
-    },
-    {
-      "citation": "Olga Poppe, Tayo Amuneke, Dalitso Banda, Aritra De, Ari Green, Manon Knoertzer, Ehi Nosakhare, Karthik Rajendran, Deepak Shankargouda, Meina Wang, Alan Au, Carlo Curino, Qun Guo, Alekh Jindal, Ajay Kalhan, Morgan Oslake, Sonia Parchani, Vijay Ramani, Raj Sellappan, Saikat Sen, Sheetal Shrotri, Soundararajan Srinivasan, Ping Xia, Shize Xu, Alicia Yang, and Yiwen Zhu. \"Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation.\" PVLDB 14(2):154-162, 2021. DOI `10.14778/3425879.3425886`. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol14/p154-poppe.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation."
-      },
-      "journal_entry_id": "2026-06-04-seagull-makes-prediction-useful-by-optimizing-the-decision-not-the-whole-curve",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2021-seagull-an-infrastructure-for-load-prediction-and-optimized-resource-allocation",
-      "title": "Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation."
-    },
-    {
-      "citation": "Yihe Huang, William Qian, Eddie Kohler, Barbara Liskov, and Liuba Shrira. \"Opportunities for Optimism in Contended Main-Memory Multicore Transactions.\" PVLDB 13(5), 2020, pp. 629-642. DOI `10.14778/3377369.3377373`. Retrieved 2026-06-04 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p629-huang.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Opportunities for Optimism in Contended Main-Memory Multicore Transactions."
-      },
-      "journal_entry_id": "2026-06-04-semantic-conflict-removal-beats-protocol-switching-alone",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2020-opportunities-for-optimism-in-contended-main-memory-multicore-transactions",
-      "title": "Opportunities for Optimism in Contended Main-Memory Multicore Transactions."
-    },
-    {
-      "citation": "Yingjun Wu, Chee-Yong Chan, and Kian-Lee Tan. \"Transaction Healing: Scaling Optimistic Concurrency Control on Multicores.\" SIGMOD 2016, pp. 1689-1704. DOI `10.1145/2882903.2915202`. Retrieved 2026-06-04 from the author PDF, `https://yingjunwu.github.io/papers/sigmod2016.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Transaction Healing: Scaling Optimistic Concurrency Control on Multicores."
-      },
-      "journal_entry_id": "2026-06-04-semantic-repair-beats-full-occ-restart-when-conflict-scope-is-small",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2016-transaction-healing-scaling-optimistic-concurrency-control-on-multicores",
-      "title": "Transaction Healing: Scaling Optimistic Concurrency Control on Multicores."
-    },
-    {
       "citation": "Tobias Ziegler, Philip A. Bernstein, Viktor Leis, and Carsten Binnig. \"Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures.\" CIDR 2023. Retrieved 2026-06-04 from `https://www.cidrdb.org/cidr2023/papers/p50-ziegler.pdf`.",
       "identifier_audit": {
         "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -10073,44 +9833,6 @@
       "title": "A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores."
     },
     {
-      "citation": "Nuno Faria, Jose Pereira, Ana Nunes Alonso, and Ricardo Vilaca. \"Towards Generic Fine-Grained Transaction Isolation in Polystores.\" Poly 2021, co-located with VLDB 2021, revised selected papers, LNCS 12921, pages 29-42. DOI `10.1007/978-3-030-93663-1_3`. Retrieved 2026-06-04 from the author-hosted PDF, `https://rmpvilaca.github.io/assets/pdf/FPAV21.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Towards Generic Fine-Grained Transaction Isolation in Polystores."
-      },
-      "journal_entry_id": "2026-06-04-snapshot-reconstruction-as-an-optimizable-route",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2021-towards-generic-fine-grained-transaction-isolation-in-polystores",
-      "title": "Towards Generic Fine-Grained Transaction Isolation in Polystores."
-    },
-    {
-      "citation": "Ziniu Wu, Ryan Marcus, Zhengchun Liu, Parimarjan Negi, Vikram Nathan, Pascal Pfeil, Gaurav Saxena, Mohammad Rahman, Balakrishnan (Murali) Narayanaswamy, and Tim Kraska. \"Stage: Query Execution Time Prediction in Amazon Redshift.\" SIGMOD 2024. DOI `10.1145/3626246.3653391`. Retrieved 2026-06-04 from the Amazon Science PDF, `https://assets.amazon.science/e6/a8/0f59e3b14ffdbe68f419b3682edb/stage-query-execution-time-prediction-in-amazon-redshift.pdf`. The ACM landing page returned HTTP 403 during this run, so the journal entry uses the author/vendor-hosted ACM paper PDF.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Stage: Query Execution Time Prediction in Amazon Redshift."
-      },
-      "journal_entry_id": "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2024-stage-query-execution-time-prediction-in-amazon-redshift",
-      "title": "Stage: Query Execution Time Prediction in Amazon Redshift."
-    },
-    {
       "citation": "Satadru Pan, Theano Stavrinos, Yunqiao Zhang, Atul Sikaria, Pavel Zakharov, Abhinav Sharma, Shiva Shankar P, Mike Shuey, Richard Wareing, Monika Gangapuram, Guanglei Cao, Christian Preseau, Pratap Singh, Kestutis Patiejunas, JR Tipton, Ethan Katz-Bassett, and Wyatt Lloyd. \"Facebook's Tectonic Filesystem: Efficiency from Exascale.\" FAST 2021. Retrieved 2026-06-04 from the USENIX page and official PDF: `https://www.usenix.org/conference/fast21/presentation/pan` and `https://www.usenix.org/system/files/fast21-pan.pdf`.",
       "identifier_audit": {
         "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -10147,25 +9869,6 @@
       ],
       "paper_id": "paper-2016-write-behind-logging",
       "title": "Write-Behind Logging."
-    },
-    {
-      "citation": "Sangjin Lee, Alberto Lerner, Andre Ryser, Kibin Park, Chanyoung Jeon, Jinsub Park, Yong Ho Song, and Philippe Cudre-Mauroux. \"X-SSD: A Storage System with Native Support for Database Logging and Replication.\" SIGMOD 2022, pages 988-1002. DOI `10.1145/3514221.3526188`. Retrieved 2026-06-04 from the author-hosted PDF, `https://exascale.info/assets/pdf/lee2022sigmod.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "X-SSD: A Storage System with Native Support for Database Logging and Replication."
-      },
-      "journal_entry_id": "2026-06-04-x-ssd-moves-wal-propagation-into-the-storage-device",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2022-x-ssd-a-storage-system-with-native-support-for-database-logging-and-replication",
-      "title": "X-SSD: A Storage System with Native Support for Database Logging and Replication."
     },
     {
       "citation": "Prateesh Goyal, Preey Shah, Kevin Zhao, Georgios Nikolaidis, Mohammad Alizadeh, and Thomas E. Anderson. \"Backpressure Flow Control.\" NSDI 2022, pp. 779-805. Retrieved 2026-06-05 from the official USENIX page and PDF: `https://www.usenix.org/conference/nsdi22/presentation/goyal` and `https://www.usenix.org/system/files/nsdi22-paper-goyal.pdf`.",
@@ -10434,25 +10137,6 @@
       "title": "Improving Optimistic Concurrency Control Through Transaction Batching and Operation Reordering."
     },
     {
-      "citation": "Hua Fan and Wojciech Golab. \"Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions.\" PVLDB 12(11):1471-1484, 2019. DOI `10.14778/3342263.3342627`. Retrieved 2026-06-05 from `https://www.vldb.org/pvldb/vol12/p1471-fan.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions."
-      },
-      "journal_entry_id": "2026-06-05-ocean-vista-turns-visibility-into-batched-watermark-gossip",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2019-ocean-vista-gossip-based-visibility-control-for-speedy-geo-distributed-transactions",
-      "title": "Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions."
-    },
-    {
       "citation": "Vincent Gramoli, Petr Kuznetsov, and Srivatsan Ravi. \"In the Search for Optimal Concurrency.\" SIROCCO 2016 preproceedings. Retrieved 2026-06-05 from `http://sirocco2016.hiit.fi/preproceedings/In_the_Search_for_Optimal_Concurrency.pdf`.",
       "identifier_audit": {
         "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
@@ -10470,25 +10154,6 @@
       ],
       "paper_id": "paper-2016-in-the-search-for-optimal-concurrency",
       "title": "In the Search for Optimal Concurrency."
-    },
-    {
-      "citation": "Youmin Chen, Xiangyao Yu, Paraschos Koutris, Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau, and Jiwu Shu. \"Plor: General Transactions with Predictable, Low Tail Latency.\" SIGMOD 2022. DOI `10.1145/3514221.3517879`. Retrieved 2026-06-05 from `https://storage.cs.tsinghua.edu.cn/papers/sigmod22plor.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Plor: General Transactions with Predictable, Low Tail Latency."
-      },
-      "journal_entry_id": "2026-06-05-plor-gives-aborted-hot-transactions-timestamp-priority",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2022-plor-general-transactions-with-predictable-low-tail-latency",
-      "title": "Plor: General Transactions with Predictable, Low Tail Latency."
     },
     {
       "citation": "Hang Zhu, Kostis Kaffes, Zixu Chen, Zhenming Liu, Christos Kozyrakis, Ion Stoica, and Xin Jin. \"RackSched: A Microsecond-Scale Scheduler for Rack-Scale Computers.\" OSDI 2020, pp. 1225-1240. Retrieved 2026-06-05 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi20/presentation/zhu` and `https://www.usenix.org/system/files/osdi20-zhu.pdf`.",
@@ -10565,25 +10230,6 @@
       ],
       "paper_id": "paper-2021-skq-event-scheduling-for-optimizing-tail-latency-in-a-traditional-os-kernel",
       "title": "SKQ: Event Scheduling for Optimizing Tail Latency in a Traditional OS Kernel."
-    },
-    {
-      "citation": "Johannes Weiner, Niket Agarwal, Dan Schatzberg, Leon Yang, Hao Wang, Blaise Sanouillet, Bikash Sharma, Tejun Heo, Mayank Jain, Chunqiang Tang, and Dimitrios Skarlatos. \"TMO: Transparent Memory Offloading in Datacenters.\" ASPLOS 2022. DOI `10.1145/3503222.3507731`. Retrieved 2026-06-05 from author PDF `https://www.cs.cmu.edu/~dskarlat/publications/tmo_asplos22.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "TMO: Transparent Memory Offloading in Datacenters."
-      },
-      "journal_entry_id": "2026-06-05-tmo-makes-tiering-a-pressure-controlled-feedback-loop",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2022-tmo-transparent-memory-offloading-in-datacenters",
-      "title": "TMO: Transparent Memory Offloading in Datacenters."
     },
     {
       "citation": "Yijie Zhong, Minqiang Zhou, Zhirong Shen, and Jiwu Shu. \"UniMem: Redesigning Disaggregated Memory within A Unified Local-Remote Memory Hierarchy.\" USENIX ATC 2024, pp. 463-474. Retrieved 2026-06-05 from the official USENIX PDF: `https://www.usenix.org/system/files/atc24-zhong.pdf`.",
@@ -11943,14 +11589,14 @@
         "Qing Zheng",
         "Garth A. Gibson"
       ],
-      "doi": "",
+      "doi": "10.1145/2806777.2806844",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:shardfs-vs-indexfs-replication-vs-caching-strategies-for-distributed-metadata-management-in-clou",
@@ -11958,7 +11604,6 @@
         "2026-06-04-namespace-metadata-is-a-route-cache-design-problem"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2015-shardfs-vs-indexfs-replication-vs-caching-strategies-for-distributed-metadata-management-in-clou",
@@ -13143,14 +12788,14 @@
         "Chee-Yong Chan",
         "Kian-Lee Tan"
       ],
-      "doi": "",
+      "doi": "10.1145/2882903.2915202",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:transaction-healing-scaling-optimistic-concurrency-control-on-multicores",
@@ -13158,7 +12803,6 @@
         "2026-06-04-semantic-repair-beats-full-occ-restart-when-conflict-scope-is-small"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2016-transaction-healing-scaling-optimistic-concurrency-control-on-multicores",
@@ -13681,14 +13325,14 @@
         "Yongjun Park",
         "Scott Mahlke"
       ],
-      "doi": "",
+      "doi": "10.1145/3037697.3037707",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus",
@@ -13696,7 +13340,6 @@
         "2026-06-04-gpu-sharing-should-be-measured-not-guessed"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2017-dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus",
@@ -15257,14 +14900,14 @@
         "Yi-Cheng Tu",
         "Bo Zeng"
       ],
-      "doi": "",
+      "doi": "10.1371/journal.pone.0214720",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:concurrent-query-processing-in-a-gpu-based-database-system",
@@ -15272,7 +14915,6 @@
         "2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2019-concurrent-query-processing-in-a-gpu-based-database-system",
@@ -15987,14 +15629,14 @@
         "Hua Fan",
         "Wojciech Golab"
       ],
-      "doi": "",
+      "doi": "10.14778/3342263.3342627",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:ocean-vista-gossip-based-visibility-control-for-speedy-geo-distributed-transactions",
@@ -16002,7 +15644,6 @@
         "2026-06-05-ocean-vista-turns-visibility-into-batched-watermark-gossip"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2019-ocean-vista-gossip-based-visibility-control-for-speedy-geo-distributed-transactions",
@@ -16053,13 +15694,13 @@
         "Viktor Leis",
         "Thomas Neumann"
       ],
-      "doi": "",
+      "doi": "10.1145/3329785.3329918",
       "duplicate_of": "",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
         "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
@@ -16067,9 +15708,7 @@
       "journal_entry_ids": [
         "2026-06-04-allocator-behavior-is-part-of-the-query-route-contract"
       ],
-      "missing_fields": [
-        "doi"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2019-on-the-impact-of-memory-allocation-on-high-performance-query-processing",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
@@ -17664,14 +17303,14 @@
         "Barbara Liskov",
         "Liuba Shrira"
       ],
-      "doi": "",
+      "doi": "10.14778/3377369.3377373",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:opportunities-for-optimism-in-contended-main-memory-multicore-transactions",
@@ -17679,7 +17318,6 @@
         "2026-06-04-semantic-conflict-removal-beats-protocol-switching-alone"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2020-opportunities-for-optimism-in-contended-main-memory-multicore-transactions",
@@ -18090,14 +17728,14 @@
         "Paolo Ferragina",
         "Giorgio Vinciguerra"
       ],
-      "doi": "",
+      "doi": "10.14778/3389133.3389135",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:the-pgm-index-a-fully-dynamic-compressed-learned-index-with-provable-worst-case-bounds",
@@ -18105,7 +17743,6 @@
         "2026-06-04-pgm-gives-learned-indexes-a-bounded-route-certificate"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2020-the-pgm-index-a-fully-dynamic-compressed-learned-index-with-provable-worst-case-bounds",
@@ -19465,14 +19102,14 @@
         "Alicia Yang",
         "Yiwen Zhu"
       ],
-      "doi": "",
+      "doi": "10.14778/3425879.3425886",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:seagull-an-infrastructure-for-load-prediction-and-optimized-resource-allocation",
@@ -19480,7 +19117,6 @@
         "2026-06-04-seagull-makes-prediction-useful-by-optimizing-the-decision-not-the-whole-curve"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2021-seagull-an-infrastructure-for-load-prediction-and-optimized-resource-allocation",
@@ -19809,14 +19445,14 @@
         "Ana Nunes Alonso",
         "Ricardo Vilaca"
       ],
-      "doi": "",
+      "doi": "10.1007/978-3-030-93663-1_3",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:towards-generic-fine-grained-transaction-isolation-in-polystores",
@@ -19824,7 +19460,6 @@
         "2026-06-04-snapshot-reconstruction-as-an-optimizable-route"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2021-towards-generic-fine-grained-transaction-isolation-in-polystores",
@@ -20974,14 +20609,14 @@
         "Chao Li",
         "Chunxiao Xing"
       ],
-      "doi": "",
+      "doi": "10.1109/icdew55742.2022.00024",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:learned-index-on-gpu",
@@ -20989,7 +20624,6 @@
         "2026-06-04-learned-gpu-indexes-need-batch-shaped-admission-not-single-query-routing"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2022-learned-index-on-gpu",
@@ -21142,14 +20776,14 @@
         "Shize Xu",
         "Ajay Kalhan"
       ],
-      "doi": "",
+      "doi": "10.14778/3514061.3514073",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless",
@@ -21157,7 +20791,6 @@
         "2026-06-04-moneyball-keeps-serverless-databases-warm-only-when-history-pays-for-it"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2022-moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless",
@@ -21209,13 +20842,13 @@
         "Fei Tang",
         "Jianfeng Zhan"
       ],
-      "doi": "",
+      "doi": "10.1109/icde53745.2022.00182",
       "duplicate_of": "",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
         "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
@@ -21223,9 +20856,7 @@
       "journal_entry_ids": [
         "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path"
       ],
-      "missing_fields": [
-        "doi"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2022-olxpbench-real-time-semantically-consistent-and-domain-specific-are-essential-in-benchmarking-de",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
@@ -21655,14 +21286,14 @@
         "Chunqiang Tang",
         "Dimitrios Skarlatos"
       ],
-      "doi": "",
+      "doi": "10.1145/3503222.3507731",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:tmo-transparent-memory-offloading-in-datacenters",
@@ -21670,7 +21301,6 @@
         "2026-06-05-tmo-makes-tiering-a-pressure-controlled-feedback-loop"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2022-tmo-transparent-memory-offloading-in-datacenters",
@@ -21693,14 +21323,14 @@
         "Yong Ho Song",
         "Philippe Cudre-Mauroux"
       ],
-      "doi": "",
+      "doi": "10.1145/3514221.3526188",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:x-ssd-a-storage-system-with-native-support-for-database-logging-and-replication",
@@ -21708,7 +21338,6 @@
         "2026-06-04-x-ssd-moves-wal-propagation-into-the-storage-device"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2022-x-ssd-a-storage-system-with-native-support-for-database-logging-and-replication",
@@ -21888,14 +21517,14 @@
         "Bas Ketsman",
         "Frank Neven"
       ],
-      "doi": "",
+      "doi": "10.1145/3584372.3588672",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:allocating-isolation-levels-to-transactions-in-a-multiversion-setting",
@@ -21903,7 +21532,6 @@
         "2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2023-allocating-isolation-levels-to-transactions-in-a-multiversion-setting",
@@ -21958,13 +21586,13 @@
         "Martin Farach-Colton",
         "John D. Owens"
       ],
-      "doi": "",
+      "doi": "10.1137/1.9781611977578.ch3",
       "duplicate_of": "",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
         "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
@@ -21972,9 +21600,7 @@
       "journal_entry_ids": [
         "2026-06-04-bght-makes-gpu-hash-indexes-a-probe-budgeted-route-not-just-a-lookup-primitive"
       ],
-      "missing_fields": [
-        "doi"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2023-analyzing-and-implementing-gpu-hash-tables",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
@@ -21997,14 +21623,14 @@
         "Ippokratis Pandis",
         "Balakrishnan Narayanaswamy"
       ],
-      "doi": "",
+      "doi": "10.1145/3555041.3589677",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshift",
@@ -22012,7 +21638,6 @@
         "2026-06-04-production-workload-management-needs-cheap-predictions-plus-hard-guardrails"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2023-auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshift",
@@ -23282,13 +22907,13 @@
         "Ziniu Wu",
         "Jingren Zhou"
       ],
-      "doi": "",
+      "doi": "10.14778/3583140.3583160",
       "duplicate_of": "",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
         "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
@@ -23296,9 +22921,7 @@
       "journal_entry_ids": [
         "2026-06-03-lero-learning-to-rank-query-optimization"
       ],
-      "missing_fields": [
-        "doi"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2023-lero-a-learning-to-rank-query-optimizer",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
@@ -23581,13 +23204,13 @@
         "Fritz Laux",
         "Thomas M. Connolly"
       ],
-      "doi": "",
+      "doi": "10.48550/arxiv.2308.09121",
       "duplicate_of": "",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
         "arxiv_status": "present",
-        "doi_review": "arxiv_preprint_without_final_doi",
-        "doi_status": "not_expected_yet",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
@@ -23595,9 +23218,7 @@
       "journal_entry_ids": [
         "2026-06-04-semantic-data-classes-can-make-concurrency-admission-route-aware"
       ],
-      "missing_fields": [
-        "doi"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2023-o-r-p-e-a-data-semantics-driven-concurrency-control",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
@@ -25792,14 +25413,14 @@
         "Anqun Pan",
         "Xiaoyong Du"
       ],
-      "doi": "",
+      "doi": "10.1109/tpds.2024.3381214",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:g-learned-index-enabling-efficient-learned-index-on-gpu",
@@ -25807,7 +25428,6 @@
         "2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2024-g-learned-index-enabling-efficient-learned-index-on-gpu",
@@ -27154,14 +26774,14 @@
         "Balakrishnan (Murali) Narayanaswamy",
         "Tim Kraska"
       ],
-      "doi": "",
+      "doi": "10.1145/3626246.3653391",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:stage-query-execution-time-prediction-in-amazon-redshift",
@@ -27169,7 +26789,6 @@
         "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2024-stage-query-execution-time-prediction-in-amazon-redshift",
@@ -27709,13 +27328,13 @@
         "Bas Ketsman",
         "Frank Neven"
       ],
-      "doi": "",
+      "doi": "10.1145/3651592",
       "duplicate_of": "",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
         "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
@@ -27723,9 +27342,7 @@
       "journal_entry_ids": [
         "2026-06-04-view-serializability-does-not-buy-extra-safe-mvcc-route-templates-for-rc-si-ssi"
       ],
-      "missing_fields": [
-        "doi"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2024-when-view-and-conflict-robustness-coincide-for-multiversion-concurrency-control",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
@@ -27847,11 +27464,11 @@
       "doi": "10.14778/3718057.3718066",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
         "doi_review": "citation_supplies_doi",
         "doi_status": "present",
-        "needs_identifier_review": true,
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:a-hybrid-approach-to-integrating-deterministic-and-non-deterministic-concurrency-control-in-data",
@@ -28874,14 +28491,14 @@
         "Fei Wu",
         "Zeke Wang"
       ],
-      "doi": "",
+      "doi": "10.1109/icde65448.2025.00031",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:hyperion-co-optimizing-ssd-access-and-gpu-computation-for-cost-efficient-gnn-training",
@@ -28889,7 +28506,6 @@
         "2026-06-04-hyperion-treats-gpu-storage-access-as-a-schedulable-pipeline"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2025-hyperion-co-optimizing-ssd-access-and-gpu-computation-for-cost-efficient-gnn-training",
@@ -29219,13 +28835,13 @@
         "Rosina Kharal",
         "Trevor Brown"
       ],
-      "doi": "",
+      "doi": "10.48550/arxiv.2406.03965",
       "duplicate_of": "",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
         "arxiv_status": "present",
-        "doi_review": "arxiv_preprint_without_final_doi",
-        "doi_status": "not_expected_yet",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
@@ -29233,9 +28849,7 @@
       "journal_entry_ids": [
         "2026-06-04-cgrx-trades-exact-gpu-index-entries-for-bucketed-rt-core-lookups"
       ],
-      "missing_fields": [
-        "doi"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2025-more-bang-for-your-buck-et-fast-and-space-efficient-hardware-accelerated-coarse-granular-indexin",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
@@ -30763,13 +30377,13 @@
         "Tong Xin",
         "Haibo Chen"
       ],
-      "doi": "",
+      "doi": "10.1145/3767295.3769349",
       "duplicate_of": "",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
         "arxiv_status": "present",
-        "doi_review": "arxiv_record_without_doi_in_journal_citation",
-        "doi_status": "secondary_missing",
+        "doi_review": "citation_supplies_doi",
+        "doi_status": "present",
         "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
@@ -30777,9 +30391,7 @@
       "journal_entry_ids": [
         "2026-06-04-delayed-metadata-updates-need-a-dirty-state-visibility-oracle"
       ],
-      "missing_fields": [
-        "doi"
-      ],
+      "missing_fields": [],
       "paper_id": "paper-2026-switchfs-asynchronous-metadata-updates-for-distributed-filesystems-with-in-network-coordination",
       "review_status": "generated_identity",
       "source": "generated_from_journal_citation",
@@ -70581,21 +70193,19 @@
           "Ziniu Wu",
           "Jingren Zhou"
         ],
-        "doi": "",
+        "doi": "10.14778/3583140.3583160",
         "identifier_audit": {
           "arxiv_review": "citation_supplies_arxiv",
           "arxiv_status": "present",
-          "doi_review": "arxiv_record_without_doi_in_journal_citation",
-          "doi_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
           "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Lero: A Learning-to-Rank Query Optimizer."
         },
         "identity_key": "title:lero-a-learning-to-rank-query-optimizer",
         "journal_entry_id": "2026-06-03-lero-learning-to-rank-query-optimization",
-        "missing_fields": [
-          "doi"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2023-lero-a-learning-to-rank-query-optimizer",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
@@ -120192,20 +119802,19 @@
           "Anqun Pan",
           "Lixiong Zheng"
         ],
-        "doi": "",
+        "doi": "10.14778/3718057.3718066",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "A Hybrid Approach to Integrating Deterministic and Non-deterministic Concurrency Control in Database Systems."
         },
         "identity_key": "title:a-hybrid-approach-to-integrating-deterministic-and-non-deterministic-concurrency-control-in-data",
         "journal_entry_id": "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2025-a-hybrid-approach-to-integrating-deterministic-and-non-deterministic-concurrency-control-in-data",
@@ -120907,21 +120516,19 @@
           "Rosina Kharal",
           "Trevor Brown"
         ],
-        "doi": "",
+        "doi": "10.48550/arxiv.2406.03965",
         "identifier_audit": {
           "arxiv_review": "citation_supplies_arxiv",
           "arxiv_status": "present",
-          "doi_review": "arxiv_preprint_without_final_doi",
-          "doi_status": "not_expected_yet",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
           "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "More Bang For Your Buck(et): Fast and Space-efficient Hardware-accelerated Coarse-granular Indexing on GPUs."
         },
         "identity_key": "title:more-bang-for-your-buck-et-fast-and-space-efficient-hardware-accelerated-coarse-granular-indexin",
         "journal_entry_id": "2026-06-04-cgrx-trades-exact-gpu-index-entries-for-bucketed-rt-core-lookups",
-        "missing_fields": [
-          "doi"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2025-more-bang-for-your-buck-et-fast-and-space-efficient-hardware-accelerated-coarse-granular-indexin",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
@@ -126710,20 +126317,19 @@
           "Shize Xu",
           "Ajay Kalhan"
         ],
-        "doi": "",
+        "doi": "10.14778/3514061.3514073",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless."
         },
         "identity_key": "title:moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless",
         "journal_entry_id": "2026-06-04-moneyball-keeps-serverless-databases-warm-only-when-history-pays-for-it",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2022-moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless",
@@ -126985,20 +126591,19 @@
           "Alicia Yang",
           "Yiwen Zhu"
         ],
-        "doi": "",
+        "doi": "10.14778/3425879.3425886",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation."
         },
         "identity_key": "title:seagull-an-infrastructure-for-load-prediction-and-optimized-resource-allocation",
         "journal_entry_id": "2026-06-04-seagull-makes-prediction-useful-by-optimizing-the-decision-not-the-whole-curve",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2021-seagull-an-infrastructure-for-load-prediction-and-optimized-resource-allocation",
@@ -127235,21 +126840,19 @@
           "Martin Farach-Colton",
           "John D. Owens"
         ],
-        "doi": "",
+        "doi": "10.1137/1.9781611977578.ch3",
         "identifier_audit": {
           "arxiv_review": "citation_supplies_arxiv",
           "arxiv_status": "present",
-          "doi_review": "arxiv_record_without_doi_in_journal_citation",
-          "doi_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
           "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Analyzing and Implementing GPU Hash Tables."
         },
         "identity_key": "title:analyzing-and-implementing-gpu-hash-tables",
         "journal_entry_id": "2026-06-04-bght-makes-gpu-hash-indexes-a-probe-budgeted-route-not-just-a-lookup-primitive",
-        "missing_fields": [
-          "doi"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2023-analyzing-and-implementing-gpu-hash-tables",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
@@ -127903,20 +127506,19 @@
           "Natacha Crooks",
           "Ion Stoica"
         ],
-        "doi": "",
+        "doi": "10.14778/3681954.3681956",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Towards Optimal Transaction Scheduling."
         },
         "identity_key": "title:towards-optimal-transaction-scheduling",
         "journal_entry_id": "2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2024-towards-optimal-transaction-scheduling",
@@ -128155,21 +127757,19 @@
           "Viktor Leis",
           "Thomas Neumann"
         ],
-        "doi": "",
+        "doi": "10.1145/3329785.3329918",
         "identifier_audit": {
           "arxiv_review": "citation_supplies_arxiv",
           "arxiv_status": "present",
-          "doi_review": "arxiv_record_without_doi_in_journal_citation",
-          "doi_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
           "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "On the Impact of Memory Allocation on High-Performance Query Processing."
         },
         "identity_key": "title:on-the-impact-of-memory-allocation-on-high-performance-query-processing",
         "journal_entry_id": "2026-06-04-allocator-behavior-is-part-of-the-query-route-contract",
-        "missing_fields": [
-          "doi"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2019-on-the-impact-of-memory-allocation-on-high-performance-query-processing",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
@@ -128591,20 +128191,19 @@
           "Balakrishnan (Murali) Narayanaswamy",
           "Tim Kraska"
         ],
-        "doi": "",
+        "doi": "10.1145/3626246.3653391",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Stage: Query Execution Time Prediction in Amazon Redshift."
         },
         "identity_key": "title:stage-query-execution-time-prediction-in-amazon-redshift",
         "journal_entry_id": "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2024-stage-query-execution-time-prediction-in-amazon-redshift",
@@ -128849,20 +128448,19 @@
           "Fei Wu",
           "Zeke Wang"
         ],
-        "doi": "",
+        "doi": "10.1109/icde65448.2025.00031",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Hyperion: Co-Optimizing SSD Access and GPU Computation for Cost-Efficient GNN Training."
         },
         "identity_key": "title:hyperion-co-optimizing-ssd-access-and-gpu-computation-for-cost-efficient-gnn-training",
         "journal_entry_id": "2026-06-04-hyperion-treats-gpu-storage-access-as-a-schedulable-pipeline",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2025-hyperion-co-optimizing-ssd-access-and-gpu-computation-for-cost-efficient-gnn-training",
@@ -130986,20 +130584,19 @@
           "Barbara Liskov",
           "Liuba Shrira"
         ],
-        "doi": "",
+        "doi": "10.14778/3377369.3377373",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Opportunities for Optimism in Contended Main-Memory Multicore Transactions."
         },
         "identity_key": "title:opportunities-for-optimism-in-contended-main-memory-multicore-transactions",
         "journal_entry_id": "2026-06-04-semantic-conflict-removal-beats-protocol-switching-alone",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2020-opportunities-for-optimism-in-contended-main-memory-multicore-transactions",
@@ -131240,20 +130837,19 @@
           "Chao Li",
           "Chunxiao Xing"
         ],
-        "doi": "",
+        "doi": "10.1109/icdew55742.2022.00024",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Learned Index on GPU."
         },
         "identity_key": "title:learned-index-on-gpu",
         "journal_entry_id": "2026-06-04-learned-gpu-indexes-need-batch-shaped-admission-not-single-query-routing",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2022-learned-index-on-gpu",
@@ -131493,20 +131089,19 @@
           "Qing Zheng",
           "Garth A. Gibson"
         ],
-        "doi": "",
+        "doi": "10.1145/2806777.2806844",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems."
         },
         "identity_key": "title:shardfs-vs-indexfs-replication-vs-caching-strategies-for-distributed-metadata-management-in-clou",
         "journal_entry_id": "2026-06-04-namespace-metadata-is-a-route-cache-design-problem",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2015-shardfs-vs-indexfs-replication-vs-caching-strategies-for-distributed-metadata-management-in-clou",
@@ -131956,20 +131551,19 @@
           "Chee-Yong Chan",
           "Kian-Lee Tan"
         ],
-        "doi": "",
+        "doi": "10.1145/2882903.2915202",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Transaction Healing: Scaling Optimistic Concurrency Control on Multicores."
         },
         "identity_key": "title:transaction-healing-scaling-optimistic-concurrency-control-on-multicores",
         "journal_entry_id": "2026-06-04-semantic-repair-beats-full-occ-restart-when-conflict-scope-is-small",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2016-transaction-healing-scaling-optimistic-concurrency-control-on-multicores",
@@ -132196,21 +131790,19 @@
           "Bas Ketsman",
           "Frank Neven"
         ],
-        "doi": "",
+        "doi": "10.1145/3651592",
         "identifier_audit": {
           "arxiv_review": "citation_supplies_arxiv",
           "arxiv_status": "present",
-          "doi_review": "arxiv_record_without_doi_in_journal_citation",
-          "doi_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
           "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "When View- and Conflict-Robustness Coincide for Multiversion Concurrency Control."
         },
         "identity_key": "title:when-view-and-conflict-robustness-coincide-for-multiversion-concurrency-control",
         "journal_entry_id": "2026-06-04-view-serializability-does-not-buy-extra-safe-mvcc-route-templates-for-rc-si-ssi",
-        "missing_fields": [
-          "doi"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2024-when-view-and-conflict-robustness-coincide-for-multiversion-concurrency-control",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
@@ -132460,21 +132052,19 @@
           "Fei Tang",
           "Jianfeng Zhan"
         ],
-        "doi": "",
+        "doi": "10.1109/icde53745.2022.00182",
         "identifier_audit": {
           "arxiv_review": "citation_supplies_arxiv",
           "arxiv_status": "present",
-          "doi_review": "arxiv_record_without_doi_in_journal_citation",
-          "doi_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
           "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "OLxPBench: Real-time, Semantically Consistent, and Domain-specific are Essential in Benchmarking, Designing, and Implementing HTAP Systems."
         },
         "identity_key": "title:olxpbench-real-time-semantically-consistent-and-domain-specific-are-essential-in-benchmarking-de",
         "journal_entry_id": "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path",
-        "missing_fields": [
-          "doi"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2022-olxpbench-real-time-semantically-consistent-and-domain-specific-are-essential-in-benchmarking-de",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
@@ -132909,21 +132499,19 @@
           "Fritz Laux",
           "Thomas M. Connolly"
         ],
-        "doi": "",
+        "doi": "10.48550/arxiv.2308.09121",
         "identifier_audit": {
           "arxiv_review": "citation_supplies_arxiv",
           "arxiv_status": "present",
-          "doi_review": "arxiv_preprint_without_final_doi",
-          "doi_status": "not_expected_yet",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
           "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "O|R|P|E - A Data Semantics Driven Concurrency Control."
         },
         "identity_key": "title:o-r-p-e-a-data-semantics-driven-concurrency-control",
         "journal_entry_id": "2026-06-04-semantic-data-classes-can-make-concurrency-admission-route-aware",
-        "missing_fields": [
-          "doi"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2023-o-r-p-e-a-data-semantics-driven-concurrency-control",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
@@ -133158,21 +132746,19 @@
           "Tong Xin",
           "Haibo Chen"
         ],
-        "doi": "",
+        "doi": "10.1145/3767295.3769349",
         "identifier_audit": {
           "arxiv_review": "citation_supplies_arxiv",
           "arxiv_status": "present",
-          "doi_review": "arxiv_record_without_doi_in_journal_citation",
-          "doi_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
           "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "SwitchFS: Asynchronous Metadata Updates for Distributed Filesystems with In-Network Coordination."
         },
         "identity_key": "title:switchfs-asynchronous-metadata-updates-for-distributed-filesystems-with-in-network-coordination",
         "journal_entry_id": "2026-06-04-delayed-metadata-updates-need-a-dirty-state-visibility-oracle",
-        "missing_fields": [
-          "doi"
-        ],
+        "missing_fields": [],
         "paper_id": "paper-2026-switchfs-asynchronous-metadata-updates-for-distributed-filesystems-with-in-network-coordination",
         "review_status": "generated_identity",
         "source": "generated_from_journal_citation",
@@ -133415,20 +133001,19 @@
           "Ippokratis Pandis",
           "Balakrishnan Narayanaswamy"
         ],
-        "doi": "",
+        "doi": "10.1145/3555041.3589677",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift."
         },
         "identity_key": "title:auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshift",
         "journal_entry_id": "2026-06-04-production-workload-management-needs-cheap-predictions-plus-hard-guardrails",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2023-auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshift",
@@ -133867,20 +133452,19 @@
           "Bas Ketsman",
           "Frank Neven"
         ],
-        "doi": "",
+        "doi": "10.1145/3584372.3588672",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Allocating Isolation Levels to Transactions in a Multiversion Setting."
         },
         "identity_key": "title:allocating-isolation-levels-to-transactions-in-a-multiversion-setting",
         "journal_entry_id": "2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2023-allocating-isolation-levels-to-transactions-in-a-multiversion-setting",
@@ -134122,20 +133706,19 @@
           "Anqun Pan",
           "Xiaoyong Du"
         ],
-        "doi": "",
+        "doi": "10.1109/tpds.2024.3381214",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "G-Learned Index: Enabling Efficient Learned Index on GPU."
         },
         "identity_key": "title:g-learned-index-enabling-efficient-learned-index-on-gpu",
         "journal_entry_id": "2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2024-g-learned-index-enabling-efficient-learned-index-on-gpu",
@@ -134610,20 +134193,19 @@
           "Paolo Ferragina",
           "Giorgio Vinciguerra"
         ],
-        "doi": "",
+        "doi": "10.14778/3389133.3389135",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds."
         },
         "identity_key": "title:the-pgm-index-a-fully-dynamic-compressed-learned-index-with-provable-worst-case-bounds",
         "journal_entry_id": "2026-06-04-pgm-gives-learned-indexes-a-bounded-route-certificate",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2020-the-pgm-index-a-fully-dynamic-compressed-learned-index-with-provable-worst-case-bounds",
@@ -135055,20 +134637,19 @@
           "Yi-Cheng Tu",
           "Bo Zeng"
         ],
-        "doi": "",
+        "doi": "10.1371/journal.pone.0214720",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Concurrent query processing in a GPU-based database system."
         },
         "identity_key": "title:concurrent-query-processing-in-a-gpu-based-database-system",
         "journal_entry_id": "2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2019-concurrent-query-processing-in-a-gpu-based-database-system",
@@ -135308,20 +134889,19 @@
           "Ana Nunes Alonso",
           "Ricardo Vilaca"
         ],
-        "doi": "",
+        "doi": "10.1007/978-3-030-93663-1_3",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Towards Generic Fine-Grained Transaction Isolation in Polystores."
         },
         "identity_key": "title:towards-generic-fine-grained-transaction-isolation-in-polystores",
         "journal_entry_id": "2026-06-04-snapshot-reconstruction-as-an-optimizable-route",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2021-towards-generic-fine-grained-transaction-isolation-in-polystores",
@@ -135552,20 +135132,19 @@
           "Yongjun Park",
           "Scott Mahlke"
         ],
-        "doi": "",
+        "doi": "10.1145/3037697.3037707",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Dynamic Resource Management for Efficient Utilization of Multitasking GPUs."
         },
         "identity_key": "title:dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus",
         "journal_entry_id": "2026-06-04-gpu-sharing-should-be-measured-not-guessed",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2017-dynamic-resource-management-for-efficient-utilization-of-multitasking-gpus",
@@ -136034,20 +135613,19 @@
           "Yong Ho Song",
           "Philippe Cudre-Mauroux"
         ],
-        "doi": "",
+        "doi": "10.1145/3514221.3526188",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "X-SSD: A Storage System with Native Support for Database Logging and Replication."
         },
         "identity_key": "title:x-ssd-a-storage-system-with-native-support-for-database-logging-and-replication",
         "journal_entry_id": "2026-06-04-x-ssd-moves-wal-propagation-into-the-storage-device",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2022-x-ssd-a-storage-system-with-native-support-for-database-logging-and-replication",
@@ -168476,20 +168054,19 @@
           "Remzi H. Arpaci-Dusseau",
           "Jiwu Shu"
         ],
-        "doi": "",
+        "doi": "10.1145/3514221.3517879",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Plor: General Transactions with Predictable, Low Tail Latency."
         },
         "identity_key": "title:plor-general-transactions-with-predictable-low-tail-latency",
         "journal_entry_id": "2026-06-05-plor-gives-aborted-hot-transactions-timestamp-priority",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2022-plor-general-transactions-with-predictable-low-tail-latency",
@@ -168909,20 +168486,19 @@
           "Hua Fan",
           "Wojciech Golab"
         ],
-        "doi": "",
+        "doi": "10.14778/3342263.3342627",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "Ocean Vista: Gossip-Based Visibility Control for Speedy Geo-Distributed Transactions."
         },
         "identity_key": "title:ocean-vista-gossip-based-visibility-control-for-speedy-geo-distributed-transactions",
         "journal_entry_id": "2026-06-05-ocean-vista-turns-visibility-into-batched-watermark-gossip",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2019-ocean-vista-gossip-based-visibility-control-for-speedy-geo-distributed-transactions",
@@ -169174,20 +168750,19 @@
           "Chunqiang Tang",
           "Dimitrios Skarlatos"
         ],
-        "doi": "",
+        "doi": "10.1145/3503222.3507731",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "citation_supplies_doi",
+          "doi_status": "present",
+          "needs_identifier_review": false,
           "review_status": "generated_identifier_audit",
           "title": "TMO: Transparent Memory Offloading in Datacenters."
         },
         "identity_key": "title:tmo-transparent-memory-offloading-in-datacenters",
         "journal_entry_id": "2026-06-05-tmo-makes-tiering-a-pressure-controlled-feedback-loop",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2022-tmo-transparent-memory-offloading-in-datacenters",
@@ -222241,32 +221816,32 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 93,
+      "arxiv_needs_identifier_review": 72,
       "arxiv_present": 123,
       "arxiv_reviewed_absent": 29,
-      "arxiv_secondary_missing": 357,
-      "doi_needs_identifier_review": 93,
-      "doi_not_expected_yet": 54,
-      "doi_present": 405,
+      "arxiv_secondary_missing": 378,
+      "doi_needs_identifier_review": 72,
+      "doi_not_expected_yet": 52,
+      "doi_present": 434,
       "doi_reviewed_absent": 34,
-      "doi_secondary_missing": 16
+      "doi_secondary_missing": 10
     },
     "paper_identity_counts": {
       "paper_entries_with_arxiv": 123,
-      "paper_entries_with_doi": 405,
+      "paper_entries_with_doi": 434,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
       "missing_arxiv": 479,
-      "missing_doi": 197
+      "missing_doi": 168
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 357,
-      "doi": 75,
-      "doi,arxiv": 122,
-      "none": 48
+      "arxiv": 378,
+      "doi": 67,
+      "doi,arxiv": 101,
+      "none": 56
     },
     "paper_records": 563,
     "pending_low_confidence_links": 0,
