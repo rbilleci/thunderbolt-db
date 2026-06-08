@@ -12774,6 +12774,53 @@ def paper_identity_missing_fields(identity: dict) -> list[str]:
     return [field for field in required_fields if not identity[field]]
 
 
+def paper_identifier_audit(identity: dict, citation: str) -> dict:
+    doi = identity["doi"]
+    arxiv = identity["arxiv"]
+    venue = identity["venue"].lower()
+    citation = citation.lower()
+    title = identity["title"]
+
+    if doi:
+        doi_status = "present"
+        doi_review = "citation_supplies_doi"
+    elif arxiv and (
+        "submitted" in citation
+        or "preprint" in citation
+        or "arxiv" in venue
+        or "final venue details are unknown" in citation
+    ):
+        doi_status = "not_expected_yet"
+        doi_review = "arxiv_preprint_without_final_doi"
+    elif arxiv:
+        doi_status = "secondary_missing"
+        doi_review = "arxiv_record_without_doi_in_journal_citation"
+    else:
+        doi_status = "needs_identifier_review"
+        doi_review = "no_doi_or_arxiv_identifier_in_journal_citation"
+
+    if arxiv:
+        arxiv_status = "present"
+        arxiv_review = "citation_supplies_arxiv"
+    elif doi:
+        arxiv_status = "secondary_missing"
+        arxiv_review = "publisher_record_has_doi_but_no_arxiv_in_journal_citation"
+    else:
+        arxiv_status = "needs_identifier_review"
+        arxiv_review = "no_doi_or_arxiv_identifier_in_journal_citation"
+
+    return {
+        "doi_status": doi_status,
+        "doi_review": doi_review,
+        "arxiv_status": arxiv_status,
+        "arxiv_review": arxiv_review,
+        "needs_identifier_review": doi_status == "needs_identifier_review"
+        or arxiv_status == "needs_identifier_review",
+        "review_status": "generated_identifier_audit",
+        "title": title,
+    }
+
+
 def build_paper_identity(entry: dict) -> dict | None:
     if entry["entry_type"] != "paper":
         return None
@@ -12801,6 +12848,7 @@ def build_paper_identity(entry: dict) -> dict | None:
         "review_status": "generated_identity",
     }
     identity["missing_fields"] = paper_identity_missing_fields(identity)
+    identity["identifier_audit"] = paper_identifier_audit(identity, citation)
     return identity
 
 
@@ -13196,6 +13244,22 @@ def normalize_paper_records(paper_identities: list[dict]) -> tuple[list[dict], l
         with_url = next((identity for identity in identities if identity["url"]), canonical)
         with_venue = next((identity for identity in identities if identity["venue"]), canonical)
         with_authors = next((identity for identity in identities if identity["authors"]), canonical)
+        doi_audit = next(
+            (
+                identity["identifier_audit"]
+                for identity in identities
+                if identity["identifier_audit"]["doi_status"] == "present"
+            ),
+            with_doi["identifier_audit"],
+        )
+        arxiv_audit = next(
+            (
+                identity["identifier_audit"]
+                for identity in identities
+                if identity["identifier_audit"]["arxiv_status"] == "present"
+            ),
+            with_arxiv["identifier_audit"],
+        )
         journal_entry_ids = [identity["journal_entry_id"] for identity in identities]
         record = {
             "paper_id": canonical["paper_id"],
@@ -13211,6 +13275,15 @@ def normalize_paper_records(paper_identities: list[dict]) -> tuple[list[dict], l
             "duplicate_of": "",
             "source": canonical["source"],
             "review_status": canonical["review_status"],
+            "identifier_audit": {
+                "doi_status": doi_audit["doi_status"],
+                "doi_review": doi_audit["doi_review"],
+                "arxiv_status": arxiv_audit["arxiv_status"],
+                "arxiv_review": arxiv_audit["arxiv_review"],
+                "needs_identifier_review": doi_audit["doi_status"] == "needs_identifier_review"
+                or arxiv_audit["arxiv_status"] == "needs_identifier_review",
+                "review_status": "generated_identifier_audit",
+            },
             "missing_fields": paper_identity_missing_fields(
                 {
                     "doi": with_doi["doi"],
@@ -13251,7 +13324,9 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     paper_identity_counts: Counter = Counter()
     paper_identity_missing_counts: Counter = Counter()
     paper_identity_missing_field_sets: Counter = Counter()
+    paper_identifier_audit_counts: Counter = Counter()
     paper_identity_missing_audit: list[dict] = []
+    paper_identifier_review_audit: list[dict] = []
     paper_identities: list[dict] = []
     unlinked: list[str] = []
 
@@ -13279,6 +13354,21 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             missing_fields = paper_identity["missing_fields"]
             missing_key = ",".join(missing_fields) if missing_fields else "none"
             paper_identity_missing_field_sets[missing_key] += 1
+            identifier_audit = paper_identity["identifier_audit"]
+            paper_identifier_audit_counts[f"doi_{identifier_audit['doi_status']}"] += 1
+            paper_identifier_audit_counts[f"arxiv_{identifier_audit['arxiv_status']}"] += 1
+            if identifier_audit["needs_identifier_review"]:
+                paper_identifier_review_audit.append(
+                    {
+                        "journal_entry_id": entry["id"],
+                        "paper_id": paper_identity["paper_id"],
+                        "title": paper_identity["title"],
+                        "doi_status": identifier_audit["doi_status"],
+                        "arxiv_status": identifier_audit["arxiv_status"],
+                        "doi_review": identifier_audit["doi_review"],
+                        "arxiv_review": identifier_audit["arxiv_review"],
+                    }
+                )
             if missing_fields:
                 paper_identity_missing_audit.append(
                     {
@@ -13286,6 +13376,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
                         "paper_id": paper_identity["paper_id"],
                         "title": paper_identity["title"],
                         "missing_fields": missing_fields,
+                        "identifier_audit": identifier_audit,
                         "citation": paper_identity["citation"] if "citation" in paper_identity else entry.get("citation", ""),
                     }
                 )
@@ -13331,7 +13422,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
     paper_records, duplicate_groups = normalize_paper_records(paper_identities)
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v7",
+        "schema": "gpu-db-research-paper-mechanism-links-v8",
         "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, and normalized paper identity records. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
@@ -13357,6 +13448,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "review_status_counts": dict(sorted(review_status_counts.items())),
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
             "paper_identity_counts": dict(sorted(paper_identity_counts.items())),
+            "paper_identifier_audit_counts": dict(sorted(paper_identifier_audit_counts.items())),
             "paper_identity_missing_counts": dict(sorted(paper_identity_missing_counts.items())),
             "paper_identity_missing_field_sets": dict(sorted(paper_identity_missing_field_sets.items())),
             "paper_records": len(paper_records),
@@ -13387,6 +13479,10 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
                 item["journal_entry_id"],
             ),
         ),
+        "paper_identifier_review_audit": sorted(
+            paper_identifier_review_audit,
+            key=lambda item: item["journal_entry_id"],
+        ),
         "records": records,
     }
 
@@ -13404,6 +13500,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     review_status_counts = index["summary"]["review_status_counts"]
     review_priority_counts = index["summary"]["review_priority_counts"]
     paper_identity_counts = index["summary"]["paper_identity_counts"]
+    paper_identifier_audit_counts = index["summary"]["paper_identifier_audit_counts"]
     paper_identity_missing_counts = index["summary"]["paper_identity_missing_counts"]
     paper_identity_missing_field_sets = index["summary"]["paper_identity_missing_field_sets"]
     records = index["records"]
@@ -13500,6 +13597,25 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
         key=lambda item: (item[0] == "none", item[0]),
     ):
         lines.append(f"- {fields}: {count}")
+    lines.append("")
+    lines.append("Generated DOI/arXiv identifier audit:")
+    for status, count in sorted(paper_identifier_audit_counts.items()):
+        lines.append(f"- {status}: {count}")
+    lines.append(
+        f"- actionable_identifier_review: {len(index['paper_identifier_review_audit'])}"
+    )
+    lines.append("")
+    lines.append("Actionable DOI/arXiv identifier audit:")
+    if index["paper_identifier_review_audit"]:
+        for item in index["paper_identifier_review_audit"][:40]:
+            lines.append(
+                f"- `{item['journal_entry_id']}` -> `{item['paper_id']}`: "
+                f"doi={item['doi_status']}, arxiv={item['arxiv_status']}: {item['title']}"
+            )
+        if len(index["paper_identifier_review_audit"]) > 40:
+            lines.append(f"- ... {len(index['paper_identifier_review_audit']) - 40} more")
+    else:
+        lines.append("- none")
     lines.append("")
     lines.append("Missing identity metadata audit:")
     if index["paper_identity_missing_audit"]:
