@@ -33,47 +33,35 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - duplicate identity groups: 32
 
 Generated identity field counts:
-- paper_entries_with_arxiv: 129
+- paper_entries_with_arxiv: 133
 - paper_entries_with_doi: 442
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
-- missing_arxiv: 473
+- missing_arxiv: 469
 - missing_doi: 160
 
 Generated identity missing-field sets:
 - arxiv: 386
-- doi: 73
-- doi,arxiv: 87
+- doi: 77
+- doi,arxiv: 83
 - none: 56
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 24
-- arxiv_present: 129
-- arxiv_reviewed_absent: 63
+- arxiv_needs_identifier_review: 12
+- arxiv_present: 133
+- arxiv_reviewed_absent: 71
 - arxiv_secondary_missing: 386
-- doi_needs_identifier_review: 24
+- doi_needs_identifier_review: 12
 - doi_not_expected_yet: 52
 - doi_present: 442
-- doi_reviewed_absent: 74
+- doi_reviewed_absent: 86
 - doi_secondary_missing: 10
-- actionable_identifier_review: 24
+- actionable_identifier_review: 12
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-06-memstrata-makes-cxl-tiering-an-isolation-and-outlier-control-problem` -> `paper-2024-managing-memory-tiers-with-cxl-in-virtualized-environments`: doi=needs_identifier_review, arxiv=needs_identifier_review: Managing Memory Tiers with CXL in Virtualized Environments.
-- `2026-06-06-pangu-makes-rdma-a-fast-path-with-tcp-as-the-safety-valve` -> `paper-2021-when-cloud-storage-meets-rdma`: doi=needs_identifier_review, arxiv=needs_identifier_review: When Cloud Storage Meets RDMA.
-- `2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy` -> `paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: Polyjuice: High-Performance Transactions via Learned Concurrency Control.
-- `2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues` -> `paper-2025-shiftlock-mitigate-one-sided-rdma-lock-contention-via-handover`: doi=needs_identifier_review, arxiv=needs_identifier_review: ShiftLock: Mitigate One-sided RDMA Lock Contention via Handover.
-- `2026-06-06-silk-makes-compaction-a-foreground-slo-scheduling-problem` -> `paper-2019-silk-preventing-latency-spikes-in-log-structured-merge-key-value-stores`: doi=needs_identifier_review, arxiv=needs_identifier_review: SILK: Preventing Latency Spikes in Log-Structured Merge Key-Value Stores.
-- `2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan` -> `paper-2023-skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays`: doi=needs_identifier_review, arxiv=needs_identifier_review: Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays.
-- `2026-06-06-smart-makes-remote-index-traversal-a-cache-validation-and-iops-shaping-problem` -> `paper-2023-smart-a-high-performance-adaptive-radix-tree-for-disaggregated-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: SMART: A High-Performance Adaptive Radix Tree for Disaggregated Memory.
-- `2026-06-06-splinterdb-turns-nvme-storage-into-a-cpu-efficiency-problem` -> `paper-2020-splinterdb-closing-the-bandwidth-gap-for-nvme-key-value-stores`: doi=needs_identifier_review, arxiv=needs_identifier_review: SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value Stores.
-- `2026-06-06-srnic-minimizes-nic-resident-per-connection-state` -> `paper-2023-srnic-a-scalable-architecture-for-rdma-nics`: doi=needs_identifier_review, arxiv=needs_identifier_review: SRNIC: A Scalable Architecture for RDMA NICs.
-- `2026-06-07-aifm-turns-far-memory-into-data-structure-policy` -> `paper-2020-aifm-high-performance-application-integrated-far-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: AIFM: High-Performance, Application-Integrated Far Memory.
-- `2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation` -> `paper-2018-finding-crash-consistency-bugs-with-bounded-black-box-crash-testing`: doi=needs_identifier_review, arxiv=needs_identifier_review: Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing.
-- `2026-06-07-bullion-makes-column-layout-follow-access-shape-compliance-and-precision` -> `paper-2025-bullion-a-column-store-for-machine-learning`: doi=needs_identifier_review, arxiv=needs_identifier_review: Bullion: A Column Store for Machine Learning.
 - `2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract` -> `paper-2017-application-crash-consistency-and-performance-with-ccfs`: doi=needs_identifier_review, arxiv=needs_identifier_review: Application Crash Consistency and Performance with CCFS.
 - `2026-06-07-chablis-splits-fast-local-commits-from-global-snapshot-publication` -> `paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chablis: Fast and General Transactions in Geo-Distributed Systems.
 - `2026-06-07-chardonnay-turns-epoch-snapshots-into-pre-lock-admission` -> `paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases.

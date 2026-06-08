@@ -331,114 +331,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-memstrata-makes-cxl-tiering-an-isolation-and-outlier-control-problem",
-      "paper_id": "paper-2024-managing-memory-tiers-with-cxl-in-virtualized-environments",
-      "title": "Managing Memory Tiers with CXL in Virtualized Environments."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-pangu-makes-rdma-a-fast-path-with-tcp-as-the-safety-valve",
-      "paper_id": "paper-2021-when-cloud-storage-meets-rdma",
-      "title": "When Cloud Storage Meets RDMA."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy",
-      "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
-      "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues",
-      "paper_id": "paper-2025-shiftlock-mitigate-one-sided-rdma-lock-contention-via-handover",
-      "title": "ShiftLock: Mitigate One-sided RDMA Lock Contention via Handover."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-silk-makes-compaction-a-foreground-slo-scheduling-problem",
-      "paper_id": "paper-2019-silk-preventing-latency-spikes-in-log-structured-merge-key-value-stores",
-      "title": "SILK: Preventing Latency Spikes in Log-Structured Merge Key-Value Stores."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan",
-      "paper_id": "paper-2023-skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays",
-      "title": "Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-smart-makes-remote-index-traversal-a-cache-validation-and-iops-shaping-problem",
-      "paper_id": "paper-2023-smart-a-high-performance-adaptive-radix-tree-for-disaggregated-memory",
-      "title": "SMART: A High-Performance Adaptive Radix Tree for Disaggregated Memory."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-splinterdb-turns-nvme-storage-into-a-cpu-efficiency-problem",
-      "paper_id": "paper-2020-splinterdb-closing-the-bandwidth-gap-for-nvme-key-value-stores",
-      "title": "SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value Stores."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-06-srnic-minimizes-nic-resident-per-connection-state",
-      "paper_id": "paper-2023-srnic-a-scalable-architecture-for-rdma-nics",
-      "title": "SRNIC: A Scalable Architecture for RDMA NICs."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-aifm-turns-far-memory-into-data-structure-policy",
-      "paper_id": "paper-2020-aifm-high-performance-application-integrated-far-memory",
-      "title": "AIFM: High-Performance, Application-Integrated Far Memory."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation",
-      "paper_id": "paper-2018-finding-crash-consistency-bugs-with-bounded-black-box-crash-testing",
-      "title": "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-07-bullion-makes-column-layout-follow-access-shape-compliance-and-precision",
-      "paper_id": "paper-2025-bullion-a-column-store-for-machine-learning",
-      "title": "Bullion: A Column Store for Machine Learning."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-07-ccfs-makes-durability-ordering-a-per-stream-contract",
       "paper_id": "paper-2017-application-crash-consistency-and-performance-with-ccfs",
       "title": "Application Crash Consistency and Performance with CCFS."
@@ -7922,6 +7814,25 @@
       "title": "Plor: General Transactions with Predictable, Low Tail Latency."
     },
     {
+      "citation": "Jiachen Wang, Ding Ding, Huan Wang, Conrad Christensen, Zhaoguo Wang, Haibo Chen, and Jinyang Li. \"Polyjuice: High-Performance Transactions via Learned Concurrency Control.\" OSDI 2021, pp. 198-216. Retrieved 2026-06-06 from the USENIX open-access PDF, `https://www.usenix.org/system/files/osdi21-wang-jiachen.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/2105.10329",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
+      },
+      "journal_entry_id": "2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
+      "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
+    },
+    {
       "citation": "Huan Zhou, Jinwei Guo, Huiqi Hu, Weining Qian, Xuan Zhou, and Aoying Zhou. \"Guaranteeing Recoverability via Partially Constrained Transaction Logs.\" arXiv:1901.06491v1, 2019. Retrieved 2026-06-06 from `https://arxiv.org/abs/1901.06491` and PDF `https://arxiv.org/pdf/1901.06491`.",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
@@ -8100,6 +8011,25 @@
       ],
       "paper_id": "paper-2022-apache-shardingsphere-a-holistic-and-pluggable-platform-for-data-sharding",
       "title": "Apache ShardingSphere: A Holistic and Pluggable Platform for Data Sharding."
+    },
+    {
+      "citation": "Paras Jain, Sam Kumar, Sarah Wooders, Shishir G. Patil, Joseph E. Gonzalez, and Ion Stoica. \"Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays.\" NSDI 2023, pages 1375-1389. Retrieved 2026-06-06 from the USENIX paper page and PDF at `https://www.usenix.org/conference/nsdi23/presentation/jain` and `https://www.usenix.org/system/files/nsdi23-jain.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/2210.07259",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays."
+      },
+      "journal_entry_id": "2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2023-skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays",
+      "title": "Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays."
     },
     {
       "citation": "Chi Zhang, Ryan Marcus, Anat Kleiman, and Olga Papaemmanouil. \"Buffer Pool Aware Query Scheduling via Deep Reinforcement Learning.\" arXiv:2007.10568v3, 2022 extended abstract of the 2020 work. Retrieved 2026-06-06 from `https://arxiv.org/abs/2007.10568` and PDF `https://arxiv.org/pdf/2007.10568`.",
@@ -8406,6 +8336,44 @@
       ],
       "paper_id": "paper-2022-asap-a-speculative-approach-to-persistence",
       "title": "ASAP: A Speculative Approach to Persistence."
+    },
+    {
+      "citation": "Jayashree Mohan, Ashlie Martinez, Soujanya Ponnapalli, Pandian Raju, and Vijay Chidambaram. \"Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing.\" OSDI 2018, 33-50. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/osdi18/presentation/mohan`, `https://www.usenix.org/system/files/osdi18-mohan.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/1810.02904",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing."
+      },
+      "journal_entry_id": "2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2018-finding-crash-consistency-bugs-with-bounded-black-box-crash-testing",
+      "title": "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing."
+    },
+    {
+      "citation": "Gang Liao, Ye Liu, Jianjun Chen, and Daniel J. Abadi. \"Bullion: A Column Store for Machine Learning.\" CIDR 2025. Retrieved 2026-06-07 from the CIDR proceedings and author PDF: `https://vldb.org/cidrdb/2025/bullion-a-column-store-for-machine-learning.html`, `https://www.cs.umd.edu/~abadi/papers/bullion-cidr.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_cidr_record_has_no_publisher_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/2404.08901",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Bullion: A Column Store for Machine Learning."
+      },
+      "journal_entry_id": "2026-06-07-bullion-makes-column-layout-follow-access-shape-compliance-and-precision",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2025-bullion-a-column-store-for-machine-learning",
+      "title": "Bullion: A Column Store for Machine Learning."
     },
     {
       "citation": "Chen Chen, Xingbo Wu, Wenshao Zhong, and Jakob Eriksson. \"Fast Abort-Freedom for Deterministic Transactions.\" IPDPS 2024. DOI: `https://doi.org/10.1109/IPDPS57955.2024.00067`. Retrieved 2026-06-07 from the NSF PAR PDF: `https://par.nsf.gov/servlets/purl/10548863`.",
@@ -10102,12 +10070,13 @@
     {
       "citation": "Yuhong Zhong, Daniel S. Berger, Carl Waldspurger, Ryan Wee, Ishwar Agarwal, Rajat Agarwal, Frank Hady, Karthik Kumar, Mark D. Hill, Mosharaf Chowdhury, and Asaf Cidon. \"Managing Memory Tiers with CXL in Virtualized Environments.\" OSDI 2024, 37-56. Retrieved 2026-06-06 from the USENIX PDF: `https://www.usenix.org/system/files/osdi24-zhong-yuhong.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_and_author_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi24/presentation/zhong-yuhong",
+        "review_status": "reviewed_identifier_repair",
         "title": "Managing Memory Tiers with CXL in Virtualized Environments."
       },
       "journal_entry_id": "2026-06-06-memstrata-makes-cxl-tiering-an-isolation-and-outlier-control-problem",
@@ -10121,12 +10090,13 @@
     {
       "citation": "Yixiao Gao, Qiang Li, Lingbo Tang, Yongqing Xi, Pengcheng Zhang, Wenwen Peng, Bo Li, Yaohui Wu, Shaozong Liu, Lei Yan, Fei Feng, Yan Zhuang, Fan Liu, Pan Liu, Xingkui Liu, Zhongjie Wu, Junping Wu, Zheng Cao, Chen Tian, Jinbo Wu, Jiaji Zhu, Haiyong Wang, Dennis Cai, and Jiesheng Wu. \"When Cloud Storage Meets RDMA.\" NSDI 2021, pp. 519-533. Retrieved 2026-06-06 from USENIX `https://www.usenix.org/conference/nsdi21/presentation/gao`. PDF: `https://www.usenix.org/system/files/nsdi21-gao.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/nsdi21/presentation/gao",
+        "review_status": "reviewed_identifier_repair",
         "title": "When Cloud Storage Meets RDMA."
       },
       "journal_entry_id": "2026-06-06-pangu-makes-rdma-a-fast-path-with-tcp-as-the-safety-valve",
@@ -10138,33 +10108,15 @@
       "title": "When Cloud Storage Meets RDMA."
     },
     {
-      "citation": "Jiachen Wang, Ding Ding, Huan Wang, Conrad Christensen, Zhaoguo Wang, Haibo Chen, and Jinyang Li. \"Polyjuice: High-Performance Transactions via Learned Concurrency Control.\" OSDI 2021, pp. 198-216. Retrieved 2026-06-06 from the USENIX open-access PDF, `https://www.usenix.org/system/files/osdi21-wang-jiachen.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
-      },
-      "journal_entry_id": "2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
-      "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
-    },
-    {
       "citation": "Jian Gao, Qing Wang, and Jiwu Shu. \"ShiftLock: Mitigate One-sided RDMA Lock Contention via Handover.\" 23rd USENIX Conference on File and Storage Technologies, FAST 2025, pages 355-372. Retrieved 2026-06-06 from `https://www.usenix.org/conference/fast25/presentation/gao` and PDF `https://www.usenix.org/system/files/fast25-gao.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/fast/Gao0S25",
+        "review_status": "reviewed_identifier_repair",
         "title": "ShiftLock: Mitigate One-sided RDMA Lock Contention via Handover."
       },
       "journal_entry_id": "2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues",
@@ -10178,12 +10130,13 @@
     {
       "citation": "Oana Balmau, Florin Dinu, Willy Zwaenepoel, Karan Gupta, Ravishankar Chandhiramoorthi, and Diego Didona. \"SILK: Preventing Latency Spikes in Log-Structured Merge Key-Value Stores.\" USENIX ATC 2019. Retrieved 2026-06-06 from the USENIX page and PDF: `https://www.usenix.org/conference/atc19/presentation/balmau`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc19/presentation/balmau",
+        "review_status": "reviewed_identifier_repair",
         "title": "SILK: Preventing Latency Spikes in Log-Structured Merge Key-Value Stores."
       },
       "journal_entry_id": "2026-06-06-silk-makes-compaction-a-foreground-slo-scheduling-problem",
@@ -10195,33 +10148,15 @@
       "title": "SILK: Preventing Latency Spikes in Log-Structured Merge Key-Value Stores."
     },
     {
-      "citation": "Paras Jain, Sam Kumar, Sarah Wooders, Shishir G. Patil, Joseph E. Gonzalez, and Ion Stoica. \"Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays.\" NSDI 2023, pages 1375-1389. Retrieved 2026-06-06 from the USENIX paper page and PDF at `https://www.usenix.org/conference/nsdi23/presentation/jain` and `https://www.usenix.org/system/files/nsdi23-jain.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays."
-      },
-      "journal_entry_id": "2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2023-skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays",
-      "title": "Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays."
-    },
-    {
       "citation": "Xuchuan Luo, Pengfei Zuo, Jiacheng Shen, Jiazhen Gu, Xin Wang, Michael R. Lyu, and Yangfan Zhou. \"SMART: A High-Performance Adaptive Radix Tree for Disaggregated Memory.\" OSDI 2023, pp. 553-571. Retrieved 2026-06-06 from USENIX, `https://www.usenix.org/system/files/osdi23-luo.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_author_and_official_usenix_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi23/presentation/luo",
+        "review_status": "reviewed_identifier_repair",
         "title": "SMART: A High-Performance Adaptive Radix Tree for Disaggregated Memory."
       },
       "journal_entry_id": "2026-06-06-smart-makes-remote-index-traversal-a-cache-validation-and-iops-shaping-problem",
@@ -10235,12 +10170,13 @@
     {
       "citation": "Alexander Conway, Abhishek Gupta, Vijay Chidambaram, Martin Farach-Colton, Richard Spillane, Amy Tai, and Rob Johnson. \"SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value Stores.\" USENIX ATC 2020, 49-63. Retrieved 2026-06-06 from the USENIX page and PDF: `https://www.usenix.org/conference/atc20/presentation/conway`, `https://www.usenix.org/system/files/atc20-conway.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc20/presentation/conway",
+        "review_status": "reviewed_identifier_repair",
         "title": "SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value Stores."
       },
       "journal_entry_id": "2026-06-06-splinterdb-turns-nvme-storage-into-a-cpu-efficiency-problem",
@@ -10254,12 +10190,13 @@
     {
       "citation": "Zilong Wang, Layong Luo, Qingsong Ning, Chaoliang Zeng, Wenxue Li, Xinchen Wan, Peng Xie, Tao Feng, Ke Cheng, Xiongfei Geng, Tianhao Wang, Weicheng Ling, Kejia Huo, Pingbo An, Kui Ji, Shideng Zhang, Bin Xu, Ruiqing Feng, Tao Ding, Kai Chen, and Chuanxiong Guo. \"SRNIC: A Scalable Architecture for RDMA NICs.\" NSDI 2023. Retrieved 2026-06-06 from `https://www.usenix.org/conference/nsdi23/presentation/wang-zilong` and `https://www.usenix.org/system/files/nsdi23-wang-zilong.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/nsdi/WangLNZLWXFCGWL23",
+        "review_status": "reviewed_identifier_repair",
         "title": "SRNIC: A Scalable Architecture for RDMA NICs."
       },
       "journal_entry_id": "2026-06-06-srnic-minimizes-nic-resident-per-connection-state",
@@ -10273,12 +10210,13 @@
     {
       "citation": "Zhenyuan Ruan, Malte Schwarzkopf, Marcos K. Aguilera, and Adam Belay. \"AIFM: High-Performance, Application-Integrated Far Memory.\" OSDI 2020, pages 315-332. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/osdi20/presentation/ruan`, `https://www.usenix.org/system/files/osdi20-ruan.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_and_project_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi20/presentation/ruan",
+        "review_status": "reviewed_identifier_repair",
         "title": "AIFM: High-Performance, Application-Integrated Far Memory."
       },
       "journal_entry_id": "2026-06-07-aifm-turns-far-memory-into-data-structure-policy",
@@ -10288,44 +10226,6 @@
       ],
       "paper_id": "paper-2020-aifm-high-performance-application-integrated-far-memory",
       "title": "AIFM: High-Performance, Application-Integrated Far Memory."
-    },
-    {
-      "citation": "Jayashree Mohan, Ashlie Martinez, Soujanya Ponnapalli, Pandian Raju, and Vijay Chidambaram. \"Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing.\" OSDI 2018, 33-50. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/osdi18/presentation/mohan`, `https://www.usenix.org/system/files/osdi18-mohan.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing."
-      },
-      "journal_entry_id": "2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2018-finding-crash-consistency-bugs-with-bounded-black-box-crash-testing",
-      "title": "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing."
-    },
-    {
-      "citation": "Gang Liao, Ye Liu, Jianjun Chen, and Daniel J. Abadi. \"Bullion: A Column Store for Machine Learning.\" CIDR 2025. Retrieved 2026-06-07 from the CIDR proceedings and author PDF: `https://vldb.org/cidrdb/2025/bullion-a-column-store-for-machine-learning.html`, `https://www.cs.umd.edu/~abadi/papers/bullion-cidr.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Bullion: A Column Store for Machine Learning."
-      },
-      "journal_entry_id": "2026-06-07-bullion-makes-column-layout-follow-access-shape-compliance-and-precision",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2025-bullion-a-column-store-for-machine-learning",
-      "title": "Bullion: A Column Store for Machine Learning."
     },
     {
       "citation": "Thanumalayan Sankaranarayana Pillai, Ramnatthan Alagappan, Lanyue Lu, Vijay Chidambaram, Andrea C. Arpaci-Dusseau, and Remzi H. Arpaci-Dusseau. \"Application Crash Consistency and Performance with CCFS.\" FAST 2017, 181-196. Retrieved 2026-06-07 from the USENIX page and PDF: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/pillai`, `https://www.usenix.org/system/files/conference/fast17/fast17_pillai.pdf`.",
@@ -13893,7 +13793,7 @@
       "year": "2018"
     },
     {
-      "arxiv": "",
+      "arxiv": "1810.02904",
       "authors": [
         "Jayashree Mohan",
         "Ashlie Martinez",
@@ -13904,11 +13804,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:finding-crash-consistency-bugs-with-bounded-black-box-crash-testing",
@@ -13916,8 +13816,7 @@
         "2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2018-finding-crash-consistency-bugs-with-bounded-black-box-crash-testing",
       "review_status": "generated_identity",
@@ -15695,11 +15594,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:silk-preventing-latency-spikes-in-log-structured-merge-key-value-stores",
@@ -16085,11 +15984,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_and_project_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:aifm-high-performance-application-integrated-far-memory",
@@ -17139,11 +17038,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:splinterdb-closing-the-bandwidth-gap-for-nvme-key-value-stores",
@@ -19156,11 +19055,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:when-cloud-storage-meets-rdma",
@@ -23305,7 +23204,7 @@
       "year": "2023"
     },
     {
-      "arxiv": "",
+      "arxiv": "2210.07259",
       "authors": [
         "Paras Jain",
         "Sam Kumar",
@@ -23317,11 +23216,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays",
@@ -23329,8 +23228,7 @@
         "2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2023-skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays",
       "review_status": "generated_identity",
@@ -23354,11 +23252,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_author_and_official_usenix_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:smart-a-high-performance-adaptive-radix-tree-for-disaggregated-memory",
@@ -23441,11 +23339,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:srnic-a-scalable-architecture-for-rdma-nics",
@@ -25515,11 +25413,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_and_author_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:managing-memory-tiers-with-cxl-in-virtualized-environments",
@@ -27176,7 +27074,7 @@
       "year": "2025"
     },
     {
-      "arxiv": "",
+      "arxiv": "2404.08901",
       "authors": [
         "Gang Liao",
         "Ye Liu",
@@ -27186,11 +27084,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_cidr_record_has_no_publisher_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:bullion-a-column-store-for-machine-learning",
@@ -27198,8 +27096,7 @@
         "2026-06-07-bullion-makes-column-layout-follow-access-shape-compliance-and-precision"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2025-bullion-a-column-store-for-machine-learning",
       "review_status": "generated_identity",
@@ -29147,11 +29044,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:shiftlock-mitigate-one-sided-rdma-lock-contention-via-handover",
@@ -32036,7 +31933,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "2404.08901",
         "authors": [
           "Gang Liao",
           "Ye Liu",
@@ -32045,19 +31942,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_cidr_record_has_no_publisher_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/2404.08901",
+          "review_status": "reviewed_identifier_repair",
           "title": "Bullion: A Column Store for Machine Learning."
         },
         "identity_key": "title:bullion-a-column-store-for-machine-learning",
         "journal_entry_id": "2026-06-07-bullion-makes-column-layout-follow-access-shape-compliance-and-precision",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2025-bullion-a-column-store-for-machine-learning",
         "review_status": "generated_identity",
@@ -37528,12 +37425,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc20/presentation/conway",
+          "review_status": "reviewed_identifier_repair",
           "title": "SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value Stores."
         },
         "identity_key": "title:splinterdb-closing-the-bandwidth-gap-for-nvme-key-value-stores",
@@ -37792,12 +37690,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_and_author_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi24/presentation/zhong-yuhong",
+          "review_status": "reviewed_identifier_repair",
           "title": "Managing Memory Tiers with CXL in Virtualized Environments."
         },
         "identity_key": "title:managing-memory-tiers-with-cxl-in-virtualized-environments",
@@ -42246,7 +42145,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "2210.07259",
         "authors": [
           "Paras Jain",
           "Sam Kumar",
@@ -42257,19 +42156,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/2210.07259",
+          "review_status": "reviewed_identifier_repair",
           "title": "Skyplane: Optimizing Transfer Cost and Throughput Using Cloud-Aware Overlays."
         },
         "identity_key": "title:skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays",
         "journal_entry_id": "2026-06-06-skyplane-makes-cold-tier-movement-a-constrained-overlay-plan",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2023-skyplane-optimizing-transfer-cost-and-throughput-using-cloud-aware-overlays",
         "review_status": "generated_identity",
@@ -43480,12 +43379,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/fast/Gao0S25",
+          "review_status": "reviewed_identifier_repair",
           "title": "ShiftLock: Mitigate One-sided RDMA Lock Contention via Handover."
         },
         "identity_key": "title:shiftlock-mitigate-one-sided-rdma-lock-contention-via-handover",
@@ -49817,7 +49717,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "2105.10329",
         "authors": [
           "Jiachen Wang",
           "Ding Ding",
@@ -49829,19 +49729,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/2105.10329",
+          "review_status": "reviewed_identifier_repair",
           "title": "Polyjuice: High-Performance Transactions via Learned Concurrency Control."
         },
         "identity_key": "title:polyjuice-high-performance-transactions-via-learned-concurrency-control",
         "journal_entry_id": "2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control",
         "review_status": "generated_identity",
@@ -52062,12 +51962,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_author_and_official_usenix_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi23/presentation/luo",
+          "review_status": "reviewed_identifier_repair",
           "title": "SMART: A High-Performance Adaptive Radix Tree for Disaggregated Memory."
         },
         "identity_key": "title:smart-a-high-performance-adaptive-radix-tree-for-disaggregated-memory",
@@ -198130,12 +198031,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/nsdi21/presentation/gao",
+          "review_status": "reviewed_identifier_repair",
           "title": "When Cloud Storage Meets RDMA."
         },
         "identity_key": "title:when-cloud-storage-meets-rdma",
@@ -203598,12 +203500,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/nsdi/WangLNZLWXFCGWL23",
+          "review_status": "reviewed_identifier_repair",
           "title": "SRNIC: A Scalable Architecture for RDMA NICs."
         },
         "identity_key": "title:srnic-a-scalable-architecture-for-rdma-nics",
@@ -210843,12 +210746,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc19/presentation/balmau",
+          "review_status": "reviewed_identifier_repair",
           "title": "SILK: Preventing Latency Spikes in Log-Structured Merge Key-Value Stores."
         },
         "identity_key": "title:silk-preventing-latency-spikes-in-log-structured-merge-key-value-stores",
@@ -214563,12 +214467,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_and_project_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi20/presentation/ruan",
+          "review_status": "reviewed_identifier_repair",
           "title": "AIFM: High-Performance, Application-Integrated Far Memory."
         },
         "identity_key": "title:aifm-high-performance-application-integrated-far-memory",
@@ -216541,7 +216446,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "1810.02904",
         "authors": [
           "Jayashree Mohan",
           "Ashlie Martinez",
@@ -216551,19 +216456,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/1810.02904",
+          "review_status": "reviewed_identifier_repair",
           "title": "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing."
         },
         "identity_key": "title:finding-crash-consistency-bugs-with-bounded-black-box-crash-testing",
         "journal_entry_id": "2026-06-07-b3-turns-crash-consistency-into-bounded-witness-generation",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2018-finding-crash-consistency-bugs-with-bounded-black-box-crash-testing",
         "review_status": "generated_identity",
@@ -221440,31 +221345,31 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 24,
-      "arxiv_present": 129,
-      "arxiv_reviewed_absent": 63,
+      "arxiv_needs_identifier_review": 12,
+      "arxiv_present": 133,
+      "arxiv_reviewed_absent": 71,
       "arxiv_secondary_missing": 386,
-      "doi_needs_identifier_review": 24,
+      "doi_needs_identifier_review": 12,
       "doi_not_expected_yet": 52,
       "doi_present": 442,
-      "doi_reviewed_absent": 74,
+      "doi_reviewed_absent": 86,
       "doi_secondary_missing": 10
     },
     "paper_identity_counts": {
-      "paper_entries_with_arxiv": 129,
+      "paper_entries_with_arxiv": 133,
       "paper_entries_with_doi": 442,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
-      "missing_arxiv": 473,
+      "missing_arxiv": 469,
       "missing_doi": 160
     },
     "paper_identity_missing_field_sets": {
       "arxiv": 386,
-      "doi": 73,
-      "doi,arxiv": 87,
+      "doi": 77,
+      "doi,arxiv": 83,
       "none": 56
     },
     "paper_records": 563,
