@@ -5614,6 +5614,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Per-item metadata placement is valid only if cache-contention hot spots are partitioned or sampled carefully.",
     },
+    (
+        "2026-06-04-hdcc-interleaves-deterministic-batches-with-optimistic-lanes",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The test cue describes retained batch dependency state; the WAL, owner, catalog, and batch frontiers support dependency witnesses.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-mixed-routes-need-replayable-frontiers",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless clause is corpus-planning guidance; the evidence keeps logging and replay frontiers as required design inputs.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-mixed-routes-need-replayable-frontiers",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The synthesis names scheduling and multi-owner replay as continuing route constraints, supporting explicit owner coordination.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-mixed-routes-need-replayable-frontiers",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless clause is corpus-priority guidance; the retained evidence still supports tier-aware routing within the mixed-route design.",
+    },
+    (
+        "2026-06-04-cgrx-trades-exact-gpu-index-entries-for-bucketed-rt-core-lookups",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Bucketed RT-core lookups are usable only when old versions, deleted keys, and node retirement follow snapshot-generation reclamation.",
+    },
+    (
+        "2026-06-04-calvinfs-makes-namespace-metadata-a-deterministic-transaction-workload",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts metadata-service architecture, not route optimization; deterministic metadata routing remains supporting evidence.",
+    },
+    (
+        "2026-06-04-calvinfs-makes-namespace-metadata-a-deterministic-transaction-workload",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Immutable descriptor publication is valid only if source generations remain unchanged during compaction or segment rewrite.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-metadata-should-be-cached-ordered-and-explainable",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The unless clause is review-priority guidance; route metadata still supports explicit tier-placement decisions.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-metadata-should-be-cached-ordered-and-explainable",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis explicitly requires a metadata-cache microbenchmark proving lookup cost does not scale with logical sessions.",
+    },
+    (
+        "2026-06-04-faster-embedded-state-stores-keep-hot-updates-in-place-while-cold-state-spills",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hot-set drift across DRAM and NVMe-like cold state is explicitly listed as a placement measurement gate.",
+    },
+    (
+        "2026-06-04-faster-embedded-state-stores-keep-hot-updates-in-place-while-cold-state-spills",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts global checks with epoch refresh, which directly supports deferred descriptor reclamation.",
+    },
+    (
+        "2026-06-04-faster-embedded-state-stores-keep-hot-updates-in-place-while-cold-state-spills",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Checkpoint, drift, latency, and recovery metrics are named measurement gates before WAL visibility transfer.",
+    },
+    (
+        "2026-06-04-faster-embedded-state-stores-keep-hot-updates-in-place-while-cold-state-spills",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained resident indexes are valid only as rebuildable acceleration state with visible write-amplification and latency limits.",
+    },
+    (
+        "2026-06-04-star-phase-switches-ownership-instead-of-paying-distributed-commit-on-every-transaction",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Phase-fenced metadata requires throughput, latency, abort, fence-overhead, and recovery proof measurements.",
+    },
+    (
+        "2026-06-04-star-phase-switches-ownership-instead-of-paying-distributed-commit-on-every-transaction",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Dependency frontiers for phase-fenced metadata need throughput, latency, abort, and replay measurements before adoption.",
+    },
+    (
+        "2026-06-04-rtindex-turns-rt-cores-into-a-read-mostly-gpu-secondary-index",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "RT-core indexes belong in HBM only when telemetry shows saved lookup work is worth the resident bytes.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-write-point-state-and-resident-index-contracts",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner queue wait, fence wait, GPU queue wait, resident-index rebuild wait, and response-ring wait are explicit benchmark gates.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-write-point-state-and-resident-index-contracts",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Resident index metadata is useful only when read-mostly, batched, and rebuilt at generation boundaries.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-hot-routes-need-separate-write-point-state-and-resident-index-contracts",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route-root publication is valid only when resident indexes are read-mostly, batched, and generation-boundary rebuilt.",
+    },
+    (
+        "2026-06-04-gpu-tps-maps-oltp-writes-onto-simt-with-grouping-locks-and-gpu-indexes",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "SmallBank and TPC-C evidence still needs GPU DB conflict-ordering evaluation before architectural adoption.",
+    },
+    (
+        "2026-06-04-gpu-tps-maps-oltp-writes-onto-simt-with-grouping-locks-and-gpu-indexes",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts GPU OLTP with scan-only GPU use, which supports retained resident execution rather than opposing it.",
+    },
+    (
+        "2026-06-04-gpu-tps-maps-oltp-writes-onto-simt-with-grouping-locks-and-gpu-indexes",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Conflict risk is an admission-key input for same-shape write batches, not a warning against micro-batching itself.",
+    },
+    (
+        "2026-06-04-gpu-tps-maps-oltp-writes-onto-simt-with-grouping-locks-and-gpu-indexes",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Conflict-risk metadata is part of shaping write batches and retained descriptors, not evidence against descriptor reclamation.",
+    },
+    (
+        "2026-06-04-ltpg-removes-predefined-read-write-sets-from-gpu-batch-transactions",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The proof gate requires staged telemetry, WAL publication checks, and predefined-versus-dynamic batch comparison.",
+    },
+    (
+        "2026-06-04-mocc-selectively-locks-only-hot-read-conflict-records",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "MOCC's CPU main-memory OLTP scope cautions against direct GPU, SQL planning, and tier-placement transfer.",
+    },
+    (
+        "2026-06-04-adaptive-logging-makes-recovery-cost-a-write-path-budget",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The recovery-cost metric is explicitly a proof gate for dependency-footprint experiments on batched writes.",
+    },
+    (
+        "2026-06-04-adaptive-logging-makes-recovery-cost-a-write-path-budget",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts fixed log detail with tunable resource policy, which remains supporting optimizer-advice evidence.",
+    },
+    (
+        "2026-06-04-scalestore-treats-dram-remote-memory-and-nvme-as-one-coherent-page-tier",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Per-object fairness is presented as an alternative coordination shape to one global owner queue.",
+    },
+    (
+        "2026-06-04-scalestore-treats-dram-remote-memory-and-nvme-as-one-coherent-page-tier",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained copies are safe only when incompatible resident copies are superseded before publishing visibility and old readers hold leases.",
+    },
+    (
+        "2026-06-04-scalestore-treats-dram-remote-memory-and-nvme-as-one-coherent-page-tier",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts memory residency choices; the evidence remains supporting context for WAL-governed cold-tier routing.",
+    },
 }
 
 
