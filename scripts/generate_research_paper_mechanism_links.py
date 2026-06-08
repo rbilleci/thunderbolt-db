@@ -6034,6 +6034,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Hierarchical learned prediction is useful only when uncertainty and expected route duration justify the added inference cost.",
     },
+    (
+        "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Stage's Redshift analytical scope cautions against direct retained GPU snapshot transfer to WAL-governed OLTP/HTAP routes.",
+    },
+    (
+        "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner routing is useful only when queue and reservation telemetry predicts the execution window, not just admission-time load.",
+    },
+    (
+        "2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Expensive global policy metadata is justified only when uncertainty and expected route duration outweigh reclamation and hot-path costs.",
+    },
+    (
+        "2026-06-04-hyperion-treats-gpu-storage-access-as-a-schedulable-pipeline",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cold-chunk overlap must prove retained lookup p99 stays within budget under PCIe/NVMe and staging-buffer pressure.",
+    },
+    (
+        "2026-06-04-manycore-file-systems-expose-hidden-cold-tier-contention",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "WAL and checkpoint segment choices need filesystem contention, fsync, and recovery-scan measurements before adoption.",
+    },
+    (
+        "2026-06-04-compound-gpu-pipelines-trade-materialization-for-explicit-reduction-pressure",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Compound fused kernels are a promising same-shape batch design but still require lookup, projection, and scatter benchmarks.",
+    },
+    (
+        "2026-06-04-compound-gpu-pipelines-trade-materialization-for-explicit-reduction-pressure",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route telemetry must be benchmarked to prove it separates atomic contention from transfer bottlenecks.",
+    },
+    (
+        "2026-06-04-lotus-keeps-partition-owners-single-threaded-but-multiplexes-multi-partition-waits",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Lotus-like logging must be measured for retained invalidation recovery without scanning unrelated GPU-resident artifacts.",
+    },
+    (
+        "2026-06-04-lotus-keeps-partition-owners-single-threaded-but-multiplexes-multi-partition-waits",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Sequencer-local publication batches need crash and visibility tests before route roots can rely on them.",
+    },
+    (
+        "2026-06-04-fluid-co-processing-should-offload-narrow-pruning-not-whole-queries-by-default",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The stress cue describes GPU-friendly Bloom pruning, which supports narrow retained snapshot routes rather than cautioning against them.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-placement-needs-stable-pressure-before-movement",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Placement changes require route-pressure, stable-window, cross-owner stealing, and CPU-fallback measurements.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-placement-needs-stable-pressure-before-movement",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner movement and stealing need separate memory-heavy and CPU-heavy pressure measurements before policy adoption.",
+    },
+    (
+        "2026-06-04-namespace-metadata-is-a-route-cache-design-problem",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-cache coherence policies need central-owner, per-worker generation-cache, and replicated-descriptor benchmarks.",
+    },
+    (
+        "2026-06-04-namespace-metadata-is-a-route-cache-design-problem",
+        "effective_session_counting",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Prefix invalidation can create a renewal storm at 1M logical sessions, cautioning against naive session-scale caching.",
+    },
+    (
+        "2026-06-04-semantic-repair-beats-full-occ-restart-when-conflict-scope-is-small",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner routing needs memory-footprint, cache-reuse, queue-time, p99, and false-invalidation benchmarks.",
+    },
+    (
+        "2026-06-04-view-serializability-does-not-buy-extra-safe-mvcc-route-templates-for-rc-si-ssi",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Mixed-isolation templates require owner-queue, validation-work, abort/retry, and p99 measurements.",
+    },
+    (
+        "2026-06-04-view-serializability-does-not-buy-extra-safe-mvcc-route-templates-for-rc-si-ssi",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The static-analysis scope lacks production SQL and throughput evaluation, so descriptor transfer needs benchmarking.",
+    },
+    (
+        "2026-06-04-view-serializability-does-not-buy-extra-safe-mvcc-route-templates-for-rc-si-ssi",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue contrasts single-version conflict order with explicit snapshot-visible dependencies, supporting frontier vectors.",
+    },
+    (
+        "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "OLxPBench defines the fresh-analytical-in-transaction workload shape that should gate HTAP freshness routing.",
+    },
+    (
+        "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The distributed JDBC benchmark scope cautions against directly inferring PostgreSQL-wire retained GPU snapshot behavior.",
+    },
+    (
+        "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The GPU DB mapping directly connects the benchmark shape to retained snapshots and route descriptors.",
+    },
+    (
+        "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path",
+        "effective_session_counting",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The distributed JDBC benchmark leaves PostgreSQL wire multiplexing and logical-session scale as required measurements.",
+    },
+    (
+        "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The MemSQL/TiDB contrast motivates a tier-placement matrix across row, CPU column, GPU, cold-transfer, and fallback paths.",
+    },
+    (
+        "2026-06-04-hybrid-benchmarks-must-put-fresh-analytical-reads-inside-the-transaction-path",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Queue handoff delay and hidden invalidation cost need benchmarks inside the fresh transaction path.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-needs-workload-shaped-proof-repair-and-latency-gates",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "HTAP freshness should advance through workload-shaped proof and latency gates rather than another standalone scan benchmark.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-needs-workload-shaped-proof-repair-and-latency-gates",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Cache placement needs workload-shaped proof, repair, and latency gates before movement policy adoption.",
+    },
+    (
+        "2026-06-04-semantic-data-classes-can-make-concurrency-admission-route-aware",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hot-write templates require proof gates comparing optimistic retry, semantic repair, ownership queues, and escrow reservation.",
+    },
+    (
+        "2026-06-04-semantic-data-classes-can-make-concurrency-admission-route-aware",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Escrow-like admission is valid only for numeric constrained commutative updates with explicit preconditions.",
+    },
+    (
+        "2026-06-04-production-workload-management-needs-cheap-predictions-plus-hard-guardrails",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner bundling is valid only when descriptors carry predicted queue, mutation-owner, refresh, and response-buffer pressure.",
+    },
+    (
+        "2026-06-04-production-workload-management-needs-cheap-predictions-plus-hard-guardrails",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fallback policy is valid only when descriptors expose predicted queue, GPU, pinned-buffer, resident-age, and fallback costs.",
+    },
 }
 
 
