@@ -2884,6 +2884,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Owner-local GC and route planning require queue, cleanup-debt, retained-read, and write-tail measurements.",
     },
+    (
+        "2026-06-03-pasha-partitioned-shared-cxl-pod-architecture",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The entry names movement-policy measurements before shared-tier placement can be trusted.",
+    },
+    (
+        "2026-06-03-pasha-partitioned-shared-cxl-pod-architecture",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Parallel logging and checkpoint support is called out as future work that must be measured before WAL visibility transfer.",
+    },
+    (
+        "2026-06-03-pasha-partitioned-shared-cxl-pod-architecture",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The partitioner minimizes shared-region operations rather than solving descriptor lifetime directly.",
+    },
+    (
+        "2026-06-03-owner-local-first-shared-only-when-measured",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Shared or accelerated tiers are admitted only when descriptor generation, bytes, and conflict class are proven.",
+    },
+    (
+        "2026-06-03-owner-local-first-shared-only-when-measured",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route-root publication is supported only when the route descriptor proves generation, bytes, and conflict class.",
+    },
+    (
+        "2026-06-03-owner-local-first-shared-only-when-measured",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "GPU OLTP conflict routing is valid only when owner-local state can prove the conflict class before admission.",
+    },
+    (
+        "2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue contrasts independent updates while the evidence supports publishing one immutable root boundary.",
+    },
+    (
+        "2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The bounded write-batch evidence keeps WAL and visibility publication together, so this remains supporting evidence.",
+    },
+    (
+        "2026-06-03-p-tree-multi-versioned-indexes-for-htap-snapshots",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue rejects unbounded cleanup and directly supports explicit snapshot-release reclamation frontiers.",
+    },
+    (
+        "2026-06-03-runtime-conflict-transaction-scheduling",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Choosing CPU fallback instead of a likely failing GPU route is the intended fallback mechanism.",
+    },
+    (
+        "2026-06-03-semantic-occ-batching-and-operation-reordering",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "A small owner-local conflict graph supports owner bundling rather than a global transaction scheduler.",
+    },
+    (
+        "2026-06-03-nomad-non-exclusive-memory-tiering",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained reads avoid blocking only if the query does not require a fresh resident generation.",
+    },
+    (
+        "2026-06-03-detox-transactional-cache-hit-rate",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The risks section says the cache setting lacks SQL, MVCC, WAL replay, GPU kernels, and multi-tier resident placement.",
+    },
+    (
+        "2026-06-03-themis-gpu-relational-pipeline-load-balancing",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Same-shape micro-batches require HBM, transfer, kernel, response, and null-result measurements before adoption.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-placement-and-scheduling-need-request-shaped-metrics",
+        "db_owned_cold_objects",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis requires request-shaped cache-value measurements before cold-object ownership choices are trusted.",
+    },
+    (
+        "2026-06-03-mordred-semantic-cpu-gpu-placement",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Residency transfer is gated on HBM, PCIe, CPU materialization, response-byte, and correctness measurements.",
+    },
+    (
+        "2026-06-03-morty-transaction-re-execution",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Early uncommitted visibility is safe only with precise validation, dirty-read checks, cleanup, WAL ordering, and recovery.",
+    },
+    (
+        "2026-06-03-morty-transaction-re-execution",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Partial re-execution versus deterministic owner ordering is explicitly framed as a concurrency benchmark.",
+    },
+    (
+        "2026-06-03-morty-transaction-re-execution",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Morty's replicated key-value scope cautions against direct descriptor-reclamation transfer to PostgreSQL-compatible SQL.",
+    },
+    (
+        "2026-06-03-loger-restricted-learned-query-optimization",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Learned join-order advice is valid only while the DBMS optimizer still owns physical operator restrictions.",
+    },
+    (
+        "2026-06-03-loger-restricted-learned-query-optimization",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue is about optimizer scope; the retained evidence still supports keeping bounded operator knowledge explicit.",
+    },
+    (
+        "2026-06-03-loger-restricted-learned-query-optimization",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route learning is acceptable only inside explicitly bounded safe alternatives with stable route-template evidence.",
+    },
+    (
+        "2026-06-03-loger-restricted-learned-query-optimization",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "The learned route transfer is useful only when decisions are cached by template, snapshot class, and tier state.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-learned-advice-needs-hard-route-boundaries",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that learned advice can choose risky CPU, cold-transfer, or hot-fragment routes without hard boundaries.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-learned-advice-needs-hard-route-boundaries",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route descriptors are useful only with a restriction language that names allowed and disallowed route behavior.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-learned-advice-needs-hard-route-boundaries",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Hot-write template routing is valid only when restrictions define what the planner may not do for the request.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-learned-advice-needs-hard-route-boundaries",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that learned advice may choose cold transfers that are too risky under current pressure.",
+    },
+    (
+        "2026-06-03-cross-paper-synthesis-learned-advice-needs-hard-route-boundaries",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The descriptor explicitly names owner domain, queue budget, skew risk, and dependency fragments, supporting owner bundling.",
+    },
+    (
+        "2026-06-03-shinjuku-microsecond-scale-preemptive-scheduling",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained routes are safe only when their service-time distribution is compatible with the queue class.",
+    },
+    (
+        "2026-06-03-path-to-gpu-initiated-i-o-for-data-intensive-systems",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Promotion to CPU or GPU cache is worthwhile only when reuse repays the tier-resource cost.",
+    },
 }
 
 
