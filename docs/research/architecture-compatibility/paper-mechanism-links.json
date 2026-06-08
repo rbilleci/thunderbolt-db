@@ -331,114 +331,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates",
-      "paper_id": "paper-2019-engineering-a-high-performance-gpu-b-tree",
-      "title": "Engineering a High-Performance GPU B-Tree."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-hetcache-makes-cache-placement-execution-centric-across-cpu-gpu-and-nvme",
-      "paper_id": "paper-2023-hetcache-synergising-nvme-storage-and-gpu-acceleration-for-memory-efficient-analytics",
-      "title": "HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards",
-      "paper_id": "paper-2017-hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases",
-      "title": "HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-kvell-propagates-old-scan-versions-instead-of-retaining-snapshots",
-      "paper_id": "paper-2020-kvell-snapshot-isolation-without-snapshots",
-      "title": "KVell+: Snapshot Isolation without Snapshots."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-mako-decouples-fast-speculative-certification-from-slow-durable-replication",
-      "paper_id": "paper-2025-mako-speculative-distributed-transactions-with-geo-replication",
-      "title": "Mako: Speculative Distributed Transactions with Geo-Replication."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-manycore-file-systems-expose-hidden-cold-tier-contention",
-      "paper_id": "paper-2016-understanding-manycore-scalability-of-file-systems",
-      "title": "Understanding Manycore Scalability of File Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-memory-centric-databases-make-pooled-memory-a-query-route-resource",
-      "paper_id": "paper-2025-databases-in-the-era-of-memory-centric-computing",
-      "title": "Databases in the Era of Memory-Centric Computing."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem",
-      "paper_id": "paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-",
-      "title": "What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-numa-placement-should-follow-measured-route-pressure-not-static-partitioning",
-      "paper_id": "paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
-      "title": "Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-r2p2-request-response-pairs-as-schedulable-runtime-units",
-      "paper_id": "paper-2019-r2p2-making-rpcs-first-class-datacenter-citizens",
-      "title": "R2P2: Making RPCs First-Class Datacenter Citizens."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-rcsi-scale-comes-from-treating-time-and-versions-as-first-class-routing-keys",
-      "paper_id": "paper-2024-scalable-oltp-in-the-cloud-what-s-the-big-deal-the-database-and-the-application-have-a-big-deal-",
-      "title": "Scalable OLTP in the Cloud: What's the BIG DEAL? The Database AND the Application Have a BIG DEAL: Their Isolation Semantics."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-shared-cache-oltp-reframes-hot-data-as-coherent-acceleration-state",
-      "paper_id": "paper-2023-is-scalable-oltp-in-the-cloud-a-solved-problem-analyzing-data-access-for-distributed-oltp-archit",
-      "title": "Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators",
       "paper_id": "paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores",
       "title": "A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores."
@@ -3786,6 +3678,25 @@
       "title": "GaccO - A GPU-accelerated OLTP DBMS."
     },
     {
+      "citation": "Muhammad A. Awad, Saman Ashkiani, Rob Johnson, Martin Farach-Colton, and John D. Owens. \"Engineering a High-Performance GPU B-Tree.\" PPoPP 2019. Retrieved 2026-06-04 from `https://par.nsf.gov/servlets/purl/10101116`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1145/3293883.3295706",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Engineering a High-Performance GPU B-Tree."
+      },
+      "journal_entry_id": "2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2019-engineering-a-high-performance-gpu-b-tree",
+      "title": "Engineering a High-Performance GPU B-Tree."
+    },
+    {
       "citation": "Jiesong Liu, Feng Zhang, Lv Lu, Chang Qi, Xiaoguang Guo, Dong Deng, Guoliang Li, Huanchen Zhang, Jidong Zhai, Hechen Zhang, Yuxing Chen, Anqun Pan, and Xiaoyong Du. \"G-Learned Index: Enabling Efficient Learned Index on GPU.\" IEEE Transactions on Parallel and Distributed Systems 35(6), June 2024, pp. 795-812. DOI `10.1109/TPDS.2024.3381214`. Retrieved 2026-06-04 from the author PDF, `https://fred1031.github.io/files/2024_tpds.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -3946,6 +3857,25 @@
       ],
       "paper_id": "paper-2024-heterogeneous-intra-pipeline-device-parallel-aggregations",
       "title": "Heterogeneous Intra-Pipeline Device-Parallel Aggregations."
+    },
+    {
+      "citation": "Salman Niazi, Mahmoud Ismail, Seif Haridi, Jim Dowling, Steffen Grohsschmiedt, and Mikael Ronstrom. \"HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases.\" FAST 2017. Retrieved 2026-06-04 from `https://www.usenix.org/system/files/conference/fast17/fast17-niazi.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/1606.01588",
+        "review_status": "reviewed_identifier_repair",
+        "title": "HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases."
+      },
+      "journal_entry_id": "2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2017-hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases",
+      "title": "HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases."
     },
     {
       "citation": "Chao Zhang, Guoliang Li, and Tao Lv. \"HyBench: A New Benchmark for HTAP Databases.\" PVLDB 17(5), 2024, pp. 939-951. doi:10.14778/3641204.3641213. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol17/p939-zhang.pdf`.",
@@ -4182,6 +4112,25 @@
       "title": "Mostly-Optimistic Concurrency Control for Highly Contended Dynamic Workloads on a Thousand Cores."
     },
     {
+      "citation": "Gabriel Haas and Viktor Leis. \"What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines.\" PVLDB 16(9), 2023. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3598581.3598584",
+        "review_status": "reviewed_identifier_repair",
+        "title": "What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines."
+      },
+      "journal_entry_id": "2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-",
+      "title": "What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines."
+    },
+    {
       "citation": "Olga Poppe, Qun Guo, Willis Lang, Pankaj Arora, Morgan Oslake, Shize Xu, and Ajay Kalhan. \"Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless.\" PVLDB 15(6):1279-1287, 2022. DOI `10.14778/3514061.3514073`. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol15/p1279-poppe.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -4252,6 +4201,25 @@
       ],
       "paper_id": "paper-2019-no-false-negatives-accepting-all-useful-schedules-in-a-fast-serializable-many-core-system",
       "title": "No False Negatives: Accepting All Useful Schedules in a Fast Serializable Many-Core System."
+    },
+    {
+      "citation": "Iraklis Psaroudakis, Tobias Scheuer, Norman May, Abdelkader Sellami, and Anastasia Ailamaki. \"Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores.\" PVLDB 10(2), 2016, pp. 37-48. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol10/p37-psaroudakis.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3015274.3015275",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores."
+      },
+      "journal_entry_id": "2026-06-04-numa-placement-should-follow-measured-route-pressure-not-static-partitioning",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
+      "title": "Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores."
     },
     {
       "citation": "Sho Nakazono, Hiroyuki Uchiyama, Yasuhiro Fujiwara, Yasuhiro Nakamura, and Hideyuki Kawashima. \"NWR: Rethinking Thomas Write Rule for Omittable Write Operations.\" arXiv:1904.08119v3, 2020. Retrieved 2026-06-04 from `https://arxiv.org/abs/1904.08119`.",
@@ -9586,33 +9554,15 @@
       "title": "Massively Parallel Multi-Versioned Transaction Processing."
     },
     {
-      "citation": "Muhammad A. Awad, Saman Ashkiani, Rob Johnson, Martin Farach-Colton, and John D. Owens. \"Engineering a High-Performance GPU B-Tree.\" PPoPP 2019. Retrieved 2026-06-04 from `https://par.nsf.gov/servlets/purl/10101116`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Engineering a High-Performance GPU B-Tree."
-      },
-      "journal_entry_id": "2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2019-engineering-a-high-performance-gpu-b-tree",
-      "title": "Engineering a High-Performance GPU B-Tree."
-    },
-    {
       "citation": "Hamish Nicholson, Aunn Raza, Periklis Chrysogelos, and Anastasia Ailamaki. \"HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics.\" CIDR 2023. Retrieved 2026-06-04 from the CIDR proceedings PDF: `https://www.cidrdb.org/cidr2023/papers/p84-nicholson.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_epfl_and_official_cidr_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://infoscience.epfl.ch/entities/publication/34fcb6aa-ca4e-4859-8f83-f59aa1e705bd",
+        "review_status": "reviewed_identifier_repair",
         "title": "HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics."
       },
       "journal_entry_id": "2026-06-04-hetcache-makes-cache-placement-execution-centric-across-cpu-gpu-and-nvme",
@@ -9624,33 +9574,15 @@
       "title": "HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics."
     },
     {
-      "citation": "Salman Niazi, Mahmoud Ismail, Seif Haridi, Jim Dowling, Steffen Grohsschmiedt, and Mikael Ronstrom. \"HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases.\" FAST 2017. Retrieved 2026-06-04 from `https://www.usenix.org/system/files/conference/fast17/fast17-niazi.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases."
-      },
-      "journal_entry_id": "2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2017-hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases",
-      "title": "HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases."
-    },
-    {
       "citation": "Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy Zwaenepoel. \"KVell+: Snapshot Isolation without Snapshots.\" OSDI 2020, pp. 425-441. Retrieved 2026-06-04 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi20/presentation/lepers`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi20/presentation/lepers",
+        "review_status": "reviewed_identifier_repair",
         "title": "KVell+: Snapshot Isolation without Snapshots."
       },
       "journal_entry_id": "2026-06-04-kvell-propagates-old-scan-versions-instead-of-retaining-snapshots",
@@ -9664,12 +9596,13 @@
     {
       "citation": "Weihai Shen, Yang Cui, Siddhartha Sen, Sebastian Angel, and Shuai Mu. \"Mako: Speculative Distributed Transactions with Geo-Replication.\" OSDI 2025. Retrieved 2026-06-04 from `https://www.usenix.org/system/files/osdi25-shen-weihai.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_usenix_and_nsf_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_usenix_and_nsf_records_have_no_available_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://par.nsf.gov/biblio/10616251-mako-speculative-distributed-transactions-geo-replication",
+        "review_status": "reviewed_identifier_repair",
         "title": "Mako: Speculative Distributed Transactions with Geo-Replication."
       },
       "journal_entry_id": "2026-06-04-mako-decouples-fast-speculative-certification-from-slow-durable-replication",
@@ -9683,12 +9616,13 @@
     {
       "citation": "Changwoo Min, Sanidhya Kashyap, Steffen Maass, Woonhak Kang, and Taesoo Kim. \"Understanding Manycore Scalability of File Systems.\" USENIX ATC 2016, pages 71-85. Retrieved 2026-06-04 from the USENIX publication page and PDF, `https://www.usenix.org/conference/atc16/technical-sessions/presentation/min`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/usenix/MinKMK16",
+        "review_status": "reviewed_identifier_repair",
         "title": "Understanding Manycore Scalability of File Systems."
       },
       "journal_entry_id": "2026-06-04-manycore-file-systems-expose-hidden-cold-tier-contention",
@@ -9702,12 +9636,13 @@
     {
       "citation": "Yannis Chronis, Anastasia Ailamaki, Lawrence Benson, Helena Caminal, Jana Giceva, Dave Patterson, Eric Sedlar, and Lisa Wu Wills. \"Databases in the Era of Memory-Centric Computing.\" CIDR 2025. Retrieved 2026-06-04 from the author-hosted PDF, `https://users.cs.duke.edu/~lkw34/papers/chronis-memcentric-cidr2025.pdf`, after the CIDR/VLDB PDF URL returned HTTP 403 to `curl`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_dblp_and_google_research_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_google_research_records_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://dblp.org/rec/conf/cidr/ChronisABCG0SW25",
+        "review_status": "reviewed_identifier_repair",
         "title": "Databases in the Era of Memory-Centric Computing."
       },
       "journal_entry_id": "2026-06-04-memory-centric-databases-make-pooled-memory-a-query-route-resource",
@@ -9719,52 +9654,15 @@
       "title": "Databases in the Era of Memory-Centric Computing."
     },
     {
-      "citation": "Gabriel Haas and Viktor Leis. \"What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines.\" PVLDB 16(9), 2023. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines."
-      },
-      "journal_entry_id": "2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-",
-      "title": "What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines."
-    },
-    {
-      "citation": "Iraklis Psaroudakis, Tobias Scheuer, Norman May, Abdelkader Sellami, and Anastasia Ailamaki. \"Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores.\" PVLDB 10(2), 2016, pp. 37-48. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol10/p37-psaroudakis.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores."
-      },
-      "journal_entry_id": "2026-06-04-numa-placement-should-follow-measured-route-pressure-not-static-partitioning",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
-      "title": "Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores."
-    },
-    {
       "citation": "Marios Kogias, George Prekas, Adrien Ghosn, Jonas Fietz, and Edouard Bugnion. \"R2P2: Making RPCs First-Class Datacenter Citizens.\" USENIX ATC 2019, pp. 863-880. Retrieved 2026-06-04 from `https://www.usenix.org/conference/atc19/presentation/kogias-r2p2` and `https://www.usenix.org/system/files/atc19-kogias-r2p2_0.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/atc19/presentation/kogias-r2p2",
+        "review_status": "reviewed_identifier_repair",
         "title": "R2P2: Making RPCs First-Class Datacenter Citizens."
       },
       "journal_entry_id": "2026-06-04-r2p2-request-response-pairs-as-schedulable-runtime-units",
@@ -9778,12 +9676,13 @@
     {
       "citation": "Pat Helland. \"Scalable OLTP in the Cloud: What's the BIG DEAL? The Database AND the Application Have a BIG DEAL: Their Isolation Semantics.\" CIDR 2024. Retrieved 2026-06-04 from `https://www.cidrdb.org/cidr2024/papers/p63-helland.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.cidrdb.org/cidr2024/papers/p63-helland.pdf",
+        "review_status": "reviewed_identifier_repair",
         "title": "Scalable OLTP in the Cloud: What's the BIG DEAL? The Database AND the Application Have a BIG DEAL: Their Isolation Semantics."
       },
       "journal_entry_id": "2026-06-04-rcsi-scale-comes-from-treating-time-and-versions-as-first-class-routing-keys",
@@ -9797,12 +9696,13 @@
     {
       "citation": "Tobias Ziegler, Philip A. Bernstein, Viktor Leis, and Carsten Binnig. \"Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures.\" CIDR 2023. Retrieved 2026-06-04 from `https://www.cidrdb.org/cidr2023/papers/p50-ziegler.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.cidrdb.org/cidr2023/papers/p50-ziegler.pdf",
+        "review_status": "reviewed_identifier_repair",
         "title": "Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures."
       },
       "journal_entry_id": "2026-06-04-shared-cache-oltp-reframes-hot-data-as-coherent-acceleration-state",
@@ -11760,14 +11660,14 @@
         "Abdelkader Sellami",
         "Anastasia Ailamaki"
       ],
-      "doi": "",
+      "doi": "10.14778/3015274.3015275",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
@@ -11775,7 +11675,6 @@
         "2026-06-04-numa-placement-should-follow-measured-route-pressure-not-static-partitioning"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
@@ -12893,11 +12792,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:understanding-manycore-scalability-of-file-systems",
@@ -13543,7 +13442,7 @@
       "year": "2017"
     },
     {
-      "arxiv": "",
+      "arxiv": "1606.01588",
       "authors": [
         "Salman Niazi",
         "Mahmoud Ismail",
@@ -13555,11 +13454,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases",
@@ -13567,8 +13466,7 @@
         "2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2017-hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases",
       "review_status": "generated_identity",
@@ -15108,14 +15006,14 @@
         "Martin Farach-Colton",
         "John D. Owens"
       ],
-      "doi": "",
+      "doi": "10.1145/3293883.3295706",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_crossref_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:engineering-a-high-performance-gpu-b-tree",
@@ -15123,7 +15021,6 @@
         "2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2019-engineering-a-high-performance-gpu-b-tree",
@@ -17068,11 +16965,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:kvell-snapshot-isolation-without-snapshots",
@@ -22628,11 +22525,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_epfl_and_official_cidr_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:hetcache-synergising-nvme-storage-and-gpu-acceleration-for-memory-efficient-analytics",
@@ -22732,11 +22629,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:is-scalable-oltp-in-the-cloud-a-solved-problem-analyzing-data-access-for-distributed-oltp-archit",
@@ -26671,11 +26568,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:scalable-oltp-in-the-cloud-what-s-the-big-deal-the-database-and-the-application-have-a-big-deal-",
@@ -27917,11 +27814,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_dblp_and_google_research_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_dblp_and_google_research_records_have_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:databases-in-the-era-of-memory-centric-computing",
@@ -28763,11 +28660,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_usenix_and_nsf_records_have_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_usenix_and_nsf_records_have_no_available_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:mako-speculative-distributed-transactions-with-geo-replication",
@@ -106902,12 +106799,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.cidrdb.org/cidr2024/papers/p63-helland.pdf",
+          "review_status": "reviewed_identifier_repair",
           "title": "Scalable OLTP in the Cloud: What's the BIG DEAL? The Database AND the Application Have a BIG DEAL: Their Isolation Semantics."
         },
         "identity_key": "title:scalable-oltp-in-the-cloud-what-s-the-big-deal-the-database-and-the-application-have-a-big-deal-",
@@ -107439,12 +107337,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.cidrdb.org/cidr2023/papers/p50-ziegler.pdf",
+          "review_status": "reviewed_identifier_repair",
           "title": "Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures."
         },
         "identity_key": "title:is-scalable-oltp-in-the-cloud-a-solved-problem-analyzing-data-access-for-distributed-oltp-archit",
@@ -107683,12 +107582,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/atc19/presentation/kogias-r2p2",
+          "review_status": "reviewed_identifier_repair",
           "title": "R2P2: Making RPCs First-Class Datacenter Citizens."
         },
         "identity_key": "title:r2p2-making-rpcs-first-class-datacenter-citizens",
@@ -110330,7 +110230,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "1606.01588",
         "authors": [
           "Salman Niazi",
           "Mahmoud Ismail",
@@ -110341,19 +110241,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/1606.01588",
+          "review_status": "reviewed_identifier_repair",
           "title": "HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases."
         },
         "identity_key": "title:hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases",
         "journal_entry_id": "2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2017-hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases",
         "review_status": "generated_identity",
@@ -114432,12 +114332,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi20/presentation/lepers",
+          "review_status": "reviewed_identifier_repair",
           "title": "KVell+: Snapshot Isolation without Snapshots."
         },
         "identity_key": "title:kvell-snapshot-isolation-without-snapshots",
@@ -115879,12 +115780,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_epfl_and_official_cidr_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://infoscience.epfl.ch/entities/publication/34fcb6aa-ca4e-4859-8f83-f59aa1e705bd",
+          "review_status": "reviewed_identifier_repair",
           "title": "HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics."
         },
         "identity_key": "title:hetcache-synergising-nvme-storage-and-gpu-acceleration-for-memory-efficient-analytics",
@@ -124456,20 +124358,20 @@
           "Martin Farach-Colton",
           "John D. Owens"
         ],
-        "doi": "",
+        "doi": "10.1145/3293883.3295706",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_crossref_acm_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1145/3293883.3295706",
+          "review_status": "reviewed_identifier_repair",
           "title": "Engineering a High-Performance GPU B-Tree."
         },
         "identity_key": "title:engineering-a-high-performance-gpu-b-tree",
         "journal_entry_id": "2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2019-engineering-a-high-performance-gpu-b-tree",
@@ -128711,12 +128613,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_official_usenix_record_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_official_usenix_record_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/usenix/MinKMK16",
+          "review_status": "reviewed_identifier_repair",
           "title": "Understanding Manycore Scalability of File Systems."
         },
         "identity_key": "title:understanding-manycore-scalability-of-file-systems",
@@ -130151,20 +130054,20 @@
           "Abdelkader Sellami",
           "Anastasia Ailamaki"
         ],
-        "doi": "",
+        "doi": "10.14778/3015274.3015275",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_crossref_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3015274.3015275",
+          "review_status": "reviewed_identifier_repair",
           "title": "Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores."
         },
         "identity_key": "title:adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
         "journal_entry_id": "2026-06-04-numa-placement-should-follow-measured-route-pressure-not-static-partitioning",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c",
@@ -138511,12 +138414,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_usenix_and_nsf_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_usenix_and_nsf_records_have_no_available_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://par.nsf.gov/biblio/10616251-mako-speculative-distributed-transactions-geo-replication",
+          "review_status": "reviewed_identifier_repair",
           "title": "Mako: Speculative Distributed Transactions with Geo-Replication."
         },
         "identity_key": "title:mako-speculative-distributed-transactions-with-geo-replication",
@@ -138984,20 +138888,20 @@
           "Gabriel Haas",
           "Viktor Leis"
         ],
-        "doi": "",
+        "doi": "10.14778/3598581.3598584",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_crossref_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3598581.3598584",
+          "review_status": "reviewed_identifier_repair",
           "title": "What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines."
         },
         "identity_key": "title:what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-",
         "journal_entry_id": "2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-",
@@ -146510,12 +146414,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_dblp_and_google_research_records_have_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_dblp_and_google_research_records_have_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://dblp.org/rec/conf/cidr/ChronisABCG0SW25",
+          "review_status": "reviewed_identifier_repair",
           "title": "Databases in the Era of Memory-Centric Computing."
         },
         "identity_key": "title:databases-in-the-era-of-memory-centric-computing",
@@ -221816,31 +221721,31 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 72,
-      "arxiv_present": 123,
-      "arxiv_reviewed_absent": 29,
-      "arxiv_secondary_missing": 378,
-      "doi_needs_identifier_review": 72,
+      "arxiv_needs_identifier_review": 60,
+      "arxiv_present": 124,
+      "arxiv_reviewed_absent": 37,
+      "arxiv_secondary_missing": 381,
+      "doi_needs_identifier_review": 60,
       "doi_not_expected_yet": 52,
-      "doi_present": 434,
-      "doi_reviewed_absent": 34,
+      "doi_present": 437,
+      "doi_reviewed_absent": 43,
       "doi_secondary_missing": 10
     },
     "paper_identity_counts": {
-      "paper_entries_with_arxiv": 123,
-      "paper_entries_with_doi": 434,
+      "paper_entries_with_arxiv": 124,
+      "paper_entries_with_doi": 437,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
-      "missing_arxiv": 479,
-      "missing_doi": 168
+      "missing_arxiv": 478,
+      "missing_doi": 165
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 378,
-      "doi": 67,
-      "doi,arxiv": 101,
+      "arxiv": 381,
+      "doi": 68,
+      "doi,arxiv": 97,
       "none": 56
     },
     "paper_records": 563,

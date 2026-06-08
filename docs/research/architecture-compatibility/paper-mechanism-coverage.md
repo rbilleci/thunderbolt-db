@@ -33,47 +33,35 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - duplicate identity groups: 32
 
 Generated identity field counts:
-- paper_entries_with_arxiv: 123
-- paper_entries_with_doi: 434
+- paper_entries_with_arxiv: 124
+- paper_entries_with_doi: 437
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
-- missing_arxiv: 479
-- missing_doi: 168
+- missing_arxiv: 478
+- missing_doi: 165
 
 Generated identity missing-field sets:
-- arxiv: 378
-- doi: 67
-- doi,arxiv: 101
+- arxiv: 381
+- doi: 68
+- doi,arxiv: 97
 - none: 56
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 72
-- arxiv_present: 123
-- arxiv_reviewed_absent: 29
-- arxiv_secondary_missing: 378
-- doi_needs_identifier_review: 72
+- arxiv_needs_identifier_review: 60
+- arxiv_present: 124
+- arxiv_reviewed_absent: 37
+- arxiv_secondary_missing: 381
+- doi_needs_identifier_review: 60
 - doi_not_expected_yet: 52
-- doi_present: 434
-- doi_reviewed_absent: 34
+- doi_present: 437
+- doi_reviewed_absent: 43
 - doi_secondary_missing: 10
-- actionable_identifier_review: 72
+- actionable_identifier_review: 60
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates` -> `paper-2019-engineering-a-high-performance-gpu-b-tree`: doi=needs_identifier_review, arxiv=needs_identifier_review: Engineering a High-Performance GPU B-Tree.
-- `2026-06-04-hetcache-makes-cache-placement-execution-centric-across-cpu-gpu-and-nvme` -> `paper-2023-hetcache-synergising-nvme-storage-and-gpu-acceleration-for-memory-efficient-analytics`: doi=needs_identifier_review, arxiv=needs_identifier_review: HetCache: Synergising NVMe Storage and GPU acceleration for Memory-Efficient Analytics.
-- `2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards` -> `paper-2017-hopsfs-scaling-hierarchical-file-system-metadata-using-newsql-databases`: doi=needs_identifier_review, arxiv=needs_identifier_review: HopsFS: Scaling Hierarchical File System Metadata Using NewSQL Databases.
-- `2026-06-04-kvell-propagates-old-scan-versions-instead-of-retaining-snapshots` -> `paper-2020-kvell-snapshot-isolation-without-snapshots`: doi=needs_identifier_review, arxiv=needs_identifier_review: KVell+: Snapshot Isolation without Snapshots.
-- `2026-06-04-mako-decouples-fast-speculative-certification-from-slow-durable-replication` -> `paper-2025-mako-speculative-distributed-transactions-with-geo-replication`: doi=needs_identifier_review, arxiv=needs_identifier_review: Mako: Speculative Distributed Transactions with Geo-Replication.
-- `2026-06-04-manycore-file-systems-expose-hidden-cold-tier-contention` -> `paper-2016-understanding-manycore-scalability-of-file-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: Understanding Manycore Scalability of File Systems.
-- `2026-06-04-memory-centric-databases-make-pooled-memory-a-query-route-resource` -> `paper-2025-databases-in-the-era-of-memory-centric-computing`: doi=needs_identifier_review, arxiv=needs_identifier_review: Databases in the Era of Memory-Centric Computing.
-- `2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem` -> `paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-`: doi=needs_identifier_review, arxiv=needs_identifier_review: What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines.
-- `2026-06-04-numa-placement-should-follow-measured-route-pressure-not-static-partitioning` -> `paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c`: doi=needs_identifier_review, arxiv=needs_identifier_review: Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores.
-- `2026-06-04-r2p2-request-response-pairs-as-schedulable-runtime-units` -> `paper-2019-r2p2-making-rpcs-first-class-datacenter-citizens`: doi=needs_identifier_review, arxiv=needs_identifier_review: R2P2: Making RPCs First-Class Datacenter Citizens.
-- `2026-06-04-rcsi-scale-comes-from-treating-time-and-versions-as-first-class-routing-keys` -> `paper-2024-scalable-oltp-in-the-cloud-what-s-the-big-deal-the-database-and-the-application-have-a-big-deal-`: doi=needs_identifier_review, arxiv=needs_identifier_review: Scalable OLTP in the Cloud: What's the BIG DEAL? The Database AND the Application Have a BIG DEAL: Their Isolation Semantics.
-- `2026-06-04-shared-cache-oltp-reframes-hot-data-as-coherent-acceleration-state` -> `paper-2023-is-scalable-oltp-in-the-cloud-a-solved-problem-analyzing-data-access-for-distributed-oltp-archit`: doi=needs_identifier_review, arxiv=needs_identifier_review: Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures.
 - `2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators` -> `paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores`: doi=needs_identifier_review, arxiv=needs_identifier_review: A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores.
 - `2026-06-04-tectonic-turns-cold-tier-efficiency-into-explicit-traffic-classes-and-sealed-metadata` -> `paper-2021-facebook-s-tectonic-filesystem-efficiency-from-exascale`: doi=needs_identifier_review, arxiv=needs_identifier_review: Facebook's Tectonic Filesystem: Efficiency from Exascale.
 - `2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract` -> `paper-2016-write-behind-logging`: doi=needs_identifier_review, arxiv=needs_identifier_review: Write-Behind Logging.
@@ -102,7 +90,19 @@ Actionable DOI/arXiv identifier audit:
 - `2026-06-06-chainpaxos-makes-replication-throughput-a-pipeline-and-membership-problem` -> `paper-2022-high-throughput-replication-with-integrated-membership-management`: doi=needs_identifier_review, arxiv=needs_identifier_review: High Throughput Replication with Integrated Membership Management.
 - `2026-06-06-citron-makes-remote-range-locks-a-static-metadata-protocol` -> `paper-2023-citron-distributed-range-lock-management-with-one-sided-rdma`: doi=needs_identifier_review, arxiv=needs_identifier_review: Citron: Distributed Range Lock Management with One-sided RDMA.
 - `2026-06-06-cloudcast-turns-cold-tier-replication-into-an-explicit-cost-time-and-stripe-routing-optimization` -> `paper-2024-cloudcast-high-throughput-cost-aware-overlay-multicast-in-the-cloud`: doi=needs_identifier_review, arxiv=needs_identifier_review: Cloudcast: High-Throughput, Cost-Aware Overlay Multicast in the Cloud.
-- ... 32 more
+- `2026-06-06-cobra-turns-serializability-into-an-off-path-route-history-check` -> `paper-2020-cobra-making-transactional-key-value-stores-verifiably-serializable`: doi=needs_identifier_review, arxiv=needs_identifier_review: Cobra: Making Transactional Key-Value Stores Verifiably Serializable.
+- `2026-06-06-diffkv-makes-value-placement-a-scan-write-ordering-dial` -> `paper-2021-differentiated-key-value-storage-management-for-balanced-i-o-performance`: doi=needs_identifier_review, arxiv=needs_identifier_review: Differentiated Key-Value Storage Management for Balanced I/O Performance.
+- `2026-06-06-eqds-moves-network-queues-to-the-edge-and-clocks-admission-with-receiver-credits` -> `paper-2022-an-edge-queued-datagram-service-for-all-datacenter-traffic`: doi=needs_identifier_review, arxiv=needs_identifier_review: An Edge-Queued Datagram Service for All Datacenter Traffic.
+- `2026-06-06-fisslock-splits-fast-grant-facts-from-heavy-waiter-state` -> `paper-2024-fast-and-scalable-in-network-lock-management-using-lock-fission`: doi=needs_identifier_review, arxiv=needs_identifier_review: Fast and Scalable In-network Lock Management Using Lock Fission.
+- `2026-06-06-ford-makes-remote-durable-transactions-a-round-trip-budget` -> `paper-2022-ford-fast-one-sided-rdma-based-distributed-transactions-for-disaggregated-persistent-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: FORD: Fast One-sided RDMA-based Distributed Transactions for Disaggregated Persistent Memory.
+- `2026-06-06-geminifs-makes-gpu-storage-metadata-explicit-enough-for-device-side-io` -> `paper-2025-geminifs-a-companion-file-system-for-gpus`: doi=needs_identifier_review, arxiv=needs_identifier_review: GeminiFS: A Companion File System for GPUs.
+- `2026-06-06-hdtx-coalesces-remote-transaction-fences-without-giving-up-priority` -> `paper-2025-fast-distributed-transactions-for-rdma-based-disaggregated-memory`: doi=needs_identifier_review, arxiv=needs_identifier_review: Fast Distributed Transactions for RDMA-based Disaggregated Memory.
+- `2026-06-06-matrixkv-makes-write-stalls-a-compaction-granularity-problem` -> `paper-2020-matrixkv-reducing-write-stalls-and-write-amplification-in-lsm-tree-based-kv-stores-with-a-matrix`: doi=needs_identifier_review, arxiv=needs_identifier_review: MatrixKV: Reducing Write Stalls and Write Amplification in LSM-tree Based KV Stores with a Matrix Container in NVM.
+- `2026-06-06-memstrata-makes-cxl-tiering-an-isolation-and-outlier-control-problem` -> `paper-2024-managing-memory-tiers-with-cxl-in-virtualized-environments`: doi=needs_identifier_review, arxiv=needs_identifier_review: Managing Memory Tiers with CXL in Virtualized Environments.
+- `2026-06-06-pangu-makes-rdma-a-fast-path-with-tcp-as-the-safety-valve` -> `paper-2021-when-cloud-storage-meets-rdma`: doi=needs_identifier_review, arxiv=needs_identifier_review: When Cloud Storage Meets RDMA.
+- `2026-06-06-polyjuice-treats-concurrency-control-as-a-learned-route-policy` -> `paper-2021-polyjuice-high-performance-transactions-via-learned-concurrency-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: Polyjuice: High-Performance Transactions via Learned Concurrency Control.
+- `2026-06-06-shiftlock-turns-hot-remote-locks-into-handoff-queues` -> `paper-2025-shiftlock-mitigate-one-sided-rdma-lock-contention-via-handover`: doi=needs_identifier_review, arxiv=needs_identifier_review: ShiftLock: Mitigate One-sided RDMA Lock Contention via Handover.
+- ... 20 more
 
 Missing identity metadata audit:
 - `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus` missing arxiv: Concurrent Analytical Query Processing with GPUs.
