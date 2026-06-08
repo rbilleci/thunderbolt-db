@@ -331,114 +331,6 @@
       "arxiv_status": "needs_identifier_review",
       "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
       "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract",
-      "paper_id": "paper-2020-the-cachelib-caching-engine-design-and-experiences-at-scale",
-      "title": "The CacheLib Caching Engine: Design and Experiences at Scale."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-calvinfs-makes-namespace-metadata-a-deterministic-transaction-workload",
-      "paper_id": "paper-2015-calvinfs-consistent-wan-replication-and-scalable-metadata-management-for-distributed-file-system",
-      "title": "CalvinFS: Consistent WAN Replication and Scalable Metadata Management for Distributed File Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges",
-      "paper_id": "paper-2020-query-performance-prediction-for-concurrent-queries-using-graph-embedding",
-      "title": "Query Performance Prediction for Concurrent Queries using Graph Embedding."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice",
-      "paper_id": "paper-2023-cooperative-memory-management-for-table-and-temporary-data",
-      "title": "Cooperative Memory Management for Table and Temporary Data."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-d-rdma-makes-fragmented-database-transfer-a-nic-scheduling-problem",
-      "paper_id": "paper-2022-d-rdma-bringing-zero-copy-rdma-to-database-systems",
-      "title": "D-RDMA: Bringing Zero-Copy RDMA to Database Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks",
-      "paper_id": "paper-2016-data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation",
-      "title": "Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-database-kernels-turn-cxl-storage-into-typed-database-services",
-      "paper_id": "paper-2024-database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl",
-      "title": "Database Kernels: Seamless Integration of Database Systems and Fast Storage via CXL."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling",
-      "paper_id": "paper-2021-everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-mai",
-      "title": "Everything is a Transaction: Unifying Logical Concurrency Control and Physical Data Structure Maintenance in Database Management Systems."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them",
-      "paper_id": "paper-2023-detock-high-performance-multi-region-transactions-at-scale",
-      "title": "Detock: High Performance Multi-region Transactions at Scale."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-dint-keeps-frequent-transaction-steps-inside-the-kernel-datapath",
-      "paper_id": "paper-2024-dint-fast-in-kernel-distributed-transactions-with-ebpf",
-      "title": "DINT: Fast In-Kernel Distributed Transactions with eBPF."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-eiffel-software-packet-scheduling-for-request-admission",
-      "paper_id": "paper-2019-eiffel-efficient-and-flexible-software-packet-scheduling",
-      "title": "Eiffel: Efficient and Flexible Software Packet Scheduling."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
-      "journal_entry_id": "2026-06-04-epic-deterministic-mvcc-removes-version-search-from-gpu-oltp-batches",
-      "paper_id": "paper-2024-massively-parallel-multi-versioned-transaction-processing",
-      "title": "Massively Parallel Multi-Versioned Transaction Processing."
-    },
-    {
-      "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "arxiv_status": "needs_identifier_review",
-      "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-      "doi_status": "needs_identifier_review",
       "journal_entry_id": "2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates",
       "paper_id": "paper-2019-engineering-a-high-performance-gpu-b-tree",
       "title": "Engineering a High-Performance GPU B-Tree."
@@ -3700,6 +3592,44 @@
       "title": "Pipelined Query Processing in Coprocessor Environments."
     },
     {
+      "citation": "Xuanhe Zhou, Ji Sun, Guoliang Li, and Jianhua Feng. \"Query Performance Prediction for Concurrent Queries using Graph Embedding.\" PVLDB 13(9), 2020. DOI `10.14778/3397230.3397238`. Retrieved 2026-06-04 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p1416-zhou.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.14778/3397230.3397238",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Query Performance Prediction for Concurrent Queries using Graph Embedding."
+      },
+      "journal_entry_id": "2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2020-query-performance-prediction-for-concurrent-queries-using-graph-embedding",
+      "title": "Query Performance Prediction for Concurrent Queries using Graph Embedding."
+    },
+    {
+      "citation": "Robert Lasch, Thomas Legler, Norman May, Bernhard Scheirle, and Kai-Uwe Sattler. \"Cooperative Memory Management for Table and Temporary Data.\" SiMoD '23, article 2, 2023. DOI `10.1145/3596225.3596230`. Retrieved 2026-06-04 from the TU Ilmenau repository PDF, `https://www.db-thueringen.de/servlets/MCRFileNodeServlet/dbt_derivate_00064480/979-8-4007-0783-4_2023_2.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1145/3596225.3596230",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Cooperative Memory Management for Table and Temporary Data."
+      },
+      "journal_entry_id": "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2023-cooperative-memory-management-for-table-and-temporary-data",
+      "title": "Cooperative Memory Management for Table and Temporary Data."
+    },
+    {
       "citation": "Sanidhya Kashyap, Dai Qin, Steve Byan, Virendra J. Marathe, and Sanketh Nalli. \"Correct, Fast Remote Persistence.\" arXiv:1909.02092, 2019. Retrieved 2026-06-04 from `https://arxiv.org/abs/1909.02092`.",
       "identifier_audit": {
         "arxiv_review": "citation_supplies_arxiv",
@@ -3826,6 +3756,25 @@
       "title": "DACE: A Database-Agnostic Cost Estimator."
     },
     {
+      "citation": "Harald Lang, Tobias Muehlbauer, Florian Funke, Peter Boncz, Thomas Neumann, and Alfons Kemper. \"Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation.\" SIGMOD 2016. Retrieved 2026-06-04 from the TUM Database Systems Group PDF at `https://www-db.cs.tum.edu/downloads/publications/datablocks.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1145/2882903.2882925",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation."
+      },
+      "journal_entry_id": "2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2016-data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation",
+      "title": "Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation."
+    },
+    {
       "citation": "Athinagoras Skiadopoulos, Qian Li, Peter Kraft, Kostis Kaffes, Daniel Hong, Shana Mathew, David Bestor, Michael Cafarella, Vijay Gadepally, Goetz Graefe, Jeremy Kepner, Christos Kozyrakis, Tim Kraska, Michael Stonebraker, Lalith Suresh, and Matei Zaharia. \"DBOS: A DBMS-oriented Operating System.\" PVLDB 15(1), 2022, pp. 21-30. doi:10.14778/3485450.3485454. Retrieved 2026-06-04 from `https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -3880,6 +3829,25 @@
       "title": "Delilah: eBPF-offload on Computational Storage."
     },
     {
+      "citation": "Cuong D. T. Nguyen, Johann K. Miller, and Daniel J. Abadi. \"Detock: High Performance Multi-region Transactions at Scale.\" PACMMOD / SIGMOD 2023, Article 148. DOI `10.1145/3589293`. Retrieved 2026-06-04 from the University of Maryland DRUM PDF, `https://api.drum.lib.umd.edu/server/api/core/bitstreams/5619e587-270c-4859-8a3e-8947e2bc9928/content`.",
+      "identifier_audit": {
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
+        "review_source": "https://doi.org/10.1145/3589293",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Detock: High Performance Multi-region Transactions at Scale."
+      },
+      "journal_entry_id": "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them",
+      "missing_fields": [
+        "arxiv"
+      ],
+      "paper_id": "paper-2023-detock-high-performance-multi-region-transactions-at-scale",
+      "title": "Detock: High Performance Multi-region Transactions at Scale."
+    },
+    {
       "citation": "Lasse Thostrup, Gloria Doci, Nils Boeschen, Manisha Luthra, and Carsten Binnig. \"Distributed GPU Joins on Fast RDMA-capable Networks.\" PACMMOD 1(1), 2023, article 29. DOI: `https://doi.org/10.1145/3588709`. Retrieved 2026-06-04 from the ACM DOI metadata and the author-version chapter in Thostrup's thesis, `https://tuprints.ulb.tu-darmstadt.de/26755/`.",
       "identifier_audit": {
         "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
@@ -3914,6 +3882,25 @@
       ],
       "paper_id": "paper-2017-don-t-hold-my-data-hostage-a-case-for-client-protocol-redesign",
       "title": "Don't Hold My Data Hostage: A Case For Client Protocol Redesign."
+    },
+    {
+      "citation": "Ahmed Saeed, Yimeng Zhao, Nandita Dukkipati, Ellen Zegura, Mostafa Ammar, Khaled Harras, and Amin Vahdat. \"Eiffel: Efficient and Flexible Software Packet Scheduling.\" 16th USENIX Symposium on Networked Systems Design and Implementation (NSDI 2019), pages 17-32. Retrieved 2026-06-04 from the USENIX page and official PDF at `https://www.usenix.org/conference/nsdi19/presentation/saeed` and `https://www.usenix.org/system/files/nsdi19-saeed.pdf`.",
+      "identifier_audit": {
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://arxiv.org/abs/1810.03060",
+        "review_status": "reviewed_identifier_repair",
+        "title": "Eiffel: Efficient and Flexible Software Packet Scheduling."
+      },
+      "journal_entry_id": "2026-06-04-eiffel-software-packet-scheduling-for-request-admission",
+      "missing_fields": [
+        "doi"
+      ],
+      "paper_id": "paper-2019-eiffel-efficient-and-flexible-software-packet-scheduling",
+      "title": "Eiffel: Efficient and Flexible Software Packet Scheduling."
     },
     {
       "citation": "Ji You Li, Jiachi Zhang, Wenchao Zhou, Yuhang Liu, Shuai Zhang, Zhuoming Xue, Ding Xu, Hua Fan, Fangyuan Zhou, and Feifei Li. \"Eigen: End-to-end Resource Optimization for Large-Scale Databases on the Cloud.\" PVLDB 16(12):3795-3807, 2023. DOI: `https://doi.org/10.14778/3611540.3611565`. Retrieved 2026-06-04 from the VLDB PDF, `https://www.vldb.org/pvldb/vol16/p3795-zhou.pdf`.",
@@ -9416,12 +9403,13 @@
     {
       "citation": "Benjamin Berg, Daniel S. Berger, Sara McAllister, Isaac Grosof, Sathya Gunasekar, Jimmy Lu, Michael Uhlar, Jim Carrig, Nathan Beckmann, Mor Harchol-Balter, and Gregory R. Ganger. \"The CacheLib Caching Engine: Design and Experiences at Scale.\" OSDI 2020. Retrieved 2026-06-04 from the USENIX publication page and PDF, `https://www.usenix.org/conference/osdi20/presentation/berg`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi20/presentation/berg",
+        "review_status": "reviewed_identifier_repair",
         "title": "The CacheLib Caching Engine: Design and Experiences at Scale."
       },
       "journal_entry_id": "2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract",
@@ -9435,12 +9423,13 @@
     {
       "citation": "Alexander Thomson and Daniel J. Abadi. \"CalvinFS: Consistent WAN Replication and Scalable Metadata Management for Distributed File Systems.\" FAST 2015. Retrieved 2026-06-04 from the USENIX publication page and PDF, `https://www.usenix.org/conference/fast15/technical-sessions/presentation/thomson`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/fast15/technical-sessions/presentation/thomson",
+        "review_status": "reviewed_identifier_repair",
         "title": "CalvinFS: Consistent WAN Replication and Scalable Metadata Management for Distributed File Systems."
       },
       "journal_entry_id": "2026-06-04-calvinfs-makes-namespace-metadata-a-deterministic-transaction-workload",
@@ -9452,52 +9441,15 @@
       "title": "CalvinFS: Consistent WAN Replication and Scalable Metadata Management for Distributed File Systems."
     },
     {
-      "citation": "Xuanhe Zhou, Ji Sun, Guoliang Li, and Jianhua Feng. \"Query Performance Prediction for Concurrent Queries using Graph Embedding.\" PVLDB 13(9), 2020. DOI `10.14778/3397230.3397238`. Retrieved 2026-06-04 from the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p1416-zhou.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Query Performance Prediction for Concurrent Queries using Graph Embedding."
-      },
-      "journal_entry_id": "2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2020-query-performance-prediction-for-concurrent-queries-using-graph-embedding",
-      "title": "Query Performance Prediction for Concurrent Queries using Graph Embedding."
-    },
-    {
-      "citation": "Robert Lasch, Thomas Legler, Norman May, Bernhard Scheirle, and Kai-Uwe Sattler. \"Cooperative Memory Management for Table and Temporary Data.\" SiMoD '23, article 2, 2023. DOI `10.1145/3596225.3596230`. Retrieved 2026-06-04 from the TU Ilmenau repository PDF, `https://www.db-thueringen.de/servlets/MCRFileNodeServlet/dbt_derivate_00064480/979-8-4007-0783-4_2023_2.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Cooperative Memory Management for Table and Temporary Data."
-      },
-      "journal_entry_id": "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2023-cooperative-memory-management-for-table-and-temporary-data",
-      "title": "Cooperative Memory Management for Table and Temporary Data."
-    },
-    {
       "citation": "Andre Ryser, Alberto Lerner, Alex Forencich, and Philippe Cudre-Mauroux. \"D-RDMA: Bringing Zero-Copy RDMA to Database Systems.\" CIDR 2022. Retrieved 2026-06-04 from `https://vldb.org/cidrdb/papers/2022/p77-ryser.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://vldb.org/cidrdb/2022/d-rdma-bringing-zero-copy-rdma-to-database-systems.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "D-RDMA: Bringing Zero-Copy RDMA to Database Systems."
       },
       "journal_entry_id": "2026-06-04-d-rdma-makes-fragmented-database-transfer-a-nic-scheduling-problem",
@@ -9509,33 +9461,15 @@
       "title": "D-RDMA: Bringing Zero-Copy RDMA to Database Systems."
     },
     {
-      "citation": "Harald Lang, Tobias Muehlbauer, Florian Funke, Peter Boncz, Thomas Neumann, and Alfons Kemper. \"Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation.\" SIGMOD 2016. Retrieved 2026-06-04 from the TUM Database Systems Group PDF at `https://www-db.cs.tum.edu/downloads/publications/datablocks.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation."
-      },
-      "journal_entry_id": "2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2016-data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation",
-      "title": "Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation."
-    },
-    {
       "citation": "Sangjin Lee, Alberto Lerner, Philippe Bonnet, and Philippe Cudre-Mauroux. \"Database Kernels: Seamless Integration of Database Systems and Fast Storage via CXL.\" CIDR 2024. Retrieved 2026-06-04 from `https://www.cidrdb.org/cidr2024/papers/p43-lee.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://vldb.org/cidrdb/2024/database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "Database Kernels: Seamless Integration of Database Systems and Fast Storage via CXL."
       },
       "journal_entry_id": "2026-06-04-database-kernels-turn-cxl-storage-into-typed-database-services",
@@ -9549,12 +9483,13 @@
     {
       "citation": "Ling Zhang, Matthew Butrovich, Tianyu Li, Yash Nannapanei, Andrew Pavlo, John Rollinson, Huanchen Zhang, et al. \"Everything is a Transaction: Unifying Logical Concurrency Control and Physical Data Structure Maintenance in Database Management Systems.\" CIDR 2021. Retrieved 2026-06-04 from the CIDR page and CMU Database Group PDF at `https://www.vldb.org/cidrdb/2021/everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-maintenance-in-database-management.html` and `https://db.cs.cmu.edu/papers/2021/cidr2021_paper06.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.vldb.org/cidrdb/2021/everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-maintenance-in-database-management.html",
+        "review_status": "reviewed_identifier_repair",
         "title": "Everything is a Transaction: Unifying Logical Concurrency Control and Physical Data Structure Maintenance in Database Management Systems."
       },
       "journal_entry_id": "2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling",
@@ -9566,33 +9501,15 @@
       "title": "Everything is a Transaction: Unifying Logical Concurrency Control and Physical Data Structure Maintenance in Database Management Systems."
     },
     {
-      "citation": "Cuong D. T. Nguyen, Johann K. Miller, and Daniel J. Abadi. \"Detock: High Performance Multi-region Transactions at Scale.\" PACMMOD / SIGMOD 2023, Article 148. DOI `10.1145/3589293`. Retrieved 2026-06-04 from the University of Maryland DRUM PDF, `https://api.drum.lib.umd.edu/server/api/core/bitstreams/5619e587-270c-4859-8a3e-8947e2bc9928/content`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Detock: High Performance Multi-region Transactions at Scale."
-      },
-      "journal_entry_id": "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2023-detock-high-performance-multi-region-transactions-at-scale",
-      "title": "Detock: High Performance Multi-region Transactions at Scale."
-    },
-    {
       "citation": "Yang Zhou, Xingyu Xiang, Matthew Kiley, Sowmya Dharanipragada, and Minlan Yu. \"DINT: Fast In-Kernel Distributed Transactions with eBPF.\" NSDI 2024, pp. 401-417. Retrieved 2026-06-04 from the USENIX publication page and PDF, `https://www.usenix.org/conference/nsdi24/presentation/zhou-yang`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/nsdi24/presentation/zhou-yang",
+        "review_status": "reviewed_identifier_repair",
         "title": "DINT: Fast In-Kernel Distributed Transactions with eBPF."
       },
       "journal_entry_id": "2026-06-04-dint-keeps-frequent-transaction-steps-inside-the-kernel-datapath",
@@ -9604,33 +9521,15 @@
       "title": "DINT: Fast In-Kernel Distributed Transactions with eBPF."
     },
     {
-      "citation": "Ahmed Saeed, Yimeng Zhao, Nandita Dukkipati, Ellen Zegura, Mostafa Ammar, Khaled Harras, and Amin Vahdat. \"Eiffel: Efficient and Flexible Software Packet Scheduling.\" 16th USENIX Symposium on Networked Systems Design and Implementation (NSDI 2019), pages 17-32. Retrieved 2026-06-04 from the USENIX page and official PDF at `https://www.usenix.org/conference/nsdi19/presentation/saeed` and `https://www.usenix.org/system/files/nsdi19-saeed.pdf`.",
-      "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
-        "title": "Eiffel: Efficient and Flexible Software Packet Scheduling."
-      },
-      "journal_entry_id": "2026-06-04-eiffel-software-packet-scheduling-for-request-admission",
-      "missing_fields": [
-        "doi",
-        "arxiv"
-      ],
-      "paper_id": "paper-2019-eiffel-efficient-and-flexible-software-packet-scheduling",
-      "title": "Eiffel: Efficient and Flexible Software Packet Scheduling."
-    },
-    {
       "citation": "Shujian Qian and Ashvin Goel. \"Massively Parallel Multi-Versioned Transaction Processing.\" OSDI 2024, pp. 765-782. Retrieved 2026-06-04 from `https://www.usenix.org/conference/osdi24/presentation/qian` and `https://www.usenix.org/system/files/osdi24-qian.pdf`.",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
-        "review_status": "generated_identifier_audit",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
+        "review_source": "https://www.usenix.org/conference/osdi24/presentation/qian",
+        "review_status": "reviewed_identifier_repair",
         "title": "Massively Parallel Multi-Versioned Transaction Processing."
       },
       "journal_entry_id": "2026-06-04-epic-deterministic-mvcc-removes-version-search-from-gpu-oltp-batches",
@@ -11519,11 +11418,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:calvinfs-consistent-wan-replication-and-scalable-metadata-management-for-distributed-file-system",
@@ -12325,14 +12224,14 @@
         "Thomas Neumann",
         "Alfons Kemper"
       ],
-      "doi": "",
+      "doi": "10.1145/2882903.2882925",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation",
@@ -12340,7 +12239,6 @@
         "2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2016-data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation",
@@ -15524,7 +15422,7 @@
       "year": "2019"
     },
     {
-      "arxiv": "",
+      "arxiv": "1810.03060",
       "authors": [
         "Ahmed Saeed",
         "Yimeng Zhao",
@@ -15537,11 +15435,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "repaired_from_arxiv_record",
+        "arxiv_status": "present",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:eiffel-efficient-and-flexible-software-packet-scheduling",
@@ -15549,8 +15447,7 @@
         "2026-06-04-eiffel-software-packet-scheduling-for-request-admission"
       ],
       "missing_fields": [
-        "doi",
-        "arxiv"
+        "doi"
       ],
       "paper_id": "paper-2019-eiffel-efficient-and-flexible-software-packet-scheduling",
       "review_status": "generated_identity",
@@ -17868,14 +17765,14 @@
         "Guoliang Li",
         "Jianhua Feng"
       ],
-      "doi": "",
+      "doi": "10.14778/3397230.3397238",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_pvldb_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:query-performance-prediction-for-concurrent-queries-using-graph-embedding",
@@ -17883,7 +17780,6 @@
         "2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2020-query-performance-prediction-for-concurrent-queries-using-graph-embedding",
@@ -18165,11 +18061,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:the-cachelib-caching-engine-design-and-experiences-at-scale",
@@ -18910,11 +18806,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-mai",
@@ -20603,11 +20499,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:d-rdma-bringing-zero-copy-rdma-to-database-systems",
@@ -22377,14 +22273,14 @@
         "Bernhard Scheirle",
         "Kai-Uwe Sattler"
       ],
-      "doi": "",
+      "doi": "10.1145/3596225.3596230",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:cooperative-memory-management-for-table-and-temporary-data",
@@ -22392,7 +22288,6 @@
         "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2023-cooperative-memory-management-for-table-and-temporary-data",
@@ -22633,14 +22528,14 @@
         "Johann K. Miller",
         "Daniel J. Abadi"
       ],
-      "doi": "",
+      "doi": "10.1145/3589293",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+        "arxiv_status": "secondary_missing",
+        "doi_review": "repaired_from_acm_record",
+        "doi_status": "present",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:detock-high-performance-multi-region-transactions-at-scale",
@@ -22648,7 +22543,6 @@
         "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them"
       ],
       "missing_fields": [
-        "doi",
         "arxiv"
       ],
       "paper_id": "paper-2023-detock-high-performance-multi-region-transactions-at-scale",
@@ -25406,11 +25300,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl",
@@ -25513,11 +25407,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:dint-fast-in-kernel-distributed-transactions-with-ebpf",
@@ -26443,11 +26337,11 @@
       "doi": "",
       "duplicate_of": "",
       "identifier_audit": {
-        "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "arxiv_status": "needs_identifier_review",
-        "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-        "doi_status": "needs_identifier_review",
-        "needs_identifier_review": true,
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "arxiv_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "doi_status": "reviewed_absent",
+        "needs_identifier_review": false,
         "review_status": "generated_identifier_audit"
       },
       "identity_key": "title:massively-parallel-multi-versioned-transaction-processing",
@@ -104281,7 +104175,7 @@
         }
       ],
       "paper_identity": {
-        "arxiv": "",
+        "arxiv": "1810.03060",
         "authors": [
           "Ahmed Saeed",
           "Yimeng Zhao",
@@ -104293,19 +104187,19 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "repaired_from_arxiv_record",
+          "arxiv_status": "present",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://arxiv.org/abs/1810.03060",
+          "review_status": "reviewed_identifier_repair",
           "title": "Eiffel: Efficient and Flexible Software Packet Scheduling."
         },
         "identity_key": "title:eiffel-efficient-and-flexible-software-packet-scheduling",
         "journal_entry_id": "2026-06-04-eiffel-software-packet-scheduling-for-request-admission",
         "missing_fields": [
-          "doi",
-          "arxiv"
+          "doi"
         ],
         "paper_id": "paper-2019-eiffel-efficient-and-flexible-software-packet-scheduling",
         "review_status": "generated_identity",
@@ -104553,12 +104447,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.vldb.org/cidrdb/2021/everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-maintenance-in-database-management.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "Everything is a Transaction: Unifying Logical Concurrency Control and Physical Data Structure Maintenance in Database Management Systems."
         },
         "identity_key": "title:everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-mai",
@@ -105067,20 +104962,20 @@
           "Thomas Neumann",
           "Alfons Kemper"
         ],
-        "doi": "",
+        "doi": "10.1145/2882903.2882925",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_acm_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1145/2882903.2882925",
+          "review_status": "reviewed_identifier_repair",
           "title": "Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation."
         },
         "identity_key": "title:data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation",
         "journal_entry_id": "2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2016-data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation",
@@ -108644,12 +108539,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi24/presentation/qian",
+          "review_status": "reviewed_identifier_repair",
           "title": "Massively Parallel Multi-Versioned Transaction Processing."
         },
         "identity_key": "title:massively-parallel-multi-versioned-transaction-processing",
@@ -114410,12 +114306,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/osdi20/presentation/berg",
+          "review_status": "reviewed_identifier_repair",
           "title": "The CacheLib Caching Engine: Design and Experiences at Scale."
         },
         "identity_key": "title:the-cachelib-caching-engine-design-and-experiences-at-scale",
@@ -120762,20 +120659,20 @@
           "Guoliang Li",
           "Jianhua Feng"
         ],
-        "doi": "",
+        "doi": "10.14778/3397230.3397238",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_pvldb_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.14778/3397230.3397238",
+          "review_status": "reviewed_identifier_repair",
           "title": "Query Performance Prediction for Concurrent Queries using Graph Embedding."
         },
         "identity_key": "title:query-performance-prediction-for-concurrent-queries-using-graph-embedding",
         "journal_entry_id": "2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2020-query-performance-prediction-for-concurrent-queries-using-graph-embedding",
@@ -121271,12 +121168,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/fast15/technical-sessions/presentation/thomson",
+          "review_status": "reviewed_identifier_repair",
           "title": "CalvinFS: Consistent WAN Replication and Scalable Metadata Management for Distributed File Systems."
         },
         "identity_key": "title:calvinfs-consistent-wan-replication-and-scalable-metadata-management-for-distributed-file-system",
@@ -124689,12 +124587,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://vldb.org/cidrdb/2024/database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "Database Kernels: Seamless Integration of Database Systems and Fast Storage via CXL."
         },
         "identity_key": "title:database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl",
@@ -127753,20 +127652,20 @@
           "Bernhard Scheirle",
           "Kai-Uwe Sattler"
         ],
-        "doi": "",
+        "doi": "10.1145/3596225.3596230",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_acm_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1145/3596225.3596230",
+          "review_status": "reviewed_identifier_repair",
           "title": "Cooperative Memory Management for Table and Temporary Data."
         },
         "identity_key": "title:cooperative-memory-management-for-table-and-temporary-data",
         "journal_entry_id": "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2023-cooperative-memory-management-for-table-and-temporary-data",
@@ -134476,20 +134375,20 @@
           "Johann K. Miller",
           "Daniel J. Abadi"
         ],
-        "doi": "",
+        "doi": "10.1145/3589293",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "publisher_record_has_doi_but_no_arxiv_in_journal_citation",
+          "arxiv_status": "secondary_missing",
+          "doi_review": "repaired_from_acm_record",
+          "doi_status": "present",
+          "needs_identifier_review": false,
+          "review_source": "https://doi.org/10.1145/3589293",
+          "review_status": "reviewed_identifier_repair",
           "title": "Detock: High Performance Multi-region Transactions at Scale."
         },
         "identity_key": "title:detock-high-performance-multi-region-transactions-at-scale",
         "journal_entry_id": "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them",
         "missing_fields": [
-          "doi",
           "arxiv"
         ],
         "paper_id": "paper-2023-detock-high-performance-multi-region-transactions-at-scale",
@@ -138768,12 +138667,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_cidr_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://vldb.org/cidrdb/2022/d-rdma-bringing-zero-copy-rdma-to-database-systems.html",
+          "review_status": "reviewed_identifier_repair",
           "title": "D-RDMA: Bringing Zero-Copy RDMA to Database Systems."
         },
         "identity_key": "title:d-rdma-bringing-zero-copy-rdma-to-database-systems",
@@ -141460,12 +141360,13 @@
         ],
         "doi": "",
         "identifier_audit": {
-          "arxiv_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "arxiv_status": "needs_identifier_review",
-          "doi_review": "no_doi_or_arxiv_identifier_in_journal_citation",
-          "doi_status": "needs_identifier_review",
-          "needs_identifier_review": true,
-          "review_status": "generated_identifier_audit",
+          "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+          "arxiv_status": "reviewed_absent",
+          "doi_review": "reviewed_official_usenix_record_has_no_doi",
+          "doi_status": "reviewed_absent",
+          "needs_identifier_review": false,
+          "review_source": "https://www.usenix.org/conference/nsdi24/presentation/zhou-yang",
+          "review_status": "reviewed_identifier_repair",
           "title": "DINT: Fast In-Kernel Distributed Transactions with eBPF."
         },
         "identity_key": "title:dint-fast-in-kernel-distributed-transactions-with-ebpf",
@@ -222340,31 +222241,31 @@
     "paper_duplicate_groups": 32,
     "paper_entries": 602,
     "paper_identifier_audit_counts": {
-      "arxiv_needs_identifier_review": 105,
-      "arxiv_present": 122,
-      "arxiv_reviewed_absent": 22,
-      "arxiv_secondary_missing": 353,
-      "doi_needs_identifier_review": 105,
+      "arxiv_needs_identifier_review": 93,
+      "arxiv_present": 123,
+      "arxiv_reviewed_absent": 29,
+      "arxiv_secondary_missing": 357,
+      "doi_needs_identifier_review": 93,
       "doi_not_expected_yet": 54,
-      "doi_present": 401,
-      "doi_reviewed_absent": 26,
+      "doi_present": 405,
+      "doi_reviewed_absent": 34,
       "doi_secondary_missing": 16
     },
     "paper_identity_counts": {
-      "paper_entries_with_arxiv": 122,
-      "paper_entries_with_doi": 401,
+      "paper_entries_with_arxiv": 123,
+      "paper_entries_with_doi": 405,
       "paper_entries_with_identity": 602,
       "paper_entries_with_url": 602,
       "paper_entries_with_venue": 602
     },
     "paper_identity_missing_counts": {
-      "missing_arxiv": 480,
-      "missing_doi": 201
+      "missing_arxiv": 479,
+      "missing_doi": 197
     },
     "paper_identity_missing_field_sets": {
-      "arxiv": 353,
-      "doi": 74,
-      "doi,arxiv": 127,
+      "arxiv": 357,
+      "doi": 75,
+      "doi,arxiv": 122,
       "none": 48
     },
     "paper_records": 563,

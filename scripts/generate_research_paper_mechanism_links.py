@@ -252,6 +252,82 @@ IDENTIFIER_REVIEW_OVERRIDES: dict[str, dict[str, str]] = {
         "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
         "review_source": "https://www.usenix.org/conference/nsdi23/presentation/arslan",
     },
+    "2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/osdi20/presentation/berg",
+    },
+    "2026-06-04-calvinfs-makes-namespace-metadata-a-deterministic-transaction-workload": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/fast15/technical-sessions/presentation/thomson",
+    },
+    "2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges": {
+        "doi": "10.14778/3397230.3397238",
+        "doi_review": "repaired_from_pvldb_record",
+        "review_source": "https://doi.org/10.14778/3397230.3397238",
+    },
+    "2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice": {
+        "doi": "10.1145/3596225.3596230",
+        "doi_review": "repaired_from_acm_record",
+        "review_source": "https://doi.org/10.1145/3596225.3596230",
+    },
+    "2026-06-04-d-rdma-makes-fragmented-database-transfer-a-nic-scheduling-problem": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "review_source": "https://vldb.org/cidrdb/2022/d-rdma-bringing-zero-copy-rdma-to-database-systems.html",
+    },
+    "2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks": {
+        "doi": "10.1145/2882903.2882925",
+        "doi_review": "repaired_from_acm_record",
+        "review_source": "https://doi.org/10.1145/2882903.2882925",
+    },
+    "2026-06-04-database-kernels-turn-cxl-storage-into-typed-database-services": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "review_source": "https://vldb.org/cidrdb/2024/database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl.html",
+    },
+    "2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_cidr_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_cidr_record_has_no_arxiv",
+        "review_source": "https://www.vldb.org/cidrdb/2021/everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-maintenance-in-database-management.html",
+    },
+    "2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them": {
+        "doi": "10.1145/3589293",
+        "doi_review": "repaired_from_acm_record",
+        "review_source": "https://doi.org/10.1145/3589293",
+    },
+    "2026-06-04-dint-keeps-frequent-transaction-steps-inside-the-kernel-datapath": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/nsdi24/presentation/zhou-yang",
+    },
+    "2026-06-04-eiffel-software-packet-scheduling-for-request-admission": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv": "1810.03060",
+        "arxiv_review": "repaired_from_arxiv_record",
+        "review_source": "https://arxiv.org/abs/1810.03060",
+    },
+    "2026-06-04-epic-deterministic-mvcc-removes-version-search-from-gpu-oltp-batches": {
+        "doi_status": "reviewed_absent",
+        "doi_review": "reviewed_official_usenix_record_has_no_doi",
+        "arxiv_status": "reviewed_absent",
+        "arxiv_review": "reviewed_official_usenix_record_has_no_arxiv",
+        "review_source": "https://www.usenix.org/conference/osdi24/presentation/qian",
+    },
 }
 
 METADATA_SNIPPET_PREFIXES = (

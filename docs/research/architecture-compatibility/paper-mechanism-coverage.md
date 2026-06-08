@@ -33,47 +33,35 @@ python3 scripts/generate_research_paper_mechanism_links.py
 - duplicate identity groups: 32
 
 Generated identity field counts:
-- paper_entries_with_arxiv: 122
-- paper_entries_with_doi: 401
+- paper_entries_with_arxiv: 123
+- paper_entries_with_doi: 405
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
-- missing_arxiv: 480
-- missing_doi: 201
+- missing_arxiv: 479
+- missing_doi: 197
 
 Generated identity missing-field sets:
-- arxiv: 353
-- doi: 74
-- doi,arxiv: 127
+- arxiv: 357
+- doi: 75
+- doi,arxiv: 122
 - none: 48
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 105
-- arxiv_present: 122
-- arxiv_reviewed_absent: 22
-- arxiv_secondary_missing: 353
-- doi_needs_identifier_review: 105
+- arxiv_needs_identifier_review: 93
+- arxiv_present: 123
+- arxiv_reviewed_absent: 29
+- arxiv_secondary_missing: 357
+- doi_needs_identifier_review: 93
 - doi_not_expected_yet: 54
-- doi_present: 401
-- doi_reviewed_absent: 26
+- doi_present: 405
+- doi_reviewed_absent: 34
 - doi_secondary_missing: 16
-- actionable_identifier_review: 105
+- actionable_identifier_review: 93
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract` -> `paper-2020-the-cachelib-caching-engine-design-and-experiences-at-scale`: doi=needs_identifier_review, arxiv=needs_identifier_review: The CacheLib Caching Engine: Design and Experiences at Scale.
-- `2026-06-04-calvinfs-makes-namespace-metadata-a-deterministic-transaction-workload` -> `paper-2015-calvinfs-consistent-wan-replication-and-scalable-metadata-management-for-distributed-file-system`: doi=needs_identifier_review, arxiv=needs_identifier_review: CalvinFS: Consistent WAN Replication and Scalable Metadata Management for Distributed File Systems.
-- `2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges` -> `paper-2020-query-performance-prediction-for-concurrent-queries-using-graph-embedding`: doi=needs_identifier_review, arxiv=needs_identifier_review: Query Performance Prediction for Concurrent Queries using Graph Embedding.
-- `2026-06-04-cooperative-memory-management-turns-cache-pressure-into-an-admission-choice` -> `paper-2023-cooperative-memory-management-for-table-and-temporary-data`: doi=needs_identifier_review, arxiv=needs_identifier_review: Cooperative Memory Management for Table and Temporary Data.
-- `2026-06-04-d-rdma-makes-fragmented-database-transfer-a-nic-scheduling-problem` -> `paper-2022-d-rdma-bringing-zero-copy-rdma-to-database-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: D-RDMA: Bringing Zero-Copy RDMA to Database Systems.
-- `2026-06-04-data-blocks-for-byte-addressable-compressed-htap-cold-chunks` -> `paper-2016-data-blocks-hybrid-oltp-and-olap-on-compressed-storage-using-both-vectorization-and-compilation`: doi=needs_identifier_review, arxiv=needs_identifier_review: Data Blocks: Hybrid OLTP and OLAP on Compressed Storage using both Vectorization and Compilation.
-- `2026-06-04-database-kernels-turn-cxl-storage-into-typed-database-services` -> `paper-2024-database-kernels-seamless-integration-of-database-systems-and-fast-storage-via-cxl`: doi=needs_identifier_review, arxiv=needs_identifier_review: Database Kernels: Seamless Integration of Database Systems and Fast Storage via CXL.
-- `2026-06-04-deferred-actions-as-mvcc-safe-maintenance-scheduling` -> `paper-2021-everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-mai`: doi=needs_identifier_review, arxiv=needs_identifier_review: Everything is a Transaction: Unifying Logical Concurrency Control and Physical Data Structure Maintenance in Database Management Systems.
-- `2026-06-04-detock-resolves-ordering-cycles-instead-of-aborting-them` -> `paper-2023-detock-high-performance-multi-region-transactions-at-scale`: doi=needs_identifier_review, arxiv=needs_identifier_review: Detock: High Performance Multi-region Transactions at Scale.
-- `2026-06-04-dint-keeps-frequent-transaction-steps-inside-the-kernel-datapath` -> `paper-2024-dint-fast-in-kernel-distributed-transactions-with-ebpf`: doi=needs_identifier_review, arxiv=needs_identifier_review: DINT: Fast In-Kernel Distributed Transactions with eBPF.
-- `2026-06-04-eiffel-software-packet-scheduling-for-request-admission` -> `paper-2019-eiffel-efficient-and-flexible-software-packet-scheduling`: doi=needs_identifier_review, arxiv=needs_identifier_review: Eiffel: Efficient and Flexible Software Packet Scheduling.
-- `2026-06-04-epic-deterministic-mvcc-removes-version-search-from-gpu-oltp-batches` -> `paper-2024-massively-parallel-multi-versioned-transaction-processing`: doi=needs_identifier_review, arxiv=needs_identifier_review: Massively Parallel Multi-Versioned Transaction Processing.
 - `2026-06-04-gpu-b-trees-need-warp-shaped-nodes-and-restart-on-contention-updates` -> `paper-2019-engineering-a-high-performance-gpu-b-tree`: doi=needs_identifier_review, arxiv=needs_identifier_review: Engineering a High-Performance GPU B-Tree.
 - `2026-06-04-gpu-learned-indexes-need-batch-shaped-residency-contracts` -> `paper-2024-g-learned-index-enabling-efficient-learned-index-on-gpu`: doi=needs_identifier_review, arxiv=needs_identifier_review: G-Learned Index: Enabling Efficient Learned Index on GPU.
 - `2026-06-04-gpu-query-concurrency-as-a-resource-fitting-problem` -> `paper-2019-concurrent-query-processing-in-a-gpu-based-database-system`: doi=needs_identifier_review, arxiv=needs_identifier_review: Concurrent query processing in a GPU-based database system.
@@ -102,7 +90,19 @@ Actionable DOI/arXiv identifier audit:
 - `2026-06-04-semantic-repair-beats-full-occ-restart-when-conflict-scope-is-small` -> `paper-2016-transaction-healing-scaling-optimistic-concurrency-control-on-multicores`: doi=needs_identifier_review, arxiv=needs_identifier_review: Transaction Healing: Scaling Optimistic Concurrency Control on Multicores.
 - `2026-06-04-shared-cache-oltp-reframes-hot-data-as-coherent-acceleration-state` -> `paper-2023-is-scalable-oltp-in-the-cloud-a-solved-problem-analyzing-data-access-for-distributed-oltp-archit`: doi=needs_identifier_review, arxiv=needs_identifier_review: Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures.
 - `2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators` -> `paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores`: doi=needs_identifier_review, arxiv=needs_identifier_review: A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores.
-- ... 65 more
+- `2026-06-04-snapshot-reconstruction-as-an-optimizable-route` -> `paper-2021-towards-generic-fine-grained-transaction-isolation-in-polystores`: doi=needs_identifier_review, arxiv=needs_identifier_review: Towards Generic Fine-Grained Transaction Isolation in Polystores.
+- `2026-06-04-stage-makes-route-prediction-a-latency-budgeted-hierarchy-not-one-model` -> `paper-2024-stage-query-execution-time-prediction-in-amazon-redshift`: doi=needs_identifier_review, arxiv=needs_identifier_review: Stage: Query Execution Time Prediction in Amazon Redshift.
+- `2026-06-04-tectonic-turns-cold-tier-efficiency-into-explicit-traffic-classes-and-sealed-metadata` -> `paper-2021-facebook-s-tectonic-filesystem-efficiency-from-exascale`: doi=needs_identifier_review, arxiv=needs_identifier_review: Facebook's Tectonic Filesystem: Efficiency from Exascale.
+- `2026-06-04-write-behind-logging-makes-durability-a-visibility-gap-contract` -> `paper-2016-write-behind-logging`: doi=needs_identifier_review, arxiv=needs_identifier_review: Write-Behind Logging.
+- `2026-06-04-x-ssd-moves-wal-propagation-into-the-storage-device` -> `paper-2022-x-ssd-a-storage-system-with-native-support-for-database-logging-and-replication`: doi=needs_identifier_review, arxiv=needs_identifier_review: X-SSD: A Storage System with Native Support for Database Logging and Replication.
+- `2026-06-05-backpressure-flow-control-makes-admission-local-selective-and-bounded` -> `paper-2022-backpressure-flow-control`: doi=needs_identifier_review, arxiv=needs_identifier_review: Backpressure Flow Control.
+- `2026-06-05-barrierfs-separates-storage-order-from-durability-waits` -> `paper-2018-barrier-enabled-io-stack-for-flash-storage`: doi=needs_identifier_review, arxiv=needs_identifier_review: Barrier-Enabled IO Stack for Flash Storage.
+- `2026-06-05-blk-switch-treats-storage-io-as-switch-scheduled-work` -> `paper-2021-rearchitecting-linux-storage-stack-for-microsecond-latency-and-high-throughput`: doi=needs_identifier_review, arxiv=needs_identifier_review: Rearchitecting Linux Storage Stack for microsecond Latency and High Throughput.
+- `2026-06-05-chablis-decouples-global-snapshot-epochs-from-local-transaction-latency` -> `paper-2024-chablis-fast-and-general-transactions-in-geo-distributed-systems`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chablis: Fast and General Transactions in Geo-Distributed Systems.
+- `2026-06-05-chardonnay-turns-cold-data-reads-into-pre-lock-admission-work` -> `paper-2023-chardonnay-fast-and-general-datacenter-transactions-for-on-disk-databases`: doi=needs_identifier_review, arxiv=needs_identifier_review: Chardonnay: Fast and General Datacenter Transactions for On-Disk Databases.
+- `2026-06-05-cpu-fallback-scans-need-route-specific-code-shapes` -> `paper-2017-hardware-sensitive-scan-operator-variants-for-compiled-selection-pipelines`: doi=needs_identifier_review, arxiv=needs_identifier_review: Hardware-Sensitive Scan Operator Variants for Compiled Selection Pipelines.
+- `2026-06-05-deuteronomy-turns-the-recovery-log-into-a-version-cache-and-delivery-queue` -> `paper-2015-high-performance-transactions-in-deuteronomy`: doi=needs_identifier_review, arxiv=needs_identifier_review: High Performance Transactions in Deuteronomy.
+- ... 53 more
 
 Missing identity metadata audit:
 - `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus` missing arxiv: Concurrent Analytical Query Processing with GPUs.
