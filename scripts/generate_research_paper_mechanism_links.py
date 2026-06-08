@@ -2464,6 +2464,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "The SimpleDB prototype omits modern contention, GPU execution, CUDA ownership, NVMe tiering, and pgwire scale.",
     },
+    (
+        "2026-06-02-scalable-and-robust-snapshot-isolation-for-high-performance-storage-engines",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The entry directly warns that retained snapshots are not enough if old snapshot state stays on the mutation owner's hot path.",
+    },
+    (
+        "2026-06-02-datacenter-rpcs-can-be-general-and-fast",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Packet receive queues and CPU-managed connection state are presented as an alternative flow-control shape to RDMA-write polling.",
+    },
+    (
+        "2026-06-02-concurrent-analytical-query-processing-with-gpus",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "MultiQx-GPU is framed as concurrent compatible query scheduling instead of dedicating one GPU to one query.",
+    },
+    (
+        "2026-06-02-data-path-fusion-in-gpu-for-analytical-query-processing",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The evaluate cue is part of visibility evaluation inside a fused route descriptor, so the link remains supporting evidence.",
+    },
+    (
+        "2026-06-02-data-path-fusion-in-gpu-for-analytical-query-processing",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The future text route explicitly requires testing an FSST/RID-index page layout against the current resident representation.",
+    },
+    (
+        "2026-06-02-data-path-fusion-in-gpu-for-analytical-query-processing",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The evaluate cue is part of generated kernel work; the stable route family and descriptor still support route-root publication.",
+    },
+    (
+        "2026-06-02-scaling-gpu-accelerated-databases-beyond-gpu-memory-size",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The evaluate cue names CPU predicate evaluation, while the evidence supports choosing CPU/GPU split routes by cost.",
+    },
+    (
+        "2026-06-02-first-modern-batch-synthesis",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained reads are attractive only when admitted work shares a compatible snapshot, route shape, and visibility boundary.",
+    },
+    (
+        "2026-06-02-first-modern-batch-synthesis",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Micro-batching is supported only when every request in the batch shares compatible snapshot, route, and visibility boundaries.",
+    },
+    (
+        "2026-06-02-first-modern-batch-synthesis",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route optimization is useful only when demand and dependency metadata are explicit before admission.",
+    },
+    (
+        "2026-06-02-virtual-memory-assisted-buffer-management",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The paper targets CPU B+tree storage engines and cautions against direct transfer to GPU-resident WAL/MVCC execution.",
+    },
+    (
+        "2026-06-02-virtual-memory-assisted-buffer-management",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Versioned eviction validation is presented as an alternative to hazard-pointer or epoch-style reclamation.",
+    },
+    (
+        "2026-06-02-robust-plan-evaluation-based-on-approximate-probabilistic-machine-learning",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The evidence identifies estimation risk from learned cost-model limitations, cautioning against unbounded learned advice.",
+    },
+    (
+        "2026-06-02-robust-plan-evaluation-based-on-approximate-probabilistic-machine-learning",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Risk pruning and estimation uncertainty warn that ordinary route selection must account for model confidence.",
+    },
+    (
+        "2026-06-02-robust-plan-evaluation-based-on-approximate-probabilistic-machine-learning",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The independence and normality assumptions may misestimate GPU queue and transfer contention for hot-write routes.",
+    },
+    (
+        "2026-06-02-robust-plan-evaluation-based-on-approximate-probabilistic-machine-learning",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Roq is evaluated for query optimization rather than a GPU-aware transactional engine with WAL, MVCC, residency, and admission.",
+    },
+    (
+        "2026-06-02-read-safe-snapshots-for-abort-wait-free-serializable-reads",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained snapshot reclamation is valid only if long reads do not force owner-queue waits or unlabeled stale reads.",
+    },
+    (
+        "2026-06-02-second-modern-batch-synthesis",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns against binary GPU-if-resident placement without route risk, freshness, and fallback telemetry.",
+    },
+    (
+        "2026-06-02-second-modern-batch-synthesis",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns that snapshot and route state need explicit telemetry before retained metadata is trusted.",
+    },
+    (
+        "2026-06-02-second-modern-batch-synthesis",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Freshness routing must avoid binary acceleration and account for uncertainty, fault state, and serializability class.",
+    },
+    (
+        "2026-06-02-second-modern-batch-synthesis",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The evidence supports observable immutable read handles with explicit tier, snapshot, generation, and invalidation state.",
+    },
+    (
+        "2026-06-02-second-modern-batch-synthesis",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The synthesis warns retained GPU reads must be chosen by freshness, tail risk, and overload state rather than residency alone.",
+    },
+    (
+        "2026-06-02-virtual-memory-assisted-buffer-management-in-tiered-memory",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier planning needs proof that readers see only valid generations while maintenance moves other segments.",
+    },
+    (
+        "2026-06-02-virtual-memory-assisted-buffer-management-in-tiered-memory",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Stable handles need a proof gate for valid-generation reads during concurrent tier maintenance.",
+    },
+    (
+        "2026-06-02-virtual-memory-assisted-buffer-management-in-tiered-memory",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "contradicts",
+        "relation_review_note": "The single-copy invariant conflicts with cache-as-acceleration correctness ownership unless limited to logical placement handles.",
+    },
+    (
+        "2026-06-02-parqo-penalty-aware-robust-plan-selection",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Penalty-aware route choices require benchmarks for skewed predicates, residency misses, saturated GPU queues, and fallback.",
+    },
+    (
+        "2026-06-02-parqo-penalty-aware-robust-plan-selection",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback adoption is gated on tests where transfer and launch overhead beat a nominally resident GPU route.",
+    },
+    (
+        "2026-06-02-parqo-penalty-aware-robust-plan-selection",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The KL-divergence test is a route-reuse mechanism, so this false-positive test cue remains supporting placement evidence.",
+    },
+    (
+        "2026-06-02-parqo-penalty-aware-robust-plan-selection",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained GPU route use is gated on measuring when queue pressure, refresh, or bad estimates make fallback better.",
+    },
+    (
+        "2026-06-02-third-modern-batch-synthesis",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis requires a route-decision record and CPU-vs-retained-GPU policy comparison before adoption.",
+    },
 }
 
 
