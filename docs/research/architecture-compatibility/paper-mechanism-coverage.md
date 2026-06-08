@@ -34,46 +34,34 @@ python3 scripts/generate_research_paper_mechanism_links.py
 
 Generated identity field counts:
 - paper_entries_with_arxiv: 122
-- paper_entries_with_doi: 398
+- paper_entries_with_doi: 401
 - paper_entries_with_identity: 602
 - paper_entries_with_url: 602
 - paper_entries_with_venue: 602
 
 Generated identity missing-field counts:
 - missing_arxiv: 480
-- missing_doi: 204
+- missing_doi: 201
 
 Generated identity missing-field sets:
-- arxiv: 350
+- arxiv: 353
 - doi: 74
-- doi,arxiv: 130
+- doi,arxiv: 127
 - none: 48
 
 Generated DOI/arXiv identifier audit:
-- arxiv_needs_identifier_review: 117
+- arxiv_needs_identifier_review: 105
 - arxiv_present: 122
-- arxiv_reviewed_absent: 13
-- arxiv_secondary_missing: 350
-- doi_needs_identifier_review: 117
+- arxiv_reviewed_absent: 22
+- arxiv_secondary_missing: 353
+- doi_needs_identifier_review: 105
 - doi_not_expected_yet: 54
-- doi_present: 398
-- doi_reviewed_absent: 17
+- doi_present: 401
+- doi_reviewed_absent: 26
 - doi_secondary_missing: 16
-- actionable_identifier_review: 117
+- actionable_identifier_review: 105
 
 Actionable DOI/arXiv identifier audit:
-- `2026-06-03-pwv-early-write-visibility` -> `paper-2017-high-performance-transactions-via-early-write-visibility`: doi=needs_identifier_review, arxiv=needs_identifier_review: High Performance Transactions via Early Write Visibility.
-- `2026-06-03-r2p2-request-response-pairs-for-rpc-admission` -> `paper-2019-r2p2-making-rpcs-first-class-datacenter-citizens`: doi=needs_identifier_review, arxiv=needs_identifier_review: R2P2: Making RPCs First-Class Datacenter Citizens.
-- `2026-06-03-resource-adaptive-query-execution-with-paged-memory-management` -> `paper-2025-resource-adaptive-query-execution-with-paged-memory-management`: doi=needs_identifier_review, arxiv=needs_identifier_review: Resource-Adaptive Query Execution with Paged Memory Management.
-- `2026-06-03-ringleader-offloads-intra-server-orchestration-to-nics` -> `paper-2023-ringleader-efficiently-offloading-intra-server-orchestration-to-nics`: doi=needs_identifier_review, arxiv=needs_identifier_review: RingLeader: Efficiently Offloading Intra-Server Orchestration to NICs.
-- `2026-06-03-shenango-high-efficiency-latency-sensitive-runtime` -> `paper-2019-shenango-achieving-high-cpu-efficiency-for-latency-sensitive-datacenter-workloads`: doi=needs_identifier_review, arxiv=needs_identifier_review: Shenango: Achieving High CPU Efficiency for Latency-sensitive Datacenter Workloads.
-- `2026-06-03-shinjuku-microsecond-scale-preemptive-scheduling` -> `paper-2019-shinjuku-preemptive-scheduling-for-microsecond-scale-tail-latency`: doi=needs_identifier_review, arxiv=needs_identifier_review: Shinjuku: Preemptive Scheduling for microsecond-scale Tail Latency.
-- `2026-06-03-smf-schedule-first-transaction-ordering` -> `paper-2024-towards-optimal-transaction-scheduling`: doi=needs_identifier_review, arxiv=needs_identifier_review: Towards Optimal Transaction Scheduling.
-- `2026-06-03-sp-pifo-strict-priority-approximation-of-programmable-scheduling` -> `paper-2020-sp-pifo-approximating-push-in-first-out-behaviors-using-strict-priority-queues`: doi=needs_identifier_review, arxiv=needs_identifier_review: SP-PIFO: Approximating Push-In First-Out Behaviors using Strict-Priority Queues.
-- `2026-06-03-umbra-variable-size-pages-for-ssd-backed-hot-working-sets` -> `paper-2020-umbra-a-disk-based-system-with-in-memory-performance`: doi=needs_identifier_review, arxiv=needs_identifier_review: Umbra: A Disk-Based System with In-Memory Performance.
-- `2026-06-03-vessel-fast-userspace-core-scheduling` -> `paper-2024-fast-core-scheduling-with-userspace-process-abstraction`: doi=needs_identifier_review, arxiv=needs_identifier_review: Fast Core Scheduling with Userspace Process Abstraction.
-- `2026-06-04-acc-chooses-concurrency-control-per-cluster-instead-of-globally` -> `paper-2017-adaptive-concurrency-control-despite-the-looking-glass-one-concurrency-control-does-not-fit-all`: doi=needs_identifier_review, arxiv=needs_identifier_review: Adaptive Concurrency Control: Despite the Looking Glass, One Concurrency Control Does Not Fit All.
-- `2026-06-04-bolt-makes-admission-feedback-arrive-before-the-queue-is-already-stale` -> `paper-2023-bolt-sub-rtt-congestion-control-for-ultra-low-latency`: doi=needs_identifier_review, arxiv=needs_identifier_review: Bolt: Sub-RTT Congestion Control for Ultra-Low Latency.
 - `2026-06-04-cachelib-makes-cache-policy-a-typed-storage-contract` -> `paper-2020-the-cachelib-caching-engine-design-and-experiences-at-scale`: doi=needs_identifier_review, arxiv=needs_identifier_review: The CacheLib Caching Engine: Design and Experiences at Scale.
 - `2026-06-04-calvinfs-makes-namespace-metadata-a-deterministic-transaction-workload` -> `paper-2015-calvinfs-consistent-wan-replication-and-scalable-metadata-management-for-distributed-file-system`: doi=needs_identifier_review, arxiv=needs_identifier_review: CalvinFS: Consistent WAN Replication and Scalable Metadata Management for Distributed File Systems.
 - `2026-06-04-concurrent-query-prediction-needs-explicit-interference-edges` -> `paper-2020-query-performance-prediction-for-concurrent-queries-using-graph-embedding`: doi=needs_identifier_review, arxiv=needs_identifier_review: Query Performance Prediction for Concurrent Queries using Graph Embedding.
@@ -102,7 +90,19 @@ Actionable DOI/arXiv identifier audit:
 - `2026-06-04-mixed-isolation-can-be-a-route-contract-not-just-a-session-default` -> `paper-2023-allocating-isolation-levels-to-transactions-in-a-multiversion-setting`: doi=needs_identifier_review, arxiv=needs_identifier_review: Allocating Isolation Levels to Transactions in a Multiversion Setting.
 - `2026-06-04-modern-nvme-makes-cold-tier-i-o-a-hot-path-scheduling-problem` -> `paper-2023-what-modern-nvme-storage-can-do-and-how-to-exploit-it-high-performance-i-o-for-high-performance-`: doi=needs_identifier_review, arxiv=needs_identifier_review: What Modern NVMe Storage Can Do, And How To Exploit It: High-Performance I/O for High-Performance Storage Engines.
 - `2026-06-04-moneyball-keeps-serverless-databases-warm-only-when-history-pays-for-it` -> `paper-2022-moneyball-proactive-auto-scaling-in-microsoft-azure-sql-database-serverless`: doi=needs_identifier_review, arxiv=needs_identifier_review: Moneyball: Proactive Auto-Scaling in Microsoft Azure SQL Database Serverless.
-- ... 77 more
+- `2026-06-04-namespace-metadata-is-a-route-cache-design-problem` -> `paper-2015-shardfs-vs-indexfs-replication-vs-caching-strategies-for-distributed-metadata-management-in-clou`: doi=needs_identifier_review, arxiv=needs_identifier_review: ShardFS vs. IndexFS: Replication vs. Caching Strategies for Distributed Metadata Management in Cloud Storage Systems.
+- `2026-06-04-numa-placement-should-follow-measured-route-pressure-not-static-partitioning` -> `paper-2016-adaptive-numa-aware-data-placement-and-task-scheduling-for-analytical-workloads-in-main-memory-c`: doi=needs_identifier_review, arxiv=needs_identifier_review: Adaptive NUMA-aware data placement and task scheduling for analytical workloads in main-memory column-stores.
+- `2026-06-04-pgm-gives-learned-indexes-a-bounded-route-certificate` -> `paper-2020-the-pgm-index-a-fully-dynamic-compressed-learned-index-with-provable-worst-case-bounds`: doi=needs_identifier_review, arxiv=needs_identifier_review: The PGM-index: a fully-dynamic compressed learned index with provable worst-case bounds.
+- `2026-06-04-production-workload-management-needs-cheap-predictions-plus-hard-guardrails` -> `paper-2023-auto-wlm-machine-learning-enhanced-workload-management-in-amazon-redshift`: doi=needs_identifier_review, arxiv=needs_identifier_review: Auto-WLM: Machine Learning Enhanced Workload Management in Amazon Redshift.
+- `2026-06-04-r2p2-request-response-pairs-as-schedulable-runtime-units` -> `paper-2019-r2p2-making-rpcs-first-class-datacenter-citizens`: doi=needs_identifier_review, arxiv=needs_identifier_review: R2P2: Making RPCs First-Class Datacenter Citizens.
+- `2026-06-04-rcsi-scale-comes-from-treating-time-and-versions-as-first-class-routing-keys` -> `paper-2024-scalable-oltp-in-the-cloud-what-s-the-big-deal-the-database-and-the-application-have-a-big-deal-`: doi=needs_identifier_review, arxiv=needs_identifier_review: Scalable OLTP in the Cloud: What's the BIG DEAL? The Database AND the Application Have a BIG DEAL: Their Isolation Semantics.
+- `2026-06-04-schedule-first-concurrency-turns-hot-key-contention-into-an-admission-problem` -> `paper-2024-towards-optimal-transaction-scheduling`: doi=needs_identifier_review, arxiv=needs_identifier_review: Towards Optimal Transaction Scheduling.
+- `2026-06-04-seagull-makes-prediction-useful-by-optimizing-the-decision-not-the-whole-curve` -> `paper-2021-seagull-an-infrastructure-for-load-prediction-and-optimized-resource-allocation`: doi=needs_identifier_review, arxiv=needs_identifier_review: Seagull: An Infrastructure for Load Prediction and Optimized Resource Allocation.
+- `2026-06-04-semantic-conflict-removal-beats-protocol-switching-alone` -> `paper-2020-opportunities-for-optimism-in-contended-main-memory-multicore-transactions`: doi=needs_identifier_review, arxiv=needs_identifier_review: Opportunities for Optimism in Contended Main-Memory Multicore Transactions.
+- `2026-06-04-semantic-repair-beats-full-occ-restart-when-conflict-scope-is-small` -> `paper-2016-transaction-healing-scaling-optimistic-concurrency-control-on-multicores`: doi=needs_identifier_review, arxiv=needs_identifier_review: Transaction Healing: Scaling Optimistic Concurrency Control on Multicores.
+- `2026-06-04-shared-cache-oltp-reframes-hot-data-as-coherent-acceleration-state` -> `paper-2023-is-scalable-oltp-in-the-cloud-a-solved-problem-analyzing-data-access-for-distributed-oltp-archit`: doi=needs_identifier_review, arxiv=needs_identifier_review: Is Scalable OLTP in the Cloud a Solved Problem? Analyzing Data Access for Distributed OLTP Architectures.
+- `2026-06-04-silicondb-adapts-morsel-scheduling-to-heterogeneous-accelerators` -> `paper-2019-a-morsel-driven-query-execution-engine-for-heterogeneous-multi-cores`: doi=needs_identifier_review, arxiv=needs_identifier_review: A Morsel-Driven Query Execution Engine for Heterogeneous Multi-Cores.
+- ... 65 more
 
 Missing identity metadata audit:
 - `2026-06-02-concurrent-analytical-query-processing-with-gpus` -> `paper-2014-concurrent-analytical-query-processing-with-gpus` missing arxiv: Concurrent Analytical Query Processing with GPUs.
