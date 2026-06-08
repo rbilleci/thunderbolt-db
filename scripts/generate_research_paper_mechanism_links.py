@@ -12754,6 +12754,11 @@ def citation_year(citation: str, entry_date: str) -> str:
     return entry_date[:4]
 
 
+def paper_identity_missing_fields(identity: dict) -> list[str]:
+    required_fields = ("doi", "arxiv", "url", "venue")
+    return [field for field in required_fields if not identity[field]]
+
+
 def build_paper_identity(entry: dict) -> dict | None:
     if entry["entry_type"] != "paper":
         return None
@@ -12766,7 +12771,7 @@ def build_paper_identity(entry: dict) -> dict | None:
     arxiv = normalize_arxiv(arxiv_match.group("arxiv")) if arxiv_match else ""
     year = citation_year(citation, entry["date"])
     identity_key = f"title:{slugify(title)}"
-    return {
+    identity = {
         "paper_id": f"paper-{year}-{slugify(title)}",
         "identity_key": identity_key,
         "title": title,
@@ -12780,6 +12785,15 @@ def build_paper_identity(entry: dict) -> dict | None:
         "source": "generated_from_journal_citation",
         "review_status": "generated_identity",
     }
+    identity["missing_fields"] = paper_identity_missing_fields(identity)
+    return identity
+
+
+def classify_entry_type(title: str, citation: str) -> str:
+    title_lower = title.lower()
+    if not citation or "synthesis" in title_lower or "cross-paper synthesis" in title_lower:
+        return "synthesis"
+    return "paper"
 
 
 def split_entries(journal: str) -> list[dict]:
@@ -12794,12 +12808,13 @@ def split_entries(journal: str) -> list[dict]:
         category = extract_match(CATEGORY_RE, body)
         tags = split_tags(extract_match(TAGS_RE, body))
         citation = extract_citation(body)
+        entry_type = classify_entry_type(title, citation)
         entries.append(
             {
                 "id": f"{date}-{slugify(title)}",
                 "date": date,
                 "title": title,
-                "entry_type": "synthesis" if "cross-paper synthesis" in title.lower() else "paper",
+                "entry_type": entry_type,
                 "category": category,
                 "relevance_tags": tags,
                 "citation": citation,
@@ -13181,6 +13196,14 @@ def normalize_paper_records(paper_identities: list[dict]) -> tuple[list[dict], l
             "duplicate_of": "",
             "source": canonical["source"],
             "review_status": canonical["review_status"],
+            "missing_fields": paper_identity_missing_fields(
+                {
+                    "doi": with_doi["doi"],
+                    "arxiv": with_arxiv["arxiv"],
+                    "url": with_url["url"],
+                    "venue": with_venue["venue"],
+                }
+            ),
         }
         paper_records.append(record)
         if len(identities) > 1:
@@ -13212,6 +13235,8 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     type_counts: Counter = Counter()
     paper_identity_counts: Counter = Counter()
     paper_identity_missing_counts: Counter = Counter()
+    paper_identity_missing_field_sets: Counter = Counter()
+    paper_identity_missing_audit: list[dict] = []
     paper_identities: list[dict] = []
     unlinked: list[str] = []
 
@@ -13236,6 +13261,19 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
                 paper_identity_counts["paper_entries_with_venue"] += 1
             else:
                 paper_identity_missing_counts["missing_venue"] += 1
+            missing_fields = paper_identity["missing_fields"]
+            missing_key = ",".join(missing_fields) if missing_fields else "none"
+            paper_identity_missing_field_sets[missing_key] += 1
+            if missing_fields:
+                paper_identity_missing_audit.append(
+                    {
+                        "journal_entry_id": entry["id"],
+                        "paper_id": paper_identity["paper_id"],
+                        "title": paper_identity["title"],
+                        "missing_fields": missing_fields,
+                        "citation": paper_identity["citation"] if "citation" in paper_identity else entry.get("citation", ""),
+                    }
+                )
         links = link_entry(entry, mechanism_ids)
         for link in links:
             confidence = link["confidence"]
@@ -13278,7 +13316,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     mechanisms_without_links = sorted(mechanism_ids - set(mechanism_counts))
     paper_records, duplicate_groups = normalize_paper_records(paper_identities)
     return {
-        "schema": "gpu-db-research-paper-mechanism-links-v5",
+        "schema": "gpu-db-research-paper-mechanism-links-v6",
         "description": "Generated traceability from literature journal entries to architecture mechanisms, including generated evidence spans, evidence quality reasons, typed paper-mechanism relations, and normalized paper identity records. Review low-confidence, fallback, and incomplete identity records before making architectural commitments.",
         "source_journal": "docs/research/gpu-db-literature-journal.md",
         "source_mechanisms": "docs/research/architecture-compatibility/mechanisms.json",
@@ -13305,6 +13343,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
             "paper_identity_counts": dict(sorted(paper_identity_counts.items())),
             "paper_identity_missing_counts": dict(sorted(paper_identity_missing_counts.items())),
+            "paper_identity_missing_field_sets": dict(sorted(paper_identity_missing_field_sets.items())),
             "paper_records": len(paper_records),
             "paper_duplicate_groups": len(duplicate_groups),
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
@@ -13324,6 +13363,15 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
         "unlinked_entry_ids": unlinked,
         "paper_records": paper_records,
         "paper_duplicate_groups": duplicate_groups,
+        "paper_identity_missing_audit": sorted(
+            paper_identity_missing_audit,
+            key=lambda item: (
+                "url" not in item["missing_fields"],
+                "venue" not in item["missing_fields"],
+                len(item["missing_fields"]),
+                item["journal_entry_id"],
+            ),
+        ),
         "records": records,
     }
 
@@ -13342,6 +13390,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     review_priority_counts = index["summary"]["review_priority_counts"]
     paper_identity_counts = index["summary"]["paper_identity_counts"]
     paper_identity_missing_counts = index["summary"]["paper_identity_missing_counts"]
+    paper_identity_missing_field_sets = index["summary"]["paper_identity_missing_field_sets"]
     records = index["records"]
     fallback_records = [
         record
@@ -13429,6 +13478,25 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     lines.append("Generated identity missing-field counts:")
     for field, count in sorted(paper_identity_missing_counts.items()):
         lines.append(f"- {field}: {count}")
+    lines.append("")
+    lines.append("Generated identity missing-field sets:")
+    for fields, count in sorted(
+        paper_identity_missing_field_sets.items(),
+        key=lambda item: (item[0] == "none", item[0]),
+    ):
+        lines.append(f"- {fields}: {count}")
+    lines.append("")
+    lines.append("Missing identity metadata audit:")
+    if index["paper_identity_missing_audit"]:
+        for item in index["paper_identity_missing_audit"][:40]:
+            fields = ", ".join(item["missing_fields"])
+            lines.append(
+                f"- `{item['journal_entry_id']}` -> `{item['paper_id']}` missing {fields}: {item['title']}"
+            )
+        if len(index["paper_identity_missing_audit"]) > 40:
+            lines.append(f"- ... {len(index['paper_identity_missing_audit']) - 40} more")
+    else:
+        lines.append("- none")
     lines.append("")
     lines.append("Duplicate identity audit:")
     if index["paper_duplicate_groups"]:
