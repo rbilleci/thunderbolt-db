@@ -9184,6 +9184,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "benchmark_required",
         "relation_review_note": "Selective bitmap-powered scan, aggregation, and join routes need evaluation before general route-cost adoption.",
     },
+    (
+        "2026-06-06-one-loop-does-not-fit-all-makes-execution-shape-selectivity-dependent",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Execution-shape transfer to descriptor reclamation needs evaluation beyond the narrow column-store predicate pipeline.",
+    },
+    (
+        "2026-06-06-one-loop-does-not-fit-all-makes-execution-shape-selectivity-dependent",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The entry explicitly routes tier-placement transfer through HBM, DRAM, CPU-cache, latency, and correctness measurements.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-receiver-credits-and-execution-shape-proo",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Execution shape varying by selectivity and movement warns against fixed dependency witnesses that ignore route shape.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-receiver-credits-and-execution-shape-proo",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Receiver-credit admission is explicitly tied to measuring staged masks and bitmap deltas under output-buffer pressure.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-fast-routes-need-private-formats-receiver-credits-and-execution-shape-proo",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Receiver-clocked explicit-edge queueing is presented as an alternative to hiding overload inside shared owner cores.",
+    },
+    (
+        "2026-06-06-crystal-turns-cache-entries-into-semantic-regions-not-blocks",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Crystal maps to semantic placement regions, but analytical cloud-storage results need GPU and OLTP placement validation.",
+    },
+    (
+        "2026-06-06-crystal-turns-cache-entries-into-semantic-regions-not-blocks",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Semantic route regions are an alternative framing to anonymous page-style retained GPU snapshot residency.",
+    },
+    (
+        "2026-06-06-push-and-pull-are-route-shapes-not-engine-religions",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback must be benchmarked against the same predicate and result shapes as each GPU route.",
+    },
+    (
+        "2026-06-06-push-and-pull-are-route-shapes-not-engine-religions",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The paper omits GPU, MVCC, write-concurrency, sessions, and tiering, so retained snapshots need separate validation.",
+    },
+    (
+        "2026-06-06-push-and-pull-are-route-shapes-not-engine-religions",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Push/pull execution evidence does not cover GPU memory or tiered storage, so placement transfer is a benchmark gate.",
+    },
+    (
+        "2026-06-06-epoch-reclamation-can-double-as-a-range-query-snapshot-source",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Reusable per-owner descriptors are presented as an alternative to fresh descriptor allocation for each publication.",
+    },
+    (
+        "2026-06-06-fptree-persistent-leaves-volatile-routing-and-crash-bounded-index-repair",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Restart rebuilds and publication ordering must be benchmarked before volatile route metadata informs cost choices.",
+    },
+    (
+        "2026-06-06-fptree-persistent-leaves-volatile-routing-and-crash-bounded-index-repair",
+        "stable_handle_indirection",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Persistent-pointer-style route identities require crash-interruption correctness measurements before handle adoption.",
+    },
+    (
+        "2026-06-06-fptree-persistent-leaves-volatile-routing-and-crash-bounded-index-repair",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Data-first and bitmap-or-generation-last publication needs a route-root microbenchmark before adoption.",
+    },
+    (
+        "2026-06-06-vbr-reclaims-route-metadata-by-validating-versions-instead-of-waiting-on-readers",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "VBR-style reclamation is valid only under its CAS, invalidation, retirement, and no-relink assumptions.",
+    },
+    (
+        "2026-06-06-db2-native-cos-keeps-database-pages-by-moving-the-storage-contract-underneath-them",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Moving storage contracts underneath pages is an alternative to treating GPU-memory descriptor state as durable truth.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-proof-now-spans-publication-reclamation-and-storage-placement",
+        "effective_session_counting",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "VBR-style memory-lifetime validation is framed as an alternative to letting stalled sessions pin metadata forever.",
+    },
+    (
+        "2026-06-06-pangu-makes-rdma-a-fast-path-with-tcp-as-the-safety-valve",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fast zero-copy/offload contracts are useful only with monitored failover paths that degrade instead of freezing storage.",
+    },
+    (
+        "2026-06-06-bvlsm-moves-value-separation-into-wal-admission",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Compact durable value records are an alternative to forcing payload, visibility, route metadata, and compaction through one root.",
+    },
+    (
+        "2026-06-06-bvlsm-moves-value-separation-into-wal-admission",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Payload-write dispatch must be measured against a single mutation owner before changing owner-bundling policy.",
+    },
+    (
+        "2026-06-06-bvlsm-moves-value-separation-into-wal-admission",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Compact durable records are an alternative to reclaiming bulky payload and route metadata through one owner queue.",
+    },
+    (
+        "2026-06-06-bvlsm-moves-value-separation-into-wal-admission",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Value-separation admission is an alternative data-shaping contract to routing all cost-relevant state through one owner queue.",
+    },
+    (
+        "2026-06-06-dex-keeps-remote-range-indexes-scalable-with-logical-ownership",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Bucketed logical ownership and coalesced refreshes are alternatives to centralized metadata-cache owner queues.",
+    },
+    (
+        "2026-06-06-gpu-accelerated-oltp-shows-concurrency-control-is-a-route-shape",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "GPU batch ordering should enter owner routing only when admission proves same-domain conflict density pays for the path.",
+    },
+    (
+        "2026-06-06-gpu-accelerated-oltp-shows-concurrency-control-is-a-route-shape",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "The retained-route evidence assumes preloaded fixed-size tables, no inserts or deletes, and known read/write sets.",
+    },
+    (
+        "2026-06-06-gpu-accelerated-oltp-shows-concurrency-control-is-a-route-shape",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU OLTP assumptions do not cover interactive SQL, DDL, MVCC chains, WAL replay, recovery, or arbitrary predicates.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-proof-now-includes-admission-shape",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hybrid CPU/OCC and GPU conflict ordering requires measurements plus explicit accepted and rejected route facts.",
+    },
+    (
+        "2026-06-06-cross-paper-synthesis-route-proof-now-includes-admission-shape",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The bounded retained-route runtime directly supports retained snapshots; the instead-of cue names stampede avoidance.",
+    },
+    (
+        "2026-06-06-oneshotgc-makes-mvcc-cleanup-a-partition-publication-problem",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "OneShotGC's in-memory CPU prototype cautions against inferring GPU WAL, recovery, and device-residency behavior.",
+    },
+    (
+        "2026-06-06-publish-on-ping-makes-reclamation-demand-driven-instead-of-read-path-pessimistic",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "POP-style reclamation needs database descriptor benchmarks beyond the public safe-memory-reclamation suites.",
+    },
 }
 
 
