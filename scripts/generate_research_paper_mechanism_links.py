@@ -8554,6 +8554,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "warns_against",
         "relation_review_note": "Epoxy provides snapshot isolation, so it cautions against treating its metadata contract as serializable trace evidence.",
     },
+    (
+        "2026-06-05-conflict-history-can-route-hot-transactions-before-validation",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained snapshots need mixed read/write invalidation tests before conflict-history routing can be adopted.",
+    },
+    (
+        "2026-06-05-rcbench-makes-remote-concurrency-control-cost-a-primitive-budget",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "RCBench omits WAL durability and crash recovery, warning against direct WAL-before-visibility transfer.",
+    },
+    (
+        "2026-06-05-cpu-fallback-scans-need-route-specific-code-shapes",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "GPU routing is valid only when calibrated CPU fallback is compared under the same visibility boundary.",
+    },
+    (
+        "2026-06-05-cpu-fallback-scans-need-route-specific-code-shapes",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The condition cue describes scan predicate code shape, while the retained link remains only weak support for deterministic templates.",
+    },
+    (
+        "2026-06-05-cpu-fallback-scans-need-route-specific-code-shapes",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The evidence warns that same-shape batches are insufficient without CPU/GPU fallback code-shape awareness.",
+    },
+    (
+        "2026-06-05-hemem-makes-tier-policy-asynchronous-and-application-visible",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The test cue is from fastest-memory wording; the snippet directly supports tier placement policy.",
+    },
+    (
+        "2026-06-05-taurus-separates-durable-log-truth-from-eventually-current-page-service",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Taurus treats pages and snapshots as repairable service tiers rather than correctness-owning placement state.",
+    },
+    (
+        "2026-06-05-horseqc-makes-gpu-transfer-routes-prove-pipeline-density",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU-favorable routes must beat CPU fallback after transfer and launch costs are included.",
+    },
+    (
+        "2026-06-05-horseqc-makes-gpu-transfer-routes-prove-pipeline-density",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner bundling is safe only if hot GPU groups do not starve short retained lookups sharing the worker.",
+    },
+    (
+        "2026-06-05-horseqc-makes-gpu-transfer-routes-prove-pipeline-density",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Older GPU and PCIe-era measurements require recalibration for NVLink, large HBM, and future CXL tiers.",
+    },
+    (
+        "2026-06-05-f1-lightning-turns-htap-into-a-freshness-windowed-service",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "F1 Lightning frames HTAP as a freshness-windowed side service rather than a replacement transactional engine.",
+    },
+    (
+        "2026-06-05-f1-lightning-turns-htap-into-a-freshness-windowed-service",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained routes need timestamp-window, refresh-byte, stale-window, and fallback benchmarks before adoption.",
+    },
+    (
+        "2026-06-05-f1-lightning-turns-htap-into-a-freshness-windowed-service",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Merged CPU/GPU reads are valid only when the snapshot frontier proves timestamp and correctness boundaries.",
+    },
+    (
+        "2026-06-05-f1-lightning-turns-htap-into-a-freshness-windowed-service",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Immutable route roots need retained-route timestamp-window and column-generation refresh benchmarks.",
+    },
+    (
+        "2026-06-05-snapper-mixes-deterministic-batches-with-dynamic-transactions",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Actor-library latency results do not cover GPU kernels, WAL fsync, NVMe, or pgwire behavior.",
+    },
+    (
+        "2026-06-05-snapper-mixes-deterministic-batches-with-dynamic-transactions",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Local partition frontier chains are presented as an alternative to forcing every global generation into the hot path.",
+    },
+    (
+        "2026-06-05-snapper-mixes-deterministic-batches-with-dynamic-transactions",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Single-server actor results leave distributed placement, coordinator locality, and hierarchical ordering as future evaluation work.",
+    },
+    (
+        "2026-06-05-tidb-turns-consensus-replication-into-an-htap-freshness-path",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "TiDB derives HTAP freshness from replication rather than an external ETL pipeline or shared execution path.",
+    },
+    (
+        "2026-06-05-tidb-turns-consensus-replication-into-an-htap-freshness-path",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Retained GPU reads need timestamp and schema frontier prototype validation.",
+    },
+    (
+        "2026-06-05-tidb-turns-consensus-replication-into-an-htap-freshness-path",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than cue describes HTAP freshness architecture; the retained link remains weak support for descriptor lifecycle thinking.",
+    },
+    (
+        "2026-06-05-ladm-makes-gpu-locality-a-schedulable-data-certificate",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Placement transfer requires latency, queue, HBM, remote-transfer, and fallback-rate measurements.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-serviceable-snapshots-also-need-locality-proof",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained analytical routes are serviceable only when timestamp, schema, and replay frontiers are proven.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-serviceable-snapshots-also-need-locality-proof",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Placement is useful only when locality proof is paired with timestamp, schema, and replay frontier proof.",
+    },
+    (
+        "2026-06-05-coco-batches-commit-and-replication-into-epoch-barriers",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Epoch frontier publication requires throughput, latency, WAL-byte, and freshness-lag benchmarks.",
+    },
+    (
+        "2026-06-05-coco-batches-commit-and-replication-into-epoch-barriers",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Immutable roots need epoch-generation publication benchmarks before replacing per-transaction publication.",
+    },
+    (
+        "2026-06-05-coco-batches-commit-and-replication-into-epoch-barriers",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Hot-write templates require epoch rollback and exact-equivalence prototype validation.",
+    },
+    (
+        "2026-06-05-snapshot-algorithms-must-be-measured-for-spikes-not-only-throughput",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Full snapshot-dump evaluation does not settle incremental resident refresh or WAL replay behavior.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-routes-need-placement-flow-and-frontier-proofs",
+        "vector_credit_admission",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Admission needs route-certificate benchmarks covering frontier, placement, and flow proof fields.",
+    },
+    (
+        "2026-06-05-cross-paper-synthesis-routes-need-placement-flow-and-frontier-proofs",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "CPU fallback belongs in the same placement, flow, and frontier benchmark matrix as accepted GPU routes.",
+    },
+    (
+        "2026-06-05-adaptive-compression-should-be-a-tier-policy-not-a-column-default",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Compression placement thresholds must be remeasured for HBM, DRAM, NVMe, and future tiers.",
+    },
 }
 
 
