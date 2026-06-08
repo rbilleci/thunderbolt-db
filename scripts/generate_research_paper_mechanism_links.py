@@ -4984,6 +4984,216 @@ RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
         "relation_type": "only_valid_if",
         "relation_review_note": "Approximate owner queues are valid only if internal ordering is not confused with SQL-visible correctness semantics.",
     },
+    (
+        "2026-06-04-flexible-resource-allocation-needs-database-visible-value-metrics",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue rejects ad hoc LRU lists and supports a unified value metric across placement tiers.",
+    },
+    (
+        "2026-06-04-flexible-resource-allocation-needs-database-visible-value-metrics",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Owner bundling is useful only when cold or idle sessions cannot evict high-value active route state.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-descriptors-should-carry-value-visibility-and-scheduling-intent",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Descriptor lifetime is tied to explicit FIFO, JSQ, priority, and deadline benchmark comparisons.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-descriptors-should-carry-value-visibility-and-scheduling-intent",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Route-root invalidation is named as a range/generation test against table-wide invalidation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-descriptors-should-carry-value-visibility-and-scheduling-intent",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Scheduler resource-value claims require explicit queue, priority, and deadline policy benchmarks.",
+    },
+    (
+        "2026-06-04-epic-deterministic-mvcc-removes-version-search-from-gpu-oltp-batches",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evaluated deterministic GPU OLTP path needs GPU DB workload measurements before adoption.",
+    },
+    (
+        "2026-06-04-epic-deterministic-mvcc-removes-version-search-from-gpu-oltp-batches",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Scratchpad resident deltas and publication generations are explicitly framed as prototype work.",
+    },
+    (
+        "2026-06-04-epic-deterministic-mvcc-removes-version-search-from-gpu-oltp-batches",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "Epic's one-shot stored-procedure assumptions warn against descriptor policy that ignores interactive SQL state.",
+    },
+    (
+        "2026-06-04-ccbench-exposes-cache-delay-and-version-lifetime-factors-in-concurrency-control",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot frontier transfer is gated on separate mutation-owner, retained-read, GPU-write, and cleanup measurements.",
+    },
+    (
+        "2026-06-04-fastlanes-makes-compressed-column-layout-a-route-level-choice",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Compressed versus uncompressed GPU, host, and transfer placement needs direct evaluation.",
+    },
+    (
+        "2026-06-04-fastlanes-makes-compressed-column-layout-a-route-level-choice",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Compressed in-flight vectors are an alternative to eager full-width materialization in route descriptors.",
+    },
+    (
+        "2026-06-04-fastlanes-makes-compressed-column-layout-a-route-level-choice",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "FastLanes is analytical compression work, so it cautions against inferring WAL or MVCC safety.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-write-batches-snapshots-and-compressed-routes-all-need-explicit-physical-i",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis routes deterministic write templates through an explicit contention and layout benchmark matrix.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-write-batches-snapshots-and-compressed-routes-all-need-explicit-physical-i",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-serialized writes must be measured with layout and retained-read interactions before adoption.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-write-batches-snapshots-and-compressed-routes-all-need-explicit-physical-i",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Dense and compressed retained reads are explicitly part of the required benchmark matrix.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-write-batches-snapshots-and-compressed-routes-all-need-explicit-physical-i",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Micro-batching remains useful only when p50 and p99 latency budgets are explicit, not throughput-only.",
+    },
+    (
+        "2026-06-04-dbos-makes-runtime-state-queryable-without-making-every-fast-path-a-table-lookup",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The instead-of cue supports owner bundling by making capacity, placement, messages, and service state visible together.",
+    },
+    (
+        "2026-06-04-dbos-makes-runtime-state-queryable-without-making-every-fast-path-a-table-lookup",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Placement metadata is valid only if buffer reuse waits for visible completion transitions.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-budgeted-temporary-state-not-just-resident-data",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Budgeted descriptor state needs a benchmark proving temporary bytes do not hide overload.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-budgeted-temporary-state-not-just-resident-data",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Tier placement for temporary and resident bytes is explicitly routed through no-GPU memory-credit measurements.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-budgeted-temporary-state-not-just-resident-data",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Snapshot generation and materialization shape metadata require route-telemetry prototype validation.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-robust-routes-need-budgeted-temporary-state-not-just-resident-data",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis requires proving large temporary operators do not evict hot retained snapshots.",
+    },
+    (
+        "2026-06-04-centiman-watermarks-turn-occ-validation-into-an-asynchronous-frontier",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Tier retirement is valid only when all active read frontiers have advanced past the placement generation.",
+    },
+    (
+        "2026-06-04-centiman-watermarks-turn-occ-validation-into-an-asynchronous-frontier",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The not-just cue requires explicit frontier proof, which directly supports snapshot frontier vectors.",
+    },
+    (
+        "2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained snapshots are valid only if resident metadata is not orphaned and stale admissions are rejected.",
+    },
+    (
+        "2026-06-04-hopsfs-moves-metadata-scale-into-transactional-shards",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Subtree-style maintenance and invalid resident generation repair are explicitly prototype gates.",
+    },
+    (
+        "2026-06-04-repmila-allocates-isolation-per-transaction-template-then-promotes-only-the-reads-that-pay-for-t",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Read-only template promotion is valid only when measured abort savings exceed added conflict traffic.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-should-be-a-typed-contract-not-an-owner-thread-habit",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Descriptor safety is supported only when authority is partitioned and route hints are generation-checked.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-should-be-a-typed-contract-not-an-owner-thread-habit",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route optimization is useful only when metadata authority and generation checks are explicit.",
+    },
+    (
+        "2026-06-04-cross-paper-synthesis-route-safety-should-be-a-typed-contract-not-an-owner-thread-habit",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis names proof of visibility, authority, residency, and conflict intent as the first gate.",
+    },
 }
 
 
