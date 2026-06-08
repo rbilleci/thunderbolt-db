@@ -1413,6 +1413,220 @@ RELATION_CANDIDATE_PRIORITY = [
 ]
 
 
+RELATION_REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
+    (
+        "2026-06-07-taurus-mm-makes-multi-master-snapshots-cheap-enough-for-shared-storage",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Fragility describes the baseline multi-master design, while the compact scalar/vector frontier state supports this mechanism.",
+    },
+    (
+        "2026-06-07-leopard-turns-isolation-semantics-into-an-online-verifier",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The verifier is an external reconstruction path rather than in-kernel descriptor instrumentation.",
+    },
+    (
+        "2026-06-07-leopard-turns-isolation-semantics-into-an-online-verifier",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The entry explicitly routes this visibility tracing idea through backlog, anomaly, latency, and throughput measurement.",
+    },
+    (
+        "2026-06-07-decentsched-makes-deterministic-hot-writes-self-schedule",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The rather-than clause motivates deterministic templates instead of abort/retry ordering.",
+    },
+    (
+        "2026-06-07-decentsched-makes-deterministic-hot-writes-self-schedule",
+        "owner_ring_bundling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "Owner-local queue ordering is presented as an alternative to routing all ordering through one global owner.",
+    },
+    (
+        "2026-06-07-decentsched-makes-deterministic-hot-writes-self-schedule",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The witness idea is tied to measuring false-positive waits, cache misses, search time, and metadata footprint.",
+    },
+    (
+        "2026-06-07-justdo-turns-logging-into-resumable-progress-state",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "warns_against",
+        "relation_review_note": "The retained evidence is explicitly in risks and mismatches and depends on cheap persist ordering.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-route-admission-now-needs-three-witnesses",
+        "dependency_witnesses",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Admission is supported only when semantic, resource, and recovery witnesses are all present.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-route-admission-now-needs-three-witnesses",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Route-root publication is valid only with proven snapshot/catalog/resident generations and safe descriptor state.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-route-admission-now-needs-three-witnesses",
+        "cost_based_route_optimizer",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The durable compact-progress contrast is not an optimizer alternative; it remains a weak supporting signal.",
+    },
+    (
+        "2026-06-07-hostping-makes-host-interconnect-health-a-route-precondition",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Fallback is valid only when path-degraded state is distinguished from stale generation and unsupported predicates.",
+    },
+    (
+        "2026-06-07-hostping-makes-host-interconnect-health-a-route-precondition",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained GPU reads are valid only while the resident snapshot is valid and path degradation is handled.",
+    },
+    (
+        "2026-06-07-tetrisched-plans-scarce-accelerators-in-space-and-time",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The entry requires p50/p99, GPU utilization, fallback pressure, missed-SLO, and stale-route measurements.",
+    },
+    (
+        "2026-06-07-tetrisched-plans-scarce-accelerators-in-space-and-time",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Retained snapshots are part of heterogeneous sets with explicit runtime and validity constraints.",
+    },
+    (
+        "2026-06-07-tetrisched-plans-scarce-accelerators-in-space-and-time",
+        "same_shape_microbatching",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Same-shape micro-batching is one supported scheduling option, not an alternative to the mechanism itself.",
+    },
+    (
+        "2026-06-07-tetrisched-plans-scarce-accelerators-in-space-and-time",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The route-advisor idea is framed as simulator work over route alternatives before adoption.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-format-metadata-is-now-route-metadata",
+        "cpu_fallback_policy",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evidence lists route-certificate and mixed-freshness benchmarks as the decision gate.",
+    },
+    (
+        "2026-06-07-adaptive-htap-treats-freshness-as-a-resource-scheduling-input",
+        "htap_freshness_router",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Freshness routing is valid only if OLAP gains do not violate WAL, visibility, or mutation latency budgets.",
+    },
+    (
+        "2026-06-07-adaptive-htap-treats-freshness-as-a-resource-scheduling-input",
+        "resource_dag_scheduling",
+    ): {
+        "relation_type": "alternative_to",
+        "relation_review_note": "The paper frames runtime scheduling as an alternative to fixed unified or decoupled HTAP modes.",
+    },
+    (
+        "2026-06-07-adaptive-htap-treats-freshness-as-a-resource-scheduling-input",
+        "multi_tier_placement",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "GPU-specific placement costs are explicitly not measured and need a proof gate.",
+    },
+    (
+        "2026-06-07-doppelganger-makes-dependency-ordering-a-streaming-state-problem",
+        "effective_session_counting",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Per-request dependency state at 1M sessions is valid only if bounded, sampled, or restricted.",
+    },
+    (
+        "2026-06-07-doppelganger-makes-dependency-ordering-a-streaming-state-problem",
+        "gpu_oltp_conflict_ordering",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The word test names the replay system context; the snippet still supports deterministic conflict ordering.",
+    },
+    (
+        "2026-06-07-durinn-turns-visibility-vs-durability-gaps-into-adversarial-tests",
+        "retained_gpu_snapshots",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The evaluated systems are smaller than a database engine, so retained GPU snapshots require DB-scale evaluation.",
+    },
+    (
+        "2026-06-07-version-aware-layout-makes-mvcc-visibility-a-search-key",
+        "snapshot_frontier_vectors",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "Grouping old deltas by generation supports frontier-style snapshot skipping despite the rather-than cue.",
+    },
+    (
+        "2026-06-07-version-aware-layout-makes-mvcc-visibility-a-search-key",
+        "wal_before_visibility",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The paper does not evaluate WAL durability or crash recovery, so WAL-before-visibility needs validation.",
+    },
+    (
+        "2026-06-07-version-aware-layout-makes-mvcc-visibility-a-search-key",
+        "bounded_descriptor_reclamation",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Owner-local old-version buffers are explicitly proposed as prototype-and-measure work.",
+    },
+    (
+        "2026-06-07-version-aware-layout-makes-mvcc-visibility-a-search-key",
+        "mvcc_gc_frontiers",
+    ): {
+        "relation_type": "supports",
+        "relation_review_note": "The word tests describes the visibility-check operation; the evidence supports MVCC GC frontier mechanics.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-learned-route-control-needs-deterministic-envelopes",
+        "learned_optimizer_advisor",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "The synthesis explicitly requires fixed, learned-ranking, and learned-batch benchmark variants.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-learned-route-control-needs-deterministic-envelopes",
+        "deterministic_hot_write_templates",
+    ): {
+        "relation_type": "benchmark_required",
+        "relation_review_note": "Deterministic envelopes are tied to route-DAG telemetry and continuous mixed-arrival benchmarks.",
+    },
+    (
+        "2026-06-07-cross-paper-synthesis-learned-route-control-needs-deterministic-envelopes",
+        "immutable_route_roots",
+    ): {
+        "relation_type": "only_valid_if",
+        "relation_review_note": "Learned policy output is valid only when published as immutable generations that hot workers evaluate cheaply.",
+    },
+}
+
+
 REVIEW_OVERRIDES: dict[tuple[str, str], dict[str, str]] = {
     (
         "2026-06-07-cross-paper-synthesis-route-admission-now-needs-three-witnesses",
@@ -4016,6 +4230,7 @@ def attach_relation_type(link: dict) -> None:
         raise ValueError(f"unknown paper-mechanism relation type: {relation_type}")
     link["relation_type"] = relation_type
     link["relation_reason"] = RELATION_TYPE_DESCRIPTIONS[relation_type]
+    link.setdefault("relation_review_status", "unreviewed")
 
 
 def relation_candidate_details(link: dict) -> tuple[str, str]:
@@ -4047,6 +4262,11 @@ def attach_evidence_span(entry: dict, link: dict, mechanism_name: str) -> None:
         "candidate_relation_type": candidate_type,
         "candidate_reason": candidate_reason,
     }
+    if link["relation_review_status"] == "unreviewed":
+        if candidate_type == "supports":
+            link["relation_review_status"] = "not_required"
+        else:
+            link["relation_review_status"] = "candidate_pending_review"
 
 
 def fallback_mechanisms(category: str, text: str) -> list[str]:
@@ -4114,6 +4334,16 @@ def apply_review_overrides(entry: dict, links: list[dict]) -> list[dict]:
             link["review_note"] = override["review_note"]
             if override["review_status"] == "removed_low_confidence_noise":
                 continue
+        relation_override = RELATION_REVIEW_OVERRIDES.get((entry["id"], link["mechanism_id"]))
+        if relation_override:
+            relation_type = relation_override["relation_type"]
+            link["relation_type"] = relation_type
+            link["relation_review_status"] = (
+                "reviewed_support_candidate"
+                if relation_type == "supports"
+                else "reviewed_reclassified"
+            )
+            link["relation_review_note"] = relation_override["relation_review_note"]
         reviewed.append(link)
     return reviewed
 
@@ -4129,6 +4359,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
     evidence_quality_reason_counts: Counter = Counter()
     relation_type_counts: Counter = Counter()
     relation_candidate_counts: Counter = Counter()
+    relation_review_status_counts: Counter = Counter()
     review_status_counts: Counter = Counter()
     review_priority_counts: Counter = Counter()
     type_counts: Counter = Counter()
@@ -4156,6 +4387,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             evidence_quality_reason_counts[link["evidence_span"]["quality_reason"]] += 1
             relation_type_counts[link["relation_type"]] += 1
             relation_candidate_counts[link["relation_candidate"]["candidate_relation_type"]] += 1
+            relation_review_status_counts[link["relation_review_status"]] += 1
             review_status_counts[link["review_status"]] += 1
             review_priority_counts[link["review_priority"]] += 1
         type_counts[entry["entry_type"]] += 1
@@ -4196,6 +4428,7 @@ def build_index(entries: list[dict], mechanisms: dict) -> dict:
             "evidence_quality_reason_counts": dict(sorted(evidence_quality_reason_counts.items())),
             "relation_type_counts": dict(sorted(relation_type_counts.items())),
             "relation_candidate_counts": dict(sorted(relation_candidate_counts.items())),
+            "relation_review_status_counts": dict(sorted(relation_review_status_counts.items())),
             "review_status_counts": dict(sorted(review_status_counts.items())),
             "review_priority_counts": dict(sorted(review_priority_counts.items())),
             "links_requiring_review": review_status_counts["pending_low_confidence_review"]
@@ -4226,6 +4459,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
     evidence_quality_reason_counts = index["summary"]["evidence_quality_reason_counts"]
     relation_type_counts = index["summary"]["relation_type_counts"]
     relation_candidate_counts = index["summary"]["relation_candidate_counts"]
+    relation_review_status_counts = index["summary"]["relation_review_status_counts"]
     review_status_counts = index["summary"]["review_status_counts"]
     review_priority_counts = index["summary"]["review_priority_counts"]
     records = index["records"]
@@ -4267,6 +4501,11 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
         for record in records
         for link in record["mechanism_links"]
         if link["relation_candidate"]["candidate_relation_type"] != "supports"
+    ]
+    pending_non_support_relation_candidate_records = [
+        (record, link)
+        for record, link in non_support_relation_candidate_records
+        if link["relation_review_status"] == "candidate_pending_review"
     ]
 
     lines = [
@@ -4319,7 +4558,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
 
     lines.extend(["", "## Generated Non-Support Relation Candidates", ""])
     lines.append(
-        "These are generated audit candidates only; relation types remain unchanged until a later reviewed slice reclassifies them."
+        "These are generated audit candidates. Reviewed slices either reclassify them or keep the original support relation with an explicit note."
     )
     lines.append("")
     lines.append("Candidate relation counts:")
@@ -4327,17 +4566,21 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
         description = RELATION_TYPE_DESCRIPTIONS.get(relation_type, "")
         lines.append(f"- {relation_type}: {count} ({description})")
     lines.append("")
-    lines.append("Candidate audit queue:")
-    if non_support_relation_candidate_records:
-        for record, link in non_support_relation_candidate_records[:80]:
+    lines.append("Candidate review status counts:")
+    for status, count in sorted(relation_review_status_counts.items()):
+        lines.append(f"- {status}: {count}")
+    lines.append("")
+    lines.append("Pending candidate audit queue:")
+    if pending_non_support_relation_candidate_records:
+        for record, link in pending_non_support_relation_candidate_records[:80]:
             span = link["evidence_span"]
             candidate = link["relation_candidate"]
             snippet = span["snippet"].replace("|", "\\|")
             lines.append(
                 f"- `{record['id']}` -> {link['mechanism_id']}:{candidate['candidate_relation_type']} ({candidate['candidate_reason']}): {snippet}"
             )
-        if len(non_support_relation_candidate_records) > 80:
-            lines.append(f"- ... {len(non_support_relation_candidate_records) - 80} more")
+        if len(pending_non_support_relation_candidate_records) > 80:
+            lines.append(f"- ... {len(pending_non_support_relation_candidate_records) - 80} more")
     else:
         lines.append("- none")
 
@@ -4347,7 +4590,7 @@ def write_markdown(index: dict, mechanisms: dict, output: Path) -> None:
             span = link["evidence_span"]
             snippet = span["snippet"].replace("|", "\\|")
             lines.append(
-                f"- `{record['id']}` -> {link['mechanism_id']}:{link['relation_type']} ({link['relation_reason']}): {snippet}"
+                f"- `{record['id']}` -> {link['mechanism_id']}:{link['relation_type']} ({link['relation_review_note']}): {snippet}"
             )
         if len(non_support_relation_records) > 80:
             lines.append(f"- ... {len(non_support_relation_records) - 80} more")
