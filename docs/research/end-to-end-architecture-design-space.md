@@ -164,9 +164,75 @@ Evidence strength:
 - Learned optimizer advice is deferred until deterministic route telemetry and
   guarded cost baselines exist.
 
-## P1 Output Boundary
+## Research-Derived Design Dimensions
 
-This P1 baseline intentionally stops before assigning mechanism states to every
-design dimension. P2 will extend this document with a mechanism-to-dimension
-matrix, candidate construction rules, and named assumptions derived from the
-compatibility edge graph.
+P2 groups the mechanism graph into architecture dimensions. A candidate is a
+vector of choices across these dimensions, not a bag of isolated papers. The
+state column says how the mechanism may shape the first candidate set:
+
+- `baseline invariant`: required for every valid candidate.
+- `candidate default`: expected in the preferred or fallback family, pending
+  the named proof gate.
+- `optional extension`: may strengthen a family but cannot be required for the
+  first preferred architecture.
+- `benchmark-only experiment`: useful for measurements, but not part of the
+  baseline claim until the gate decides it.
+- `deferred feature`: excluded from current candidate construction.
+
+| Dimension | Mechanism | State | Candidate role | Required coupling or rule | First proof gate |
+| --- | --- | --- | --- | --- | --- |
+| Durability and visibility | `wal_before_visibility` | baseline invariant | Durable source of truth and visibility publication gate. | Every route, resident snapshot, catalog root, and metadata generation must lag durable commit evidence. | `benchmark-wal_before_visibility` |
+| Metadata publication | `immutable_route_roots` | baseline invariant | Common publication shape for route, catalog, layout, residency, and visibility generations. | Requires WAL-before-visibility and reclaimable old roots before external eligibility advances. | `benchmark-immutable_route_roots` |
+| Metadata publication | `dependency_witnesses` | candidate default | Explains async body persistence and delayed route eligibility. | Strengthens immutable roots and crash proof; required before log-structured warm-tier claims. | `benchmark-dependency_witnesses` |
+| Validation | `semantic_crash_oracle` | baseline invariant | Recovery and unsafe-publication proof harness. | Strengthens WAL and dependency witnesses; required for DB-owned cold-object recovery claims. | `benchmark-semantic_crash_oracle` |
+| Validation | `isolation_trace_oracle` | baseline invariant | External proof that returned reads match declared isolation and route choices. | Required by CPU fallback; strengthens retained snapshots and freshness routing. | `benchmark-isolation_trace_oracle` |
+| MVCC and snapshot frontiers | `snapshot_frontier_vectors` | candidate default | Cross-owner snapshot proof with scalar hot-path generations where possible. | Required by retained snapshots and HTAP freshness routing. | `benchmark-snapshot_frontier_vectors` |
+| MVCC and snapshot frontiers | `mvcc_gc_frontiers` | candidate default | Bounded version memory and long-reader accounting. | Strengthens snapshot vectors; has tension with retained snapshots because residency extends version lifetime. | `benchmark-mvcc_gc_frontiers` |
+| Memory reclamation | `bounded_descriptor_reclamation` | candidate default | Bounded lifetime for route, catalog, plan, residency, and old-root descriptors. | Strengthens immutable roots; compatible with MVCC GC and stable handles. | `benchmark-bounded_descriptor_reclamation` |
+| Storage layout | `stable_handle_indirection` | candidate default | Logical identity survives movement, compaction, and residency changes. | Strengthens retained snapshots; required by multi-tier placement. | `benchmark-stable_handle_indirection` |
+| Execution | `retained_gpu_snapshots` | candidate default | Main low-latency retained-read acceleration path. | Requires snapshot frontiers and immutable roots; must be guarded by stale-route rejection, CPU fallback, and MVCC retention bounds. | `benchmark-retained_gpu_snapshots` |
+| Execution | `same_shape_microbatching` | candidate default | Kernel-launch amortization for repeated prepared retained routes. | Requires vector-credit admission; strengthens retained snapshots; tension with fairness when batches grow. | `benchmark-same_shape_microbatching` |
+| Execution and fallback | `cpu_fallback_policy` | baseline invariant | Correctness-preserving route for stale, unsupported, saturated, low-benefit, or over-budget work. | Requires isolation trace oracle; strengthens retained snapshots by making rejection explicit. | `benchmark-cpu_fallback_policy` |
+| Routing | `htap_freshness_router` | candidate default | Chooses retained, wait, refresh, CPU, reject, or retry paths by freshness and benefit. | Requires snapshot frontier vectors; strengthened by CPU fallback, retained snapshots, and isolation traces. | `benchmark-htap_freshness_router` |
+| Query optimization | `cost_based_route_optimizer` | candidate default | Deterministic route choice over CPU, GPU, retained, refresh, transfer, and cold paths. | Requires vector credits and strengthens freshness routing; learned advice may only sit behind this guard. | `benchmark-cost_based_route_optimizer` |
+| Query optimization | `learned_optimizer_advisor` | deferred feature | Future hinting layer for route, knob, or placement suggestions. | Requires fallback baseline and isolation trace oracle; has tension with WAL/visibility guardrails if allowed to affect correctness. | `benchmark-learned_optimizer_advisor` |
+| Runtime admission | `vector_credit_admission` | baseline invariant | Bounded admission across requests, bytes, pinned buffers, GPU streams, WAL slots, and responses. | Strengthens effective session counting and resource DAG scheduling; required by batching and costed routes. | `benchmark-vector_credit_admission` |
+| Runtime admission | `effective_session_counting` | candidate default | 1M logical-session model where only ready work and blocked responses consume hot capacity. | Requires vector credits; cannot imply one hot allocation, thread, or queue slot per logical session. | `benchmark-effective_session_counting` |
+| Runtime scheduling | `owner_ring_bundling` | candidate default | Low-allocation owner-local drain loop and natural micro-batch formation. | Requires vector credits; strengthened by deficit fairness and deterministic hot-write templates. | `benchmark-owner_ring_bundling` |
+| Runtime scheduling | `resource_dag_scheduling` | optional extension | Dependency-aware packing for refresh, transfer, query, write, kernel, and response work. | Strengthened by vector credits; compatible with dependency witnesses and batching; tension with fairness complexity. | `benchmark-resource_dag_scheduling` |
+| Runtime scheduling | `deficit_fairness` | candidate default | Bounds starvation caused by batching or throughput-favorable owner scheduling. | Strengthens owner rings; must cap same-shape batching delay. | `benchmark-deficit_fairness` |
+| Transaction execution | `gpu_oltp_conflict_ordering` | benchmark-only experiment | Explore GPU write-path conflict ordering for known-access batches. | Requires WAL-before-visibility; alternative-to deterministic templates; tension with same-shape batching on dynamic conflicts. | `benchmark-gpu_oltp_conflict_ordering` |
+| Transaction execution | `deterministic_hot_write_templates` | benchmark-only experiment | Hot-key tail-control experiment using template or queue-positioned write lanes. | Strengthens owner-ring scheduling; alternative to GPU conflict ordering for first write-path experiments. | `benchmark-deterministic_hot_write_templates` |
+| Storage placement | `multi_tier_placement` | candidate default | HBM/DRAM/NVMe/object placement by reuse, movement cost, and freshness. | Requires stable handles; strengthens retained snapshots; compatible with costed route optimization. | `benchmark-multi_tier_placement` |
+| Storage placement | `log_structured_warm_tier` | benchmark-only experiment | Warm-tier write coalescing and rebuildable metadata experiment. | Requires dependency witnesses and crash oracle; compatible with multi-tier placement but not required for the first preferred family. | `benchmark-log_structured_warm_tier` |
+| Storage placement | `db_owned_cold_objects` | optional extension | Cold object lifecycle, scan/index control, backup, and PITR alignment. | Requires immutable roots; strengthened by multi-tier placement; semantic crash oracle is required for recovery claims. | `benchmark-db_owned_cold_objects` |
+
+## Dimension Coupling Notes
+
+- The correctness spine is
+  `wal_before_visibility` -> `immutable_route_roots` -> route eligibility,
+  with `semantic_crash_oracle` and `isolation_trace_oracle` proving externally
+  visible outcomes. Candidate families may vary their acceleration strategy,
+  but not this spine.
+- Retained GPU reads require a four-way coupling:
+  `retained_gpu_snapshots`, `snapshot_frontier_vectors`,
+  `mvcc_gc_frontiers`, and `cpu_fallback_policy`. A candidate that keeps
+  resident read generations but omits explicit snapshot proof, reclamation
+  frontiers, or fallback semantics is rejected.
+- Runtime scale requires `vector_credit_admission` before any claim about
+  micro-batching, 1M logical sessions, costed routing, owner rings, or GPU
+  stream scheduling. Queue growth without a typed overload outcome fails the
+  hard admission constraint.
+- Tiering requires `stable_handle_indirection` before it can become more than
+  an experiment. Without stable handles, movement across HBM, DRAM, NVMe, and
+  object tiers can invalidate residency descriptors or snapshot proofs.
+- Benchmark-only write acceleration mechanisms are not allowed to displace the
+  CPU/WAL authority path in the preferred architecture. They may appear as
+  explicit labs for bounded write-shape families.
+
+## P2.1 Output Boundary
+
+This slice assigns every mechanism in the research compatibility graph to a
+design dimension and candidate-construction state. The next P2 slice will turn
+the matrix and compatibility edges into explicit candidate construction rules,
+named assumptions, and rejection rules for P3 architecture-family generation.
