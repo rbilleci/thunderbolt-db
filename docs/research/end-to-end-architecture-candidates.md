@@ -446,6 +446,14 @@ Movement is a first-class route cost. Warm and cold bodies can persist
 asynchronously only when `dependency_witnesses` explain delayed eligibility and
 `immutable_route_roots` keep readers away from unfenced bodies.
 
+A future `direct_wal_gpu_ingest` path belongs here rather than in the preferred
+Candidate A baseline. In that path, CPU append remains the WAL/MVCC authority,
+Chronicle-style mmap segment writes may reduce CPU append overhead, and GPU
+ingest may consume only sealed or fenced LSN ranges. The transfer experiment
+must compare pinned host H2D copies with GPUDirect Storage or equivalent
+NVMe-to-GPU DMA, and it may only produce rebuildable retained snapshots,
+visibility directories, resident indexes, or refresh artifacts.
+
 ### Visibility Model
 
 Visibility combines WAL frontier, catalog generation, partition generation,
@@ -517,6 +525,8 @@ First gates:
   recovery proof.
 - Does not claim all over-resident scans should use GPU.
 - Does not require learned placement or learned route advice.
+- Does not let GPU readers observe the live mutable WAL tail or treat
+  partially transferred WAL batches as visible commit evidence.
 
 ## Candidate E - Runtime-First 1M-Session Architecture
 
@@ -781,6 +791,9 @@ The following ideas should not shape current implementation packets:
   state;
 - log-structured warm-tier publication before dependency witnesses and crash
   oracle cases pass;
+- direct WAL-to-GPU ingest from a live mutable mmap tail. A future
+  `direct_wal_gpu_ingest` experiment may batch fenced WAL ranges into HBM, but
+  it cannot bypass CPU/WAL durability or visibility publication;
 - full 125% over-resident benchmark claims before partitioned resident route
   execution and movement-cost gates pass.
 

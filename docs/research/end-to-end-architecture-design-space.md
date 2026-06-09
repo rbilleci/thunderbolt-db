@@ -358,8 +358,33 @@ Reject a candidate before scoring when any of these conditions hold:
   before deterministic route telemetry and fallback guardrails exist.
 - It promotes benchmark-only write mechanisms into the preferred baseline
   before WAL, isolation, conflict, and tail-latency gates pass.
+- It lets GPU work consume a live mutable WAL mmap tail or partially
+  transferred WAL bytes before a durable LSN fence has made that range
+  externally eligible.
 - It has no crash/recovery, isolation, fallback, and operator-observability
   validation plan.
+
+### Future Exploration Path - Direct WAL GPU Ingest
+
+`direct_wal_gpu_ingest` is a future Candidate B/D proof path, not a current
+baseline mechanism. The intended shape is:
+
+1. CPU append remains WAL/MVCC authority, optionally using mmap-backed segment
+   files for low-overhead Chronicle-style writes.
+2. Durable LSN publication still requires the normal WAL flush/fence.
+3. GPU ingest cursors may read only sealed or fenced WAL ranges.
+4. Transfer implementations may compare pinned host H2D copies against
+   GPUDirect Storage or equivalent NVMe-to-GPU DMA when the platform supports
+   it.
+5. GPU work may build retained snapshots, visibility directories, resident
+   indexes, or refresh artifacts, but cannot decide commit durability or SQL
+   visibility.
+
+The first rejection risk is hidden authority leakage: if a partially
+transferred or unfenced WAL batch can become externally visible, the path is
+rejected. The first proof packet should measure transfer size, PCIe/NVMe/GPU
+credit pressure, HBM staging cost, replay/refresh speedup, and crash behavior
+against CPU replay and pinned-buffer fallback.
 
 ## P2 Output Boundary
 

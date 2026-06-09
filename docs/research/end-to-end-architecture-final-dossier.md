@@ -202,6 +202,14 @@ route and residency descriptors so future movement or compaction does not
 change logical route identity. `multi_tier_placement` is the next-stage
 Candidate B/D bridge, not the first baseline claim.
 
+A future `direct_wal_gpu_ingest` path may be explored under Candidate B/D, but
+only as fenced WAL replay/refresh acceleration. Chronicle-style mmap WAL
+segments can reduce CPU append overhead, and GPUDirect Storage or equivalent
+NVMe-to-GPU DMA can be compared against pinned host H2D copies for sealed WAL
+ranges. The GPU side may build retained snapshots, visibility directories,
+resident indexes, or refresh artifacts; it must not read the live mutable WAL
+tail or decide commit visibility.
+
 References:
 
 - mechanisms: `stable_handle_indirection`, `multi_tier_placement`,
@@ -333,6 +341,7 @@ retained-read p99 interference gates.
 | 6 | Partition/tier gate: `benchmark-snapshot_frontier_vectors`, `benchmark-stable_handle_indirection`, `benchmark-multi_tier_placement`, `benchmark-cost_based_route_optimizer` | Whether Candidate B can become next stage. | Keep B/D deferred and do not claim 125% over-resident retained execution. |
 | 7 | Warm/cold recovery gate: `benchmark-db_owned_cold_objects`, `benchmark-dependency_witnesses`, `benchmark-log_structured_warm_tier` | Whether Candidate D can own warm/cold route metadata. | Treat warm/cold bodies as rebuildable experiments with CPU fallback. |
 | 8 | Write lab gate: `benchmark-deterministic_hot_write_templates` or `benchmark-gpu_oltp_conflict_ordering` | Whether Candidate C is worth retaining as a lab. | Remove GPU write work from scheduling and route-cost assumptions. |
+| 9 | Direct WAL GPU ingest gate: fenced mmap segment ranges, pinned H2D versus GPUDirect Storage or equivalent NVMe-to-GPU DMA, PCIe/NVMe/GPU credits, and crash injection | Whether Candidate B/D should add direct WAL-to-GPU replay or refresh acceleration. | Keep WAL ingest CPU/pinned-buffer based; forbid GPU consumption of live mutable WAL tails or unfenced batches. |
 
 ## Worker-Ready Next Packets
 
@@ -412,12 +421,32 @@ Target docs/code/tests:
 Deliverable: the minimum Candidate B primitive needed before another full
 125% tier run is defensible.
 
+### Packet 7 - Direct WAL GPU Ingest Prototype
+
+Target docs/code/tests:
+
+- `docs/architecture/05-storage-and-recovery.md`
+- `docs/architecture/10-p8-gpu-optimized-storage-engine.md`
+- `docs/architecture/12-acid-isolation-and-gpu-memory.md`
+- mmap-backed WAL segment append and sealed-range cursor tests
+- pinned host H2D versus GPUDirect Storage or equivalent NVMe-to-GPU transfer
+  benchmark when hardware support is available
+- crash/recovery tests for partially written, partially transferred, and
+  unfenced WAL batches
+
+Deliverable: a fenced WAL ingest path that lets GPU workers consume only
+durable LSN ranges to build retained snapshots, visibility directories,
+resident indexes, or refresh artifacts. The packet must report transfer bytes,
+PCIe/NVMe/GPU credit pressure, HBM staging cost, replay/refresh speedup, and
+CPU fallback comparison.
+
 ## Non-Claims And Assumptions
 
 This dossier does not claim:
 
 - GPU memory is durable.
 - GPU writes are authoritative.
+- GPU ingest of a live mutable WAL mmap tail is safe.
 - one million sessions are active at once.
 - the 125% over-resident benchmark is solved.
 - learned optimizer advice is safe to use for correctness-sensitive route
