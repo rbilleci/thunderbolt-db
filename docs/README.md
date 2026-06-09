@@ -57,6 +57,7 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/research/end-to-end-architecture-candidates.md`
    - `docs/research/end-to-end-architecture-final-dossier.md`
    - `docs/research/end-to-end-architecture-diagrams.html`
+   - `docs/research/end-to-end-architecture-diagrams.png`
 
 14. **Decision history (ADRs)**
    - `docs/adr/README.md`
