@@ -1374,7 +1374,7 @@ engine_pgwire_concurrency_metric() {
     request_count="$concurrency"
   fi
 
-  local phase_path phase_samples phase_queue_wait_avg_us phase_queue_wait_max_us phase_engine_execute_avg_us phase_client_write_avg_us phase_d2h_avg_bytes phase_result_materialize_avg_us phase_retained_wall_avg_us phase_cuda_event_avg_us phase_kernel_delta_avg
+  local phase_path phase_samples phase_queue_wait_avg_us phase_queue_wait_max_us phase_engine_execute_avg_us phase_client_write_avg_us phase_d2h_avg_bytes phase_result_materialize_avg_us phase_retained_wall_avg_us phase_cuda_event_avg_us phase_kernel_delta_avg phase_microbatch_size_avg phase_microbatch_unique_selects_avg
   phase_path="$(write_retained_phase_sample "$run_dir" "$request_count")"
   phase_samples=$(wc -l <"$phase_path" | tr -d ' ')
   phase_queue_wait_avg_us="$(phase_metric_avg "$phase_path" scheduler_queue_wait_micros)"
@@ -1386,8 +1386,10 @@ engine_pgwire_concurrency_metric() {
   phase_retained_wall_avg_us="$(phase_metric_avg "$phase_path" retained_wall_micros)"
   phase_cuda_event_avg_us="$(phase_metric_avg "$phase_path" retained_cuda_event_micros)"
   phase_kernel_delta_avg="$(phase_metric_avg "$phase_path" kernel_delta)"
+  phase_microbatch_size_avg="$(phase_metric_avg "$phase_path" microbatch_size)"
+  phase_microbatch_unique_selects_avg="$(phase_metric_avg "$phase_path" microbatch_unique_selects)"
 
-  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"%s","query":"%s","concurrency":%s,"request_count":%s,"requests_per_client":%s,"warmup_requests_per_client":%s,"retained_read_response_cache":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"phase_samples":%s,"phase_scheduler_queue_wait_avg_us":%s,"phase_scheduler_queue_wait_max_us":%s,"phase_engine_execute_avg_us":%s,"phase_client_write_avg_us":%s,"phase_result_materialize_avg_us":%s,"phase_retained_wall_avg_us":%s,"phase_cuda_event_avg_us":%s,"phase_d2h_avg_bytes":%s,"phase_kernel_delta_avg":%s,"phase_artifact":"%s","blocker":"none"}\n' \
+  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"%s","query":"%s","concurrency":%s,"request_count":%s,"requests_per_client":%s,"warmup_requests_per_client":%s,"retained_read_response_cache":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"phase_samples":%s,"phase_scheduler_queue_wait_avg_us":%s,"phase_scheduler_queue_wait_max_us":%s,"phase_engine_execute_avg_us":%s,"phase_client_write_avg_us":%s,"phase_result_materialize_avg_us":%s,"phase_retained_wall_avg_us":%s,"phase_cuda_event_avg_us":%s,"phase_d2h_avg_bytes":%s,"phase_kernel_delta_avg":%s,"phase_microbatch_size_avg":%s,"phase_microbatch_unique_selects_avg":%s,"phase_artifact":"%s","blocker":"none"}\n' \
     "$client_driver" \
     "$query_id" \
     "$concurrency" \
@@ -1414,6 +1416,8 @@ engine_pgwire_concurrency_metric() {
     "$(json_number_or_null "$phase_cuda_event_avg_us")" \
     "$(json_number_or_null "$phase_d2h_avg_bytes")" \
     "$(json_number_or_null "$phase_kernel_delta_avg")" \
+    "$(json_number_or_null "$phase_microbatch_size_avg")" \
+    "$(json_number_or_null "$phase_microbatch_unique_selects_avg")" \
     "$(json_escape "$phase_path")" >>"$metrics_path"
   printf '25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,%s,%s,%s,%s,none,%s,%s,"%s qps; p50=%sus p95=%sus p99=%sus; owner_thread_engine_scheduler; requests=%s"\n' \
     "$client_driver" \
@@ -1780,7 +1784,7 @@ write_engine_backed_pgwire_concurrency_smoke() {
   local server_log="$smoke_dir/engine-pgwire-endpoint.log"
   local facts_path="$smoke_dir/endpoint-facts.txt"
   local max_sessions
-  max_sessions="$(pgwire_required_engine_sessions "$targets" 3)"
+  max_sessions="$(pgwire_required_engine_sessions "$targets" 4)"
   : >"$metrics_path"
 
   if ! command -v psql >/dev/null 2>&1; then
@@ -1855,7 +1859,7 @@ REPORT
     return 0
   fi
 
-  local expected_count lookup_key lookup_item lookup_qty lookup_amount tmp_prefix concurrency literal_variants literal_sql_list literal_expected_list
+  local expected_count lookup_key lookup_item lookup_qty lookup_amount tmp_prefix concurrency literal_variants literal_sql_list literal_expected_list literal_projection_sql_list literal_projection_expected_list
   expected_count="$rows"
   lookup_key=$(((rows + 1) / 2))
   lookup_item=$(((lookup_key % 100000) + 1))
@@ -1865,6 +1869,8 @@ REPORT
   literal_variants="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_LITERAL_VARIANTS:-16}"
   literal_sql_list=""
   literal_expected_list=""
+  literal_projection_sql_list=""
+  literal_projection_expected_list=""
   local literal_idx literal_key literal_item literal_qty literal_amount
   for literal_idx in $(seq 1 "$literal_variants"); do
     literal_key=$(( ((literal_idx - 1) % rows) + 1 ))
@@ -1874,9 +1880,13 @@ REPORT
     if [ -n "$literal_sql_list" ]; then
       literal_sql_list="${literal_sql_list};;"
       literal_expected_list="${literal_expected_list};;"
+      literal_projection_sql_list="${literal_projection_sql_list};;"
+      literal_projection_expected_list="${literal_projection_expected_list};;"
     fi
     literal_sql_list="${literal_sql_list}SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $literal_key"
     literal_expected_list="${literal_expected_list}${literal_key}|${literal_item}|${literal_qty}|${literal_amount}"
+    literal_projection_sql_list="${literal_projection_sql_list}SELECT ol_o_id FROM order_line WHERE ol_o_id = $literal_key"
+    literal_projection_expected_list="${literal_projection_expected_list}${literal_key}"
   done
 
   cat >"$curve_path" <<CSV
@@ -1899,10 +1909,16 @@ CSV
       "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
       "$tmp_prefix" retained_engine_int4_equality_multi_column_projection true "$concurrency" \
       "$literal_sql_list" "$literal_expected_list"
+    engine_pgwire_concurrency_metric "$url" "$metrics_path" "$curve_path" \
+      order_line_lookup_ol_o_id_projection_literal_batch \
+      "$lookup_key" \
+      "SELECT ol_o_id FROM order_line WHERE ol_o_id = $lookup_key" \
+      "$tmp_prefix" retained_engine_int4_equality_projection true "$concurrency" \
+      "$literal_projection_sql_list" "$literal_projection_expected_list"
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"multi_literal_batched_retained_equality_lookup","decision":"cache-off retained reads should stay on the GPU path; optimize compatible lookup batching before considering CPU routing","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"multi_literal_batched_retained_equality_lookup","decision":"cache-off retained reads should stay on the GPU path; optimize compatible lookup batching before considering CPU routing","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1938,12 +1954,13 @@ The scaled run seeds \`order_line\` through SQL-visible \`CREATE TABLE\` plus
 \`COPY FROM STDIN\`, then runs real overlapping persistent PostgreSQL-compatible
 simple-query sessions for the requested concurrency targets. The graph-ready
 curve records retained \`COUNT(*)\`, exact retained multi-column int4 lookup,
-and a varied-literal retained multi-column int4 lookup schedule with
-p50/p95/p99, throughput, error count, correctness status, retained-route
-classification, and owner-thread scheduler evidence. The JSON metrics also
-attach retained endpoint phase aggregates for scheduler queue wait, engine
-execute, retained wall time, CUDA event time, D2H bytes, result materialization,
-and client response write.
+a varied-literal retained multi-column int4 lookup schedule, and a
+varied-literal retained single-column int4 lookup schedule with p50/p95/p99,
+throughput, error count, correctness status, retained-route classification,
+and owner-thread scheduler evidence. The JSON metrics also attach retained
+endpoint phase aggregates for scheduler queue wait, engine execute, retained
+wall time, CUDA event time, D2H bytes, result materialization, and client
+response write.
 
 ## Decision
 

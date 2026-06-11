@@ -18912,10 +18912,14 @@ impl Engine {
         let mut batch_selected_indexes: Option<Vec<usize>> = None;
         for select in selects {
             let decision = self.plan_relational_resident_route(select);
-            if !decision.accepted || decision.query_shape != "int4_equality_multi_column_projection"
+            if !decision.accepted
+                || !matches!(
+                    decision.query_shape.as_str(),
+                    "int4_equality_projection" | "int4_equality_multi_column_projection"
+                )
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "resident device-memory equality batch currently supports only accepted int4 equality multi-column projection, got {}: {}",
+                    "resident device-memory equality batch currently supports only accepted int4 equality projection, got {}: {}",
                     decision.query_shape, decision.reason
                 ))));
             }
@@ -18935,7 +18939,7 @@ impl Engine {
                 || select.order_by.is_some()
                 || select.limit.is_some()
                 || select.offset.is_some()
-                || bound.selected_indexes.len() < 2
+                || bound.selected_indexes.is_empty()
                 || !bound
                     .selected_indexes
                     .iter()
@@ -18944,7 +18948,7 @@ impl Engine {
                 || filter_groups[0].len() != 1
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident device-memory equality batch currently supports SELECT int4_columns with one int4 equality predicate"
+                    "resident device-memory equality batch currently supports SELECT one_or_more_int4_columns with one int4 equality predicate"
                         .to_string(),
                 )));
             }
@@ -27565,6 +27569,35 @@ mod tests {
                     .saturating_sub(before.kernel_exec_samples)
             )
         );
+        assert_eq!(decision.last_execution_kernel_samples, Some(1));
+        assert_eq!(decision.last_execution_matched_rows, Some(2));
+
+        let single_column_selects = [
+            "SELECT id FROM events WHERE id = 1",
+            "SELECT id FROM events WHERE id = 3",
+        ]
+        .into_iter()
+        .map(|sql| {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            select
+        })
+        .collect::<Vec<_>>();
+        let single_column_results = e
+            .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
+                &single_column_selects,
+            )
+            .unwrap();
+        assert_eq!(single_column_results[0].rows, vec![vec![SqlValue::Int4(1)]]);
+        assert_eq!(single_column_results[1].rows, vec![vec![SqlValue::Int4(3)]]);
+        let decision = e
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision("events")
+            .unwrap()
+            .clone();
+        assert_eq!(decision.query_shape, "int4_equality_projection");
         assert_eq!(decision.last_execution_kernel_samples, Some(1));
         assert_eq!(decision.last_execution_matched_rows, Some(2));
     }

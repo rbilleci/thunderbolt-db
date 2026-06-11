@@ -391,6 +391,9 @@ impl EndpointState {
                                 .kernel_exec_samples
                                 .saturating_sub(before.kernel_exec_samples),
                             result_rows: result.rows.len(),
+                            microbatch_kind: "none",
+                            microbatch_size: 1,
+                            microbatch_unique_selects: 1,
                         },
                     )?;
                 }
@@ -500,6 +503,9 @@ impl EndpointState {
                         d2h_delta,
                         kernel_delta,
                         result_rows: result.rows.len(),
+                        microbatch_kind: "multi_literal_gpu",
+                        microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
+                        microbatch_unique_selects: u64::try_from(selects.len()).unwrap_or(u64::MAX),
                     },
                 )?;
             }
@@ -729,7 +735,7 @@ fn retained_select_literal_batch_candidate(
     let SelectProjection::Columns(projection_columns) = &select.projection else {
         return None;
     };
-    if projection_columns.len() < 2 {
+    if projection_columns.is_empty() {
         return None;
     }
     let filters = if !select.filter_groups.is_empty() {
@@ -855,13 +861,16 @@ struct SelectPhaseFact<'a> {
     d2h_delta: u64,
     kernel_delta: u64,
     result_rows: usize,
+    microbatch_kind: &'a str,
+    microbatch_size: u64,
+    microbatch_unique_selects: u64,
 }
 
 impl std::fmt::Display for SelectPhaseFact<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{}}}",
+            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{}}}",
             json_escape(self.sql),
             json_escape(self.query_shape),
             self.scheduler_queue_wait_micros,
@@ -878,7 +887,10 @@ impl std::fmt::Display for SelectPhaseFact<'_> {
             self.h2d_delta,
             self.d2h_delta,
             self.kernel_delta,
-            self.result_rows
+            self.result_rows,
+            json_escape(self.microbatch_kind),
+            self.microbatch_size,
+            self.microbatch_unique_selects
         )
     }
 }
