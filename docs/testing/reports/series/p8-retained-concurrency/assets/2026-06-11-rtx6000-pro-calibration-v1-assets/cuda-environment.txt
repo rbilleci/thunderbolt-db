@@ -1,0 +1,7 @@
+timestamp_utc=2026-06-11T18:23:19Z
+host=mvsm
+kernel=Linux 6.17.0-35-generic x86_64 GNU/Linux
+cargo=cargo 1.94.0 (85eff7c80 2026-01-15)
+rustc=rustc 1.94.0 (4a4ef493e 2026-03-02)
+nvidia_smi_query=
+0, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 595.71.05, 97887 MiB
