@@ -14,8 +14,8 @@ type DynError = Box<dyn Error + Send + Sync>;
 #[derive(Clone)]
 struct Args {
     url: String,
-    sql: String,
-    expected: String,
+    sqls: Vec<String>,
+    expecteds: Vec<String>,
     concurrency: usize,
     requests_per_client: usize,
     warmup_requests_per_client: usize,
@@ -33,10 +33,26 @@ struct RequestResult {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), DynError> {
+    let sql = required_env("GPU_DB_PERSISTENT_PGWIRE_SQL")?;
+    let expected = required_env("GPU_DB_PERSISTENT_PGWIRE_EXPECTED")?;
+    let sqls = env::var("GPU_DB_PERSISTENT_PGWIRE_SQL_LIST")
+        .ok()
+        .map(|value| split_list_env(&value))
+        .unwrap_or_else(|| vec![sql.clone()]);
+    let expecteds = env::var("GPU_DB_PERSISTENT_PGWIRE_EXPECTED_LIST")
+        .ok()
+        .map(|value| split_list_env(&value))
+        .unwrap_or_else(|| vec![expected.clone()]);
+    if sqls.len() != expecteds.len() {
+        return Err("GPU_DB_PERSISTENT_PGWIRE_SQL_LIST and GPU_DB_PERSISTENT_PGWIRE_EXPECTED_LIST must have the same length".into());
+    }
+    if sqls.is_empty() {
+        return Err("GPU_DB_PERSISTENT_PGWIRE_SQL_LIST must not be empty".into());
+    }
     let args = Args {
         url: required_env("GPU_DB_PERSISTENT_PGWIRE_URL")?,
-        sql: required_env("GPU_DB_PERSISTENT_PGWIRE_SQL")?,
-        expected: required_env("GPU_DB_PERSISTENT_PGWIRE_EXPECTED")?,
+        sqls,
+        expecteds,
         concurrency: parse_usize_env("GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY", 1)?,
         requests_per_client: parse_usize_env("GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT", 1)?,
         warmup_requests_per_client: parse_usize_env(
@@ -100,22 +116,23 @@ async fn run_client(
     let mut results = Vec::with_capacity(args.requests_per_client);
     barrier.wait().await;
     for _ in 0..args.warmup_requests_per_client {
-        let messages = client.simple_query(&args.sql).await?;
+        let (sql, expected) = request_sql_expected(&args, client_id, 0);
+        let messages = client.simple_query(sql).await?;
         let actual = simple_query_actual(&messages);
-        if actual != args.expected {
+        if actual != expected {
             return Err(format!(
-                "warmup request for client {client_id} returned {actual:?}, expected {:?}",
-                args.expected
+                "warmup request for client {client_id} returned {actual:?}, expected {expected:?}"
             )
             .into());
         }
     }
     for request_id in 1..=args.requests_per_client {
+        let (sql, expected) = request_sql_expected(&args, client_id, request_id);
         let started = Instant::now();
-        match client.simple_query(&args.sql).await {
+        match client.simple_query(sql).await {
             Ok(messages) => {
                 let actual = simple_query_actual(&messages);
-                let status = if actual == args.expected {
+                let status = if actual == expected {
                     "pass"
                 } else {
                     "wrong_result"
@@ -140,6 +157,15 @@ async fn run_client(
         }
     }
     Ok(results)
+}
+
+fn request_sql_expected(args: &Args, client_id: usize, request_id: usize) -> (&str, &str) {
+    let idx = (client_id + request_id).saturating_sub(1) % args.sqls.len();
+    (&args.sqls[idx], &args.expecteds[idx])
+}
+
+fn split_list_env(value: &str) -> Vec<String> {
+    value.split(";;").map(str::to_string).collect()
 }
 
 fn simple_query_actual(messages: &[SimpleQueryMessage]) -> String {
@@ -215,6 +241,7 @@ fn write_result_artifacts(
     )?;
     writeln!(summary, "client_driver=tokio-postgres/simple-query")?;
     writeln!(summary, "persistent_sessions={}", args.concurrency)?;
+    writeln!(summary, "sql_schedule_len={}", args.sqls.len())?;
     writeln!(summary, "requests_per_client={}", args.requests_per_client)?;
     writeln!(
         summary,

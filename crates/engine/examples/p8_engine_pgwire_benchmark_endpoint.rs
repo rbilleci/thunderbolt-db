@@ -11,7 +11,8 @@ use gpu_db_engine::{Engine, RelationalResidencyWarmupPolicy};
 use gpu_db_protocol::backend::{BackendColumn, BackendWriter};
 use gpu_db_protocol::{
     parse_command, parse_copy_from_stdin, parse_copy_row, parse_frontend_message,
-    parse_startup_packet, Command, CopyFromStdin, FrontendMessage, SqlValue, StartupPacket,
+    parse_startup_packet, Command, CopyFromStdin, FrontendMessage, Select, SelectFilterOp,
+    SelectProjection, SqlValue, StartupPacket,
 };
 
 const SSL_REQUEST_CODE: u32 = 80877103;
@@ -401,6 +402,112 @@ impl EndpointState {
         Ok(())
     }
 
+    fn handle_multi_literal_select_batch(
+        &mut self,
+        items: &[(String, Select)],
+        scheduler_queue_wait_micros: u64,
+    ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique_items = Vec::new();
+        let mut unique_by_needle = HashMap::new();
+        let mut item_to_unique = Vec::with_capacity(items.len());
+        for (sql, select) in items {
+            let needle = retained_select_literal_needle(select)
+                .ok_or("literal SELECT batch requires one int4 equality needle")?;
+            let unique_idx = if let Some(idx) = unique_by_needle.get(&needle) {
+                *idx
+            } else {
+                let idx = unique_items.len();
+                unique_by_needle.insert(needle, idx);
+                unique_items.push((sql.clone(), select.clone()));
+                idx
+            };
+            item_to_unique.push(unique_idx);
+        }
+        let selects = unique_items
+            .iter()
+            .map(|(_sql, select)| select.clone())
+            .collect::<Vec<_>>();
+        let before = self.engine.metrics().snapshot();
+        let execute_started = Instant::now();
+        let results = self
+            .engine
+            .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
+                &selects,
+            )?;
+        let engine_execute_micros = execute_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let after = self.engine.metrics().snapshot();
+        let decision = self
+            .engine
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision(&selects[0].table)
+            .cloned();
+        let batch_len = u64::try_from(items.len()).unwrap_or(u64::MAX).max(1);
+        let h2d_delta = after.h2d_bytes_total.saturating_sub(before.h2d_bytes_total) / batch_len;
+        let d2h_delta = after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total) / batch_len;
+        let kernel_delta = after
+            .kernel_exec_samples
+            .saturating_sub(before.kernel_exec_samples)
+            / batch_len;
+        let mut outputs = Vec::with_capacity(items.len());
+        for ((sql, _select), unique_idx) in items.iter().zip(item_to_unique) {
+            let result = &results[unique_idx];
+            let columns = result
+                .columns
+                .iter()
+                .map(|column| BackendColumn::new(&column.name, column.type_oid, column.type_size))
+                .collect::<Vec<_>>();
+            let mut output = Vec::new();
+            let mut writer = BackendWriter::new(&mut output);
+            let write_started = Instant::now();
+            let result_materialize_micros =
+                write_select_result_rows(&mut writer, &columns, &result.rows)?;
+            writer.ready_for_query(false)?;
+            let client_write_micros = write_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            if let Some(decision) = &decision {
+                self.fact(
+                    "select_phase_json",
+                    SelectPhaseFact {
+                        sql,
+                        query_shape: &decision.query_shape,
+                        scheduler_queue_wait_micros,
+                        engine_execute_micros,
+                        result_materialize_micros,
+                        client_write_micros,
+                        retained_wall_micros: decision.last_execution_wall_micros,
+                        retained_device_lookup_micros: decision.last_execution_device_lookup_micros,
+                        retained_match_index_micros: decision.last_execution_match_index_micros,
+                        retained_selected_projection_micros: decision
+                            .last_execution_selected_projection_micros,
+                        retained_result_materialization_micros: decision
+                            .last_execution_result_materialization_micros,
+                        retained_cuda_event_micros: decision.last_execution_kernel_event_elapsed_us,
+                        retained_matched_rows: decision
+                            .last_execution_matched_rows
+                            .map(|value| value.try_into().unwrap_or(u64::MAX)),
+                        h2d_delta,
+                        d2h_delta,
+                        kernel_delta,
+                        result_rows: result.rows.len(),
+                    },
+                )?;
+            }
+            outputs.push(output);
+        }
+        Ok(outputs)
+    }
+
     fn start_copy(
         &mut self,
         sql: &str,
@@ -561,6 +668,13 @@ struct EngineRequest {
     response_tx: mpsc::Sender<Result<EngineResponse, String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetainedSelectLiteralBatchKey {
+    table: String,
+    projection_columns: Vec<String>,
+    filter_column: String,
+}
+
 fn retained_select_microbatch_key(command: &EngineCommand) -> Option<&str> {
     let EngineCommand::SimpleQuery(sql) = command else {
         return None;
@@ -569,6 +683,78 @@ fn retained_select_microbatch_key(command: &EngineCommand) -> Option<&str> {
         Ok(Command::Select(_)) => Some(sql),
         _ => None,
     }
+}
+
+fn retained_select_literal_needle(select: &Select) -> Option<i32> {
+    if select.filter_groups.len() > 1 {
+        return None;
+    }
+    let filters = if !select.filter_groups.is_empty() {
+        select.filter_groups[0].clone()
+    } else if !select.filters.is_empty() {
+        select.filters.clone()
+    } else if let Some(filter) = select.filter.clone() {
+        vec![filter]
+    } else {
+        return None;
+    };
+    if filters.len() != 1 || filters[0].op != SelectFilterOp::Eq {
+        return None;
+    }
+    let SqlValue::Int4(needle) = filters[0].value else {
+        return None;
+    };
+    Some(needle)
+}
+
+fn retained_select_literal_batch_candidate(
+    command: &EngineCommand,
+) -> Option<(RetainedSelectLiteralBatchKey, i32, Select, String)> {
+    let EngineCommand::SimpleQuery(sql) = command else {
+        return None;
+    };
+    let Ok(Command::Select(select)) = parse_command(sql) else {
+        return None;
+    };
+    if select.distinct
+        || select.group_by.is_some()
+        || !select.having_groups.is_empty()
+        || select.order_by.is_some()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.filter_groups.len() > 1
+    {
+        return None;
+    }
+    let SelectProjection::Columns(projection_columns) = &select.projection else {
+        return None;
+    };
+    if projection_columns.len() < 2 {
+        return None;
+    }
+    let filters = if !select.filter_groups.is_empty() {
+        select.filter_groups[0].clone()
+    } else if !select.filters.is_empty() {
+        select.filters.clone()
+    } else if let Some(filter) = select.filter.clone() {
+        vec![filter]
+    } else {
+        return None;
+    };
+    if filters.len() != 1 || filters[0].op != SelectFilterOp::Eq {
+        return None;
+    }
+    let needle = retained_select_literal_needle(&select)?;
+    Some((
+        RetainedSelectLiteralBatchKey {
+            table: select.table.clone(),
+            projection_columns: projection_columns.clone(),
+            filter_column: filters[0].column.clone(),
+        },
+        needle,
+        select,
+        sql.clone(),
+    ))
 }
 
 fn request_engine(
@@ -946,6 +1132,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     state.fact("owner_thread_gpu_microbatch_max", gpu_microbatch_max)?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
+    state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
     state.fact("max_sessions", max_sessions)?;
     state.fact(
         "crate_direction",
@@ -956,6 +1143,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut deferred_requests = VecDeque::new();
     let mut gpu_microbatch_batches = 0_u64;
     let mut gpu_microbatch_coalesced_requests = 0_u64;
+    let mut gpu_literal_microbatch_batches = 0_u64;
+    let mut gpu_literal_microbatch_coalesced_requests = 0_u64;
     while completed < max_sessions {
         while completed_rx.try_recv().is_ok() {
             completed += 1;
@@ -968,8 +1157,39 @@ fn main() -> Result<(), Box<dyn Error>> {
         match next_request {
             Ok(request) => {
                 let mut batch = vec![request];
+                let mut literal_microbatch = false;
                 if gpu_microbatch_max > 1 {
-                    if let Some(batch_key) =
+                    if let Some((batch_key, _first_needle, _select, _sql)) =
+                        retained_select_literal_batch_candidate(&batch[0].command)
+                    {
+                        while batch.len() < gpu_microbatch_max {
+                            match request_rx.try_recv() {
+                                Ok(next) => {
+                                    if let Some((next_key, _next_needle, _select, _sql)) =
+                                        retained_select_literal_batch_candidate(&next.command)
+                                    {
+                                        if next_key == batch_key {
+                                            batch.push(next);
+                                        } else {
+                                            deferred_requests.push_back(next);
+                                            break;
+                                        }
+                                    } else {
+                                        deferred_requests.push_back(next);
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => break,
+                            }
+                        }
+                        let exact_key =
+                            retained_select_microbatch_key(&batch[0].command).unwrap_or_default();
+                        literal_microbatch = batch.len() > 1
+                            && !batch.iter().all(|request| {
+                                retained_select_microbatch_key(&request.command) == Some(exact_key)
+                            });
+                    } else if let Some(batch_key) =
                         retained_select_microbatch_key(&batch[0].command).map(str::to_string)
                     {
                         while batch.len() < gpu_microbatch_max {
@@ -991,9 +1211,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 if batch.len() > 1 {
-                    gpu_microbatch_batches = gpu_microbatch_batches.saturating_add(1);
-                    gpu_microbatch_coalesced_requests = gpu_microbatch_coalesced_requests
-                        .saturating_add(u64::try_from(batch.len() - 1).unwrap_or(u64::MAX));
+                    if literal_microbatch {
+                        gpu_literal_microbatch_batches =
+                            gpu_literal_microbatch_batches.saturating_add(1);
+                        gpu_literal_microbatch_coalesced_requests =
+                            gpu_literal_microbatch_coalesced_requests
+                                .saturating_add(u64::try_from(batch.len() - 1).unwrap_or(u64::MAX));
+                    } else {
+                        gpu_microbatch_batches = gpu_microbatch_batches.saturating_add(1);
+                        gpu_microbatch_coalesced_requests = gpu_microbatch_coalesced_requests
+                            .saturating_add(u64::try_from(batch.len() - 1).unwrap_or(u64::MAX));
+                    }
                 }
                 let scheduler_queue_wait_micros = batch[0]
                     .enqueued_at
@@ -1002,22 +1230,59 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .try_into()
                     .unwrap_or(u64::MAX);
                 if batch.len() > 1 {
-                    let result = (|| -> Result<Vec<u8>, Box<dyn Error>> {
-                        let EngineCommand::SimpleQuery(sql) = &batch[0].command else {
-                            return Err("only simple SELECT can be microbatched".into());
-                        };
-                        let mut output = Vec::new();
-                        state.handle_simple_query(sql, &mut output, scheduler_queue_wait_micros)?;
-                        state.flush_facts()?;
-                        Ok(output)
-                    })()
-                    .map_err(|err| err.to_string());
-                    for request in batch {
-                        let response = result
-                            .as_ref()
-                            .map(|bytes| EngineResponse::Bytes(bytes.clone()))
-                            .map_err(|err| err.clone());
-                        let _ = request.response_tx.send(response);
+                    if literal_microbatch {
+                        let result = (|| -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+                            let items = batch
+                                .iter()
+                                .map(|request| {
+                                    retained_select_literal_batch_candidate(&request.command)
+                                        .map(|(_key, _needle, select, sql)| (sql, select))
+                                        .ok_or("only compatible int4 equality SELECT can be literal-microbatched")
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let outputs = state.handle_multi_literal_select_batch(
+                                &items,
+                                scheduler_queue_wait_micros,
+                            )?;
+                            state.flush_facts()?;
+                            Ok(outputs)
+                        })()
+                        .map_err(|err| err.to_string());
+                        match result {
+                            Ok(outputs) => {
+                                for (request, output) in batch.into_iter().zip(outputs) {
+                                    let _ =
+                                        request.response_tx.send(Ok(EngineResponse::Bytes(output)));
+                                }
+                            }
+                            Err(err) => {
+                                for request in batch {
+                                    let _ = request.response_tx.send(Err(err.clone()));
+                                }
+                            }
+                        }
+                    } else {
+                        let result = (|| -> Result<Vec<u8>, Box<dyn Error>> {
+                            let EngineCommand::SimpleQuery(sql) = &batch[0].command else {
+                                return Err("only simple SELECT can be microbatched".into());
+                            };
+                            let mut output = Vec::new();
+                            state.handle_simple_query(
+                                sql,
+                                &mut output,
+                                scheduler_queue_wait_micros,
+                            )?;
+                            state.flush_facts()?;
+                            Ok(output)
+                        })()
+                        .map_err(|err| err.to_string());
+                        for request in batch {
+                            let response = result
+                                .as_ref()
+                                .map(|bytes| EngineResponse::Bytes(bytes.clone()))
+                                .map_err(|err| err.clone());
+                            let _ = request.response_tx.send(response);
+                        }
                     }
                 } else {
                     let request = batch.pop().expect("single request batch is non-empty");
@@ -1077,6 +1342,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_microbatch_coalesced_requests",
         gpu_microbatch_coalesced_requests,
+    )?;
+    state.fact(
+        "owner_thread_gpu_literal_microbatch_batches",
+        gpu_literal_microbatch_batches,
+    )?;
+    state.fact(
+        "owner_thread_gpu_literal_microbatch_coalesced_requests",
+        gpu_literal_microbatch_coalesced_requests,
     )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;

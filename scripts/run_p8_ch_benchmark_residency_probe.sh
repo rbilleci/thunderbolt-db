@@ -1292,6 +1292,8 @@ engine_pgwire_concurrency_metric() {
   local route_classification="$8"
   local retained_route="$9"
   local concurrency="${10}"
+  local sql_list="${11:-}"
+  local expected_list="${12:-}"
   local run_dir="${tmp_prefix}-${query_id}-c${concurrency}"
   local client_driver="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}"
   local requests_per_client="${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}"
@@ -1301,14 +1303,27 @@ engine_pgwire_concurrency_metric() {
 
   local wall_start_ns wall_end_ns wall_us throughput p50_us p95_us p99_us error_count correctness request_count
   if [ "$client_driver" = "tokio-postgres/simple-query" ]; then
-    GPU_DB_PERSISTENT_PGWIRE_URL="$url" \
-      GPU_DB_PERSISTENT_PGWIRE_SQL="$sql" \
-      GPU_DB_PERSISTENT_PGWIRE_EXPECTED="$expected" \
-      GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY="$concurrency" \
-      GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT="$requests_per_client" \
-      GPU_DB_PERSISTENT_PGWIRE_WARMUP_REQUESTS_PER_CLIENT="$warmup_requests_per_client" \
-      GPU_DB_PERSISTENT_PGWIRE_RUN_DIR="$run_dir" \
-      target/debug/examples/p8_persistent_pgwire_concurrency_runner >"$run_dir/runner.out" 2>"$run_dir/runner.err"
+    if [ -n "$sql_list" ]; then
+      GPU_DB_PERSISTENT_PGWIRE_URL="$url" \
+        GPU_DB_PERSISTENT_PGWIRE_SQL="$sql" \
+        GPU_DB_PERSISTENT_PGWIRE_EXPECTED="$expected" \
+        GPU_DB_PERSISTENT_PGWIRE_SQL_LIST="$sql_list" \
+        GPU_DB_PERSISTENT_PGWIRE_EXPECTED_LIST="$expected_list" \
+        GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY="$concurrency" \
+        GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT="$requests_per_client" \
+        GPU_DB_PERSISTENT_PGWIRE_WARMUP_REQUESTS_PER_CLIENT="$warmup_requests_per_client" \
+        GPU_DB_PERSISTENT_PGWIRE_RUN_DIR="$run_dir" \
+        target/debug/examples/p8_persistent_pgwire_concurrency_runner >"$run_dir/runner.out" 2>"$run_dir/runner.err"
+    else
+      GPU_DB_PERSISTENT_PGWIRE_URL="$url" \
+        GPU_DB_PERSISTENT_PGWIRE_SQL="$sql" \
+        GPU_DB_PERSISTENT_PGWIRE_EXPECTED="$expected" \
+        GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY="$concurrency" \
+        GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT="$requests_per_client" \
+        GPU_DB_PERSISTENT_PGWIRE_WARMUP_REQUESTS_PER_CLIENT="$warmup_requests_per_client" \
+        GPU_DB_PERSISTENT_PGWIRE_RUN_DIR="$run_dir" \
+        target/debug/examples/p8_persistent_pgwire_concurrency_runner >"$run_dir/runner.out" 2>"$run_dir/runner.err"
+    fi
     # shellcheck disable=SC1091
     . "$run_dir/summary.env"
     throughput="$throughput_qps"
@@ -1765,7 +1780,7 @@ write_engine_backed_pgwire_concurrency_smoke() {
   local server_log="$smoke_dir/engine-pgwire-endpoint.log"
   local facts_path="$smoke_dir/endpoint-facts.txt"
   local max_sessions
-  max_sessions="$(pgwire_required_engine_sessions "$targets" 2)"
+  max_sessions="$(pgwire_required_engine_sessions "$targets" 3)"
   : >"$metrics_path"
 
   if ! command -v psql >/dev/null 2>&1; then
@@ -1840,13 +1855,29 @@ REPORT
     return 0
   fi
 
-  local expected_count lookup_key lookup_item lookup_qty lookup_amount tmp_prefix concurrency
+  local expected_count lookup_key lookup_item lookup_qty lookup_amount tmp_prefix concurrency literal_variants literal_sql_list literal_expected_list
   expected_count="$rows"
   lookup_key=$(((rows + 1) / 2))
   lookup_item=$(((lookup_key % 100000) + 1))
   lookup_qty=$(((lookup_key % 50) + 1))
   lookup_amount=$(((lookup_key * 17) % 100000))
   tmp_prefix="$smoke_dir/concurrent-query"
+  literal_variants="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_LITERAL_VARIANTS:-16}"
+  literal_sql_list=""
+  literal_expected_list=""
+  local literal_idx literal_key literal_item literal_qty literal_amount
+  for literal_idx in $(seq 1 "$literal_variants"); do
+    literal_key=$(( ((literal_idx - 1) % rows) + 1 ))
+    literal_item=$(((literal_key % 100000) + 1))
+    literal_qty=$(((literal_key % 50) + 1))
+    literal_amount=$(((literal_key * 17) % 100000))
+    if [ -n "$literal_sql_list" ]; then
+      literal_sql_list="${literal_sql_list};;"
+      literal_expected_list="${literal_expected_list};;"
+    fi
+    literal_sql_list="${literal_sql_list}SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $literal_key"
+    literal_expected_list="${literal_expected_list}${literal_key}|${literal_item}|${literal_qty}|${literal_amount}"
+  done
 
   cat >"$curve_path" <<CSV
 tier,target,profile,client_driver,query,concurrency,status,blocker,route_classification,retained_gpu_route,saturation_note
@@ -1862,10 +1893,16 @@ CSV
       "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
       "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
       "$tmp_prefix" retained_engine_int4_equality_multi_column_projection true "$concurrency"
+    engine_pgwire_concurrency_metric "$url" "$metrics_path" "$curve_path" \
+      order_line_lookup_ol_o_id_multi_column_literal_batch \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
+      "$tmp_prefix" retained_engine_int4_equality_multi_column_projection true "$concurrency" \
+      "$literal_sql_list" "$literal_expected_list"
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"multi_literal_batched_retained_equality_lookup","decision":"cache-off retained reads should stay on the GPU path; optimize compatible lookup batching before considering CPU routing","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"multi_literal_batched_retained_equality_lookup","decision":"cache-off retained reads should stay on the GPU path; optimize compatible lookup batching before considering CPU routing","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1899,12 +1936,14 @@ retained device pointers.
 
 The scaled run seeds \`order_line\` through SQL-visible \`CREATE TABLE\` plus
 \`COPY FROM STDIN\`, then runs real overlapping persistent PostgreSQL-compatible
-simple-query sessions for the requested concurrency targets. The graph-ready curve records retained
-\`COUNT(*)\` and retained multi-column int4 lookup rows with p50/p95/p99,
-throughput, error count, correctness status, retained-route classification, and
-owner-thread scheduler evidence. The JSON metrics also attach retained endpoint
-phase aggregates for scheduler queue wait, engine execute, retained wall time,
-CUDA event time, D2H bytes, result materialization, and client response write.
+simple-query sessions for the requested concurrency targets. The graph-ready
+curve records retained \`COUNT(*)\`, exact retained multi-column int4 lookup,
+and a varied-literal retained multi-column int4 lookup schedule with
+p50/p95/p99, throughput, error count, correctness status, retained-route
+classification, and owner-thread scheduler evidence. The JSON metrics also
+attach retained endpoint phase aggregates for scheduler queue wait, engine
+execute, retained wall time, CUDA event time, D2H bytes, result materialization,
+and client response write.
 
 ## Decision
 

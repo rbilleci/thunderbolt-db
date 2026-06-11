@@ -18899,6 +18899,261 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
+        &mut self,
+        selects: &[Select],
+    ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+        if selects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut members = Vec::with_capacity(selects.len());
+        let mut batch_table: Option<RelationalTable> = None;
+        let mut batch_filter_idx: Option<usize> = None;
+        let mut batch_selected_indexes: Option<Vec<usize>> = None;
+        for select in selects {
+            let decision = self.plan_relational_resident_route(select);
+            if !decision.accepted || decision.query_shape != "int4_equality_multi_column_projection"
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident device-memory equality batch currently supports only accepted int4 equality multi-column projection, got {}: {}",
+                    decision.query_shape, decision.reason
+                ))));
+            }
+            let (table, bound) = self.bind_relational_select_for_execution(select)?;
+            let filter_groups = if !bound.filter_groups.is_empty() {
+                bound.filter_groups.clone()
+            } else if !bound.filters.is_empty() {
+                vec![bound.filters.clone()]
+            } else if let Some(filter) = bound.filter.clone() {
+                vec![vec![filter]]
+            } else {
+                Vec::new()
+            };
+            if select.distinct
+                || select.group_by.is_some()
+                || !select.having_groups.is_empty()
+                || select.order_by.is_some()
+                || select.limit.is_some()
+                || select.offset.is_some()
+                || bound.selected_indexes.len() < 2
+                || !bound
+                    .selected_indexes
+                    .iter()
+                    .all(|idx| table.columns[*idx].ty == SqlType::Int4)
+                || filter_groups.len() != 1
+                || filter_groups[0].len() != 1
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory equality batch currently supports SELECT int4_columns with one int4 equality predicate"
+                        .to_string(),
+                )));
+            }
+            let (filter_idx, op, value) = filter_groups[0][0].clone();
+            let SqlValue::Int4(needle) = value else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory equality batch currently supports only int4 equality predicates"
+                        .to_string(),
+                )));
+            };
+            if op != SelectFilterOp::Eq || table.columns[filter_idx].ty != SqlType::Int4 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory equality batch currently supports only int4 equality predicates"
+                        .to_string(),
+                )));
+            }
+            if let Some(existing) = &batch_table {
+                if existing.name != table.name
+                    || existing.schema != table.schema
+                    || existing.columns != table.columns
+                {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident device-memory equality batch cannot mix tables".to_string(),
+                    )));
+                }
+            } else {
+                batch_table = Some(table.clone());
+            }
+            if batch_filter_idx.is_some_and(|existing| existing != filter_idx) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory equality batch cannot mix predicate columns"
+                        .to_string(),
+                )));
+            }
+            batch_filter_idx = Some(filter_idx);
+            if batch_selected_indexes
+                .as_ref()
+                .is_some_and(|existing| existing != &bound.selected_indexes)
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory equality batch cannot mix projection columns"
+                        .to_string(),
+                )));
+            }
+            batch_selected_indexes = Some(bound.selected_indexes.clone());
+            let (_query, access_path) =
+                self.relational_select_mvcc_query(select, &table, &bound)?;
+            members.push((bound, access_path, needle));
+        }
+
+        let table = batch_table.expect("non-empty batch has table");
+        let filter_idx = batch_filter_idx.expect("non-empty batch has filter");
+        let selected_indexes = batch_selected_indexes.expect("non-empty batch has projections");
+        let snapshot = self
+            .relational_residency_snapshot_ref(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let snapshot_gpu_id = snapshot.gpu_id;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let filter_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
+        let projection_offsets = selected_indexes
+            .iter()
+            .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+            .collect::<Result<Vec<_>, ExecuteError>>()?;
+        let needles = members
+            .iter()
+            .map(|(_bound, _access_path, needle)| *needle)
+            .collect::<Vec<_>>();
+
+        if let Some(device_memory) = self
+            .relational_resident_cache
+            .device_memory
+            .get(&table.name)
+        {
+            device_memory.clear_last_kernel_event_elapsed_us();
+        }
+        let before_metrics = self.metrics.snapshot();
+        let batch_started = Instant::now();
+        let projected_rows = {
+            let device_memory = self
+                .relational_resident_cache
+                .device_memory
+                .get(&table.name)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" has no retained resident device memory",
+                        table.name
+                    )))
+                })?;
+            device_memory
+                .match_project_i32_equal_any_from_payload(
+                    filter_offset,
+                    &needles,
+                    &projection_offsets,
+                    row_count,
+                )
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
+        };
+        let batch_micros = batch_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let materialize_started = Instant::now();
+        let mut rows_by_select = vec![Vec::new(); members.len()];
+        for projected in projected_rows {
+            rows_by_select[projected.needle_index].push(
+                projected
+                    .values
+                    .into_iter()
+                    .map(SqlValue::Int4)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let materialization_micros = materialize_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let total_rows = rows_by_select.iter().map(Vec::len).sum::<usize>();
+        let result_d2h_bytes = total_rows
+            .checked_mul(selected_indexes.len())
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<i32>()))
+            .and_then(|bytes| bytes.checked_add(total_rows * std::mem::size_of::<u32>()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u32>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX);
+        self.metrics.observe_d2h_bytes(result_d2h_bytes);
+        self.metrics
+            .observe_kernel_exec_ms(batch_micros.div_ceil(1000).max(1));
+        let kernel_event_elapsed_us = self
+            .relational_resident_cache
+            .device_memory
+            .get(&table.name)
+            .and_then(|device_memory| device_memory.last_kernel_event_elapsed_us());
+        if let Some(elapsed_us) = kernel_event_elapsed_us {
+            self.metrics.observe_kernel_event_elapsed_us(elapsed_us);
+        }
+        self.relational_resident_cache
+            .record_route_selected_projection_micros(
+                &table.name,
+                batch_micros,
+                batch_micros,
+                materialization_micros,
+                total_rows,
+            );
+        let after_metrics = self.metrics.snapshot();
+        self.relational_resident_cache
+            .record_route_execution_observation(
+                &table.name,
+                RelationalResidentRouteExecutionObservation {
+                    h2d_bytes: after_metrics
+                        .h2d_bytes_total
+                        .saturating_sub(before_metrics.h2d_bytes_total),
+                    d2h_bytes: after_metrics
+                        .d2h_bytes_total
+                        .saturating_sub(before_metrics.d2h_bytes_total),
+                    kernel_samples: after_metrics
+                        .kernel_exec_samples
+                        .saturating_sub(before_metrics.kernel_exec_samples),
+                    kernel_ms: after_metrics
+                        .kernel_exec_total_ms
+                        .saturating_sub(before_metrics.kernel_exec_total_ms),
+                    kernel_event_elapsed_us,
+                    rows: total_rows,
+                    wall_micros: batch_started
+                        .elapsed()
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                },
+            );
+
+        Ok(members
+            .into_iter()
+            .zip(rows_by_select)
+            .map(
+                |((bound, access_path, _needle), rows)| RelationalSelectResult {
+                    columns: bound.selected_columns,
+                    rows,
+                    planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
+                    executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
+                    fallback_reason: None,
+                    access_path,
+                },
+            )
+            .collect())
+    }
+
     pub fn execute_relational_distinct_projection_with_resident_device_memory_probe(
         &mut self,
         select: &Select,
@@ -27224,6 +27479,94 @@ mod tests {
             unsupported.reason,
             "resident routing has no retained-kernel proof for this SELECT shape"
         );
+    }
+
+    #[test]
+    fn p8_resident_route_batches_int4_equality_projection_literals() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE events (id INT, bucket INT, amount INT, label TEXT)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, bucket, amount, label) VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 30, 'alpine')",
+        )
+        .unwrap();
+        e.populate_relational_residency_snapshot("events").unwrap();
+
+        let selects = [
+            "SELECT id, bucket, amount FROM events WHERE id = 1",
+            "SELECT id, bucket, amount FROM events WHERE id = 3",
+        ]
+        .into_iter()
+        .map(|sql| {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            select
+        })
+        .collect::<Vec<_>>();
+        let route = e.plan_relational_resident_route(&selects[0]);
+        if !route.accepted {
+            assert_eq!(
+                route.reason,
+                "resident snapshot has no retained device memory"
+            );
+            return;
+        }
+
+        let before = e.metrics().snapshot();
+        let results = e
+            .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
+                &selects,
+            )
+            .unwrap();
+        let after = e.metrics().snapshot();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].rows,
+            vec![vec![
+                SqlValue::Int4(1),
+                SqlValue::Int4(1),
+                SqlValue::Int4(10)
+            ]]
+        );
+        assert_eq!(
+            results[1].rows,
+            vec![vec![
+                SqlValue::Int4(3),
+                SqlValue::Int4(2),
+                SqlValue::Int4(30)
+            ]]
+        );
+        for result in &results {
+            assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+            assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(result.fallback_reason, None);
+        }
+        let decision = e
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision("events")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            decision.query_shape,
+            "int4_equality_multi_column_projection"
+        );
+        assert_eq!(decision.last_execution_h2d_bytes, Some(0));
+        assert_eq!(
+            decision.last_execution_kernel_samples,
+            Some(
+                after
+                    .kernel_exec_samples
+                    .saturating_sub(before.kernel_exec_samples)
+            )
+        );
+        assert_eq!(decision.last_execution_kernel_samples, Some(1));
+        assert_eq!(decision.last_execution_matched_rows, Some(2));
     }
 
     #[test]

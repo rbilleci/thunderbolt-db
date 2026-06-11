@@ -262,6 +262,22 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_equal_project(self, filters, projection_offsets, row_count)
     }
 
+    pub fn match_project_i32_equal_any_from_payload(
+        &self,
+        filter_offset: u64,
+        needles: &[i32],
+        projection_offsets: &[u64],
+        row_count: u64,
+    ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_equal_any_project(
+            self,
+            filter_offset,
+            needles,
+            projection_offsets,
+            row_count,
+        )
+    }
+
     pub fn match_i32_equal_row_indices_from_payload(
         &self,
         filters: &[(u64, i32)],
@@ -453,6 +469,12 @@ pub struct CudaI32GroupedStats {
     pub sum: i64,
     pub min: i32,
     pub max: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaI32BatchProjectionRow {
+    pub needle_index: usize,
+    pub values: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2443,6 +2465,468 @@ DONE:
         .chunks_exact(projection_count)
         .map(|row| row.to_vec())
         .collect())
+}
+
+fn launch_cuda_resident_i32_equal_any_project(
+    resident: &CudaResidentDeviceMemory,
+    filter_offset: u64,
+    needles: &[i32],
+    projection_offsets: &[u64],
+    row_count: u64,
+) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const MAX_PROJECTIONS: usize = 4;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_equal_any_project(
+    .param .u64 resident_ptr,
+    .param .u64 row_count,
+    .param .u32 needle_count,
+    .param .u32 projection_count,
+    .param .u64 filter_offset,
+    .param .u64 projection_offset0,
+    .param .u64 projection_offset1,
+    .param .u64 projection_offset2,
+    .param .u64 projection_offset3,
+    .param .u64 needles_ptr,
+    .param .u64 out_values_ptr,
+    .param .u64 out_needle_indices_ptr,
+    .param .u64 out_count_ptr
+)
+{
+    .reg .pred %p_out;
+    .reg .pred %p_done;
+    .reg .pred %p_match;
+    .reg .u32 %r_tid;
+    .reg .u32 %r_block;
+    .reg .u32 %r_block_dim;
+    .reg .u32 %idx32;
+    .reg .u32 %needle_count;
+    .reg .u32 %projection_count;
+    .reg .u32 %needle_idx;
+    .reg .u32 %slot;
+    .reg .u32 %one;
+    .reg .u64 %idx;
+    .reg .u64 %rows;
+    .reg .u64 %resident;
+    .reg .u64 %filter_offset;
+    .reg .u64 %projection_offset0;
+    .reg .u64 %projection_offset1;
+    .reg .u64 %projection_offset2;
+    .reg .u64 %projection_offset3;
+    .reg .u64 %needles;
+    .reg .u64 %out_values;
+    .reg .u64 %out_needle_indices;
+    .reg .u64 %out_count;
+    .reg .u64 %row_byte;
+    .reg .u64 %addr;
+    .reg .u64 %needle_byte;
+    .reg .u64 %slot64;
+    .reg .u64 %projection_count64;
+    .reg .u64 %base_slot;
+    .reg .u64 %out_addr;
+    .reg .s32 %row_value;
+    .reg .s32 %needle_value;
+    .reg .s32 %projection_value;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u32 %needle_count, [needle_count];
+    ld.param.u32 %projection_count, [projection_count];
+    ld.param.u64 %filter_offset, [filter_offset];
+    ld.param.u64 %projection_offset0, [projection_offset0];
+    ld.param.u64 %projection_offset1, [projection_offset1];
+    ld.param.u64 %projection_offset2, [projection_offset2];
+    ld.param.u64 %projection_offset3, [projection_offset3];
+    ld.param.u64 %needles, [needles_ptr];
+    ld.param.u64 %out_values, [out_values_ptr];
+    ld.param.u64 %out_needle_indices, [out_needle_indices_ptr];
+    ld.param.u64 %out_count, [out_count_ptr];
+
+    mov.u32 %r_tid, %tid.x;
+    mov.u32 %r_block, %ctaid.x;
+    mov.u32 %r_block_dim, %ntid.x;
+    mad.lo.u32 %idx32, %r_block, %r_block_dim, %r_tid;
+    cvt.u64.u32 %idx, %idx32;
+
+    setp.ge.u64 %p_out, %idx, %rows;
+    @%p_out bra DONE;
+    setp.eq.u32 %p_done, %needle_count, 0;
+    @%p_done bra DONE;
+    setp.eq.u32 %p_done, %projection_count, 0;
+    @%p_done bra DONE;
+
+    mul.lo.u64 %row_byte, %idx, 4;
+    add.u64 %addr, %resident, %filter_offset;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %row_value, [%addr];
+
+    mov.u32 %needle_idx, 0;
+NEEDLE_LOOP:
+    setp.ge.u32 %p_done, %needle_idx, %needle_count;
+    @%p_done bra DONE;
+    cvt.u64.u32 %needle_byte, %needle_idx;
+    mul.lo.u64 %needle_byte, %needle_byte, 4;
+    add.u64 %addr, %needles, %needle_byte;
+    ld.global.s32 %needle_value, [%addr];
+    setp.eq.s32 %p_match, %row_value, %needle_value;
+    @%p_match bra MATCHED;
+    add.u32 %needle_idx, %needle_idx, 1;
+    bra NEEDLE_LOOP;
+
+MATCHED:
+    mov.u32 %one, 1;
+    atom.global.add.u32 %slot, [%out_count], %one;
+    cvt.u64.u32 %slot64, %slot;
+
+    mul.lo.u64 %out_addr, %slot64, 4;
+    add.u64 %out_addr, %out_needle_indices, %out_addr;
+    st.global.u32 [%out_addr], %needle_idx;
+
+    cvt.u64.u32 %projection_count64, %projection_count;
+    mul.lo.u64 %base_slot, %slot64, %projection_count64;
+    mul.lo.u64 %base_slot, %base_slot, 4;
+
+    add.u64 %addr, %resident, %projection_offset0;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %projection_value, [%addr];
+    add.u64 %out_addr, %out_values, %base_slot;
+    st.global.s32 [%out_addr], %projection_value;
+
+    setp.le.u32 %p_done, %projection_count, 1;
+    @%p_done bra DONE;
+    add.u64 %addr, %resident, %projection_offset1;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %projection_value, [%addr];
+    add.u64 %out_addr, %out_values, %base_slot;
+    add.u64 %out_addr, %out_addr, 4;
+    st.global.s32 [%out_addr], %projection_value;
+
+    setp.le.u32 %p_done, %projection_count, 2;
+    @%p_done bra DONE;
+    add.u64 %addr, %resident, %projection_offset2;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %projection_value, [%addr];
+    add.u64 %out_addr, %out_values, %base_slot;
+    add.u64 %out_addr, %out_addr, 8;
+    st.global.s32 [%out_addr], %projection_value;
+
+    setp.le.u32 %p_done, %projection_count, 3;
+    @%p_done bra DONE;
+    add.u64 %addr, %resident, %projection_offset3;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %projection_value, [%addr];
+    add.u64 %out_addr, %out_values, %base_slot;
+    add.u64 %out_addr, %out_addr, 12;
+    st.global.s32 [%out_addr], %projection_value;
+
+DONE:
+    ret;
+}
+"#;
+
+    if needles.is_empty() {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+    if projection_offsets.is_empty() || projection_offsets.len() > MAX_PROJECTIONS {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            projection_offsets.len(),
+        ));
+    }
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+    let filter_bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| filter_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if filter_bytes > resident.metadata.allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            filter_bytes as usize,
+        ));
+    }
+    for byte_offset in projection_offsets {
+        let bytes = row_count
+            .checked_mul(std::mem::size_of::<i32>() as u64)
+            .and_then(|bytes| byte_offset.checked_add(bytes))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if bytes > resident.metadata.allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+        }
+    }
+    let row_count_u32 = u32::try_from(row_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let needle_count_u32 = u32::try_from(needles.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(needles.len()))?;
+    let output_cells = row_count
+        .checked_mul(projection_offsets.len() as u64)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_bytes = usize::try_from(
+        output_cells
+            .checked_mul(std::mem::size_of::<i32>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_indices_bytes = usize::try_from(
+        row_count
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let needle_bytes = needles
+        .len()
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_mem_alloc = unsafe {
+        resident
+            ._lib
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        resident
+            ._lib
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memset_d8 = unsafe {
+        resident
+            ._lib
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            ._lib
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        resident
+            ._lib
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut device_needles = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_needles, needle_bytes) })?;
+    let needles_guard = CudaDeviceAllocationGuard {
+        ptr: device_needles,
+        free: *cu_mem_free,
+    };
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            needles_guard.ptr,
+            needles.as_ptr().cast::<c_void>(),
+            needle_bytes,
+        )
+    })?;
+
+    let mut device_values = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_values, output_bytes) })?;
+    let values_guard = CudaDeviceAllocationGuard {
+        ptr: device_values,
+        free: *cu_mem_free,
+    };
+    let mut device_needle_indices = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_needle_indices, output_indices_bytes) })?;
+    let indices_guard = CudaDeviceAllocationGuard {
+        ptr: device_needle_indices,
+        free: *cu_mem_free,
+    };
+    let mut device_count = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_count, std::mem::size_of::<u32>()) })?;
+    let count_guard = CudaDeviceAllocationGuard {
+        ptr: device_count,
+        free: *cu_mem_free,
+    };
+    check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(
+            &mut function,
+            module,
+            c"gpu_db_resident_i32_equal_any_project".as_ptr(),
+        )
+    })?;
+
+    let mut resident_arg = resident.device_ptr;
+    let mut rows_arg = row_count;
+    let mut needle_count_arg = needle_count_u32;
+    let mut projection_count_arg = u32::try_from(projection_offsets.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(projection_offsets.len()))?;
+    let mut filter_offset_arg = filter_offset;
+    let mut projected_offsets = [0_u64; MAX_PROJECTIONS];
+    for (idx, offset) in projection_offsets.iter().enumerate() {
+        projected_offsets[idx] = *offset;
+    }
+    let mut needles_arg = needles_guard.ptr;
+    let mut output_arg = values_guard.ptr;
+    let mut indices_arg = indices_guard.ptr;
+    let mut count_arg = count_guard.ptr;
+    let mut args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_count_arg as *mut u32).cast::<c_void>(),
+        (&mut projection_count_arg as *mut u32).cast::<c_void>(),
+        (&mut filter_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[0] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[1] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[2] as *mut u64).cast::<c_void>(),
+        (&mut projected_offsets[3] as *mut u64).cast::<c_void>(),
+        (&mut needles_arg as *mut u64).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut indices_arg as *mut u64).cast::<c_void>(),
+        (&mut count_arg as *mut u64).cast::<c_void>(),
+    ];
+    let threads_per_block = 128;
+    let blocks = row_count_u32.div_ceil(threads_per_block);
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
+        cu_launch_kernel(
+            function,
+            blocks,
+            1,
+            1,
+            threads_per_block,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+
+    let mut match_count = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut match_count as *mut u32).cast::<c_void>(),
+            count_guard.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    let match_count = u64::from(match_count);
+    if match_count > row_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    let match_count_usize = usize::try_from(match_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let projection_count = projection_offsets.len();
+    let mut values = vec![0_i32; match_count_usize.saturating_mul(projection_count)];
+    if !values.is_empty() {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                values.as_mut_ptr().cast::<c_void>(),
+                values_guard.ptr,
+                values.len() * std::mem::size_of::<i32>(),
+            )
+        })?;
+    }
+    let mut needle_indices = vec![0_u32; match_count_usize];
+    if !needle_indices.is_empty() {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                needle_indices.as_mut_ptr().cast::<c_void>(),
+                indices_guard.ptr,
+                needle_indices.len() * std::mem::size_of::<u32>(),
+            )
+        })?;
+    }
+
+    drop(module_guard);
+    drop(count_guard);
+    drop(indices_guard);
+    drop(values_guard);
+    drop(needles_guard);
+    values
+        .chunks_exact(projection_count)
+        .zip(needle_indices)
+        .map(|(row, needle_index)| {
+            let needle_index = usize::try_from(needle_index)
+                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if needle_index >= needles.len() {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index));
+            }
+            Ok(CudaI32BatchProjectionRow {
+                needle_index,
+                values: row.to_vec(),
+            })
+        })
+        .collect()
 }
 
 fn launch_cuda_resident_i32_equal_row_indices(
