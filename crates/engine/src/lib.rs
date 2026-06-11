@@ -18697,6 +18697,67 @@ impl Engine {
                     .to_string(),
             ))
         })?;
+        if bound
+            .selected_indexes
+            .iter()
+            .all(|idx| table.columns[*idx].ty == SqlType::Int4)
+        {
+            let projection_offsets = bound
+                .selected_indexes
+                .iter()
+                .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+                .collect::<Result<Vec<_>, ExecuteError>>()?;
+            let fused_started = Instant::now();
+            let projected_rows = device_memory
+                .match_project_i32_equal_from_payload(
+                    &filter_offsets,
+                    &projection_offsets,
+                    row_count,
+                )
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            let fused_micros = fused_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            let materialize_started = Instant::now();
+            let rows = projected_rows
+                .into_iter()
+                .map(|row| row.into_iter().map(SqlValue::Int4).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            let materialization_micros = materialize_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            let result_d2h_bytes = rows
+                .len()
+                .checked_mul(bound.selected_indexes.len())
+                .and_then(|cells| cells.checked_mul(std::mem::size_of::<i32>()))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u32>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX);
+            self.metrics.observe_d2h_bytes(result_d2h_bytes);
+            self.metrics
+                .observe_kernel_exec_ms(fused_micros.div_ceil(1000).max(1));
+            self.relational_resident_cache
+                .record_route_selected_projection_micros(
+                    &table.name,
+                    fused_micros,
+                    fused_micros,
+                    materialization_micros,
+                    rows.len(),
+                );
+
+            return Ok(RelationalSelectResult {
+                columns: bound.selected_columns,
+                rows,
+                planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
+                executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
+                fallback_reason: None,
+                access_path,
+            });
+        }
         let match_started = Instant::now();
         let matching_row_indices = device_memory
             .match_i32_equal_row_indices_from_payload(&filter_offsets, row_count)
@@ -27262,12 +27323,7 @@ mod tests {
         );
         assert_eq!(
             decision.last_execution_d2h_bytes,
-            Some(
-                (2 * 2 * std::mem::size_of::<i32>()
-                    + std::mem::size_of::<u64>()
-                    + 2 * std::mem::size_of::<u64>()
-                    + std::mem::size_of::<u64>()) as u64
-            )
+            Some((2 * 2 * std::mem::size_of::<i32>() + std::mem::size_of::<u32>()) as u64)
         );
 
         let Command::Select(composite) =
@@ -27316,12 +27372,7 @@ mod tests {
         );
         assert_eq!(
             decision.last_execution_d2h_bytes,
-            Some(
-                (2 * std::mem::size_of::<i32>()
-                    + std::mem::size_of::<u64>()
-                    + std::mem::size_of::<u64>()
-                    + std::mem::size_of::<u64>()) as u64
-            )
+            Some((2 * std::mem::size_of::<i32>() + std::mem::size_of::<u32>()) as u64)
         );
 
         let Command::Select(mixed_composite) =
