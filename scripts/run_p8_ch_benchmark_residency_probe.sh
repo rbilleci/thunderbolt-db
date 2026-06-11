@@ -1865,7 +1865,7 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"route_aware_admission_and_response_scheduling_without_cache","decision":"cache-off retained reads still expose the owner-thread queue boundary; keep retained response cache opt-in and optimize non-cacheable OLTP paths","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"multi_literal_batched_retained_equality_lookup","decision":"cache-off retained reads should stay on the GPU path; optimize compatible lookup batching before considering CPU routing","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1882,8 +1882,8 @@ JSON
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false
-- next_target: route_aware_admission_and_response_scheduling_without_cache
-- decision: cache-off retained reads still expose the owner-thread queue boundary
+- next_target: multi_literal_batched_retained_equality_lookup
+- decision: cache-off retained reads should stay on the GPU path and batch compatible lookup work before CPU routing
 - endpoint_facts: $facts_path
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
@@ -1911,15 +1911,16 @@ CUDA event time, D2H bytes, result materialization, and client response write.
 The retained-read response cache remains available as an opt-in fast path for
 repeated identical \`SELECT\` requests, but the default benchmark path keeps it
 disabled so cache-off OLTP-style retained reads continue to expose the real
-owner-thread queue boundary. The next optimization target is route-aware
-admission and response scheduling without relying on cache hits.
+owner-thread queue boundary. The next optimization target is multi-literal
+retained equality batching: group compatible lookup predicates with different
+literal values, submit one GPU batch, and demultiplex results back to waiters.
 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
 REPORT
   kill "$server_pid" >/dev/null 2>&1 || true
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=route_aware_admission_and_response_scheduling_without_cache artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=multi_literal_batched_retained_equality_lookup artifact=$report_path"
   return 0
 }
 

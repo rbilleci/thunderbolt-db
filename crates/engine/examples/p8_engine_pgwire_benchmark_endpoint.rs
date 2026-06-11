@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
@@ -561,6 +561,16 @@ struct EngineRequest {
     response_tx: mpsc::Sender<Result<EngineResponse, String>>,
 }
 
+fn retained_select_microbatch_key(command: &EngineCommand) -> Option<&str> {
+    let EngineCommand::SimpleQuery(sql) = command else {
+        return None;
+    };
+    match parse_command(sql) {
+        Ok(Command::Select(_)) => Some(sql),
+        _ => None,
+    }
+}
+
 fn request_engine(
     request_tx: &mpsc::Sender<EngineRequest>,
     command: EngineCommand,
@@ -881,6 +891,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
+    let gpu_microbatch_max = std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_MAX")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64);
 
     let listener = TcpListener::bind(&listen)?;
     let (request_tx, request_rx) = mpsc::channel::<EngineRequest>();
@@ -929,6 +944,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "retained_read_response_cache_enabled",
         retained_read_response_cache_enabled,
     )?;
+    state.fact("owner_thread_gpu_microbatch_max", gpu_microbatch_max)?;
+    state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("max_sessions", max_sessions)?;
     state.fact(
         "crate_direction",
@@ -936,56 +953,113 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     let mut completed = 0;
+    let mut deferred_requests = VecDeque::new();
+    let mut gpu_microbatch_batches = 0_u64;
+    let mut gpu_microbatch_coalesced_requests = 0_u64;
     while completed < max_sessions {
         while completed_rx.try_recv().is_ok() {
             completed += 1;
         }
-        match request_rx.recv_timeout(Duration::from_millis(50)) {
+        let next_request = if let Some(request) = deferred_requests.pop_front() {
+            Ok(request)
+        } else {
+            request_rx.recv_timeout(Duration::from_millis(50))
+        };
+        match next_request {
             Ok(request) => {
-                let scheduler_queue_wait_micros = request
+                let mut batch = vec![request];
+                if gpu_microbatch_max > 1 {
+                    if let Some(batch_key) =
+                        retained_select_microbatch_key(&batch[0].command).map(str::to_string)
+                    {
+                        while batch.len() < gpu_microbatch_max {
+                            match request_rx.try_recv() {
+                                Ok(next) => {
+                                    if retained_select_microbatch_key(&next.command)
+                                        == Some(batch_key.as_str())
+                                    {
+                                        batch.push(next);
+                                    } else {
+                                        deferred_requests.push_back(next);
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => break,
+                            }
+                        }
+                    }
+                }
+                if batch.len() > 1 {
+                    gpu_microbatch_batches = gpu_microbatch_batches.saturating_add(1);
+                    gpu_microbatch_coalesced_requests = gpu_microbatch_coalesced_requests
+                        .saturating_add(u64::try_from(batch.len() - 1).unwrap_or(u64::MAX));
+                }
+                let scheduler_queue_wait_micros = batch[0]
                     .enqueued_at
                     .elapsed()
                     .as_micros()
                     .try_into()
                     .unwrap_or(u64::MAX);
-                let result = (|| -> Result<EngineResponse, Box<dyn Error>> {
-                    let mut output = Vec::new();
-                    match request.command {
-                        EngineCommand::Startup(frame) => {
-                            state.handle_startup(&frame, &mut output)?;
-                            Ok(EngineResponse::Bytes(output))
-                        }
-                        EngineCommand::SimpleQuery(sql) => {
-                            state.handle_simple_query(
-                                &sql,
-                                &mut output,
-                                scheduler_queue_wait_micros,
-                            )?;
-                            Ok(EngineResponse::Bytes(output))
-                        }
-                        EngineCommand::StartCopy(sql) => {
-                            let pending = state.start_copy(&sql, &mut output)?;
-                            Ok(EngineResponse::CopyStarted {
-                                bytes: output,
-                                pending,
-                            })
-                        }
-                        EngineCommand::CopyChunk { copy, rows } => {
-                            let copied = state.commit_copy_chunk(&copy, rows)?;
-                            Ok(EngineResponse::CopyChunkCommitted { copied })
-                        }
-                        EngineCommand::FinishCopy(pending) => {
-                            state.finish_copy(pending, &mut output)?;
-                            Ok(EngineResponse::Bytes(output))
-                        }
+                if batch.len() > 1 {
+                    let result = (|| -> Result<Vec<u8>, Box<dyn Error>> {
+                        let EngineCommand::SimpleQuery(sql) = &batch[0].command else {
+                            return Err("only simple SELECT can be microbatched".into());
+                        };
+                        let mut output = Vec::new();
+                        state.handle_simple_query(sql, &mut output, scheduler_queue_wait_micros)?;
+                        state.flush_facts()?;
+                        Ok(output)
+                    })()
+                    .map_err(|err| err.to_string());
+                    for request in batch {
+                        let response = result
+                            .as_ref()
+                            .map(|bytes| EngineResponse::Bytes(bytes.clone()))
+                            .map_err(|err| err.clone());
+                        let _ = request.response_tx.send(response);
                     }
-                })()
-                .and_then(|response| {
-                    state.flush_facts()?;
-                    Ok(response)
-                })
-                .map_err(|err| err.to_string());
-                let _ = request.response_tx.send(result);
+                } else {
+                    let request = batch.pop().expect("single request batch is non-empty");
+                    let result = (|| -> Result<EngineResponse, Box<dyn Error>> {
+                        let mut output = Vec::new();
+                        match request.command {
+                            EngineCommand::Startup(frame) => {
+                                state.handle_startup(&frame, &mut output)?;
+                                Ok(EngineResponse::Bytes(output))
+                            }
+                            EngineCommand::SimpleQuery(sql) => {
+                                state.handle_simple_query(
+                                    &sql,
+                                    &mut output,
+                                    scheduler_queue_wait_micros,
+                                )?;
+                                Ok(EngineResponse::Bytes(output))
+                            }
+                            EngineCommand::StartCopy(sql) => {
+                                let pending = state.start_copy(&sql, &mut output)?;
+                                Ok(EngineResponse::CopyStarted {
+                                    bytes: output,
+                                    pending,
+                                })
+                            }
+                            EngineCommand::CopyChunk { copy, rows } => {
+                                let copied = state.commit_copy_chunk(&copy, rows)?;
+                                Ok(EngineResponse::CopyChunkCommitted { copied })
+                            }
+                            EngineCommand::FinishCopy(pending) => {
+                                state.finish_copy(pending, &mut output)?;
+                                Ok(EngineResponse::Bytes(output))
+                            }
+                        }
+                    })()
+                    .and_then(|response| {
+                        state.flush_facts()?;
+                        Ok(response)
+                    })
+                    .map_err(|err| err.to_string());
+                    let _ = request.response_tx.send(result);
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -996,6 +1070,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cache = retained_read_response_cache
         .lock()
         .map_err(|_| "retained read response cache lock poisoned")?;
+    state.fact(
+        "owner_thread_gpu_microbatch_batches",
+        gpu_microbatch_batches,
+    )?;
+    state.fact(
+        "owner_thread_gpu_microbatch_coalesced_requests",
+        gpu_microbatch_coalesced_requests,
+    )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;
     state.fact(

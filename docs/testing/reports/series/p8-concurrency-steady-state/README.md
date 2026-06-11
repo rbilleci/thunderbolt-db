@@ -11,3 +11,4 @@ P8 retained-read concurrency, persistent-client measurement, and steady-state re
 - [`runs/2026-06-11-retained-response-cache-default-v1.md`](runs/2026-06-11-retained-response-cache-default-v1.md): P8 Retained Response Cache Opt-In Probe
 - [`runs/2026-06-11-cache-off-telemetry-fast-path-v1.md`](runs/2026-06-11-cache-off-telemetry-fast-path-v1.md): P8 Cache-Off Telemetry Fast Path
 - [`runs/2026-06-11-fused-gpu-lookup-cache-off-v1.md`](runs/2026-06-11-fused-gpu-lookup-cache-off-v1.md): P8 Fused GPU Lookup Cache-Off Probe
+- [`runs/2026-06-11-exact-select-gpu-microbatch-cache-off-v1.md`](runs/2026-06-11-exact-select-gpu-microbatch-cache-off-v1.md): P8 Exact SELECT GPU Microbatch Cache-Off Probe
