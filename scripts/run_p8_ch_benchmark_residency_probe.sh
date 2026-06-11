@@ -1296,7 +1296,7 @@ engine_pgwire_concurrency_metric() {
   local client_driver="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}"
   local requests_per_client="${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}"
   local warmup_requests_per_client="${GPU_DB_CH_BENCH_PERSISTENT_WARMUP_REQUESTS_PER_CLIENT:-0}"
-  local retained_read_response_cache="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-1}"
+  local retained_read_response_cache="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"
   mkdir -p "$run_dir"
 
   local wall_start_ns wall_end_ns wall_us throughput p50_us p95_us p99_us error_count correctness request_count
@@ -1788,7 +1788,7 @@ REPORT
   GPU_DB_P8_ENGINE_PGWIRE_LISTEN="$listen" \
     GPU_DB_P8_ENGINE_PGWIRE_FACTS="$facts_path" \
     GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS="$max_sessions" \
-    GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-1}" \
+    GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}" \
     target/debug/examples/p8_engine_pgwire_benchmark_endpoint >"$server_log" 2>&1 &
   local server_pid=$!
   trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' RETURN
@@ -1864,7 +1864,7 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-1}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"response_cache_invalidation_and_route_aware_admission","decision":"retained read response caching bypasses repeated identical SELECTs after first owner-thread validation; keep retained scheduler batching deferred until non-identical route mixes dominate","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"route_aware_admission_and_response_scheduling_without_cache","decision":"cache-off retained reads still expose the owner-thread queue boundary; keep retained response cache opt-in and optimize non-cacheable OLTP paths","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1877,12 +1877,12 @@ JSON
 - requested_concurrency_targets: \`$targets\`
 - requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}\`
 - warmup_requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_WARMUP_REQUESTS_PER_CLIENT:-0}\`
-- retained_read_response_cache: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-1}\`
+- retained_read_response_cache: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}\`
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false
-- next_target: response_cache_invalidation_and_route_aware_admission
-- decision: retained-read response cache bypasses repeated identical SELECTs after first owner-thread validation
+- next_target: route_aware_admission_and_response_scheduling_without_cache
+- decision: cache-off retained reads still expose the owner-thread queue boundary
 - endpoint_facts: $facts_path
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
@@ -1907,18 +1907,18 @@ CUDA event time, D2H bytes, result materialization, and client response write.
 
 ## Decision
 
-The retained-read response cache removes repeated identical \`SELECT\` requests
-from the owner-thread command queue after the first validated retained route
-result. If mixed-query or non-cacheable workloads still show owner queue
-dominance, the next optimization target is route-aware admission and response
-scheduling rather than retained CUDA scheduler batching.
+The retained-read response cache remains available as an opt-in fast path for
+repeated identical \`SELECT\` requests, but the default benchmark path keeps it
+disabled so cache-off OLTP-style retained reads continue to expose the real
+owner-thread queue boundary. The next optimization target is route-aware
+admission and response scheduling without relying on cache hits.
 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
 REPORT
   kill "$server_pid" >/dev/null 2>&1 || true
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=response_cache_invalidation_and_route_aware_admission artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=route_aware_admission_and_response_scheduling_without_cache artifact=$report_path"
   return 0
 }
 

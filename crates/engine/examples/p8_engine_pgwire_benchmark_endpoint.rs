@@ -842,7 +842,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let retained_read_response_cache_enabled =
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(true);
+            .unwrap_or(false);
 
     let listener = TcpListener::bind(&listen)?;
     let (request_tx, request_rx) = mpsc::channel::<EngineRequest>();

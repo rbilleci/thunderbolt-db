@@ -1,9 +1,9 @@
-# P8 Retained Response Cache Default
+# P8 Retained Response Cache Opt-In Probe
 
 - stream: benchmark
 - round_id: 2026-06-11-retained-response-cache-default-v1
 - status: closed
-- optimization: default-enable retained-read response cache for the engine-backed pgwire benchmark endpoint
+- optimization_probe: opt-in retained-read response cache for the engine-backed pgwire benchmark endpoint
 - previous_baseline: 2026-06-11-rtx6000-pro-calibration-v1
 - next_target: response_cache_invalidation_and_route_aware_admission
 - metrics_artifact: target/2026-06-11-retained-response-cache-default-v1/engine-backed-pgwire-concurrency-smoke/metrics.jsonl
@@ -12,11 +12,11 @@
 
 ## Result
 
-The engine-backed pgwire benchmark endpoint now defaults
-`GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE` to enabled. The cache is
-still explicitly controllable through the environment, and the cache remains
-invalidated on SQL-visible mutation paths before new retained reads can be
-served from cached response bytes.
+The engine-backed pgwire benchmark endpoint includes an opt-in retained-read
+response cache controlled by `GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE=1`.
+This probe measured that fast path, but it is not the default OLTP benchmark
+path. The cache remains invalidated on SQL-visible mutation paths before new
+retained reads can be served from cached response bytes.
 
 This optimization targets the measured owner-thread / pgwire boundary for
 repeated retained reads. The first request for a retained `SELECT` still enters
@@ -73,18 +73,19 @@ scheduling work.
 
 ## Decision
 
-This closes a useful response-path optimization for the current steady-state
-benchmark shape. It demonstrates that once retained route correctness and
-wire-format response bytes are established for a stable SQL text and cache
-generation, repeated identical retained reads should not pay owner-thread queue
-cost.
+This is a useful optional fast path for the current steady-state benchmark
+shape, but it does not close the owner-thread scheduler boundary for real OLTP
+workloads. It demonstrates that once retained route correctness and wire-format
+response bytes are established for a stable SQL text and cache generation,
+repeated identical retained reads can avoid owner-thread queue cost.
 
-The next optimization should not be retained CUDA scheduler batching yet. It
-should harden the cache and admission boundary for less ideal workloads:
+The next optimization should not rely on this cache. It should target cache-off
+OLTP-style workloads:
 
-- cache invalidation evidence for mixed read/write sequences
 - route-aware admission for non-cacheable retained reads
 - response scheduling separation for cache misses and mixed query families
+- cache invalidation evidence for mixed read/write sequences as a correctness
+  proof for the optional fast path
 
 ## Validation
 
