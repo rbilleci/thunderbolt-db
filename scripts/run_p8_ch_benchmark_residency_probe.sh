@@ -1579,6 +1579,7 @@ REPORT
   GPU_DB_P8_ENGINE_PGWIRE_LISTEN="$listen" \
     GPU_DB_P8_ENGINE_PGWIRE_FACTS="$facts_path" \
     GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS=12 \
+    GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL=full \
     target/debug/examples/p8_engine_pgwire_benchmark_endpoint >"$server_log" 2>&1 &
   local server_pid=$!
   trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' RETURN

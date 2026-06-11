@@ -9,3 +9,4 @@ P8 retained-read concurrency, persistent-client measurement, and steady-state re
 - [`runs/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1.md`](runs/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1.md): P8 Steady-State Pgwire Response Optimization
 - [`runs/2026-06-11-rtx6000-pro-calibration-v1.md`](runs/2026-06-11-rtx6000-pro-calibration-v1.md): RTX 6000 Pro Calibration Baseline
 - [`runs/2026-06-11-retained-response-cache-default-v1.md`](runs/2026-06-11-retained-response-cache-default-v1.md): P8 Retained Response Cache Opt-In Probe
+- [`runs/2026-06-11-cache-off-telemetry-fast-path-v1.md`](runs/2026-06-11-cache-off-telemetry-fast-path-v1.md): P8 Cache-Off Telemetry Fast Path

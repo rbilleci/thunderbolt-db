@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -143,10 +143,45 @@ impl PendingCopy {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SelectFactDetail {
+    Full,
+    PhaseOnly,
+}
+
+impl SelectFactDetail {
+    fn from_env() -> Self {
+        match std::env::var("GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL") {
+            Ok(value) if matches!(value.as_str(), "full" | "FULL" | "1" | "true" | "TRUE") => {
+                Self::Full
+            }
+            _ => Self::PhaseOnly,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::PhaseOnly => "phase_only",
+        }
+    }
+}
+
 struct EndpointState {
     engine: Engine,
     next_txn_id: u64,
-    facts: File,
+    facts: BufWriter<File>,
+    select_fact_detail: SelectFactDetail,
+}
+
+fn retained_match_index_compaction(query_shape: &str) -> bool {
+    matches!(
+        query_shape,
+        "int4_equality_projection"
+            | "int4_equality_multi_column_projection"
+            | "int4_composite_equality_multi_column_projection"
+            | "int4_equality_mixed_column_projection"
+    )
 }
 
 impl EndpointState {
@@ -159,7 +194,8 @@ impl EndpointState {
         Ok(Self {
             engine: Engine::new_local(),
             next_txn_id: 1,
-            facts,
+            facts: BufWriter::new(facts),
+            select_fact_detail: SelectFactDetail::from_env(),
         })
     }
 
@@ -170,7 +206,10 @@ impl EndpointState {
     }
 
     fn fact(&mut self, key: &str, value: impl std::fmt::Display) -> io::Result<()> {
-        writeln!(self.facts, "{key}={value}")?;
+        writeln!(self.facts, "{key}={value}")
+    }
+
+    fn flush_facts(&mut self) -> io::Result<()> {
         self.facts.flush()
     }
 
@@ -249,81 +288,80 @@ impl EndpointState {
                     let zero_h2d = decision.last_execution_h2d_bytes == Some(0)
                         && h2d_delta == 0
                         && decision.h2d_bytes_if_resident == 0;
-                    self.fact("client_visible_select_sql", sql)?;
-                    self.fact(
-                        "client_visible_select_retained_route_accepted",
-                        decision.accepted,
-                    )?;
-                    self.fact(
-                        "client_visible_select_retained_route_shape",
-                        &decision.query_shape,
-                    )?;
-                    self.fact("client_visible_select_retained_route_zero_h2d", zero_h2d)?;
-                    self.fact("client_visible_select_retained_route_h2d_delta", h2d_delta)?;
-                    self.fact(
-                        "client_visible_select_retained_route_d2h_delta",
-                        after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total),
-                    )?;
-                    self.fact(
-                        "client_visible_select_retained_route_kernel_delta",
-                        after
-                            .kernel_exec_samples
-                            .saturating_sub(before.kernel_exec_samples),
-                    )?;
-                    self.fact(
-                        "client_visible_select_engine_execute_micros",
-                        engine_execute_micros,
-                    )?;
-                    self.fact(
-                        "client_visible_select_result_materialize_micros",
-                        result_materialize_micros,
-                    )?;
-                    self.fact(
-                        "client_visible_select_client_write_micros",
-                        client_write_micros,
-                    )?;
-                    self.fact(
-                        "client_visible_select_scheduler_queue_wait_micros",
-                        scheduler_queue_wait_micros,
-                    )?;
-                    if let Some(value) = decision.last_execution_wall_micros {
-                        self.fact("client_visible_select_retained_wall_micros", value)?;
-                    }
-                    if let Some(value) = decision.last_execution_device_lookup_micros {
-                        self.fact("client_visible_select_retained_device_lookup_micros", value)?;
-                    }
-                    if let Some(value) = decision.last_execution_match_index_micros {
-                        self.fact("client_visible_select_retained_match_index_micros", value)?;
-                    }
-                    if let Some(value) = decision.last_execution_selected_projection_micros {
+                    if self.select_fact_detail == SelectFactDetail::Full {
+                        self.fact("client_visible_select_sql", sql)?;
                         self.fact(
-                            "client_visible_select_retained_selected_projection_micros",
-                            value,
+                            "client_visible_select_retained_route_accepted",
+                            decision.accepted,
                         )?;
-                    }
-                    if let Some(value) = decision.last_execution_result_materialization_micros {
                         self.fact(
-                            "client_visible_select_retained_result_materialization_micros",
-                            value,
+                            "client_visible_select_retained_route_shape",
+                            &decision.query_shape,
                         )?;
+                        self.fact("client_visible_select_retained_route_zero_h2d", zero_h2d)?;
+                        self.fact("client_visible_select_retained_route_h2d_delta", h2d_delta)?;
+                        self.fact(
+                            "client_visible_select_retained_route_d2h_delta",
+                            after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total),
+                        )?;
+                        self.fact(
+                            "client_visible_select_retained_route_kernel_delta",
+                            after
+                                .kernel_exec_samples
+                                .saturating_sub(before.kernel_exec_samples),
+                        )?;
+                        self.fact(
+                            "client_visible_select_engine_execute_micros",
+                            engine_execute_micros,
+                        )?;
+                        self.fact(
+                            "client_visible_select_result_materialize_micros",
+                            result_materialize_micros,
+                        )?;
+                        self.fact(
+                            "client_visible_select_client_write_micros",
+                            client_write_micros,
+                        )?;
+                        self.fact(
+                            "client_visible_select_scheduler_queue_wait_micros",
+                            scheduler_queue_wait_micros,
+                        )?;
+                        if let Some(value) = decision.last_execution_wall_micros {
+                            self.fact("client_visible_select_retained_wall_micros", value)?;
+                        }
+                        if let Some(value) = decision.last_execution_device_lookup_micros {
+                            self.fact(
+                                "client_visible_select_retained_device_lookup_micros",
+                                value,
+                            )?;
+                        }
+                        if let Some(value) = decision.last_execution_match_index_micros {
+                            self.fact("client_visible_select_retained_match_index_micros", value)?;
+                        }
+                        if let Some(value) = decision.last_execution_selected_projection_micros {
+                            self.fact(
+                                "client_visible_select_retained_selected_projection_micros",
+                                value,
+                            )?;
+                        }
+                        if let Some(value) = decision.last_execution_result_materialization_micros {
+                            self.fact(
+                                "client_visible_select_retained_result_materialization_micros",
+                                value,
+                            )?;
+                        }
+                        if let Some(value) = decision.last_execution_matched_rows {
+                            self.fact("client_visible_select_retained_matched_rows", value)?;
+                        }
+                        if let Some(value) = decision.last_execution_kernel_event_elapsed_us {
+                            self.fact("client_visible_select_retained_cuda_event_micros", value)?;
+                        }
+                        self.fact(
+                            "client_visible_select_retained_match_index_compaction",
+                            retained_match_index_compaction(&decision.query_shape),
+                        )?;
+                        self.fact("client_visible_select_rows", result.rows.len())?;
                     }
-                    if let Some(value) = decision.last_execution_matched_rows {
-                        self.fact("client_visible_select_retained_matched_rows", value)?;
-                    }
-                    if let Some(value) = decision.last_execution_kernel_event_elapsed_us {
-                        self.fact("client_visible_select_retained_cuda_event_micros", value)?;
-                    }
-                    self.fact(
-                        "client_visible_select_retained_match_index_compaction",
-                        matches!(
-                            decision.query_shape.as_str(),
-                            "int4_equality_projection"
-                                | "int4_equality_multi_column_projection"
-                                | "int4_composite_equality_multi_column_projection"
-                                | "int4_equality_mixed_column_projection"
-                        ),
-                    )?;
-                    self.fact("client_visible_select_rows", result.rows.len())?;
                     self.fact(
                         "select_phase_json",
                         SelectPhaseFact {
@@ -881,6 +919,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact("protocol_parser_reused", true)?;
     state.fact("backend_writer_api_available", true)?;
     state.fact("owner_thread_engine_scheduler", true)?;
+    state.fact(
+        "owner_thread_fact_writer",
+        "bufwriter_request_boundary_flush",
+    )?;
+    state.fact("select_fact_detail", state.select_fact_detail.as_str())?;
     state.fact("client_io_workers_engine_owned_state", false)?;
     state.fact(
         "retained_read_response_cache_enabled",
@@ -937,6 +980,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 })()
+                .and_then(|response| {
+                    state.flush_facts()?;
+                    Ok(response)
+                })
                 .map_err(|err| err.to_string());
                 let _ = request.response_tx.send(result);
             }
@@ -955,5 +1002,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "retained_read_response_cache_invalidations",
         cache.invalidations,
     )?;
+    state.flush_facts()?;
     Ok(())
 }
