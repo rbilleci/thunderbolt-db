@@ -32,6 +32,7 @@ Environment:
   GPU_DB_CH_BENCH_ENGINE_PGWIRE_ROWS scaled engine-backed pgwire smoke rows, default 64
   GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT engine-backed pgwire smoke listen port, default 55437
   GPU_DB_CH_BENCH_ENGINE_PGWIRE_CONCURRENCY_TARGETS engine-backed concurrency targets, default 1,2
+  GPU_DB_CH_BENCH_PERSISTENT_PIPELINE_DEPTH in-flight simple queries per persistent client, default 1
   GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_ROWS scaled identical pgwire target smoke rows, default 32
   GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_CONCURRENCY_TARGETS identical target concurrency targets, default 1,2
   GPU_DB_CH_BENCH_ALLOW_FULL_IDENTICAL_PGWIRE_25PCT set to 1 to permit a full identical pgwire 25pct run
@@ -1309,6 +1310,7 @@ engine_pgwire_concurrency_metric() {
   local client_driver="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}"
   local requests_per_client="${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}"
   local warmup_requests_per_client="${GPU_DB_CH_BENCH_PERSISTENT_WARMUP_REQUESTS_PER_CLIENT:-0}"
+  local pipeline_depth="${GPU_DB_CH_BENCH_PERSISTENT_PIPELINE_DEPTH:-1}"
   local retained_read_response_cache="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"
   mkdir -p "$run_dir"
 
@@ -1323,6 +1325,7 @@ engine_pgwire_concurrency_metric() {
         GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY="$concurrency" \
         GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT="$requests_per_client" \
         GPU_DB_PERSISTENT_PGWIRE_WARMUP_REQUESTS_PER_CLIENT="$warmup_requests_per_client" \
+        GPU_DB_PERSISTENT_PGWIRE_PIPELINE_DEPTH="$pipeline_depth" \
         GPU_DB_PERSISTENT_PGWIRE_RUN_DIR="$run_dir" \
         target/debug/examples/p8_persistent_pgwire_concurrency_runner >"$run_dir/runner.out" 2>"$run_dir/runner.err"
     else
@@ -1332,6 +1335,7 @@ engine_pgwire_concurrency_metric() {
         GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY="$concurrency" \
         GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT="$requests_per_client" \
         GPU_DB_PERSISTENT_PGWIRE_WARMUP_REQUESTS_PER_CLIENT="$warmup_requests_per_client" \
+        GPU_DB_PERSISTENT_PGWIRE_PIPELINE_DEPTH="$pipeline_depth" \
         GPU_DB_PERSISTENT_PGWIRE_RUN_DIR="$run_dir" \
         target/debug/examples/p8_persistent_pgwire_concurrency_runner >"$run_dir/runner.out" 2>"$run_dir/runner.err"
     fi
@@ -1985,6 +1989,7 @@ JSON
 - requested_concurrency_targets: \`$targets\`
 - requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}\`
 - warmup_requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_WARMUP_REQUESTS_PER_CLIENT:-0}\`
+- pipeline_depth: \`${GPU_DB_CH_BENCH_PERSISTENT_PIPELINE_DEPTH:-1}\`
 - select_fact_detail: \`${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}\`
 - retained_read_response_cache: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}\`
 - gpu_microbatch_admission_window_micros: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}\`

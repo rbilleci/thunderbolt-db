@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Barrier;
+use tokio::task::JoinSet;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -19,6 +20,7 @@ struct Args {
     concurrency: usize,
     requests_per_client: usize,
     warmup_requests_per_client: usize,
+    pipeline_depth: usize,
     run_dir: PathBuf,
 }
 
@@ -59,6 +61,7 @@ async fn main() -> Result<(), DynError> {
             "GPU_DB_PERSISTENT_PGWIRE_WARMUP_REQUESTS_PER_CLIENT",
             0,
         )?,
+        pipeline_depth: parse_usize_env("GPU_DB_PERSISTENT_PGWIRE_PIPELINE_DEPTH", 1)?,
         run_dir: PathBuf::from(required_env("GPU_DB_PERSISTENT_PGWIRE_RUN_DIR")?),
     };
     if args.concurrency == 0 {
@@ -66,6 +69,9 @@ async fn main() -> Result<(), DynError> {
     }
     if args.requests_per_client == 0 {
         return Err("GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT must be positive".into());
+    }
+    if args.pipeline_depth == 0 {
+        return Err("GPU_DB_PERSISTENT_PGWIRE_PIPELINE_DEPTH must be positive".into());
     }
     fs::create_dir_all(&args.run_dir)?;
 
@@ -97,23 +103,22 @@ async fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-async fn connect_client(url: &str, client_id: usize) -> Result<Client, DynError> {
+async fn connect_client(url: &str, client_id: usize) -> Result<Arc<Client>, DynError> {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             eprintln!("persistent_pgwire_client_{client_id}_connection_error={error}");
         }
     });
-    Ok(client)
+    Ok(Arc::new(client))
 }
 
 async fn run_client(
     client_id: usize,
-    client: Client,
+    client: Arc<Client>,
     args: Args,
     barrier: Arc<Barrier>,
 ) -> Result<Vec<RequestResult>, DynError> {
-    let mut results = Vec::with_capacity(args.requests_per_client);
     barrier.wait().await;
     for _ in 0..args.warmup_requests_per_client {
         let (sql, expected) = request_sql_expected(&args, client_id, 0);
@@ -126,6 +131,18 @@ async fn run_client(
             .into());
         }
     }
+    if args.pipeline_depth == 1 {
+        return run_client_serial(client_id, client, args).await;
+    }
+    run_client_pipelined(client_id, client, args).await
+}
+
+async fn run_client_serial(
+    client_id: usize,
+    client: Arc<Client>,
+    args: Args,
+) -> Result<Vec<RequestResult>, DynError> {
+    let mut results = Vec::with_capacity(args.requests_per_client);
     for request_id in 1..=args.requests_per_client {
         let (sql, expected) = request_sql_expected(&args, client_id, request_id);
         let started = Instant::now();
@@ -155,6 +172,58 @@ async fn run_client(
                 });
             }
         }
+    }
+    Ok(results)
+}
+
+async fn run_client_pipelined(
+    client_id: usize,
+    client: Arc<Client>,
+    args: Args,
+) -> Result<Vec<RequestResult>, DynError> {
+    let mut results = Vec::with_capacity(args.requests_per_client);
+    let mut next_request_id = 1;
+    let mut in_flight = JoinSet::new();
+    while next_request_id <= args.requests_per_client || !in_flight.is_empty() {
+        while next_request_id <= args.requests_per_client && in_flight.len() < args.pipeline_depth {
+            let request_id = next_request_id;
+            next_request_id += 1;
+            let (sql, expected) = request_sql_expected(&args, client_id, request_id);
+            let sql = sql.to_string();
+            let expected = expected.to_string();
+            let request_client = client.clone();
+            in_flight.spawn(async move {
+                let started = Instant::now();
+                match request_client.simple_query(&sql).await {
+                    Ok(messages) => {
+                        let actual = simple_query_actual(&messages);
+                        let status = if actual == expected {
+                            "pass"
+                        } else {
+                            "wrong_result"
+                        };
+                        RequestResult {
+                            client: client_id,
+                            request: request_id,
+                            latency_us: started.elapsed().as_micros(),
+                            status,
+                            actual,
+                        }
+                    }
+                    Err(error) => RequestResult {
+                        client: client_id,
+                        request: request_id,
+                        latency_us: started.elapsed().as_micros(),
+                        status: "error",
+                        actual: error.to_string(),
+                    },
+                }
+            });
+        }
+        let Some(result) = in_flight.join_next().await else {
+            continue;
+        };
+        results.push(result?);
     }
     Ok(results)
 }
@@ -248,6 +317,7 @@ fn write_result_artifacts(
         "warmup_requests_per_client={}",
         args.warmup_requests_per_client
     )?;
+    writeln!(summary, "pipeline_depth={}", args.pipeline_depth)?;
     Ok(())
 }
 

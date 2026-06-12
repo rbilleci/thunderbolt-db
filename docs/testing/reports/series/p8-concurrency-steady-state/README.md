@@ -34,3 +34,4 @@ P8 retained-read concurrency, persistent-client measurement, and steady-state re
 - [`runs/2026-06-12-generation-cache-hit-bypass-v1.md`](runs/2026-06-12-generation-cache-hit-bypass-v1.md): P8 Generation Cache Hit Bypass
 - [`runs/2026-06-12-read-runtime-view-scaffold-v1.md`](runs/2026-06-12-read-runtime-view-scaffold-v1.md): P8 Read Runtime View Scaffold
 - [`runs/2026-06-12-retained-read-runtime-worker-reject-v1.md`](runs/2026-06-12-retained-read-runtime-worker-reject-v1.md): P8 Retained Read Runtime Worker Rejection
+- [`runs/2026-06-13-persistent-pipeline-depth-reject-v1.md`](runs/2026-06-13-persistent-pipeline-depth-reject-v1.md): P8 Persistent Pgwire Pipeline Depth Rejection
