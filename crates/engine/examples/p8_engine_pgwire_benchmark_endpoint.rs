@@ -697,6 +697,18 @@ impl RetainedSelectBatchCandidate {
             Self::Literal { exact_key, .. } | Self::Exact { exact_key } => exact_key,
         }
     }
+
+    fn route_key(&self) -> String {
+        match self {
+            Self::Literal { batch_key, .. } => format!(
+                "literal:{}:{}:{}",
+                batch_key.table,
+                batch_key.projection_columns.join(","),
+                batch_key.filter_column
+            ),
+            Self::Exact { exact_key } => format!("exact:{exact_key}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -814,6 +826,63 @@ fn recv_next_batch_candidate(
         Err(mpsc::RecvTimeoutError::Timeout) => Ok((None, wait_started.elapsed().min(remaining))),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::TryRecvError::Disconnected),
     }
+}
+
+fn push_ready_lane(
+    lanes: &mut HashMap<String, VecDeque<EngineRequest>>,
+    lane_order: &mut VecDeque<String>,
+    request: EngineRequest,
+) -> bool {
+    let Some(candidate) = request.batch_candidate.as_ref() else {
+        return false;
+    };
+    let route_key = candidate.route_key();
+    if !lanes.contains_key(&route_key) {
+        lane_order.push_back(route_key.clone());
+    }
+    lanes.entry(route_key).or_default().push_back(request);
+    true
+}
+
+fn remove_ready_lane_order(lane_order: &mut VecDeque<String>, route_key: &str) {
+    if let Some(index) = lane_order.iter().position(|key| key == route_key) {
+        lane_order.remove(index);
+    }
+}
+
+fn pop_ready_lane(
+    lanes: &mut HashMap<String, VecDeque<EngineRequest>>,
+    lane_order: &mut VecDeque<String>,
+) -> Option<EngineRequest> {
+    while let Some(route_key) = lane_order.pop_front() {
+        let Some(queue) = lanes.get_mut(&route_key) else {
+            continue;
+        };
+        let request = queue.pop_front();
+        if queue.is_empty() {
+            lanes.remove(&route_key);
+        } else {
+            lane_order.push_back(route_key);
+        }
+        if request.is_some() {
+            return request;
+        }
+    }
+    None
+}
+
+fn pop_matching_ready_lane(
+    lanes: &mut HashMap<String, VecDeque<EngineRequest>>,
+    lane_order: &mut VecDeque<String>,
+    route_key: &str,
+) -> Option<EngineRequest> {
+    let queue = lanes.get_mut(route_key)?;
+    let request = queue.pop_front();
+    if queue.is_empty() {
+        lanes.remove(route_key);
+        remove_ready_lane_order(lane_order, route_key);
+    }
+    request
 }
 
 fn request_engine(
@@ -1164,6 +1233,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(1);
+    let gpu_microbatch_route_lane_scan_limit =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(32);
 
     let listener = TcpListener::bind(&listen)?;
     let (request_tx, request_rx) = mpsc::channel::<EngineRequest>();
@@ -1221,7 +1296,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner_thread_gpu_microbatch_ready_scan_limit",
         gpu_microbatch_ready_scan_limit,
     )?;
+    state.fact(
+        "owner_thread_gpu_microbatch_route_lane_scan_limit",
+        gpu_microbatch_route_lane_scan_limit,
+    )?;
     state.fact("owner_thread_gpu_microbatch_preclassified_requests", true)?;
+    state.fact("owner_thread_gpu_microbatch_route_lanes", true)?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
     state.fact("max_sessions", max_sessions)?;
@@ -1232,6 +1312,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut completed = 0;
     let mut deferred_requests = VecDeque::new();
+    let mut ready_lanes: HashMap<String, VecDeque<EngineRequest>> = HashMap::new();
+    let mut ready_lane_order = VecDeque::new();
     let mut gpu_microbatch_batches = 0_u64;
     let mut gpu_microbatch_coalesced_requests = 0_u64;
     let mut gpu_literal_microbatch_batches = 0_u64;
@@ -1240,11 +1322,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         while completed_rx.try_recv().is_ok() {
             completed += 1;
         }
-        let next_request = if let Some(request) = deferred_requests.pop_front() {
-            Ok(request)
-        } else {
-            request_rx.recv_timeout(Duration::from_millis(50))
-        };
+        let next_request =
+            if let Some(request) = pop_ready_lane(&mut ready_lanes, &mut ready_lane_order) {
+                Ok(request)
+            } else if let Some(request) = deferred_requests.pop_front() {
+                Ok(request)
+            } else {
+                request_rx.recv_timeout(Duration::from_millis(50))
+            };
         match next_request {
             Ok(request) => {
                 let mut batch = vec![request];
@@ -1258,8 +1343,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                         ..
                     }) = batch[0].batch_candidate.clone()
                     {
+                        let route_key = batch[0]
+                            .batch_candidate
+                            .as_ref()
+                            .expect("literal candidate exists")
+                            .route_key();
                         let mut scanned_ready = 0_usize;
                         while batch.len() < gpu_microbatch_max {
+                            if let Some(next) = pop_matching_ready_lane(
+                                &mut ready_lanes,
+                                &mut ready_lane_order,
+                                &route_key,
+                            ) {
+                                batch.push(next);
+                                continue;
+                            }
+                            if !deferred_requests.is_empty() {
+                                break;
+                            }
                             match recv_next_batch_candidate(
                                 &request_rx,
                                 batch_started,
@@ -1278,11 +1379,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         }) if *next_key == batch_key => {
                                             batch.push(next);
                                         }
-                                        _ => {
-                                            deferred_requests.push_back(next);
-                                            if scanned_ready >= gpu_microbatch_ready_scan_limit {
+                                        Some(_) => {
+                                            push_ready_lane(
+                                                &mut ready_lanes,
+                                                &mut ready_lane_order,
+                                                next,
+                                            );
+                                            if scanned_ready >= gpu_microbatch_route_lane_scan_limit
+                                            {
                                                 break;
                                             }
+                                        }
+                                        _ => {
+                                            deferred_requests.push_back(next);
+                                            break;
                                         }
                                     }
                                 }
@@ -1310,8 +1420,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .as_ref()
                         .map(|candidate| candidate.exact_key().to_string())
                     {
+                        let route_key = format!("exact:{batch_key}");
                         let mut scanned_ready = 0_usize;
                         while batch.len() < gpu_microbatch_max {
+                            if let Some(next) = pop_matching_ready_lane(
+                                &mut ready_lanes,
+                                &mut ready_lane_order,
+                                &route_key,
+                            ) {
+                                batch.push(next);
+                                continue;
+                            }
+                            if !deferred_requests.is_empty() {
+                                break;
+                            }
                             match recv_next_batch_candidate(
                                 &request_rx,
                                 batch_started,
@@ -1329,11 +1451,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         .is_some_and(|candidate| candidate.exact_key() == batch_key)
                                     {
                                         batch.push(next);
-                                    } else {
-                                        deferred_requests.push_back(next);
-                                        if scanned_ready >= gpu_microbatch_ready_scan_limit {
+                                    } else if next.batch_candidate.is_some() {
+                                        push_ready_lane(
+                                            &mut ready_lanes,
+                                            &mut ready_lane_order,
+                                            next,
+                                        );
+                                        if scanned_ready >= gpu_microbatch_route_lane_scan_limit {
                                             break;
                                         }
+                                    } else {
+                                        deferred_requests.push_back(next);
+                                        break;
                                     }
                                 }
                                 Ok((None, waited)) => {

@@ -18,3 +18,4 @@ P8 retained-read concurrency, persistent-client measurement, and steady-state re
 - [`runs/2026-06-12-mixed-projection-literal-batch-cache-off-v1.md`](runs/2026-06-12-mixed-projection-literal-batch-cache-off-v1.md): P8 Mixed Projection Literal Batch Cache-Off Probe
 - [`runs/2026-06-12-owner-preclassified-batch-candidates-cache-off-v1.md`](runs/2026-06-12-owner-preclassified-batch-candidates-cache-off-v1.md): P8 Owner Preclassified Batch Candidates Cache-Off Probe
 - [`runs/2026-06-12-shape-aware-ready-scan-cache-off-v1.md`](runs/2026-06-12-shape-aware-ready-scan-cache-off-v1.md): P8 Shape-Aware Ready Scan Cache-Off Probe
+- [`runs/2026-06-12-route-lane-admission-cache-off-v1.md`](runs/2026-06-12-route-lane-admission-cache-off-v1.md): P8 Route-Lane Admission Cache-Off Probe
