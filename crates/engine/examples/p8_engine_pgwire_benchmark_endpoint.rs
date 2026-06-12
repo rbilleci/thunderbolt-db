@@ -173,6 +173,10 @@ struct EndpointState {
     next_txn_id: u64,
     facts: BufWriter<File>,
     select_fact_detail: SelectFactDetail,
+    retained_read_job_submission_batches: u64,
+    retained_read_jobs_submitted: u64,
+    retained_read_job_submit_wall_micros_total: u64,
+    retained_read_job_complete_wall_micros_total: u64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -219,6 +223,10 @@ impl EndpointState {
             next_txn_id: 1,
             facts: BufWriter::new(facts),
             select_fact_detail: SelectFactDetail::from_env(),
+            retained_read_job_submission_batches: 0,
+            retained_read_jobs_submitted: 0,
+            retained_read_job_submit_wall_micros_total: 0,
+            retained_read_job_complete_wall_micros_total: 0,
         })
     }
 
@@ -479,6 +487,17 @@ impl EndpointState {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
+        self.retained_read_job_submission_batches =
+            self.retained_read_job_submission_batches.saturating_add(1);
+        self.retained_read_jobs_submitted = self
+            .retained_read_jobs_submitted
+            .saturating_add(u64::try_from(read_jobs.len()).unwrap_or(u64::MAX));
+        self.retained_read_job_submit_wall_micros_total = self
+            .retained_read_job_submit_wall_micros_total
+            .saturating_add(retained_read_submit_micros);
+        self.retained_read_job_complete_wall_micros_total = self
+            .retained_read_job_complete_wall_micros_total
+            .saturating_add(retained_read_complete_micros);
         let engine_execute_micros = execute_started
             .elapsed()
             .as_micros()
@@ -1951,6 +1970,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_prepared_retained_route_requests",
         gpu_prepared_retained_route_requests,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_job_submission_batches",
+        state.retained_read_job_submission_batches,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_jobs_submitted",
+        state.retained_read_jobs_submitted,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_job_submit_wall_micros_total",
+        state.retained_read_job_submit_wall_micros_total,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_job_complete_wall_micros_total",
+        state.retained_read_job_complete_wall_micros_total,
     )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;
