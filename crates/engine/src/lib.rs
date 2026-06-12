@@ -6430,6 +6430,16 @@ pub struct RelationalRetainedReadJob {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalRetainedReadSubmission {
+    pub route_id: String,
+    pub table: String,
+    pub snapshot_generation: u64,
+    pub job_count: usize,
+    pub submit_wall_micros: u64,
+    results: Vec<RelationalSelectResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidentDeviceInt4ColumnStats {
     pub name: String,
     pub min: i32,
@@ -15212,6 +15222,17 @@ impl Engine {
         &mut self,
         jobs: &[RelationalRetainedReadJob],
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+        let submission =
+            self.submit_relational_retained_read_jobs_with_resident_device_memory_probe(jobs)?;
+        Ok(Self::complete_relational_retained_read_submission(
+            submission,
+        ))
+    }
+
+    pub fn submit_relational_retained_read_jobs_with_resident_device_memory_probe(
+        &mut self,
+        jobs: &[RelationalRetainedReadJob],
+    ) -> Result<RelationalRetainedReadSubmission, ExecuteError> {
         for job in jobs {
             let handle = self
                 .relational_retained_snapshot_handle(&job.table)
@@ -15240,13 +15261,38 @@ impl Engine {
                 ))));
             }
         }
+        let submit_started = Instant::now();
         let selects = jobs
             .iter()
             .map(|job| job.select.clone())
             .collect::<Vec<_>>();
-        self.execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
-            &selects,
-        )
+        let results = self
+            .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
+                &selects,
+            )?;
+        let first_job = jobs.first();
+        Ok(RelationalRetainedReadSubmission {
+            route_id: first_job
+                .map(|job| job.route_id.clone())
+                .unwrap_or_else(|| "empty".to_string()),
+            table: first_job
+                .map(|job| job.table.clone())
+                .unwrap_or_else(|| "empty".to_string()),
+            snapshot_generation: first_job.map(|job| job.snapshot_generation).unwrap_or(0),
+            job_count: jobs.len(),
+            submit_wall_micros: submit_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            results,
+        })
+    }
+
+    pub fn complete_relational_retained_read_submission(
+        submission: RelationalRetainedReadSubmission,
+    ) -> Vec<RelationalSelectResult> {
+        submission.results
     }
 
     pub fn execute_relational_count_with_resident_device_memory_probe(
@@ -28006,9 +28052,17 @@ mod tests {
                 value: 1
             }]
         );
-        let read_job_results = e
-            .execute_relational_retained_read_jobs_with_resident_device_memory_probe(&read_jobs)
+        let submission = e
+            .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&read_jobs)
             .unwrap();
+        assert_eq!(submission.route_id, read_jobs[0].route_id);
+        assert_eq!(
+            submission.snapshot_generation,
+            read_jobs[0].snapshot_generation
+        );
+        assert_eq!(submission.job_count, read_jobs.len());
+        assert!(submission.submit_wall_micros > 0);
+        let read_job_results = Engine::complete_relational_retained_read_submission(submission);
         assert_eq!(read_job_results, mixed_column_results);
 
         e.execute_text(

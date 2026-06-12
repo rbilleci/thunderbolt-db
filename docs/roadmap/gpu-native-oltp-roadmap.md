@@ -108,6 +108,8 @@ Evidence:
 - c64 queue wait reduction without CPU fallback
 - descriptor slice closed by
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-retained-read-job-cache-off-v1.md`
+- synchronous submit/complete slice closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-retained-read-submit-complete-cache-off-v1.md`
 
 ### M4: Small GPU Stream Pool
 
@@ -202,11 +204,11 @@ comparison baseline.
 
 ## Near-Term Next Slice
 
-Continue M3 with submit/completion:
+Continue M3 with async/concurrent execution:
 
-1. Split retained read execution into explicit submit and completion phases for
-   the retained read job descriptor.
-2. Keep submit/completion on the owner thread first; measure owner critical
-   section and queue wait before adding concurrent streams.
-3. Preserve generation mismatch rejection and mutation publication barriers.
+1. Make retained read submit nonblocking for the owner loop, or allow a bounded
+   set of submitted retained reads to overlap before completion.
+2. Preserve generation mismatch rejection and mutation publication barriers.
+3. Add telemetry for in-flight read submissions, completion count, and owner
+   critical-section time.
 4. Report c8/c64 queue wait and p50 impact before moving to M4 stream pool.
