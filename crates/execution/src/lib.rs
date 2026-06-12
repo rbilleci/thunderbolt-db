@@ -474,6 +474,7 @@ pub struct CudaI32GroupedStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CudaI32BatchProjectionRow {
     pub needle_index: usize,
+    pub row_index: u64,
     pub values: Vec<i32>,
 }
 
@@ -2517,6 +2518,7 @@ fn launch_cuda_resident_i32_equal_any_project(
     .param .u64 needles_ptr,
     .param .u64 out_values_ptr,
     .param .u64 out_needle_indices_ptr,
+    .param .u64 out_row_indices_ptr,
     .param .u64 out_count_ptr
 )
 {
@@ -2543,6 +2545,7 @@ fn launch_cuda_resident_i32_equal_any_project(
     .reg .u64 %needles;
     .reg .u64 %out_values;
     .reg .u64 %out_needle_indices;
+    .reg .u64 %out_row_indices;
     .reg .u64 %out_count;
     .reg .u64 %row_byte;
     .reg .u64 %addr;
@@ -2567,6 +2570,7 @@ fn launch_cuda_resident_i32_equal_any_project(
     ld.param.u64 %needles, [needles_ptr];
     ld.param.u64 %out_values, [out_values_ptr];
     ld.param.u64 %out_needle_indices, [out_needle_indices_ptr];
+    ld.param.u64 %out_row_indices, [out_row_indices_ptr];
     ld.param.u64 %out_count, [out_count_ptr];
 
     mov.u32 %r_tid, %tid.x;
@@ -2608,6 +2612,10 @@ MATCHED:
     mul.lo.u64 %out_addr, %slot64, 4;
     add.u64 %out_addr, %out_needle_indices, %out_addr;
     st.global.u32 [%out_addr], %needle_idx;
+
+    mul.lo.u64 %out_addr, %slot64, 8;
+    add.u64 %out_addr, %out_row_indices, %out_addr;
+    st.global.u64 [%out_addr], %idx;
 
     cvt.u64.u32 %projection_count64, %projection_count;
     mul.lo.u64 %base_slot, %slot64, %projection_count64;
@@ -2696,6 +2704,12 @@ DONE:
     let output_indices_bytes = usize::try_from(
         row_count
             .checked_mul(std::mem::size_of::<u32>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_row_indices_bytes = usize::try_from(
+        row_count
+            .checked_mul(std::mem::size_of::<u64>() as u64)
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
     )
     .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
@@ -2796,6 +2810,12 @@ DONE:
         ptr: device_needle_indices,
         free: *cu_mem_free,
     };
+    let mut device_row_indices = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_row_indices, output_row_indices_bytes) })?;
+    let row_indices_guard = CudaDeviceAllocationGuard {
+        ptr: device_row_indices,
+        free: *cu_mem_free,
+    };
     let mut device_count = 0_u64;
     check_cuda(unsafe { cu_mem_alloc(&mut device_count, std::mem::size_of::<u32>()) })?;
     let count_guard = CudaDeviceAllocationGuard {
@@ -2837,6 +2857,7 @@ DONE:
     let mut needles_arg = needles_guard.ptr;
     let mut output_arg = values_guard.ptr;
     let mut indices_arg = indices_guard.ptr;
+    let mut row_indices_arg = row_indices_guard.ptr;
     let mut count_arg = count_guard.ptr;
     let mut args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
@@ -2851,6 +2872,7 @@ DONE:
         (&mut needles_arg as *mut u64).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
         (&mut indices_arg as *mut u64).cast::<c_void>(),
+        (&mut row_indices_arg as *mut u64).cast::<c_void>(),
         (&mut count_arg as *mut u64).cast::<c_void>(),
     ];
     let threads_per_block = 128;
@@ -2906,23 +2928,39 @@ DONE:
             )
         })?;
     }
+    let mut row_indices = vec![0_u64; match_count_usize];
+    if !row_indices.is_empty() {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                row_indices.as_mut_ptr().cast::<c_void>(),
+                row_indices_guard.ptr,
+                row_indices.len() * std::mem::size_of::<u64>(),
+            )
+        })?;
+    }
 
     drop(module_guard);
     drop(count_guard);
+    drop(row_indices_guard);
     drop(indices_guard);
     drop(values_guard);
     drop(needles_guard);
     values
         .chunks_exact(projection_count)
         .zip(needle_indices)
-        .map(|(row, needle_index)| {
+        .zip(row_indices)
+        .map(|((row, needle_index), row_index)| {
             let needle_index = usize::try_from(needle_index)
                 .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
             if needle_index >= needles.len() {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index));
             }
+            if row_index >= row_count {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+            }
             Ok(CudaI32BatchProjectionRow {
                 needle_index,
+                row_index,
                 values: row.to_vec(),
             })
         })

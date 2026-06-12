@@ -18915,7 +18915,9 @@ impl Engine {
             if !decision.accepted
                 || !matches!(
                     decision.query_shape.as_str(),
-                    "int4_equality_projection" | "int4_equality_multi_column_projection"
+                    "int4_equality_projection"
+                        | "int4_equality_multi_column_projection"
+                        | "int4_equality_mixed_column_projection"
                 )
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -18943,12 +18945,12 @@ impl Engine {
                 || !bound
                     .selected_indexes
                     .iter()
-                    .all(|idx| table.columns[*idx].ty == SqlType::Int4)
+                    .all(|idx| matches!(table.columns[*idx].ty, SqlType::Int4 | SqlType::Text))
                 || filter_groups.len() != 1
                 || filter_groups[0].len() != 1
             {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                    "resident device-memory equality batch currently supports SELECT one_or_more_int4_columns with one int4 equality predicate"
+                    "resident device-memory equality batch currently supports SELECT one_or_more_int4_or_text_columns with one int4 equality predicate"
                         .to_string(),
                 )));
             }
@@ -19029,10 +19031,17 @@ impl Engine {
             ))
         })?;
         let filter_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
-        let projection_offsets = selected_indexes
+        let all_int4_projection = selected_indexes
             .iter()
-            .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
-            .collect::<Result<Vec<_>, ExecuteError>>()?;
+            .all(|idx| table.columns[*idx].ty == SqlType::Int4);
+        let projection_offsets = if all_int4_projection {
+            selected_indexes
+                .iter()
+                .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+                .collect::<Result<Vec<_>, ExecuteError>>()?
+        } else {
+            vec![filter_offset]
+        };
         let needles = members
             .iter()
             .map(|(_bound, _access_path, needle)| *needle)
@@ -19073,32 +19082,150 @@ impl Engine {
             .try_into()
             .unwrap_or(u64::MAX);
         let materialize_started = Instant::now();
-        let mut rows_by_select = vec![Vec::new(); members.len()];
-        for projected in projected_rows {
-            rows_by_select[projected.needle_index].push(
-                projected
-                    .values
-                    .into_iter()
-                    .map(SqlValue::Int4)
-                    .collect::<Vec<_>>(),
-            );
-        }
+        let rows_by_select = if all_int4_projection {
+            let mut rows_by_select = vec![Vec::new(); members.len()];
+            for projected in &projected_rows {
+                rows_by_select[projected.needle_index].push(
+                    projected
+                        .values
+                        .iter()
+                        .copied()
+                        .map(SqlValue::Int4)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            rows_by_select
+        } else {
+            let matched_row_indices = projected_rows
+                .iter()
+                .map(|projected| projected.row_index)
+                .collect::<Vec<_>>();
+            let device_memory = self
+                .relational_resident_cache
+                .device_memory
+                .get(&table.name)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" has no retained resident device memory",
+                        table.name
+                    )))
+                })?;
+            let mut int4_values = BTreeMap::new();
+            let mut text_values = BTreeMap::new();
+            for idx in &selected_indexes {
+                match table.columns[*idx].ty {
+                    SqlType::Int4 => {
+                        let byte_offset =
+                            resident_device_int4_column_offset(snapshot, &table, *idx)?;
+                        let values = device_memory
+                            .project_i32_rows_from_payload(byte_offset, &matched_row_indices)
+                            .map_err(|err| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                            })?;
+                        if values.len() != matched_row_indices.len() {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "resident device-memory equality batch mixed projection int4 column returned {} rows, expected {}",
+                                values.len(),
+                                matched_row_indices.len()
+                            ))));
+                        }
+                        int4_values.insert(*idx, values);
+                    }
+                    SqlType::Text => {
+                        let layout = resident_device_text_column_layout(snapshot, &table, *idx)?;
+                        let values = device_memory
+                            .project_text_rows_from_payload(
+                                layout.offsets_byte_offset,
+                                layout.bytes_byte_offset,
+                                layout.bytes_len,
+                                &matched_row_indices,
+                            )
+                            .map_err(|err| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                            })?;
+                        if values.len() != matched_row_indices.len() {
+                            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "resident device-memory equality batch mixed projection text column returned {} rows, expected {}",
+                                values.len(),
+                                matched_row_indices.len()
+                            ))));
+                        }
+                        text_values.insert(*idx, values);
+                    }
+                }
+            }
+            let mut rows_by_select = vec![Vec::new(); members.len()];
+            for (projected_idx, projected) in projected_rows.iter().enumerate() {
+                let row = selected_indexes
+                    .iter()
+                    .map(|idx| {
+                        if let Some(values) = int4_values.get(idx) {
+                            return Ok(SqlValue::Int4(values[projected_idx]));
+                        }
+                        if let Some(values) = text_values.get(idx) {
+                            return Ok(SqlValue::Text(values[projected_idx].clone()));
+                        }
+                        Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "resident device-memory equality batch mixed projection missing projected column"
+                                .to_string(),
+                        )))
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()?;
+                rows_by_select[projected.needle_index].push(row);
+            }
+            rows_by_select
+        };
         let materialization_micros = materialize_started
             .elapsed()
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
         let total_rows = rows_by_select.iter().map(Vec::len).sum::<usize>();
-        let result_d2h_bytes = total_rows
-            .checked_mul(selected_indexes.len())
-            .and_then(|cells| cells.checked_mul(std::mem::size_of::<i32>()))
-            .and_then(|bytes| bytes.checked_add(total_rows * std::mem::size_of::<u32>()))
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u32>()))
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .unwrap_or(u64::MAX);
+        let int4_result_columns = selected_indexes
+            .iter()
+            .filter(|idx| table.columns[**idx].ty == SqlType::Int4)
+            .count();
+        let text_result_bytes = if all_int4_projection {
+            0
+        } else {
+            rows_by_select
+                .iter()
+                .flatten()
+                .flat_map(|row| row.iter())
+                .filter_map(|value| match value {
+                    SqlValue::Text(value) => Some(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                    _ => None,
+                })
+                .fold(0_u64, u64::saturating_add)
+                .saturating_add(
+                    u64::try_from(total_rows)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(2 * std::mem::size_of::<u64>() as u64),
+                )
+        };
+        let row_metadata_d2h_bytes = u64::try_from(total_rows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul((std::mem::size_of::<u32>() + std::mem::size_of::<u64>()) as u64)
+            .saturating_add(std::mem::size_of::<u32>() as u64);
+        let result_d2h_bytes = u64::try_from(total_rows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(int4_result_columns)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<i32>() as u64),
+            )
+            .saturating_add(text_result_bytes)
+            .saturating_add(row_metadata_d2h_bytes);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.metrics
-            .observe_kernel_exec_ms(batch_micros.div_ceil(1000).max(1));
+        let kernel_samples = if all_int4_projection {
+            1
+        } else {
+            selected_indexes.len().saturating_add(1)
+        };
+        for _ in 0..kernel_samples {
+            self.metrics
+                .observe_kernel_exec_ms(batch_micros.div_ceil(1000).max(1));
+        }
         let kernel_event_elapsed_us = self
             .relational_resident_cache
             .device_memory
@@ -27599,6 +27726,45 @@ mod tests {
             .clone();
         assert_eq!(decision.query_shape, "int4_equality_projection");
         assert_eq!(decision.last_execution_kernel_samples, Some(1));
+        assert_eq!(decision.last_execution_matched_rows, Some(2));
+
+        let mixed_column_selects = [
+            "SELECT id, label FROM events WHERE id = 1",
+            "SELECT id, label FROM events WHERE id = 3",
+        ]
+        .into_iter()
+        .map(|sql| {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            select
+        })
+        .collect::<Vec<_>>();
+        let mixed_column_results = e
+            .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
+                &mixed_column_selects,
+            )
+            .unwrap();
+        assert_eq!(
+            mixed_column_results[0].rows,
+            vec![vec![SqlValue::Int4(1), SqlValue::Text("alpha".into())]]
+        );
+        assert_eq!(
+            mixed_column_results[1].rows,
+            vec![vec![SqlValue::Int4(3), SqlValue::Text("alpine".into())]]
+        );
+        let decision = e
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision("events")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            decision.query_shape,
+            "int4_equality_mixed_column_projection"
+        );
+        assert_eq!(decision.last_execution_h2d_bytes, Some(0));
+        assert_eq!(decision.last_execution_kernel_samples, Some(3));
         assert_eq!(decision.last_execution_matched_rows, Some(2));
     }
 
