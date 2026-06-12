@@ -1158,6 +1158,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or(0);
     let gpu_microbatch_admission_window =
         Duration::from_micros(gpu_microbatch_admission_window_micros);
+    let gpu_microbatch_ready_scan_limit =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
 
     let listener = TcpListener::bind(&listen)?;
     let (request_tx, request_rx) = mpsc::channel::<EngineRequest>();
@@ -1211,6 +1217,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner_thread_gpu_microbatch_admission_window_micros",
         gpu_microbatch_admission_window_micros,
     )?;
+    state.fact(
+        "owner_thread_gpu_microbatch_ready_scan_limit",
+        gpu_microbatch_ready_scan_limit,
+    )?;
     state.fact("owner_thread_gpu_microbatch_preclassified_requests", true)?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
@@ -1248,6 +1258,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         ..
                     }) = batch[0].batch_candidate.clone()
                     {
+                        let mut scanned_ready = 0_usize;
                         while batch.len() < gpu_microbatch_max {
                             match recv_next_batch_candidate(
                                 &request_rx,
@@ -1259,6 +1270,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         microbatch_admission_wait_micros.saturating_add(
                                             waited.as_micros().try_into().unwrap_or(u64::MAX),
                                         );
+                                    scanned_ready = scanned_ready.saturating_add(1);
                                     match &next.batch_candidate {
                                         Some(RetainedSelectBatchCandidate::Literal {
                                             batch_key: next_key,
@@ -1268,7 +1280,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         }
                                         _ => {
                                             deferred_requests.push_back(next);
-                                            break;
+                                            if scanned_ready >= gpu_microbatch_ready_scan_limit {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -1296,6 +1310,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .as_ref()
                         .map(|candidate| candidate.exact_key().to_string())
                     {
+                        let mut scanned_ready = 0_usize;
                         while batch.len() < gpu_microbatch_max {
                             match recv_next_batch_candidate(
                                 &request_rx,
@@ -1307,6 +1322,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         microbatch_admission_wait_micros.saturating_add(
                                             waited.as_micros().try_into().unwrap_or(u64::MAX),
                                         );
+                                    scanned_ready = scanned_ready.saturating_add(1);
                                     if next
                                         .batch_candidate
                                         .as_ref()
@@ -1315,7 +1331,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         batch.push(next);
                                     } else {
                                         deferred_requests.push_back(next);
-                                        break;
+                                        if scanned_ready >= gpu_microbatch_ready_scan_limit {
+                                            break;
+                                        }
                                     }
                                 }
                                 Ok((None, waited)) => {

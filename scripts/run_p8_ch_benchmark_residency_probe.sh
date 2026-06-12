@@ -1786,7 +1786,7 @@ write_engine_backed_pgwire_concurrency_smoke() {
   local server_log="$smoke_dir/engine-pgwire-endpoint.log"
   local facts_path="$smoke_dir/endpoint-facts.txt"
   local max_sessions
-  max_sessions="$(pgwire_required_engine_sessions "$targets" 5)"
+  max_sessions="$(pgwire_required_engine_sessions "$targets" 6)"
   : >"$metrics_path"
 
   if ! command -v psql >/dev/null 2>&1; then
@@ -1812,6 +1812,7 @@ REPORT
     GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS="$max_sessions" \
     GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}" \
     GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}" \
+    GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT:-1}" \
     target/debug/examples/p8_engine_pgwire_benchmark_endpoint >"$server_log" 2>&1 &
   local server_pid=$!
   trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' RETURN
@@ -1862,7 +1863,7 @@ REPORT
     return 0
   fi
 
-  local expected_count lookup_key lookup_item lookup_qty lookup_amount tmp_prefix concurrency literal_variants literal_sql_list literal_expected_list literal_projection_sql_list literal_projection_expected_list literal_mixed_sql_list literal_mixed_expected_list
+  local expected_count lookup_key lookup_item lookup_qty lookup_amount tmp_prefix concurrency literal_variants literal_sql_list literal_expected_list literal_projection_sql_list literal_projection_expected_list literal_mixed_sql_list literal_mixed_expected_list literal_heterogeneous_sql_list literal_heterogeneous_expected_list
   expected_count="$rows"
   lookup_key=$(((rows + 1) / 2))
   lookup_item=$(((lookup_key % 100000) + 1))
@@ -1876,6 +1877,8 @@ REPORT
   literal_projection_expected_list=""
   literal_mixed_sql_list=""
   literal_mixed_expected_list=""
+  literal_heterogeneous_sql_list=""
+  literal_heterogeneous_expected_list=""
   local literal_idx literal_key literal_item literal_qty literal_amount literal_bucket literal_dist
   for literal_idx in $(seq 1 "$literal_variants"); do
     literal_key=$(( ((literal_idx - 1) % rows) + 1 ))
@@ -1895,6 +1898,8 @@ REPORT
       literal_projection_expected_list="${literal_projection_expected_list};;"
       literal_mixed_sql_list="${literal_mixed_sql_list};;"
       literal_mixed_expected_list="${literal_mixed_expected_list};;"
+      literal_heterogeneous_sql_list="${literal_heterogeneous_sql_list};;"
+      literal_heterogeneous_expected_list="${literal_heterogeneous_expected_list};;"
     fi
     literal_sql_list="${literal_sql_list}SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $literal_key"
     literal_expected_list="${literal_expected_list}${literal_key}|${literal_item}|${literal_qty}|${literal_amount}"
@@ -1902,6 +1907,8 @@ REPORT
     literal_projection_expected_list="${literal_projection_expected_list}${literal_key}"
     literal_mixed_sql_list="${literal_mixed_sql_list}SELECT ol_o_id, ol_dist_info FROM order_line WHERE ol_o_id = $literal_key"
     literal_mixed_expected_list="${literal_mixed_expected_list}${literal_key}|${literal_dist}"
+    literal_heterogeneous_sql_list="${literal_heterogeneous_sql_list}SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $literal_key;;SELECT ol_o_id FROM order_line WHERE ol_o_id = $literal_key;;SELECT ol_o_id, ol_dist_info FROM order_line WHERE ol_o_id = $literal_key"
+    literal_heterogeneous_expected_list="${literal_heterogeneous_expected_list}${literal_key}|${literal_item}|${literal_qty}|${literal_amount};;${literal_key};;${literal_key}|${literal_dist}"
   done
 
   cat >"$curve_path" <<CSV
@@ -1936,10 +1943,16 @@ CSV
       "SELECT ol_o_id, ol_dist_info FROM order_line WHERE ol_o_id = $lookup_key" \
       "$tmp_prefix" retained_engine_int4_equality_mixed_column_projection true "$concurrency" \
       "$literal_mixed_sql_list" "$literal_mixed_expected_list"
+    engine_pgwire_concurrency_metric "$url" "$metrics_path" "$curve_path" \
+      order_line_lookup_ol_o_id_heterogeneous_literal_batch \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
+      "$tmp_prefix" retained_engine_heterogeneous_literal_projection_batch true "$concurrency" \
+      "$literal_heterogeneous_sql_list" "$literal_heterogeneous_expected_list"
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"shape_aware_retained_batch_admission","decision":"cache-off retained reads should stay on the GPU path; mixed int4/text projection batching is now covered, fixed admission waits stay opt-in, and shape-aware batching is the next admission target","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"shape_aware_retained_batch_admission","decision":"cache-off retained reads should stay on the GPU path; mixed int4/text projection batching is covered, fixed admission waits stay opt-in, and shape-aware ready scans can group compatible work behind nonmatching queued shapes","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1954,6 +1967,7 @@ JSON
 - warmup_requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_WARMUP_REQUESTS_PER_CLIENT:-0}\`
 - retained_read_response_cache: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}\`
 - gpu_microbatch_admission_window_micros: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}\`
+- gpu_microbatch_ready_scan_limit: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT:-1}\`
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false
