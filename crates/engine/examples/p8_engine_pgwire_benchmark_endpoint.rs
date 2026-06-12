@@ -731,6 +731,24 @@ impl RetainedSelectBatchCandidate {
             Self::Exact { exact_key } => format!("exact:{exact_key}"),
         }
     }
+
+    fn projected_payload_weight(&self) -> usize {
+        match self {
+            Self::Literal { batch_key, .. } => batch_key
+                .projection_columns
+                .iter()
+                .map(|column| {
+                    if column.ends_with("_info") || column.ends_with("_data") {
+                        4
+                    } else {
+                        1
+                    }
+                })
+                .sum::<usize>()
+                .max(1),
+            Self::Exact { .. } => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -912,24 +930,30 @@ fn route_lane_scan_limit_for_batch(
     configured_limit: usize,
     microbatch_max: usize,
     batch_len: usize,
+    payload_aware: bool,
+    projected_payload_weight: usize,
+    matching_lane_depth: usize,
 ) -> usize {
     match policy {
         RouteLaneScanPolicy::Fixed => configured_limit,
         RouteLaneScanPolicy::Adaptive => {
+            let mut limit = configured_limit;
+            if payload_aware {
+                if projected_payload_weight >= 5 {
+                    limit = limit.saturating_div(2).max(8).min(configured_limit);
+                }
+                if matching_lane_depth > 0 && batch_len.saturating_add(matching_lane_depth) >= 8 {
+                    limit = limit.saturating_div(2).max(8).min(configured_limit);
+                }
+            }
             let half_full = microbatch_max.saturating_add(1) / 2;
             let quarter_full = microbatch_max.saturating_add(3) / 4;
             if batch_len >= half_full {
-                configured_limit
-                    .saturating_div(4)
-                    .max(4)
-                    .min(configured_limit)
+                limit.saturating_div(4).max(4).min(configured_limit)
             } else if batch_len >= quarter_full {
-                configured_limit
-                    .saturating_div(2)
-                    .max(8)
-                    .min(configured_limit)
+                limit.saturating_div(2).max(8).min(configured_limit)
             } else {
-                configured_limit
+                limit
             }
         }
     }
@@ -1289,6 +1313,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(32);
+    let gpu_microbatch_route_lane_payload_aware =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_PAYLOAD_AWARE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
     let requested_gpu_microbatch_route_lane_scan_policy = RouteLaneScanPolicy::from_env();
     let gpu_microbatch_route_lane_scan_policy = if requested_gpu_microbatch_route_lane_scan_policy
         == RouteLaneScanPolicy::Adaptive
@@ -1367,6 +1395,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner_thread_gpu_microbatch_route_lane_scan_effective_policy",
         gpu_microbatch_route_lane_scan_policy.as_str(),
     )?;
+    state.fact(
+        "owner_thread_gpu_microbatch_route_lane_payload_aware",
+        gpu_microbatch_route_lane_payload_aware,
+    )?;
     state.fact("owner_thread_gpu_microbatch_preclassified_requests", true)?;
     state.fact("owner_thread_gpu_microbatch_route_lanes", true)?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
@@ -1388,6 +1420,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut gpu_route_lane_scan_batches = 0_u64;
     let mut gpu_route_lane_scan_budget = 0_u64;
     let mut gpu_route_lane_scanned_ready = 0_u64;
+    let mut gpu_route_lane_projected_payload_weight = 0_u64;
     while completed < max_sessions {
         while completed_rx.try_recv().is_ok() {
             completed += 1;
@@ -1419,6 +1452,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .as_ref()
                             .expect("literal candidate exists")
                             .route_key();
+                        let projected_payload_weight = batch[0]
+                            .batch_candidate
+                            .as_ref()
+                            .expect("literal candidate exists")
+                            .projected_payload_weight();
                         while batch.len() < gpu_microbatch_max {
                             if let Some(next) = pop_matching_ready_lane(
                                 &mut ready_lanes,
@@ -1460,6 +1498,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                                                 gpu_microbatch_route_lane_scan_limit,
                                                 gpu_microbatch_max,
                                                 batch.len(),
+                                                gpu_microbatch_route_lane_payload_aware,
+                                                projected_payload_weight,
+                                                ready_lanes
+                                                    .get(&route_key)
+                                                    .map(VecDeque::len)
+                                                    .unwrap_or(0),
                                             );
                                             if scanned_ready >= scan_limit {
                                                 break;
@@ -1496,6 +1540,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .map(|candidate| candidate.exact_key().to_string())
                     {
                         let route_key = format!("exact:{batch_key}");
+                        let projected_payload_weight = batch[0]
+                            .batch_candidate
+                            .as_ref()
+                            .map(RetainedSelectBatchCandidate::projected_payload_weight)
+                            .unwrap_or(1);
                         while batch.len() < gpu_microbatch_max {
                             if let Some(next) = pop_matching_ready_lane(
                                 &mut ready_lanes,
@@ -1536,6 +1585,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                                             gpu_microbatch_route_lane_scan_limit,
                                             gpu_microbatch_max,
                                             batch.len(),
+                                            gpu_microbatch_route_lane_payload_aware,
+                                            projected_payload_weight,
+                                            ready_lanes
+                                                .get(&route_key)
+                                                .map(VecDeque::len)
+                                                .unwrap_or(0),
                                         );
                                         if scanned_ready >= scan_limit {
                                             break;
@@ -1567,9 +1622,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                             gpu_microbatch_route_lane_scan_limit,
                             gpu_microbatch_max,
                             batch.len(),
+                            gpu_microbatch_route_lane_payload_aware,
+                            batch[0]
+                                .batch_candidate
+                                .as_ref()
+                                .map(RetainedSelectBatchCandidate::projected_payload_weight)
+                                .unwrap_or(1),
+                            0,
                         );
                         gpu_route_lane_scan_budget = gpu_route_lane_scan_budget
                             .saturating_add(u64::try_from(scan_limit).unwrap_or(u64::MAX));
+                        gpu_route_lane_projected_payload_weight =
+                            gpu_route_lane_projected_payload_weight.saturating_add(
+                                batch[0]
+                                    .batch_candidate
+                                    .as_ref()
+                                    .map(RetainedSelectBatchCandidate::projected_payload_weight)
+                                    .and_then(|weight| u64::try_from(weight).ok())
+                                    .unwrap_or(1),
+                            );
                     }
                 }
                 if batch.len() > 1 {
@@ -1730,6 +1801,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_route_lane_scanned_ready",
         gpu_route_lane_scanned_ready,
+    )?;
+    state.fact(
+        "owner_thread_gpu_route_lane_projected_payload_weight",
+        gpu_route_lane_projected_payload_weight,
     )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;

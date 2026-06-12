@@ -20,3 +20,4 @@ P8 retained-read concurrency, persistent-client measurement, and steady-state re
 - [`runs/2026-06-12-shape-aware-ready-scan-cache-off-v1.md`](runs/2026-06-12-shape-aware-ready-scan-cache-off-v1.md): P8 Shape-Aware Ready Scan Cache-Off Probe
 - [`runs/2026-06-12-route-lane-admission-cache-off-v1.md`](runs/2026-06-12-route-lane-admission-cache-off-v1.md): P8 Route-Lane Admission Cache-Off Probe
 - [`runs/2026-06-12-adaptive-route-lane-pressure-cache-off-v1.md`](runs/2026-06-12-adaptive-route-lane-pressure-cache-off-v1.md): P8 Adaptive Route-Lane Pressure Cache-Off Probe
+- [`runs/2026-06-12-payload-aware-route-lane-cache-off-v1.md`](runs/2026-06-12-payload-aware-route-lane-cache-off-v1.md): P8 Payload-Aware Route-Lane Cache-Off Probe
