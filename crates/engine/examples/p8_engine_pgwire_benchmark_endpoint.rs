@@ -175,6 +175,28 @@ struct EndpointState {
     select_fact_detail: SelectFactDetail,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RouteLaneScanPolicy {
+    Fixed,
+    Adaptive,
+}
+
+impl RouteLaneScanPolicy {
+    fn from_env() -> Self {
+        match std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_POLICY") {
+            Ok(value) if matches!(value.as_str(), "fixed" | "FIXED") => Self::Fixed,
+            _ => Self::Adaptive,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Adaptive => "adaptive",
+        }
+    }
+}
+
 fn retained_match_index_compaction(query_shape: &str) -> bool {
     matches!(
         query_shape,
@@ -885,6 +907,34 @@ fn pop_matching_ready_lane(
     request
 }
 
+fn route_lane_scan_limit_for_batch(
+    policy: RouteLaneScanPolicy,
+    configured_limit: usize,
+    microbatch_max: usize,
+    batch_len: usize,
+) -> usize {
+    match policy {
+        RouteLaneScanPolicy::Fixed => configured_limit,
+        RouteLaneScanPolicy::Adaptive => {
+            let half_full = microbatch_max.saturating_add(1) / 2;
+            let quarter_full = microbatch_max.saturating_add(3) / 4;
+            if batch_len >= half_full {
+                configured_limit
+                    .saturating_div(4)
+                    .max(4)
+                    .min(configured_limit)
+            } else if batch_len >= quarter_full {
+                configured_limit
+                    .saturating_div(2)
+                    .max(8)
+                    .min(configured_limit)
+            } else {
+                configured_limit
+            }
+        }
+    }
+}
+
 fn request_engine(
     request_tx: &mpsc::Sender<EngineRequest>,
     command: EngineCommand,
@@ -1239,6 +1289,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(32);
+    let requested_gpu_microbatch_route_lane_scan_policy = RouteLaneScanPolicy::from_env();
+    let gpu_microbatch_route_lane_scan_policy = if requested_gpu_microbatch_route_lane_scan_policy
+        == RouteLaneScanPolicy::Adaptive
+        && max_sessions < 128
+    {
+        RouteLaneScanPolicy::Fixed
+    } else {
+        requested_gpu_microbatch_route_lane_scan_policy
+    };
 
     let listener = TcpListener::bind(&listen)?;
     let (request_tx, request_rx) = mpsc::channel::<EngineRequest>();
@@ -1300,6 +1359,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner_thread_gpu_microbatch_route_lane_scan_limit",
         gpu_microbatch_route_lane_scan_limit,
     )?;
+    state.fact(
+        "owner_thread_gpu_microbatch_route_lane_scan_requested_policy",
+        requested_gpu_microbatch_route_lane_scan_policy.as_str(),
+    )?;
+    state.fact(
+        "owner_thread_gpu_microbatch_route_lane_scan_effective_policy",
+        gpu_microbatch_route_lane_scan_policy.as_str(),
+    )?;
     state.fact("owner_thread_gpu_microbatch_preclassified_requests", true)?;
     state.fact("owner_thread_gpu_microbatch_route_lanes", true)?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
@@ -1318,6 +1385,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut gpu_microbatch_coalesced_requests = 0_u64;
     let mut gpu_literal_microbatch_batches = 0_u64;
     let mut gpu_literal_microbatch_coalesced_requests = 0_u64;
+    let mut gpu_route_lane_scan_batches = 0_u64;
+    let mut gpu_route_lane_scan_budget = 0_u64;
+    let mut gpu_route_lane_scanned_ready = 0_u64;
     while completed < max_sessions {
         while completed_rx.try_recv().is_ok() {
             completed += 1;
@@ -1337,6 +1407,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mut microbatch_admission_wait_micros = 0_u64;
                 if gpu_microbatch_max > 1 {
                     let batch_started = Instant::now();
+                    let mut scanned_ready = 0_usize;
                     if let Some(RetainedSelectBatchCandidate::Literal {
                         batch_key,
                         exact_key,
@@ -1348,7 +1419,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .as_ref()
                             .expect("literal candidate exists")
                             .route_key();
-                        let mut scanned_ready = 0_usize;
                         while batch.len() < gpu_microbatch_max {
                             if let Some(next) = pop_matching_ready_lane(
                                 &mut ready_lanes,
@@ -1385,8 +1455,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                                                 &mut ready_lane_order,
                                                 next,
                                             );
-                                            if scanned_ready >= gpu_microbatch_route_lane_scan_limit
-                                            {
+                                            let scan_limit = route_lane_scan_limit_for_batch(
+                                                gpu_microbatch_route_lane_scan_policy,
+                                                gpu_microbatch_route_lane_scan_limit,
+                                                gpu_microbatch_max,
+                                                batch.len(),
+                                            );
+                                            if scanned_ready >= scan_limit {
                                                 break;
                                             }
                                         }
@@ -1421,7 +1496,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .map(|candidate| candidate.exact_key().to_string())
                     {
                         let route_key = format!("exact:{batch_key}");
-                        let mut scanned_ready = 0_usize;
                         while batch.len() < gpu_microbatch_max {
                             if let Some(next) = pop_matching_ready_lane(
                                 &mut ready_lanes,
@@ -1457,7 +1531,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                                             &mut ready_lane_order,
                                             next,
                                         );
-                                        if scanned_ready >= gpu_microbatch_route_lane_scan_limit {
+                                        let scan_limit = route_lane_scan_limit_for_batch(
+                                            gpu_microbatch_route_lane_scan_policy,
+                                            gpu_microbatch_route_lane_scan_limit,
+                                            gpu_microbatch_max,
+                                            batch.len(),
+                                        );
+                                        if scanned_ready >= scan_limit {
                                             break;
                                         }
                                     } else {
@@ -1477,6 +1557,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 ) => break,
                             }
                         }
+                    }
+                    if scanned_ready > 0 {
+                        gpu_route_lane_scan_batches = gpu_route_lane_scan_batches.saturating_add(1);
+                        gpu_route_lane_scanned_ready = gpu_route_lane_scanned_ready
+                            .saturating_add(u64::try_from(scanned_ready).unwrap_or(u64::MAX));
+                        let scan_limit = route_lane_scan_limit_for_batch(
+                            gpu_microbatch_route_lane_scan_policy,
+                            gpu_microbatch_route_lane_scan_limit,
+                            gpu_microbatch_max,
+                            batch.len(),
+                        );
+                        gpu_route_lane_scan_budget = gpu_route_lane_scan_budget
+                            .saturating_add(u64::try_from(scan_limit).unwrap_or(u64::MAX));
                     }
                 }
                 if batch.len() > 1 {
@@ -1625,6 +1718,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_literal_microbatch_coalesced_requests",
         gpu_literal_microbatch_coalesced_requests,
+    )?;
+    state.fact(
+        "owner_thread_gpu_route_lane_scan_batches",
+        gpu_route_lane_scan_batches,
+    )?;
+    state.fact(
+        "owner_thread_gpu_route_lane_scan_budget",
+        gpu_route_lane_scan_budget,
+    )?;
+    state.fact(
+        "owner_thread_gpu_route_lane_scanned_ready",
+        gpu_route_lane_scanned_ready,
     )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;
