@@ -306,7 +306,8 @@ impl EndpointState {
                 self.fact("create_table_into_engine_wal_mvcc", true)?;
             }
             Command::Select(select) => {
-                let before = self.engine.metrics().snapshot();
+                let emit_select_phase = self.select_fact_detail.emits_phase();
+                let before = emit_select_phase.then(|| self.engine.metrics().snapshot());
                 let execute_started = Instant::now();
                 let result = self.engine.execute_relational_select(&select)?;
                 let engine_execute_micros = execute_started
@@ -314,13 +315,16 @@ impl EndpointState {
                     .as_micros()
                     .try_into()
                     .unwrap_or(u64::MAX);
-                let after = self.engine.metrics().snapshot();
-                let decision = self
-                    .engine
-                    .status_snapshot()
-                    .relational_residency
-                    .latest_route_decision(&select.table)
-                    .cloned();
+                let after = emit_select_phase.then(|| self.engine.metrics().snapshot());
+                let decision = if emit_select_phase {
+                    self.engine
+                        .status_snapshot()
+                        .relational_residency
+                        .latest_route_decision(&select.table)
+                        .cloned()
+                } else {
+                    None
+                };
                 let columns = result
                     .columns
                     .iter()
@@ -338,7 +342,9 @@ impl EndpointState {
                     .as_micros()
                     .try_into()
                     .unwrap_or(u64::MAX);
-                if let Some(decision) = decision {
+                if let (Some(decision), Some(before), Some(after)) =
+                    (decision, before.as_ref(), after.as_ref())
+                {
                     let h2d_delta = after.h2d_bytes_total.saturating_sub(before.h2d_bytes_total);
                     let zero_h2d = decision.last_execution_h2d_bytes == Some(0)
                         && h2d_delta == 0
@@ -529,7 +535,8 @@ impl EndpointState {
         } else {
             None
         };
-        let before = self.engine.metrics().snapshot();
+        let emit_select_phase = self.select_fact_detail.emits_phase();
+        let before = emit_select_phase.then(|| self.engine.metrics().snapshot());
         let execute_started = Instant::now();
         let (results, retained_read_submit_micros, retained_read_complete_micros) =
             match read_jobs.as_ref() {
@@ -578,23 +585,36 @@ impl EndpointState {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
-        let after = self.engine.metrics().snapshot();
-        let decision = self
-            .engine
-            .status_snapshot()
-            .relational_residency
-            .latest_route_decision(&selects[0].table)
-            .cloned();
-        let snapshot_handle = self
-            .engine
-            .relational_retained_snapshot_handle(&selects[0].table);
+        let after = emit_select_phase.then(|| self.engine.metrics().snapshot());
+        let decision = if emit_select_phase {
+            self.engine
+                .status_snapshot()
+                .relational_residency
+                .latest_route_decision(&selects[0].table)
+                .cloned()
+        } else {
+            None
+        };
+        let snapshot_handle = if emit_select_phase {
+            self.engine
+                .relational_retained_snapshot_handle(&selects[0].table)
+        } else {
+            None
+        };
         let batch_len = u64::try_from(items.len()).unwrap_or(u64::MAX).max(1);
-        let h2d_delta = after.h2d_bytes_total.saturating_sub(before.h2d_bytes_total) / batch_len;
-        let d2h_delta = after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total) / batch_len;
-        let kernel_delta = after
-            .kernel_exec_samples
-            .saturating_sub(before.kernel_exec_samples)
-            / batch_len;
+        let (h2d_delta, d2h_delta, kernel_delta) =
+            if let (Some(before), Some(after)) = (before.as_ref(), after.as_ref()) {
+                (
+                    after.h2d_bytes_total.saturating_sub(before.h2d_bytes_total) / batch_len,
+                    after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total) / batch_len,
+                    after
+                        .kernel_exec_samples
+                        .saturating_sub(before.kernel_exec_samples)
+                        / batch_len,
+                )
+            } else {
+                (0, 0, 0)
+            };
         let mut outputs = Vec::with_capacity(items.len());
         for ((sql, _select), unique_idx) in items.iter().zip(item_to_unique) {
             let result = &results[unique_idx];
@@ -704,7 +724,10 @@ impl EndpointState {
             .iter()
             .map(|select| self.engine.prepare_relational_retained_read_job(select))
             .collect::<Result<Vec<_>, _>>()?;
-        let before_metrics = self.engine.metrics().snapshot();
+        let before_metrics = self
+            .select_fact_detail
+            .emits_phase()
+            .then(|| self.engine.metrics().snapshot());
         let execute_started = Instant::now();
         let submission = self
             .engine
@@ -773,29 +796,44 @@ impl EndpointState {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX);
-        let after = self.engine.metrics().snapshot();
-        let decision = self
-            .engine
-            .status_snapshot()
-            .relational_residency
-            .latest_route_decision(&selects[0].table)
-            .cloned();
-        let snapshot_handle = self
-            .engine
-            .relational_retained_snapshot_handle(&selects[0].table);
+        let emit_select_phase = self.select_fact_detail.emits_phase();
+        let after = emit_select_phase.then(|| self.engine.metrics().snapshot());
+        let decision = if emit_select_phase {
+            self.engine
+                .status_snapshot()
+                .relational_residency
+                .latest_route_decision(&selects[0].table)
+                .cloned()
+        } else {
+            None
+        };
+        let snapshot_handle = if emit_select_phase {
+            self.engine
+                .relational_retained_snapshot_handle(&selects[0].table)
+        } else {
+            None
+        };
         let batch_len = u64::try_from(items.len()).unwrap_or(u64::MAX).max(1);
-        let h2d_delta = after
-            .h2d_bytes_total
-            .saturating_sub(before_metrics.h2d_bytes_total)
-            / batch_len;
-        let d2h_delta = after
-            .d2h_bytes_total
-            .saturating_sub(before_metrics.d2h_bytes_total)
-            / batch_len;
-        let kernel_delta = after
-            .kernel_exec_samples
-            .saturating_sub(before_metrics.kernel_exec_samples)
-            / batch_len;
+        let (h2d_delta, d2h_delta, kernel_delta) = if let (Some(before_metrics), Some(after)) =
+            (before_metrics.as_ref(), after.as_ref())
+        {
+            (
+                after
+                    .h2d_bytes_total
+                    .saturating_sub(before_metrics.h2d_bytes_total)
+                    / batch_len,
+                after
+                    .d2h_bytes_total
+                    .saturating_sub(before_metrics.d2h_bytes_total)
+                    / batch_len,
+                after
+                    .kernel_exec_samples
+                    .saturating_sub(before_metrics.kernel_exec_samples)
+                    / batch_len,
+            )
+        } else {
+            (0, 0, 0)
+        };
         let mut outputs = Vec::with_capacity(items.len());
         for ((sql, _select), unique_idx) in items.iter().zip(item_to_unique) {
             let result = &results[unique_idx];
@@ -1022,7 +1060,7 @@ struct SubmittedRetainedLiteralBatch {
     selects: Vec<Select>,
     read_jobs: Vec<RelationalRetainedReadJob>,
     submission: RelationalRetainedReadSubmission,
-    before_metrics: RuntimeMetricsSnapshot,
+    before_metrics: Option<RuntimeMetricsSnapshot>,
     execute_started: Instant,
     scheduler_queue_wait_micros: u64,
     microbatch_admission_wait_micros: u64,
