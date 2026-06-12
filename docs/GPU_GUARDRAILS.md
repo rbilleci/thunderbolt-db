@@ -2,6 +2,9 @@
 
 These guardrails ensure we optimize for GPU execution from day one while preserving correctness and operability.
 
+For the architectural north star behind these rules, read
+`docs/architecture/00-gpu-native-principles.md`.
+
 ## Non-Negotiable Rules
 
 1. **Dual-target operator contract**

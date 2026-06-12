@@ -6,6 +6,7 @@ This project uses a layered documentation model so implementation can proceed qu
 
 1. **Design baseline**
    - `DESIGN.md`
+   - `docs/architecture/00-gpu-native-principles.md`
 
 2. **Non-negotiable constraints**
    - `docs/architecture/01-system-invariants.md`
