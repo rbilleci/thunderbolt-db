@@ -269,7 +269,26 @@ impl CudaResidentDeviceMemory {
         projection_offsets: &[u64],
         row_count: u64,
     ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_equal_any_project(
+        if row_count == 0 {
+            return Ok(Vec::new());
+        }
+        self.submit_match_project_i32_equal_any_from_payload(
+            filter_offset,
+            needles,
+            projection_offsets,
+            row_count,
+        )?
+        .complete(self)
+    }
+
+    pub fn submit_match_project_i32_equal_any_from_payload(
+        &self,
+        filter_offset: u64,
+        needles: &[i32],
+        projection_offsets: &[u64],
+        row_count: u64,
+    ) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
+        submit_cuda_resident_i32_equal_any_project(
             self,
             filter_offset,
             needles,
@@ -498,6 +517,109 @@ pub struct CudaI32BatchProjectionRow {
     pub needle_index: usize,
     pub row_index: u64,
     pub values: Vec<i32>,
+}
+
+pub struct CudaI32EqualAnyProjectSubmission {
+    projection_count: usize,
+    needles_len: usize,
+    row_count: u64,
+    values_guard: CudaDeviceAllocationGuard,
+    indices_guard: CudaDeviceAllocationGuard,
+    row_indices_guard: CudaDeviceAllocationGuard,
+    count_guard: CudaDeviceAllocationGuard,
+    _needles_guard: CudaDeviceAllocationGuard,
+    _module_guard: CudaModuleGuard,
+    start_event_guard: CudaEventGuard,
+    stop_event_guard: CudaEventGuard,
+    cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> i32,
+    cu_event_synchronize: unsafe extern "C" fn(*mut c_void) -> i32,
+    cu_event_elapsed_time: unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32,
+}
+
+impl CudaI32EqualAnyProjectSubmission {
+    pub fn complete(
+        self,
+        resident: &CudaResidentDeviceMemory,
+    ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
+        check_cuda(unsafe { (self.cu_event_synchronize)(self.stop_event_guard.event) })?;
+
+        let mut elapsed_ms = 0.0_f32;
+        check_cuda(unsafe {
+            (self.cu_event_elapsed_time)(
+                &mut elapsed_ms,
+                self.start_event_guard.event,
+                self.stop_event_guard.event,
+            )
+        })?;
+        resident
+            .record_kernel_event_elapsed_us(Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64));
+
+        let mut match_count = 0_u32;
+        check_cuda(unsafe {
+            (self.cu_memcpy_dtoh)(
+                (&mut match_count as *mut u32).cast::<c_void>(),
+                self.count_guard.ptr,
+                std::mem::size_of::<u32>(),
+            )
+        })?;
+        let match_count = u64::from(match_count);
+        if match_count > self.row_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
+        let match_count_usize = usize::try_from(match_count)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let mut values = vec![0_i32; match_count_usize.saturating_mul(self.projection_count)];
+        if !values.is_empty() {
+            check_cuda(unsafe {
+                (self.cu_memcpy_dtoh)(
+                    values.as_mut_ptr().cast::<c_void>(),
+                    self.values_guard.ptr,
+                    values.len() * std::mem::size_of::<i32>(),
+                )
+            })?;
+        }
+        let mut needle_indices = vec![0_u32; match_count_usize];
+        if !needle_indices.is_empty() {
+            check_cuda(unsafe {
+                (self.cu_memcpy_dtoh)(
+                    needle_indices.as_mut_ptr().cast::<c_void>(),
+                    self.indices_guard.ptr,
+                    needle_indices.len() * std::mem::size_of::<u32>(),
+                )
+            })?;
+        }
+        let mut row_indices = vec![0_u64; match_count_usize];
+        if !row_indices.is_empty() {
+            check_cuda(unsafe {
+                (self.cu_memcpy_dtoh)(
+                    row_indices.as_mut_ptr().cast::<c_void>(),
+                    self.row_indices_guard.ptr,
+                    row_indices.len() * std::mem::size_of::<u64>(),
+                )
+            })?;
+        }
+
+        values
+            .chunks_exact(self.projection_count)
+            .zip(needle_indices)
+            .zip(row_indices)
+            .map(|((row, needle_index), row_index)| {
+                let needle_index = usize::try_from(needle_index)
+                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+                if needle_index >= self.needles_len {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index));
+                }
+                if row_index >= self.row_count {
+                    return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+                }
+                Ok(CudaI32BatchProjectionRow {
+                    needle_index,
+                    row_index,
+                    values: row.to_vec(),
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2498,13 +2620,13 @@ DONE:
         .collect())
 }
 
-fn launch_cuda_resident_i32_equal_any_project(
+fn submit_cuda_resident_i32_equal_any_project(
     resident: &CudaResidentDeviceMemory,
     filter_offset: u64,
     needles: &[i32],
     projection_offsets: &[u64],
     row_count: u64,
-) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
+) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
@@ -2527,7 +2649,11 @@ fn launch_cuda_resident_i32_equal_any_project(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    type CuEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
+    type CuEventDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuEventRecord = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+    type CuEventSynchronize = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32;
 
     const MAX_PROJECTIONS: usize = 4;
     const PTX: &[u8] = br#"
@@ -2698,7 +2824,7 @@ DONE:
         ));
     }
     if row_count == 0 {
-        return Ok(Vec::new());
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
     }
     let filter_bytes = row_count
         .checked_mul(std::mem::size_of::<i32>() as u64)
@@ -2807,10 +2933,35 @@ DONE:
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_ctx_synchronize = unsafe {
+    let cu_event_create = unsafe {
         resident
             ._lib
-            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .get::<CuEventCreate>(b"cuEventCreate\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_event_destroy = unsafe {
+        resident
+            ._lib
+            .get::<CuEventDestroy>(b"cuEventDestroy_v2\0")
+            .or_else(|_| resident._lib.get::<CuEventDestroy>(b"cuEventDestroy\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_event_record = unsafe {
+        resident
+            ._lib
+            .get::<CuEventRecord>(b"cuEventRecord\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_event_synchronize = unsafe {
+        resident
+            ._lib
+            .get::<CuEventSynchronize>(b"cuEventSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_event_elapsed_time = unsafe {
+        resident
+            ._lib
+            .get::<CuEventElapsedTime>(b"cuEventElapsedTime\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
@@ -2907,7 +3058,21 @@ DONE:
     ];
     let threads_per_block = 128;
     let blocks = row_count_u32.div_ceil(threads_per_block);
-    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
+    let mut start = std::ptr::null_mut();
+    check_cuda(unsafe { cu_event_create(&mut start, 0) })?;
+    let start_event_guard = CudaEventGuard {
+        event: start,
+        destroy: *cu_event_destroy,
+    };
+    let mut stop = std::ptr::null_mut();
+    check_cuda(unsafe { cu_event_create(&mut stop, 0) })?;
+    let stop_event_guard = CudaEventGuard {
+        event: stop,
+        destroy: *cu_event_destroy,
+    };
+
+    check_cuda(unsafe { cu_event_record(start_event_guard.event, std::ptr::null_mut()) })?;
+    check_cuda(unsafe {
         cu_launch_kernel(
             function,
             blocks,
@@ -2922,79 +3087,24 @@ DONE:
             std::ptr::null_mut(),
         )
     })?;
+    check_cuda(unsafe { cu_event_record(stop_event_guard.event, std::ptr::null_mut()) })?;
 
-    let mut match_count = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut match_count as *mut u32).cast::<c_void>(),
-            count_guard.ptr,
-            std::mem::size_of::<u32>(),
-        )
-    })?;
-    let match_count = u64::from(match_count);
-    if match_count > row_count {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
-    }
-    let match_count_usize = usize::try_from(match_count)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let projection_count = projection_offsets.len();
-    let mut values = vec![0_i32; match_count_usize.saturating_mul(projection_count)];
-    if !values.is_empty() {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                values.as_mut_ptr().cast::<c_void>(),
-                values_guard.ptr,
-                values.len() * std::mem::size_of::<i32>(),
-            )
-        })?;
-    }
-    let mut needle_indices = vec![0_u32; match_count_usize];
-    if !needle_indices.is_empty() {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                needle_indices.as_mut_ptr().cast::<c_void>(),
-                indices_guard.ptr,
-                needle_indices.len() * std::mem::size_of::<u32>(),
-            )
-        })?;
-    }
-    let mut row_indices = vec![0_u64; match_count_usize];
-    if !row_indices.is_empty() {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                row_indices.as_mut_ptr().cast::<c_void>(),
-                row_indices_guard.ptr,
-                row_indices.len() * std::mem::size_of::<u64>(),
-            )
-        })?;
-    }
-
-    drop(module_guard);
-    drop(count_guard);
-    drop(row_indices_guard);
-    drop(indices_guard);
-    drop(values_guard);
-    drop(needles_guard);
-    values
-        .chunks_exact(projection_count)
-        .zip(needle_indices)
-        .zip(row_indices)
-        .map(|((row, needle_index), row_index)| {
-            let needle_index = usize::try_from(needle_index)
-                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-            if needle_index >= needles.len() {
-                return Err(CudaRuntimeProbeError::InvalidInputLength(needle_index));
-            }
-            if row_index >= row_count {
-                return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
-            }
-            Ok(CudaI32BatchProjectionRow {
-                needle_index,
-                row_index,
-                values: row.to_vec(),
-            })
-        })
-        .collect()
+    Ok(CudaI32EqualAnyProjectSubmission {
+        projection_count: projection_offsets.len(),
+        needles_len: needles.len(),
+        row_count,
+        values_guard,
+        indices_guard,
+        row_indices_guard,
+        count_guard,
+        _needles_guard: needles_guard,
+        _module_guard: module_guard,
+        start_event_guard,
+        stop_event_guard,
+        cu_memcpy_dtoh: *cu_memcpy_dtoh,
+        cu_event_synchronize: *cu_event_synchronize,
+        cu_event_elapsed_time: *cu_event_elapsed_time,
+    })
 }
 
 fn launch_cuda_resident_i32_equal_any_project_text(
@@ -8814,6 +8924,87 @@ mod tests {
         assert_eq!(
             runtime.mvcc_visibility_mask(&empty, 3).unwrap(),
             Vec::<bool>::new()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_i32_equal_any_project_submit_complete_matches_sync() {
+        let runtime = CudaDriverRuntime::probe().unwrap();
+        let row_count = 5_u64;
+        let filter_offset = std::mem::size_of::<u64>() as u64;
+        let projection_offset = filter_offset + row_count * std::mem::size_of::<i32>() as u64;
+        let mut header = Vec::new();
+        header.extend_from_slice(&row_count.to_le_bytes());
+        let mut filter = Vec::new();
+        for value in [1_i32, 2, 3, 2, 4] {
+            filter.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut projection = Vec::new();
+        for value in [10_i32, 20, 30, 21, 40] {
+            projection.extend_from_slice(&value.to_le_bytes());
+        }
+        let allocated_len = projection_offset + projection.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: filter_offset,
+                        bytes: &filter,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: projection_offset,
+                        bytes: &projection,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let sync_rows = resident
+            .match_project_i32_equal_any_from_payload(
+                filter_offset,
+                &[2, 4],
+                &[projection_offset],
+                row_count,
+            )
+            .unwrap();
+        let async_rows = resident
+            .submit_match_project_i32_equal_any_from_payload(
+                filter_offset,
+                &[2, 4],
+                &[projection_offset],
+                row_count,
+            )
+            .unwrap()
+            .complete(&resident)
+            .unwrap();
+
+        assert_eq!(async_rows, sync_rows);
+        assert_eq!(
+            async_rows,
+            vec![
+                CudaI32BatchProjectionRow {
+                    needle_index: 0,
+                    row_index: 1,
+                    values: vec![20],
+                },
+                CudaI32BatchProjectionRow {
+                    needle_index: 0,
+                    row_index: 3,
+                    values: vec![21],
+                },
+                CudaI32BatchProjectionRow {
+                    needle_index: 1,
+                    row_index: 4,
+                    values: vec![40],
+                },
+            ]
         );
     }
 
