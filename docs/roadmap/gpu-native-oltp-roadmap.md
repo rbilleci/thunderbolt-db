@@ -50,7 +50,7 @@ The v1 GPU-native OLTP target is:
 
 ## Executable Milestones
 
-### M1: Prepared Entity Route Skeleton
+### M1: Prepared Entity Route Skeleton (closed)
 
 Implement an internal prepared retained route descriptor for the current
 `order_line WHERE ol_o_id = $1` benchmark shape.
@@ -68,8 +68,10 @@ Evidence:
 
 - c8 and c64 cache-off p50/p95 for prepared route vs SQL-text route
 - queue wait, engine execute, retained wall, and materialization facts
+- closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-prepared-retained-route-cache-off-v1.md`
 
-### M2: Immutable Retained Snapshot Handle
+### M2: Immutable Retained Snapshot Handle (closed)
 
 Extract read-only resident state into an explicit snapshot handle that retained
 routes can reference without borrowing the whole mutable engine owner.
@@ -86,6 +88,8 @@ Evidence:
 
 - retained route execution reports snapshot generation
 - writes/COPY invalidate or publish generations deterministically
+- closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-retained-snapshot-handle-cache-off-v1.md`
 
 ### M3: Async Read Job Lifecycle
 
@@ -196,12 +200,13 @@ comparison baseline.
 
 ## Near-Term Next Slice
 
-Start with M1:
+Start with M3:
 
-1. Add a prepared retained entity route descriptor for the current
-   `order_line` int4 lookup.
-2. Add a benchmark metric that drives the route path without reparsing SQL per
-   request.
-3. Keep the SQL-text pgwire path as a comparison.
-4. Report whether route preparation reduces queue/engine time enough to justify
-   moving to snapshot handle extraction.
+1. Add a read job descriptor that carries the prepared route id, typed
+   parameters, and retained snapshot generation.
+2. Split route preparation from retained GPU execution inside the owner-thread
+   scheduler.
+3. Keep mutation publication single-owner and validate generation mismatch
+   rejection before any async/concurrent execution work.
+4. Report whether the split reduces owner critical-section time before adding a
+   stream pool.

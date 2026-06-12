@@ -23,3 +23,4 @@ P8 retained-read concurrency, persistent-client measurement, and steady-state re
 - [`runs/2026-06-12-payload-aware-route-lane-cache-off-v1.md`](runs/2026-06-12-payload-aware-route-lane-cache-off-v1.md): P8 Payload-Aware Route-Lane Cache-Off Probe
 - [`runs/2026-06-12-latency-lane-retained-literal-cache-off-v1.md`](runs/2026-06-12-latency-lane-retained-literal-cache-off-v1.md): P8 Retained Literal Latency Lane Cache-Off Probe
 - [`runs/2026-06-12-prepared-retained-route-cache-off-v1.md`](runs/2026-06-12-prepared-retained-route-cache-off-v1.md): P8 Prepared Retained Route Cache-Off Probe
+- [`runs/2026-06-12-retained-snapshot-handle-cache-off-v1.md`](runs/2026-06-12-retained-snapshot-handle-cache-off-v1.md): P8 Retained Snapshot Handle Cache-Off Probe

@@ -6378,6 +6378,7 @@ pub struct RelationalResidencySnapshot {
     pub gpu_id: u16,
     pub schema: String,
     pub table: String,
+    pub generation: u64,
     pub row_count: usize,
     pub column_count: usize,
     pub resident_bytes: u64,
@@ -6395,6 +6396,22 @@ pub struct RelationalResidencySnapshot {
     pub resident_bytes_after_admission: u64,
     pub evicted_tables_on_admission: Vec<String>,
     pub device_memory_proof: Option<CudaDeviceMemoryProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalRetainedSnapshotHandle {
+    pub schema: String,
+    pub table: String,
+    pub gpu_id: u16,
+    pub generation: u64,
+    pub row_count: usize,
+    pub column_count: usize,
+    pub resident_bytes: u64,
+    pub valid_through_index: Index,
+    pub valid: bool,
+    pub has_retained_device_memory: bool,
+    pub resident_device_int4_columns: Vec<String>,
+    pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6462,6 +6479,12 @@ impl RelationalResidencySnapshot {
             && self.invalidated_at_index.is_none()
             && !self.invalidated_by_memory_pressure
             && !self.memory_pressure_active
+    }
+
+    fn next_generation(previous: Option<&Self>) -> u64 {
+        previous
+            .map(|snapshot| snapshot.generation.saturating_add(1))
+            .unwrap_or(1)
     }
 }
 
@@ -20937,6 +20960,7 @@ impl Engine {
             gpu_id,
             schema: catalog_table.schema,
             table: catalog_table.name.clone(),
+            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_ref()),
             row_count,
             column_count: catalog_table.columns.len(),
             resident_bytes,
@@ -21189,6 +21213,7 @@ impl Engine {
             gpu_id,
             schema: catalog_table.schema,
             table: catalog_table.name.clone(),
+            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_ref()),
             row_count,
             column_count: catalog_table.columns.len(),
             resident_bytes,
@@ -21293,6 +21318,7 @@ impl Engine {
             gpu_id,
             schema: catalog_table.schema,
             table: catalog_table.name.clone(),
+            generation: RelationalResidencySnapshot::next_generation(previous_snapshot.as_ref()),
             row_count,
             column_count: catalog_table.columns.len(),
             resident_bytes,
@@ -21577,6 +21603,43 @@ impl Engine {
             })
     }
 
+    pub fn relational_retained_snapshot_handle(
+        &self,
+        table: &str,
+    ) -> Option<RelationalRetainedSnapshotHandle> {
+        self.relational_resident_cache
+            .snapshots
+            .get(table)
+            .map(|snapshot| {
+                let memory_pressure_active = self
+                    .router
+                    .runtime()
+                    .snapshot()
+                    .memory_pressured_gpu_ids
+                    .contains(&snapshot.gpu_id);
+                RelationalRetainedSnapshotHandle {
+                    schema: snapshot.schema.clone(),
+                    table: snapshot.table.clone(),
+                    gpu_id: snapshot.gpu_id,
+                    generation: snapshot.generation,
+                    row_count: snapshot.row_count,
+                    column_count: snapshot.column_count,
+                    resident_bytes: snapshot.resident_bytes,
+                    valid_through_index: snapshot.valid_through_index,
+                    valid: snapshot.invalidated_by_txn_id.is_none()
+                        && snapshot.invalidated_at_index.is_none()
+                        && !snapshot.invalidated_by_memory_pressure
+                        && !memory_pressure_active,
+                    has_retained_device_memory: self
+                        .relational_resident_cache
+                        .device_memory
+                        .contains_key(table),
+                    resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
+                    resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
+                }
+            })
+    }
+
     fn relational_residency_snapshot_ref(
         &self,
         table: &str,
@@ -21822,6 +21885,7 @@ impl Engine {
         RelationalResidentRouteDecisionStatus {
             table: table.to_string(),
             gpu_id: None,
+            snapshot_generation: None,
             partition_count: 0,
             accepted: false,
             reason: reason.into(),
@@ -21945,6 +22009,7 @@ impl Engine {
         let mut decision = RelationalResidentRouteDecisionStatus {
             table: table.name.clone(),
             gpu_id: Some(snapshot.gpu_id),
+            snapshot_generation: Some(snapshot.generation),
             partition_count: 1,
             accepted: false,
             reason: String::new(),
@@ -22079,6 +22144,7 @@ impl Engine {
         let mut decision = RelationalResidentRouteDecisionStatus {
             table: table.name.clone(),
             gpu_id,
+            snapshot_generation: None,
             partition_count: partitions.len(),
             accepted: false,
             reason: String::new(),
@@ -22307,6 +22373,7 @@ impl Engine {
                     schema: snapshot.schema.clone(),
                     table: snapshot.table.clone(),
                     gpu_id: snapshot.gpu_id,
+                    snapshot_generation: snapshot.generation,
                     cache_state: cache_state.to_string(),
                     row_count: snapshot.row_count,
                     column_count: snapshot.column_count,
@@ -29482,8 +29549,17 @@ mod tests {
         assert_eq!(entry.table, "events");
         assert_eq!(entry.action, RelationalResidencyWarmupAction::Warmed);
         assert!(entry.resident_bytes > 0);
+        let first_handle = e.relational_retained_snapshot_handle("events").unwrap();
+        assert_eq!(first_handle.generation, 1);
+        assert_eq!(first_handle.row_count, 2);
+        assert!(first_handle.valid);
+        assert_eq!(
+            first_handle.resident_device_int4_columns,
+            vec!["id".to_string()]
+        );
         let route = entry.route_decision.as_ref().unwrap();
         assert_eq!(route.query_shape, "count_all");
+        assert_eq!(route.snapshot_generation, Some(first_handle.generation));
         if route.has_retained_device_memory {
             assert!(route.accepted);
             let Command::Select(select) = parse_command("SELECT COUNT(*) FROM events").unwrap()
@@ -29509,6 +29585,15 @@ mod tests {
                 .invalidated_by_txn_id,
             Some(3)
         );
+        let invalidated_handle = e.relational_retained_snapshot_handle("events").unwrap();
+        assert!(first_handle.valid);
+        assert_eq!(
+            first_handle.has_retained_device_memory,
+            route.has_retained_device_memory
+        );
+        assert_eq!(invalidated_handle.generation, first_handle.generation);
+        assert!(!invalidated_handle.valid);
+        assert!(!invalidated_handle.has_retained_device_memory);
         let refreshed = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
             tables: vec!["events".to_string()],
             refresh_invalidated: true,
@@ -29524,6 +29609,10 @@ mod tests {
                 .invalidated_by_txn_id,
             None
         );
+        let refreshed_handle = e.relational_retained_snapshot_handle("events").unwrap();
+        assert_eq!(refreshed_handle.generation, 2);
+        assert_eq!(refreshed_handle.row_count, 3);
+        assert!(refreshed_handle.valid);
         assert_eq!(
             e.status_snapshot()
                 .relational_residency
@@ -29531,6 +29620,14 @@ mod tests {
                 .unwrap()
                 .estimated_rows,
             3
+        );
+        assert_eq!(
+            e.status_snapshot()
+                .relational_residency
+                .table("events")
+                .unwrap()
+                .snapshot_generation,
+            refreshed_handle.generation
         );
 
         let gpu_override =
