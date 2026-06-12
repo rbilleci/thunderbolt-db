@@ -29,3 +29,4 @@ P8 retained-read concurrency, persistent-client measurement, and steady-state re
 - [`runs/2026-06-12-preplanned-read-job-cache-off-v1.md`](runs/2026-06-12-preplanned-read-job-cache-off-v1.md): P8 Preplanned Read Job Cache-Off Probe
 - [`runs/2026-06-12-compact-text-projection-cache-off-v1.md`](runs/2026-06-12-compact-text-projection-cache-off-v1.md): P8 Compact Text Projection Cache-Off Probe
 - [`runs/2026-06-12-depth-biased-route-lane-cache-off-v1.md`](runs/2026-06-12-depth-biased-route-lane-cache-off-v1.md): P8 Depth-Biased Route Lane Cache-Off Probe
+- [`runs/2026-06-12-m3-m4-x5-boundary-audit-v1.md`](runs/2026-06-12-m3-m4-x5-boundary-audit-v1.md): P8 M3/M4 X5 Boundary Audit
