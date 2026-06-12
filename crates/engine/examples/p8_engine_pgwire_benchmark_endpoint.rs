@@ -150,6 +150,7 @@ impl PendingCopy {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SelectFactDetail {
+    None,
     Full,
     PhaseOnly,
 }
@@ -157,18 +158,29 @@ enum SelectFactDetail {
 impl SelectFactDetail {
     fn from_env() -> Self {
         match std::env::var("GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL") {
+            Ok(value) if matches!(value.as_str(), "none" | "NONE" | "0" | "false" | "FALSE") => {
+                Self::None
+            }
             Ok(value) if matches!(value.as_str(), "full" | "FULL" | "1" | "true" | "TRUE") => {
                 Self::Full
             }
-            _ => Self::PhaseOnly,
+            Ok(value) if matches!(value.as_str(), "phase_only" | "PHASE_ONLY" | "phase") => {
+                Self::PhaseOnly
+            }
+            _ => Self::None,
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Full => "full",
             Self::PhaseOnly => "phase_only",
         }
+    }
+
+    fn emits_phase(self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -397,49 +409,54 @@ impl EndpointState {
                         )?;
                         self.fact("client_visible_select_rows", result.rows.len())?;
                     }
-                    self.fact(
-                        "select_phase_json",
-                        SelectPhaseFact {
-                            sql,
-                            query_shape: &decision.query_shape,
-                            scheduler_queue_wait_micros,
-                            engine_execute_micros,
-                            result_materialize_micros,
-                            client_write_micros,
-                            retained_wall_micros: decision.last_execution_wall_micros,
-                            retained_device_lookup_micros: decision
-                                .last_execution_device_lookup_micros,
-                            retained_match_index_micros: decision.last_execution_match_index_micros,
-                            retained_selected_projection_micros: decision
-                                .last_execution_selected_projection_micros,
-                            retained_result_materialization_micros: decision
-                                .last_execution_result_materialization_micros,
-                            retained_cuda_event_micros: decision
-                                .last_execution_kernel_event_elapsed_us,
-                            retained_matched_rows: decision
-                                .last_execution_matched_rows
-                                .map(|value| value.try_into().unwrap_or(u64::MAX)),
-                            retained_read_job_route_id: None,
-                            retained_snapshot_generation: decision.snapshot_generation,
-                            retained_read_submit_micros: None,
-                            retained_read_complete_micros: None,
-                            retained_read_pending_queue_micros: None,
-                            retained_read_pending_inflight_at_submit: None,
-                            h2d_delta,
-                            d2h_delta: after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total),
-                            kernel_delta: after
-                                .kernel_exec_samples
-                                .saturating_sub(before.kernel_exec_samples),
-                            result_rows: result.rows.len(),
-                            microbatch_kind: "none",
-                            microbatch_size: 1,
-                            microbatch_unique_selects: 1,
-                            microbatch_admission_wait_micros: 0,
-                            microbatch_route_key: None,
-                            microbatch_ready_lane_count: 0,
-                            retained_read_job_path: false,
-                        },
-                    )?;
+                    if self.select_fact_detail.emits_phase() {
+                        self.fact(
+                            "select_phase_json",
+                            SelectPhaseFact {
+                                sql,
+                                query_shape: &decision.query_shape,
+                                scheduler_queue_wait_micros,
+                                engine_execute_micros,
+                                result_materialize_micros,
+                                client_write_micros,
+                                retained_wall_micros: decision.last_execution_wall_micros,
+                                retained_device_lookup_micros: decision
+                                    .last_execution_device_lookup_micros,
+                                retained_match_index_micros: decision
+                                    .last_execution_match_index_micros,
+                                retained_selected_projection_micros: decision
+                                    .last_execution_selected_projection_micros,
+                                retained_result_materialization_micros: decision
+                                    .last_execution_result_materialization_micros,
+                                retained_cuda_event_micros: decision
+                                    .last_execution_kernel_event_elapsed_us,
+                                retained_matched_rows: decision
+                                    .last_execution_matched_rows
+                                    .map(|value| value.try_into().unwrap_or(u64::MAX)),
+                                retained_read_job_route_id: None,
+                                retained_snapshot_generation: decision.snapshot_generation,
+                                retained_read_submit_micros: None,
+                                retained_read_complete_micros: None,
+                                retained_read_pending_queue_micros: None,
+                                retained_read_pending_inflight_at_submit: None,
+                                h2d_delta,
+                                d2h_delta: after
+                                    .d2h_bytes_total
+                                    .saturating_sub(before.d2h_bytes_total),
+                                kernel_delta: after
+                                    .kernel_exec_samples
+                                    .saturating_sub(before.kernel_exec_samples),
+                                result_rows: result.rows.len(),
+                                microbatch_kind: "none",
+                                microbatch_size: 1,
+                                microbatch_unique_selects: 1,
+                                microbatch_admission_wait_micros: 0,
+                                microbatch_route_key: None,
+                                microbatch_ready_lane_count: 0,
+                                retained_read_job_path: false,
+                            },
+                        )?;
+                    }
                 }
             }
             other => {
@@ -589,7 +606,8 @@ impl EndpointState {
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX);
-            if let Some(decision) = &decision {
+            if self.select_fact_detail.emits_phase() && decision.is_some() {
+                let decision = decision.as_ref().expect("decision is present");
                 self.fact(
                     "select_phase_json",
                     SelectPhaseFact {
@@ -774,7 +792,8 @@ impl EndpointState {
         for ((sql, _select), unique_idx) in items.iter().zip(item_to_unique) {
             let result = &results[unique_idx];
             let rendered = render_select_result(result)?;
-            if let Some(decision) = &decision {
+            if self.select_fact_detail.emits_phase() && decision.is_some() {
+                let decision = decision.as_ref().expect("decision is present");
                 self.fact(
                     "select_phase_json",
                     SelectPhaseFact {

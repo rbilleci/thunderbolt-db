@@ -120,6 +120,8 @@ Evidence:
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-async-retained-int4-c64-ab-v1.md`
 - owner-loop pending completion queue implementation and rejection closed by
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-owner-loop-pending-completion-impl-v1.md`
+- select phase fact hot-path removal closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-select-phase-facts-off-c64-v1.md`
 
 Current state:
 
@@ -131,6 +133,9 @@ Current state:
   but the c64 A/B regressed the main literal rows, so the cap defaults to `0`
 - prepared retained microbatches remain opt-in; do not keep tuning pending caps
   as the default path unless a new design removes a whole owner-loop boundary
+- per-retained-SELECT phase JSON emission is no longer on the endpoint default
+  hot path; benchmark runs request `phase_only` explicitly when they need phase
+  aggregates
 
 ### M4: Small GPU Stream Pool
 
@@ -236,8 +241,8 @@ for a 5x-class boundary reduction, not a 1.2x row improvement:
 2. Keep the owner-loop pending completion queue as an opt-in diagnostic with
    cap `0` by default; cap `2` proved real overlap but regressed c64 p50.
 3. Preserve generation mismatch rejection and mutation publication barriers.
-4. Add telemetry for owner critical-section time versus response
-   materialization/write time before promoting any new path.
+4. Keep diagnostic fact logging off the default endpoint hot path; use
+   `phase_only` only for evidence runs that need per-request aggregates.
 5. Report c8/c64 queue wait and p50 impact before moving beyond M4.
 6. Treat route-lane depth, payload, and diversity heuristics as opt-in probes
    unless they collapse queue wait by multiple times without hurting homogeneous
