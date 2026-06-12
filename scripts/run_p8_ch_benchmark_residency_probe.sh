@@ -171,6 +171,17 @@ json_bool() {
   esac
 }
 
+select_phase_telemetry_bool() {
+  case "$1" in
+    none|NONE|0|false|FALSE)
+      printf 'false'
+      ;;
+    *)
+      printf 'true'
+      ;;
+  esac
+}
+
 phase_metric_avg() {
   local path="$1"
   local key="$2"
@@ -1961,7 +1972,7 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"select_fact_detail":"$(json_escape "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}")","retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"owner_response_scheduling_boundary","decision":"cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs and pending completion remain opt-in diagnostics until they remove a whole owner-loop boundary","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"select_fact_detail":"$(json_escape "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}")","retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":$(select_phase_telemetry_bool "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}"),"next_target":"owner_response_scheduling_boundary","decision":"cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs and pending completion remain opt-in diagnostics until they remove a whole owner-loop boundary","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke

@@ -122,6 +122,8 @@ Evidence:
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-owner-loop-pending-completion-impl-v1.md`
 - select phase fact hot-path removal closed by
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-select-phase-facts-off-c64-v1.md`
+- no-phase-facts full c1-c64 fast-path guard closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-select-facts-none-full-guard-v1.md`
 
 Current state:
 
