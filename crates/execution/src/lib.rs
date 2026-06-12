@@ -3377,13 +3377,23 @@ fn copy_cuda_resident_text_rows(
 ) -> Result<Vec<String>, CudaRuntimeProbeError> {
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
 
+    if row_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let min_row_idx = row_indices.iter().copied().min().unwrap_or(0);
+    let max_row_idx = row_indices.iter().copied().max().unwrap_or(0);
+    let offset_count = max_row_idx
+        .checked_sub(min_row_idx)
+        .and_then(|span| span.checked_add(2))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let offsets_offset = min_row_idx
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .and_then(|offset| offsets_byte_offset.checked_add(offset))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     let offsets_end = offsets_byte_offset
         .checked_add(
-            row_indices
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
+            max_row_idx
                 .checked_add(2)
                 .and_then(|count| count.checked_mul(std::mem::size_of::<u64>() as u64))
                 .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
@@ -3408,38 +3418,72 @@ fn copy_cuda_resident_text_rows(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
-    let mut values = Vec::with_capacity(row_indices.len());
+    let mut offsets = vec![
+        0_u64;
+        usize::try_from(offset_count).map_err(|_| {
+            CudaRuntimeProbeError::InvalidInputLength(usize::MAX)
+        })?
+    ];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            offsets.as_mut_ptr().cast::<c_void>(),
+            resident.device_ptr + offsets_offset,
+            offsets
+                .len()
+                .checked_mul(std::mem::size_of::<u64>())
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+        )
+    })?;
+
+    let mut spans = Vec::with_capacity(row_indices.len());
+    let mut min_text_start = u64::MAX;
+    let mut max_text_end = 0_u64;
     for row_idx in row_indices {
-        let offsets_offset = row_idx
-            .checked_mul(std::mem::size_of::<u64>() as u64)
-            .and_then(|offset| offsets_byte_offset.checked_add(offset))
+        let offset_idx = row_idx
+            .checked_sub(min_row_idx)
+            .and_then(|idx| usize::try_from(idx).ok())
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        let mut pair = [0_u64; 2];
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                pair.as_mut_ptr().cast::<c_void>(),
-                resident.device_ptr + offsets_offset,
-                2 * std::mem::size_of::<u64>(),
-            )
-        })?;
-        let start = pair[0];
-        let end = pair[1];
+        let start = offsets[offset_idx];
+        let end = offsets[offset_idx + 1];
         if start > end || end > bytes_len {
             return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
         }
+        min_text_start = min_text_start.min(start);
+        max_text_end = max_text_end.max(end);
+        spans.push((start, end));
+    }
+
+    let text_span_len = max_text_end
+        .checked_sub(min_text_start)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut text_bytes = vec![
+        0_u8;
+        usize::try_from(text_span_len).map_err(|_| {
+            CudaRuntimeProbeError::InvalidInputLength(usize::MAX)
+        })?
+    ];
+    if text_span_len > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                text_bytes.as_mut_ptr().cast::<c_void>(),
+                resident.device_ptr + bytes_byte_offset + min_text_start,
+                text_bytes.len(),
+            )
+        })?;
+    }
+
+    let mut values = Vec::with_capacity(row_indices.len());
+    for (start, end) in spans {
         let value_len = usize::try_from(end - start)
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        let mut bytes = vec![0_u8; value_len];
-        if value_len > 0 {
-            check_cuda(unsafe {
-                cu_memcpy_dtoh(
-                    bytes.as_mut_ptr().cast::<c_void>(),
-                    resident.device_ptr + bytes_byte_offset + start,
-                    value_len,
-                )
-            })?;
-        }
-        let value = std::str::from_utf8(&bytes)
+        let value_start = start
+            .checked_sub(min_text_start)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let value_end = value_start
+            .checked_add(value_len)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let value = std::str::from_utf8(&text_bytes[value_start..value_end])
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(value_len))?;
         values.push(value.to_string());
     }
