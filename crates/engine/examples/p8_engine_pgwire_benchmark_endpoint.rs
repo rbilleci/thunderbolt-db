@@ -433,6 +433,7 @@ impl EndpointState {
         items: &[(String, Select)],
         scheduler_queue_wait_micros: u64,
         microbatch_admission_wait_micros: u64,
+        microbatch_kind: &'static str,
     ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -527,7 +528,7 @@ impl EndpointState {
                         d2h_delta,
                         kernel_delta,
                         result_rows: result.rows.len(),
-                        microbatch_kind: "multi_literal_gpu",
+                        microbatch_kind,
                         microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
                         microbatch_unique_selects: u64::try_from(selects.len()).unwrap_or(u64::MAX),
                         microbatch_admission_wait_micros,
@@ -1341,6 +1342,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
     let gpu_latency_lane_enabled = requested_gpu_latency_lane_enabled && max_sessions >= 128;
+    let prepared_retained_routes_enabled =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_ROUTES")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(true);
     let requested_gpu_microbatch_route_lane_scan_policy = RouteLaneScanPolicy::from_env();
     let gpu_microbatch_route_lane_scan_policy = if requested_gpu_microbatch_route_lane_scan_policy
         == RouteLaneScanPolicy::Adaptive
@@ -1438,6 +1443,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner_thread_gpu_latency_lane_retained_literal_effective",
         gpu_latency_lane_enabled,
     )?;
+    state.fact(
+        "owner_thread_gpu_prepared_retained_routes",
+        prepared_retained_routes_enabled,
+    )?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
     state.fact("max_sessions", max_sessions)?;
@@ -1459,6 +1468,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut gpu_route_lane_scanned_ready = 0_u64;
     let mut gpu_route_lane_projected_payload_weight = 0_u64;
     let mut gpu_latency_lane_requests = 0_u64;
+    let mut gpu_prepared_retained_route_requests = 0_u64;
     while completed < max_sessions {
         while completed_rx.try_recv().is_ok() {
             completed += 1;
@@ -1735,6 +1745,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 &items,
                                 scheduler_queue_wait_micros,
                                 microbatch_admission_wait_micros,
+                                "multi_literal_gpu",
                             )?;
                             state.flush_facts()?;
                             Ok(outputs)
@@ -1776,6 +1787,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let _ = request.response_tx.send(response);
                         }
                     }
+                } else if prepared_retained_routes_enabled
+                    && matches!(
+                        batch[0].batch_candidate,
+                        Some(RetainedSelectBatchCandidate::Literal { .. })
+                    )
+                {
+                    let request = batch.pop().expect("single request batch is non-empty");
+                    let result = (|| -> Result<Vec<u8>, Box<dyn Error>> {
+                        let Some(RetainedSelectBatchCandidate::Literal { select, sql, .. }) =
+                            &request.batch_candidate
+                        else {
+                            return Err("prepared retained route requires literal SELECT".into());
+                        };
+                        let items = [(sql.clone(), select.clone())];
+                        let outputs = state.handle_multi_literal_select_batch(
+                            &items,
+                            scheduler_queue_wait_micros,
+                            microbatch_admission_wait_micros,
+                            "prepared_literal_gpu",
+                        )?;
+                        state.flush_facts()?;
+                        outputs
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| "prepared retained route returned no output".into())
+                    })()
+                    .map_err(|err| err.to_string());
+                    if result.is_ok() {
+                        gpu_prepared_retained_route_requests =
+                            gpu_prepared_retained_route_requests.saturating_add(1);
+                    }
+                    let _ = request.response_tx.send(result.map(EngineResponse::Bytes));
                 } else {
                     let request = batch.pop().expect("single request batch is non-empty");
                     let result = (|| -> Result<EngineResponse, Box<dyn Error>> {
@@ -1862,6 +1905,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_latency_lane_requests",
         gpu_latency_lane_requests,
+    )?;
+    state.fact(
+        "owner_thread_gpu_prepared_retained_route_requests",
+        gpu_prepared_retained_route_requests,
     )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;
