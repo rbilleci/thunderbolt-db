@@ -1795,16 +1795,16 @@ fn handle_client_io(
                 }
             }
             FrontendMessage::SimpleQuery(sql) => {
+                let cached = retained_read_response_cache
+                    .lock()
+                    .map_err(|_| "retained read response cache lock poisoned".to_string())?
+                    .get(&sql);
+                if let Some(bytes) = cached {
+                    stream.write_all(&bytes).map_err(|err| err.to_string())?;
+                    continue;
+                }
                 match parse_command(&sql).map_err(|err| err.to_string())? {
                     Command::Select(_) => {
-                        let cached = retained_read_response_cache
-                            .lock()
-                            .map_err(|_| "retained read response cache lock poisoned".to_string())?
-                            .get(&sql);
-                        if let Some(bytes) = cached {
-                            stream.write_all(&bytes).map_err(|err| err.to_string())?;
-                            continue;
-                        }
                         let response = request_engine(
                             &request_sender,
                             EngineCommand::SimpleQuery(sql.clone()),
