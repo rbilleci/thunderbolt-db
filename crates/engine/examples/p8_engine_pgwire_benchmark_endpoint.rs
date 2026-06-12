@@ -673,8 +673,30 @@ enum EngineResponse {
 
 struct EngineRequest {
     command: EngineCommand,
+    batch_candidate: Option<RetainedSelectBatchCandidate>,
     enqueued_at: Instant,
     response_tx: mpsc::Sender<Result<EngineResponse, String>>,
+}
+
+#[derive(Debug, Clone)]
+enum RetainedSelectBatchCandidate {
+    Literal {
+        batch_key: RetainedSelectLiteralBatchKey,
+        exact_key: String,
+        select: Select,
+        sql: String,
+    },
+    Exact {
+        exact_key: String,
+    },
+}
+
+impl RetainedSelectBatchCandidate {
+    fn exact_key(&self) -> &str {
+        match self {
+            Self::Literal { exact_key, .. } | Self::Exact { exact_key } => exact_key,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -682,16 +704,6 @@ struct RetainedSelectLiteralBatchKey {
     table: String,
     projection_columns: Vec<String>,
     filter_column: String,
-}
-
-fn retained_select_microbatch_key(command: &EngineCommand) -> Option<&str> {
-    let EngineCommand::SimpleQuery(sql) = command else {
-        return None;
-    };
-    match parse_command(sql) {
-        Ok(Command::Select(_)) => Some(sql),
-        _ => None,
-    }
 }
 
 fn retained_select_literal_needle(select: &Select) -> Option<i32> {
@@ -717,14 +729,10 @@ fn retained_select_literal_needle(select: &Select) -> Option<i32> {
 }
 
 fn retained_select_literal_batch_candidate(
-    command: &EngineCommand,
-) -> Option<(RetainedSelectLiteralBatchKey, i32, Select, String)> {
-    let EngineCommand::SimpleQuery(sql) = command else {
-        return None;
-    };
-    let Ok(Command::Select(select)) = parse_command(sql) else {
-        return None;
-    };
+    sql: &str,
+    select: Select,
+) -> Option<RetainedSelectBatchCandidate> {
+    let exact_key = sql.to_string();
     if select.distinct
         || select.group_by.is_some()
         || !select.having_groups.is_empty()
@@ -753,17 +761,33 @@ fn retained_select_literal_batch_candidate(
     if filters.len() != 1 || filters[0].op != SelectFilterOp::Eq {
         return None;
     }
-    let needle = retained_select_literal_needle(&select)?;
-    Some((
-        RetainedSelectLiteralBatchKey {
+    let _needle = retained_select_literal_needle(&select)?;
+    Some(RetainedSelectBatchCandidate::Literal {
+        batch_key: RetainedSelectLiteralBatchKey {
             table: select.table.clone(),
             projection_columns: projection_columns.clone(),
             filter_column: filters[0].column.clone(),
         },
-        needle,
+        exact_key,
         select,
-        sql.clone(),
-    ))
+        sql: sql.to_string(),
+    })
+}
+
+fn retained_select_batch_candidate(
+    command: &EngineCommand,
+) -> Option<RetainedSelectBatchCandidate> {
+    let EngineCommand::SimpleQuery(sql) = command else {
+        return None;
+    };
+    let Ok(Command::Select(select)) = parse_command(sql) else {
+        return None;
+    };
+    retained_select_literal_batch_candidate(sql, select).or_else(|| {
+        Some(RetainedSelectBatchCandidate::Exact {
+            exact_key: sql.clone(),
+        })
+    })
 }
 
 fn recv_next_batch_candidate(
@@ -797,9 +821,11 @@ fn request_engine(
     command: EngineCommand,
 ) -> Result<EngineResponse, String> {
     let (response_tx, response_rx) = mpsc::channel();
+    let batch_candidate = retained_select_batch_candidate(&command);
     request_tx
         .send(EngineRequest {
             command,
+            batch_candidate,
             enqueued_at: Instant::now(),
             response_tx,
         })
@@ -1185,6 +1211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner_thread_gpu_microbatch_admission_window_micros",
         gpu_microbatch_admission_window_micros,
     )?;
+    state.fact("owner_thread_gpu_microbatch_preclassified_requests", true)?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
     state.fact("max_sessions", max_sessions)?;
@@ -1215,8 +1242,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mut microbatch_admission_wait_micros = 0_u64;
                 if gpu_microbatch_max > 1 {
                     let batch_started = Instant::now();
-                    if let Some((batch_key, _first_needle, _select, _sql)) =
-                        retained_select_literal_batch_candidate(&batch[0].command)
+                    if let Some(RetainedSelectBatchCandidate::Literal {
+                        batch_key,
+                        exact_key,
+                        ..
+                    }) = batch[0].batch_candidate.clone()
                     {
                         while batch.len() < gpu_microbatch_max {
                             match recv_next_batch_candidate(
@@ -1229,18 +1259,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         microbatch_admission_wait_micros.saturating_add(
                                             waited.as_micros().try_into().unwrap_or(u64::MAX),
                                         );
-                                    if let Some((next_key, _next_needle, _select, _sql)) =
-                                        retained_select_literal_batch_candidate(&next.command)
-                                    {
-                                        if next_key == batch_key {
+                                    match &next.batch_candidate {
+                                        Some(RetainedSelectBatchCandidate::Literal {
+                                            batch_key: next_key,
+                                            ..
+                                        }) if *next_key == batch_key => {
                                             batch.push(next);
-                                        } else {
+                                        }
+                                        _ => {
                                             deferred_requests.push_back(next);
                                             break;
                                         }
-                                    } else {
-                                        deferred_requests.push_back(next);
-                                        break;
                                     }
                                 }
                                 Ok((None, waited)) => {
@@ -1255,14 +1284,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 ) => break,
                             }
                         }
-                        let exact_key =
-                            retained_select_microbatch_key(&batch[0].command).unwrap_or_default();
                         literal_microbatch = batch.len() > 1
                             && !batch.iter().all(|request| {
-                                retained_select_microbatch_key(&request.command) == Some(exact_key)
+                                request
+                                    .batch_candidate
+                                    .as_ref()
+                                    .is_some_and(|candidate| candidate.exact_key() == exact_key)
                             });
-                    } else if let Some(batch_key) =
-                        retained_select_microbatch_key(&batch[0].command).map(str::to_string)
+                    } else if let Some(batch_key) = batch[0]
+                        .batch_candidate
+                        .as_ref()
+                        .map(|candidate| candidate.exact_key().to_string())
                     {
                         while batch.len() < gpu_microbatch_max {
                             match recv_next_batch_candidate(
@@ -1275,8 +1307,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         microbatch_admission_wait_micros.saturating_add(
                                             waited.as_micros().try_into().unwrap_or(u64::MAX),
                                         );
-                                    if retained_select_microbatch_key(&next.command)
-                                        == Some(batch_key.as_str())
+                                    if next
+                                        .batch_candidate
+                                        .as_ref()
+                                        .is_some_and(|candidate| candidate.exact_key() == batch_key)
                                     {
                                         batch.push(next);
                                     } else {
@@ -1323,9 +1357,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let items = batch
                                 .iter()
                                 .map(|request| {
-                                    retained_select_literal_batch_candidate(&request.command)
-                                        .map(|(_key, _needle, select, sql)| (sql, select))
-                                        .ok_or("only compatible int4 equality SELECT can be literal-microbatched")
+                                    match &request.batch_candidate {
+                                        Some(RetainedSelectBatchCandidate::Literal {
+                                            select,
+                                            sql,
+                                            ..
+                                        }) => Ok((sql.clone(), select.clone())),
+                                        _ => Err("only compatible int4 equality SELECT can be literal-microbatched"),
+                                    }
                                 })
                                 .collect::<Result<Vec<_>, _>>()?;
                             let outputs = state.handle_multi_literal_select_batch(
