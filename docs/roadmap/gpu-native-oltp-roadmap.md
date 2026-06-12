@@ -206,7 +206,10 @@ comparison baseline.
 
 ## Near-Term Next Slice
 
-Continue M3 with async/concurrent execution:
+Continue M3/M4 with async/concurrent execution. Do not spend more default-path
+work on increasingly complex single owner-queue heuristics unless they are
+short probes that protect an existing win. The next implementation should aim
+for a 5x-class boundary reduction, not a 1.2x row improvement:
 
 1. Make retained read submit nonblocking for the owner loop, or allow a bounded
    set of submitted retained reads to overlap before completion.
@@ -214,3 +217,6 @@ Continue M3 with async/concurrent execution:
 3. Add telemetry for in-flight read submissions, completion count, and owner
    critical-section time.
 4. Report c8/c64 queue wait and p50 impact before moving to M4 stream pool.
+5. Treat route-lane depth, payload, and diversity heuristics as opt-in probes
+   unless they collapse queue wait by multiple times without hurting homogeneous
+   route batches.

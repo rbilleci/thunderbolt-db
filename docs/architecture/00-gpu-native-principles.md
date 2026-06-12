@@ -103,6 +103,14 @@ and serialized until the transaction model says otherwise.
    prepared/typed route measurements that show the engine floor without repeated
    SQL parse and text protocol overhead.
 
+7. **Prefer 5x boundary collapses over 1.2x tuning.**
+   Small scheduler or materialization tweaks are useful only when they are
+   simple, validate a larger design, or protect an existing win. Default roadmap
+   work should target whole-boundary reductions such as bypassing owner-queue
+   waits, overlapping read-only GPU work, or replacing repeated SQL/protocol
+   work with prepared route execution. If a slice cannot plausibly change a
+   measured row by multiple times, keep it as a short probe or skip it.
+
 ## Architecture Choices This Rules Out As Defaults
 
 - CPU indexes as the main answer for hot retained point reads.
@@ -130,4 +138,5 @@ For the current P8 retained-read work, prefer steps that move toward:
 
 Avoid spending too much effort on increasingly complex single-queue heuristics
 unless the measurement clearly shows they are a stepping stone toward this
-model.
+model. Favor changes that can plausibly deliver a 5x class improvement on a
+measured bottleneck over changes that merely smooth one benchmark row.
