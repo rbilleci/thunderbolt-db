@@ -498,7 +498,9 @@ impl EndpointState {
                         )?;
                     let retained_read_submit_micros = submission.submit_wall_micros;
                     let complete_started = Instant::now();
-                    let results = Engine::complete_relational_retained_read_submission(submission);
+                    let results = self
+                        .engine
+                        .complete_relational_retained_read_submission(submission)?;
                     let retained_read_complete_micros = complete_started
                         .elapsed()
                         .as_micros()

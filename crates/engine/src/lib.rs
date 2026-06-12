@@ -7,9 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32Comparison,
-    CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory, DeviceRouter,
-    DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime, Operator, PlannedOp,
-    ProjectOperator, RouteDecision, ScanOperator, SortOperator,
+    CudaI32EqualAnyProjectSubmission, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk,
+    CudaResidentDeviceMemory, DeviceRouter, DeviceTarget, FilterOperator, LimitOperator,
+    MockGpuRuntime, Operator, PlannedOp, ProjectOperator, RouteDecision, ScanOperator,
+    SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -6429,14 +6430,28 @@ pub struct RelationalRetainedReadJob {
     select: Select,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalRetainedReadSubmission {
     pub route_id: String,
     pub table: String,
     pub snapshot_generation: u64,
     pub job_count: usize,
     pub submit_wall_micros: u64,
-    results: Vec<RelationalSelectResult>,
+    inner: RelationalRetainedReadSubmissionInner,
+}
+
+enum RelationalRetainedReadSubmissionInner {
+    Ready(Vec<RelationalSelectResult>),
+    PendingInt4Projection(RelationalRetainedInt4ProjectionSubmission),
+}
+
+struct RelationalRetainedInt4ProjectionSubmission {
+    table: RelationalTable,
+    snapshot_gpu_id: u16,
+    selected_indexes: Vec<usize>,
+    members: Vec<(BoundRelationalSelect, RelationalAccessPath, i32)>,
+    before_metrics: RuntimeMetricsSnapshot,
+    batch_started: Instant,
+    submission: CudaI32EqualAnyProjectSubmission,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15224,9 +15239,7 @@ impl Engine {
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         let submission =
             self.submit_relational_retained_read_jobs_with_resident_device_memory_probe(jobs)?;
-        Ok(Self::complete_relational_retained_read_submission(
-            submission,
-        ))
+        self.complete_relational_retained_read_submission(submission)
     }
 
     pub fn submit_relational_retained_read_jobs_with_resident_device_memory_probe(
@@ -15262,6 +15275,11 @@ impl Engine {
             }
         }
         let submit_started = Instant::now();
+        if let Some(submission) =
+            self.try_submit_relational_retained_int4_projection_jobs(jobs, submit_started)?
+        {
+            return Ok(submission);
+        }
         let selects = jobs
             .iter()
             .map(|job| job.select.clone())
@@ -15285,14 +15303,309 @@ impl Engine {
                 .as_micros()
                 .try_into()
                 .unwrap_or(u64::MAX),
-            results,
+            inner: RelationalRetainedReadSubmissionInner::Ready(results),
         })
     }
 
     pub fn complete_relational_retained_read_submission(
+        &mut self,
         submission: RelationalRetainedReadSubmission,
-    ) -> Vec<RelationalSelectResult> {
-        submission.results
+    ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+        match submission.inner {
+            RelationalRetainedReadSubmissionInner::Ready(results) => Ok(results),
+            RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => {
+                self.complete_relational_retained_int4_projection_submission(pending)
+            }
+        }
+    }
+
+    fn try_submit_relational_retained_int4_projection_jobs(
+        &mut self,
+        jobs: &[RelationalRetainedReadJob],
+        submit_started: Instant,
+    ) -> Result<Option<RelationalRetainedReadSubmission>, ExecuteError> {
+        if jobs.is_empty() {
+            return Ok(Some(RelationalRetainedReadSubmission {
+                route_id: "empty".to_string(),
+                table: "empty".to_string(),
+                snapshot_generation: 0,
+                job_count: 0,
+                submit_wall_micros: submit_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                inner: RelationalRetainedReadSubmissionInner::Ready(Vec::new()),
+            }));
+        }
+
+        let mut members = Vec::with_capacity(jobs.len());
+        let mut batch_table: Option<RelationalTable> = None;
+        let mut batch_filter_idx: Option<usize> = None;
+        let mut batch_selected_indexes: Option<Vec<usize>> = None;
+        for job in jobs {
+            let query_shape = job.route_id.split(':').next().unwrap_or("unknown");
+            if !matches!(
+                query_shape,
+                "int4_equality_projection" | "int4_equality_multi_column_projection"
+            ) {
+                return Ok(None);
+            }
+            let (table, bound) = self.bind_relational_select_for_execution(&job.select)?;
+            let filter_groups = if !bound.filter_groups.is_empty() {
+                bound.filter_groups.clone()
+            } else if !bound.filters.is_empty() {
+                vec![bound.filters.clone()]
+            } else if let Some(filter) = bound.filter.clone() {
+                vec![vec![filter]]
+            } else {
+                Vec::new()
+            };
+            if job.schema != table.schema
+                || job.table != table.name
+                || job.params.len() != 1
+                || bound.selected_indexes.is_empty()
+                || !bound
+                    .selected_indexes
+                    .iter()
+                    .all(|idx| table.columns[*idx].ty == SqlType::Int4)
+                || filter_groups.len() != 1
+                || filter_groups[0].len() != 1
+            {
+                return Ok(None);
+            }
+            let (filter_idx, op, value) = filter_groups[0][0].clone();
+            let SqlValue::Int4(needle) = value else {
+                return Ok(None);
+            };
+            if op != SelectFilterOp::Eq || table.columns[filter_idx].ty != SqlType::Int4 {
+                return Ok(None);
+            }
+            match &job.params[0] {
+                RelationalRetainedReadParam::Int4Eq { column, value }
+                    if column == &table.columns[filter_idx].name && *value == needle => {}
+                _ => return Ok(None),
+            }
+            if let Some(existing) = &batch_table {
+                if existing.name != table.name
+                    || existing.schema != table.schema
+                    || existing.columns != table.columns
+                {
+                    return Ok(None);
+                }
+            } else {
+                batch_table = Some(table.clone());
+            }
+            if batch_filter_idx.is_some_and(|existing| existing != filter_idx) {
+                return Ok(None);
+            }
+            batch_filter_idx = Some(filter_idx);
+            if batch_selected_indexes
+                .as_ref()
+                .is_some_and(|existing| existing != &bound.selected_indexes)
+            {
+                return Ok(None);
+            }
+            batch_selected_indexes = Some(bound.selected_indexes.clone());
+            let (_query, access_path) =
+                self.relational_select_mvcc_query(&job.select, &table, &bound)?;
+            members.push((bound, access_path, needle));
+        }
+
+        let table = batch_table.expect("non-empty batch has table");
+        let filter_idx = batch_filter_idx.expect("non-empty batch has filter");
+        let selected_indexes = batch_selected_indexes.expect("non-empty batch has projections");
+        let snapshot = self
+            .relational_residency_snapshot_ref(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name || !snapshot.is_valid() {
+            return Ok(None);
+        }
+        let snapshot_gpu_id = snapshot.gpu_id;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let filter_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
+        let projection_offsets = selected_indexes
+            .iter()
+            .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+            .collect::<Result<Vec<_>, ExecuteError>>()?;
+        let needles = members
+            .iter()
+            .map(|(_bound, _access_path, needle)| *needle)
+            .collect::<Vec<_>>();
+        let device_memory = self
+            .relational_resident_cache
+            .device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        device_memory.clear_last_kernel_event_elapsed_us();
+        let before_metrics = self.metrics.snapshot();
+        let batch_started = Instant::now();
+        let cuda_submission = device_memory
+            .submit_match_project_i32_equal_any_from_payload(
+                filter_offset,
+                &needles,
+                &projection_offsets,
+                row_count,
+            )
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let first_job = jobs.first().expect("non-empty jobs");
+
+        Ok(Some(RelationalRetainedReadSubmission {
+            route_id: first_job.route_id.clone(),
+            table: first_job.table.clone(),
+            snapshot_generation: first_job.snapshot_generation,
+            job_count: jobs.len(),
+            submit_wall_micros: submit_started
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            inner: RelationalRetainedReadSubmissionInner::PendingInt4Projection(
+                RelationalRetainedInt4ProjectionSubmission {
+                    table,
+                    snapshot_gpu_id,
+                    selected_indexes,
+                    members,
+                    before_metrics,
+                    batch_started,
+                    submission: cuda_submission,
+                },
+            ),
+        }))
+    }
+
+    fn complete_relational_retained_int4_projection_submission(
+        &mut self,
+        pending: RelationalRetainedInt4ProjectionSubmission,
+    ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+        let device_memory = self
+            .relational_resident_cache
+            .device_memory
+            .get(&pending.table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    pending.table.name
+                )))
+            })?;
+        let projected_rows = pending
+            .submission
+            .complete(device_memory)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let batch_micros = pending
+            .batch_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let materialize_started = Instant::now();
+        let mut rows_by_select = vec![Vec::new(); pending.members.len()];
+        for projected in &projected_rows {
+            rows_by_select[projected.needle_index].push(
+                projected
+                    .values
+                    .iter()
+                    .copied()
+                    .map(SqlValue::Int4)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let materialization_micros = materialize_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let total_rows = rows_by_select.iter().map(Vec::len).sum::<usize>();
+        let int4_result_columns = pending.selected_indexes.len();
+        let row_metadata_d2h_bytes = u64::try_from(total_rows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul((std::mem::size_of::<u32>() + std::mem::size_of::<u64>()) as u64)
+            .saturating_add(std::mem::size_of::<u32>() as u64);
+        let result_d2h_bytes = u64::try_from(total_rows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(int4_result_columns)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<i32>() as u64),
+            )
+            .saturating_add(row_metadata_d2h_bytes);
+        self.metrics.observe_d2h_bytes(result_d2h_bytes);
+        self.metrics
+            .observe_kernel_exec_ms(batch_micros.div_ceil(1000).max(1));
+        let kernel_event_elapsed_us = self
+            .relational_resident_cache
+            .device_memory
+            .get(&pending.table.name)
+            .and_then(|device_memory| device_memory.last_kernel_event_elapsed_us());
+        if let Some(elapsed_us) = kernel_event_elapsed_us {
+            self.metrics.observe_kernel_event_elapsed_us(elapsed_us);
+        }
+        self.relational_resident_cache
+            .record_route_selected_projection_micros(
+                &pending.table.name,
+                batch_micros,
+                batch_micros,
+                materialization_micros,
+                total_rows,
+            );
+        let after_metrics = self.metrics.snapshot();
+        self.relational_resident_cache
+            .record_route_execution_observation(
+                &pending.table.name,
+                RelationalResidentRouteExecutionObservation {
+                    h2d_bytes: after_metrics
+                        .h2d_bytes_total
+                        .saturating_sub(pending.before_metrics.h2d_bytes_total),
+                    d2h_bytes: after_metrics
+                        .d2h_bytes_total
+                        .saturating_sub(pending.before_metrics.d2h_bytes_total),
+                    kernel_samples: after_metrics
+                        .kernel_exec_samples
+                        .saturating_sub(pending.before_metrics.kernel_exec_samples),
+                    kernel_ms: after_metrics
+                        .kernel_exec_total_ms
+                        .saturating_sub(pending.before_metrics.kernel_exec_total_ms),
+                    kernel_event_elapsed_us,
+                    rows: total_rows,
+                    wall_micros: pending
+                        .batch_started
+                        .elapsed()
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                },
+            );
+
+        Ok(pending
+            .members
+            .into_iter()
+            .zip(rows_by_select)
+            .map(
+                |((bound, access_path, _needle), rows)| RelationalSelectResult {
+                    columns: bound.selected_columns,
+                    rows,
+                    planned_target: DeviceTarget::Gpu(pending.snapshot_gpu_id),
+                    executed_target: DeviceTarget::Gpu(pending.snapshot_gpu_id),
+                    fallback_reason: None,
+                    access_path,
+                },
+            )
+            .collect())
     }
 
     pub fn execute_relational_count_with_resident_device_memory_probe(
@@ -28116,6 +28429,25 @@ mod tests {
         assert_eq!(decision.query_shape, "int4_equality_projection");
         assert_eq!(decision.last_execution_kernel_samples, Some(1));
         assert_eq!(decision.last_execution_matched_rows, Some(2));
+        let single_column_read_jobs = single_column_selects
+            .iter()
+            .map(|select| e.prepare_relational_retained_read_job(select))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let single_column_submission = e
+            .submit_relational_retained_read_jobs_with_resident_device_memory_probe(
+                &single_column_read_jobs,
+            )
+            .unwrap();
+        assert_eq!(
+            single_column_submission.job_count,
+            single_column_read_jobs.len()
+        );
+        assert!(single_column_submission.submit_wall_micros > 0);
+        let single_column_read_job_results = e
+            .complete_relational_retained_read_submission(single_column_submission)
+            .unwrap();
+        assert_eq!(single_column_read_job_results, single_column_results);
 
         let mixed_column_selects = [
             "SELECT id, label FROM events WHERE id = 1",
@@ -28187,7 +28519,9 @@ mod tests {
         );
         assert_eq!(submission.job_count, read_jobs.len());
         assert!(submission.submit_wall_micros > 0);
-        let read_job_results = Engine::complete_relational_retained_read_submission(submission);
+        let read_job_results = e
+            .complete_relational_retained_read_submission(submission)
+            .unwrap();
         assert_eq!(read_job_results, mixed_column_results);
 
         e.execute_text(
