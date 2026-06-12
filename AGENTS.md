@@ -7,6 +7,9 @@ optimize for that thesis unless the user explicitly changes direction.
 
 - Treat GPU-resident execution as the product direction, not as an optional
   accelerator around a CPU-first database.
+- Optimize for GPU-native OLTP: entity fetches, tenant/security-filtered page
+  reads, bounded joins, and computed detail routes, not only analytical scans or
+  primary-key microbenchmarks.
 - Prefer designs where hot data, lookup structures, encoded columns, and read
   snapshots live in GPU memory.
 - Use CPU execution as reference semantics, control plane, fallback, ingress,
@@ -40,6 +43,7 @@ When choosing between implementation approaches:
 Before major runtime, storage, or scheduler changes, read:
 
 - `docs/architecture/00-gpu-native-principles.md`
+- `docs/roadmap/gpu-native-oltp-roadmap.md`
 - `docs/GPU_GUARDRAILS.md`
 - `docs/architecture/04-execution-model-cpu-gpu.md`
 - `docs/architecture/11-high-throughput-query-runtime.md`

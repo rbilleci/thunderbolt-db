@@ -25,6 +25,35 @@ than a side accelerator.
   valuable, but consistent low p50 requires avoiding unnecessary owner-queue
   waits and eventually allowing multiple in-flight read-only GPU jobs.
 
+## Target Workload: GPU-Native OLTP
+
+The target workload is OLTP for domains such as banking and e-commerce, not only
+primary-key microbenchmarks and not only analytical scans. The engine should
+prioritize hot, bounded, high-concurrency routes such as:
+
+- **Entity fetches:** single-row or single-object reads that may be wide.
+- **Tenant/security-filtered reads:** every access path may include tenant,
+  account, ACL, or visibility predicates.
+- **Page reads:** filtered/indexed result pages of roughly 20-50 rows.
+- **Bounded joins:** one or two table joins where at least one side is keyed,
+  tenant-bounded, or otherwise limited.
+- **Computed detail routes:** entity/detail views with derived values,
+  summaries, balances, or correlated lookup-like fields.
+
+The core optimization unit should become a prepared OLTP route, not an arbitrary
+SQL string. A prepared route records:
+
+- route id and SQL/protocol source
+- snapshot generation
+- tenant/security predicates
+- typed key/range/filter parameters
+- join shape and bounded fanout assumptions
+- projection and computed-column plan
+- expected cardinality: one row, bounded page, or bounded detail fanout
+- latency/throughput admission policy
+
+Point lookup support is the first proof, but it is not the final target.
+
 ## Preferred Long-Term Shape
 
 ```text
@@ -93,6 +122,8 @@ For the current P8 retained-read work, prefer steps that move toward:
 
 - prepared retained route ids and typed parameters
 - immutable retained snapshot handles
+- bounded OLTP route classes: entity, page, tenant-filtered, bounded join, and
+  computed detail
 - route-family scheduling that is simple to explain
 - multiple in-flight read-only GPU jobs over a stream pool
 - serialized mutation and snapshot publication

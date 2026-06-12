@@ -70,6 +70,7 @@ This project uses a layered documentation model so implementation can proceed qu
 
 15. **Delivery scope and sequencing**
    - `docs/roadmap/v0-v1.md`
+   - `docs/roadmap/gpu-native-oltp-roadmap.md`
    - `docs/roadmap/no-nvidia-bootstrap-plan.md`
    - `docs/roadmap/no-gpu-bootstrap-closeout-review.md`
 
