@@ -1407,6 +1407,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_ROUTES")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(true);
+    let prepared_retained_singletons_enabled =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_SINGLETONS")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
     let requested_gpu_microbatch_route_lane_scan_policy = RouteLaneScanPolicy::from_env();
     let gpu_microbatch_route_lane_scan_policy = if requested_gpu_microbatch_route_lane_scan_policy
         == RouteLaneScanPolicy::Adaptive
@@ -1507,6 +1511,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_prepared_retained_routes",
         prepared_retained_routes_enabled,
+    )?;
+    state.fact(
+        "owner_thread_gpu_prepared_retained_singletons",
+        prepared_retained_singletons_enabled,
     )?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
@@ -1814,6 +1822,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .map_err(|err| err.to_string());
                         match result {
                             Ok(outputs) => {
+                                gpu_prepared_retained_route_requests =
+                                    gpu_prepared_retained_route_requests.saturating_add(
+                                        u64::try_from(outputs.len()).unwrap_or(u64::MAX),
+                                    );
                                 for (request, output) in batch.into_iter().zip(outputs) {
                                     let _ =
                                         request.response_tx.send(Ok(EngineResponse::Bytes(output)));
@@ -1849,6 +1861,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 } else if prepared_retained_routes_enabled
+                    && prepared_retained_singletons_enabled
                     && matches!(
                         batch[0].batch_candidate,
                         Some(RetainedSelectBatchCandidate::Literal { .. })
