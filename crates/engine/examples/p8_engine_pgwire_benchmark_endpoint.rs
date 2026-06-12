@@ -407,6 +407,7 @@ impl EndpointState {
                             retained_matched_rows: decision
                                 .last_execution_matched_rows
                                 .map(|value| value.try_into().unwrap_or(u64::MAX)),
+                            retained_read_job_route_id: None,
                             retained_snapshot_generation: decision.snapshot_generation,
                             h2d_delta,
                             d2h_delta: after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total),
@@ -459,13 +460,15 @@ impl EndpointState {
             .iter()
             .map(|(_sql, select)| select.clone())
             .collect::<Vec<_>>();
+        let read_jobs = selects
+            .iter()
+            .map(|select| self.engine.prepare_relational_retained_read_job(select))
+            .collect::<Result<Vec<_>, _>>()?;
         let before = self.engine.metrics().snapshot();
         let execute_started = Instant::now();
         let results = self
             .engine
-            .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
-                &selects,
-            )?;
+            .execute_relational_retained_read_jobs_with_resident_device_memory_probe(&read_jobs)?;
         let engine_execute_micros = execute_started
             .elapsed()
             .as_micros()
@@ -528,6 +531,7 @@ impl EndpointState {
                         retained_matched_rows: decision
                             .last_execution_matched_rows
                             .map(|value| value.try_into().unwrap_or(u64::MAX)),
+                        retained_read_job_route_id: Some(&read_jobs[unique_idx].route_id),
                         retained_snapshot_generation: snapshot_handle
                             .as_ref()
                             .map(|handle| handle.generation)
@@ -1085,6 +1089,7 @@ struct SelectPhaseFact<'a> {
     retained_result_materialization_micros: Option<u64>,
     retained_cuda_event_micros: Option<u64>,
     retained_matched_rows: Option<u64>,
+    retained_read_job_route_id: Option<&'a str>,
     retained_snapshot_generation: Option<u64>,
     h2d_delta: u64,
     d2h_delta: u64,
@@ -1100,7 +1105,7 @@ impl std::fmt::Display for SelectPhaseFact<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"retained_snapshot_generation\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{},\"microbatch_admission_wait_micros\":{}}}",
+            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"retained_read_job_route_id\":{},\"retained_snapshot_generation\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{},\"microbatch_admission_wait_micros\":{}}}",
             json_escape(self.sql),
             json_escape(self.query_shape),
             self.scheduler_queue_wait_micros,
@@ -1114,6 +1119,7 @@ impl std::fmt::Display for SelectPhaseFact<'_> {
             json_optional_u64(self.retained_result_materialization_micros),
             json_optional_u64(self.retained_cuda_event_micros),
             json_optional_u64(self.retained_matched_rows),
+            json_optional_str(self.retained_read_job_route_id),
             json_optional_u64(self.retained_snapshot_generation),
             self.h2d_delta,
             self.d2h_delta,
@@ -1130,6 +1136,12 @@ impl std::fmt::Display for SelectPhaseFact<'_> {
 fn json_optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn json_optional_str(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", json_escape(value)))
         .unwrap_or_else(|| "null".to_string())
 }
 

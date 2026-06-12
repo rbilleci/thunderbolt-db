@@ -6415,6 +6415,21 @@ pub struct RelationalRetainedSnapshotHandle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelationalRetainedReadParam {
+    Int4Eq { column: String, value: i32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalRetainedReadJob {
+    pub route_id: String,
+    pub schema: String,
+    pub table: String,
+    pub snapshot_generation: u64,
+    pub params: Vec<RelationalRetainedReadParam>,
+    select: Select,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidentDeviceInt4ColumnStats {
     pub name: String,
     pub min: i32,
@@ -15096,6 +15111,142 @@ impl Engine {
                 },
             );
         Ok(result)
+    }
+
+    pub fn prepare_relational_retained_read_job(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalRetainedReadJob, ExecuteError> {
+        let decision = self.plan_relational_resident_route(select);
+        if !decision.accepted {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "retained read job rejected: {}",
+                decision.reason
+            ))));
+        }
+        if !matches!(
+            decision.query_shape.as_str(),
+            "int4_equality_projection"
+                | "int4_equality_multi_column_projection"
+                | "int4_equality_mixed_column_projection"
+        ) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "retained read jobs currently support only int4 equality projection routes, got {}",
+                decision.query_shape
+            ))));
+        }
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let handle = self
+            .relational_retained_snapshot_handle(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained snapshot handle",
+                    table.name
+                )))
+            })?;
+        if !handle.valid {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" retained snapshot handle is invalid",
+                table.name
+            ))));
+        }
+        if !handle.has_retained_device_memory {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" retained snapshot handle has no device memory",
+                table.name
+            ))));
+        }
+        let filter_groups = if !bound.filter_groups.is_empty() {
+            bound.filter_groups.clone()
+        } else if !bound.filters.is_empty() {
+            vec![bound.filters.clone()]
+        } else if let Some(filter) = bound.filter.clone() {
+            vec![vec![filter]]
+        } else {
+            Vec::new()
+        };
+        if filter_groups.len() != 1 || filter_groups[0].len() != 1 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "retained read jobs currently require one equality predicate".to_string(),
+            )));
+        }
+        let (filter_idx, op, value) = filter_groups[0][0].clone();
+        let SqlValue::Int4(needle) = value else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "retained read jobs currently require an int4 equality parameter".to_string(),
+            )));
+        };
+        if op != SelectFilterOp::Eq || table.columns[filter_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "retained read jobs currently require an int4 equality parameter".to_string(),
+            )));
+        }
+        let projection_columns = bound
+            .selected_indexes
+            .iter()
+            .map(|idx| table.columns[*idx].name.clone())
+            .collect::<Vec<_>>();
+        let filter_column = table.columns[filter_idx].name.clone();
+        let route_id = format!(
+            "{}:{}:{}:{}:{}",
+            decision.query_shape,
+            table.schema,
+            table.name,
+            projection_columns.join(","),
+            filter_column
+        );
+        Ok(RelationalRetainedReadJob {
+            route_id,
+            schema: table.schema,
+            table: table.name,
+            snapshot_generation: handle.generation,
+            params: vec![RelationalRetainedReadParam::Int4Eq {
+                column: filter_column,
+                value: needle,
+            }],
+            select: select.clone(),
+        })
+    }
+
+    pub fn execute_relational_retained_read_jobs_with_resident_device_memory_probe(
+        &mut self,
+        jobs: &[RelationalRetainedReadJob],
+    ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+        for job in jobs {
+            let handle = self
+                .relational_retained_snapshot_handle(&job.table)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" has no retained snapshot handle",
+                        job.table
+                    )))
+                })?;
+            if handle.generation != job.snapshot_generation {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "retained read job snapshot generation mismatch for relation \"{}\": job={}, current={}",
+                    job.table, job.snapshot_generation, handle.generation
+                ))));
+            }
+            if !handle.valid {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "retained read job snapshot handle for relation \"{}\" is invalid",
+                    job.table
+                ))));
+            }
+            if !handle.has_retained_device_memory {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "retained read job snapshot handle for relation \"{}\" has no device memory",
+                    job.table
+                ))));
+            }
+        }
+        let selects = jobs
+            .iter()
+            .map(|job| job.select.clone())
+            .collect::<Vec<_>>();
+        self.execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
+            &selects,
+        )
     }
 
     pub fn execute_relational_count_with_resident_device_memory_probe(
@@ -27833,6 +27984,52 @@ mod tests {
         assert_eq!(decision.last_execution_h2d_bytes, Some(0));
         assert_eq!(decision.last_execution_kernel_samples, Some(3));
         assert_eq!(decision.last_execution_matched_rows, Some(2));
+
+        let read_jobs = mixed_column_selects
+            .iter()
+            .map(|select| e.prepare_relational_retained_read_job(select))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(read_jobs.len(), 2);
+        assert_eq!(read_jobs[0].snapshot_generation, 1);
+        assert!(
+            read_jobs[0]
+                .route_id
+                .starts_with("int4_equality_mixed_column_projection:public:events:id,label:id"),
+            "{}",
+            read_jobs[0].route_id
+        );
+        assert_eq!(
+            read_jobs[0].params,
+            vec![RelationalRetainedReadParam::Int4Eq {
+                column: "id".to_string(),
+                value: 1
+            }]
+        );
+        let read_job_results = e
+            .execute_relational_retained_read_jobs_with_resident_device_memory_probe(&read_jobs)
+            .unwrap();
+        assert_eq!(read_job_results, mixed_column_results);
+
+        e.execute_text(
+            3,
+            "INSERT INTO events (id, bucket, amount, label) VALUES (4, 2, 40, 'amber')",
+        )
+        .unwrap();
+        e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+            tables: vec!["events".to_string()],
+            refresh_invalidated: true,
+            ..RelationalResidencyWarmupPolicy::default()
+        });
+        let stale_job = e
+            .execute_relational_retained_read_jobs_with_resident_device_memory_probe(&read_jobs)
+            .unwrap_err();
+        assert!(
+            stale_job
+                .to_string()
+                .contains("snapshot generation mismatch"),
+            "{stale_job}"
+        );
     }
 
     #[test]

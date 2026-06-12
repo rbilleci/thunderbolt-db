@@ -106,6 +106,8 @@ Evidence:
 
 - multiple in-flight read jobs visible in telemetry
 - c64 queue wait reduction without CPU fallback
+- descriptor slice closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-retained-read-job-cache-off-v1.md`
 
 ### M4: Small GPU Stream Pool
 
@@ -200,13 +202,11 @@ comparison baseline.
 
 ## Near-Term Next Slice
 
-Start with M3:
+Continue M3 with submit/completion:
 
-1. Add a read job descriptor that carries the prepared route id, typed
-   parameters, and retained snapshot generation.
-2. Split route preparation from retained GPU execution inside the owner-thread
-   scheduler.
-3. Keep mutation publication single-owner and validate generation mismatch
-   rejection before any async/concurrent execution work.
-4. Report whether the split reduces owner critical-section time before adding a
-   stream pool.
+1. Split retained read execution into explicit submit and completion phases for
+   the retained read job descriptor.
+2. Keep submit/completion on the owner thread first; measure owner critical
+   section and queue wait before adding concurrent streams.
+3. Preserve generation mismatch rejection and mutation publication barriers.
+4. Report c8/c64 queue wait and p50 impact before moving to M4 stream pool.
