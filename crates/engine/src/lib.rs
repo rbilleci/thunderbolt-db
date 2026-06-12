@@ -8,9 +8,9 @@ use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32Comparison,
     CudaI32EqualAnyProjectSubmission, CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk,
-    CudaResidentDeviceMemory, DeviceRouter, DeviceTarget, FilterOperator, LimitOperator,
-    MockGpuRuntime, Operator, PlannedOp, ProjectOperator, RouteDecision, ScanOperator,
-    SortOperator,
+    CudaResidentDeviceMemory, CudaResidentDeviceMemoryReadView, DeviceRouter, DeviceTarget,
+    FilterOperator, LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator,
+    RouteDecision, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -22319,6 +22319,20 @@ impl Engine {
                     resident_device_text_columns: snapshot.resident_device_text_columns.clone(),
                 }
             })
+    }
+
+    pub fn relational_retained_device_read_view(
+        &self,
+        table: &str,
+    ) -> Option<CudaResidentDeviceMemoryReadView> {
+        let handle = self.relational_retained_snapshot_handle(table)?;
+        if !handle.valid || !handle.has_retained_device_memory {
+            return None;
+        }
+        self.relational_resident_cache
+            .device_memory
+            .get(table)
+            .map(CudaResidentDeviceMemory::read_view)
     }
 
     fn relational_residency_snapshot_ref(

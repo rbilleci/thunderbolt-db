@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::os::raw::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use libloading::Library;
 use serde::{Deserialize, Serialize};
@@ -95,7 +95,15 @@ pub struct CudaResidentDeviceMemory {
     cu_mem_free: unsafe extern "C" fn(u64) -> i32,
     cu_ctx_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
     last_kernel_event_elapsed_us: Mutex<Option<u64>>,
-    _lib: Library,
+    _lib: Arc<Library>,
+}
+
+#[derive(Clone)]
+pub struct CudaResidentDeviceMemoryReadView {
+    metadata: CudaDeviceMemoryProof,
+    device_ptr: u64,
+    context: *mut c_void,
+    _lib: Arc<Library>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,9 +127,118 @@ impl fmt::Debug for CudaResidentDeviceMemory {
     }
 }
 
+impl fmt::Debug for CudaResidentDeviceMemoryReadView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CudaResidentDeviceMemoryReadView")
+            .field("metadata", &self.metadata)
+            .field("device_ptr", &self.device_ptr)
+            .finish_non_exhaustive()
+    }
+}
+
+// This view never frees or mutates the retained allocation. It is valid only
+// while the owning resident allocation remains alive and the snapshot generation
+// that published it has not been invalidated by the engine.
+unsafe impl Send for CudaResidentDeviceMemoryReadView {}
+unsafe impl Sync for CudaResidentDeviceMemoryReadView {}
+
+impl CudaResidentDeviceMemoryReadView {
+    pub fn metadata(&self) -> &CudaDeviceMemoryProof {
+        &self.metadata
+    }
+
+    pub fn device_ptr(&self) -> u64 {
+        self.device_ptr
+    }
+
+    pub fn context(&self) -> *mut c_void {
+        self.context
+    }
+
+    pub fn submit_match_project_i32_equal_any_from_payload(
+        &self,
+        filter_offset: u64,
+        needles: &[i32],
+        projection_offsets: &[u64],
+        row_count: u64,
+    ) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
+        submit_cuda_resident_i32_equal_any_project(
+            self,
+            filter_offset,
+            needles,
+            projection_offsets,
+            row_count,
+        )
+    }
+}
+
+trait CudaResidentReadSource {
+    fn metadata(&self) -> &CudaDeviceMemoryProof;
+    fn device_ptr(&self) -> u64;
+    fn context(&self) -> *mut c_void;
+    fn lib(&self) -> &Library;
+}
+
+impl CudaResidentReadSource for CudaResidentDeviceMemory {
+    fn metadata(&self) -> &CudaDeviceMemoryProof {
+        &self.metadata
+    }
+
+    fn device_ptr(&self) -> u64 {
+        self.device_ptr
+    }
+
+    fn context(&self) -> *mut c_void {
+        self.context
+    }
+
+    fn lib(&self) -> &Library {
+        self._lib.as_ref()
+    }
+}
+
+impl CudaResidentReadSource for CudaResidentDeviceMemoryReadView {
+    fn metadata(&self) -> &CudaDeviceMemoryProof {
+        &self.metadata
+    }
+
+    fn device_ptr(&self) -> u64 {
+        self.device_ptr
+    }
+
+    fn context(&self) -> *mut c_void {
+        self.context
+    }
+
+    fn lib(&self) -> &Library {
+        self._lib.as_ref()
+    }
+}
+
 impl CudaResidentDeviceMemory {
     pub fn metadata(&self) -> &CudaDeviceMemoryProof {
         &self.metadata
+    }
+
+    pub fn device_ptr(&self) -> u64 {
+        self.device_ptr
+    }
+
+    pub fn context(&self) -> *mut c_void {
+        self.context
+    }
+
+    fn lib(&self) -> &Library {
+        self._lib.as_ref()
+    }
+
+    pub fn read_view(&self) -> CudaResidentDeviceMemoryReadView {
+        CudaResidentDeviceMemoryReadView {
+            metadata: self.metadata.clone(),
+            device_ptr: self.device_ptr,
+            context: self.context,
+            _lib: Arc::clone(&self._lib),
+        }
     }
 
     pub fn last_kernel_event_elapsed_us(&self) -> Option<u64> {
@@ -1012,7 +1129,7 @@ impl CudaDriverRuntime {
             cu_mem_free: resident.cu_mem_free,
             cu_ctx_destroy: resident.cu_ctx_destroy,
             last_kernel_event_elapsed_us: Mutex::new(None),
-            _lib: resident._lib,
+            _lib: Arc::new(resident._lib),
         })
     }
 
@@ -1076,7 +1193,7 @@ impl CudaDriverRuntime {
             cu_mem_free: resident.cu_mem_free,
             cu_ctx_destroy: resident.cu_ctx_destroy,
             last_kernel_event_elapsed_us: Mutex::new(None),
-            _lib: resident._lib,
+            _lib: Arc::new(resident._lib),
         })
     }
 
@@ -1120,7 +1237,7 @@ impl CudaDriverRuntime {
             cu_mem_free: resident.cu_mem_free,
             cu_ctx_destroy: resident.cu_ctx_destroy,
             last_kernel_event_elapsed_us: Mutex::new(None),
-            _lib: resident._lib,
+            _lib: Arc::new(resident._lib),
         })
     }
 }
@@ -1422,60 +1539,60 @@ fn launch_cuda_resident_row_count(
 }
 "#;
 
-    if resident.metadata.allocated_bytes < std::mem::size_of::<u64>() as u64 {
+    if resident.metadata().allocated_bytes < std::mem::size_of::<u64>() as u64 {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
-            resident.metadata.allocated_bytes as usize,
+            resident.metadata().allocated_bytes as usize,
         ));
     }
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -1503,7 +1620,7 @@ fn launch_cuda_resident_row_count(
         cu_module_get_function(&mut function, module, c"gpu_db_resident_row_count".as_ptr())
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut output_arg = allocation_guard.ptr;
     let mut args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
@@ -1628,58 +1745,58 @@ done:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata.allocated_bytes {
+    if bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -1711,7 +1828,7 @@ done:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut offset_arg = byte_offset;
     let mut rows_arg = row_count;
     let mut needle_arg = needle;
@@ -1868,58 +1985,58 @@ done:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata.allocated_bytes {
+    if bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -1951,7 +2068,7 @@ done:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut offset_arg = byte_offset;
     let mut rows_arg = row_count;
     let mut needle_arg = needle;
@@ -2014,8 +2131,8 @@ fn launch_cuda_resident_text_prefix_count(
     let bytes_end = bytes_byte_offset
         .checked_add(bytes_len)
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if offsets_end > resident.metadata.allocated_bytes
-        || bytes_end > resident.metadata.allocated_bytes
+    if offsets_end > resident.metadata().allocated_bytes
+        || bytes_end > resident.metadata().allocated_bytes
     {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             offsets_end.max(bytes_end) as usize,
@@ -2030,9 +2147,9 @@ fn launch_cuda_resident_text_prefix_count(
 
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
@@ -2040,7 +2157,7 @@ fn launch_cuda_resident_text_prefix_count(
     check_cuda(unsafe {
         cu_memcpy_dtoh(
             raw_offsets.as_mut_ptr().cast::<c_void>(),
-            resident.device_ptr + offsets_byte_offset,
+            resident.device_ptr() + offsets_byte_offset,
             offsets_len_usize,
         )
     })?;
@@ -2049,7 +2166,7 @@ fn launch_cuda_resident_text_prefix_count(
         check_cuda(unsafe {
             cu_memcpy_dtoh(
                 bytes.as_mut_ptr().cast::<c_void>(),
-                resident.device_ptr + bytes_byte_offset,
+                resident.device_ptr() + bytes_byte_offset,
                 bytes_len_usize,
             )
         })?;
@@ -2099,8 +2216,8 @@ fn launch_cuda_resident_text_project(
     let bytes_end = bytes_byte_offset
         .checked_add(bytes_len)
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if offsets_end > resident.metadata.allocated_bytes
-        || bytes_end > resident.metadata.allocated_bytes
+    if offsets_end > resident.metadata().allocated_bytes
+        || bytes_end > resident.metadata().allocated_bytes
     {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             offsets_end.max(bytes_end) as usize,
@@ -2115,9 +2232,9 @@ fn launch_cuda_resident_text_project(
 
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
@@ -2125,7 +2242,7 @@ fn launch_cuda_resident_text_project(
     check_cuda(unsafe {
         cu_memcpy_dtoh(
             raw_offsets.as_mut_ptr().cast::<c_void>(),
-            resident.device_ptr + offsets_byte_offset,
+            resident.device_ptr() + offsets_byte_offset,
             offsets_len_usize,
         )
     })?;
@@ -2134,7 +2251,7 @@ fn launch_cuda_resident_text_project(
         check_cuda(unsafe {
             cu_memcpy_dtoh(
                 bytes.as_mut_ptr().cast::<c_void>(),
-                resident.device_ptr + bytes_byte_offset,
+                resident.device_ptr() + bytes_byte_offset,
                 bytes_len_usize,
             )
         })?;
@@ -2174,9 +2291,9 @@ fn copy_cuda_resident_i32_rows(
 
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
@@ -2189,7 +2306,7 @@ fn copy_cuda_resident_i32_rows(
         let value_end = value_offset
             .checked_add(std::mem::size_of::<i32>() as u64)
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if value_end > resident.metadata.allocated_bytes {
+        if value_end > resident.metadata().allocated_bytes {
             return Err(CudaRuntimeProbeError::InvalidInputLength(
                 value_end as usize,
             ));
@@ -2198,7 +2315,7 @@ fn copy_cuda_resident_i32_rows(
         check_cuda(unsafe {
             cu_memcpy_dtoh(
                 (&mut value as *mut i32).cast::<c_void>(),
-                resident.device_ptr + value_offset,
+                resident.device_ptr() + value_offset,
                 std::mem::size_of::<i32>(),
             )
         })?;
@@ -2427,7 +2544,7 @@ DONE:
             .checked_mul(std::mem::size_of::<i32>() as u64)
             .and_then(|bytes| byte_offset.checked_add(bytes))
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if bytes > resident.metadata.allocated_bytes {
+        if bytes > resident.metadata().allocated_bytes {
             return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
         }
     }
@@ -2436,7 +2553,7 @@ DONE:
             .checked_mul(std::mem::size_of::<i32>() as u64)
             .and_then(|bytes| byte_offset.checked_add(bytes))
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if bytes > resident.metadata.allocated_bytes {
+        if bytes > resident.metadata().allocated_bytes {
             return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
         }
     }
@@ -2454,59 +2571,59 @@ DONE:
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memset_d8 = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -2545,7 +2662,7 @@ DONE:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut rows_arg = row_count;
     let mut filter_count_arg = u32::try_from(filters.len())
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(filters.len()))?;
@@ -2636,8 +2753,8 @@ DONE:
         .collect())
 }
 
-fn submit_cuda_resident_i32_equal_any_project(
-    resident: &CudaResidentDeviceMemory,
+fn submit_cuda_resident_i32_equal_any_project<R: CudaResidentReadSource>(
+    resident: &R,
     filter_offset: u64,
     needles: &[i32],
     projection_offsets: &[u64],
@@ -2847,7 +2964,7 @@ DONE:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| filter_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if filter_bytes > resident.metadata.allocated_bytes {
+    if filter_bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             filter_bytes as usize,
         ));
@@ -2857,7 +2974,7 @@ DONE:
             .checked_mul(std::mem::size_of::<i32>() as u64)
             .and_then(|bytes| byte_offset.checked_add(bytes))
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if bytes > resident.metadata.allocated_bytes {
+        if bytes > resident.metadata().allocated_bytes {
             return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
         }
     }
@@ -2893,97 +3010,97 @@ DONE:
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memset_d8 = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_htod = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_set_current = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSetCurrent>(b"cuCtxSetCurrent\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_event_create = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuEventCreate>(b"cuEventCreate\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_event_destroy = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuEventDestroy>(b"cuEventDestroy_v2\0")
-            .or_else(|_| resident._lib.get::<CuEventDestroy>(b"cuEventDestroy\0"))
+            .or_else(|_| resident.lib().get::<CuEventDestroy>(b"cuEventDestroy\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_event_record = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuEventRecord>(b"cuEventRecord\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_event_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuEventSynchronize>(b"cuEventSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_event_elapsed_time = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuEventElapsedTime>(b"cuEventElapsedTime\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -3048,7 +3165,7 @@ DONE:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut rows_arg = row_count;
     let mut needle_count_arg = needle_count_u32;
     let mut projection_count_arg = u32::try_from(projection_offsets.len())
@@ -3116,7 +3233,7 @@ DONE:
         projection_count: projection_offsets.len(),
         needles_len: needles.len(),
         row_count,
-        context: resident.context,
+        context: resident.context(),
         values_guard,
         indices_guard,
         row_indices_guard,
@@ -3417,9 +3534,9 @@ DONE:
     let text_bytes_end = text_bytes_byte_offset
         .checked_add(text_bytes_len)
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if filter_bytes > resident.metadata.allocated_bytes
-        || text_offsets_end > resident.metadata.allocated_bytes
-        || text_bytes_end > resident.metadata.allocated_bytes
+    if filter_bytes > resident.metadata().allocated_bytes
+        || text_offsets_end > resident.metadata().allocated_bytes
+        || text_bytes_end > resident.metadata().allocated_bytes
     {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             filter_bytes.max(text_offsets_end).max(text_bytes_end) as usize,
@@ -3430,7 +3547,7 @@ DONE:
             .checked_mul(std::mem::size_of::<i32>() as u64)
             .and_then(|bytes| byte_offset.checked_add(bytes))
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if bytes > resident.metadata.allocated_bytes {
+        if bytes > resident.metadata().allocated_bytes {
             return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
         }
     }
@@ -3470,66 +3587,66 @@ DONE:
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memset_d8 = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_htod = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -3619,7 +3736,7 @@ DONE:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut rows_arg = row_count;
     let mut needle_count_arg = needle_count_u32;
     let mut projection_count_arg = u32::try_from(projection_offsets.len())
@@ -3983,7 +4100,7 @@ DONE:
             .checked_mul(std::mem::size_of::<i32>() as u64)
             .and_then(|bytes| byte_offset.checked_add(bytes))
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if bytes > resident.metadata.allocated_bytes {
+        if bytes > resident.metadata().allocated_bytes {
             return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
         }
     }
@@ -3998,59 +4115,59 @@ DONE:
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memset_d8 = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -4089,7 +4206,7 @@ DONE:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut rows_arg = row_count;
     let mut filter_count_arg = u32::try_from(filters.len())
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(filters.len()))?;
@@ -4181,23 +4298,23 @@ fn launch_cuda_resident_i32_between_row_indices(
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata.allocated_bytes {
+    if bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
     let bytes_usize = usize::try_from(bytes - byte_offset)
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let mut raw_values = vec![0_u8; bytes_usize];
     check_cuda(unsafe {
         cu_memcpy_dtoh(
             raw_values.as_mut_ptr().cast::<c_void>(),
-            resident.device_ptr + byte_offset,
+            resident.device_ptr() + byte_offset,
             bytes_usize,
         )
     })?;
@@ -4256,8 +4373,8 @@ fn copy_cuda_resident_text_rows(
     let bytes_end = bytes_byte_offset
         .checked_add(bytes_len)
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if offsets_end > resident.metadata.allocated_bytes
-        || bytes_end > resident.metadata.allocated_bytes
+    if offsets_end > resident.metadata().allocated_bytes
+        || bytes_end > resident.metadata().allocated_bytes
     {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             offsets_end.max(bytes_end) as usize,
@@ -4266,9 +4383,9 @@ fn copy_cuda_resident_text_rows(
 
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
@@ -4281,7 +4398,7 @@ fn copy_cuda_resident_text_rows(
     check_cuda(unsafe {
         cu_memcpy_dtoh(
             offsets.as_mut_ptr().cast::<c_void>(),
-            resident.device_ptr + offsets_offset,
+            resident.device_ptr() + offsets_offset,
             offsets
                 .len()
                 .checked_mul(std::mem::size_of::<u64>())
@@ -4320,7 +4437,7 @@ fn copy_cuda_resident_text_rows(
         check_cuda(unsafe {
             cu_memcpy_dtoh(
                 text_bytes.as_mut_ptr().cast::<c_void>(),
-                resident.device_ptr + bytes_byte_offset + min_text_start,
+                resident.device_ptr() + bytes_byte_offset + min_text_start,
                 text_bytes.len(),
             )
         })?;
@@ -4448,65 +4565,65 @@ done:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata.allocated_bytes {
+    if bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memset_d8 = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -4535,7 +4652,7 @@ done:
         cu_module_get_function(&mut function, module, c"gpu_db_resident_i32_sum".as_ptr())
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut offset_arg = byte_offset;
     let mut rows_arg = row_count;
     let mut output_arg = allocation_guard.ptr;
@@ -4736,65 +4853,65 @@ ret_done:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata.allocated_bytes {
+    if bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_htod = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -4841,7 +4958,7 @@ ret_done:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut offset_arg = byte_offset;
     let mut rows_arg = row_count;
     let mut lower_arg = lower_inclusive;
@@ -4979,7 +5096,7 @@ done:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata.allocated_bytes {
+    if bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
     if row_count == 0 {
@@ -4988,52 +5105,52 @@ done:
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -5075,7 +5192,7 @@ done:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut offset_arg = byte_offset;
     let mut rows_arg = row_count;
     let mut values_arg = values_guard.ptr;
@@ -5369,12 +5486,12 @@ done:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| value_byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if group_bytes > resident.metadata.allocated_bytes {
+    if group_bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             group_bytes as usize,
         ));
     }
-    if value_bytes > resident.metadata.allocated_bytes {
+    if value_bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             value_bytes as usize,
         ));
@@ -5385,7 +5502,7 @@ done:
                 .checked_mul(std::mem::size_of::<i32>() as u64)
                 .and_then(|bytes| filter_byte_offset.checked_add(bytes))
                 .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-            if filter_bytes > resident.metadata.allocated_bytes {
+            if filter_bytes > resident.metadata().allocated_bytes {
                 return Err(CudaRuntimeProbeError::InvalidInputLength(
                     filter_bytes as usize,
                 ));
@@ -5400,52 +5517,52 @@ done:
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -5520,7 +5637,7 @@ done:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut group_offset_arg = group_byte_offset;
     let mut value_offset_arg = value_byte_offset;
     let mut filter_offset_arg = filter_byte_offset;
@@ -5769,7 +5886,7 @@ done:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if bytes > resident.metadata.allocated_bytes {
+    if bytes > resident.metadata().allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
     }
     if row_count == 0 {
@@ -5778,52 +5895,52 @@ done:
 
     let cu_mem_alloc = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_dtoh = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_unload = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleUnload>(b"cuModuleUnload\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_get_function = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_launch_kernel = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_ctx_synchronize = unsafe {
         resident
-            ._lib
+            .lib()
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
@@ -5867,7 +5984,7 @@ done:
         )
     })?;
 
-    let mut resident_arg = resident.device_ptr;
+    let mut resident_arg = resident.device_ptr();
     let mut offset_arg = byte_offset;
     let mut rows_arg = row_count;
     let mut needle_arg = needle;
@@ -8135,17 +8252,17 @@ where
     type CuEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32;
 
     let event_symbols = unsafe {
-        let create = resident._lib.get::<CuEventCreate>(b"cuEventCreate\0");
+        let create = resident.lib().get::<CuEventCreate>(b"cuEventCreate\0");
         let destroy = resident
-            ._lib
+            .lib()
             .get::<CuEventDestroy>(b"cuEventDestroy_v2\0")
-            .or_else(|_| resident._lib.get::<CuEventDestroy>(b"cuEventDestroy\0"));
-        let record = resident._lib.get::<CuEventRecord>(b"cuEventRecord\0");
+            .or_else(|_| resident.lib().get::<CuEventDestroy>(b"cuEventDestroy\0"));
+        let record = resident.lib().get::<CuEventRecord>(b"cuEventRecord\0");
         let synchronize = resident
-            ._lib
+            .lib()
             .get::<CuEventSynchronize>(b"cuEventSynchronize\0");
         let elapsed = resident
-            ._lib
+            .lib()
             .get::<CuEventElapsedTime>(b"cuEventElapsedTime\0");
         match (create, destroy, record, synchronize, elapsed) {
             (Ok(create), Ok(destroy), Ok(record), Ok(synchronize), Ok(elapsed)) => {
@@ -9009,8 +9126,21 @@ mod tests {
             .unwrap()
             .complete(&resident)
             .unwrap();
+        let (read_view_rows, read_view_elapsed_us) = resident
+            .read_view()
+            .submit_match_project_i32_equal_any_from_payload(
+                filter_offset,
+                &[2, 4],
+                &[projection_offset],
+                row_count,
+            )
+            .unwrap()
+            .complete_detached()
+            .unwrap();
 
         assert_eq!(async_rows, sync_rows);
+        assert_eq!(read_view_rows, sync_rows);
+        assert!(read_view_elapsed_us.is_some());
         assert_eq!(
             async_rows,
             vec![
