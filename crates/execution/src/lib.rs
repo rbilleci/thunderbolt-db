@@ -523,6 +523,7 @@ pub struct CudaI32EqualAnyProjectSubmission {
     projection_count: usize,
     needles_len: usize,
     row_count: u64,
+    context: *mut c_void,
     values_guard: CudaDeviceAllocationGuard,
     indices_guard: CudaDeviceAllocationGuard,
     row_indices_guard: CudaDeviceAllocationGuard,
@@ -531,16 +532,31 @@ pub struct CudaI32EqualAnyProjectSubmission {
     _module_guard: CudaModuleGuard,
     start_event_guard: CudaEventGuard,
     stop_event_guard: CudaEventGuard,
+    cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> i32,
     cu_event_synchronize: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_event_elapsed_time: unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32,
 }
+
+// Pending read submissions own their temporary CUDA allocations/events/module.
+// The resident allocation itself remains owned elsewhere and must outlive
+// completion.
+unsafe impl Send for CudaI32EqualAnyProjectSubmission {}
 
 impl CudaI32EqualAnyProjectSubmission {
     pub fn complete(
         self,
         resident: &CudaResidentDeviceMemory,
     ) -> Result<Vec<CudaI32BatchProjectionRow>, CudaRuntimeProbeError> {
+        let (rows, elapsed_us) = self.complete_detached()?;
+        resident.record_kernel_event_elapsed_us(elapsed_us);
+        Ok(rows)
+    }
+
+    pub fn complete_detached(
+        self,
+    ) -> Result<(Vec<CudaI32BatchProjectionRow>, Option<u64>), CudaRuntimeProbeError> {
+        check_cuda(unsafe { (self.cu_ctx_set_current)(self.context) })?;
         check_cuda(unsafe { (self.cu_event_synchronize)(self.stop_event_guard.event) })?;
 
         let mut elapsed_ms = 0.0_f32;
@@ -551,8 +567,7 @@ impl CudaI32EqualAnyProjectSubmission {
                 self.stop_event_guard.event,
             )
         })?;
-        resident
-            .record_kernel_event_elapsed_us(Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64));
+        let elapsed_us = Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64);
 
         let mut match_count = 0_u32;
         check_cuda(unsafe {
@@ -599,7 +614,7 @@ impl CudaI32EqualAnyProjectSubmission {
             })?;
         }
 
-        values
+        let rows = values
             .chunks_exact(self.projection_count)
             .zip(needle_indices)
             .zip(row_indices)
@@ -618,7 +633,8 @@ impl CudaI32EqualAnyProjectSubmission {
                     values: row.to_vec(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((rows, elapsed_us))
     }
 }
 
@@ -2649,6 +2665,7 @@ fn submit_cuda_resident_i32_equal_any_project(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
+    type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
     type CuEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
     type CuEventDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
     type CuEventRecord = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
@@ -2933,6 +2950,12 @@ DONE:
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
+    let cu_ctx_set_current = unsafe {
+        resident
+            ._lib
+            .get::<CuCtxSetCurrent>(b"cuCtxSetCurrent\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
     let cu_event_create = unsafe {
         resident
             ._lib
@@ -3093,6 +3116,7 @@ DONE:
         projection_count: projection_offsets.len(),
         needles_len: needles.len(),
         row_count,
+        context: resident.context,
         values_guard,
         indices_guard,
         row_indices_guard,
@@ -3101,6 +3125,7 @@ DONE:
         _module_guard: module_guard,
         start_event_guard,
         stop_event_guard,
+        cu_ctx_set_current: *cu_ctx_set_current,
         cu_memcpy_dtoh: *cu_memcpy_dtoh,
         cu_event_synchronize: *cu_event_synchronize,
         cu_event_elapsed_time: *cu_event_elapsed_time,

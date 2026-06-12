@@ -3,7 +3,10 @@ use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1077,6 +1080,18 @@ struct PendingRetainedLiteralBatch {
     submitted_at: Instant,
 }
 
+struct RetainedReadCompletionWork {
+    requests: Vec<EngineRequest>,
+    submitted: SubmittedRetainedLiteralBatch,
+}
+
+#[derive(Default)]
+struct RetainedReadCompletionWorkerStats {
+    submitted: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+}
+
 #[derive(Default)]
 struct PendingRetainedReadStats {
     submissions: u64,
@@ -1120,6 +1135,56 @@ fn complete_pending_retained_literal_batch(
             }
         }
         Err(err) => {
+            for request in requests {
+                let _ = request.response_tx.send(Err(err.clone()));
+            }
+        }
+    }
+}
+
+fn complete_retained_literal_batch_detached(
+    submitted: SubmittedRetainedLiteralBatch,
+) -> Result<Vec<Vec<u8>>, String> {
+    let SubmittedRetainedLiteralBatch {
+        items,
+        item_to_unique,
+        submission,
+        ..
+    } = submitted;
+    let results = submission
+        .complete_detached()
+        .map_err(|err| err.to_string())?;
+    let mut outputs = Vec::with_capacity(items.len());
+    for unique_idx in item_to_unique {
+        let result = results
+            .get(unique_idx)
+            .ok_or_else(|| format!("detached retained read missing unique result {unique_idx}"))?;
+        outputs.push(
+            render_select_result(result)
+                .map_err(|err| err.to_string())?
+                .bytes,
+        );
+    }
+    Ok(outputs)
+}
+
+fn complete_retained_read_work_detached(
+    work: RetainedReadCompletionWork,
+    stats: &RetainedReadCompletionWorkerStats,
+) {
+    let RetainedReadCompletionWork {
+        requests,
+        submitted,
+    } = work;
+    match complete_retained_literal_batch_detached(submitted) {
+        Ok(outputs) => {
+            stats.completed.fetch_add(1, Ordering::Relaxed);
+            for (request, output) in requests.into_iter().zip(outputs) {
+                let _ = request.response_tx.send(Ok(EngineResponse::Bytes(output)));
+            }
+        }
+        Err(err) => {
+            stats.failed.fetch_add(1, Ordering::Relaxed);
             for request in requests {
                 let _ = request.response_tx.send(Err(err.clone()));
             }
@@ -1864,6 +1929,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0);
+    let requested_retained_read_completion_workers =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_COMPLETION_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
     let requested_gpu_microbatch_route_lane_scan_policy = RouteLaneScanPolicy::from_env();
     let gpu_microbatch_route_lane_scan_policy = if requested_gpu_microbatch_route_lane_scan_policy
         == RouteLaneScanPolicy::Adaptive
@@ -1911,6 +1981,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let mut state = EndpointState::new(&facts_path)?;
+    let retained_read_completion_worker_count = if requested_retained_read_completion_workers > 0
+        && prepared_retained_microbatches_enabled
+        && retained_read_pending_completion_cap > 0
+        && state.select_fact_detail == SelectFactDetail::None
+    {
+        1
+    } else {
+        0
+    };
+    let retained_read_completion_worker_stats =
+        Arc::new(RetainedReadCompletionWorkerStats::default());
+    let (mut retained_read_completion_tx, retained_read_completion_worker_handle) =
+        if retained_read_completion_worker_count > 0 {
+            let (tx, rx) = mpsc::channel::<RetainedReadCompletionWork>();
+            let worker_stats = Arc::clone(&retained_read_completion_worker_stats);
+            let handle = thread::spawn(move || {
+                while let Ok(work) = rx.recv() {
+                    complete_retained_read_work_detached(work, &worker_stats);
+                }
+            });
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
     state.fact("engine_backed_pgwire_tcp_endpoint", true)?;
     state.fact("listen", &listen)?;
     state.fact("protocol_parser_reused", true)?;
@@ -1980,6 +2074,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_retained_read_pending_completion_cap",
         retained_read_pending_completion_cap,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_completion_workers_requested",
+        requested_retained_read_completion_workers,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_completion_workers_effective",
+        retained_read_completion_worker_count,
     )?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
@@ -2353,11 +2455,50 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 )
                                 .map_err(|err| err.to_string());
                             match result {
-                                Ok(submitted) if submitted.submission.is_pending() => {
+                                Ok(mut submitted) if submitted.submission.is_pending() => {
+                                    let mut batch = batch;
                                     gpu_prepared_retained_route_requests =
                                         gpu_prepared_retained_route_requests.saturating_add(
                                             u64::try_from(batch.len()).unwrap_or(u64::MAX),
                                         );
+                                    let worker_submitted = retained_read_completion_worker_stats
+                                        .submitted
+                                        .load(Ordering::Relaxed);
+                                    let worker_done = retained_read_completion_worker_stats
+                                        .completed
+                                        .load(Ordering::Relaxed)
+                                        .saturating_add(
+                                            retained_read_completion_worker_stats
+                                                .failed
+                                                .load(Ordering::Relaxed),
+                                        );
+                                    let worker_inflight =
+                                        worker_submitted.saturating_sub(worker_done);
+                                    if let Some(tx) = retained_read_completion_tx.as_ref() {
+                                        if worker_inflight
+                                            < u64::try_from(retained_read_pending_completion_cap)
+                                                .unwrap_or(u64::MAX)
+                                        {
+                                            let work = RetainedReadCompletionWork {
+                                                requests: batch,
+                                                submitted,
+                                            };
+                                            match tx.send(work) {
+                                                Ok(()) => {
+                                                    retained_read_completion_worker_stats
+                                                        .submitted
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    continue;
+                                                }
+                                                Err(err) => {
+                                                    let work = err.0;
+                                                    batch = work.requests;
+                                                    submitted = work.submitted;
+                                                    retained_read_completion_tx = None;
+                                                }
+                                            }
+                                        }
+                                    }
                                     pending_retained_read_stats.submissions =
                                         pending_retained_read_stats.submissions.saturating_add(1);
                                     pending_retained_read_stats.max =
@@ -2567,6 +2708,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             &mut pending_retained_read_stats,
         );
     }
+    drop(retained_read_completion_tx.take());
+    if let Some(handle) = retained_read_completion_worker_handle {
+        let _ = handle.join();
+    }
     let _ = accept_handle.join();
     state.fact("completed_client_sessions", completed)?;
     let cache = retained_read_response_cache
@@ -2651,6 +2796,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_retained_read_pending_overlap_opportunities",
         pending_retained_read_stats.overlap_opportunities,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_completion_worker_submitted",
+        retained_read_completion_worker_stats
+            .submitted
+            .load(Ordering::Relaxed),
+    )?;
+    state.fact(
+        "owner_thread_retained_read_completion_worker_completed",
+        retained_read_completion_worker_stats
+            .completed
+            .load(Ordering::Relaxed),
+    )?;
+    state.fact(
+        "owner_thread_retained_read_completion_worker_failed",
+        retained_read_completion_worker_stats
+            .failed
+            .load(Ordering::Relaxed),
     )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;

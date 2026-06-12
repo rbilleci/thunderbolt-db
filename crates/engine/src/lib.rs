@@ -6446,6 +6446,16 @@ impl RelationalRetainedReadSubmission {
             RelationalRetainedReadSubmissionInner::PendingInt4Projection(_)
         )
     }
+
+    pub fn complete_detached(self) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+        match self.inner {
+            RelationalRetainedReadSubmissionInner::Ready(results) => Ok(results),
+            RelationalRetainedReadSubmissionInner::PendingInt4Projection(pending) => Ok(
+                Engine::complete_relational_retained_int4_projection_submission_detached(pending)?
+                    .results,
+            ),
+        }
+    }
 }
 
 enum RelationalRetainedReadSubmissionInner {
@@ -6461,6 +6471,18 @@ struct RelationalRetainedInt4ProjectionSubmission {
     before_metrics: RuntimeMetricsSnapshot,
     batch_started: Instant,
     submission: CudaI32EqualAnyProjectSubmission,
+}
+
+struct RelationalRetainedInt4ProjectionCompletion {
+    table_name: String,
+    before_metrics: RuntimeMetricsSnapshot,
+    batch_micros: u64,
+    wall_micros: u64,
+    materialization_micros: u64,
+    total_rows: usize,
+    int4_result_columns: usize,
+    kernel_event_elapsed_us: Option<u64>,
+    results: Vec<RelationalSelectResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15502,19 +15524,76 @@ impl Engine {
         &mut self,
         pending: RelationalRetainedInt4ProjectionSubmission,
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
-        let device_memory = self
+        if !self
             .relational_resident_cache
             .device_memory
-            .get(&pending.table.name)
-            .ok_or_else(|| {
-                ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "relation \"{}\" has no retained resident device memory",
-                    pending.table.name
-                )))
-            })?;
-        let projected_rows = pending
+            .contains_key(&pending.table.name)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" has no retained resident device memory",
+                pending.table.name
+            ))));
+        }
+        let completion =
+            Self::complete_relational_retained_int4_projection_submission_detached(pending)?;
+        let row_metadata_d2h_bytes = u64::try_from(completion.total_rows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul((std::mem::size_of::<u32>() + std::mem::size_of::<u64>()) as u64)
+            .saturating_add(std::mem::size_of::<u32>() as u64);
+        let result_d2h_bytes = u64::try_from(completion.total_rows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(completion.int4_result_columns)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<i32>() as u64),
+            )
+            .saturating_add(row_metadata_d2h_bytes);
+        self.metrics.observe_d2h_bytes(result_d2h_bytes);
+        self.metrics
+            .observe_kernel_exec_ms(completion.batch_micros.div_ceil(1000).max(1));
+        if let Some(elapsed_us) = completion.kernel_event_elapsed_us {
+            self.metrics.observe_kernel_event_elapsed_us(elapsed_us);
+        }
+        self.relational_resident_cache
+            .record_route_selected_projection_micros(
+                &completion.table_name,
+                completion.batch_micros,
+                completion.batch_micros,
+                completion.materialization_micros,
+                completion.total_rows,
+            );
+        let after_metrics = self.metrics.snapshot();
+        self.relational_resident_cache
+            .record_route_execution_observation(
+                &completion.table_name,
+                RelationalResidentRouteExecutionObservation {
+                    h2d_bytes: after_metrics
+                        .h2d_bytes_total
+                        .saturating_sub(completion.before_metrics.h2d_bytes_total),
+                    d2h_bytes: after_metrics
+                        .d2h_bytes_total
+                        .saturating_sub(completion.before_metrics.d2h_bytes_total),
+                    kernel_samples: after_metrics
+                        .kernel_exec_samples
+                        .saturating_sub(completion.before_metrics.kernel_exec_samples),
+                    kernel_ms: after_metrics
+                        .kernel_exec_total_ms
+                        .saturating_sub(completion.before_metrics.kernel_exec_total_ms),
+                    kernel_event_elapsed_us: completion.kernel_event_elapsed_us,
+                    rows: completion.total_rows,
+                    wall_micros: completion.wall_micros,
+                },
+            );
+
+        Ok(completion.results)
+    }
+
+    fn complete_relational_retained_int4_projection_submission_detached(
+        pending: RelationalRetainedInt4ProjectionSubmission,
+    ) -> Result<RelationalRetainedInt4ProjectionCompletion, ExecuteError> {
+        let (projected_rows, kernel_event_elapsed_us) = pending
             .submission
-            .complete(device_memory)
+            .complete_detached()
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let batch_micros = pending
             .batch_started
@@ -15540,67 +15619,8 @@ impl Engine {
             .try_into()
             .unwrap_or(u64::MAX);
         let total_rows = rows_by_select.iter().map(Vec::len).sum::<usize>();
-        let int4_result_columns = pending.selected_indexes.len();
-        let row_metadata_d2h_bytes = u64::try_from(total_rows)
-            .unwrap_or(u64::MAX)
-            .saturating_mul((std::mem::size_of::<u32>() + std::mem::size_of::<u64>()) as u64)
-            .saturating_add(std::mem::size_of::<u32>() as u64);
-        let result_d2h_bytes = u64::try_from(total_rows)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(
-                u64::try_from(int4_result_columns)
-                    .unwrap_or(u64::MAX)
-                    .saturating_mul(std::mem::size_of::<i32>() as u64),
-            )
-            .saturating_add(row_metadata_d2h_bytes);
-        self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.metrics
-            .observe_kernel_exec_ms(batch_micros.div_ceil(1000).max(1));
-        let kernel_event_elapsed_us = self
-            .relational_resident_cache
-            .device_memory
-            .get(&pending.table.name)
-            .and_then(|device_memory| device_memory.last_kernel_event_elapsed_us());
-        if let Some(elapsed_us) = kernel_event_elapsed_us {
-            self.metrics.observe_kernel_event_elapsed_us(elapsed_us);
-        }
-        self.relational_resident_cache
-            .record_route_selected_projection_micros(
-                &pending.table.name,
-                batch_micros,
-                batch_micros,
-                materialization_micros,
-                total_rows,
-            );
-        let after_metrics = self.metrics.snapshot();
-        self.relational_resident_cache
-            .record_route_execution_observation(
-                &pending.table.name,
-                RelationalResidentRouteExecutionObservation {
-                    h2d_bytes: after_metrics
-                        .h2d_bytes_total
-                        .saturating_sub(pending.before_metrics.h2d_bytes_total),
-                    d2h_bytes: after_metrics
-                        .d2h_bytes_total
-                        .saturating_sub(pending.before_metrics.d2h_bytes_total),
-                    kernel_samples: after_metrics
-                        .kernel_exec_samples
-                        .saturating_sub(pending.before_metrics.kernel_exec_samples),
-                    kernel_ms: after_metrics
-                        .kernel_exec_total_ms
-                        .saturating_sub(pending.before_metrics.kernel_exec_total_ms),
-                    kernel_event_elapsed_us,
-                    rows: total_rows,
-                    wall_micros: pending
-                        .batch_started
-                        .elapsed()
-                        .as_micros()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                },
-            );
-
-        Ok(pending
+        let table_name = pending.table.name.clone();
+        let results = pending
             .members
             .into_iter()
             .zip(rows_by_select)
@@ -15614,7 +15634,24 @@ impl Engine {
                     access_path,
                 },
             )
-            .collect())
+            .collect();
+        let wall_micros = pending
+            .batch_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        Ok(RelationalRetainedInt4ProjectionCompletion {
+            table_name,
+            before_metrics: pending.before_metrics,
+            batch_micros,
+            wall_micros,
+            materialization_micros,
+            total_rows,
+            int4_result_columns: pending.selected_indexes.len(),
+            kernel_event_elapsed_us,
+            results,
+        })
     }
 
     pub fn execute_relational_count_with_resident_device_memory_probe(
