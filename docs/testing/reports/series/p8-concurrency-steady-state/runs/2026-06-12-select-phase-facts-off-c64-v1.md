@@ -38,6 +38,10 @@ GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL=phase_only
 unless the caller overrides it. This preserves comparable diagnostic benchmark
 runs while making the endpoint's direct default path faster.
 
+Fact flushing is also dirty-aware now. The owner loop still calls
+`flush_facts()` at the same correctness boundaries, but the call returns without
+touching the file when no new facts were written.
+
 ## c64 A/B
 
 Setup:
@@ -74,6 +78,18 @@ Phase facts off:
 - heterogeneous: `13706 qps / 4048us p50`
 - phase samples: `0`, as expected
 
+Phase facts off, dirty-aware fact flush repeat:
+
+- artifact:
+  `target/2026-06-12-select-facts-none-dirty-flush-c64-rpc8/engine-backed-pgwire-concurrency-smoke/`
+- count: `52197 qps / 917us p50`
+- exact multi-column: `35347 qps / 1371us p50`
+- multi-column literal batch: `20930 qps / 2546us p50`
+- projection literal batch: `20518 qps / 2785us p50`
+- mixed int4/text: `22975 qps / 2269us p50`
+- heterogeneous: `18966 qps / 2705us p50`
+- phase samples: `0`, as expected
+
 ## Read
 
 This is not a new GPU execution algorithm. It is a hot-path observability fix.
@@ -93,6 +109,8 @@ The biggest wins are exactly the high-volume literal rows:
 Count stayed flat and exact multi-column was noisier/slower in this run, so this
 is not a universal c64 win. The default change is still justified because
 diagnostic phase JSON should not be on the endpoint hot path unless requested.
+The dirty-aware flush repeat was also mixed, but it kept the no-facts path ahead
+of phase-on and improved heterogeneous to `2705us` p50.
 
 ## Validation
 

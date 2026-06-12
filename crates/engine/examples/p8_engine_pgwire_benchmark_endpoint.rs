@@ -188,6 +188,7 @@ struct EndpointState {
     engine: Engine,
     next_txn_id: u64,
     facts: BufWriter<File>,
+    facts_dirty: bool,
     select_fact_detail: SelectFactDetail,
     retained_read_job_submission_batches: u64,
     retained_read_jobs_submitted: u64,
@@ -238,6 +239,7 @@ impl EndpointState {
             engine: Engine::new_local(),
             next_txn_id: 1,
             facts: BufWriter::new(facts),
+            facts_dirty: false,
             select_fact_detail: SelectFactDetail::from_env(),
             retained_read_job_submission_batches: 0,
             retained_read_jobs_submitted: 0,
@@ -253,11 +255,17 @@ impl EndpointState {
     }
 
     fn fact(&mut self, key: &str, value: impl std::fmt::Display) -> io::Result<()> {
-        writeln!(self.facts, "{key}={value}")
+        writeln!(self.facts, "{key}={value}")?;
+        self.facts_dirty = true;
+        Ok(())
     }
 
     fn flush_facts(&mut self) -> io::Result<()> {
-        self.facts.flush()
+        if self.facts_dirty {
+            self.facts.flush()?;
+            self.facts_dirty = false;
+        }
+        Ok(())
     }
 
     fn handle_startup(
