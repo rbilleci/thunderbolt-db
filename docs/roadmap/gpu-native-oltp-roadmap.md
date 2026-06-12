@@ -112,6 +112,20 @@ Evidence:
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-retained-read-submit-complete-cache-off-v1.md`
 - preplanned execution slice closed by
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-preplanned-read-job-cache-off-v1.md`
+- execution-layer nonblocking all-int4 submit primitive closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-execution-async-retained-int4-submit-v1.md`
+- engine-level pending all-int4 retained read-job submission closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-engine-pending-retained-int4-submit-v1.md`
+- adjacent submit/complete A/B closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-async-retained-int4-c64-ab-v1.md`
+
+Current state:
+
+- all-int4 retained read jobs can submit CUDA work without immediately
+  synchronizing in the execution layer
+- mixed/text retained read jobs still use the synchronous path
+- endpoint behavior still completes adjacent to submit, so prepared retained
+  microbatches remain opt-in until the owner loop overlaps pending work
 
 ### M4: Small GPU Stream Pool
 
@@ -211,8 +225,9 @@ work on increasingly complex single owner-queue heuristics unless they are
 short probes that protect an existing win. The next implementation should aim
 for a 5x-class boundary reduction, not a 1.2x row improvement:
 
-1. Make retained read submit nonblocking for the owner loop, or allow a bounded
-   set of submitted retained reads to overlap before completion.
+1. Add an owner-loop pending completion queue for prepared all-int4 retained
+   read jobs: launch nonblocking work, drain independent ready work, then
+   complete and publish responses.
 2. Preserve generation mismatch rejection and mutation publication barriers.
 3. Add telemetry for in-flight read submissions, completion count, and owner
    critical-section time.
@@ -220,3 +235,6 @@ for a 5x-class boundary reduction, not a 1.2x row improvement:
 5. Treat route-lane depth, payload, and diversity heuristics as opt-in probes
    unless they collapse queue wait by multiple times without hurting homogeneous
    route batches.
+6. Use fixed route-lane scan as the default baseline:
+   `GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_POLICY=fixed` and
+   scan limit `32`.
