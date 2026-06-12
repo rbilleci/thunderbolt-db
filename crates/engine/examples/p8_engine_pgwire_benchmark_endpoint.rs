@@ -394,6 +394,7 @@ impl EndpointState {
                             microbatch_kind: "none",
                             microbatch_size: 1,
                             microbatch_unique_selects: 1,
+                            microbatch_admission_wait_micros: 0,
                         },
                     )?;
                 }
@@ -409,6 +410,7 @@ impl EndpointState {
         &mut self,
         items: &[(String, Select)],
         scheduler_queue_wait_micros: u64,
+        microbatch_admission_wait_micros: u64,
     ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -506,6 +508,7 @@ impl EndpointState {
                         microbatch_kind: "multi_literal_gpu",
                         microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
                         microbatch_unique_selects: u64::try_from(selects.len()).unwrap_or(u64::MAX),
+                        microbatch_admission_wait_micros,
                     },
                 )?;
             }
@@ -763,6 +766,32 @@ fn retained_select_literal_batch_candidate(
     ))
 }
 
+fn recv_next_batch_candidate(
+    request_rx: &mpsc::Receiver<EngineRequest>,
+    batch_started: Instant,
+    admission_window: Duration,
+) -> Result<(Option<EngineRequest>, Duration), mpsc::TryRecvError> {
+    match request_rx.try_recv() {
+        Ok(request) => return Ok((Some(request), Duration::ZERO)),
+        Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::TryRecvError::Disconnected),
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
+    if admission_window.is_zero() {
+        return Ok((None, Duration::ZERO));
+    }
+    let elapsed = batch_started.elapsed();
+    if elapsed >= admission_window {
+        return Ok((None, Duration::ZERO));
+    }
+    let wait_started = Instant::now();
+    let remaining = admission_window.saturating_sub(elapsed);
+    match request_rx.recv_timeout(remaining) {
+        Ok(request) => Ok((Some(request), wait_started.elapsed())),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok((None, wait_started.elapsed().min(remaining))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::TryRecvError::Disconnected),
+    }
+}
+
 fn request_engine(
     request_tx: &mpsc::Sender<EngineRequest>,
     command: EngineCommand,
@@ -864,13 +893,14 @@ struct SelectPhaseFact<'a> {
     microbatch_kind: &'a str,
     microbatch_size: u64,
     microbatch_unique_selects: u64,
+    microbatch_admission_wait_micros: u64,
 }
 
 impl std::fmt::Display for SelectPhaseFact<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{}}}",
+            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{},\"microbatch_admission_wait_micros\":{}}}",
             json_escape(self.sql),
             json_escape(self.query_shape),
             self.scheduler_queue_wait_micros,
@@ -890,7 +920,8 @@ impl std::fmt::Display for SelectPhaseFact<'_> {
             self.result_rows,
             json_escape(self.microbatch_kind),
             self.microbatch_size,
-            self.microbatch_unique_selects
+            self.microbatch_unique_selects,
+            self.microbatch_admission_wait_micros
         )
     }
 }
@@ -1094,6 +1125,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(64);
+    let gpu_microbatch_admission_window_micros =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+    let gpu_microbatch_admission_window =
+        Duration::from_micros(gpu_microbatch_admission_window_micros);
 
     let listener = TcpListener::bind(&listen)?;
     let (request_tx, request_rx) = mpsc::channel::<EngineRequest>();
@@ -1143,6 +1181,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         retained_read_response_cache_enabled,
     )?;
     state.fact("owner_thread_gpu_microbatch_max", gpu_microbatch_max)?;
+    state.fact(
+        "owner_thread_gpu_microbatch_admission_window_micros",
+        gpu_microbatch_admission_window_micros,
+    )?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
     state.fact("max_sessions", max_sessions)?;
@@ -1170,13 +1212,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(request) => {
                 let mut batch = vec![request];
                 let mut literal_microbatch = false;
+                let mut microbatch_admission_wait_micros = 0_u64;
                 if gpu_microbatch_max > 1 {
+                    let batch_started = Instant::now();
                     if let Some((batch_key, _first_needle, _select, _sql)) =
                         retained_select_literal_batch_candidate(&batch[0].command)
                     {
                         while batch.len() < gpu_microbatch_max {
-                            match request_rx.try_recv() {
-                                Ok(next) => {
+                            match recv_next_batch_candidate(
+                                &request_rx,
+                                batch_started,
+                                gpu_microbatch_admission_window,
+                            ) {
+                                Ok((Some(next), waited)) => {
+                                    microbatch_admission_wait_micros =
+                                        microbatch_admission_wait_micros.saturating_add(
+                                            waited.as_micros().try_into().unwrap_or(u64::MAX),
+                                        );
                                     if let Some((next_key, _next_needle, _select, _sql)) =
                                         retained_select_literal_batch_candidate(&next.command)
                                     {
@@ -1191,8 +1243,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         break;
                                     }
                                 }
-                                Err(mpsc::TryRecvError::Empty) => break,
-                                Err(mpsc::TryRecvError::Disconnected) => break,
+                                Ok((None, waited)) => {
+                                    microbatch_admission_wait_micros =
+                                        microbatch_admission_wait_micros.saturating_add(
+                                            waited.as_micros().try_into().unwrap_or(u64::MAX),
+                                        );
+                                    break;
+                                }
+                                Err(
+                                    mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected,
+                                ) => break,
                             }
                         }
                         let exact_key =
@@ -1205,8 +1265,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                         retained_select_microbatch_key(&batch[0].command).map(str::to_string)
                     {
                         while batch.len() < gpu_microbatch_max {
-                            match request_rx.try_recv() {
-                                Ok(next) => {
+                            match recv_next_batch_candidate(
+                                &request_rx,
+                                batch_started,
+                                gpu_microbatch_admission_window,
+                            ) {
+                                Ok((Some(next), waited)) => {
+                                    microbatch_admission_wait_micros =
+                                        microbatch_admission_wait_micros.saturating_add(
+                                            waited.as_micros().try_into().unwrap_or(u64::MAX),
+                                        );
                                     if retained_select_microbatch_key(&next.command)
                                         == Some(batch_key.as_str())
                                     {
@@ -1216,8 +1284,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         break;
                                     }
                                 }
-                                Err(mpsc::TryRecvError::Empty) => break,
-                                Err(mpsc::TryRecvError::Disconnected) => break,
+                                Ok((None, waited)) => {
+                                    microbatch_admission_wait_micros =
+                                        microbatch_admission_wait_micros.saturating_add(
+                                            waited.as_micros().try_into().unwrap_or(u64::MAX),
+                                        );
+                                    break;
+                                }
+                                Err(
+                                    mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected,
+                                ) => break,
                             }
                         }
                     }
@@ -1255,6 +1331,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let outputs = state.handle_multi_literal_select_batch(
                                 &items,
                                 scheduler_queue_wait_micros,
+                                microbatch_admission_wait_micros,
                             )?;
                             state.flush_facts()?;
                             Ok(outputs)

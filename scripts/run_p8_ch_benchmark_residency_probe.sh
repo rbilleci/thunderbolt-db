@@ -1374,7 +1374,7 @@ engine_pgwire_concurrency_metric() {
     request_count="$concurrency"
   fi
 
-  local phase_path phase_samples phase_queue_wait_avg_us phase_queue_wait_max_us phase_engine_execute_avg_us phase_client_write_avg_us phase_d2h_avg_bytes phase_result_materialize_avg_us phase_retained_wall_avg_us phase_cuda_event_avg_us phase_kernel_delta_avg phase_microbatch_size_avg phase_microbatch_unique_selects_avg
+  local phase_path phase_samples phase_queue_wait_avg_us phase_queue_wait_max_us phase_engine_execute_avg_us phase_client_write_avg_us phase_d2h_avg_bytes phase_result_materialize_avg_us phase_retained_wall_avg_us phase_cuda_event_avg_us phase_kernel_delta_avg phase_microbatch_size_avg phase_microbatch_unique_selects_avg phase_microbatch_admission_wait_avg_us
   phase_path="$(write_retained_phase_sample "$run_dir" "$request_count")"
   phase_samples=$(wc -l <"$phase_path" | tr -d ' ')
   phase_queue_wait_avg_us="$(phase_metric_avg "$phase_path" scheduler_queue_wait_micros)"
@@ -1388,8 +1388,9 @@ engine_pgwire_concurrency_metric() {
   phase_kernel_delta_avg="$(phase_metric_avg "$phase_path" kernel_delta)"
   phase_microbatch_size_avg="$(phase_metric_avg "$phase_path" microbatch_size)"
   phase_microbatch_unique_selects_avg="$(phase_metric_avg "$phase_path" microbatch_unique_selects)"
+  phase_microbatch_admission_wait_avg_us="$(phase_metric_avg "$phase_path" microbatch_admission_wait_micros)"
 
-  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"%s","query":"%s","concurrency":%s,"request_count":%s,"requests_per_client":%s,"warmup_requests_per_client":%s,"retained_read_response_cache":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"phase_samples":%s,"phase_scheduler_queue_wait_avg_us":%s,"phase_scheduler_queue_wait_max_us":%s,"phase_engine_execute_avg_us":%s,"phase_client_write_avg_us":%s,"phase_result_materialize_avg_us":%s,"phase_retained_wall_avg_us":%s,"phase_cuda_event_avg_us":%s,"phase_d2h_avg_bytes":%s,"phase_kernel_delta_avg":%s,"phase_microbatch_size_avg":%s,"phase_microbatch_unique_selects_avg":%s,"phase_artifact":"%s","blocker":"none"}\n' \
+  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"%s","query":"%s","concurrency":%s,"request_count":%s,"requests_per_client":%s,"warmup_requests_per_client":%s,"retained_read_response_cache":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"phase_samples":%s,"phase_scheduler_queue_wait_avg_us":%s,"phase_scheduler_queue_wait_max_us":%s,"phase_engine_execute_avg_us":%s,"phase_client_write_avg_us":%s,"phase_result_materialize_avg_us":%s,"phase_retained_wall_avg_us":%s,"phase_cuda_event_avg_us":%s,"phase_d2h_avg_bytes":%s,"phase_kernel_delta_avg":%s,"phase_microbatch_size_avg":%s,"phase_microbatch_unique_selects_avg":%s,"phase_microbatch_admission_wait_avg_us":%s,"phase_artifact":"%s","blocker":"none"}\n' \
     "$client_driver" \
     "$query_id" \
     "$concurrency" \
@@ -1418,6 +1419,7 @@ engine_pgwire_concurrency_metric() {
     "$(json_number_or_null "$phase_kernel_delta_avg")" \
     "$(json_number_or_null "$phase_microbatch_size_avg")" \
     "$(json_number_or_null "$phase_microbatch_unique_selects_avg")" \
+    "$(json_number_or_null "$phase_microbatch_admission_wait_avg_us")" \
     "$(json_escape "$phase_path")" >>"$metrics_path"
   printf '25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,%s,%s,%s,%s,none,%s,%s,"%s qps; p50=%sus p95=%sus p99=%sus; owner_thread_engine_scheduler; requests=%s"\n' \
     "$client_driver" \
@@ -1809,6 +1811,7 @@ REPORT
     GPU_DB_P8_ENGINE_PGWIRE_FACTS="$facts_path" \
     GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS="$max_sessions" \
     GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}" \
+    GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}" \
     target/debug/examples/p8_engine_pgwire_benchmark_endpoint >"$server_log" 2>&1 &
   local server_pid=$!
   trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' RETURN
@@ -1918,7 +1921,7 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"multi_literal_batched_retained_equality_lookup","decision":"cache-off retained reads should stay on the GPU path; optimize compatible lookup batching before considering CPU routing","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"shape_aware_retained_batch_admission_or_mixed_projection_support","decision":"cache-off retained reads should stay on the GPU path; keep fixed admission waits opt-in and prefer shape-aware batching before CPU routing","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1932,11 +1935,12 @@ JSON
 - requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}\`
 - warmup_requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_WARMUP_REQUESTS_PER_CLIENT:-0}\`
 - retained_read_response_cache: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}\`
+- gpu_microbatch_admission_window_micros: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}\`
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false
-- next_target: multi_literal_batched_retained_equality_lookup
-- decision: cache-off retained reads should stay on the GPU path and batch compatible lookup work before CPU routing
+- next_target: shape_aware_retained_batch_admission_or_mixed_projection_support
+- decision: cache-off retained reads should stay on the GPU path; fixed admission waits are opt-in and shape-aware batching is the next admission target
 - endpoint_facts: $facts_path
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
@@ -1976,7 +1980,7 @@ REPORT
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=multi_literal_batched_retained_equality_lookup artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=shape_aware_retained_batch_admission_or_mixed_projection_support artifact=$report_path"
   return 0
 }
 
