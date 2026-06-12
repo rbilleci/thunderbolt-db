@@ -1958,7 +1958,7 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"shape_aware_retained_batch_admission","decision":"cache-off retained reads should stay on the GPU path; mixed int4/text projection batching is covered, fixed admission waits stay opt-in, and shape-aware ready scans can group compatible work behind nonmatching queued shapes","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"owner_loop_pending_completion_overlap","decision":"cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs remain opt-in until pending submissions are overlapped with independent owner-loop work","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1983,8 +1983,8 @@ JSON
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false
-- next_target: shape_aware_retained_batch_admission
-- decision: cache-off retained reads should stay on the GPU path; mixed int4/text projection batching is covered, fixed admission waits are opt-in, and shape-aware batching is the next admission target
+- next_target: owner_loop_pending_completion_overlap
+- decision: cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs remain opt-in until pending submissions are overlapped with independent owner-loop work
 - endpoint_facts: $facts_path
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
@@ -2016,16 +2016,16 @@ response write.
 The retained-read response cache remains available as an opt-in fast path for
 repeated identical \`SELECT\` requests, but the default benchmark path keeps it
 disabled so cache-off OLTP-style retained reads continue to expose the real
-owner-thread queue boundary. The next optimization target is shape-aware
-retained batch admission: keep fixed waits disabled by default, but use route
-family pressure and underfilled batches to decide when admission should wait.
+owner-thread queue boundary. The next optimization target is owner-loop pending
+completion overlap for retained read jobs: launch nonblocking work, drain
+independent ready work, then complete and publish responses.
 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
 REPORT
   kill "$server_pid" >/dev/null 2>&1 || true
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=shape_aware_retained_batch_admission artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=owner_loop_pending_completion_overlap artifact=$report_path"
   return 0
 }
 
