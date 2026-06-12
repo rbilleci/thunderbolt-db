@@ -984,7 +984,27 @@ fn remove_ready_lane_order(lane_order: &mut VecDeque<String>, route_key: &str) {
 fn pop_ready_lane(
     lanes: &mut HashMap<String, VecDeque<EngineRequest>>,
     lane_order: &mut VecDeque<String>,
+    prefer_deepest: bool,
 ) -> Option<EngineRequest> {
+    if prefer_deepest {
+        let route_key = lane_order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, route_key)| {
+                lanes
+                    .get(route_key)
+                    .map(|queue| (index, route_key.clone(), queue.len()))
+            })
+            .max_by_key(|(index, _route_key, depth)| (*depth, std::cmp::Reverse(*index)))
+            .map(|(_index, route_key, _depth)| route_key)?;
+        let queue = lanes.get_mut(&route_key)?;
+        let request = queue.pop_front();
+        if queue.is_empty() {
+            lanes.remove(&route_key);
+            remove_ready_lane_order(lane_order, &route_key);
+        }
+        return request;
+    }
     while let Some(route_key) = lane_order.pop_front() {
         let Some(queue) = lanes.get_mut(&route_key) else {
             continue;
@@ -1440,6 +1460,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_PAYLOAD_AWARE")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
+    let gpu_microbatch_route_lane_depth_bias =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_DEPTH_BIAS")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
     let requested_gpu_latency_lane_enabled =
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_LATENCY_LANE_RETAINED_LITERAL")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -1544,6 +1568,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner_thread_gpu_microbatch_route_lane_payload_aware",
         gpu_microbatch_route_lane_payload_aware,
     )?;
+    state.fact(
+        "owner_thread_gpu_microbatch_route_lane_depth_bias",
+        gpu_microbatch_route_lane_depth_bias,
+    )?;
     state.fact("owner_thread_gpu_microbatch_preclassified_requests", true)?;
     state.fact("owner_thread_gpu_microbatch_route_lanes", true)?;
     state.fact(
@@ -1586,6 +1614,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut gpu_route_lane_scan_budget = 0_u64;
     let mut gpu_route_lane_scanned_ready = 0_u64;
     let mut gpu_route_lane_projected_payload_weight = 0_u64;
+    let mut gpu_route_lane_deepest_picks = 0_u64;
     let mut gpu_latency_lane_requests = 0_u64;
     let mut gpu_prepared_retained_route_requests = 0_u64;
     while completed < max_sessions {
@@ -1596,7 +1625,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(request) => Ok((request, true)),
             Err(mpsc::TryRecvError::Disconnected) => break,
             Err(mpsc::TryRecvError::Empty) => {
-                if let Some(request) = pop_ready_lane(&mut ready_lanes, &mut ready_lane_order) {
+                let prefer_deepest_ready_lane = gpu_microbatch_route_lane_depth_bias
+                    && gpu_microbatch_route_lane_scan_policy == RouteLaneScanPolicy::Adaptive;
+                if let Some(request) = pop_ready_lane(
+                    &mut ready_lanes,
+                    &mut ready_lane_order,
+                    prefer_deepest_ready_lane,
+                ) {
+                    if prefer_deepest_ready_lane {
+                        gpu_route_lane_deepest_picks =
+                            gpu_route_lane_deepest_picks.saturating_add(1);
+                    }
                     Ok((request, false))
                 } else if let Some(request) = deferred_requests.pop_front() {
                     Ok((request, false))
@@ -2042,6 +2081,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_route_lane_projected_payload_weight",
         gpu_route_lane_projected_payload_weight,
+    )?;
+    state.fact(
+        "owner_thread_gpu_route_lane_deepest_picks",
+        gpu_route_lane_deepest_picks,
     )?;
     state.fact(
         "owner_thread_gpu_latency_lane_requests",
