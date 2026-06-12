@@ -188,8 +188,8 @@ enum RouteLaneScanPolicy {
 impl RouteLaneScanPolicy {
     fn from_env() -> Self {
         match std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_POLICY") {
-            Ok(value) if matches!(value.as_str(), "fixed" | "FIXED") => Self::Fixed,
-            _ => Self::Adaptive,
+            Ok(value) if matches!(value.as_str(), "adaptive" | "ADAPTIVE") => Self::Adaptive,
+            _ => Self::Fixed,
         }
     }
 
