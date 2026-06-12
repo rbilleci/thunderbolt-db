@@ -19305,9 +19305,26 @@ impl Engine {
         {
             device_memory.clear_last_kernel_event_elapsed_us();
         }
+        let text_projection_indexes = selected_indexes
+            .iter()
+            .copied()
+            .filter(|idx| table.columns[*idx].ty == SqlType::Text)
+            .collect::<Vec<_>>();
+        let compact_text_projection_idx = (!all_int4_projection
+            && text_projection_indexes.len() == 1)
+            .then(|| text_projection_indexes[0]);
+        let int4_projection_indexes = selected_indexes
+            .iter()
+            .copied()
+            .filter(|idx| table.columns[*idx].ty == SqlType::Int4)
+            .collect::<Vec<_>>();
+        let int4_projection_offsets = int4_projection_indexes
+            .iter()
+            .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+            .collect::<Result<Vec<_>, ExecuteError>>()?;
         let before_metrics = self.metrics.snapshot();
         let batch_started = Instant::now();
-        let projected_rows = {
+        let compact_text_rows = if let Some(text_idx) = compact_text_projection_idx {
             let device_memory = self
                 .relational_resident_cache
                 .device_memory
@@ -19318,14 +19335,50 @@ impl Engine {
                         table.name
                     )))
                 })?;
-            device_memory
-                .match_project_i32_equal_any_from_payload(
-                    filter_offset,
-                    &needles,
-                    &projection_offsets,
-                    row_count,
-                )
-                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?
+            let layout = resident_device_text_column_layout(snapshot, &table, text_idx)?;
+            Some(
+                device_memory
+                    .match_project_i32_equal_any_text_from_payload(
+                        filter_offset,
+                        &needles,
+                        &int4_projection_offsets,
+                        layout.offsets_byte_offset,
+                        layout.bytes_byte_offset,
+                        layout.bytes_len,
+                        row_count,
+                    )
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let projected_rows = if compact_text_rows.is_none() {
+            let device_memory = self
+                .relational_resident_cache
+                .device_memory
+                .get(&table.name)
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" has no retained resident device memory",
+                        table.name
+                    )))
+                })?;
+            Some(
+                device_memory
+                    .match_project_i32_equal_any_from_payload(
+                        filter_offset,
+                        &needles,
+                        &projection_offsets,
+                        row_count,
+                    )
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?,
+            )
+        } else {
+            None
         };
         let batch_micros = batch_started
             .elapsed()
@@ -19335,7 +19388,13 @@ impl Engine {
         let materialize_started = Instant::now();
         let rows_by_select = if all_int4_projection {
             let mut rows_by_select = vec![Vec::new(); members.len()];
-            for projected in &projected_rows {
+            let projected_rows = projected_rows.as_ref().ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory equality batch missing int4 projection rows"
+                        .to_string(),
+                ))
+            })?;
+            for projected in projected_rows {
                 rows_by_select[projected.needle_index].push(
                     projected
                         .values
@@ -19346,7 +19405,42 @@ impl Engine {
                 );
             }
             rows_by_select
+        } else if let (Some(text_idx), Some(compact_rows)) =
+            (compact_text_projection_idx, compact_text_rows.as_ref())
+        {
+            let int4_positions = int4_projection_indexes
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(position, idx)| (idx, position))
+                .collect::<BTreeMap<_, _>>();
+            let mut rows_by_select = vec![Vec::new(); members.len()];
+            for projected in compact_rows {
+                let row = selected_indexes
+                    .iter()
+                    .map(|idx| {
+                        if *idx == text_idx {
+                            return Ok(SqlValue::Text(projected.text.clone()));
+                        }
+                        if let Some(position) = int4_positions.get(idx) {
+                            return Ok(SqlValue::Int4(projected.values[*position]));
+                        }
+                        Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "resident device-memory equality batch compact text projection missing projected column"
+                                .to_string(),
+                        )))
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()?;
+                rows_by_select[projected.needle_index].push(row);
+            }
+            rows_by_select
         } else {
+            let projected_rows = projected_rows.as_ref().ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory equality batch missing mixed projection rows"
+                        .to_string(),
+                ))
+            })?;
             let matched_row_indices = projected_rows
                 .iter()
                 .map(|projected| projected.row_index)
