@@ -700,6 +700,13 @@ struct EngineRequest {
     response_tx: mpsc::Sender<Result<EngineResponse, String>>,
 }
 
+#[derive(Clone)]
+struct EngineRequestSender {
+    throughput_tx: mpsc::Sender<EngineRequest>,
+    latency_tx: mpsc::Sender<EngineRequest>,
+    latency_lane_enabled: bool,
+}
+
 #[derive(Debug, Clone)]
 enum RetainedSelectBatchCandidate {
     Literal {
@@ -960,18 +967,28 @@ fn route_lane_scan_limit_for_batch(
 }
 
 fn request_engine(
-    request_tx: &mpsc::Sender<EngineRequest>,
+    request_sender: &EngineRequestSender,
     command: EngineCommand,
 ) -> Result<EngineResponse, String> {
     let (response_tx, response_rx) = mpsc::channel();
     let batch_candidate = retained_select_batch_candidate(&command);
-    request_tx
-        .send(EngineRequest {
-            command,
+    let use_latency_lane = request_sender.latency_lane_enabled
+        && matches!(
             batch_candidate,
-            enqueued_at: Instant::now(),
-            response_tx,
-        })
+            Some(RetainedSelectBatchCandidate::Literal { .. })
+        );
+    let request = EngineRequest {
+        command,
+        batch_candidate,
+        enqueued_at: Instant::now(),
+        response_tx,
+    };
+    let tx = if use_latency_lane {
+        &request_sender.latency_tx
+    } else {
+        &request_sender.throughput_tx
+    };
+    tx.send(request)
         .map_err(|err| format!("engine scheduler request failed: {err}"))?;
     response_rx
         .recv()
@@ -990,12 +1007,12 @@ fn write_engine_response(stream: &mut TcpStream, response: EngineResponse) -> Re
 
 fn commit_pending_copy_chunks(
     pending: &mut PendingCopy,
-    request_tx: &mpsc::Sender<EngineRequest>,
+    request_sender: &EngineRequestSender,
     chunks: Vec<Vec<Vec<SqlValue>>>,
 ) -> Result<(), String> {
     for rows in chunks {
         match request_engine(
-            request_tx,
+            request_sender,
             EngineCommand::CopyChunk {
                 copy: pending.copy.clone(),
                 rows,
@@ -1167,7 +1184,7 @@ fn startup_code(frame: &[u8]) -> Option<u32> {
 
 fn handle_client_io(
     mut stream: TcpStream,
-    request_tx: mpsc::Sender<EngineRequest>,
+    request_sender: EngineRequestSender,
     retained_read_response_cache: Arc<Mutex<RetainedReadResponseCache>>,
 ) -> Result<bool, String> {
     let mut startup = match read_startup_frame(&mut stream).map_err(|err| err.to_string())? {
@@ -1183,7 +1200,7 @@ fn handle_client_io(
     }
     write_engine_response(
         &mut stream,
-        request_engine(&request_tx, EngineCommand::Startup(startup))?,
+        request_engine(&request_sender, EngineCommand::Startup(startup))?,
     )?;
 
     let mut pending_copy: Option<PendingCopy> = None;
@@ -1194,7 +1211,7 @@ fn handle_client_io(
                     .lock()
                     .map_err(|_| "retained read response cache lock poisoned".to_string())?
                     .invalidate();
-                match request_engine(&request_tx, EngineCommand::StartCopy(sql))? {
+                match request_engine(&request_sender, EngineCommand::StartCopy(sql))? {
                     EngineResponse::CopyStarted { bytes, pending } => {
                         stream.write_all(&bytes).map_err(|err| err.to_string())?;
                         pending_copy = Some(pending);
@@ -1221,8 +1238,10 @@ fn handle_client_io(
                             stream.write_all(&bytes).map_err(|err| err.to_string())?;
                             continue;
                         }
-                        let response =
-                            request_engine(&request_tx, EngineCommand::SimpleQuery(sql.clone()))?;
+                        let response = request_engine(
+                            &request_sender,
+                            EngineCommand::SimpleQuery(sql.clone()),
+                        )?;
                         if let EngineResponse::Bytes(bytes) = &response {
                             retained_read_response_cache
                                 .lock()
@@ -1240,7 +1259,7 @@ fn handle_client_io(
                             .invalidate();
                         write_engine_response(
                             &mut stream,
-                            request_engine(&request_tx, EngineCommand::SimpleQuery(sql))?,
+                            request_engine(&request_sender, EngineCommand::SimpleQuery(sql))?,
                         )?;
                     }
                 }
@@ -1250,7 +1269,7 @@ fn handle_client_io(
                     .as_mut()
                     .ok_or("COPY data arrived without pending COPY stream")?;
                 let chunks = pending.push_bytes(&bytes).map_err(|err| err.to_string())?;
-                commit_pending_copy_chunks(pending, &request_tx, chunks)?;
+                commit_pending_copy_chunks(pending, &request_sender, chunks)?;
             }
             FrontendMessage::CopyDone => {
                 retained_read_response_cache
@@ -1263,10 +1282,10 @@ fn handle_client_io(
                 let chunks = pending
                     .finish_pending_text()
                     .map_err(|err| err.to_string())?;
-                commit_pending_copy_chunks(&mut pending, &request_tx, chunks)?;
+                commit_pending_copy_chunks(&mut pending, &request_sender, chunks)?;
                 write_engine_response(
                     &mut stream,
-                    request_engine(&request_tx, EngineCommand::FinishCopy(pending))?,
+                    request_engine(&request_sender, EngineCommand::FinishCopy(pending))?,
                 )?;
             }
             FrontendMessage::Terminate => break,
@@ -1317,6 +1336,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_PAYLOAD_AWARE")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
+    let requested_gpu_latency_lane_enabled =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_LATENCY_LANE_RETAINED_LITERAL")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+    let gpu_latency_lane_enabled = requested_gpu_latency_lane_enabled && max_sessions >= 128;
     let requested_gpu_microbatch_route_lane_scan_policy = RouteLaneScanPolicy::from_env();
     let gpu_microbatch_route_lane_scan_policy = if requested_gpu_microbatch_route_lane_scan_policy
         == RouteLaneScanPolicy::Adaptive
@@ -1329,24 +1353,29 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let listener = TcpListener::bind(&listen)?;
     let (request_tx, request_rx) = mpsc::channel::<EngineRequest>();
+    let (latency_request_tx, latency_request_rx) = mpsc::channel::<EngineRequest>();
     let (completed_tx, completed_rx) = mpsc::channel::<()>();
     let retained_read_response_cache = Arc::new(Mutex::new(RetainedReadResponseCache::new(
         retained_read_response_cache_enabled,
     )));
-    let accept_request_tx = request_tx.clone();
+    let accept_request_sender = EngineRequestSender {
+        throughput_tx: request_tx.clone(),
+        latency_tx: latency_request_tx.clone(),
+        latency_lane_enabled: gpu_latency_lane_enabled,
+    };
     let accept_completed_tx = completed_tx.clone();
     let accept_retained_read_response_cache = Arc::clone(&retained_read_response_cache);
     let accept_handle = thread::spawn(move || -> Result<(), String> {
         for stream in listener.incoming().take(max_sessions) {
             let stream = stream.map_err(|err| err.to_string())?;
-            let client_request_tx = accept_request_tx.clone();
+            let client_request_sender = accept_request_sender.clone();
             let client_completed_tx = accept_completed_tx.clone();
             let client_retained_read_response_cache =
                 Arc::clone(&accept_retained_read_response_cache);
             thread::spawn(move || {
                 let completed = handle_client_io(
                     stream,
-                    client_request_tx,
+                    client_request_sender,
                     client_retained_read_response_cache,
                 )
                 .unwrap_or(false);
@@ -1401,6 +1430,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     state.fact("owner_thread_gpu_microbatch_preclassified_requests", true)?;
     state.fact("owner_thread_gpu_microbatch_route_lanes", true)?;
+    state.fact(
+        "owner_thread_gpu_latency_lane_retained_literal_requested",
+        requested_gpu_latency_lane_enabled,
+    )?;
+    state.fact(
+        "owner_thread_gpu_latency_lane_retained_literal_effective",
+        gpu_latency_lane_enabled,
+    )?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
     state.fact("max_sessions", max_sessions)?;
@@ -1421,20 +1458,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut gpu_route_lane_scan_budget = 0_u64;
     let mut gpu_route_lane_scanned_ready = 0_u64;
     let mut gpu_route_lane_projected_payload_weight = 0_u64;
+    let mut gpu_latency_lane_requests = 0_u64;
     while completed < max_sessions {
         while completed_rx.try_recv().is_ok() {
             completed += 1;
         }
-        let next_request =
-            if let Some(request) = pop_ready_lane(&mut ready_lanes, &mut ready_lane_order) {
-                Ok(request)
-            } else if let Some(request) = deferred_requests.pop_front() {
-                Ok(request)
-            } else {
-                request_rx.recv_timeout(Duration::from_millis(50))
-            };
+        let next_request = match latency_request_rx.try_recv() {
+            Ok(request) => Ok((request, true)),
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                if let Some(request) = pop_ready_lane(&mut ready_lanes, &mut ready_lane_order) {
+                    Ok((request, false))
+                } else if let Some(request) = deferred_requests.pop_front() {
+                    Ok((request, false))
+                } else {
+                    request_rx
+                        .recv_timeout(Duration::from_millis(1))
+                        .map(|request| (request, false))
+                }
+            }
+        };
         match next_request {
-            Ok(request) => {
+            Ok((request, latency_lane_request)) => {
+                if latency_lane_request {
+                    gpu_latency_lane_requests = gpu_latency_lane_requests.saturating_add(1);
+                }
+                let batch_request_rx = if latency_lane_request {
+                    &latency_request_rx
+                } else {
+                    &request_rx
+                };
                 let mut batch = vec![request];
                 let mut literal_microbatch = false;
                 let mut microbatch_admission_wait_micros = 0_u64;
@@ -1470,7 +1523,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 break;
                             }
                             match recv_next_batch_candidate(
-                                &request_rx,
+                                batch_request_rx,
                                 batch_started,
                                 gpu_microbatch_admission_window,
                             ) {
@@ -1558,7 +1611,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 break;
                             }
                             match recv_next_batch_candidate(
-                                &request_rx,
+                                batch_request_rx,
                                 batch_started,
                                 gpu_microbatch_admission_window,
                             ) {
@@ -1805,6 +1858,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_route_lane_projected_payload_weight",
         gpu_route_lane_projected_payload_weight,
+    )?;
+    state.fact(
+        "owner_thread_gpu_latency_lane_requests",
+        gpu_latency_lane_requests,
     )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;
