@@ -15266,10 +15266,10 @@ impl Engine {
             .iter()
             .map(|job| job.select.clone())
             .collect::<Vec<_>>();
-        let results = self
-            .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
-                &selects,
-            )?;
+        let results = self.execute_relational_equality_multi_column_projection_batch_inner(
+            &selects,
+            Some(jobs),
+        )?;
         let first_job = jobs.first();
         Ok(RelationalRetainedReadSubmission {
             route_id: first_job
@@ -19123,26 +19123,57 @@ impl Engine {
         &mut self,
         selects: &[Select],
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
+        self.execute_relational_equality_multi_column_projection_batch_inner(selects, None)
+    }
+
+    fn execute_relational_equality_multi_column_projection_batch_inner(
+        &mut self,
+        selects: &[Select],
+        planned_jobs: Option<&[RelationalRetainedReadJob]>,
+    ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         if selects.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(jobs) = planned_jobs {
+            if jobs.len() != selects.len() {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "retained read job count {} does not match SELECT count {}",
+                    jobs.len(),
+                    selects.len()
+                ))));
+            }
         }
         let mut members = Vec::with_capacity(selects.len());
         let mut batch_table: Option<RelationalTable> = None;
         let mut batch_filter_idx: Option<usize> = None;
         let mut batch_selected_indexes: Option<Vec<usize>> = None;
-        for select in selects {
-            let decision = self.plan_relational_resident_route(select);
-            if !decision.accepted
-                || !matches!(
-                    decision.query_shape.as_str(),
-                    "int4_equality_projection"
-                        | "int4_equality_multi_column_projection"
-                        | "int4_equality_mixed_column_projection"
-                )
-            {
+        for (select_idx, select) in selects.iter().enumerate() {
+            let query_shape = if let Some(jobs) = planned_jobs {
+                jobs[select_idx]
+                    .route_id
+                    .split(':')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
+            } else {
+                let decision = self.plan_relational_resident_route(select);
+                if !decision.accepted {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "resident device-memory equality batch currently supports only accepted int4 equality projection, got {}: {}",
+                        decision.query_shape, decision.reason
+                    ))));
+                }
+                decision.query_shape
+            };
+            if !matches!(
+                query_shape.as_str(),
+                "int4_equality_projection"
+                    | "int4_equality_multi_column_projection"
+                    | "int4_equality_mixed_column_projection"
+            ) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "resident device-memory equality batch currently supports only accepted int4 equality projection, got {}: {}",
-                    decision.query_shape, decision.reason
+                    query_shape, "preplanned retained read job"
                 ))));
             }
             let (table, bound) = self.bind_relational_select_for_execution(select)?;

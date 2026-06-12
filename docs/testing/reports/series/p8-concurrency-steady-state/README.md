@@ -26,3 +26,4 @@ P8 retained-read concurrency, persistent-client measurement, and steady-state re
 - [`runs/2026-06-12-retained-snapshot-handle-cache-off-v1.md`](runs/2026-06-12-retained-snapshot-handle-cache-off-v1.md): P8 Retained Snapshot Handle Cache-Off Probe
 - [`runs/2026-06-12-retained-read-job-cache-off-v1.md`](runs/2026-06-12-retained-read-job-cache-off-v1.md): P8 Retained Read Job Cache-Off Probe
 - [`runs/2026-06-12-retained-read-submit-complete-cache-off-v1.md`](runs/2026-06-12-retained-read-submit-complete-cache-off-v1.md): P8 Retained Read Submit/Complete Cache-Off Probe
+- [`runs/2026-06-12-preplanned-read-job-cache-off-v1.md`](runs/2026-06-12-preplanned-read-job-cache-off-v1.md): P8 Preplanned Read Job Cache-Off Probe

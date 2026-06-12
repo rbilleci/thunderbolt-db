@@ -110,6 +110,8 @@ Evidence:
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-retained-read-job-cache-off-v1.md`
 - synchronous submit/complete slice closed by
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-retained-read-submit-complete-cache-off-v1.md`
+- preplanned execution slice closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-preplanned-read-job-cache-off-v1.md`
 
 ### M4: Small GPU Stream Pool
 
