@@ -429,6 +429,9 @@ impl EndpointState {
                             microbatch_size: 1,
                             microbatch_unique_selects: 1,
                             microbatch_admission_wait_micros: 0,
+                            microbatch_route_key: None,
+                            microbatch_ready_lane_count: 0,
+                            retained_read_job_path: false,
                         },
                     )?;
                 }
@@ -447,6 +450,8 @@ impl EndpointState {
         microbatch_admission_wait_micros: u64,
         microbatch_kind: &'static str,
         use_retained_read_jobs: bool,
+        microbatch_route_key: Option<&str>,
+        microbatch_ready_lane_count: usize,
     ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -602,6 +607,10 @@ impl EndpointState {
                         microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
                         microbatch_unique_selects: u64::try_from(selects.len()).unwrap_or(u64::MAX),
                         microbatch_admission_wait_micros,
+                        microbatch_route_key,
+                        microbatch_ready_lane_count: u64::try_from(microbatch_ready_lane_count)
+                            .unwrap_or(u64::MAX),
+                        retained_read_job_path: use_retained_read_jobs,
                     },
                 )?;
             }
@@ -1159,13 +1168,16 @@ struct SelectPhaseFact<'a> {
     microbatch_size: u64,
     microbatch_unique_selects: u64,
     microbatch_admission_wait_micros: u64,
+    microbatch_route_key: Option<&'a str>,
+    microbatch_ready_lane_count: u64,
+    retained_read_job_path: bool,
 }
 
 impl std::fmt::Display for SelectPhaseFact<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"retained_read_job_route_id\":{},\"retained_snapshot_generation\":{},\"retained_read_submit_micros\":{},\"retained_read_complete_micros\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{},\"microbatch_admission_wait_micros\":{}}}",
+            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"retained_read_job_route_id\":{},\"retained_snapshot_generation\":{},\"retained_read_submit_micros\":{},\"retained_read_complete_micros\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{},\"microbatch_admission_wait_micros\":{},\"microbatch_route_key\":{},\"microbatch_ready_lane_count\":{},\"retained_read_job_path\":{}}}",
             json_escape(self.sql),
             json_escape(self.query_shape),
             self.scheduler_queue_wait_micros,
@@ -1190,7 +1202,10 @@ impl std::fmt::Display for SelectPhaseFact<'_> {
             json_escape(self.microbatch_kind),
             self.microbatch_size,
             self.microbatch_unique_selects,
-            self.microbatch_admission_wait_micros
+            self.microbatch_admission_wait_micros,
+            json_optional_str(self.microbatch_route_key),
+            self.microbatch_ready_lane_count,
+            self.retained_read_job_path
         )
     }
 }
@@ -1831,6 +1846,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .unwrap_or(u64::MAX);
                 if batch.len() > 1 {
                     if literal_microbatch {
+                        let microbatch_route_key = batch[0]
+                            .batch_candidate
+                            .as_ref()
+                            .map(RetainedSelectBatchCandidate::route_key);
+                        let microbatch_ready_lane_count = ready_lanes.len();
                         let result = (|| -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
                             let items = batch
                                 .iter()
@@ -1851,6 +1871,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 microbatch_admission_wait_micros,
                                 "multi_literal_gpu",
                                 prepared_retained_microbatches_enabled,
+                                microbatch_route_key.as_deref(),
+                                microbatch_ready_lane_count,
                             )?;
                             state.flush_facts()?;
                             Ok(outputs)
@@ -1919,6 +1941,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                             microbatch_admission_wait_micros,
                             "prepared_literal_gpu",
                             true,
+                            request
+                                .batch_candidate
+                                .as_ref()
+                                .map(RetainedSelectBatchCandidate::route_key)
+                                .as_deref(),
+                            ready_lanes.len(),
                         )?;
                         state.flush_facts()?;
                         outputs
