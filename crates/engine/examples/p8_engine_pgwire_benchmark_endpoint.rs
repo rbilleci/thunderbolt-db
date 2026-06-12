@@ -446,6 +446,7 @@ impl EndpointState {
         scheduler_queue_wait_micros: u64,
         microbatch_admission_wait_micros: u64,
         microbatch_kind: &'static str,
+        use_retained_read_jobs: bool,
     ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -470,34 +471,58 @@ impl EndpointState {
             .iter()
             .map(|(_sql, select)| select.clone())
             .collect::<Vec<_>>();
-        let read_jobs = selects
-            .iter()
-            .map(|select| self.engine.prepare_relational_retained_read_job(select))
-            .collect::<Result<Vec<_>, _>>()?;
+        let read_jobs = if use_retained_read_jobs {
+            Some(
+                selects
+                    .iter()
+                    .map(|select| self.engine.prepare_relational_retained_read_job(select))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            None
+        };
         let before = self.engine.metrics().snapshot();
         let execute_started = Instant::now();
-        let submission = self
-            .engine
-            .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&read_jobs)?;
-        let retained_read_submit_micros = submission.submit_wall_micros;
-        let complete_started = Instant::now();
-        let results = Engine::complete_relational_retained_read_submission(submission);
-        let retained_read_complete_micros = complete_started
-            .elapsed()
-            .as_micros()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        self.retained_read_job_submission_batches =
-            self.retained_read_job_submission_batches.saturating_add(1);
-        self.retained_read_jobs_submitted = self
-            .retained_read_jobs_submitted
-            .saturating_add(u64::try_from(read_jobs.len()).unwrap_or(u64::MAX));
-        self.retained_read_job_submit_wall_micros_total = self
-            .retained_read_job_submit_wall_micros_total
-            .saturating_add(retained_read_submit_micros);
-        self.retained_read_job_complete_wall_micros_total = self
-            .retained_read_job_complete_wall_micros_total
-            .saturating_add(retained_read_complete_micros);
+        let (results, retained_read_submit_micros, retained_read_complete_micros) =
+            match read_jobs.as_ref() {
+                Some(read_jobs) => {
+                    let submission = self
+                        .engine
+                        .submit_relational_retained_read_jobs_with_resident_device_memory_probe(
+                            read_jobs,
+                        )?;
+                    let retained_read_submit_micros = submission.submit_wall_micros;
+                    let complete_started = Instant::now();
+                    let results = Engine::complete_relational_retained_read_submission(submission);
+                    let retained_read_complete_micros = complete_started
+                        .elapsed()
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX);
+                    self.retained_read_job_submission_batches =
+                        self.retained_read_job_submission_batches.saturating_add(1);
+                    self.retained_read_jobs_submitted = self
+                        .retained_read_jobs_submitted
+                        .saturating_add(u64::try_from(read_jobs.len()).unwrap_or(u64::MAX));
+                    self.retained_read_job_submit_wall_micros_total = self
+                        .retained_read_job_submit_wall_micros_total
+                        .saturating_add(retained_read_submit_micros);
+                    self.retained_read_job_complete_wall_micros_total = self
+                        .retained_read_job_complete_wall_micros_total
+                        .saturating_add(retained_read_complete_micros);
+                    (
+                        results,
+                        Some(retained_read_submit_micros),
+                        Some(retained_read_complete_micros),
+                    )
+                }
+                None => (
+                    self.engine
+                        .execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(&selects)?,
+                    None,
+                    None,
+                ),
+            };
         let engine_execute_micros = execute_started
             .elapsed()
             .as_micros()
@@ -560,13 +585,15 @@ impl EndpointState {
                         retained_matched_rows: decision
                             .last_execution_matched_rows
                             .map(|value| value.try_into().unwrap_or(u64::MAX)),
-                        retained_read_job_route_id: Some(&read_jobs[unique_idx].route_id),
+                        retained_read_job_route_id: read_jobs
+                            .as_ref()
+                            .map(|read_jobs| read_jobs[unique_idx].route_id.as_str()),
                         retained_snapshot_generation: snapshot_handle
                             .as_ref()
                             .map(|handle| handle.generation)
                             .or(decision.snapshot_generation),
-                        retained_read_submit_micros: Some(retained_read_submit_micros),
-                        retained_read_complete_micros: Some(retained_read_complete_micros),
+                        retained_read_submit_micros,
+                        retained_read_complete_micros,
                         h2d_delta,
                         d2h_delta,
                         kernel_delta,
@@ -1411,6 +1438,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_SINGLETONS")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
+    let prepared_retained_microbatches_enabled =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_MICROBATCHES")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
     let requested_gpu_microbatch_route_lane_scan_policy = RouteLaneScanPolicy::from_env();
     let gpu_microbatch_route_lane_scan_policy = if requested_gpu_microbatch_route_lane_scan_policy
         == RouteLaneScanPolicy::Adaptive
@@ -1515,6 +1546,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_gpu_prepared_retained_singletons",
         prepared_retained_singletons_enabled,
+    )?;
+    state.fact(
+        "owner_thread_gpu_prepared_retained_microbatches",
+        prepared_retained_microbatches_enabled,
     )?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
@@ -1815,6 +1850,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 scheduler_queue_wait_micros,
                                 microbatch_admission_wait_micros,
                                 "multi_literal_gpu",
+                                prepared_retained_microbatches_enabled,
                             )?;
                             state.flush_facts()?;
                             Ok(outputs)
@@ -1822,10 +1858,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .map_err(|err| err.to_string());
                         match result {
                             Ok(outputs) => {
-                                gpu_prepared_retained_route_requests =
-                                    gpu_prepared_retained_route_requests.saturating_add(
-                                        u64::try_from(outputs.len()).unwrap_or(u64::MAX),
-                                    );
+                                if prepared_retained_microbatches_enabled {
+                                    gpu_prepared_retained_route_requests =
+                                        gpu_prepared_retained_route_requests.saturating_add(
+                                            u64::try_from(outputs.len()).unwrap_or(u64::MAX),
+                                        );
+                                }
                                 for (request, output) in batch.into_iter().zip(outputs) {
                                     let _ =
                                         request.response_tx.send(Ok(EngineResponse::Bytes(output)));
@@ -1880,6 +1918,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             scheduler_queue_wait_micros,
                             microbatch_admission_wait_micros,
                             "prepared_literal_gpu",
+                            true,
                         )?;
                         state.flush_facts()?;
                         outputs
