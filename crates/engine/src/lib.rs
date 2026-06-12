@@ -6439,6 +6439,15 @@ pub struct RelationalRetainedReadSubmission {
     inner: RelationalRetainedReadSubmissionInner,
 }
 
+impl RelationalRetainedReadSubmission {
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self.inner,
+            RelationalRetainedReadSubmissionInner::PendingInt4Projection(_)
+        )
+    }
+}
+
 enum RelationalRetainedReadSubmissionInner {
     Ready(Vec<RelationalSelectResult>),
     PendingInt4Projection(RelationalRetainedInt4ProjectionSubmission),

@@ -7,7 +7,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gpu_db_engine::{Engine, RelationalResidencyWarmupPolicy};
+use gpu_db_engine::{
+    Engine, RelationalResidencyWarmupPolicy, RelationalRetainedReadJob,
+    RelationalRetainedReadSubmission, RelationalSelectResult,
+};
+use gpu_db_metrics::RuntimeMetricsSnapshot;
 use gpu_db_protocol::backend::{BackendColumn, BackendWriter};
 use gpu_db_protocol::{
     parse_command, parse_copy_from_stdin, parse_copy_row, parse_frontend_message,
@@ -419,6 +423,8 @@ impl EndpointState {
                             retained_snapshot_generation: decision.snapshot_generation,
                             retained_read_submit_micros: None,
                             retained_read_complete_micros: None,
+                            retained_read_pending_queue_micros: None,
+                            retained_read_pending_inflight_at_submit: None,
                             h2d_delta,
                             d2h_delta: after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total),
                             kernel_delta: after
@@ -453,6 +459,18 @@ impl EndpointState {
         microbatch_route_key: Option<&str>,
         microbatch_ready_lane_count: usize,
     ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        if use_retained_read_jobs {
+            let submitted = self.submit_prepared_retained_literal_batch(
+                items.to_vec(),
+                scheduler_queue_wait_micros,
+                microbatch_admission_wait_micros,
+                microbatch_kind,
+                microbatch_route_key.map(str::to_string),
+                microbatch_ready_lane_count,
+                None,
+            )?;
+            return self.complete_prepared_retained_literal_batch(submitted);
+        }
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -601,6 +619,8 @@ impl EndpointState {
                             .or(decision.snapshot_generation),
                         retained_read_submit_micros,
                         retained_read_complete_micros,
+                        retained_read_pending_queue_micros: None,
+                        retained_read_pending_inflight_at_submit: None,
                         h2d_delta,
                         d2h_delta,
                         kernel_delta,
@@ -617,6 +637,189 @@ impl EndpointState {
                 )?;
             }
             outputs.push(output);
+        }
+        Ok(outputs)
+    }
+
+    fn submit_prepared_retained_literal_batch(
+        &mut self,
+        items: Vec<(String, Select)>,
+        scheduler_queue_wait_micros: u64,
+        microbatch_admission_wait_micros: u64,
+        microbatch_kind: &'static str,
+        microbatch_route_key: Option<String>,
+        microbatch_ready_lane_count: usize,
+        pending_inflight_at_submit: Option<u64>,
+    ) -> Result<SubmittedRetainedLiteralBatch, Box<dyn Error>> {
+        if items.is_empty() {
+            return Err("prepared retained literal batch requires at least one item".into());
+        }
+        let mut unique_items = Vec::new();
+        let mut unique_by_needle = HashMap::new();
+        let mut item_to_unique = Vec::with_capacity(items.len());
+        for (sql, select) in &items {
+            let needle = retained_select_literal_needle(select)
+                .ok_or("literal SELECT batch requires one int4 equality needle")?;
+            let unique_idx = if let Some(idx) = unique_by_needle.get(&needle) {
+                *idx
+            } else {
+                let idx = unique_items.len();
+                unique_by_needle.insert(needle, idx);
+                unique_items.push((sql.clone(), select.clone()));
+                idx
+            };
+            item_to_unique.push(unique_idx);
+        }
+        let selects = unique_items
+            .iter()
+            .map(|(_sql, select)| select.clone())
+            .collect::<Vec<_>>();
+        let read_jobs = selects
+            .iter()
+            .map(|select| self.engine.prepare_relational_retained_read_job(select))
+            .collect::<Result<Vec<_>, _>>()?;
+        let before_metrics = self.engine.metrics().snapshot();
+        let execute_started = Instant::now();
+        let submission = self
+            .engine
+            .submit_relational_retained_read_jobs_with_resident_device_memory_probe(&read_jobs)?;
+        Ok(SubmittedRetainedLiteralBatch {
+            items,
+            item_to_unique,
+            selects,
+            read_jobs,
+            submission,
+            before_metrics,
+            execute_started,
+            scheduler_queue_wait_micros,
+            microbatch_admission_wait_micros,
+            microbatch_kind,
+            microbatch_route_key,
+            microbatch_ready_lane_count,
+            pending_queue_micros: None,
+            pending_inflight_at_submit,
+        })
+    }
+
+    fn complete_prepared_retained_literal_batch(
+        &mut self,
+        submitted: SubmittedRetainedLiteralBatch,
+    ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        let SubmittedRetainedLiteralBatch {
+            items,
+            item_to_unique,
+            selects,
+            read_jobs,
+            submission,
+            before_metrics,
+            execute_started,
+            scheduler_queue_wait_micros,
+            microbatch_admission_wait_micros,
+            microbatch_kind,
+            microbatch_route_key,
+            microbatch_ready_lane_count,
+            pending_queue_micros,
+            pending_inflight_at_submit,
+        } = submitted;
+        let retained_read_submit_micros = submission.submit_wall_micros;
+        let complete_started = Instant::now();
+        let results = self
+            .engine
+            .complete_relational_retained_read_submission(submission)?;
+        let retained_read_complete_micros = complete_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        self.retained_read_job_submission_batches =
+            self.retained_read_job_submission_batches.saturating_add(1);
+        self.retained_read_jobs_submitted = self
+            .retained_read_jobs_submitted
+            .saturating_add(u64::try_from(read_jobs.len()).unwrap_or(u64::MAX));
+        self.retained_read_job_submit_wall_micros_total = self
+            .retained_read_job_submit_wall_micros_total
+            .saturating_add(retained_read_submit_micros);
+        self.retained_read_job_complete_wall_micros_total = self
+            .retained_read_job_complete_wall_micros_total
+            .saturating_add(retained_read_complete_micros);
+        let engine_execute_micros = execute_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let after = self.engine.metrics().snapshot();
+        let decision = self
+            .engine
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision(&selects[0].table)
+            .cloned();
+        let snapshot_handle = self
+            .engine
+            .relational_retained_snapshot_handle(&selects[0].table);
+        let batch_len = u64::try_from(items.len()).unwrap_or(u64::MAX).max(1);
+        let h2d_delta = after
+            .h2d_bytes_total
+            .saturating_sub(before_metrics.h2d_bytes_total)
+            / batch_len;
+        let d2h_delta = after
+            .d2h_bytes_total
+            .saturating_sub(before_metrics.d2h_bytes_total)
+            / batch_len;
+        let kernel_delta = after
+            .kernel_exec_samples
+            .saturating_sub(before_metrics.kernel_exec_samples)
+            / batch_len;
+        let mut outputs = Vec::with_capacity(items.len());
+        for ((sql, _select), unique_idx) in items.iter().zip(item_to_unique) {
+            let result = &results[unique_idx];
+            let rendered = render_select_result(result)?;
+            if let Some(decision) = &decision {
+                self.fact(
+                    "select_phase_json",
+                    SelectPhaseFact {
+                        sql,
+                        query_shape: &decision.query_shape,
+                        scheduler_queue_wait_micros,
+                        engine_execute_micros,
+                        result_materialize_micros: rendered.result_materialize_micros,
+                        client_write_micros: rendered.client_write_micros,
+                        retained_wall_micros: decision.last_execution_wall_micros,
+                        retained_device_lookup_micros: decision.last_execution_device_lookup_micros,
+                        retained_match_index_micros: decision.last_execution_match_index_micros,
+                        retained_selected_projection_micros: decision
+                            .last_execution_selected_projection_micros,
+                        retained_result_materialization_micros: decision
+                            .last_execution_result_materialization_micros,
+                        retained_cuda_event_micros: decision.last_execution_kernel_event_elapsed_us,
+                        retained_matched_rows: decision
+                            .last_execution_matched_rows
+                            .map(|value| value.try_into().unwrap_or(u64::MAX)),
+                        retained_read_job_route_id: Some(read_jobs[unique_idx].route_id.as_str()),
+                        retained_snapshot_generation: snapshot_handle
+                            .as_ref()
+                            .map(|handle| handle.generation)
+                            .or(decision.snapshot_generation),
+                        retained_read_submit_micros: Some(retained_read_submit_micros),
+                        retained_read_complete_micros: Some(retained_read_complete_micros),
+                        retained_read_pending_queue_micros: pending_queue_micros,
+                        retained_read_pending_inflight_at_submit: pending_inflight_at_submit,
+                        h2d_delta,
+                        d2h_delta,
+                        kernel_delta,
+                        result_rows: result.rows.len(),
+                        microbatch_kind,
+                        microbatch_size: u64::try_from(items.len()).unwrap_or(u64::MAX),
+                        microbatch_unique_selects: u64::try_from(selects.len()).unwrap_or(u64::MAX),
+                        microbatch_admission_wait_micros,
+                        microbatch_route_key: microbatch_route_key.as_deref(),
+                        microbatch_ready_lane_count: u64::try_from(microbatch_ready_lane_count)
+                            .unwrap_or(u64::MAX),
+                        retained_read_job_path: true,
+                    },
+                )?;
+            }
+            outputs.push(rendered.bytes);
         }
         Ok(outputs)
     }
@@ -784,6 +987,79 @@ struct EngineRequest {
     batch_candidate: Option<RetainedSelectBatchCandidate>,
     enqueued_at: Instant,
     response_tx: mpsc::Sender<Result<EngineResponse, String>>,
+}
+
+struct SubmittedRetainedLiteralBatch {
+    items: Vec<(String, Select)>,
+    item_to_unique: Vec<usize>,
+    selects: Vec<Select>,
+    read_jobs: Vec<RelationalRetainedReadJob>,
+    submission: RelationalRetainedReadSubmission,
+    before_metrics: RuntimeMetricsSnapshot,
+    execute_started: Instant,
+    scheduler_queue_wait_micros: u64,
+    microbatch_admission_wait_micros: u64,
+    microbatch_kind: &'static str,
+    microbatch_route_key: Option<String>,
+    microbatch_ready_lane_count: usize,
+    pending_queue_micros: Option<u64>,
+    pending_inflight_at_submit: Option<u64>,
+}
+
+struct PendingRetainedLiteralBatch {
+    requests: Vec<EngineRequest>,
+    submitted: SubmittedRetainedLiteralBatch,
+    submitted_at: Instant,
+}
+
+#[derive(Default)]
+struct PendingRetainedReadStats {
+    submissions: u64,
+    max: u64,
+    completed: u64,
+    wait_micros_total: u64,
+    overlap_opportunities: u64,
+}
+
+fn complete_pending_retained_literal_batch(
+    state: &mut EndpointState,
+    pending: PendingRetainedLiteralBatch,
+    pending_stats: &mut PendingRetainedReadStats,
+) {
+    let PendingRetainedLiteralBatch {
+        requests,
+        mut submitted,
+        submitted_at,
+    } = pending;
+    let pending_queue_micros = submitted_at
+        .elapsed()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    submitted.pending_queue_micros = Some(pending_queue_micros);
+    pending_stats.completed = pending_stats.completed.saturating_add(1);
+    pending_stats.wait_micros_total = pending_stats
+        .wait_micros_total
+        .saturating_add(pending_queue_micros);
+    let result = state
+        .complete_prepared_retained_literal_batch(submitted)
+        .and_then(|outputs| {
+            state.flush_facts()?;
+            Ok(outputs)
+        })
+        .map_err(|err| err.to_string());
+    match result {
+        Ok(outputs) => {
+            for (request, output) in requests.into_iter().zip(outputs) {
+                let _ = request.response_tx.send(Ok(EngineResponse::Bytes(output)));
+            }
+        }
+        Err(err) => {
+            for request in requests {
+                let _ = request.response_tx.send(Err(err.clone()));
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1164,6 +1440,37 @@ fn write_select_result_rows<W: Write + ?Sized>(
     Ok(result_materialize_micros)
 }
 
+struct RenderedSelectResult {
+    bytes: Vec<u8>,
+    result_materialize_micros: u64,
+    client_write_micros: u64,
+}
+
+fn render_select_result(
+    result: &RelationalSelectResult,
+) -> Result<RenderedSelectResult, Box<dyn Error>> {
+    let columns = result
+        .columns
+        .iter()
+        .map(|column| BackendColumn::new(&column.name, column.type_oid, column.type_size))
+        .collect::<Vec<_>>();
+    let mut bytes = Vec::new();
+    let mut writer = BackendWriter::new(&mut bytes);
+    let write_started = Instant::now();
+    let result_materialize_micros = write_select_result_rows(&mut writer, &columns, &result.rows)?;
+    writer.ready_for_query(false)?;
+    let client_write_micros = write_started
+        .elapsed()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Ok(RenderedSelectResult {
+        bytes,
+        result_materialize_micros,
+        client_write_micros,
+    })
+}
+
 struct SelectPhaseFact<'a> {
     sql: &'a str,
     query_shape: &'a str,
@@ -1182,6 +1489,8 @@ struct SelectPhaseFact<'a> {
     retained_snapshot_generation: Option<u64>,
     retained_read_submit_micros: Option<u64>,
     retained_read_complete_micros: Option<u64>,
+    retained_read_pending_queue_micros: Option<u64>,
+    retained_read_pending_inflight_at_submit: Option<u64>,
     h2d_delta: u64,
     d2h_delta: u64,
     kernel_delta: u64,
@@ -1199,7 +1508,7 @@ impl std::fmt::Display for SelectPhaseFact<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"retained_read_job_route_id\":{},\"retained_snapshot_generation\":{},\"retained_read_submit_micros\":{},\"retained_read_complete_micros\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{},\"microbatch_admission_wait_micros\":{},\"microbatch_route_key\":{},\"microbatch_ready_lane_count\":{},\"retained_read_job_path\":{}}}",
+            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"retained_read_job_route_id\":{},\"retained_snapshot_generation\":{},\"retained_read_submit_micros\":{},\"retained_read_complete_micros\":{},\"retained_read_pending_queue_micros\":{},\"retained_read_pending_inflight_at_submit\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{},\"microbatch_kind\":\"{}\",\"microbatch_size\":{},\"microbatch_unique_selects\":{},\"microbatch_admission_wait_micros\":{},\"microbatch_route_key\":{},\"microbatch_ready_lane_count\":{},\"retained_read_job_path\":{}}}",
             json_escape(self.sql),
             json_escape(self.query_shape),
             self.scheduler_queue_wait_micros,
@@ -1217,6 +1526,8 @@ impl std::fmt::Display for SelectPhaseFact<'_> {
             json_optional_u64(self.retained_snapshot_generation),
             json_optional_u64(self.retained_read_submit_micros),
             json_optional_u64(self.retained_read_complete_micros),
+            json_optional_u64(self.retained_read_pending_queue_micros),
+            json_optional_u64(self.retained_read_pending_inflight_at_submit),
             self.h2d_delta,
             self.d2h_delta,
             self.kernel_delta,
@@ -1483,6 +1794,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_MICROBATCHES")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
+    let retained_read_pending_completion_cap =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_PENDING_COMPLETION_CAP")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
     let requested_gpu_microbatch_route_lane_scan_policy = RouteLaneScanPolicy::from_env();
     let gpu_microbatch_route_lane_scan_policy = if requested_gpu_microbatch_route_lane_scan_policy
         == RouteLaneScanPolicy::Adaptive
@@ -1596,6 +1912,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "owner_thread_gpu_prepared_retained_microbatches",
         prepared_retained_microbatches_enabled,
     )?;
+    state.fact(
+        "owner_thread_retained_read_pending_completion_cap",
+        retained_read_pending_completion_cap,
+    )?;
     state.fact("owner_thread_gpu_microbatch_exact_select", true)?;
     state.fact("owner_thread_gpu_microbatch_multi_literal_select", true)?;
     state.fact("max_sessions", max_sessions)?;
@@ -1608,6 +1928,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut deferred_requests = VecDeque::new();
     let mut ready_lanes: HashMap<String, VecDeque<EngineRequest>> = HashMap::new();
     let mut ready_lane_order = VecDeque::new();
+    let mut pending_retained_read_batches = VecDeque::new();
+    let mut pending_retained_read_stats = PendingRetainedReadStats::default();
     let mut gpu_microbatch_batches = 0_u64;
     let mut gpu_microbatch_coalesced_requests = 0_u64;
     let mut gpu_literal_microbatch_batches = 0_u64;
@@ -1622,6 +1944,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     while completed < max_sessions {
         while completed_rx.try_recv().is_ok() {
             completed += 1;
+        }
+        if retained_read_pending_completion_cap > 0
+            && pending_retained_read_batches.len() >= retained_read_pending_completion_cap
+        {
+            if let Some(pending) = pending_retained_read_batches.pop_front() {
+                complete_pending_retained_literal_batch(
+                    &mut state,
+                    pending,
+                    &mut pending_retained_read_stats,
+                );
+                continue;
+            }
         }
         let next_request = match latency_request_rx.try_recv() {
             Ok(request) => Ok((request, true)),
@@ -1639,6 +1973,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                             gpu_route_lane_deepest_picks.saturating_add(1);
                     }
                     Ok((request, false))
+                } else if !pending_retained_read_batches.is_empty() {
+                    if let Some(pending) = pending_retained_read_batches.pop_front() {
+                        complete_pending_retained_literal_batch(
+                            &mut state,
+                            pending,
+                            &mut pending_retained_read_stats,
+                        );
+                    }
+                    continue;
                 } else if let Some(request) = deferred_requests.pop_front() {
                     Ok((request, false))
                 } else {
@@ -1652,6 +1995,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok((request, latency_lane_request)) => {
                 if latency_lane_request {
                     gpu_latency_lane_requests = gpu_latency_lane_requests.saturating_add(1);
+                }
+                if !pending_retained_read_batches.is_empty() && request.batch_candidate.is_none() {
+                    deferred_requests.push_front(request);
+                    if let Some(pending) = pending_retained_read_batches.pop_front() {
+                        complete_pending_retained_literal_batch(
+                            &mut state,
+                            pending,
+                            &mut pending_retained_read_stats,
+                        );
+                    }
+                    continue;
+                }
+                if !pending_retained_read_batches.is_empty() {
+                    pending_retained_read_stats.overlap_opportunities = pending_retained_read_stats
+                        .overlap_opportunities
+                        .saturating_add(1);
                 }
                 let batch_request_rx = if latency_lane_request {
                     &latency_request_rx
@@ -1892,49 +2251,138 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .as_ref()
                             .map(RetainedSelectBatchCandidate::route_key);
                         let microbatch_ready_lane_count = ready_lanes.len();
-                        let result = (|| -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
-                            let items = batch
-                                .iter()
-                                .map(|request| {
-                                    match &request.batch_candidate {
-                                        Some(RetainedSelectBatchCandidate::Literal {
-                                            select,
-                                            sql,
-                                            ..
-                                        }) => Ok((sql.clone(), select.clone())),
-                                        _ => Err("only compatible int4 equality SELECT can be literal-microbatched"),
-                                    }
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let outputs = state.handle_multi_literal_select_batch(
-                                &items,
-                                scheduler_queue_wait_micros,
-                                microbatch_admission_wait_micros,
-                                "multi_literal_gpu",
-                                prepared_retained_microbatches_enabled,
-                                microbatch_route_key.as_deref(),
-                                microbatch_ready_lane_count,
-                            )?;
-                            state.flush_facts()?;
-                            Ok(outputs)
-                        })()
-                        .map_err(|err| err.to_string());
-                        match result {
-                            Ok(outputs) => {
-                                if prepared_retained_microbatches_enabled {
-                                    gpu_prepared_retained_route_requests =
-                                        gpu_prepared_retained_route_requests.saturating_add(
-                                            u64::try_from(outputs.len()).unwrap_or(u64::MAX),
-                                        );
-                                }
-                                for (request, output) in batch.into_iter().zip(outputs) {
-                                    let _ =
-                                        request.response_tx.send(Ok(EngineResponse::Bytes(output)));
-                                }
-                            }
+                        let items_result = batch
+                            .iter()
+                            .map(|request| match &request.batch_candidate {
+                                Some(RetainedSelectBatchCandidate::Literal {
+                                    select, sql, ..
+                                }) => Ok((sql.clone(), select.clone())),
+                                _ => Err("only compatible int4 equality SELECT can be literal-microbatched"),
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|err| err.to_string());
+                        let items = match items_result {
+                            Ok(items) => items,
                             Err(err) => {
                                 for request in batch {
                                     let _ = request.response_tx.send(Err(err.clone()));
+                                }
+                                continue;
+                            }
+                        };
+                        if prepared_retained_microbatches_enabled
+                            && retained_read_pending_completion_cap > 0
+                        {
+                            let result = state
+                                .submit_prepared_retained_literal_batch(
+                                    items,
+                                    scheduler_queue_wait_micros,
+                                    microbatch_admission_wait_micros,
+                                    "multi_literal_gpu",
+                                    microbatch_route_key.clone(),
+                                    microbatch_ready_lane_count,
+                                    Some(
+                                        u64::try_from(pending_retained_read_batches.len())
+                                            .unwrap_or(u64::MAX),
+                                    ),
+                                )
+                                .map_err(|err| err.to_string());
+                            match result {
+                                Ok(submitted) if submitted.submission.is_pending() => {
+                                    gpu_prepared_retained_route_requests =
+                                        gpu_prepared_retained_route_requests.saturating_add(
+                                            u64::try_from(batch.len()).unwrap_or(u64::MAX),
+                                        );
+                                    pending_retained_read_stats.submissions =
+                                        pending_retained_read_stats.submissions.saturating_add(1);
+                                    pending_retained_read_stats.max =
+                                        pending_retained_read_stats.max.max(
+                                            u64::try_from(
+                                                pending_retained_read_batches
+                                                    .len()
+                                                    .saturating_add(1),
+                                            )
+                                            .unwrap_or(u64::MAX),
+                                        );
+                                    pending_retained_read_batches.push_back(
+                                        PendingRetainedLiteralBatch {
+                                            requests: batch,
+                                            submitted,
+                                            submitted_at: Instant::now(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                                Ok(submitted) => {
+                                    let result = state
+                                        .complete_prepared_retained_literal_batch(submitted)
+                                        .and_then(|outputs| {
+                                            state.flush_facts()?;
+                                            Ok(outputs)
+                                        })
+                                        .map_err(|err| err.to_string());
+                                    match result {
+                                        Ok(outputs) => {
+                                            gpu_prepared_retained_route_requests =
+                                                gpu_prepared_retained_route_requests
+                                                    .saturating_add(
+                                                        u64::try_from(outputs.len())
+                                                            .unwrap_or(u64::MAX),
+                                                    );
+                                            for (request, output) in batch.into_iter().zip(outputs)
+                                            {
+                                                let _ = request
+                                                    .response_tx
+                                                    .send(Ok(EngineResponse::Bytes(output)));
+                                            }
+                                        }
+                                        Err(err) => {
+                                            for request in batch {
+                                                let _ = request.response_tx.send(Err(err.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    for request in batch {
+                                        let _ = request.response_tx.send(Err(err.clone()));
+                                    }
+                                }
+                            }
+                        } else {
+                            let result = state
+                                .handle_multi_literal_select_batch(
+                                    &items,
+                                    scheduler_queue_wait_micros,
+                                    microbatch_admission_wait_micros,
+                                    "multi_literal_gpu",
+                                    prepared_retained_microbatches_enabled,
+                                    microbatch_route_key.as_deref(),
+                                    microbatch_ready_lane_count,
+                                )
+                                .and_then(|outputs| {
+                                    state.flush_facts()?;
+                                    Ok(outputs)
+                                })
+                                .map_err(|err| err.to_string());
+                            match result {
+                                Ok(outputs) => {
+                                    if prepared_retained_microbatches_enabled {
+                                        gpu_prepared_retained_route_requests =
+                                            gpu_prepared_retained_route_requests.saturating_add(
+                                                u64::try_from(outputs.len()).unwrap_or(u64::MAX),
+                                            );
+                                    }
+                                    for (request, output) in batch.into_iter().zip(outputs) {
+                                        let _ = request
+                                            .response_tx
+                                            .send(Ok(EngineResponse::Bytes(output)));
+                                    }
+                                }
+                                Err(err) => {
+                                    for request in batch {
+                                        let _ = request.response_tx.send(Err(err.clone()));
+                                    }
                                 }
                             }
                         }
@@ -2047,6 +2495,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    while let Some(pending) = pending_retained_read_batches.pop_front() {
+        complete_pending_retained_literal_batch(
+            &mut state,
+            pending,
+            &mut pending_retained_read_stats,
+        );
+    }
     let _ = accept_handle.join();
     state.fact("completed_client_sessions", completed)?;
     let cache = retained_read_response_cache
@@ -2111,6 +2566,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "owner_thread_retained_read_job_complete_wall_micros_total",
         state.retained_read_job_complete_wall_micros_total,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_pending_submissions",
+        pending_retained_read_stats.submissions,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_pending_max",
+        pending_retained_read_stats.max,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_pending_completed",
+        pending_retained_read_stats.completed,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_pending_wait_micros_total",
+        pending_retained_read_stats.wait_micros_total,
+    )?;
+    state.fact(
+        "owner_thread_retained_read_pending_overlap_opportunities",
+        pending_retained_read_stats.overlap_opportunities,
     )?;
     state.fact("retained_read_response_cache_hits", cache.hits)?;
     state.fact("retained_read_response_cache_misses", cache.misses)?;

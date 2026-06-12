@@ -118,14 +118,19 @@ Evidence:
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-engine-pending-retained-int4-submit-v1.md`
 - adjacent submit/complete A/B closed by
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-async-retained-int4-c64-ab-v1.md`
+- owner-loop pending completion queue implementation and rejection closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-owner-loop-pending-completion-impl-v1.md`
 
 Current state:
 
 - all-int4 retained read jobs can submit CUDA work without immediately
   synchronizing in the execution layer
 - mixed/text retained read jobs still use the synchronous path
-- endpoint behavior still completes adjacent to submit, so prepared retained
-  microbatches remain opt-in until the owner loop overlaps pending work
+- endpoint pending completion can overlap all-int4 prepared microbatch work when
+  `GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_PENDING_COMPLETION_CAP` is enabled,
+  but the c64 A/B regressed the main literal rows, so the cap defaults to `0`
+- prepared retained microbatches remain opt-in; do not keep tuning pending caps
+  as the default path unless a new design removes a whole owner-loop boundary
 
 ### M4: Small GPU Stream Pool
 
@@ -225,16 +230,18 @@ work on increasingly complex single owner-queue heuristics unless they are
 short probes that protect an existing win. The next implementation should aim
 for a 5x-class boundary reduction, not a 1.2x row improvement:
 
-1. Add an owner-loop pending completion queue for prepared all-int4 retained
-   read jobs: launch nonblocking work, drain independent ready work, then
-   complete and publish responses.
-2. Preserve generation mismatch rejection and mutation publication barriers.
-3. Add telemetry for in-flight read submissions, completion count, and owner
-   critical-section time.
-4. Report c8/c64 queue wait and p50 impact before moving to M4 stream pool.
-5. Treat route-lane depth, payload, and diversity heuristics as opt-in probes
+1. Move response materialization/write work out of the owner critical path, or
+   advance to a small read-only stream pool with enough independent work to
+   hide completion.
+2. Keep the owner-loop pending completion queue as an opt-in diagnostic with
+   cap `0` by default; cap `2` proved real overlap but regressed c64 p50.
+3. Preserve generation mismatch rejection and mutation publication barriers.
+4. Add telemetry for owner critical-section time versus response
+   materialization/write time before promoting any new path.
+5. Report c8/c64 queue wait and p50 impact before moving beyond M4.
+6. Treat route-lane depth, payload, and diversity heuristics as opt-in probes
    unless they collapse queue wait by multiple times without hurting homogeneous
    route batches.
-6. Use fixed route-lane scan as the default baseline:
+7. Use fixed route-lane scan as the default baseline:
    `GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_POLICY=fixed` and
    scan limit `32`.

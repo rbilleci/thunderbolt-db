@@ -1819,6 +1819,8 @@ REPORT
     GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_DEPTH_BIAS="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_DEPTH_BIAS:-0}" \
     GPU_DB_P8_ENGINE_PGWIRE_GPU_LATENCY_LANE_RETAINED_LITERAL="${GPU_DB_P8_ENGINE_PGWIRE_GPU_LATENCY_LANE_RETAINED_LITERAL:-0}" \
     GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_ROUTES="${GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_ROUTES:-1}" \
+    GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_MICROBATCHES="${GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_MICROBATCHES:-0}" \
+    GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_PENDING_COMPLETION_CAP="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_PENDING_COMPLETION_CAP:-0}" \
     target/debug/examples/p8_engine_pgwire_benchmark_endpoint >"$server_log" 2>&1 &
   local server_pid=$!
   trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' RETURN
@@ -1958,7 +1960,7 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"owner_loop_pending_completion_overlap","decision":"cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs remain opt-in until pending submissions are overlapped with independent owner-loop work","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"owner_response_scheduling_boundary","decision":"cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs and pending completion remain opt-in diagnostics until they remove a whole owner-loop boundary","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1980,11 +1982,13 @@ JSON
 - gpu_microbatch_route_lane_depth_bias: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_DEPTH_BIAS:-0}\`
 - gpu_latency_lane_retained_literal: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_LATENCY_LANE_RETAINED_LITERAL:-0}\`
 - prepared_retained_routes: \`${GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_ROUTES:-1}\`
+- prepared_retained_microbatches: \`${GPU_DB_P8_ENGINE_PGWIRE_PREPARED_RETAINED_MICROBATCHES:-0}\`
+- retained_read_pending_completion_cap: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_PENDING_COMPLETION_CAP:-0}\`
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false
-- next_target: owner_loop_pending_completion_overlap
-- decision: cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs remain opt-in until pending submissions are overlapped with independent owner-loop work
+- next_target: owner_response_scheduling_boundary
+- decision: cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs and pending completion remain opt-in diagnostics until they remove a whole owner-loop boundary
 - endpoint_facts: $facts_path
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
@@ -2016,16 +2020,16 @@ response write.
 The retained-read response cache remains available as an opt-in fast path for
 repeated identical \`SELECT\` requests, but the default benchmark path keeps it
 disabled so cache-off OLTP-style retained reads continue to expose the real
-owner-thread queue boundary. The next optimization target is owner-loop pending
-completion overlap for retained read jobs: launch nonblocking work, drain
-independent ready work, then complete and publish responses.
+owner-thread queue boundary. The next optimization target is owner response
+scheduling: keep GPU route execution on the owner, but move response
+materialization/write work out of the owner critical path.
 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
 REPORT
   kill "$server_pid" >/dev/null 2>&1 || true
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=owner_loop_pending_completion_overlap artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=owner_response_scheduling_boundary artifact=$report_path"
   return 0
 }
 
