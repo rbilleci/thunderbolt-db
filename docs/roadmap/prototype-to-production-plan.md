@@ -298,6 +298,12 @@ Each major milestone below ships with a dated run report under
 - **Honest comparator.** Where a milestone makes a throughput/latency claim, run
   the three-way default-PG / tuned-PG / GPU-DB comparison with all curves
   in-report, not the GPU-DB column alone.
+- **Known harness noise (tracked, fixed in Phase 5).** Today's probe cannot
+  resolve sub-10% deltas (±15–40% per-cell variance at small scale). Until the
+  Phase 5 harness-noise-reduction work lands (median-of-N + confidence interval,
+  realistic datasets, pinned clocks, significance thresholds), a milestone that
+  cannot show a *mechanistic* reason a change is regression-free must treat small
+  latency deltas as inconclusive rather than as evidence of no regression.
 
 ### Phase 0 — Unify and tell the truth (foundation, weeks)
 **Goal:** one system of record, reached through a protocol-neutral boundary;
@@ -407,6 +413,19 @@ honest docs; the real tech stack adopted.
   harness with steady-state duration runs and **p99/p99.9/p99.99 tail-at-load
   capture** — none of which exists today. Always run the three-way default-PG /
   tuned-PG / GPU-DB comparison with all curves in-report.
+- **Harness noise reduction (committed).** The current probe is too noisy to
+  resolve sub-10% regressions: at 64-row tables / 8-request bursts it shows
+  ±15–40% per-cell run-to-run variance (measured at P0-M2,
+  `docs/testing/reports/series/prototype-to-production/runs/2026-06-13-p0-m2-facade-serving-path-v1.md`).
+  This phase **must** drive that down so milestone gates are trustworthy:
+  realistic dataset sizes (not 64 rows), many measured requests per session,
+  warmup separated from measurement, **N repeated runs with reported
+  median + confidence interval / coefficient of variation**, pinned clocks
+  (GPU/CPU frequency, fixed power state), and a documented per-metric
+  significance threshold a milestone must clear before a delta counts as real.
+  Until then, milestone gates rely on *mechanistic isolation* (a change outside
+  the measured path cannot regress it) plus correctness, not on small latency
+  deltas.
 - **Working set > VRAM.** Multi-GPU / partitioned residency to unblock the 125%
   tier (currently one allocation per table).
 - **Drive the honest path** to >100k TPS sustained and sub-0.5ms p50 without the
