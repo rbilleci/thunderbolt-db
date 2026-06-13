@@ -146,8 +146,14 @@ Current state:
   because it converts filled all-INT4 retained batches into singleton GPU
   launches
 - batched read-runtime execution preserves route-shape batch fill off-owner and
-  is the default cache-off path for all-INT4 retained point reads; mixed/text
-  retained routes still fall back to the owner route-lane path
+  is the default cache-off path for all-INT4 retained point reads
+- mixed int4/text retained point reads now use the same batched runtime for one
+  compact text projection per route, closing the owner route-lane fallback for
+  the current heterogeneous benchmark shape; closed by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-13-mixed-text-read-runtime-default-v1.md`
+- remaining runtime wait is in the single runtime worker and the synchronous
+  compact text projection/copy path; add per-route runtime queue telemetry
+  before tuning stream-pool width
 
 ### M4: Small GPU Stream Pool
 

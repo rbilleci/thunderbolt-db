@@ -170,6 +170,28 @@ impl CudaResidentDeviceMemoryReadView {
             row_count,
         )
     }
+
+    pub fn match_project_i32_equal_any_text_from_payload(
+        &self,
+        filter_offset: u64,
+        needles: &[i32],
+        projection_offsets: &[u64],
+        text_offsets_byte_offset: u64,
+        text_bytes_byte_offset: u64,
+        text_bytes_len: u64,
+        row_count: u64,
+    ) -> Result<Vec<CudaI32TextBatchProjectionRow>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_equal_any_project_text(
+            self,
+            filter_offset,
+            needles,
+            projection_offsets,
+            text_offsets_byte_offset,
+            text_bytes_byte_offset,
+            text_bytes_len,
+            row_count,
+        )
+    }
 }
 
 trait CudaResidentReadSource {
@@ -177,6 +199,7 @@ trait CudaResidentReadSource {
     fn device_ptr(&self) -> u64;
     fn context(&self) -> *mut c_void;
     fn lib(&self) -> &Library;
+    fn record_kernel_event_elapsed_us(&self, _elapsed_us: Option<u64>) {}
 }
 
 impl CudaResidentReadSource for CudaResidentDeviceMemory {
@@ -194,6 +217,10 @@ impl CudaResidentReadSource for CudaResidentDeviceMemory {
 
     fn lib(&self) -> &Library {
         self._lib.as_ref()
+    }
+
+    fn record_kernel_event_elapsed_us(&self, elapsed_us: Option<u64>) {
+        CudaResidentDeviceMemory::record_kernel_event_elapsed_us(self, elapsed_us);
     }
 }
 
@@ -3250,8 +3277,8 @@ DONE:
     })
 }
 
-fn launch_cuda_resident_i32_equal_any_project_text(
-    resident: &CudaResidentDeviceMemory,
+fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentReadSource>(
+    resident: &R,
     filter_offset: u64,
     needles: &[i32],
     projection_offsets: &[u64],
@@ -3283,6 +3310,7 @@ fn launch_cuda_resident_i32_equal_any_project_text(
         *mut *mut c_void,
     ) -> i32;
     type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+    type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
 
     const MAX_PROJECTIONS: usize = 4;
     const PTX: &[u8] = br#"
@@ -3651,6 +3679,13 @@ DONE:
             .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
+    let cu_ctx_set_current = unsafe {
+        resident
+            .lib()
+            .get::<CuCtxSetCurrent>(b"cuCtxSetCurrent\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    check_cuda(unsafe { cu_ctx_set_current(resident.context()) })?;
 
     let mut device_needles = 0_u64;
     check_cuda(unsafe { cu_mem_alloc(&mut device_needles, needle_bytes) })?;
@@ -8238,12 +8273,13 @@ impl Drop for CudaEventGuard {
     }
 }
 
-fn launch_with_optional_cuda_event_timing<F>(
-    resident: &CudaResidentDeviceMemory,
+fn launch_with_optional_cuda_event_timing<R, F>(
+    resident: &R,
     cu_ctx_synchronize: unsafe extern "C" fn() -> i32,
     launch: F,
 ) -> Result<(), CudaRuntimeProbeError>
 where
+    R: CudaResidentReadSource,
     F: FnOnce() -> i32,
 {
     type CuEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;

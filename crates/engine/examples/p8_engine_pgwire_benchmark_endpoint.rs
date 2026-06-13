@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use gpu_db_engine::{
     Engine, RelationalResidencyWarmupPolicy, RelationalRetainedReadJob,
-    RelationalRetainedReadSubmission, RelationalSelectResult,
+    RelationalRetainedReadSubmission, RelationalSelectResult, ResidentDeviceTextColumnLayout,
 };
 use gpu_db_execution::CudaResidentDeviceMemoryReadView;
 use gpu_db_metrics::RuntimeMetricsSnapshot;
@@ -83,6 +83,7 @@ struct RetainedReadRuntimeRoute {
     generation: u64,
     row_count: u64,
     int4_columns: Vec<String>,
+    text_columns: Vec<ResidentDeviceTextColumnLayout>,
     read_view: CudaResidentDeviceMemoryReadView,
 }
 
@@ -98,6 +99,8 @@ struct RetainedReadRuntimeStats {
     batches: u64,
     batched_requests: u64,
     max_batch: u64,
+    batch_execute_wall_micros_total: u64,
+    batch_execute_wall_micros_max: u64,
 }
 
 struct RetainedReadRuntimeInner {
@@ -206,6 +209,8 @@ impl RetainedReadRuntime {
             batches: inner.stats.batches,
             batched_requests: inner.stats.batched_requests,
             max_batch: inner.stats.max_batch,
+            batch_execute_wall_micros_total: inner.stats.batch_execute_wall_micros_total,
+            batch_execute_wall_micros_max: inner.stats.batch_execute_wall_micros_max,
         })
     }
 
@@ -235,17 +240,31 @@ impl RetainedReadRuntime {
                 inner.stats.misses = inner.stats.misses.saturating_add(1);
                 return Ok(None);
             }
-            if !route
+            let filter_is_int4 = route
                 .int4_columns
                 .iter()
-                .any(|column| column == &batch_key.filter_column)
-                || batch_key.projection_columns.iter().any(|column| {
-                    !route
-                        .int4_columns
+                .any(|column| column == &batch_key.filter_column);
+            let supported_projection = batch_key.projection_columns.iter().all(|column| {
+                route
+                    .int4_columns
+                    .iter()
+                    .any(|candidate| candidate == column)
+                    || route
+                        .text_columns
                         .iter()
-                        .any(|candidate| candidate == column)
+                        .any(|candidate| candidate.name == *column)
+            });
+            let text_projection_count = batch_key
+                .projection_columns
+                .iter()
+                .filter(|column| {
+                    route
+                        .text_columns
+                        .iter()
+                        .any(|candidate| candidate.name == **column)
                 })
-            {
+                .count();
+            if !filter_is_int4 || !supported_projection || text_projection_count > 1 {
                 inner.stats.unsupported = inner.stats.unsupported.saturating_add(1);
                 return Ok(None);
             }
@@ -267,7 +286,7 @@ impl RetainedReadRuntime {
             response_tx,
         };
         if work_tx.send(work).is_err() {
-            self.finish_work(1, 0, 0, 1)?;
+            self.finish_work(1, 0, 0, 1, 0)?;
             return Ok(None);
         }
         match response_rx.recv() {
@@ -286,6 +305,7 @@ impl RetainedReadRuntime {
         hits: u64,
         batch_size: u64,
         failures: u64,
+        batch_execute_wall_micros: u64,
     ) -> Result<(), String> {
         let mut inner = self
             .inner
@@ -298,6 +318,14 @@ impl RetainedReadRuntime {
             inner.stats.batches = inner.stats.batches.saturating_add(1);
             inner.stats.batched_requests = inner.stats.batched_requests.saturating_add(batch_size);
             inner.stats.max_batch = inner.stats.max_batch.max(batch_size);
+            inner.stats.batch_execute_wall_micros_total = inner
+                .stats
+                .batch_execute_wall_micros_total
+                .saturating_add(batch_execute_wall_micros);
+            inner.stats.batch_execute_wall_micros_max = inner
+                .stats
+                .batch_execute_wall_micros_max
+                .max(batch_execute_wall_micros);
         }
         self.idle.notify_all();
         Ok(())
@@ -338,18 +366,25 @@ impl RetainedReadRuntime {
                 }
             }
             let batch_size = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            let batch_started = Instant::now();
             match execute_retained_read_runtime_batch(&batch) {
                 Ok(outputs) => {
+                    let batch_wall_micros =
+                        u64::try_from(batch_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                     for (work, output) in batch.into_iter().zip(outputs) {
                         let _ = work.response_tx.send(Ok(output));
                     }
-                    let _ = self.finish_work(batch_size, batch_size, batch_size, 0);
+                    let _ =
+                        self.finish_work(batch_size, batch_size, batch_size, 0, batch_wall_micros);
                 }
                 Err(err) => {
+                    let batch_wall_micros =
+                        u64::try_from(batch_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                     for work in batch {
                         let _ = work.response_tx.send(Err(err.clone()));
                     }
-                    let _ = self.finish_work(batch_size, 0, batch_size, batch_size);
+                    let _ =
+                        self.finish_work(batch_size, 0, batch_size, batch_size, batch_wall_micros);
                 }
             }
         }
@@ -357,7 +392,7 @@ impl RetainedReadRuntime {
             let _ = work
                 .response_tx
                 .send(Err("retained read runtime worker stopped".to_string()));
-            let _ = self.finish_work(1, 0, 0, 1);
+            let _ = self.finish_work(1, 0, 0, 1, 0);
         }
     }
 }
@@ -390,6 +425,33 @@ fn execute_retained_read_runtime_batch(
             .ok_or_else(|| "retained read runtime column offset overflow".to_string())
     };
     let filter_offset = column_offset(&batch_key.filter_column)?;
+    let text_projection = batch_key.projection_columns.iter().find_map(|column| {
+        route
+            .text_columns
+            .iter()
+            .find(|candidate| candidate.name == *column)
+    });
+    if let Some(text_layout) = text_projection {
+        let int4_projection_columns = batch_key
+            .projection_columns
+            .iter()
+            .filter(|column| **column != text_layout.name)
+            .cloned()
+            .collect::<Vec<_>>();
+        let int4_projection_offsets = int4_projection_columns
+            .iter()
+            .map(|column| column_offset(column))
+            .collect::<Result<Vec<_>, _>>()?;
+        return execute_retained_read_runtime_text_batch(
+            works,
+            route,
+            batch_key,
+            filter_offset,
+            &int4_projection_columns,
+            &int4_projection_offsets,
+            text_layout,
+        );
+    }
     let projection_offsets = batch_key
         .projection_columns
         .iter()
@@ -436,6 +498,94 @@ fn execute_retained_read_runtime_batch(
         .projection_columns
         .iter()
         .map(|column| BackendColumn::new(column, 23, 4))
+        .collect::<Vec<_>>();
+    let mut outputs = Vec::with_capacity(works.len());
+    for unique_idx in work_to_unique {
+        let rows = rows_by_unique
+            .get(unique_idx)
+            .ok_or_else(|| format!("retained read runtime missing unique result {unique_idx}"))?;
+        let mut bytes = Vec::new();
+        let mut writer = BackendWriter::new(&mut bytes);
+        write_select_result_rows(&mut writer, &columns, rows).map_err(|err| err.to_string())?;
+        writer
+            .ready_for_query(false)
+            .map_err(|err| err.to_string())?;
+        outputs.push(bytes);
+    }
+    Ok(outputs)
+}
+
+fn execute_retained_read_runtime_text_batch(
+    works: &[RetainedReadRuntimeWork],
+    route: &RetainedReadRuntimeRoute,
+    batch_key: &RetainedSelectLiteralBatchKey,
+    filter_offset: u64,
+    int4_projection_columns: &[String],
+    int4_projection_offsets: &[u64],
+    text_layout: &ResidentDeviceTextColumnLayout,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut unique_needles = Vec::new();
+    let mut unique_by_needle = HashMap::new();
+    let mut work_to_unique = Vec::with_capacity(works.len());
+    for work in works {
+        let unique_idx = if let Some(idx) = unique_by_needle.get(&work.needle) {
+            *idx
+        } else {
+            let idx = unique_needles.len();
+            unique_by_needle.insert(work.needle, idx);
+            unique_needles.push(work.needle);
+            idx
+        };
+        work_to_unique.push(unique_idx);
+    }
+    let projected_rows = route
+        .read_view
+        .match_project_i32_equal_any_text_from_payload(
+            filter_offset,
+            &unique_needles,
+            int4_projection_offsets,
+            text_layout.offsets_byte_offset,
+            text_layout.bytes_byte_offset,
+            text_layout.bytes_len,
+            route.row_count,
+        )
+        .map_err(|err| err.to_string())?;
+    let int4_projection_index = int4_projection_columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| (column.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut rows_by_unique = vec![Vec::new(); unique_needles.len()];
+    for row in projected_rows {
+        if let Some(rows) = rows_by_unique.get_mut(row.needle_index) {
+            let mut values = Vec::with_capacity(batch_key.projection_columns.len());
+            for column in &batch_key.projection_columns {
+                if column == &text_layout.name {
+                    values.push(SqlValue::Text(row.text.clone()));
+                } else {
+                    let value_idx =
+                        int4_projection_index.get(column.as_str()).ok_or_else(|| {
+                            format!("retained read runtime missing int4 projection {column}")
+                        })?;
+                    let value = row.values.get(*value_idx).ok_or_else(|| {
+                        format!("retained read runtime missing int4 value for {column}")
+                    })?;
+                    values.push(SqlValue::Int4(*value));
+                }
+            }
+            rows.push(values);
+        }
+    }
+    let columns = batch_key
+        .projection_columns
+        .iter()
+        .map(|column| {
+            if column == &text_layout.name {
+                BackendColumn::new(column, 25, -1)
+            } else {
+                BackendColumn::new(column, 23, 4)
+            }
+        })
         .collect::<Vec<_>>();
     let mut outputs = Vec::with_capacity(works.len());
     for unique_idx in work_to_unique {
@@ -1414,6 +1564,7 @@ impl EndpointState {
                 generation: handle.generation,
                 row_count: u64::try_from(handle.row_count).unwrap_or(u64::MAX),
                 int4_columns: handle.resident_device_int4_columns,
+                text_columns: handle.resident_device_text_columns,
                 read_view,
             };
             self.retained_read_runtime
@@ -3289,6 +3440,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         runtime_stats.batched_requests,
     )?;
     state.fact("retained_read_runtime_max_batch", runtime_stats.max_batch)?;
+    state.fact(
+        "retained_read_runtime_batch_execute_wall_micros_total",
+        runtime_stats.batch_execute_wall_micros_total,
+    )?;
+    state.fact(
+        "retained_read_runtime_batch_execute_wall_micros_max",
+        runtime_stats.batch_execute_wall_micros_max,
+    )?;
     state.flush_facts()?;
     Ok(())
 }
