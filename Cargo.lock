@@ -590,6 +590,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu_db_snapshot"
+version = "0.1.0"
+
+[[package]]
 name = "gpu_db_storage"
 version = "0.1.0"
 dependencies = [

@@ -503,3 +503,48 @@ thesis pays off second.
    an `Arc<Snapshot>` and demonstrate two concurrent readers against one published
    generation. This proves the single most enabling refactor before committing the
    team to it.
+
+## 9. Tracked deferred work — DO NOT LOSE (consolidation & cleanup)
+
+These are consciously deferred (Phase 1 performance work comes first, see §6/§7),
+but they are **owed** and must not silently disappear. Each has a trigger that
+says when it must be picked up, and an acceptance bar.
+
+### 9.1 Consolidate to ONE server
+
+**Debt:** there are currently three pgwire paths — the legacy full-compat
+`gpu-db-server` (rich surface, in-memory `HashMap` guts, not engine-backed), the
+benchmark endpoint (engine-backed, direct engine calls, harness-only), and the new
+`gpu_db_server` crate (engine-backed *through the façade*, minimal surface,
+P0-M3). This is acceptable as a transitional proof-of-architecture, **not** as a
+durable state.
+- **End state:** ONE server = the legacy compatibility surface (extended protocol,
+  COPY, SCRAM/TLS, catalog) running on engine guts through the neutral façade; the
+  benchmark endpoint retired once the unified server can carry the benchmark.
+- **Trigger:** when the engine-backed server needs the real compatibility surface
+  (first external pilot / pre-GA), and after 9.2 unblocks it.
+- **Acceptance:** the 352 golden scenarios + driver smokes pass against the
+  engine-backed server; the legacy in-memory server and the benchmark endpoint are
+  deleted; one server binary remains.
+
+### 9.2 Invert the `engine → protocol` dependency (the "smell")
+
+**Debt:** `engine` depends on `protocol` because the neutral SQL vocabulary
+(`SqlValue`, `SqlType`, `Select`, `parse_command`, `Command`) lives in the wire
+crate. This is the inverted coupling §5.0 warns against, and it is what makes
+routing the legacy server through the façade a Cargo cycle (so 9.1 is blocked on
+this). The façade also still carries a conversion layer because of it.
+- **End state:** neutral SQL vocabulary lives in a lower crate (e.g. `gpu_db_sql`
+  or `gpu_db_types`); `engine`, `protocol`, and `facade` all depend on *it*;
+  `engine` no longer depends on `protocol`; the façade's neutral types come from
+  the shared crate (conversion layer shrinks).
+- **Trigger:** before 9.1, or as a low-risk cool-down task between Phase 1
+  milestones — whichever comes first. Does not get harder if deferred.
+- **Acceptance:** `engine`'s `Cargo.toml` has no `gpu_db_protocol` dependency; the
+  full workspace + all tests are green; an ArchUnit-style check (or a documented
+  dependency assertion) prevents the back-edge from returning.
+
+> Status note: these are referenced from the Phase 0 "Structural findings" block
+> and from the P0-M3 run report. Update this section's status when picked up; do
+> not let the three-server state or the engine→protocol edge become permanent by
+> omission.
