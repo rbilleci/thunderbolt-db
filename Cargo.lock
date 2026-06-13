@@ -580,6 +580,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu_db_server"
+version = "0.1.0"
+dependencies = [
+ "gpu_db_facade",
+ "gpu_db_protocol",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "gpu_db_storage"
 version = "0.1.0"
 dependencies = [

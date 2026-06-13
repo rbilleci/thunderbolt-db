@@ -1,0 +1,23 @@
+[package]
+name = "gpu_db_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Engine-backed pgwire server (prototype→production plan, P0-M3). Serves the
+# relational subset through the protocol-neutral façade: pgwire wire framing from
+# `gpu_db_protocol`, execution via `gpu_db_facade` over the real `Engine`. This is
+# the unification target — a server that speaks the wire AND uses the engine —
+# distinct from the legacy in-memory `gpu-db-server` in the protocol crate.
+
+[[bin]]
+name = "gpu-db-engine-server"
+path = "src/main.rs"
+
+[dependencies]
+gpu_db_protocol = { path = "../protocol" }
+gpu_db_facade = { path = "../facade" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"

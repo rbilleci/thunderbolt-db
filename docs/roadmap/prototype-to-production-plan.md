@@ -333,6 +333,23 @@ honest docs; the real tech stack adopted.
   latency/throughput regression** beyond a stated tolerance, and the result is
   recorded as a dated run report.
 
+**Structural findings discovered during P0-M1…M3 (reshape the rest of Phase 0):**
+
+1. **`engine` depends on `protocol`**, so routing the *existing* in-crate
+   `gpu-db-server` (which lives in `crates/protocol`) through the façade is a
+   Cargo cycle (`protocol → facade → engine → protocol`). The engine-backed
+   server was therefore built as a **separate `gpu_db_server` crate**
+   (P0-M3). Inverting `engine → protocol` — moving the neutral SQL vocabulary
+   (`SqlValue`/`SqlType`/`Select`/`parse_command`) into a lower crate — remains
+   owed and is the clean long-term fix; relocating the legacy server in place is
+   rejected because its path/crate name is hard-wired into several preflight
+   scripts and the 352-scenario golden harness.
+2. **`Engine` is `!Send`** (it owns raw CUDA device handles). A multi-connection
+   engine-backed server therefore cannot share one engine across threads; it
+   needs the **Phase 1 concurrency substrate** (reader/writer split over an
+   `Arc`-shared snapshot, or an owner-thread command queue). The P0-M3 server is
+   single-threaded by design until then.
+
 ### Phase 1 — Concurrency, MVCC, and commit durability (THE critical path)
 **Goal:** the substrate on which every target becomes possible.
 - **Reader/writer split.** Make reads `&Engine` over an `Arc`-shared immutable
