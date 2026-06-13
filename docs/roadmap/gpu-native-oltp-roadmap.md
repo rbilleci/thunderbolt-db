@@ -154,6 +154,11 @@ Current state:
 - remaining runtime wait is in the single runtime worker and the synchronous
   compact text projection/copy path; add per-route runtime queue telemetry
   before tuning stream-pool width
+- per-route runtime queue telemetry was added and naive route-key worker
+  sharding was rejected as a default by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-13-runtime-queue-telemetry-workers-reject-v1.md`;
+  keep one runtime worker until stream ownership or async text completion is
+  designed explicitly
 
 ### M4: Small GPU Stream Pool
 

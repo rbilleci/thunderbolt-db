@@ -1,6 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
@@ -99,6 +100,20 @@ struct RetainedReadRuntimeStats {
     batches: u64,
     batched_requests: u64,
     max_batch: u64,
+    request_queue_wait_micros_total: u64,
+    request_queue_wait_micros_max: u64,
+    batch_execute_wall_micros_total: u64,
+    batch_execute_wall_micros_max: u64,
+    route_stats: HashMap<RetainedSelectLiteralBatchKey, RetainedReadRuntimeRouteStats>,
+}
+
+#[derive(Clone, Default)]
+struct RetainedReadRuntimeRouteStats {
+    batches: u64,
+    requests: u64,
+    max_batch: u64,
+    request_queue_wait_micros_total: u64,
+    request_queue_wait_micros_max: u64,
     batch_execute_wall_micros_total: u64,
     batch_execute_wall_micros_max: u64,
 }
@@ -114,7 +129,7 @@ struct RetainedReadRuntimeInner {
 struct RetainedReadRuntime {
     inner: Mutex<RetainedReadRuntimeInner>,
     idle: Condvar,
-    work_tx: Option<mpsc::Sender<RetainedReadRuntimeWork>>,
+    work_txs: Vec<mpsc::Sender<RetainedReadRuntimeWork>>,
     batch_max: usize,
 }
 
@@ -122,6 +137,7 @@ struct RetainedReadRuntimeWork {
     route: RetainedReadRuntimeRoute,
     batch_key: RetainedSelectLiteralBatchKey,
     needle: i32,
+    enqueued_at: Instant,
     response_tx: mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
@@ -129,12 +145,19 @@ impl RetainedReadRuntime {
     fn new(
         enabled: bool,
         batch_max: usize,
-    ) -> (Self, Option<mpsc::Receiver<RetainedReadRuntimeWork>>) {
-        let (work_tx, work_rx) = if enabled {
-            let (tx, rx) = mpsc::channel();
-            (Some(tx), Some(rx))
+        worker_count: usize,
+    ) -> (Self, Vec<mpsc::Receiver<RetainedReadRuntimeWork>>) {
+        let (work_txs, work_rxs) = if enabled {
+            let mut work_txs = Vec::new();
+            let mut work_rxs = Vec::new();
+            for _ in 0..worker_count.max(1) {
+                let (tx, rx) = mpsc::channel();
+                work_txs.push(tx);
+                work_rxs.push(rx);
+            }
+            (work_txs, work_rxs)
         } else {
-            (None, None)
+            (Vec::new(), Vec::new())
         };
         (
             Self {
@@ -146,10 +169,10 @@ impl RetainedReadRuntime {
                     stats: RetainedReadRuntimeStats::default(),
                 }),
                 idle: Condvar::new(),
-                work_tx,
+                work_txs,
                 batch_max: batch_max.max(1),
             },
-            work_rx,
+            work_rxs,
         )
     }
 
@@ -209,8 +232,11 @@ impl RetainedReadRuntime {
             batches: inner.stats.batches,
             batched_requests: inner.stats.batched_requests,
             max_batch: inner.stats.max_batch,
+            request_queue_wait_micros_total: inner.stats.request_queue_wait_micros_total,
+            request_queue_wait_micros_max: inner.stats.request_queue_wait_micros_max,
             batch_execute_wall_micros_total: inner.stats.batch_execute_wall_micros_total,
             batch_execute_wall_micros_max: inner.stats.batch_execute_wall_micros_max,
+            route_stats: inner.stats.route_stats.clone(),
         })
     }
 
@@ -269,7 +295,7 @@ impl RetainedReadRuntime {
                 return Ok(None);
             }
             inner.in_flight = inner.in_flight.saturating_add(1);
-            let Some(work_tx) = self.work_tx.clone() else {
+            let Some(work_tx) = self.worker_tx_for(&batch_key) else {
                 inner.in_flight = inner.in_flight.saturating_sub(1);
                 self.idle.notify_all();
                 inner.stats.misses = inner.stats.misses.saturating_add(1);
@@ -283,10 +309,11 @@ impl RetainedReadRuntime {
             route,
             batch_key,
             needle,
+            enqueued_at: Instant::now(),
             response_tx,
         };
         if work_tx.send(work).is_err() {
-            self.finish_work(1, 0, 0, 1, 0)?;
+            self.finish_work(1, 0, 0, 1, None, 0, 0, 0)?;
             return Ok(None);
         }
         match response_rx.recv() {
@@ -299,12 +326,28 @@ impl RetainedReadRuntime {
         }
     }
 
+    fn worker_tx_for(
+        &self,
+        batch_key: &RetainedSelectLiteralBatchKey,
+    ) -> Option<mpsc::Sender<RetainedReadRuntimeWork>> {
+        if self.work_txs.is_empty() {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        batch_key.hash(&mut hasher);
+        let worker_idx = (hasher.finish() as usize) % self.work_txs.len();
+        self.work_txs.get(worker_idx).cloned()
+    }
+
     fn finish_work(
         &self,
         completed: u64,
         hits: u64,
         batch_size: u64,
         failures: u64,
+        batch_key: Option<&RetainedSelectLiteralBatchKey>,
+        request_queue_wait_micros_total: u64,
+        request_queue_wait_micros_max: u64,
         batch_execute_wall_micros: u64,
     ) -> Result<(), String> {
         let mut inner = self
@@ -318,6 +361,14 @@ impl RetainedReadRuntime {
             inner.stats.batches = inner.stats.batches.saturating_add(1);
             inner.stats.batched_requests = inner.stats.batched_requests.saturating_add(batch_size);
             inner.stats.max_batch = inner.stats.max_batch.max(batch_size);
+            inner.stats.request_queue_wait_micros_total = inner
+                .stats
+                .request_queue_wait_micros_total
+                .saturating_add(request_queue_wait_micros_total);
+            inner.stats.request_queue_wait_micros_max = inner
+                .stats
+                .request_queue_wait_micros_max
+                .max(request_queue_wait_micros_max);
             inner.stats.batch_execute_wall_micros_total = inner
                 .stats
                 .batch_execute_wall_micros_total
@@ -326,6 +377,28 @@ impl RetainedReadRuntime {
                 .stats
                 .batch_execute_wall_micros_max
                 .max(batch_execute_wall_micros);
+            if let Some(batch_key) = batch_key {
+                let route_stats = inner
+                    .stats
+                    .route_stats
+                    .entry(batch_key.clone())
+                    .or_default();
+                route_stats.batches = route_stats.batches.saturating_add(1);
+                route_stats.requests = route_stats.requests.saturating_add(batch_size);
+                route_stats.max_batch = route_stats.max_batch.max(batch_size);
+                route_stats.request_queue_wait_micros_total = route_stats
+                    .request_queue_wait_micros_total
+                    .saturating_add(request_queue_wait_micros_total);
+                route_stats.request_queue_wait_micros_max = route_stats
+                    .request_queue_wait_micros_max
+                    .max(request_queue_wait_micros_max);
+                route_stats.batch_execute_wall_micros_total = route_stats
+                    .batch_execute_wall_micros_total
+                    .saturating_add(batch_execute_wall_micros);
+                route_stats.batch_execute_wall_micros_max = route_stats
+                    .batch_execute_wall_micros_max
+                    .max(batch_execute_wall_micros);
+            }
         }
         self.idle.notify_all();
         Ok(())
@@ -366,6 +439,17 @@ impl RetainedReadRuntime {
                 }
             }
             let batch_size = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            let batch_key = batch[0].batch_key.clone();
+            let batch_queued_at = Instant::now();
+            let mut queue_wait_micros_total = 0_u64;
+            let mut queue_wait_micros_max = 0_u64;
+            for work in &batch {
+                let queue_wait_micros =
+                    u64::try_from(batch_queued_at.duration_since(work.enqueued_at).as_micros())
+                        .unwrap_or(u64::MAX);
+                queue_wait_micros_total = queue_wait_micros_total.saturating_add(queue_wait_micros);
+                queue_wait_micros_max = queue_wait_micros_max.max(queue_wait_micros);
+            }
             let batch_started = Instant::now();
             match execute_retained_read_runtime_batch(&batch) {
                 Ok(outputs) => {
@@ -374,8 +458,16 @@ impl RetainedReadRuntime {
                     for (work, output) in batch.into_iter().zip(outputs) {
                         let _ = work.response_tx.send(Ok(output));
                     }
-                    let _ =
-                        self.finish_work(batch_size, batch_size, batch_size, 0, batch_wall_micros);
+                    let _ = self.finish_work(
+                        batch_size,
+                        batch_size,
+                        batch_size,
+                        0,
+                        Some(&batch_key),
+                        queue_wait_micros_total,
+                        queue_wait_micros_max,
+                        batch_wall_micros,
+                    );
                 }
                 Err(err) => {
                     let batch_wall_micros =
@@ -383,8 +475,16 @@ impl RetainedReadRuntime {
                     for work in batch {
                         let _ = work.response_tx.send(Err(err.clone()));
                     }
-                    let _ =
-                        self.finish_work(batch_size, 0, batch_size, batch_size, batch_wall_micros);
+                    let _ = self.finish_work(
+                        batch_size,
+                        0,
+                        batch_size,
+                        batch_size,
+                        Some(&batch_key),
+                        queue_wait_micros_total,
+                        queue_wait_micros_max,
+                        batch_wall_micros,
+                    );
                 }
             }
         }
@@ -392,7 +492,7 @@ impl RetainedReadRuntime {
             let _ = work
                 .response_tx
                 .send(Err("retained read runtime worker stopped".to_string()));
-            let _ = self.finish_work(1, 0, 0, 1, 0);
+            let _ = self.finish_work(1, 0, 0, 1, None, 0, 0, 0);
         }
     }
 }
@@ -1800,7 +1900,7 @@ impl RetainedSelectBatchCandidate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RetainedSelectLiteralBatchKey {
     table: String,
     projection_columns: Vec<String>,
@@ -2448,6 +2548,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(gpu_microbatch_max);
+    let retained_read_runtime_workers =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
     let gpu_microbatch_admission_window_micros =
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS")
             .ok()
@@ -2522,12 +2628,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (retained_read_runtime_inner, retained_read_runtime_work_rx) = RetainedReadRuntime::new(
         retained_read_runtime_view_enabled,
         retained_read_runtime_batch_max,
+        retained_read_runtime_workers,
     );
     let retained_read_runtime = Arc::new(retained_read_runtime_inner);
-    let _retained_read_runtime_worker_handle = retained_read_runtime_work_rx.map(|work_rx| {
-        let worker_runtime = Arc::clone(&retained_read_runtime);
-        thread::spawn(move || worker_runtime.run_worker(work_rx))
-    });
+    let _retained_read_runtime_worker_handles = retained_read_runtime_work_rx
+        .into_iter()
+        .map(|work_rx| {
+            let worker_runtime = Arc::clone(&retained_read_runtime);
+            thread::spawn(move || worker_runtime.run_worker(work_rx))
+        })
+        .collect::<Vec<_>>();
     let accept_request_sender = EngineRequestSender {
         throughput_tx: request_tx.clone(),
         latency_tx: latency_request_tx.clone(),
@@ -2607,6 +2717,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "retained_read_runtime_batch_max",
         retained_read_runtime_batch_max,
+    )?;
+    state.fact(
+        "retained_read_runtime_workers",
+        retained_read_runtime_workers,
     )?;
     state.fact("owner_thread_gpu_microbatch_max", gpu_microbatch_max)?;
     state.fact(
@@ -3441,6 +3555,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     state.fact("retained_read_runtime_max_batch", runtime_stats.max_batch)?;
     state.fact(
+        "retained_read_runtime_request_queue_wait_micros_total",
+        runtime_stats.request_queue_wait_micros_total,
+    )?;
+    state.fact(
+        "retained_read_runtime_request_queue_wait_micros_max",
+        runtime_stats.request_queue_wait_micros_max,
+    )?;
+    state.fact(
         "retained_read_runtime_batch_execute_wall_micros_total",
         runtime_stats.batch_execute_wall_micros_total,
     )?;
@@ -3448,6 +3570,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         "retained_read_runtime_batch_execute_wall_micros_max",
         runtime_stats.batch_execute_wall_micros_max,
     )?;
+    let mut route_stats = runtime_stats.route_stats.into_iter().collect::<Vec<_>>();
+    route_stats.sort_by(|(left_key, _), (right_key, _)| {
+        (
+            left_key.table.as_str(),
+            left_key.filter_column.as_str(),
+            left_key.projection_columns.join(","),
+        )
+            .cmp(&(
+                right_key.table.as_str(),
+                right_key.filter_column.as_str(),
+                right_key.projection_columns.join(","),
+            ))
+    });
+    for (batch_key, stats) in route_stats {
+        state.fact(
+            "retained_read_runtime_route_stats_json",
+            format!(
+                "{{\"table\":\"{}\",\"filter_column\":\"{}\",\"projection_columns\":\"{}\",\"batches\":{},\"requests\":{},\"max_batch\":{},\"request_queue_wait_micros_total\":{},\"request_queue_wait_micros_max\":{},\"batch_execute_wall_micros_total\":{},\"batch_execute_wall_micros_max\":{}}}",
+                batch_key.table,
+                batch_key.filter_column,
+                batch_key.projection_columns.join(","),
+                stats.batches,
+                stats.requests,
+                stats.max_batch,
+                stats.request_queue_wait_micros_total,
+                stats.request_queue_wait_micros_max,
+                stats.batch_execute_wall_micros_total,
+                stats.batch_execute_wall_micros_max
+            ),
+        )?;
+    }
     state.flush_facts()?;
     Ok(())
 }

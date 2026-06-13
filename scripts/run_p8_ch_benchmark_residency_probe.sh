@@ -1829,6 +1829,7 @@ REPORT
     GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}" \
     GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW:-1}" \
     GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_BATCH_MAX="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_BATCH_MAX:-64}" \
+    GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_WORKERS="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_WORKERS:-1}" \
     GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}" \
     GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT:-1}" \
     GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_LIMIT="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_LIMIT:-32}" \
@@ -1978,7 +1979,7 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"select_fact_detail":"$(json_escape "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}")","retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"retained_read_runtime_view":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW:-1}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":$(select_phase_telemetry_bool "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}"),"next_target":"owner_response_scheduling_boundary","decision":"cache-off all-int4 retained reads use the batched read runtime by default; fixed route lanes remain the owner fallback and mixed/text path","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"select_fact_detail":"$(json_escape "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}")","retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"retained_read_runtime_view":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW:-1}"),"retained_read_runtime_workers":${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_WORKERS:-1},"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":$(select_phase_telemetry_bool "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}"),"next_target":"runtime_queue_or_stream_pool","decision":"cache-off all-int4 and one-text retained point reads use the batched read runtime by default; count remains on the owner path","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1996,6 +1997,7 @@ JSON
 - retained_read_response_cache: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}\`
 - retained_read_runtime_view: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW:-1}\`
 - retained_read_runtime_batch_max: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_BATCH_MAX:-64}\`
+- retained_read_runtime_workers: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_WORKERS:-1}\`
 - gpu_microbatch_admission_window_micros: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}\`
 - gpu_microbatch_ready_scan_limit: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT:-1}\`
 - gpu_microbatch_route_lane_scan_limit: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_LIMIT:-32}\`
@@ -2009,8 +2011,8 @@ JSON
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false
-- next_target: mixed_text_read_runtime_or_stream_pool
-- decision: cache-off all-int4 retained reads use the batched read runtime by default; fixed route lanes remain the owner fallback and mixed/text path
+- next_target: runtime_queue_or_stream_pool
+- decision: cache-off all-int4 and one-text retained point reads use the batched read runtime by default; count remains on the owner path
 - endpoint_facts: $facts_path
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
@@ -2042,16 +2044,15 @@ response write.
 The retained-read response cache remains available as an opt-in fast path for
 repeated identical \`SELECT\` requests, but the default benchmark path keeps it
 disabled so cache-off OLTP-style retained reads continue to expose the real
-owner-thread queue boundary. The next optimization target is owner response
-scheduling: keep GPU route execution on the owner, but move response
-materialization/write work out of the owner critical path.
+read-runtime and owner-thread queue boundaries. The next optimization target is
+runtime queue/stream-pool scheduling for filled retained read batches.
 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
 REPORT
   kill "$server_pid" >/dev/null 2>&1 || true
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=owner_response_scheduling_boundary artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=runtime_queue_or_stream_pool artifact=$report_path"
   return 0
 }
 
