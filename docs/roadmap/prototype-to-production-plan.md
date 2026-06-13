@@ -512,16 +512,45 @@ substrate, not kernel tuning; and (2) there is substantial *unused* GPU headroom
 waiting on the other side of that substrate. Build the foundation first; the GPU
 thesis pays off second.
 
-## 8. What to do first (next two work-items)
+## 8. Current state & immediate next step (session handoff)
 
-1. **Phase 0 unification spike:** route one real query (e.g. the `order_line`
-   point lookup) from `gpu-db-server` *through* the `Engine` instead of its
-   `HashMap` state, end to end, with the existing wire tests still green. This
-   proves the pivot and exposes the real integration seams.
-2. **Phase 1 reader/writer-split spike:** convert one read route to `&Engine` over
-   an `Arc<Snapshot>` and demonstrate two concurrent readers against one published
-   generation. This proves the single most enabling refactor before committing the
-   team to it.
+**Branch:** `phase0-m1-engine-facade` (pushed to origin). **Last updated:**
+2026-06-13.
+
+**Milestone ladder — done, all independently audited and the audit findings fixed:**
+- M0 baseline ✅ · P0-M1 façade ✅ · P0-M2 first serving path ✅ ·
+  P0-M3 engine-backed server (`crates/server`) ✅ · P1-M2 snapshot spike
+  (`crates/snapshot`) ✅.
+- Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
+  `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
+- **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
+
+**Last benchmark:** the P0-M2 "M2" run. Nothing since touched the measured path
+(all additive/correctness/docs), so per §5.7 no benchmark was re-run. The next
+meaningful benchmark is the M0 re-run inside P1-M3.
+
+**Immediate next: P1-M3 — apply the snapshot substrate to the engine read path.**
+Full design, ordered steps, and acceptance gates:
+`docs/architecture/14-engine-snapshot-integration-design.md`. Do it incrementally:
+1. **First**, add `unsafe impl Send + Sync for CudaResidentDeviceMemory` + a
+   **real-GPU soundness probe** (device memory must not be freed while a reader
+   holds its generation). This is the soundness crux — prove it before touching
+   any read-path signatures.
+2. Make per-table residency a `SnapshotCell<Arc<owner>>`; publish-on-commit instead
+   of in-place free (also fixes the global stop-the-world invalidation).
+3. Flip `execute_relational_select` + the resident-route methods from `&mut self`
+   to `&self` over a loaded generation.
+4. Re-run M0 **with Phase-5 noise controls** (median-of-N + CI) and show the
+   queue-wait term drop — this is the first milestone that may claim a real latency
+   improvement.
+
+**Gotcha (found 2026-06-13):** `CudaResidentDeviceMemoryReadView` is *non-owning*;
+a `SnapshotCell<ReadView>` would be a GPU use-after-free on invalidation — the
+generation must hold the **owner**, and published generations must stay immutable
+(the `unsafe impl Send` depends on it).
+
+**To resume:** start a session with "continue gpu-db P1-M3" — the auto-loaded
+memory + this section + doc 14 are the entrypoint.
 
 ## 9. Tracked deferred work — DO NOT LOSE (consolidation & cleanup)
 
