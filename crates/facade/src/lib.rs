@@ -85,6 +85,10 @@ pub enum QueryOutcome {
         tag: CommandTag,
         rows_affected: Option<u64>,
     },
+    /// The statement was empty (e.g. `""`, `";"`, only whitespace/comments). Wire
+    /// adapters must reply with their empty-query signal (PostgreSQL's
+    /// `EmptyQueryResponse`), not a syntax error.
+    Empty,
 }
 
 /// Neutral error category. Adapters map this to their protocol's error code
@@ -160,6 +164,10 @@ impl EngineFacade {
             .unwrap_or(false)
     }
 
+    // A per-statement monotonic id handed to the engine's `execute_text`. It is a
+    // placeholder, NOT a transaction handle: `BEGIN/INSERT/INSERT/COMMIT` get
+    // several unrelated ids today (real MVCC transaction identity arrives in
+    // P1-M3). Allocated per `execute` call; only the write path actually uses it.
     fn take_txn_id(&mut self) -> u64 {
         let id = self.next_txn_id;
         self.next_txn_id += 1;
@@ -218,7 +226,14 @@ pub fn execute_on_engine(
     txn_id: u64,
     sql: &str,
 ) -> Result<QueryOutcome, DbError> {
-    match parse_command(sql).map_err(map_parse_error)? {
+    let command = match parse_command(sql) {
+        Ok(command) => command,
+        // An empty statement is not an error in the wire protocol — surface it as
+        // a distinct neutral outcome so adapters emit EmptyQueryResponse.
+        Err(ParseError::Empty) => return Ok(QueryOutcome::Empty),
+        Err(err) => return Err(map_parse_error(err)),
+    };
+    match command {
         Command::Select(select) => {
             let result = engine
                 .execute_relational_select(&select)
@@ -264,6 +279,11 @@ fn map_parse_error(err: ParseError) -> DbError {
 }
 
 fn map_execute_error(err: ExecuteError) -> DbError {
+    // Coarse on purpose: `Engine`/`Txn`/`Storage` all collapse to `Engine` (→
+    // SQLSTATE XX000). A serialization/conflict error (`Txn`) ideally maps to a
+    // retryable class-40 code, but the engine does not yet expose typed error
+    // categories, and string-sniffing its messages would be fragile. Finer
+    // categorization waits on typed engine errors (Phase 3).
     let category = match &err {
         ExecuteError::Parse(_) => ErrorCategory::Syntax,
         ExecuteError::NonReadCommand(_) => ErrorCategory::Unsupported,
@@ -423,6 +443,19 @@ mod tests {
         assert!(facade.session_in_transaction(session));
         facade.execute(session, "COMMIT").unwrap();
         assert!(!facade.session_in_transaction(session));
+    }
+
+    #[test]
+    fn empty_statement_is_neutral_empty_not_a_syntax_error() {
+        let mut facade = EngineFacade::new();
+        let session = facade.open_session();
+        for sql in ["", "   ", ";", ";;;"] {
+            assert_eq!(
+                facade.execute(session, sql),
+                Ok(QueryOutcome::Empty),
+                "empty statement {sql:?} should be QueryOutcome::Empty"
+            );
+        }
     }
 
     #[test]

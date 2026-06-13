@@ -38,29 +38,50 @@ cargo test -p gpu_db_snapshot --release → 4 passed ×3 (concurrency repetition
 cargo fmt / clippy -p gpu_db_snapshot   → clean
 ```
 
-The four tests and what each retires:
+The four tests are **deterministic** (no timing-dependent assertions; verified by
+20/20 release reruns after the audit hardened two of them). What each retires:
 
 1. `concurrent_readers_always_see_a_consistent_immutable_generation` — 8 reader
-   threads vs a writer publishing 5,000 generations; every read sees a consistent
-   `(n, n*7)` pair (no torn reads). Proves immutable-generation read safety under
-   churn.
-2. `reads_actually_overlap_no_global_serialization` — peak concurrent readers
-   measured **> 1**. Proves the read body is not globally serialized (the load
-   path doesn't funnel reads through a lock).
+   threads each do a fixed 5,000 loads while a writer publishes 5,000 generations
+   concurrently; every read sees a consistent `(n, n*7)` pair (no torn reads).
+   Proves immutable-generation read safety under churn. (Fixed-count loads, not a
+   stop-flag race — the original timing-based version flaked on a fast machine.)
+2. `reads_actually_overlap_no_global_serialization` — all 8 readers load a handle
+   and meet at a `Barrier` *while still holding it*, so peak concurrent readers is
+   deterministically **== 8**. The barrier can't release unless all 8 read bodies
+   are live at once — impossible if the load path serialized reads behind a lock.
 3. `old_generation_is_retired_only_after_its_last_reader_drains` — a reader pins
    g1, the writer publishes g2/g3, g1 is **not** dropped; only when the reader
    drains is g1 reclaimed. Proves epoch-safe reclamation — the property
    GPU-resident device memory needs.
 4. `resident_read_view_with_raw_pointer_is_shared_across_threads` — a payload
-   `{ ptr: *const u8, len }` with `unsafe impl Send + Sync` (mirroring
+   `{ ptr: *const u8, len }` with `unsafe impl Send + Sync` (shaped like
    `CudaResidentDeviceMemoryReadView`) is read concurrently by 8 threads against
-   one generation. **Directly retires the GPU-resident-sharing risk.**
+   one generation. Shows that a raw-pointer payload **can** ride the abstraction
+   across threads safely **when the pointed-to memory is immutable and outlives
+   readers**.
 
-## Outcome: the central P1 bet looks sound
+## Outcome: the ownership/epoch pattern is de-risked; device-memory lifetime is NOT yet
 
-The pattern compiles, the ownership model is race-free under repetition, reclamation
-is epoch-safe, and a raw-pointer GPU-resident-style payload rides it across threads.
-This is the substrate the engine's reader/writer split adopts.
+What is genuinely proven: the pattern compiles, the ownership model is race-free
+under repetition, and reclamation is **epoch-safe** (an old generation is freed
+only after its last reader drains). That is the load-bearing concurrency property,
+and it holds.
+
+What is **not** yet proven — and remains the real open risk:
+
+- Test 4 uses a `Box::leak`'d `'static` immutable buffer, which is trivially safe
+  to share. The real `CudaResidentDeviceMemoryReadView` (`execution/lib.rs:101`)
+  is valid only "while the owning resident allocation remains alive **and the
+  snapshot generation that published it has not been invalidated by the engine**."
+  The **owning** `CudaResidentDeviceMemory` is itself `!Send`. So the genuinely
+  hard part — coupling a device-memory read view's lifetime to its owning
+  allocation, and the interaction with the engine's current **stop-the-world
+  residency invalidation on every write** (`engine/lib.rs:9017`) — is **not**
+  exercised by this spike.
+- Therefore: the *epoch/ownership* bet looks sound; the *GPU-device-memory
+  lifetime + eviction/invalidation* bet is still open until the pattern is applied
+  to the real resident types. That application is where the remaining risk lives.
 
 ## Honest scope boundaries
 

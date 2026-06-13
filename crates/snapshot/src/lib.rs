@@ -19,9 +19,13 @@
 //!
 //! The payload `T` is opaque and only requires `Send + Sync`, so it can carry a
 //! GPU-resident read view holding raw device pointers (the production payload),
-//! exactly like `CudaResidentDeviceMemoryReadView` which already declares
-//! `unsafe impl Send + Sync`. The `resident_read_view_is_shared_across_threads`
-//! test models that case directly.
+//! similar to `CudaResidentDeviceMemoryReadView` which declares
+//! `unsafe impl Send + Sync`. The `resident_read_view_…` test exercises the
+//! *immutable-read sharing* aspect of that case (a leaked-static buffer). It does
+//! **not** model the real device-memory lifetime coupling (the read view is valid
+//! only while its owning `!Send` allocation lives and its generation has not been
+//! engine-invalidated) — that risk is retired only when this substrate is applied
+//! to the real resident types.
 //!
 //! Note: the publish slot is guarded by a `Mutex` whose critical section is a
 //! single `Arc` clone/swap (sub-microsecond) — the read *body* runs outside it.
@@ -95,26 +99,39 @@ impl<T> SnapshotCell<T> {
         }
     }
 
+    /// Lock the publish slot, recovering from poison. The critical section only
+    /// ever clones/swaps an `Arc` (it cannot leave the slot in a torn state), so
+    /// continuing past a poisoned lock is safe — and avoids one panicking thread
+    /// taking down every reader and the writer.
+    fn slot(&self) -> std::sync::MutexGuard<'_, Arc<Generation<T>>> {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Load the currently-published generation as a reader handle. The returned
     /// handle pins that generation until dropped. Lock-free read body afterward.
     pub fn load(&self) -> SnapshotHandle<T> {
-        let generation = Arc::clone(&self.current.lock().expect("snapshot cell poisoned"));
+        let generation = Arc::clone(&self.slot());
         SnapshotHandle { generation }
     }
 
     /// Publish a new generation and return its id. The previous generation
     /// remains alive for any readers still holding a handle to it.
+    ///
+    /// The id is allocated **inside** the lock so that generation-id order always
+    /// matches install order — making `current_generation()` monotonic even if the
+    /// single-writer contract is ever relaxed to multiple concurrent writers.
     pub fn publish(&self, payload: T) -> u64 {
+        let mut slot = self.slot();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let generation = Arc::new(Generation { id, payload });
-        let mut slot = self.current.lock().expect("snapshot cell poisoned");
-        *slot = generation;
+        *slot = Arc::new(Generation { id, payload });
         id
     }
 
     /// The id of the currently-published generation.
     pub fn current_generation(&self) -> u64 {
-        self.current.lock().expect("snapshot cell poisoned").id
+        self.slot().id
     }
 }
 
@@ -129,75 +146,79 @@ mod tests {
     fn concurrent_readers_always_see_a_consistent_immutable_generation() {
         // Payload is (n, n*7); a torn read would break the invariant. Because each
         // generation is immutable, every reader always sees a consistent pair.
+        //
+        // Deterministic: each reader does a FIXED number of loads (no stop-flag
+        // race — on a fast machine the writer can otherwise finish before readers
+        // are even scheduled). Completing all 8 × READS asserts without panic is
+        // the proof; the writer publishes concurrently throughout.
+        const READS: usize = 5_000;
         let cell = Arc::new(SnapshotCell::new((1_u64, 7_u64)));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let writer = {
             let cell = Arc::clone(&cell);
-            let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 for n in 2..=5_000_u64 {
                     cell.publish((n, n.wrapping_mul(7)));
                 }
-                stop.store(true, Ordering::Relaxed);
             })
         };
 
         let readers: Vec<_> = (0..8)
             .map(|_| {
                 let cell = Arc::clone(&cell);
-                let stop = Arc::clone(&stop);
                 thread::spawn(move || {
-                    let mut reads = 0_u64;
-                    while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..READS {
                         let handle = cell.load();
                         let (n, derived) = *handle.get();
                         assert_eq!(derived, n.wrapping_mul(7), "torn read of generation");
-                        reads += 1;
                     }
-                    reads
                 })
             })
             .collect();
 
         writer.join().unwrap();
-        let total: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
-        assert!(total > 0, "readers should have observed generations");
+        for reader in readers {
+            reader.join().unwrap();
+        }
     }
 
     #[test]
     fn reads_actually_overlap_no_global_serialization() {
+        // Deterministic (not timing-dependent): every reader loads a generation,
+        // records the concurrency count, then rendezvouses at a barrier *while
+        // still holding its handle*. The barrier cannot release until all READERS
+        // are simultaneously in their read body — which is impossible if the load
+        // path serialized reads behind one lock. So peak == READERS exactly.
+        const READERS: usize = 8;
         let cell = Arc::new(SnapshotCell::new(0_u64));
         let concurrent = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(READERS));
 
-        let readers: Vec<_> = (0..8)
+        let readers: Vec<_> = (0..READERS)
             .map(|_| {
                 let cell = Arc::clone(&cell);
                 let concurrent = Arc::clone(&concurrent);
                 let peak = Arc::clone(&peak);
+                let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
-                    for _ in 0..2_000 {
-                        let _handle = cell.load();
-                        let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
-                        let mut observed = peak.load(Ordering::SeqCst);
-                        while now > observed {
-                            match peak.compare_exchange_weak(
-                                observed,
-                                now,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            ) {
-                                Ok(_) => break,
-                                Err(actual) => observed = actual,
-                            }
+                    let _handle = cell.load();
+                    let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut observed = peak.load(Ordering::SeqCst);
+                    while now > observed {
+                        match peak.compare_exchange_weak(
+                            observed,
+                            now,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => observed = actual,
                         }
-                        // Hold the read open briefly so overlap is observable.
-                        for _ in 0..1_000 {
-                            std::hint::spin_loop();
-                        }
-                        concurrent.fetch_sub(1, Ordering::SeqCst);
                     }
+                    // All readers hold a handle and meet here at once.
+                    barrier.wait();
+                    concurrent.fetch_sub(1, Ordering::SeqCst);
                 })
             })
             .collect();
@@ -205,9 +226,10 @@ mod tests {
         for reader in readers {
             reader.join().unwrap();
         }
-        assert!(
-            peak.load(Ordering::SeqCst) > 1,
-            "read bodies never overlapped; the load path is serializing reads"
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            READERS,
+            "read bodies did not all overlap; the load path is serializing reads"
         );
     }
 

@@ -8,10 +8,16 @@
 //!
 //! ## Scope (honest boundaries)
 //!
-//! - **Simple query protocol only.** Extended-protocol (Parse/Bind/Execute),
-//!   COPY, auth (SCRAM/TLS), and the catalog/introspection surface are out of
-//!   scope here — those live in the legacy full-compatibility `gpu-db-server`
-//!   and are migrated behind the façade in later milestones.
+//! - **Simple query protocol only, one statement per message.** Extended-protocol
+//!   (Parse/Bind/Execute), COPY, auth (SCRAM/TLS), and the catalog/introspection
+//!   surface are out of scope here — those live in the legacy full-compatibility
+//!   `gpu-db-server` and are migrated behind the façade in later milestones.
+//!   **Multi-statement simple queries are not yet supported:** a single `Query`
+//!   message containing `;`-separated statements (e.g. `SELECT 1; SELECT 2`,
+//!   common in migration scripts) is rejected with one error rather than executed
+//!   statement-by-statement. The wire stays in sync (one message in, one error +
+//!   ReadyForQuery out); splitting on top-level `;` is a tracked follow-up.
+//!   Empty statements correctly return `EmptyQueryResponse`.
 //! - **Single-threaded, one connection at a time.** The `Engine` owns raw CUDA
 //!   device handles and is not `Send`; this server keeps it on the serve thread
 //!   and handles connections sequentially. Concurrent connections require the
@@ -136,6 +142,11 @@ fn run_simple_query_loop(
 fn write_outcome(stream: &mut TcpStream, outcome: Result<QueryOutcome, DbError>) -> io::Result<()> {
     let mut writer = BackendWriter::new(&mut *stream);
     match outcome {
+        // An empty statement gets EmptyQueryResponse (not CommandComplete), per
+        // the wire protocol.
+        Ok(QueryOutcome::Empty) => {
+            writer.empty_query_response()?;
+        }
         Ok(outcome) => {
             let tag = pg_adapter::command_complete_tag(&outcome);
             if let QueryOutcome::Rows { columns, rows } = &outcome {

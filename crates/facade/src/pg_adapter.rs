@@ -49,6 +49,10 @@ pub fn error_sqlstate(category: ErrorCategory) -> &'static str {
 /// The PostgreSQL `CommandComplete` tag for a neutral outcome.
 pub fn command_complete_tag(outcome: &QueryOutcome) -> String {
     match outcome {
+        // Empty statements get an EmptyQueryResponse, not a CommandComplete, so an
+        // adapter should special-case `QueryOutcome::Empty` before calling this;
+        // the empty string here is a defensive fallback.
+        QueryOutcome::Empty => String::new(),
         QueryOutcome::Rows { rows, .. } => format!("SELECT {}", rows.len()),
         QueryOutcome::Command { tag, rows_affected } => match tag {
             CommandTag::Begin => "BEGIN".to_string(),

@@ -82,18 +82,27 @@ But it is shallow in three ways that matter:
 
 | Target (revised) | Best *honest* measurement today | Gap |
 |---|---|---|
-| Sustained > 100k TPS | ~57.7k qps (COUNT) / ~33–41k qps (lookup) @ **64 conns**, 8 requests/session burst | ~2× on rate; **"sustained" never measured** |
-| P50 < 0.5 ms | 837µs (COUNT) / 1.18–1.5 ms (lookup), cache-off | ~1.7–2.4×; only the *opt-in cache* path reaches it (351–455µs) |
-| P99 < 1 ms | **not recorded** for the cache-off runtime (reports stop at p95) | unmeasured |
+| Sustained > 100k TPS | ~25k qps (COUNT) / ~16–26k qps (lookup) @ **64 conns**, 8-request burst — **M0 baseline, this branch** | **~4×** on rate; **"sustained" never measured** |
+| P50 < 0.5 ms | ~1.58 ms (COUNT) / 1.5–2.9 ms (lookup), cache-off — M0 baseline | **~3×**; only the *opt-in cache* path reaches it (351–455µs) |
+| P99 < 1 ms | c64 p99 **1.9–3.4 ms** (M0); not met on the cache-off path | ~2–3× |
 | P99.9 < 5 ms | **measured nowhere at load** | cannot evaluate |
 | Connections 100k–1M | **64** (128 errored); thread-per-connection model | ~1,500–15,000× |
 
+> Numbers above are the committed **M0 baseline** (`docs/testing/reports/series/
+> p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`), measured
+> on this branch. Earlier reports cited a faster cache-off run (~57.7k qps / 837µs
+> COUNT); M0 on the same machine this session measured ~2× lower. That the two
+> "honest" runs differ by ~2× — well beyond the per-cell noise — is itself
+> evidence the harness needs the Phase 5 noise-reduction work (§5, §5.7) before
+> any latency number is trustworthy. M0 is treated as authoritative here because
+> it is the committed regression reference.
+
 The >100k qps / sub-0.5ms figures that exist (100–114k qps, p50 351–378µs) come
 **only from an opt-in response/parser byte-cache** that `docs/architecture/11-…`
-explicitly forbids claiming as a production runtime. The honest, execute-from-
-snapshot path lands ~2× short on rate and ~2× short on p50, and the tail and
-connection-scale targets are **not yet measurable** — the harness tops out at 64
-connections, fires 8 requests/session, and captures no p99.9.
+explicitly forbids claiming as a production runtime. On the M0 baseline the
+honest, execute-from-snapshot path is **~4× short on rate and ~3× short on p50**,
+and the tail and connection-scale targets are **not yet measurable** — the harness
+tops out at 64 connections, fires 8 requests/session, and captures no p99.9.
 
 **Conclusion:** the targets are not close, and more importantly several of them
 are **not yet measurable** on the current substrate. The first job is not to tune;
@@ -184,12 +193,15 @@ it is to build the substrate on which the targets can even be evaluated.
   in CI**; all CUDA tests are `#[ignore]`-gated and run only via a manual script.
 
 ### 2.6 Performance (honest, cache-off, single node, ≤64 conns)
-- Best: COUNT p50 **837µs / 57.7k qps**; multi-col lookup p50 **1.18ms / 41k qps**;
-  mixed int4/text p50 **1.5ms / 33k qps** (all @ c64, 64 rows/session).
-- Phase decomposition: engine wall ~150–350µs, **CUDA event only 9–16µs** →
+- **M0 baseline (this branch, authoritative):** COUNT c64 p50 **1.58ms / 25.4k qps**;
+  multi-col lookup p50 **2.08ms / 20.7k qps**; proj-literal p50 **1.46ms / 26k qps**
+  (all @ c64, 64 rows/session). (An earlier run reported ~837µs / 57.7k qps for
+  COUNT; M0 measured ~2× lower on the same machine — see the §1.3 note; the
+  discrepancy is itself a harness-noise signal.)
+- Phase decomposition: engine wall ~150–350µs, **CUDA event only 15µs** →
   **queue-wait-bound**. The 06-12/06-13 M3 arc moved reads off the owner thread
-  while preserving batch density (a real ~50–75× p50 collapse vs the owner-
-  serialized baseline) but settled ~2× short of the (cache-only) ceiling.
+  while preserving batch density (a real large p50 collapse vs the owner-
+  serialized baseline) but remains well short of the targets on the cache-off path.
 - COPY ingest: **30,992 rows/sec vs PostgreSQL 61,660** — ~2× slower, barely
   clearing the 30k gate; value-index append is the new dominant cost.
 - 125% (over-VRAM) tier **permanently blocked** under the current one-allocation-
@@ -328,6 +340,13 @@ honest docs; the real tech stack adopted.
   engine is reached only via a protocol-neutral façade (session + engine-native
   typed results + engine-native errors); pgwire is an adapter over it; CI green;
   the matrix states the real envelope.
+  - **Status: NOT CLOSED (partially met).** P0-M1…M3 delivered the façade and a
+    *separate* simple-query engine-backed server (`gpu_db_server`) as proof of
+    architecture — but **three** pgwire paths still exist, so the "single binary"
+    criterion is unmet. Closing Phase 0 is blocked on §9.2 (invert
+    `engine → protocol`) and §9.1 (consolidate to one server). The Phase 1
+    performance work proceeds in parallel by deliberate sequencing (§6/§7); Phase 0
+    is not abandoned, it is held open against §9.
 - **Benchmark gate:** the unified path reproduces the established baseline
   (§5.7) for the `order_line` point lookup and COUNT routes at c1–c64 with **no
   latency/throughput regression** beyond a stated tolerance, and the result is

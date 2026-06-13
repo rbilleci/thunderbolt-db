@@ -45,7 +45,16 @@ Façade fact `create_table_through_facade=true` confirmed present — the servin
 path executed through the neutral boundary. **All families `correctness=pass`,
 `error_count=0` at every concurrency.**
 
-c64 (headline), p50 µs / qps, M0 → M2:
+**Read the verdict first, then the table.** The verdict rests on *mechanistic
+isolation*, **not** on the c64 deltas below — and those deltas are below this
+harness's noise floor (±15–40% per cell, see the Observation section), so they are
+reported only for completeness. CREATE TABLE is dispatched once during table setup
+(`p8_engine_pgwire_benchmark_endpoint.rs:935`); the measured loop is the retained
+SELECT path. The changed code therefore never runs inside the measured loop and
+*cannot* move SELECT latency — the −29% (faster) and +18% (slower) cells are noise
+in opposite directions, which is itself consistent with that.
+
+c64, p50 µs / qps, M0 → M2 (all below the noise floor):
 
 | query | p50 M0 | p50 M2 | Δ | qps M0 | qps M2 | err |
 |---|--:|--:|--:|--:|--:|--:|
@@ -56,13 +65,13 @@ c64 (headline), p50 µs / qps, M0 → M2:
 | mixed | 1723 | 2025 | +18% | 22084 | 18846 | 0 |
 | heterogeneous | 1958 | 2085 | +6% | 17988 | 16706 | 0 |
 
-## Verdict: pass
+## Verdict: pass (on mechanistic isolation + correctness)
 
-No systematic regression. The deltas are **bidirectional run-to-run variance**
-(one family 29% faster, another 18% slower, count unchanged), which is expected:
-the change is confined to table creation and does not execute inside the measured
-query loop, so it *cannot* mechanistically move query latency. Correctness is
-intact end to end.
+No regression is possible from this change: it is confined to table creation and
+does not execute inside the measured SELECT loop. Correctness is intact end to end
+(`create_table_through_facade=true`, all families `correctness=pass`/`err=0`). The
+c64 deltas are bidirectional noise and are **not** evidence either way — per §5.7,
+with no measured-path change the gate is mechanistic isolation, not the numbers.
 
 Secondary observation for the benchmark discipline: at 64-row tables / 8-request
 bursts this harness shows ±15–40% per-cell variance at c8, so it cannot resolve
