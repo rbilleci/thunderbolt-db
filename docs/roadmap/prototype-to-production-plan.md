@@ -568,8 +568,18 @@ Full design, ordered steps, and acceptance gates:
      triggers/multi-table DML). Report:
      `.../runs/2026-06-13-p1-m3-step2-per-table-invalidation-v1.md`. (Deepens the §9.2
      engine→protocol coupling — residency now parses `Command`s in `engine`.)
-   - **Slice B (next): `SnapshotCell<Arc<owner>>` residency + `&self` reads** — coupled
-     with step 3, since a published generation only matters once reads are concurrent.
+   - **Slice B (in progress): `SnapshotCell<Arc<owner>>` residency + `&self` reads.**
+     - **Step 1 ✅ (2026-06-13): refcount the resident owner.**
+       `device_memory: BTreeMap<String, Arc<CudaResidentDeviceMemory>>` — the
+       `Arc<owner>` foundation. Behavior-preserving (engine suite unchanged); the
+       migration proved nearly free (`&Arc` auto-derefs at the ~37 read sites; one
+       method-reference call site adjusted). Relies on step 1's `unsafe impl Send +
+       Sync`.
+     - **Next:** route the read sites through an owned-`Arc` accessor, swap the backing
+       store to `SnapshotCell<Option<Arc<owner>>>` with publish-on-commit (reusing
+       slice A's mutated-table scope for publish-per-table), then flip the read methods
+       to `&self` (step 3 / gate 2). This remainder is audit-worthy and is the
+       prerequisite for step 4's latency claim.
 3. Flip `execute_relational_select` + the resident-route methods from `&mut self`
    to `&self` over a loaded generation.
 4. Re-run M0 **with Phase-5 noise controls** (median-of-N + CI) and show the

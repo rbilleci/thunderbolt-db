@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
@@ -6030,7 +6031,7 @@ pub struct Engine {
 #[derive(Debug, Default)]
 struct RelationalResidentCache {
     snapshots: BTreeMap<String, RelationalResidencySnapshot>,
-    device_memory: BTreeMap<String, CudaResidentDeviceMemory>,
+    device_memory: BTreeMap<String, Arc<CudaResidentDeviceMemory>>,
     partitions: BTreeMap<String, Vec<RelationalResidentPartition>>,
     partition_device_memory: BTreeMap<(String, u32), CudaResidentDeviceMemory>,
     budget_bytes_by_gpu: BTreeMap<u16, u64>,
@@ -6165,7 +6166,8 @@ impl RelationalResidentCache {
         device_memory: Option<CudaResidentDeviceMemory>,
     ) {
         if let Some(device_memory) = device_memory {
-            self.device_memory.insert(table.clone(), device_memory);
+            self.device_memory
+                .insert(table.clone(), Arc::new(device_memory));
         } else {
             self.device_memory.remove(&table);
         }
@@ -22412,7 +22414,7 @@ impl Engine {
         self.relational_resident_cache
             .device_memory
             .get(table)
-            .map(CudaResidentDeviceMemory::read_view)
+            .map(|device_memory| device_memory.read_view())
     }
 
     fn relational_residency_snapshot_ref(
