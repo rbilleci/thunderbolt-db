@@ -27,6 +27,8 @@ mkdir -p "$OUT_DIR"
   cargo test -p gpu_db_execution cuda_driver_runtime -- --include-ignored --nocapture
   echo "== cuda mvcc engine =="
   cargo test -p gpu_db_engine execute_mvcc_query_cuda_driver_runs -- --include-ignored --nocapture
+  echo "== p1-m3 snapshot soundness probe (doc 14 gate 1) =="
+  cargo test -p gpu_db_execution published_resident_generation -- --include-ignored --nocapture
 } 2>&1 | tee "$LOG"
 
 echo "environment_report=$REPORT"

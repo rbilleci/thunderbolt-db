@@ -520,7 +520,7 @@ thesis pays off second.
 **Milestone ladder — done, all independently audited and the audit findings fixed:**
 - M0 baseline ✅ · P0-M1 façade ✅ · P0-M2 first serving path ✅ ·
   P0-M3 engine-backed server (`crates/server`) ✅ · P1-M2 snapshot spike
-  (`crates/snapshot`) ✅.
+  (`crates/snapshot`) ✅ · **P1-M3 step 1 snapshot soundness probe ✅ (2026-06-13)**.
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
@@ -536,6 +536,14 @@ Full design, ordered steps, and acceptance gates:
    **real-GPU soundness probe** (device memory must not be freed while a reader
    holds its generation). This is the soundness crux — prove it before touching
    any read-path signatures.
+   - **✅ Done 2026-06-13.** `unsafe impl` + `// SAFETY:` landed in
+     `crates/execution`; the probe
+     (`published_resident_generation_survives_a_replacement_publish_and_is_freed_after_drain`)
+     does a real cross-thread GPU read of a held generation after a replacement
+     publish and proves it is freed only after the reader drains — 8/8 deterministic
+     on real hardware. Run report:
+     `docs/testing/reports/series/prototype-to-production/runs/2026-06-13-p1-m3-step1-soundness-probe-v1.md`.
+     Surfaced the GPU **context-model** decision now tracked as §9.3.
 2. Make per-table residency a `SnapshotCell<Arc<owner>>`; publish-on-commit instead
    of in-place free (also fixes the global stop-the-world invalidation).
 3. Flip `execute_relational_select` + the resident-route methods from `&mut self`
@@ -548,6 +556,15 @@ Full design, ordered steps, and acceptance gates:
 a `SnapshotCell<ReadView>` would be a GPU use-after-free on invalidation — the
 generation must hold the **owner**, and published generations must stay immutable
 (the `unsafe impl Send` depends on it).
+
+**Architecture note (2026-06-13):** implementing step 1 confirmed the reader/writer
+snapshot model is the right long-term spine (it generalizes to MVCC; shared-nothing-
+per-core was considered and rejected for a GPU-shared, general-SQL engine) **and**
+surfaced that the long-term GPU **context model** is the next load-bearing change
+after P1-M3: move from one CUDA context per allocation to **one shared primary
+context per device** (`cudarc`-style). Approved sequencing: land the snapshot read
+path first (P1-M3 steps 1–4), migrate the context model next. Tracked as **§9.3**;
+full rationale in doc 14's *Long-term GPU context model* section. Step 1 is unaffected.
 
 **To resume:** start a session with "continue gpu-db P1-M3" — the auto-loaded
 memory + this section + doc 14 are the entrypoint.
@@ -592,7 +609,37 @@ this). The façade also still carries a conversion layer because of it.
   full workspace + all tests are green; an ArchUnit-style check (or a documented
   dependency assertion) prevents the back-edge from returning.
 
+### 9.3 GPU context model: per-allocation → one shared primary context
+
+**Debt:** each `CudaResidentDeviceMemory` creates its own CUDA context
+(`cuCtxCreate`, `execution/lib.rs:1323`) and destroys it on `Drop`
+(`cuCtxDestroy`, `:816`) — **one heavyweight context per table-generation** — and
+loads its PTX module per launch; most resident launches assume the context is
+ambiently current on the calling thread (only the two `_equal_any_project` paths
+`cuCtxSetCurrent`, `:3100`/`:3685`). This was an acceptable prototype shortcut but
+fights the P1-M3 snapshot model: publish-on-commit would churn a context per write,
+it is the root of the cross-thread context-currency problem, and it blocks a
+process-wide module cache and the Phase-2 stream pool. Surfaced while implementing
+P1-M3 step 1 (2026-06-13); full analysis in doc 14's *Long-term GPU context model*.
+- **End state:** a `GpuDevice` layer owning **one retained primary context per
+  physical GPU** (`cuDevicePrimaryCtxRetain`, made current once per worker thread),
+  a process-wide module/function cache, and (Phase 2) a stream pool;
+  `CudaResidentDeviceMemory` holds only a `device_ptr` in the shared context and its
+  `Drop` calls `cuMemFree` alone. This is the `cudarc` model the plan already wants
+  to adopt (§Phase 0 / Phase 2), and it makes the step-1 `unsafe impl Send + Sync`
+  easier to justify (allocation lifetime decoupled from context lifetime).
+- **Trigger:** the next milestone after the P1-M3 snapshot read path lands (steps
+  1–4). Deliberately sequenced *after* the snapshot/MVCC substrate because the
+  measured bottleneck is CPU serialization, not context churn (M0: GPU 99% idle), and
+  swapping the context model under a working, tested `&self` read path is far safer
+  than two unsafe refactors at once.
+- **Acceptance:** one primary context per GPU shared across reader threads; no
+  per-allocation `cuCtxCreate`/`cuCtxDestroy`; modules loaded once and cached; the
+  real-GPU resident tests + the step-1 soundness probe stay green; a documented
+  assertion that residency owns no context.
+
 > Status note: these are referenced from the Phase 0 "Structural findings" block
-> and from the P0-M3 run report. Update this section's status when picked up; do
-> not let the three-server state or the engine→protocol edge become permanent by
-> omission.
+> and from the P0-M3 / P1-M3-step-1 run reports. Update each subsection's status when
+> picked up; do not let the three-server state, the engine→protocol edge, or the
+> per-allocation context model become permanent by omission. §9.3 is the immediate
+> successor to the P1-M3 snapshot read path.

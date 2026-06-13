@@ -7,3 +7,9 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 libloading.workspace = true
+
+[dev-dependencies]
+# Reader/writer snapshot substrate, used by the P1-M3 step-1 real-GPU soundness
+# probe to publish a resident generation and prove epoch-safe reclamation of real
+# device memory. Test-only edge (snapshot is std-only; no dependency cycle).
+gpu_db_snapshot = { path = "../snapshot" }
