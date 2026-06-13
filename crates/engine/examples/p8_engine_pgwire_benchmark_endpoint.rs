@@ -95,6 +95,9 @@ struct RetainedReadRuntimeStats {
     misses: u64,
     unsupported: u64,
     failures: u64,
+    batches: u64,
+    batched_requests: u64,
+    max_batch: u64,
 }
 
 struct RetainedReadRuntimeInner {
@@ -108,20 +111,43 @@ struct RetainedReadRuntimeInner {
 struct RetainedReadRuntime {
     inner: Mutex<RetainedReadRuntimeInner>,
     idle: Condvar,
+    work_tx: Option<mpsc::Sender<RetainedReadRuntimeWork>>,
+    batch_max: usize,
+}
+
+struct RetainedReadRuntimeWork {
+    route: RetainedReadRuntimeRoute,
+    batch_key: RetainedSelectLiteralBatchKey,
+    needle: i32,
+    response_tx: mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
 impl RetainedReadRuntime {
-    fn new(enabled: bool) -> Self {
-        Self {
-            inner: Mutex::new(RetainedReadRuntimeInner {
-                enabled,
-                generation: 0,
-                in_flight: 0,
-                route: None,
-                stats: RetainedReadRuntimeStats::default(),
-            }),
-            idle: Condvar::new(),
-        }
+    fn new(
+        enabled: bool,
+        batch_max: usize,
+    ) -> (Self, Option<mpsc::Receiver<RetainedReadRuntimeWork>>) {
+        let (work_tx, work_rx) = if enabled {
+            let (tx, rx) = mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        (
+            Self {
+                inner: Mutex::new(RetainedReadRuntimeInner {
+                    enabled,
+                    generation: 0,
+                    in_flight: 0,
+                    route: None,
+                    stats: RetainedReadRuntimeStats::default(),
+                }),
+                idle: Condvar::new(),
+                work_tx,
+                batch_max: batch_max.max(1),
+            },
+            work_rx,
+        )
     }
 
     fn publish(&self, route: RetainedReadRuntimeRoute) -> Result<(), String> {
@@ -177,6 +203,9 @@ impl RetainedReadRuntime {
             misses: inner.stats.misses,
             unsupported: inner.stats.unsupported,
             failures: inner.stats.failures,
+            batches: inner.stats.batches,
+            batched_requests: inner.stats.batched_requests,
+            max_batch: inner.stats.max_batch,
         })
     }
 
@@ -189,7 +218,7 @@ impl RetainedReadRuntime {
             Some(needle) => needle,
             None => return Ok(None),
         };
-        let (route, runtime_generation) = {
+        let (route, work_tx) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -221,39 +250,126 @@ impl RetainedReadRuntime {
                 return Ok(None);
             }
             inner.in_flight = inner.in_flight.saturating_add(1);
-            (route, inner.generation)
+            let Some(work_tx) = self.work_tx.clone() else {
+                inner.in_flight = inner.in_flight.saturating_sub(1);
+                self.idle.notify_all();
+                inner.stats.misses = inner.stats.misses.saturating_add(1);
+                return Ok(None);
+            };
+            (route, work_tx)
         };
 
-        let result = execute_retained_read_runtime_route(&route, &batch_key, needle);
+        let (response_tx, response_rx) = mpsc::channel();
+        let work = RetainedReadRuntimeWork {
+            route,
+            batch_key,
+            needle,
+            response_tx,
+        };
+        if work_tx.send(work).is_err() {
+            self.finish_work(1, 0, 0, 1)?;
+            return Ok(None);
+        }
+        match response_rx.recv() {
+            Ok(Ok(bytes)) => Ok(Some(bytes)),
+            Ok(Err(err)) => {
+                eprintln!("retained read runtime view failed, falling back to owner: {err}");
+                Ok(None)
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn finish_work(
+        &self,
+        completed: u64,
+        hits: u64,
+        batch_size: u64,
+        failures: u64,
+    ) -> Result<(), String> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| "retained read runtime lock poisoned".to_string())?;
-        inner.in_flight = inner.in_flight.saturating_sub(1);
-        self.idle.notify_all();
-        if runtime_generation != inner.generation {
-            inner.stats.misses = inner.stats.misses.saturating_add(1);
-            return Ok(None);
+        inner.in_flight = inner.in_flight.saturating_sub(completed);
+        inner.stats.hits = inner.stats.hits.saturating_add(hits);
+        inner.stats.failures = inner.stats.failures.saturating_add(failures);
+        if batch_size > 0 {
+            inner.stats.batches = inner.stats.batches.saturating_add(1);
+            inner.stats.batched_requests = inner.stats.batched_requests.saturating_add(batch_size);
+            inner.stats.max_batch = inner.stats.max_batch.max(batch_size);
         }
-        match result {
-            Ok(bytes) => {
-                inner.stats.hits = inner.stats.hits.saturating_add(1);
-                Ok(Some(bytes))
+        self.idle.notify_all();
+        Ok(())
+    }
+
+    fn run_worker(self: Arc<Self>, work_rx: mpsc::Receiver<RetainedReadRuntimeWork>) {
+        let mut backlog = VecDeque::new();
+        loop {
+            let first = if let Some(work) = backlog.pop_front() {
+                work
+            } else {
+                match work_rx.recv() {
+                    Ok(work) => work,
+                    Err(_) => break,
+                }
+            };
+            let mut batch = vec![first];
+            while batch.len() < self.batch_max {
+                let next = if let Some(position) = backlog
+                    .iter()
+                    .position(|work| work.batch_key == batch[0].batch_key)
+                {
+                    backlog.remove(position)
+                } else {
+                    match work_rx.try_recv() {
+                        Ok(work) => Some(work),
+                        Err(mpsc::TryRecvError::Empty) => None,
+                        Err(mpsc::TryRecvError::Disconnected) => None,
+                    }
+                };
+                let Some(work) = next else {
+                    break;
+                };
+                if work.batch_key == batch[0].batch_key {
+                    batch.push(work);
+                } else {
+                    backlog.push_back(work);
+                }
             }
-            Err(err) => {
-                inner.stats.failures = inner.stats.failures.saturating_add(1);
-                eprintln!("retained read runtime view failed, falling back to owner: {err}");
-                Ok(None)
+            let batch_size = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            match execute_retained_read_runtime_batch(&batch) {
+                Ok(outputs) => {
+                    for (work, output) in batch.into_iter().zip(outputs) {
+                        let _ = work.response_tx.send(Ok(output));
+                    }
+                    let _ = self.finish_work(batch_size, batch_size, batch_size, 0);
+                }
+                Err(err) => {
+                    for work in batch {
+                        let _ = work.response_tx.send(Err(err.clone()));
+                    }
+                    let _ = self.finish_work(batch_size, 0, batch_size, batch_size);
+                }
             }
+        }
+        for work in backlog {
+            let _ = work
+                .response_tx
+                .send(Err("retained read runtime worker stopped".to_string()));
+            let _ = self.finish_work(1, 0, 0, 1);
         }
     }
 }
 
-fn execute_retained_read_runtime_route(
-    route: &RetainedReadRuntimeRoute,
-    batch_key: &RetainedSelectLiteralBatchKey,
-    needle: i32,
-) -> Result<Vec<u8>, String> {
+fn execute_retained_read_runtime_batch(
+    works: &[RetainedReadRuntimeWork],
+) -> Result<Vec<Vec<u8>>, String> {
+    let first = works
+        .first()
+        .ok_or_else(|| "retained read runtime batch requires work".to_string())?;
+    let route = &first.route;
+    let batch_key = &first.batch_key;
     let int4_width = std::mem::size_of::<i32>() as u64;
     let column_bytes = route
         .row_count
@@ -279,11 +395,25 @@ fn execute_retained_read_runtime_route(
         .iter()
         .map(|column| column_offset(column))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut unique_needles = Vec::new();
+    let mut unique_by_needle = HashMap::new();
+    let mut work_to_unique = Vec::with_capacity(works.len());
+    for work in works {
+        let unique_idx = if let Some(idx) = unique_by_needle.get(&work.needle) {
+            *idx
+        } else {
+            let idx = unique_needles.len();
+            unique_by_needle.insert(work.needle, idx);
+            unique_needles.push(work.needle);
+            idx
+        };
+        work_to_unique.push(unique_idx);
+    }
     let submitted = route
         .read_view
         .submit_match_project_i32_equal_any_from_payload(
             filter_offset,
-            &[needle],
+            &unique_needles,
             &projection_offsets,
             route.row_count,
         )
@@ -291,28 +421,36 @@ fn execute_retained_read_runtime_route(
     let (projected_rows, _kernel_event_elapsed_us) = submitted
         .complete_detached()
         .map_err(|err| err.to_string())?;
-    let rows = projected_rows
-        .into_iter()
-        .filter(|row| row.needle_index == 0)
-        .map(|row| {
-            row.values
-                .into_iter()
-                .map(SqlValue::Int4)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let mut rows_by_unique = vec![Vec::new(); unique_needles.len()];
+    for row in projected_rows {
+        if let Some(rows) = rows_by_unique.get_mut(row.needle_index) {
+            rows.push(
+                row.values
+                    .into_iter()
+                    .map(SqlValue::Int4)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
     let columns = batch_key
         .projection_columns
         .iter()
         .map(|column| BackendColumn::new(column, 23, 4))
         .collect::<Vec<_>>();
-    let mut bytes = Vec::new();
-    let mut writer = BackendWriter::new(&mut bytes);
-    write_select_result_rows(&mut writer, &columns, &rows).map_err(|err| err.to_string())?;
-    writer
-        .ready_for_query(false)
-        .map_err(|err| err.to_string())?;
-    Ok(bytes)
+    let mut outputs = Vec::with_capacity(works.len());
+    for unique_idx in work_to_unique {
+        let rows = rows_by_unique
+            .get(unique_idx)
+            .ok_or_else(|| format!("retained read runtime missing unique result {unique_idx}"))?;
+        let mut bytes = Vec::new();
+        let mut writer = BackendWriter::new(&mut bytes);
+        write_select_result_rows(&mut writer, &columns, rows).map_err(|err| err.to_string())?;
+        writer
+            .ready_for_query(false)
+            .map_err(|err| err.to_string())?;
+        outputs.push(bytes);
+    }
+    Ok(outputs)
 }
 
 struct PendingCopy {
@@ -2147,12 +2285,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let retained_read_runtime_view_enabled =
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false);
+            .unwrap_or(true);
     let gpu_microbatch_max = std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_MAX")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(64);
+    let retained_read_runtime_batch_max =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_BATCH_MAX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(gpu_microbatch_max);
     let gpu_microbatch_admission_window_micros =
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS")
             .ok()
@@ -2224,8 +2368,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let retained_read_response_cache = Arc::new(Mutex::new(RetainedReadResponseCache::new(
         retained_read_response_cache_enabled,
     )));
-    let retained_read_runtime =
-        Arc::new(RetainedReadRuntime::new(retained_read_runtime_view_enabled));
+    let (retained_read_runtime_inner, retained_read_runtime_work_rx) = RetainedReadRuntime::new(
+        retained_read_runtime_view_enabled,
+        retained_read_runtime_batch_max,
+    );
+    let retained_read_runtime = Arc::new(retained_read_runtime_inner);
+    let _retained_read_runtime_worker_handle = retained_read_runtime_work_rx.map(|work_rx| {
+        let worker_runtime = Arc::clone(&retained_read_runtime);
+        thread::spawn(move || worker_runtime.run_worker(work_rx))
+    });
     let accept_request_sender = EngineRequestSender {
         throughput_tx: request_tx.clone(),
         latency_tx: latency_request_tx.clone(),
@@ -2301,6 +2452,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "retained_read_runtime_view_enabled",
         retained_read_runtime_view_enabled,
+    )?;
+    state.fact(
+        "retained_read_runtime_batch_max",
+        retained_read_runtime_batch_max,
     )?;
     state.fact("owner_thread_gpu_microbatch_max", gpu_microbatch_max)?;
     state.fact(
@@ -3128,6 +3283,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "retained_read_runtime_view_failures",
         runtime_stats.failures,
     )?;
+    state.fact("retained_read_runtime_batches", runtime_stats.batches)?;
+    state.fact(
+        "retained_read_runtime_batched_requests",
+        runtime_stats.batched_requests,
+    )?;
+    state.fact("retained_read_runtime_max_batch", runtime_stats.max_batch)?;
     state.flush_facts()?;
     Ok(())
 }

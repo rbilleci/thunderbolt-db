@@ -126,6 +126,8 @@ Evidence:
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-select-facts-none-full-guard-v1.md`
 - direct client-thread retained read-view runtime probe rejected by
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-13-read-runtime-view-reject-v1.md`
+- batched retained read runtime promoted for all-INT4 point reads by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-13-batched-read-runtime-default-v1.md`
 
 Current state:
 
@@ -143,6 +145,9 @@ Current state:
 - client-thread read-view execution can bypass the owner but regresses badly
   because it converts filled all-INT4 retained batches into singleton GPU
   launches
+- batched read-runtime execution preserves route-shape batch fill off-owner and
+  is the default cache-off path for all-INT4 retained point reads; mixed/text
+  retained routes still fall back to the owner route-lane path
 
 ### M4: Small GPU Stream Pool
 
@@ -247,6 +252,7 @@ for a 5x-class boundary reduction, not a 1.2x row improvement:
    hide completion.
    Preserve filled retained job batches; direct singleton read-view launches
    are a rejected default path.
+   The batched read runtime now satisfies this for all-INT4 point reads.
 2. Keep the owner-loop pending completion queue as an opt-in diagnostic with
    cap `0` by default; cap `2` proved real overlap but regressed c64 p50.
 3. Preserve generation mismatch rejection and mutation publication barriers.
