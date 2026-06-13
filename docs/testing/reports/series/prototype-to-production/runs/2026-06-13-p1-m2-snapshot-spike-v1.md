@@ -102,11 +102,24 @@ measured path is unchanged (mechanistic isolation; additive crate). The perf
 payoff — collapsing M0's dominant queue-wait term via concurrent reads — is
 realized when the engine read path adopts this substrate; M0 is re-run then.
 
+## Post-spike investigation (retires part of the audit's open risk)
+
+Reading the real types found a concrete soundness constraint and the corrected
+design, written up in `docs/architecture/14-engine-snapshot-integration-design.md`:
+`CudaResidentDeviceMemoryReadView` is **non-owning** (raw `device_ptr` + an
+`Arc<Library>`, but no handle to the owning `CudaResidentDeviceMemory`, whose `Drop`
+frees the device memory). So a `SnapshotCell<ReadView>` would be a **use-after-free**
+on invalidation — the generation must hold the **owner**
+(`Arc<CudaResidentDeviceMemory>`, which requires adding `unsafe impl Send + Sync` to
+the owner under a publish-don't-mutate discipline). This is the key design decision
+the engine application turns on; doc 14 is its blueprint and acceptance gates.
+
 ## Next
 
-1. **Apply to the engine** (the rest of P1): `SnapshotCell`-backed residency,
-   `&self` read execution, serialized writer publish-on-commit; re-run M0 and show
-   the queue-wait term drop. This also makes the engine-backed server (P0-M3)
+1. **Apply to the engine** (the rest of P1, per doc 14): `SnapshotCell<Arc<owner>>`
+   residency, `&self` read execution, serialized writer publish-on-commit; the
+   real-GPU soundness probe is the first acceptance gate; re-run M0 and show the
+   queue-wait term drop. This also makes the engine-backed server (P0-M3)
    multi-connection.
 2. Expose **neutral telemetry** through the façade (P0-M2 finding) so the read
    serving path can migrate without losing phase facts.
