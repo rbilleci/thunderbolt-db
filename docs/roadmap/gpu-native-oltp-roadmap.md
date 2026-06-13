@@ -124,6 +124,8 @@ Evidence:
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-select-phase-facts-off-c64-v1.md`
 - no-phase-facts full c1-c64 fast-path guard closed by
   `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-12-select-facts-none-full-guard-v1.md`
+- direct client-thread retained read-view runtime probe rejected by
+  `docs/testing/reports/series/p8-concurrency-steady-state/runs/2026-06-13-read-runtime-view-reject-v1.md`
 
 Current state:
 
@@ -138,6 +140,9 @@ Current state:
 - per-retained-SELECT phase JSON emission is no longer on the endpoint default
   hot path; benchmark runs request `phase_only` explicitly when they need phase
   aggregates
+- client-thread read-view execution can bypass the owner but regresses badly
+  because it converts filled all-INT4 retained batches into singleton GPU
+  launches
 
 ### M4: Small GPU Stream Pool
 
@@ -240,6 +245,8 @@ for a 5x-class boundary reduction, not a 1.2x row improvement:
 1. Move response materialization/write work out of the owner critical path, or
    advance to a small read-only stream pool with enough independent work to
    hide completion.
+   Preserve filled retained job batches; direct singleton read-view launches
+   are a rejected default path.
 2. Keep the owner-loop pending completion queue as an opt-in diagnostic with
    cap `0` by default; cap `2` proved real overlap but regressed c64 p50.
 3. Preserve generation mismatch rejection and mutation publication barriers.

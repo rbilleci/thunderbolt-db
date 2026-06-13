@@ -3104,6 +3104,7 @@ DONE:
             .get::<CuEventElapsedTime>(b"cuEventElapsedTime\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
+    check_cuda(unsafe { cu_ctx_set_current(resident.context()) })?;
 
     let mut device_needles = 0_u64;
     check_cuda(unsafe { cu_mem_alloc(&mut device_needles, needle_bytes) })?;

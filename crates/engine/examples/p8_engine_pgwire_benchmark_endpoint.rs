@@ -5,7 +5,7 @@ use std::io::{self, BufWriter, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Condvar, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use gpu_db_engine::{
     Engine, RelationalResidencyWarmupPolicy, RelationalRetainedReadJob,
     RelationalRetainedReadSubmission, RelationalSelectResult,
 };
+use gpu_db_execution::CudaResidentDeviceMemoryReadView;
 use gpu_db_metrics::RuntimeMetricsSnapshot;
 use gpu_db_protocol::backend::{BackendColumn, BackendWriter};
 use gpu_db_protocol::{
@@ -74,6 +75,244 @@ impl RetainedReadResponseCache {
             self.entries.clear();
         }
     }
+}
+
+#[derive(Clone)]
+struct RetainedReadRuntimeRoute {
+    table: String,
+    generation: u64,
+    row_count: u64,
+    int4_columns: Vec<String>,
+    read_view: CudaResidentDeviceMemoryReadView,
+}
+
+#[derive(Default)]
+struct RetainedReadRuntimeStats {
+    published: u64,
+    invalidations: u64,
+    attempts: u64,
+    hits: u64,
+    misses: u64,
+    unsupported: u64,
+    failures: u64,
+}
+
+struct RetainedReadRuntimeInner {
+    enabled: bool,
+    generation: u64,
+    in_flight: u64,
+    route: Option<RetainedReadRuntimeRoute>,
+    stats: RetainedReadRuntimeStats,
+}
+
+struct RetainedReadRuntime {
+    inner: Mutex<RetainedReadRuntimeInner>,
+    idle: Condvar,
+}
+
+impl RetainedReadRuntime {
+    fn new(enabled: bool) -> Self {
+        Self {
+            inner: Mutex::new(RetainedReadRuntimeInner {
+                enabled,
+                generation: 0,
+                in_flight: 0,
+                route: None,
+                stats: RetainedReadRuntimeStats::default(),
+            }),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, route: RetainedReadRuntimeRoute) -> Result<(), String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "retained read runtime lock poisoned".to_string())?;
+        if !inner.enabled {
+            return Ok(());
+        }
+        while inner.in_flight > 0 {
+            inner = self
+                .idle
+                .wait(inner)
+                .map_err(|_| "retained read runtime lock poisoned".to_string())?;
+        }
+        inner.generation = inner.generation.saturating_add(1);
+        inner.route = Some(route);
+        inner.stats.published = inner.stats.published.saturating_add(1);
+        Ok(())
+    }
+
+    fn invalidate(&self) -> Result<(), String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "retained read runtime lock poisoned".to_string())?;
+        if !inner.enabled {
+            return Ok(());
+        }
+        inner.route = None;
+        inner.generation = inner.generation.saturating_add(1);
+        inner.stats.invalidations = inner.stats.invalidations.saturating_add(1);
+        while inner.in_flight > 0 {
+            inner = self
+                .idle
+                .wait(inner)
+                .map_err(|_| "retained read runtime lock poisoned".to_string())?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_stats(&self) -> Result<RetainedReadRuntimeStats, String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "retained read runtime lock poisoned".to_string())?;
+        Ok(RetainedReadRuntimeStats {
+            published: inner.stats.published,
+            invalidations: inner.stats.invalidations,
+            attempts: inner.stats.attempts,
+            hits: inner.stats.hits,
+            misses: inner.stats.misses,
+            unsupported: inner.stats.unsupported,
+            failures: inner.stats.failures,
+        })
+    }
+
+    fn try_execute(&self, sql: &str, select: &Select) -> Result<Option<Vec<u8>>, String> {
+        let candidate = retained_select_literal_batch_candidate(sql, select.clone());
+        let Some(RetainedSelectBatchCandidate::Literal { batch_key, .. }) = candidate else {
+            return Ok(None);
+        };
+        let needle = match retained_select_literal_needle(select) {
+            Some(needle) => needle,
+            None => return Ok(None),
+        };
+        let (route, runtime_generation) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| "retained read runtime lock poisoned".to_string())?;
+            if !inner.enabled {
+                return Ok(None);
+            }
+            inner.stats.attempts = inner.stats.attempts.saturating_add(1);
+            let Some(route) = inner.route.clone() else {
+                inner.stats.misses = inner.stats.misses.saturating_add(1);
+                return Ok(None);
+            };
+            if route.table != batch_key.table || route.generation == 0 {
+                inner.stats.misses = inner.stats.misses.saturating_add(1);
+                return Ok(None);
+            }
+            if !route
+                .int4_columns
+                .iter()
+                .any(|column| column == &batch_key.filter_column)
+                || batch_key.projection_columns.iter().any(|column| {
+                    !route
+                        .int4_columns
+                        .iter()
+                        .any(|candidate| candidate == column)
+                })
+            {
+                inner.stats.unsupported = inner.stats.unsupported.saturating_add(1);
+                return Ok(None);
+            }
+            inner.in_flight = inner.in_flight.saturating_add(1);
+            (route, inner.generation)
+        };
+
+        let result = execute_retained_read_runtime_route(&route, &batch_key, needle);
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "retained read runtime lock poisoned".to_string())?;
+        inner.in_flight = inner.in_flight.saturating_sub(1);
+        self.idle.notify_all();
+        if runtime_generation != inner.generation {
+            inner.stats.misses = inner.stats.misses.saturating_add(1);
+            return Ok(None);
+        }
+        match result {
+            Ok(bytes) => {
+                inner.stats.hits = inner.stats.hits.saturating_add(1);
+                Ok(Some(bytes))
+            }
+            Err(err) => {
+                inner.stats.failures = inner.stats.failures.saturating_add(1);
+                eprintln!("retained read runtime view failed, falling back to owner: {err}");
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn execute_retained_read_runtime_route(
+    route: &RetainedReadRuntimeRoute,
+    batch_key: &RetainedSelectLiteralBatchKey,
+    needle: i32,
+) -> Result<Vec<u8>, String> {
+    let int4_width = std::mem::size_of::<i32>() as u64;
+    let column_bytes = route
+        .row_count
+        .checked_mul(int4_width)
+        .ok_or_else(|| "retained read runtime row-count overflow".to_string())?;
+    let column_offset = |column: &str| -> Result<u64, String> {
+        let ordinal = route
+            .int4_columns
+            .iter()
+            .position(|candidate| candidate == column)
+            .ok_or_else(|| format!("retained read runtime missing int4 column {column}"))?;
+        (std::mem::size_of::<u64>() as u64)
+            .checked_add(
+                (ordinal as u64)
+                    .checked_mul(column_bytes)
+                    .ok_or_else(|| "retained read runtime column offset overflow".to_string())?,
+            )
+            .ok_or_else(|| "retained read runtime column offset overflow".to_string())
+    };
+    let filter_offset = column_offset(&batch_key.filter_column)?;
+    let projection_offsets = batch_key
+        .projection_columns
+        .iter()
+        .map(|column| column_offset(column))
+        .collect::<Result<Vec<_>, _>>()?;
+    let submitted = route
+        .read_view
+        .submit_match_project_i32_equal_any_from_payload(
+            filter_offset,
+            &[needle],
+            &projection_offsets,
+            route.row_count,
+        )
+        .map_err(|err| err.to_string())?;
+    let (projected_rows, _kernel_event_elapsed_us) = submitted
+        .complete_detached()
+        .map_err(|err| err.to_string())?;
+    let rows = projected_rows
+        .into_iter()
+        .filter(|row| row.needle_index == 0)
+        .map(|row| {
+            row.values
+                .into_iter()
+                .map(SqlValue::Int4)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let columns = batch_key
+        .projection_columns
+        .iter()
+        .map(|column| BackendColumn::new(column, 23, 4))
+        .collect::<Vec<_>>();
+    let mut bytes = Vec::new();
+    let mut writer = BackendWriter::new(&mut bytes);
+    write_select_result_rows(&mut writer, &columns, &rows).map_err(|err| err.to_string())?;
+    writer
+        .ready_for_query(false)
+        .map_err(|err| err.to_string())?;
+    Ok(bytes)
 }
 
 struct PendingCopy {
@@ -189,6 +428,7 @@ impl SelectFactDetail {
 
 struct EndpointState {
     engine: Engine,
+    retained_read_runtime: Arc<RetainedReadRuntime>,
     next_txn_id: u64,
     facts: BufWriter<File>,
     facts_dirty: bool,
@@ -232,7 +472,10 @@ fn retained_match_index_compaction(query_shape: &str) -> bool {
 }
 
 impl EndpointState {
-    fn new(facts_path: &str) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        facts_path: &str,
+        retained_read_runtime: Arc<RetainedReadRuntime>,
+    ) -> Result<Self, Box<dyn Error>> {
         let facts = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -240,6 +483,7 @@ impl EndpointState {
             .open(facts_path)?;
         Ok(Self {
             engine: Engine::new_local(),
+            retained_read_runtime,
             next_txn_id: 1,
             facts: BufWriter::new(facts),
             facts_dirty: false,
@@ -1021,6 +1265,23 @@ impl EndpointState {
             "sql_visible_resident_device_memory_retained",
             snapshot.device_memory_proof.is_some(),
         )?;
+        if let (Some(handle), Some(read_view)) = (
+            self.engine
+                .relational_retained_snapshot_handle(&pending.copy.table),
+            self.engine
+                .relational_retained_device_read_view(&pending.copy.table),
+        ) {
+            let route = RetainedReadRuntimeRoute {
+                table: pending.copy.table.clone(),
+                generation: handle.generation,
+                row_count: u64::try_from(handle.row_count).unwrap_or(u64::MAX),
+                int4_columns: handle.resident_device_int4_columns,
+                read_view,
+            };
+            self.retained_read_runtime
+                .publish(route)
+                .map_err(|err| -> Box<dyn Error> { err.into() })?;
+        }
         self.fact("copy_streaming_bounded_chunks", true)?;
         self.fact("copy_committed_chunks", pending.committed_chunks)?;
         self.fact("copy_max_buffered_decoded_rows", pending.max_buffered_rows)?;
@@ -1753,6 +2014,7 @@ fn handle_client_io(
     mut stream: TcpStream,
     request_sender: EngineRequestSender,
     retained_read_response_cache: Arc<Mutex<RetainedReadResponseCache>>,
+    retained_read_runtime: Arc<RetainedReadRuntime>,
 ) -> Result<bool, String> {
     let mut startup = match read_startup_frame(&mut stream).map_err(|err| err.to_string())? {
         Some(frame) => frame,
@@ -1774,6 +2036,7 @@ fn handle_client_io(
     while let Some(frame) = read_tagged_frame(&mut stream).map_err(|err| err.to_string())? {
         match parse_frontend_message(&frame).map_err(|err| err.to_string())? {
             FrontendMessage::SimpleQuery(sql) if parse_copy_from_stdin(&sql).is_some() => {
+                retained_read_runtime.invalidate()?;
                 retained_read_response_cache
                     .lock()
                     .map_err(|_| "retained read response cache lock poisoned".to_string())?
@@ -1804,7 +2067,11 @@ fn handle_client_io(
                     continue;
                 }
                 match parse_command(&sql).map_err(|err| err.to_string())? {
-                    Command::Select(_) => {
+                    Command::Select(select) => {
+                        if let Some(bytes) = retained_read_runtime.try_execute(&sql, &select)? {
+                            stream.write_all(&bytes).map_err(|err| err.to_string())?;
+                            continue;
+                        }
                         let response = request_engine(
                             &request_sender,
                             EngineCommand::SimpleQuery(sql.clone()),
@@ -1820,6 +2087,7 @@ fn handle_client_io(
                         write_engine_response(&mut stream, response)?;
                     }
                     _ => {
+                        retained_read_runtime.invalidate()?;
                         retained_read_response_cache
                             .lock()
                             .map_err(|_| "retained read response cache lock poisoned".to_string())?
@@ -1839,6 +2107,7 @@ fn handle_client_io(
                 commit_pending_copy_chunks(pending, &request_sender, chunks)?;
             }
             FrontendMessage::CopyDone => {
+                retained_read_runtime.invalidate()?;
                 retained_read_response_cache
                     .lock()
                     .map_err(|_| "retained read response cache lock poisoned".to_string())?
@@ -1873,6 +2142,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(1);
     let retained_read_response_cache_enabled =
         std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+    let retained_read_runtime_view_enabled =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
     let gpu_microbatch_max = std::env::var("GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_MAX")
@@ -1951,6 +2224,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let retained_read_response_cache = Arc::new(Mutex::new(RetainedReadResponseCache::new(
         retained_read_response_cache_enabled,
     )));
+    let retained_read_runtime =
+        Arc::new(RetainedReadRuntime::new(retained_read_runtime_view_enabled));
     let accept_request_sender = EngineRequestSender {
         throughput_tx: request_tx.clone(),
         latency_tx: latency_request_tx.clone(),
@@ -1958,6 +2233,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let accept_completed_tx = completed_tx.clone();
     let accept_retained_read_response_cache = Arc::clone(&retained_read_response_cache);
+    let accept_retained_read_runtime = Arc::clone(&retained_read_runtime);
     let accept_handle = thread::spawn(move || -> Result<(), String> {
         for stream in listener.incoming().take(max_sessions) {
             let stream = stream.map_err(|err| err.to_string())?;
@@ -1965,11 +2241,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             let client_completed_tx = accept_completed_tx.clone();
             let client_retained_read_response_cache =
                 Arc::clone(&accept_retained_read_response_cache);
+            let client_retained_read_runtime = Arc::clone(&accept_retained_read_runtime);
             thread::spawn(move || {
                 let completed = handle_client_io(
                     stream,
                     client_request_sender,
                     client_retained_read_response_cache,
+                    client_retained_read_runtime,
                 )
                 .unwrap_or(false);
                 if completed {
@@ -1980,7 +2258,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok(())
     });
 
-    let mut state = EndpointState::new(&facts_path)?;
+    let mut state = EndpointState::new(&facts_path, Arc::clone(&retained_read_runtime))?;
     let retained_read_completion_worker_count = if requested_retained_read_completion_workers > 0
         && prepared_retained_microbatches_enabled
         && retained_read_pending_completion_cap > 0
@@ -2019,6 +2297,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "retained_read_response_cache_enabled",
         retained_read_response_cache_enabled,
+    )?;
+    state.fact(
+        "retained_read_runtime_view_enabled",
+        retained_read_runtime_view_enabled,
     )?;
     state.fact("owner_thread_gpu_microbatch_max", gpu_microbatch_max)?;
     state.fact(
@@ -2820,6 +3102,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact(
         "retained_read_response_cache_invalidations",
         cache.invalidations,
+    )?;
+    let runtime_stats = retained_read_runtime
+        .snapshot_stats()
+        .map_err(|err| -> Box<dyn Error> { err.into() })?;
+    state.fact(
+        "retained_read_runtime_view_published",
+        runtime_stats.published,
+    )?;
+    state.fact(
+        "retained_read_runtime_view_invalidations",
+        runtime_stats.invalidations,
+    )?;
+    state.fact(
+        "retained_read_runtime_view_attempts",
+        runtime_stats.attempts,
+    )?;
+    state.fact("retained_read_runtime_view_hits", runtime_stats.hits)?;
+    state.fact("retained_read_runtime_view_misses", runtime_stats.misses)?;
+    state.fact(
+        "retained_read_runtime_view_unsupported",
+        runtime_stats.unsupported,
+    )?;
+    state.fact(
+        "retained_read_runtime_view_failures",
+        runtime_stats.failures,
     )?;
     state.flush_facts()?;
     Ok(())

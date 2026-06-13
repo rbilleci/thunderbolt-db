@@ -1827,6 +1827,7 @@ REPORT
     GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS="$max_sessions" \
     GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL="${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}" \
     GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}" \
+    GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW="${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW:-0}" \
     GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}" \
     GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT:-1}" \
     GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_LIMIT="${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_LIMIT:-32}" \
@@ -1976,7 +1977,7 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"select_fact_detail":"$(json_escape "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}")","retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":$(select_phase_telemetry_bool "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}"),"next_target":"owner_response_scheduling_boundary","decision":"cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs and pending completion remain opt-in diagnostics until they remove a whole owner-loop boundary","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_ol_o_id_multi_column_literal_batch","order_line_lookup_ol_o_id_projection_literal_batch","order_line_lookup_ol_o_id_mixed_projection_literal_batch","order_line_lookup_ol_o_id_heterogeneous_literal_batch"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"select_fact_detail":"$(json_escape "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}")","retained_read_response_cache":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}"),"retained_read_runtime_view":$(json_bool "${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW:-0}"),"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":$(select_phase_telemetry_bool "${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}"),"next_target":"owner_response_scheduling_boundary","decision":"cache-off retained reads stay on the direct GPU microbatch path by default; fixed route lanes are the default; prepared retained read jobs and pending completion remain opt-in diagnostics until they remove a whole owner-loop boundary","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
@@ -1992,6 +1993,7 @@ JSON
 - pipeline_depth: \`${GPU_DB_CH_BENCH_PERSISTENT_PIPELINE_DEPTH:-1}\`
 - select_fact_detail: \`${GPU_DB_P8_ENGINE_PGWIRE_SELECT_FACT_DETAIL:-phase_only}\`
 - retained_read_response_cache: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE:-0}\`
+- retained_read_runtime_view: \`${GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RUNTIME_VIEW:-0}\`
 - gpu_microbatch_admission_window_micros: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ADMISSION_WINDOW_MICROS:-0}\`
 - gpu_microbatch_ready_scan_limit: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_READY_SCAN_LIMIT:-1}\`
 - gpu_microbatch_route_lane_scan_limit: \`${GPU_DB_P8_ENGINE_PGWIRE_GPU_MICROBATCH_ROUTE_LANE_SCAN_LIMIT:-32}\`
