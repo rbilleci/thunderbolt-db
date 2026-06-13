@@ -1,0 +1,16 @@
+[package]
+name = "gpu_db_facade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Protocol-neutral façade over the engine (prototype→production plan, P0-M1).
+# Depends on the engine (execution) and, transitionally, on the protocol crate for
+# the SQL value/command vocabulary it converts away from. The eventual goal
+# (next milestone) is to move that neutral vocabulary into `gpu_db_types` and
+# invert the engine→protocol dependency.
+
+[dependencies]
+thiserror.workspace = true
+gpu_db_engine = { path = "../engine" }
+gpu_db_protocol = { path = "../protocol" }
