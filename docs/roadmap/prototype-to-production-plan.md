@@ -316,6 +316,18 @@ Each major milestone below ships with a dated run report under
   realistic datasets, pinned clocks, significance thresholds), a milestone that
   cannot show a *mechanistic* reason a change is regression-free must treat small
   latency deltas as inconclusive rather than as evidence of no regression.
+  - **Update (2026-06-13): a minimal median-of-N slice landed** for the
+    engine-pgwire concurrency path (`scripts/run_p8_engine_pgwire_median_of_n.sh`
+    + `scripts/aggregate_concurrency_runs.py`): N repeated runs → per-cell median,
+    95% CI, coefficient of variation, and a power-based **A/B minimum detectable
+    effect**, with a discarded warm-up and error/failed-run exclusion. The committed
+    N=10 baseline resolves before/after deltas of **~13% (median cell, up to ~24%
+    noisiest)** at α=0.05/power=0.80 — that A/B MDE is the step-4 credibility gate
+    (the ~7% CI half-width is estimate *precision*, ~2× smaller, not the gate). See
+    `docs/testing/reports/series/prototype-to-production/runs/2026-06-13-p1-m3-noise-controlled-baseline-v1.md`.
+    Independently audited (the original report mislabeled precision as the gate;
+    fixed). The **full** Phase-5 harness (open-loop/offered-rate, steady-state
+    duration, p99.9, realistic datasets, three-way PG curves) is still owed.
 
 ### Phase 0 — Unify and tell the truth (foundation, weeks)
 **Goal:** one system of record, reached through a protocol-neutral boundary;
@@ -525,9 +537,11 @@ thesis pays off second.
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
 
-**Last benchmark:** the P0-M2 "M2" run. Nothing since touched the measured path
-(all additive/correctness/docs), so per §5.7 no benchmark was re-run. The next
-meaningful benchmark is the M0 re-run inside P1-M3.
+**Last benchmark:** a **noise-controlled median-of-10 baseline** captured 2026-06-13
+(`target/2026-06-13-p1-m3-median-baseline/`) as the regression anchor for P1-M3 — it
+reproduces M0 within run-to-run variance (step 1 changed nothing on the measured
+path; this is a noise characterization, not an improvement). The next *meaningful*
+(improvement) benchmark is the step-4 re-run after the `&self` read-path flip.
 
 **Immediate next: P1-M3 — apply the snapshot substrate to the engine read path.**
 Full design, ordered steps, and acceptance gates:
@@ -551,6 +565,12 @@ Full design, ordered steps, and acceptance gates:
 4. Re-run M0 **with Phase-5 noise controls** (median-of-N + CI) and show the
    queue-wait term drop — this is the first milestone that may claim a real latency
    improvement.
+   - **Noise controls + baseline now exist (2026-06-13)**:
+     `scripts/run_p8_engine_pgwire_median_of_n.sh` + the committed median-of-10
+     baseline (resolves ~13% median before/after deltas — A/B MDE at N=10, α=0.05,
+     power=0.80). Step 4 re-runs that exact command and accepts only deltas above
+     each cell's A/B minimum-detectable-effect. Report:
+     `.../runs/2026-06-13-p1-m3-noise-controlled-baseline-v1.md`.
 
 **Gotcha (found 2026-06-13):** `CudaResidentDeviceMemoryReadView` is *non-owning*;
 a `SnapshotCell<ReadView>` would be a GPU use-after-free on invalidation — the
