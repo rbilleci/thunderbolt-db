@@ -17,6 +17,7 @@ gpu_db_batching = { path = "../batching" }
 gpu_db_planner = { path = "../planner" }
 gpu_db_execution = { path = "../execution" }
 gpu_db_storage = { path = "../storage" }
+gpu_db_snapshot = { path = "../snapshot" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

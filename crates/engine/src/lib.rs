@@ -35,6 +35,7 @@ use gpu_db_protocol::{
     TablespacePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
+use gpu_db_snapshot::SnapshotCell;
 use gpu_db_storage::{
     InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleStore, TupleVersion,
     Visibility as StorageVisibility,
@@ -6028,10 +6029,73 @@ pub struct Engine {
     cached_cuda_probe_runtime: Option<CudaDriverRuntime>,
 }
 
+/// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]
+/// generation. A reader `get`s an owned `Arc` (a refcount bump, no borrow of the map)
+/// so it pins the owner for its whole read; the serialized writer publishes a new
+/// generation on (re)population and a `None` tombstone on invalidation instead of
+/// freeing in place, so an in-flight reader's generation is never dropped under it
+/// (P1-M3 slice B; doc 14). `Some` = resident, `None` = tombstoned (not resident).
+#[derive(Debug, Default)]
+struct ResidentDeviceMemoryMap {
+    cells: BTreeMap<String, SnapshotCell<Option<Arc<CudaResidentDeviceMemory>>>>,
+}
+
+impl ResidentDeviceMemoryMap {
+    /// Load the currently-published resident owner for `table`, if any (owned `Arc`).
+    fn get(&self, table: &str) -> Option<Arc<CudaResidentDeviceMemory>> {
+        self.cells
+            .get(table)
+            .and_then(|cell| cell.load().get().clone())
+    }
+
+    /// Whether `table` currently has a published resident owner.
+    fn contains_key(&self, table: &str) -> bool {
+        self.cells
+            .get(table)
+            .is_some_and(|cell| cell.load().get().is_some())
+    }
+
+    /// Number of tables with a published resident owner (tombstones excluded).
+    /// Test-only accessor (residency counts are asserted in tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.cells
+            .values()
+            .filter(|cell| cell.load().get().is_some())
+            .count()
+    }
+
+    /// Publish a table's resident owner as a new generation (creating the cell on
+    /// first residency); an in-flight reader keeps the generation it already loaded.
+    fn insert(&mut self, table: String, owner: CudaResidentDeviceMemory) {
+        let owner = Some(Arc::new(owner));
+        if let Some(cell) = self.cells.get(&table) {
+            cell.publish(owner);
+            return;
+        }
+        self.cells.insert(table, SnapshotCell::new(owner));
+    }
+
+    /// Publish a `None` tombstone (invalidation): the cell is retained so in-flight
+    /// readers keep their generation; new loads see "not resident". No-op if the table
+    /// has no cell.
+    fn invalidate(&mut self, table: &str) {
+        if let Some(cell) = self.cells.get(table) {
+            cell.publish(None);
+        }
+    }
+
+    /// Remove a table's cell entirely (DROP TABLE). In-flight readers retain their own
+    /// loaded generation via its `Arc`, so this never frees memory under a reader.
+    fn remove(&mut self, table: &str) {
+        self.cells.remove(table);
+    }
+}
+
 #[derive(Debug, Default)]
 struct RelationalResidentCache {
     snapshots: BTreeMap<String, RelationalResidencySnapshot>,
-    device_memory: BTreeMap<String, Arc<CudaResidentDeviceMemory>>,
+    device_memory: ResidentDeviceMemoryMap,
     partitions: BTreeMap<String, Vec<RelationalResidentPartition>>,
     partition_device_memory: BTreeMap<(String, u32), CudaResidentDeviceMemory>,
     budget_bytes_by_gpu: BTreeMap<u16, u64>,
@@ -6166,10 +6230,11 @@ impl RelationalResidentCache {
         device_memory: Option<CudaResidentDeviceMemory>,
     ) {
         if let Some(device_memory) = device_memory {
-            self.device_memory
-                .insert(table.clone(), Arc::new(device_memory));
+            self.device_memory.insert(table.clone(), device_memory);
         } else {
-            self.device_memory.remove(&table);
+            // Refreshed without device memory (e.g. no GPU): publish a tombstone so any
+            // in-flight reader of a prior resident generation keeps it.
+            self.device_memory.invalidate(&table);
         }
         self.snapshots.insert(table, snapshot);
     }
@@ -9050,7 +9115,9 @@ impl Engine {
                 proof.retained = false;
             }
         }
-        self.relational_resident_cache.device_memory.remove(table);
+        self.relational_resident_cache
+            .device_memory
+            .invalidate(table);
         if let Some(partitions) = self.relational_resident_cache.partitions.get_mut(table) {
             for partition in partitions.iter_mut() {
                 if partition.invalidated_by_txn_id.is_none() {
@@ -9131,7 +9198,9 @@ impl Engine {
                 if let Some(proof) = snapshot.device_memory_proof.as_mut() {
                     proof.retained = false;
                 }
-                self.relational_resident_cache.device_memory.remove(table);
+                self.relational_resident_cache
+                    .device_memory
+                    .invalidate(table);
             }
         }
         for (table, partitions) in self.relational_resident_cache.partitions.iter_mut() {
