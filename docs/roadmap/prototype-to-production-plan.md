@@ -575,11 +575,23 @@ Full design, ordered steps, and acceptance gates:
        migration proved nearly free (`&Arc` auto-derefs at the ~37 read sites; one
        method-reference call site adjusted). Relies on step 1's `unsafe impl Send +
        Sync`.
-     - **Next:** route the read sites through an owned-`Arc` accessor, swap the backing
-       store to `SnapshotCell<Option<Arc<owner>>>` with publish-on-commit (reusing
-       slice A's mutated-table scope for publish-per-table), then flip the read methods
-       to `&self` (step 3 / gate 2). This remainder is audit-worthy and is the
-       prerequisite for step 4's latency claim.
+     - **Step 2 ✅ (2026-06-13): SnapshotCell residency + publish-on-commit.** A
+       `ResidentDeviceMemoryMap` newtype backs each table with its own
+       `SnapshotCell<Option<Arc<owner>>>`; reads `get()` an owned `Arc`, the writer
+       publishes generations (populate→`Some`, invalidation→`None` tombstone retaining
+       the cell, DROP→remove). The `get()` accessor returns owned `Arc` so the ~33 read
+       sites are unchanged. Behavior-preserving (suite 371 green). Report:
+       `.../runs/2026-06-13-p1-m3-step2-sliceB-snapshotcell-residency-v1.md`.
+     - **Next — step 3 (the `&self` flip / gate 2):** flip `execute_relational_select`,
+       the dispatcher, and the resident-route methods from `&mut self` to `&self` over a
+       loaded generation so reads run concurrently. Needs interior mutability for the
+       metrics + route-decision recording the read path mutates today; its own audit.
+       Prerequisite for step 4's latency claim. **Two follow-ups the B2 audit surfaced,
+       both owed here:** (a) capture one loaded owner `Arc` per dispatch and thread it
+       through clear→probe→read so kernel-event telemetry can't read a different
+       generation's `Mutex` under concurrency; (b) migrate `partition_device_memory` to
+       the same tombstone/`SnapshotCell` model — it is still freed in place and is not
+       `&self`-read-safe for concurrent free.
 3. Flip `execute_relational_select` + the resident-route methods from `&mut self`
    to `&self` over a loaded generation.
 4. Re-run M0 **with Phase-5 noise controls** (median-of-N + CI) and show the
