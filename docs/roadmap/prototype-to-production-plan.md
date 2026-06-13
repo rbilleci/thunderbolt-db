@@ -532,7 +532,8 @@ thesis pays off second.
 **Milestone ladder — done, all independently audited and the audit findings fixed:**
 - M0 baseline ✅ · P0-M1 façade ✅ · P0-M2 first serving path ✅ ·
   P0-M3 engine-backed server (`crates/server`) ✅ · P1-M2 snapshot spike
-  (`crates/snapshot`) ✅ · **P1-M3 step 1 snapshot soundness probe ✅ (2026-06-13)**.
+  (`crates/snapshot`) ✅ · **P1-M3 step 1 snapshot soundness probe ✅ (2026-06-13)** ·
+  **P1-M3 step 2a per-table residency invalidation ✅ (2026-06-13)**.
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
@@ -560,6 +561,15 @@ Full design, ordered steps, and acceptance gates:
      Surfaced the GPU **context-model** decision now tracked as §9.3.
 2. Make per-table residency a `SnapshotCell<Arc<owner>>`; publish-on-commit instead
    of in-place free (also fixes the global stop-the-world invalidation).
+   - **Slice A ✅ (2026-06-13): per-table invalidation.** The commit path now
+     invalidates only the tables a batch mutated (derived from the committed commands),
+     with a conservative global fallback that can never under-invalidate. Independently
+     audited (no under-invalidation path — the engine is RESTRICT-only, no cascades/
+     triggers/multi-table DML). Report:
+     `.../runs/2026-06-13-p1-m3-step2-per-table-invalidation-v1.md`. (Deepens the §9.2
+     engine→protocol coupling — residency now parses `Command`s in `engine`.)
+   - **Slice B (next): `SnapshotCell<Arc<owner>>` residency + `&self` reads** — coupled
+     with step 3, since a published generation only matters once reads are concurrent.
 3. Flip `execute_relational_select` + the resident-route methods from `&mut self`
    to `&self` over a loaded generation.
 4. Re-run M0 **with Phase-5 noise controls** (median-of-N + CI) and show the
@@ -619,6 +629,9 @@ durable state.
 crate. This is the inverted coupling §5.0 warns against, and it is what makes
 routing the legacy server through the façade a Cargo cycle (so 9.1 is blocked on
 this). The façade also still carries a conversion layer because of it.
+- Note (2026-06-13): P1-M3 step 2a (per-table residency invalidation) added another
+  `parse_command`/`Command` use in `engine` (`residency_invalidation_scope`),
+  deepening this coupling — one more reason the inversion is owed.
 - **End state:** neutral SQL vocabulary lives in a lower crate (e.g. `gpu_db_sql`
   or `gpu_db_types`); `engine`, `protocol`, and `facade` all depend on *it*;
   `engine` no longer depends on `protocol`; the façade's neutral types come from

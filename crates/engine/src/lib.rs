@@ -8941,7 +8941,7 @@ impl Engine {
             self.repl.mark_applied(e.index);
         }
 
-        self.invalidate_relational_residency(txn_id, token.index);
+        self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
         self.visible_up_to = self.visible_up_to.max(token.index);
         self.metrics.inc_commit();
 
@@ -9006,7 +9006,7 @@ impl Engine {
         }
 
         let residency_invalidation_started = Instant::now();
-        self.invalidate_relational_residency(txn_id, token.index);
+        self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
         let residency_invalidation_micros = residency_invalidation_started.elapsed().as_micros();
         self.visible_up_to = self.visible_up_to.max(token.index);
         self.metrics.inc_commit();
@@ -9014,8 +9014,32 @@ impl Engine {
         Ok((token, residency_invalidation_micros))
     }
 
+    /// Global (stop-the-world) residency invalidation: invalidate every resident
+    /// table. Retained as the **conservative fallback** for commit batches whose
+    /// mutated tables cannot be determined precisely ([`Engine::residency_invalidation_scope`]
+    /// returns `None`). Equivalent to invalidating each resident table individually.
     fn invalidate_relational_residency(&mut self, txn_id: TxnId, index: Index) {
-        for (table, snapshot) in self.relational_resident_cache.snapshots.iter_mut() {
+        let tables: BTreeSet<String> = self
+            .relational_resident_cache
+            .snapshots
+            .keys()
+            .cloned()
+            .chain(self.relational_resident_cache.partitions.keys().cloned())
+            .collect();
+        for table in &tables {
+            self.invalidate_relational_residency_table(table, txn_id, index);
+        }
+    }
+
+    /// Invalidate the residency of a **single** table (its snapshot, device memory,
+    /// and partitions). This is the per-table unit the commit path uses so a write to
+    /// one table no longer evicts every other table's residency — the former
+    /// stop-the-world behavior. Summing this over all resident tables reproduces the
+    /// previous global invalidation; the device-memory/partition removals here are
+    /// unconditional, so in degenerate cache states it may clear a stray cross-map
+    /// entry the old two-loop form left — strictly-safe extra cleanup, never stale.
+    fn invalidate_relational_residency_table(&mut self, table: &str, txn_id: TxnId, index: Index) {
+        if let Some(snapshot) = self.relational_resident_cache.snapshots.get_mut(table) {
             if snapshot.invalidated_by_txn_id.is_none() {
                 snapshot.invalidated_by_txn_id = Some(txn_id);
                 snapshot.invalidated_at_index = Some(index);
@@ -9023,10 +9047,10 @@ impl Engine {
             if let Some(proof) = snapshot.device_memory_proof.as_mut() {
                 proof.retained = false;
             }
-            self.relational_resident_cache.device_memory.remove(table);
         }
-        for (table, partitions) in self.relational_resident_cache.partitions.iter_mut() {
-            for partition in partitions {
+        self.relational_resident_cache.device_memory.remove(table);
+        if let Some(partitions) = self.relational_resident_cache.partitions.get_mut(table) {
+            for partition in partitions.iter_mut() {
                 if partition.invalidated_by_txn_id.is_none() {
                     partition.invalidated_by_txn_id = Some(txn_id);
                     partition.invalidated_at_index = Some(index);
@@ -9035,9 +9059,65 @@ impl Engine {
                     proof.retained = false;
                 }
             }
-            self.relational_resident_cache
-                .partition_device_memory
-                .retain(|(partition_table, _partition_id), _memory| partition_table != table);
+        }
+        self.relational_resident_cache
+            .partition_device_memory
+            .retain(|(partition_table, _partition_id), _memory| partition_table != table);
+    }
+
+    /// The set of tables a committed batch invalidates, or `None` to fall back to a
+    /// global invalidation. **Conservative by construction:** it narrows only for
+    /// commands whose mutated table(s) are unambiguous (single-table DML, TRUNCATE,
+    /// DROP TABLE) and treats CREATE TABLE as touching no existing residency. Any other
+    /// command — or a payload that fails to decode or parse — returns `None`, so
+    /// residency is never left stale. Over-invalidation is merely a performance cost;
+    /// under-invalidation would serve wrong rows, so this must never narrow when unsure.
+    fn residency_invalidation_scope(entries: &[LogEntry]) -> Option<BTreeSet<String>> {
+        let mut tables = BTreeSet::new();
+        for entry in entries {
+            let text = std::str::from_utf8(&entry.payload).ok()?;
+            let command = parse_command(text).ok()?;
+            match command {
+                Command::Insert(insert) => {
+                    tables.insert(insert.table);
+                }
+                Command::Update(update) => {
+                    tables.insert(update.table);
+                }
+                Command::Delete(delete) => {
+                    tables.insert(delete.table);
+                }
+                Command::TruncateTable(truncate) => {
+                    tables.insert(truncate.name);
+                }
+                Command::DropTable(drop) => {
+                    tables.extend(drop.names);
+                }
+                // A brand-new table has no prior residency to invalidate.
+                Command::CreateTable(_) => {}
+                // Any other command (other DDL, ACL, KV, schema/db/role/...) is not yet
+                // precisely scoped; invalidate everything rather than risk staleness.
+                _ => return None,
+            }
+        }
+        Some(tables)
+    }
+
+    /// Invalidate residency for a committed batch: per-table when the mutated tables
+    /// can be determined, else a conservative global invalidation.
+    fn invalidate_relational_residency_for_commit(
+        &mut self,
+        entries: &[LogEntry],
+        txn_id: TxnId,
+        index: Index,
+    ) {
+        match Self::residency_invalidation_scope(entries) {
+            Some(tables) => {
+                for table in &tables {
+                    self.invalidate_relational_residency_table(table, txn_id, index);
+                }
+            }
+            None => self.invalidate_relational_residency(txn_id, index),
         }
     }
 
@@ -26269,6 +26349,124 @@ mod tests {
             invalidated.invalidated_at_index
         );
         assert!(refresh_cost.invalidated_by_memory_pressure);
+    }
+
+    #[test]
+    fn mutation_invalidates_only_the_mutated_table_residency() {
+        // P1-M3 step 2: per-table residency invalidation. A write to one table must no
+        // longer evict every other table's residency (the former stop-the-world bug).
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
+        e.execute_text(2, "CREATE TABLE b (id INT)").unwrap();
+        e.execute_text(3, "INSERT INTO a (id) VALUES (1)").unwrap();
+        e.execute_text(4, "INSERT INTO b (id) VALUES (1)").unwrap();
+        e.populate_relational_residency_snapshot("a").unwrap();
+        e.populate_relational_residency_snapshot("b").unwrap();
+        assert!(e.relational_residency_snapshot("a").unwrap().is_valid());
+        assert!(e.relational_residency_snapshot("b").unwrap().is_valid());
+
+        e.execute_text(5, "INSERT INTO a (id) VALUES (2)").unwrap();
+
+        let a = e.relational_residency_snapshot("a").unwrap();
+        assert_eq!(
+            a.invalidated_by_txn_id,
+            Some(5),
+            "the mutated table is invalidated"
+        );
+        assert!(!a.is_valid());
+        let b = e.relational_residency_snapshot("b").unwrap();
+        assert_eq!(
+            b.invalidated_by_txn_id, None,
+            "table b residency must survive a write to table a (per-table invalidation)"
+        );
+        assert!(b.is_valid());
+    }
+
+    #[test]
+    fn create_table_does_not_invalidate_existing_residency() {
+        // CREATE TABLE introduces a brand-new table with no prior residency, so it must
+        // touch no existing table's snapshot (scope contributes the empty set).
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
+        e.execute_text(2, "INSERT INTO a (id) VALUES (1)").unwrap();
+        e.populate_relational_residency_snapshot("a").unwrap();
+        assert!(e.relational_residency_snapshot("a").unwrap().is_valid());
+
+        e.execute_text(3, "CREATE TABLE c (id INT)").unwrap();
+        assert!(
+            e.relational_residency_snapshot("a").unwrap().is_valid(),
+            "CREATE TABLE must not invalidate an unrelated resident table"
+        );
+    }
+
+    #[test]
+    fn unscoped_ddl_conservatively_invalidates_unrelated_residency() {
+        // A schema change is not (yet) scoped to a single table, so it conservatively
+        // invalidates UNRELATED residency too rather than risk a stale snapshot.
+        // Over-invalidation is safe; under-invalidation would serve wrong rows. (The
+        // mutated table `a` has its snapshot rebuilt by the schema change itself, so we
+        // observe the conservative fallback on the untouched table `b`.)
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE a (id INT)").unwrap();
+        e.execute_text(2, "CREATE TABLE b (id INT)").unwrap();
+        e.execute_text(3, "INSERT INTO a (id) VALUES (1)").unwrap();
+        e.execute_text(4, "INSERT INTO b (id) VALUES (1)").unwrap();
+        e.populate_relational_residency_snapshot("a").unwrap();
+        e.populate_relational_residency_snapshot("b").unwrap();
+        assert!(e.relational_residency_snapshot("b").unwrap().is_valid());
+
+        e.execute_text(5, "ALTER TABLE a ADD COLUMN note INT DEFAULT 0")
+            .unwrap();
+
+        let b = e.relational_residency_snapshot("b").unwrap();
+        assert!(
+            !b.is_valid(),
+            "an unscoped DDL on table a must conservatively invalidate unrelated table b"
+        );
+        assert_eq!(b.invalidated_by_txn_id, Some(5));
+    }
+
+    #[test]
+    fn residency_invalidation_scope_narrows_dml_and_falls_back_on_unknown() {
+        fn entry(index: Index, sql: &str) -> LogEntry {
+            LogEntry {
+                term: 1,
+                index,
+                payload: sql.as_bytes().to_vec(),
+            }
+        }
+
+        // single-table DML -> exactly that table
+        assert_eq!(
+            Engine::residency_invalidation_scope(&[entry(1, "INSERT INTO a (id) VALUES (1)")]),
+            Some(BTreeSet::from(["a".to_string()]))
+        );
+        // DML across tables -> the union
+        assert_eq!(
+            Engine::residency_invalidation_scope(&[
+                entry(1, "INSERT INTO a (id) VALUES (1)"),
+                entry(2, "INSERT INTO b (id) VALUES (1)"),
+            ]),
+            Some(BTreeSet::from(["a".to_string(), "b".to_string()]))
+        );
+        // CREATE TABLE introduces no prior residency -> empty set (narrowed, not global)
+        assert_eq!(
+            Engine::residency_invalidation_scope(&[entry(1, "CREATE TABLE d (id INT)")]),
+            Some(BTreeSet::new())
+        );
+        // an unscoped command anywhere in the batch -> conservative global (None)
+        assert_eq!(
+            Engine::residency_invalidation_scope(&[
+                entry(1, "INSERT INTO a (id) VALUES (1)"),
+                entry(2, "ALTER TABLE a ADD COLUMN note INT DEFAULT 0"),
+            ]),
+            None
+        );
+        // an unparseable payload -> conservative global (None)
+        assert_eq!(
+            Engine::residency_invalidation_scope(&[entry(1, "this is not sql")]),
+            None
+        );
     }
 
     #[test]

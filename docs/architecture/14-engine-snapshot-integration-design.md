@@ -53,6 +53,12 @@ generation metadata). Then:
 - This also naturally fixes the current stop-the-world behavior
   (`engine/lib.rs:9017` invalidates *all* residency on any write): publish-per-table
   replaces global removal, and in-flight readers are never interrupted.
+  - **Done early as step 2 slice A (2026-06-13):** the stop-the-world fix landed ahead
+    of the `SnapshotCell` migration — the commit path now invalidates only the mutated
+    tables (conservative global fallback), independently audited. The per-table
+    invalidation *unit* and the "which tables did this commit mutate" logic are reused
+    by the publish-per-table path here. Slice B is the `SnapshotCell<Arc<owner>>`
+    migration + `&self` reads (with step 3).
 
 ### Required type changes
 
