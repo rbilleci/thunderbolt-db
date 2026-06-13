@@ -933,12 +933,19 @@ impl EndpointState {
     ) -> Result<(), Box<dyn Error>> {
         match parse_command(sql)? {
             Command::CreateTable(_) => {
+                // P0-M2: this serving path now flows through the protocol-neutral
+                // façade. The façade parses, dispatches to the engine, and returns
+                // a neutral outcome; the pg adapter formats the completion tag.
+                // Hot retained-read paths below still call the engine directly via
+                // the documented transitional path until they are migrated.
                 let txn_id = self.take_txn_id();
-                self.engine.execute_text(txn_id, sql)?;
+                let outcome = gpu_db_facade::execute_on_engine(&mut self.engine, txn_id, sql)
+                    .map_err(|err| err.to_string())?;
                 let mut writer = BackendWriter::new(output);
-                writer.command_complete("CREATE TABLE")?;
+                writer
+                    .command_complete(&gpu_db_facade::pg_adapter::command_complete_tag(&outcome))?;
                 writer.ready_for_query(false)?;
-                self.fact("create_table_into_engine_wal_mvcc", true)?;
+                self.fact("create_table_through_facade", true)?;
             }
             Command::Select(select) => {
                 let emit_select_phase = self.select_fact_detail.emits_phase();

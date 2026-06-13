@@ -21,3 +21,7 @@ gpu_db_storage = { path = "../storage" }
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-postgres = "0.7"
+# Examples route serving paths through the protocol-neutral façade. This is a
+# dev-only back-edge (facade depends on engine); it does not affect the library
+# build graph.
+gpu_db_facade = { path = "../facade" }

@@ -177,53 +177,18 @@ impl EngineFacade {
             });
         }
 
-        match parse_command(sql).map_err(map_parse_error)? {
-            Command::Select(select) => {
-                let result = self
-                    .engine
-                    .execute_relational_select(&select)
-                    .map_err(map_execute_error)?;
-                let columns = result.columns.iter().map(map_column).collect();
-                let rows = result
-                    .rows
-                    .into_iter()
-                    .map(|row| row.into_iter().map(map_value).collect())
-                    .collect();
-                Ok(QueryOutcome::Rows { columns, rows })
-            }
-            Command::Begin => {
-                self.set_in_transaction(session, true);
-                Ok(QueryOutcome::Command {
-                    tag: CommandTag::Begin,
-                    rows_affected: None,
-                })
-            }
-            Command::Commit { .. } => {
-                self.set_in_transaction(session, false);
-                Ok(QueryOutcome::Command {
-                    tag: CommandTag::Commit,
-                    rows_affected: None,
-                })
-            }
-            Command::Rollback { .. } => {
-                self.set_in_transaction(session, false);
-                Ok(QueryOutcome::Command {
-                    tag: CommandTag::Rollback,
-                    rows_affected: None,
-                })
-            }
-            other => {
-                let tag = command_tag(&other);
-                let txn_id = self.take_txn_id();
-                self.engine
-                    .execute_text(txn_id, sql)
-                    .map_err(map_execute_error)?;
-                Ok(QueryOutcome::Command {
-                    tag,
-                    rows_affected: None,
-                })
+        let txn_id = self.take_txn_id();
+        let outcome = execute_on_engine(&mut self.engine, txn_id, sql)?;
+        if let QueryOutcome::Command { tag, .. } = &outcome {
+            match tag {
+                CommandTag::Begin => self.set_in_transaction(session, true),
+                CommandTag::Commit | CommandTag::Rollback => {
+                    self.set_in_transaction(session, false)
+                }
+                _ => {}
             }
         }
+        Ok(outcome)
     }
 
     fn set_in_transaction(&mut self, session: SessionId, value: bool) {
@@ -236,6 +201,58 @@ impl EngineFacade {
 impl Default for EngineFacade {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Execute one SQL command against a borrowed engine and return a neutral
+/// outcome.
+///
+/// This is the stateless core of [`EngineFacade::execute`], exposed so a serving
+/// path that already owns its `Engine` (the benchmark endpoint today, the
+/// production server next) can route a statement through the neutral boundary
+/// without surrendering ownership of the engine. Transaction-control statements
+/// produce the corresponding [`CommandTag`] but do not update any session state —
+/// the owning caller decides whether to track that.
+pub fn execute_on_engine(
+    engine: &mut Engine,
+    txn_id: u64,
+    sql: &str,
+) -> Result<QueryOutcome, DbError> {
+    match parse_command(sql).map_err(map_parse_error)? {
+        Command::Select(select) => {
+            let result = engine
+                .execute_relational_select(&select)
+                .map_err(map_execute_error)?;
+            let columns = result.columns.iter().map(map_column).collect();
+            let rows = result
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().map(map_value).collect())
+                .collect();
+            Ok(QueryOutcome::Rows { columns, rows })
+        }
+        Command::Begin => Ok(QueryOutcome::Command {
+            tag: CommandTag::Begin,
+            rows_affected: None,
+        }),
+        Command::Commit { .. } => Ok(QueryOutcome::Command {
+            tag: CommandTag::Commit,
+            rows_affected: None,
+        }),
+        Command::Rollback { .. } => Ok(QueryOutcome::Command {
+            tag: CommandTag::Rollback,
+            rows_affected: None,
+        }),
+        other => {
+            let tag = command_tag(&other);
+            engine
+                .execute_text(txn_id, sql)
+                .map_err(map_execute_error)?;
+            Ok(QueryOutcome::Command {
+                tag,
+                rows_affected: None,
+            })
+        }
     }
 }
 
