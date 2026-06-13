@@ -16,12 +16,12 @@ The engine targets the following service‑level objectives for a mid‑size cor
 
 | Metric | Target |
 |--------|--------|
-| Sustained OLTP throughput | >= 50 000 TPS |
-| Peak burst throughput | >= 200 000 TPS |
-| P50 latency (simple OLTP) | < 2 ms |
-| P99 latency (simple OLTP) | < 10 ms |
-| P99.9 latency (simple OLTP) | < 50 ms |
-| Concurrent connections | >= 10 000 |
+| Sustained OLTP throughput | > 100 000 TPS |
+| Peak burst throughput | >= 400 000 TPS |
+| P50 latency (simple OLTP) | < 0.5 ms |
+| P99 latency (simple OLTP) | < 1 ms |
+| P99.9 latency (simple OLTP) | < 5 ms |
+| Concurrent connections | > 100 000 (up to 1 000 000) |
 | RPO (Recovery Point Objective) | 0 (no committed transaction loss) |
 | RTO (Recovery Time Objective) | < 30 s automated failover; < 5 min full GPU recovery |
 
@@ -81,7 +81,7 @@ Each layer exposes a defined interface.  Key interface contracts include:
 The engine maintains per‑session state in a **Session Manager** subsystem:
 
 * **Session state structure:**  Authenticated user, current database, transaction state (idle / in‑transaction / aborted), prepared statements, named portals, GUC parameter overrides, GPU resource reservations, temporary tables.
-* **Concurrency model:**  Async I/O via **Tokio** runtime using `io_uring` (Linux, via `tokio-uring`) or `kqueue` (macOS) with a small pool of I/O threads handling protocol encode/decode.  Parsed requests are fed into the batching/execution pipeline.  This avoids thread‑per‑connection overhead while supporting >= 10 000 concurrent connections.  Rust `async`/`await` manages the many concurrent protocol state machines, with each connection as a lightweight Tokio task.
+* **Concurrency model:**  Async I/O via **Tokio** runtime using `io_uring` (Linux, via `tokio-uring`) or `kqueue` (macOS) with a small pool of I/O threads handling protocol encode/decode.  Parsed requests are fed into the batching/execution pipeline.  This avoids thread‑per‑connection overhead while supporting > 100 000 concurrent connections (target ceiling 1 000 000 logical sessions, where only active flows consume hot‑path resources).  Rust `async`/`await` manages the many concurrent protocol state machines, with each connection as a lightweight Tokio task.
 * **Thread pool architecture:**  Separate thread pools for: (a) I/O threads for protocol handling, (b) planner/optimizer threads, (c) a batcher thread that assembles micro‑batches and dispatches to GPU streams, (d) WAL writer threads, (e) background workers (vacuum, checkpoint, statistics).  **Sizing guidance:**  I/O threads = number of CPU cores / 4 (minimum 2); planner threads = number of CPU cores / 4; batcher threads = 1 per GPU; WAL writer = 1 dedicated thread; background workers = configurable (default 3).  All pool sizes exposed as GUC parameters.  Total thread count should not exceed 2× CPU core count to avoid context‑switch overhead.
 * **Connection pooling:**  Built‑in transaction‑mode connection pooling (similar to PgBouncer).  Connections are returned to the pool at transaction boundaries.  Support `DISCARD ALL` semantics for external pooler compatibility.  Under overload, connections queue with a configurable timeout rather than being rejected.
 * **Resource limits:**  Per‑session limits on GPU memory, concurrent queries, and temporary storage.  `max_connections` parameter controls the system‑wide limit.
@@ -219,7 +219,7 @@ After each checkpoint, the first WAL record modifying a given page includes a **
 #### 3.7.5 Filesystem and storage requirements
 
 * **Recommended filesystems:**  XFS (preferred for WAL — optimized for concurrent sequential writes, stable `fsync` semantics) or ext4 with `data=ordered` journaling mode.  ZFS is supported but `O_DIRECT` must be disabled (ZFS uses its own ARC); WAL flush uses `fsync` instead.  Never use `data=writeback` on ext4 — it can lose data on crash.
-* **WAL storage:**  Dedicated NVMe SSD for WAL (separate from data files) to avoid I/O contention between sequential WAL writes and random data reads.  Sustained sequential write bandwidth >= 1 GB/s recommended for 200K TPS target.  Enterprise‑grade NVMe with power‑loss protection (PLP) required — consumer SSDs may lose buffered writes on power failure, violating fsync durability.
+* **WAL storage:**  Dedicated NVMe SSD for WAL (separate from data files) to avoid I/O contention between sequential WAL writes and random data reads.  Sustained sequential write bandwidth >= 2 GB/s recommended for the 400K TPS peak target.  Enterprise‑grade NVMe with power‑loss protection (PLP) required — consumer SSDs may lose buffered writes on power failure, violating fsync durability.
 * **Data storage:**  NVMe SSDs for data files.  RAID is not required (replication provides redundancy), but RAID‑10 is acceptable.  For large datasets, tiered storage: NVMe for hot data, SATA SSD or HDD for archived WAL and backups.
 * **Battery‑backed write cache (BBWC):**  If using hardware RAID, BBWC is required to ensure that write‑back caching honors `fsync` semantics.  Without BBWC, disable write‑back caching on the RAID controller.
 * **GPUDirect Storage:**  Requires a GDS‑compatible filesystem (ext4, XFS) and NVMe devices.  GDS is not supported on network filesystems (NFS, CIFS).  Fall back to pinned‑memory transfers when GDS is unavailable.
@@ -282,14 +282,14 @@ Transactions are classified before execution:
 Batching uses a **dual‑trigger** mechanism rather than a fixed batch size:
 
 * **Count threshold:**  Configurable (default 256 transactions).  Larger values improve GPU throughput but increase latency.
-* **Time deadline:**  Configurable (default 1 ms since first transaction in the batch).  Caps worst‑case queuing delay.
+* **Time deadline:**  Configurable (default 250 µs since first transaction in the batch).  Caps worst‑case queuing delay.  The deadline must stay well under the P50 target (0.5 ms) so that batch accumulation alone cannot consume the latency budget; the previous 1 ms default is incompatible with the sub‑0.5 ms P50 SLO.
 * Whichever trigger fires first closes the batch.  Both parameters are tunable at runtime.
 
 **Transaction‑type binning:**  At batch formation, transactions are grouped by type (balance inquiry, debit, credit, transfer) so that threads within the same warp execute the same code path, minimizing warp divergence.
 
 **Batch size floor:**  All batches are padded to a multiple of 32 (warp size) with no‑op transactions to avoid partial‑warp waste.
 
-**Latency analysis:**  At 50 000 TPS, a 1 ms deadline accumulates ~50 transactions per batch.  This is below optimal GPU utilization but acceptable for latency SLAs.  Multiple threads per transaction (32 threads for index lookups, version allocation, constraint checks) inflate parallelism to 50 × 32 = 1 600 threads.  At peak 200 000 TPS, a 1 ms window yields ~200 transactions = 6 400 threads — better GPU utilization.
+**Latency analysis:**  At 100 000 TPS, a 250 µs deadline accumulates ~25 transactions per batch.  This is below optimal GPU utilization but is the deliberate cost of the sub‑0.5 ms P50 SLO — the tighter latency target trades batch occupancy for queueing‑delay headroom.  Multiple threads per transaction (32 threads for index lookups, version allocation, constraint checks) inflate parallelism to 25 × 32 = 800 threads.  At peak 400 000 TPS, a 250 µs window yields ~100 transactions = 3 200 threads — better GPU utilization.  Sustaining occupancy at small batch counts depends on running multiple in‑flight batches across the CUDA stream pipeline rather than enlarging the per‑batch window.
 
 #### 4.1.3 GPU execution pipeline
 
@@ -303,7 +303,7 @@ Batching uses a **dual‑trigger** mechanism rather than a fixed batch size:
 
 **CUDA Graphs:**  Capture the multi‑kernel pipeline (initialize + execute + apply + index‑update) as a `cudaGraph_t` and replay it per batch.  This reduces per‑launch overhead from ~5 μs/kernel to ~1 μs for the entire pipeline.
 
-**Kernel launch overhead analysis:**  5 kernels × 7 μs = 35 μs overhead per batch.  At 2 ms target latency, this is < 2% — acceptable.  CUDA Graphs reduce this further.
+**Kernel launch overhead analysis:**  5 kernels × 7 μs = 35 μs overhead per batch.  Against the 0.5 ms P50 target this is ~7% — no longer negligible, so **CUDA Graphs become required, not optional**: collapsing the pipeline to a ~1 μs replay brings overhead back under ~1% of the latency budget.
 
 **Shared memory budget per block:**  On sm_80 through sm_120, configurable shared memory ranges from 48 KB (default) to 164 KB+ (sm_90+).  With 256 threads per block and 48 KB shared memory, each transaction gets ~192 bytes — sufficient for a few row pointers and scratch variables.  Use `cudaFuncSetAttribute()` to request maximum shared memory carveout for memory‑intensive kernels, documenting the tradeoff with L1 cache capacity.  For transactions exceeding their shared‑memory allocation, a **spill‑to‑global‑memory** path uses a pre‑allocated per‑block scratch area (10–20× slower but preserves correctness).  Bulk operations (e.g., a transfer debiting one account and crediting 10 000 accounts) are decomposed into sub‑batches at the CPU level.
 
@@ -622,7 +622,7 @@ Banking regulators require geographic redundancy.  The engine supports multi‑r
 * **Failover trigger:**  Manual operator decision (regulatory requirement — automated cross‑region failover can cause split‑brain with WAN partitions).  Automated monitoring alerts when cross‑region lag exceeds threshold.
 * **Standby promotion:**  Region B standby promoted to primary via Raft reconfiguration.  DNS/load‑balancer update directs clients to new primary.  GPU caches rebuilt from local WAL on the newly promoted nodes.
 * **WAL archiving for DR:**  Continuous WAL archiving to cross‑region object storage (S3 Cross‑Region Replication, GCS multi‑region buckets).  Guarantees PITR capability even if both Region A and Region B suffer simultaneous failure.
-* **Network bandwidth:**  Cross‑region WAL streaming requires sustained bandwidth proportional to write rate.  At 200K TPS with ~200 bytes per WAL record average, WAL generation is ~40 MB/s; cross‑region link must sustain this with headroom.
+* **Network bandwidth:**  Cross‑region WAL streaming requires sustained bandwidth proportional to write rate.  At 400K TPS with ~200 bytes per WAL record average, WAL generation is ~80 MB/s; cross‑region link must sustain this with headroom.
 * **Operational runbook:**  DR failover, failback, and split‑brain resolution procedures are documented as part of Phase 5 compliance certification.
 
 ### 7.12 Cross‑device consistency verification
@@ -797,7 +797,7 @@ Use `O_DIRECT` for WAL and checkpoint writes.  GPUDirect Storage for transfers >
 
 * **GPU memory pressure:**  Gradually increase working set to exhaustion; measure latency degradation curve.  Test with working set 10× GPU memory.
 * **72‑hour sustained load:**  Detect memory leaks, GPU fragmentation, WAL growth, GC failures.
-* **Thundering herd:**  10 000 connections querying the same hot account simultaneously.
+* **Thundering herd:**  100 000 connections querying the same hot account simultaneously.
 * **Cross‑GPU communication stress:**  Maximize cross‑GPU transfer and measure throughput degradation.
 * **Backpressure verification:**  When GPU falls behind, verify graceful degradation (queue/slow) not catastrophic failure (OOM/deadlock).
 * **Batch formation at low load:**  At 10 TPS, verify time‑deadline trigger fires and latency remains acceptable.
