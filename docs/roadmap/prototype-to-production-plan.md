@@ -582,11 +582,19 @@ Full design, ordered steps, and acceptance gates:
        the cell, DROP→remove). The `get()` accessor returns owned `Arc` so the ~33 read
        sites are unchanged. Behavior-preserving (suite 371 green). Report:
        `.../runs/2026-06-13-p1-m3-step2-sliceB-snapshotcell-residency-v1.md`.
-     - **Next — step 3 (the `&self` flip / gate 2):** flip `execute_relational_select`,
-       the dispatcher, and the resident-route methods from `&mut self` to `&self` over a
-       loaded generation so reads run concurrently. Needs interior mutability for the
-       metrics + route-decision recording the read path mutates today; its own audit.
-       Prerequisite for step 4's latency claim. **Two follow-ups the B2 audit surfaced,
+     - **Step 3 (the `&self` flip / gate 2) — in progress:** flip
+       `execute_relational_select`, the dispatcher, and the resident-route methods from
+       `&mut self` to `&self` over a loaded generation so reads run concurrently. Needs
+       interior mutability for the metrics + route-decision recording the read path
+       mutates today; its own audit. Prerequisite for step 4's latency claim.
+       - **Step 3a ✅ (2026-06-14): `RuntimeMetrics` is interior-mutable** (atomics +
+         mutex tail; all `inc_*`/`observe_*` now `&self`, saturating preserved). The
+         metrics foundation for the `&self` read path. Contained to `crates/metrics`,
+         behavior-preserving (12 tests green).
+       - **Remaining:** step 3b (make the route-decision recording —
+         `record_route_execution_observation`/`record_decision` — interior-mutable);
+         step 3c (flip the read signatures to `&self` + the telemetry-coherence fix +
+         a concurrent-reads test) then audit. **Two follow-ups the B2 audit surfaced,
        both owed here:** (a) capture one loaded owner `Arc` per dispatch and thread it
        through clear→probe→read so kernel-event telemetry can't read a different
        generation's `Mutex` under concurrency; (b) migrate `partition_device_memory` to
