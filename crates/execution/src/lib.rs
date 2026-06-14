@@ -114,10 +114,30 @@ struct CachedModule {
 /// process teardown (or if an entry is ever evicted). Residency holds an
 /// `Arc<GpuPrimaryContext>` and owns no context of its own (the §9.3 "residency owns no
 /// context" property).
+/// Bytes of reusable device "scratch" output attached to each pooled stream. Migrated
+/// scalar routes (e.g. COUNT) write their result here instead of `cuMemAlloc`-ing a fresh
+/// output buffer per call — removing a driver-serialized allocation from the hot path.
+const POOLED_STREAM_SCRATCH_BYTES: usize = 64;
+
+/// A pooled CUDA stream plus the reusable per-stream resources a migrated launch needs: a
+/// small device output buffer and a pair of timing events. Pooling these removes the
+/// per-call `cuMemAlloc`/`cuEventCreate`/`cuEventDestroy` (all driver-serialized) that the
+/// P2-M1 step-4 benchmark found re-serializing concurrent reads once the module load and
+/// whole-context sync were gone. `start_event`/`stop_event` are null when the event symbols
+/// are unavailable (timing is then skipped).
+struct PooledStream {
+    stream: *mut c_void,
+    output: u64,
+    start_event: *mut c_void,
+    stop_event: *mut c_void,
+}
+
 struct GpuPrimaryContext {
     device: i32,
     context: *mut c_void,
+    cu_mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> i32,
     cu_mem_free: unsafe extern "C" fn(u64) -> i32,
+    cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> i32,
     cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_primary_ctx_release: unsafe extern "C" fn(i32) -> i32,
     cu_module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32,
@@ -125,8 +145,13 @@ struct GpuPrimaryContext {
     cu_module_get_function: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32,
     cu_stream_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> i32,
     cu_stream_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    cu_stream_synchronize: unsafe extern "C" fn(*mut c_void) -> i32,
+    cu_event_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> i32,
+    cu_event_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    cu_event_record: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32,
+    cu_event_elapsed_time: unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32,
     modules: Mutex<BTreeMap<&'static CStr, CachedModule>>,
-    streams: Mutex<Vec<*mut c_void>>,
+    streams: Mutex<Vec<PooledStream>>,
     lib: Arc<Library>,
 }
 
@@ -185,27 +210,58 @@ impl GpuPrimaryContext {
         Ok(function)
     }
 
-    /// Take a stream from the pool, creating one if the pool is empty.
-    fn acquire_stream(&self) -> Result<*mut c_void, CudaRuntimeProbeError> {
-        if let Some(stream) = self.streams.lock().expect("gpu stream pool poisoned").pop() {
-            return Ok(stream);
+    /// Take a stream (with its reusable scratch output + timing events) from the pool,
+    /// creating one if the pool is empty.
+    fn acquire_pooled_stream(&self) -> Result<PooledStream, CudaRuntimeProbeError> {
+        if let Some(pooled) = self.streams.lock().expect("gpu stream pool poisoned").pop() {
+            return Ok(pooled);
         }
         let mut stream = std::ptr::null_mut();
         check_cuda(unsafe { (self.cu_stream_create)(&mut stream, 0) })?;
-        Ok(stream)
+        let mut output = 0_u64;
+        if let Err(err) =
+            check_cuda(unsafe { (self.cu_mem_alloc)(&mut output, POOLED_STREAM_SCRATCH_BYTES) })
+        {
+            unsafe { (self.cu_stream_destroy)(stream) };
+            return Err(err);
+        }
+        // Best-effort timing events: if either fails, run untimed rather than fail the read.
+        let mut start_event = std::ptr::null_mut();
+        let mut stop_event = std::ptr::null_mut();
+        let s1 = unsafe { (self.cu_event_create)(&mut start_event, 0) };
+        let s2 = unsafe { (self.cu_event_create)(&mut stop_event, 0) };
+        if s1 != 0 || s2 != 0 {
+            if s1 == 0 {
+                unsafe { (self.cu_event_destroy)(start_event) };
+            }
+            if s2 == 0 {
+                unsafe { (self.cu_event_destroy)(stop_event) };
+            }
+            start_event = std::ptr::null_mut();
+            stop_event = std::ptr::null_mut();
+        }
+        Ok(PooledStream {
+            stream,
+            output,
+            start_event,
+            stop_event,
+        })
     }
 
-    /// Return a stream to the pool for reuse.
-    fn release_stream(&self, stream: *mut c_void) {
+    /// Return a pooled stream (and its scratch) to the pool for reuse.
+    fn release_pooled_stream(&self, pooled: PooledStream) {
         self.streams
             .lock()
             .expect("gpu stream pool poisoned")
-            .push(stream);
+            .push(pooled);
     }
 
     #[cfg(test)]
     fn cached_module_count(&self) -> usize {
-        self.modules.lock().map(|modules| modules.len()).unwrap_or(0)
+        self.modules
+            .lock()
+            .map(|modules| modules.len())
+            .unwrap_or(0)
     }
 
     fn create(gpu_id: u16) -> Result<Self, CudaRuntimeProbeError> {
@@ -214,13 +270,20 @@ impl GpuPrimaryContext {
         type CuPrimaryCtxRetain = unsafe extern "C" fn(*mut *mut c_void, i32) -> i32;
         type CuPrimaryCtxRelease = unsafe extern "C" fn(i32) -> i32;
         type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
         type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
         type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
         type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
         type CuModuleGetFunction =
             unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
         type CuStreamCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
         type CuStreamDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuStreamSynchronize = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
+        type CuEventDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuEventRecord = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+        type CuEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32;
 
         let lib = unsafe {
             Library::new("libcuda.so.1")
@@ -244,7 +307,10 @@ impl GpuPrimaryContext {
             b"cuDevicePrimaryCtxRelease\0"
         );
         let cu_ctx_set_current: CuCtxSetCurrent = sym!(CuCtxSetCurrent, b"cuCtxSetCurrent\0");
+        let cu_mem_alloc: CuMemAlloc = sym!(CuMemAlloc, b"cuMemAlloc_v2\0", b"cuMemAlloc\0");
         let cu_mem_free: CuMemFree = sym!(CuMemFree, b"cuMemFree_v2\0", b"cuMemFree\0");
+        let cu_memcpy_dtoh: CuMemcpyDtoH =
+            sym!(CuMemcpyDtoH, b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0");
         let cu_module_load_data: CuModuleLoadData = sym!(CuModuleLoadData, b"cuModuleLoadData\0");
         let cu_module_unload: CuModuleUnload = sym!(CuModuleUnload, b"cuModuleUnload\0");
         let cu_module_get_function: CuModuleGetFunction =
@@ -255,6 +321,14 @@ impl GpuPrimaryContext {
             b"cuStreamDestroy_v2\0",
             b"cuStreamDestroy\0"
         );
+        let cu_stream_synchronize: CuStreamSynchronize =
+            sym!(CuStreamSynchronize, b"cuStreamSynchronize\0");
+        let cu_event_create: CuEventCreate = sym!(CuEventCreate, b"cuEventCreate\0");
+        let cu_event_destroy: CuEventDestroy =
+            sym!(CuEventDestroy, b"cuEventDestroy_v2\0", b"cuEventDestroy\0");
+        let cu_event_record: CuEventRecord = sym!(CuEventRecord, b"cuEventRecord\0");
+        let cu_event_elapsed_time: CuEventElapsedTime =
+            sym!(CuEventElapsedTime, b"cuEventElapsedTime\0");
 
         check_cuda(unsafe { cu_init(0) })?;
         let mut device = 0_i32;
@@ -265,7 +339,9 @@ impl GpuPrimaryContext {
         Ok(Self {
             device,
             context,
+            cu_mem_alloc,
             cu_mem_free,
+            cu_memcpy_dtoh,
             cu_ctx_set_current,
             cu_primary_ctx_release,
             cu_module_load_data,
@@ -273,6 +349,11 @@ impl GpuPrimaryContext {
             cu_module_get_function,
             cu_stream_create,
             cu_stream_destroy,
+            cu_stream_synchronize,
+            cu_event_create,
+            cu_event_destroy,
+            cu_event_record,
+            cu_event_elapsed_time,
             modules: Mutex::new(BTreeMap::new()),
             streams: Mutex::new(Vec::new()),
             lib: Arc::new(lib),
@@ -290,8 +371,17 @@ impl Drop for GpuPrimaryContext {
             }
         }
         if let Ok(mut streams) = self.streams.lock() {
-            for stream in std::mem::take(&mut *streams) {
-                unsafe { (self.cu_stream_destroy)(stream) };
+            for pooled in std::mem::take(&mut *streams) {
+                unsafe {
+                    if !pooled.start_event.is_null() {
+                        (self.cu_event_destroy)(pooled.start_event);
+                    }
+                    if !pooled.stop_event.is_null() {
+                        (self.cu_event_destroy)(pooled.stop_event);
+                    }
+                    (self.cu_mem_free)(pooled.output);
+                    (self.cu_stream_destroy)(pooled.stream);
+                }
             }
         }
         unsafe { (self.cu_primary_ctx_release)(self.device) };
@@ -1697,9 +1787,6 @@ where
 fn launch_cuda_resident_row_count(
     resident: &CudaResidentDeviceMemory,
 ) -> Result<u64, CudaRuntimeProbeError> {
-    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
-    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -1741,27 +1828,6 @@ fn launch_cuda_resident_row_count(
         ));
     }
 
-    let cu_mem_alloc = unsafe {
-        resident
-            .lib()
-            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_mem_free = unsafe {
-        resident
-            .lib()
-            .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_launch_kernel = unsafe {
         resident
             .lib()
@@ -1769,16 +1835,10 @@ fn launch_cuda_resident_row_count(
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
-    let mut device_output = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_output, std::mem::size_of::<u64>()) })?;
-    let allocation_guard = CudaDeviceAllocationGuard {
-        ptr: device_output,
-        free: *cu_mem_free,
-    };
-
     // P2-M1: reuse the process-wide cached module/function (no per-launch
-    // cuModuleLoadData/Unload) and launch on a pooled private stream synced individually
-    // (no whole-context cuCtxSynchronize) — the two fixes the step-1 spike proved.
+    // cuModuleLoadData/Unload) and launch on a pooled private stream with a pooled scratch
+    // output + events (no per-call cuMemAlloc/cuEvent* and no whole-context
+    // cuCtxSynchronize) — the fixes the step-1 spike and step-4 benchmark located.
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
@@ -1786,40 +1846,32 @@ fn launch_cuda_resident_row_count(
         .primary()
         .cached_function(c"gpu_db_resident_row_count", &ptx)?;
 
-    let mut resident_arg = resident.device_ptr();
-    let mut output_arg = allocation_guard.ptr;
-    let mut args = [
-        (&mut resident_arg as *mut u64).cast::<c_void>(),
-        (&mut output_arg as *mut u64).cast::<c_void>(),
-    ];
-    launch_resident_kernel_on_pooled_stream(resident, |stream| unsafe {
-        cu_launch_kernel(
-            function,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            0,
-            stream,
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
+    let mut output_bytes = [0_u8; std::mem::size_of::<u64>()];
+    launch_resident_kernel_on_pooled_stream(resident, &mut output_bytes, |stream, output_ptr| {
+        let mut resident_arg = resident.device_ptr();
+        let mut output_arg = output_ptr;
+        let mut args = [
+            (&mut resident_arg as *mut u64).cast::<c_void>(),
+            (&mut output_arg as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                function,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
     })?;
 
-    let mut output = 0_u64;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut output as *mut u64).cast::<c_void>(),
-            allocation_guard.ptr,
-            std::mem::size_of::<u64>(),
-        )
-    })?;
-
-    drop(allocation_guard);
-
-    Ok(output)
+    Ok(u64::from_le_bytes(output_bytes))
 }
 
 fn launch_cuda_resident_i32_equal_count(
@@ -8496,93 +8548,68 @@ where
 /// always returned to the pool, even on error or panic.
 fn launch_resident_kernel_on_pooled_stream<F>(
     resident: &CudaResidentDeviceMemory,
+    output: &mut [u8],
     launch: F,
 ) -> Result<(), CudaRuntimeProbeError>
 where
-    F: FnOnce(*mut c_void) -> i32,
+    F: FnOnce(*mut c_void, u64) -> i32,
 {
-    type CuStreamSynchronize = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
-    type CuEventDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuEventRecord = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
-    type CuEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32;
-
     let primary = resident.primary();
-    let cu_stream_synchronize = unsafe {
-        *primary
-            .lib()
-            .get::<CuStreamSynchronize>(b"cuStreamSynchronize\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
+    assert!(
+        output.len() <= POOLED_STREAM_SCRATCH_BYTES,
+        "kernel output ({}) exceeds pooled stream scratch ({POOLED_STREAM_SCRATCH_BYTES})",
+        output.len()
+    );
 
-    // RAII: return the stream to the pool on every exit (success, error, panic).
+    // RAII: return the pooled stream (and its scratch) on every exit (success/error/panic).
     struct StreamLease<'a> {
         primary: &'a GpuPrimaryContext,
-        stream: *mut c_void,
+        pooled: Option<PooledStream>,
     }
     impl Drop for StreamLease<'_> {
         fn drop(&mut self) {
-            self.primary.release_stream(self.stream);
+            if let Some(pooled) = self.pooled.take() {
+                self.primary.release_pooled_stream(pooled);
+            }
         }
     }
     let lease = StreamLease {
         primary,
-        stream: primary.acquire_stream()?,
+        pooled: Some(primary.acquire_pooled_stream()?),
     };
-    let stream = lease.stream;
+    let pooled = lease.pooled.as_ref().expect("pooled stream just set");
+    let stream = pooled.stream;
+    let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
 
-    let event_symbols = unsafe {
-        let create = primary.lib().get::<CuEventCreate>(b"cuEventCreate\0");
-        let destroy = primary
-            .lib()
-            .get::<CuEventDestroy>(b"cuEventDestroy_v2\0")
-            .or_else(|_| primary.lib().get::<CuEventDestroy>(b"cuEventDestroy\0"));
-        let record = primary.lib().get::<CuEventRecord>(b"cuEventRecord\0");
-        let elapsed = primary
-            .lib()
-            .get::<CuEventElapsedTime>(b"cuEventElapsedTime\0");
-        match (create, destroy, record, elapsed) {
-            (Ok(create), Ok(destroy), Ok(record), Ok(elapsed)) => {
-                Some((*create, *destroy, *record, *elapsed))
-            }
-            _ => None,
-        }
-    };
+    // No per-call cuModuleLoadData (cached function) and no per-call cuMemAlloc/cuEvent*
+    // (pooled scratch + events): the launch runs on a private stream synced individually.
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })?;
+    }
+    check_cuda(launch(stream, pooled.output))?;
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.stop_event, stream) })?;
+    }
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) })?;
 
-    if let Some((cu_event_create, cu_event_destroy, cu_event_record, cu_event_elapsed_time)) =
-        event_symbols
-    {
-        let mut start = std::ptr::null_mut();
-        check_cuda(unsafe { cu_event_create(&mut start, 0) })?;
-        let start_guard = CudaEventGuard {
-            event: start,
-            destroy: cu_event_destroy,
-        };
-        let mut stop = std::ptr::null_mut();
-        check_cuda(unsafe { cu_event_create(&mut stop, 0) })?;
-        let stop_guard = CudaEventGuard {
-            event: stop,
-            destroy: cu_event_destroy,
-        };
-
-        check_cuda(unsafe { cu_event_record(start_guard.event, stream) })?;
-        check_cuda(launch(stream))?;
-        check_cuda(unsafe { cu_event_record(stop_guard.event, stream) })?;
-        // Syncing the stream completes the recorded stop event, so elapsed time is valid.
-        check_cuda(unsafe { cu_stream_synchronize(stream) })?;
-
+    if timed {
         let mut elapsed_ms = 0.0_f32;
         check_cuda(unsafe {
-            cu_event_elapsed_time(&mut elapsed_ms, start_guard.event, stop_guard.event)
+            (primary.cu_event_elapsed_time)(&mut elapsed_ms, pooled.start_event, pooled.stop_event)
         })?;
         resident
             .record_kernel_event_elapsed_us(Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64));
-        return Ok(());
+    } else {
+        resident.record_kernel_event_elapsed_us(None);
     }
 
-    check_cuda(launch(stream))?;
-    check_cuda(unsafe { cu_stream_synchronize(stream) })?;
-    resident.record_kernel_event_elapsed_us(None);
+    check_cuda(unsafe {
+        (primary.cu_memcpy_dtoh)(
+            output.as_mut_ptr().cast::<c_void>(),
+            pooled.output,
+            output.len(),
+        )
+    })?;
     Ok(())
 }
 
