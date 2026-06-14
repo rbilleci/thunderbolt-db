@@ -327,7 +327,10 @@ Each major milestone below ships with a dated run report under
     `docs/testing/reports/series/prototype-to-production/runs/2026-06-13-p1-m3-noise-controlled-baseline-v1.md`.
     Independently audited (the original report mislabeled precision as the gate;
     fixed). The **full** Phase-5 harness (open-loop/offered-rate, steady-state
-    duration, p99.9, realistic datasets, three-way PG curves) is still owed.
+    duration, p99.9, realistic datasets, three-way PG curves) is still owed — but a
+    **minimal** open-loop / multi-hundred-connection / p99.9 cut must land **before** the
+    heavy P1/P2 concurrency work (Phase 1 "Measure at load *before* the heavy lifts"), so
+    each concurrency milestone is validated at load rather than in this closed-loop probe.
 
 ### Phase 0 — Unify and tell the truth (foundation, weeks)
 **Goal:** one system of record, reached through a protocol-neutral boundary;
@@ -388,6 +391,22 @@ honest docs; the real tech stack adopted.
   and atomically publishes the next generation. This is the single most enabling
   refactor in the plan — it converts "no concurrent reads" into "N concurrent
   readers over a published generation."
+  - **Read half ✅ (P1-M3, 2026-06-14):** the relational read path is `&self`,
+    residency is `SnapshotCell<Arc<owner>>` publish-on-commit, `Engine: Send + Sync`,
+    gate 2 (concurrent readers over one generation) proven. The GPU layer is also
+    per-thread-ready (P2-M1 shared context + stream pool).
+  - **Write half — owed:** the serialized writer that publishes the next generation
+    *while readers run*. Blocked on the tracked hazard `partition_device_memory` →
+    `SnapshotCell` (the only residency still freed in place under `&mut self`); fix that
+    before any write overlaps a read.
+- **Concurrent dispatch (P1-M4 — the immediate unlock).** The read substrate and the GPU
+  layer are concurrent-ready, but **no caller drives them concurrently** — the
+  engine-backed server is single-threaded and the benchmark server funnels through one
+  owner thread. Share one `Arc<Engine>` across a bounded worker pool so reads actually
+  dispatch in parallel. This is the *smallest* change that converts everything built in
+  P1-M3/P2-M1/P2-M2 into a measured throughput win, and it needs **no async rewrite** — it
+  runs on the existing blocking sockets. Do it **before** async ingress; async ingress then
+  swaps the acceptor underneath it for connection scale.
 - **Real MVCC.** Per-transaction snapshots, a commit-timestamp oracle distinct from
   the log index, and **write-write conflict detection** (Snapshot Isolation
   minimum; SSI for `SERIALIZABLE` ledgers). Honor the already-parsed isolation
@@ -395,13 +414,37 @@ honest docs; the real tech stack adopted.
 - **Real commit durability.** Make `WalBuffer::flush_all` fsync (with **group
   commit** — one fsync per batch); add LSN, CRC, and parent-dir fsync. Gate
   visibility on real durability.
-- **Async ingress.** Replace thread-per-connection with a `tokio` acceptor + bounded
-  executor; introduce a real bounded command/owner ring for the writer.
+- **Async ingress (P1-M5).** On top of the concurrent dispatcher, replace
+  thread-per-connection with a `tokio` acceptor + bounded executor (for connection
+  *scale*, not just parallelism); introduce a real bounded command/owner ring for the
+  writer.
+- **Measure at load *before* the heavy lifts.** Stand up a minimal open-loop /
+  offered-rate, multi-hundred-connection, **p99.9** harness (a cut-down of the Phase-5
+  harness) *first*, so every concurrency milestone above is validated end-to-end at load —
+  not in a closed-loop ≤64-connection microbenchmark. §5.7 already requires p99.9 per
+  milestone; that is unmeetable until this exists.
 - **De-monolith** `engine/src/lib.rs` (24k prod LOC, one file) into modules aligned
   with these boundaries.
 - **Exit:** concurrent readers measured against one published generation; an SI
   conflict test aborts a lost-update; a kill-mid-commit test loses nothing;
   ≥10k concurrent connections accepted.
+
+**Concurrency across the flow — status map.** The end-to-end view this phase (with Phase 2
+for the GPU layer) must close. Concurrency is driven at *every* layer, but the work done so
+far is the read + GPU substrate (the lower half); the next value is a caller that uses it
+and a harness that measures it:
+
+| flow layer | driven by | status |
+|---|---|---|
+| Connection ingress (async acceptor, admission) | P1-M5 async ingress + Phase 5 | not started (thread-per-conn) |
+| Server→engine **concurrent dispatch** | **P1-M4 (immediate)** | owed — substrate ready, no caller |
+| Engine **read** path | P1-M3 reader/writer (read half) | ✅ done (`&self`, gate 2) |
+| Engine **write** path concurrency | P1 writer half + MVCC | owed — blocked on `partition_device_memory` |
+| GPU **execution** (parallel kernels) | Phase 2 | started (P2-M2, 1 of ~6 routes) |
+| GPU **shared context + stream pool** | §9.3 / Phase 2 | ✅ done (P2-M1) |
+| GPU **async submit/complete** (overlap) | Phase 2 | owed — caps concurrent throughput for small ops |
+| Memory residency under concurrency | Phase 2 (generation chains) | partial — per-table cell, no chains yet |
+| **Measuring** concurrency at load | minimal harness (above) → Phase 5 | not started |
 
 ### Phase 2 — Real GPU execution engine
 **Goal:** make the GPU-native thesis real and parallel.
@@ -569,9 +612,19 @@ reproduces M0 within run-to-run variance (step 1 changed nothing on the measured
 path; this is a noise characterization, not an improvement). The next *meaningful*
 (improvement) benchmark is the step-4 re-run after the `&self` read-path flip.
 
-**Immediate next: P1-M3 — apply the snapshot substrate to the engine read path.**
-Full design, ordered steps, and acceptance gates:
-`docs/architecture/14-engine-snapshot-integration-design.md`. Do it incrementally:
+**Immediate next: P1-M4 — concurrent dispatch (turn the substrate into throughput).**
+P1-M3 (read path), P2-M1 (GPU shared-context/stream substrate), and P2-M2 (parallel scan
+kernel) are **done**; the engine is `&self`/`Send + Sync` and the GPU layer is
+per-thread-ready, but **no caller runs them concurrently**. Next: share one `Arc<Engine>`
+across a bounded worker pool in the engine-backed server so reads dispatch in parallel, and
+land a **minimal open-loop / p99.9 / multi-hundred-connection** harness alongside it so the
+win is measured at load (not the closed-loop ≤64-conn probe). Then P1-M5 async ingress for
+connection scale, and the write-half + `partition_device_memory` → `SnapshotCell` before any
+concurrent write. See Phase 1 "Concurrency across the flow — status map".
+
+**Completed record — P1-M3 (applied the snapshot substrate to the engine read path).**
+Full design + acceptance gates:
+`docs/architecture/14-engine-snapshot-integration-design.md`. It landed incrementally:
 1. **First**, add `unsafe impl Send + Sync for CudaResidentDeviceMemory` + a
    **real-GPU soundness probe** (device memory must not be freed while a reader
    holds its generation). This is the soundness crux — prove it before touching
