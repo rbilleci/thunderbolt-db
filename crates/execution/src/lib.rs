@@ -1,7 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CStr;
 use std::fmt;
 use std::os::raw::c_void;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use libloading::Library;
 use serde::{Deserialize, Serialize};
@@ -88,22 +89,250 @@ pub struct CudaDeviceMemoryProof {
     pub retained: bool,
 }
 
+// ---------------------------------------------------------------------------
+// GPU shared-context substrate (plan §9.3 + Phase 2 module cache / stream pool)
+// ---------------------------------------------------------------------------
+
+/// A loaded CUDA module and the entry function handle resolved from it. Cached on the
+/// owning `GpuPrimaryContext` so a kernel's PTX is JIT-loaded once per process, not per
+/// launch. The handles are valid for the lifetime of the context they were loaded into.
+struct CachedModule {
+    module: *mut c_void,
+    function: *mut c_void,
+}
+
+/// One retained CUDA **primary** context per physical GPU (plan §9.3), shared by every
+/// resident allocation and every reader thread. Replaces the prototype's per-allocation
+/// `cuCtxCreate`/`cuCtxDestroy` (one heavyweight context per table-generation). It owns the
+/// process-wide module/function cache (`cached_function`) — which kills the per-launch
+/// `cuModuleLoadData`/`Unload` the P1-M3 step-4 benchmark found dominating concurrent reads
+/// — and a small stream pool (`acquire_stream`/`release_stream`) so concurrent launches use
+/// private streams synced individually (`cuStreamSynchronize`) instead of one global
+/// `cuCtxSynchronize` barrier. Created lazily and cached in `gpu_primary_context`; retained
+/// for process lifetime (the registry holds a strong `Arc`), so `Drop` — which unloads
+/// cached modules, destroys pooled streams, then `cuDevicePrimaryCtxRelease` — runs at
+/// process teardown (or if an entry is ever evicted). Residency holds an
+/// `Arc<GpuPrimaryContext>` and owns no context of its own (the §9.3 "residency owns no
+/// context" property).
+struct GpuPrimaryContext {
+    device: i32,
+    context: *mut c_void,
+    cu_mem_free: unsafe extern "C" fn(u64) -> i32,
+    cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
+    cu_primary_ctx_release: unsafe extern "C" fn(i32) -> i32,
+    cu_module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32,
+    cu_module_unload: unsafe extern "C" fn(*mut c_void) -> i32,
+    cu_module_get_function: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32,
+    cu_stream_create: unsafe extern "C" fn(*mut *mut c_void, u32) -> i32,
+    cu_stream_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    modules: Mutex<BTreeMap<&'static CStr, CachedModule>>,
+    streams: Mutex<Vec<*mut c_void>>,
+    lib: Arc<Library>,
+}
+
+// SAFETY: the only !Send/!Sync fields are the raw `context` and the cached module/stream
+// pointers. The CUDA driver API is thread-safe (driver >= 4.0): one primary context may
+// be current on many threads at once, and concurrent launches of one cached function on
+// distinct streams are explicitly permitted. The context is immutable after creation; the
+// module cache and stream pool are each behind a `Mutex`, so the only mutation is
+// serialized. `cuMemFree`/`cuStreamDestroy`/`cuDevicePrimaryCtxRelease` are valid from any
+// thread. This is the load-bearing context-layer `unsafe`; residency above it becomes
+// auto-`Send`/`Sync` (it owns only `device_ptr: u64`, a `Mutex`, and `Arc<Self>`).
+unsafe impl Send for GpuPrimaryContext {}
+unsafe impl Sync for GpuPrimaryContext {}
+
+impl GpuPrimaryContext {
+    fn context(&self) -> *mut c_void {
+        self.context
+    }
+
+    fn lib(&self) -> &Library {
+        self.lib.as_ref()
+    }
+
+    /// Make this primary context current on the calling thread (idempotent; a context may
+    /// be current on many threads). Every reader thread must call this before launching.
+    fn set_current(&self) -> Result<(), CudaRuntimeProbeError> {
+        check_cuda(unsafe { (self.cu_ctx_set_current)(self.context) })
+    }
+
+    /// Return the entry function for `entry_name`, loading + caching its module the first
+    /// time. `ptx_with_nul` must be NUL-terminated PTX. The returned handle is reused on
+    /// every subsequent call and is safe to launch concurrently on distinct streams.
+    fn cached_function(
+        &self,
+        entry_name: &'static CStr,
+        ptx_with_nul: &[u8],
+    ) -> Result<*mut c_void, CudaRuntimeProbeError> {
+        let mut modules = self.modules.lock().expect("gpu module cache poisoned");
+        if let Some(cached) = modules.get(entry_name) {
+            return Ok(cached.function);
+        }
+        let mut module = std::ptr::null_mut();
+        check_cuda(unsafe {
+            (self.cu_module_load_data)(&mut module, ptx_with_nul.as_ptr().cast::<c_void>())
+        })?;
+        let module_guard = CudaModuleGuard {
+            module,
+            unload: self.cu_module_unload,
+        };
+        let mut function = std::ptr::null_mut();
+        check_cuda(unsafe {
+            (self.cu_module_get_function)(&mut function, module, entry_name.as_ptr())
+        })?;
+        std::mem::forget(module_guard); // ownership moves into the cache (unloaded on Drop)
+        modules.insert(entry_name, CachedModule { module, function });
+        Ok(function)
+    }
+
+    /// Take a stream from the pool, creating one if the pool is empty.
+    fn acquire_stream(&self) -> Result<*mut c_void, CudaRuntimeProbeError> {
+        if let Some(stream) = self.streams.lock().expect("gpu stream pool poisoned").pop() {
+            return Ok(stream);
+        }
+        let mut stream = std::ptr::null_mut();
+        check_cuda(unsafe { (self.cu_stream_create)(&mut stream, 0) })?;
+        Ok(stream)
+    }
+
+    /// Return a stream to the pool for reuse.
+    fn release_stream(&self, stream: *mut c_void) {
+        self.streams
+            .lock()
+            .expect("gpu stream pool poisoned")
+            .push(stream);
+    }
+
+    #[cfg(test)]
+    fn cached_module_count(&self) -> usize {
+        self.modules.lock().map(|modules| modules.len()).unwrap_or(0)
+    }
+
+    fn create(gpu_id: u16) -> Result<Self, CudaRuntimeProbeError> {
+        type CuInit = unsafe extern "C" fn(u32) -> i32;
+        type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+        type CuPrimaryCtxRetain = unsafe extern "C" fn(*mut *mut c_void, i32) -> i32;
+        type CuPrimaryCtxRelease = unsafe extern "C" fn(i32) -> i32;
+        type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+        type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+        type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuModuleGetFunction =
+            unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+        type CuStreamCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
+        type CuStreamDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+
+        let lib = unsafe {
+            Library::new("libcuda.so.1")
+                .or_else(|_| Library::new("libcuda.so"))
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        macro_rules! sym {
+            ($t:ty, $primary:literal $(, $fallback:literal)*) => {{
+                let result = unsafe { lib.get::<$t>($primary) };
+                $( let result = result.or_else(|_| unsafe { lib.get::<$t>($fallback) }); )*
+                *result.map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+            }};
+        }
+        let cu_init: CuInit = sym!(CuInit, b"cuInit\0");
+        let cu_device_get: CuDeviceGet = sym!(CuDeviceGet, b"cuDeviceGet\0");
+        let cu_primary_ctx_retain: CuPrimaryCtxRetain =
+            sym!(CuPrimaryCtxRetain, b"cuDevicePrimaryCtxRetain\0");
+        let cu_primary_ctx_release: CuPrimaryCtxRelease = sym!(
+            CuPrimaryCtxRelease,
+            b"cuDevicePrimaryCtxRelease_v2\0",
+            b"cuDevicePrimaryCtxRelease\0"
+        );
+        let cu_ctx_set_current: CuCtxSetCurrent = sym!(CuCtxSetCurrent, b"cuCtxSetCurrent\0");
+        let cu_mem_free: CuMemFree = sym!(CuMemFree, b"cuMemFree_v2\0", b"cuMemFree\0");
+        let cu_module_load_data: CuModuleLoadData = sym!(CuModuleLoadData, b"cuModuleLoadData\0");
+        let cu_module_unload: CuModuleUnload = sym!(CuModuleUnload, b"cuModuleUnload\0");
+        let cu_module_get_function: CuModuleGetFunction =
+            sym!(CuModuleGetFunction, b"cuModuleGetFunction\0");
+        let cu_stream_create: CuStreamCreate = sym!(CuStreamCreate, b"cuStreamCreate\0");
+        let cu_stream_destroy: CuStreamDestroy = sym!(
+            CuStreamDestroy,
+            b"cuStreamDestroy_v2\0",
+            b"cuStreamDestroy\0"
+        );
+
+        check_cuda(unsafe { cu_init(0) })?;
+        let mut device = 0_i32;
+        check_cuda(unsafe { cu_device_get(&mut device, i32::from(gpu_id)) })?;
+        let mut context = std::ptr::null_mut();
+        check_cuda(unsafe { cu_primary_ctx_retain(&mut context, device) })?;
+
+        Ok(Self {
+            device,
+            context,
+            cu_mem_free,
+            cu_ctx_set_current,
+            cu_primary_ctx_release,
+            cu_module_load_data,
+            cu_module_unload,
+            cu_module_get_function,
+            cu_stream_create,
+            cu_stream_destroy,
+            modules: Mutex::new(BTreeMap::new()),
+            streams: Mutex::new(Vec::new()),
+            lib: Arc::new(lib),
+        })
+    }
+}
+
+impl Drop for GpuPrimaryContext {
+    fn drop(&mut self) {
+        // Unload cached modules and destroy pooled streams BEFORE releasing the primary
+        // context (they belong to it), then release our retain.
+        if let Ok(mut modules) = self.modules.lock() {
+            for (_, cached) in std::mem::take(&mut *modules) {
+                unsafe { (self.cu_module_unload)(cached.module) };
+            }
+        }
+        if let Ok(mut streams) = self.streams.lock() {
+            for stream in std::mem::take(&mut *streams) {
+                unsafe { (self.cu_stream_destroy)(stream) };
+            }
+        }
+        unsafe { (self.cu_primary_ctx_release)(self.device) };
+    }
+}
+
+/// Process-wide registry of retained primary contexts, one per GPU id. The strong `Arc`
+/// kept here retains each context for process lifetime; allocations clone it so the
+/// context outlives every allocation made in it.
+static GPU_PRIMARY_CONTEXTS: OnceLock<Mutex<BTreeMap<u16, Arc<GpuPrimaryContext>>>> =
+    OnceLock::new();
+
+/// Get (creating + caching on first use) the shared primary context for `gpu_id`.
+fn gpu_primary_context(gpu_id: u16) -> Result<Arc<GpuPrimaryContext>, CudaRuntimeProbeError> {
+    let registry = GPU_PRIMARY_CONTEXTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut map = registry
+        .lock()
+        .expect("gpu primary-context registry poisoned");
+    if let Some(existing) = map.get(&gpu_id) {
+        return Ok(Arc::clone(existing));
+    }
+    let context = Arc::new(GpuPrimaryContext::create(gpu_id)?);
+    map.insert(gpu_id, Arc::clone(&context));
+    Ok(context)
+}
+
 pub struct CudaResidentDeviceMemory {
     metadata: CudaDeviceMemoryProof,
     device_ptr: u64,
-    context: *mut c_void,
-    cu_mem_free: unsafe extern "C" fn(u64) -> i32,
-    cu_ctx_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// The shared primary context this allocation lives in (plan §9.3). Residency owns no
+    /// context of its own; it holds a refcount so the context outlives the allocation, and
+    /// reaches the device pointer, library, module cache, and stream pool through it.
+    primary: Arc<GpuPrimaryContext>,
     last_kernel_event_elapsed_us: Mutex<Option<u64>>,
-    _lib: Arc<Library>,
 }
 
 #[derive(Clone)]
 pub struct CudaResidentDeviceMemoryReadView {
     metadata: CudaDeviceMemoryProof,
     device_ptr: u64,
-    context: *mut c_void,
-    _lib: Arc<Library>,
+    primary: Arc<GpuPrimaryContext>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,45 +365,14 @@ impl fmt::Debug for CudaResidentDeviceMemoryReadView {
     }
 }
 
-// This view never frees or mutates the retained allocation. It is valid only
-// while the owning resident allocation remains alive and the snapshot generation
-// that published it has not been invalidated by the engine.
-unsafe impl Send for CudaResidentDeviceMemoryReadView {}
-unsafe impl Sync for CudaResidentDeviceMemoryReadView {}
-
-// SAFETY: `CudaResidentDeviceMemory` is `!Send`/`!Sync` for exactly one reason — the
-// raw `context: *mut c_void`. Every other field is already thread-safe: `device_ptr`
-// is a `u64`, the two `cu_*` fields are `extern "C" fn` pointers, the telemetry slot
-// is a `Mutex`, and `_lib` is `Arc<Library>` (libloading marks `Library: Send + Sync`).
-// Sharing the owner across reader threads is sound under the engine's
-// publish-don't-mutate snapshot discipline (P1-M3, doc 14):
-//   * Immutable after publication. A published generation's owner is never mutated in
-//     place; readers only *read* `device_ptr`/`context`/`metadata`. The sole interior-
-//     mutable field, `last_kernel_event_elapsed_us`, is a `Mutex` (no data race);
-//     under concurrent readers it is semantically last-writer-wins — a telemetry
-//     caveat, not a safety one (per-read timing moves into the read result in step 4).
-//   * Freed exactly once, after drain. `cu_mem_free`/`cu_ctx_destroy` run only in
-//     `Drop` (see below), which under `SnapshotCell`'s `Arc<Generation<_>>` refcount
-//     happens only after the last reader holding that generation has released its
-//     handle. No reader can observe freed device memory — the use-after-free the
-//     non-owning read view risks is exactly what holding the owner here prevents.
-//   * CUDA calls are thread-agnostic. `cuMemFree`/`cuCtxDestroy` are valid from any
-//     thread (the driver API is thread-safe), so dropping the owner on a non-creating
-//     thread is sound. A reader issuing a kernel launch must first make the context
-//     current on its thread. The probe below uses launch paths that `cuCtxSetCurrent`
-//     themselves (`submit_*` + `complete_detached`); most other resident launches do
-//     not, and assume an ambiently-current context. On a thread with *no* context
-//     current those return `INVALID_CONTEXT` (a safe error); on a thread with a
-//     *different* allocation's context current they would misdirect the launch into the
-//     wrong address space (unsafe). That hazard is a property of the per-allocation
-//     context API — present with or without this impl — and is *not* something
-//     `Send`/`Sync` introduces; eliminating it by making every launch use one shared
-//     device context is P1-M3 step 3 / the shared-context milestone (plan §9.3). (This
-//     sub-claim is by inspection — the probe exercises only the context-setting path.)
-// This is the load-bearing `unsafe` of P1-M3; its soundness is exercised by the
-// `published_resident_generation_*` GPU probe below.
-unsafe impl Send for CudaResidentDeviceMemory {}
-unsafe impl Sync for CudaResidentDeviceMemory {}
+// Both `CudaResidentDeviceMemory` and its read view are now **auto** `Send`/`Sync`: every
+// field is thread-safe — `metadata` is plain data, `device_ptr` is a `u64`, the telemetry
+// slot is a `Mutex`, and the context/library/module-cache/stream-pool all live behind
+// `Arc<GpuPrimaryContext>` (whose own `unsafe impl Send + Sync` carries the load-bearing
+// argument). This is the §9.3 payoff over the P1-M3 per-allocation model: residency owns
+// no raw context, so the previously hand-written `unsafe impl`s here are gone — concurrent
+// reads over a published generation are safe by construction, witnessed by the
+// `published_resident_generation_*` and `concurrent_readers_*` GPU probes.
 
 impl CudaResidentDeviceMemoryReadView {
     pub fn metadata(&self) -> &CudaDeviceMemoryProof {
@@ -186,7 +384,7 @@ impl CudaResidentDeviceMemoryReadView {
     }
 
     pub fn context(&self) -> *mut c_void {
-        self.context
+        self.primary.context()
     }
 
     pub fn submit_match_project_i32_equal_any_from_payload(
@@ -246,11 +444,11 @@ impl CudaResidentReadSource for CudaResidentDeviceMemory {
     }
 
     fn context(&self) -> *mut c_void {
-        self.context
+        self.primary.context()
     }
 
     fn lib(&self) -> &Library {
-        self._lib.as_ref()
+        self.primary.lib()
     }
 
     fn record_kernel_event_elapsed_us(&self, elapsed_us: Option<u64>) {
@@ -268,11 +466,11 @@ impl CudaResidentReadSource for CudaResidentDeviceMemoryReadView {
     }
 
     fn context(&self) -> *mut c_void {
-        self.context
+        self.primary.context()
     }
 
     fn lib(&self) -> &Library {
-        self._lib.as_ref()
+        self.primary.lib()
     }
 }
 
@@ -286,37 +484,35 @@ impl CudaResidentDeviceMemory {
     }
 
     pub fn context(&self) -> *mut c_void {
-        self.context
+        self.primary.context()
     }
 
-    /// Bind this allocation's CUDA context to the calling thread. The driver keeps the
-    /// current context per-thread, so a reader thread that did not create the context
-    /// must make it current before launching a kernel — otherwise the launch fails with
-    /// `CUDA_ERROR_INVALID_CONTEXT` (201). Safe to call concurrently from many reader
-    /// threads: a context may be current on multiple threads at once (driver ≥ 4.0).
-    /// This is what makes the `&self` concurrent read path work on the per-allocation
-    /// context model; the shared-primary-context milestone (plan §9.3) will make it a
-    /// once-per-thread bind instead of once-per-read.
+    /// The shared primary context backing this allocation — the entry point to the module
+    /// cache and stream pool for migrated launch routes (plan §9.3 / Phase 2).
+    fn primary(&self) -> &GpuPrimaryContext {
+        &self.primary
+    }
+
+    /// Bind the shared primary context to the calling thread. The driver keeps the current
+    /// context per-thread, so a reader thread must make it current before launching a
+    /// kernel — otherwise the launch fails with `CUDA_ERROR_INVALID_CONTEXT` (201). Safe
+    /// to call concurrently from many reader threads: a context may be current on multiple
+    /// threads at once (driver ≥ 4.0). With the shared primary context (§9.3) this is a
+    /// once-per-thread bind to the *same* context for every table, not a per-allocation
+    /// context — which also removes the old cross-generation context-mismatch hazard.
     pub fn set_current_context(&self) -> Result<(), CudaRuntimeProbeError> {
-        type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
-        let cu_ctx_set_current = unsafe {
-            self.lib()
-                .get::<CuCtxSetCurrent>(b"cuCtxSetCurrent\0")
-                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-        };
-        check_cuda(unsafe { cu_ctx_set_current(self.context) })
+        self.primary.set_current()
     }
 
     fn lib(&self) -> &Library {
-        self._lib.as_ref()
+        self.primary.lib()
     }
 
     pub fn read_view(&self) -> CudaResidentDeviceMemoryReadView {
         CudaResidentDeviceMemoryReadView {
             metadata: self.metadata.clone(),
             device_ptr: self.device_ptr,
-            context: self.context,
-            _lib: Arc::clone(&self._lib),
+            primary: Arc::clone(&self.primary),
         }
     }
 
@@ -863,9 +1059,11 @@ impl CudaI32Stats {
 
 impl Drop for CudaResidentDeviceMemory {
     fn drop(&mut self) {
+        // §9.3: residency frees only its own device memory. The shared primary context is
+        // owned by `GpuPrimaryContext` (released when the last `Arc` — registry + every
+        // allocation — drops), not destroyed per allocation.
         unsafe {
-            (self.cu_mem_free)(self.device_ptr);
-            (self.cu_ctx_destroy)(self.context);
+            (self.primary.cu_mem_free)(self.device_ptr);
         }
     }
 }
@@ -1204,11 +1402,8 @@ impl CudaDriverRuntime {
                 retained: true,
             },
             device_ptr: resident.device_ptr,
-            context: resident.context,
-            cu_mem_free: resident.cu_mem_free,
-            cu_ctx_destroy: resident.cu_ctx_destroy,
+            primary: resident.primary,
             last_kernel_event_elapsed_us: Mutex::new(None),
-            _lib: Arc::new(resident._lib),
         })
     }
 
@@ -1268,11 +1463,8 @@ impl CudaDriverRuntime {
                 retained: true,
             },
             device_ptr: resident.device_ptr,
-            context: resident.context,
-            cu_mem_free: resident.cu_mem_free,
-            cu_ctx_destroy: resident.cu_ctx_destroy,
+            primary: resident.primary,
             last_kernel_event_elapsed_us: Mutex::new(None),
-            _lib: Arc::new(resident._lib),
         })
     }
 
@@ -1312,22 +1504,16 @@ impl CudaDriverRuntime {
                 retained: true,
             },
             device_ptr: resident.device_ptr,
-            context: resident.context,
-            cu_mem_free: resident.cu_mem_free,
-            cu_ctx_destroy: resident.cu_ctx_destroy,
+            primary: resident.primary,
             last_kernel_event_elapsed_us: Mutex::new(None),
-            _lib: Arc::new(resident._lib),
         })
     }
 }
 
 struct RawCudaResidentDeviceMemory {
     device_ptr: u64,
-    context: *mut c_void,
-    cu_mem_free: unsafe extern "C" fn(u64) -> i32,
-    cu_ctx_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    primary: Arc<GpuPrimaryContext>,
     copied_bytes: u64,
-    _lib: Library,
 }
 
 fn launch_cuda_resident_device_memory(
@@ -1349,64 +1535,36 @@ fn launch_cuda_resident_device_memory_chunks(
     allocated_len: usize,
     chunks: &[CudaDeviceMemoryChunk<'_>],
 ) -> Result<RawCudaResidentDeviceMemory, CudaRuntimeProbeError> {
-    type CuInit = unsafe extern "C" fn(u32) -> i32;
-    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
-    type CuCtxCreate = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32;
-    type CuCtxDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
 
-    let lib = unsafe {
-        Library::new("libcuda.so.1")
-            .or_else(|_| Library::new("libcuda.so"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
+    // §9.3: allocate into the shared primary context for this GPU (created + cached on
+    // first use), not a fresh per-allocation context. Make it current on this thread so
+    // the allocation and host→device copies land in it.
+    let primary = gpu_primary_context(gpu_id)?;
+    primary.set_current()?;
 
-    let cu_init = unsafe {
-        *lib.get::<CuInit>(b"cuInit\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_device_get = unsafe {
-        *lib.get::<CuDeviceGet>(b"cuDeviceGet\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_ctx_create = unsafe {
-        *lib.get::<CuCtxCreate>(b"cuCtxCreate_v2\0")
-            .or_else(|_| lib.get::<CuCtxCreate>(b"cuCtxCreate\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_ctx_destroy = unsafe {
-        *lib.get::<CuCtxDestroy>(b"cuCtxDestroy_v2\0")
-            .or_else(|_| lib.get::<CuCtxDestroy>(b"cuCtxDestroy\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_mem_alloc = unsafe {
-        *lib.get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+        *primary
+            .lib()
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
-        *lib.get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| lib.get::<CuMemFree>(b"cuMemFree\0"))
+        *primary
+            .lib()
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_htod = unsafe {
-        *lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+        *primary
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-
-    check_cuda(unsafe { cu_init(0) })?;
-
-    let mut device = 0;
-    check_cuda(unsafe { cu_device_get(&mut device, i32::from(gpu_id)) })?;
-
-    let mut context = std::ptr::null_mut();
-    check_cuda(unsafe { cu_ctx_create(&mut context, 0, device) })?;
-    let context_guard = CudaContextGuard {
-        context,
-        destroy: cu_ctx_destroy,
     };
 
     let mut device_ptr = 0_u64;
@@ -1438,15 +1596,11 @@ fn launch_cuda_resident_device_memory_chunks(
     }
 
     std::mem::forget(allocation_guard);
-    std::mem::forget(context_guard);
 
     Ok(RawCudaResidentDeviceMemory {
         device_ptr,
-        context,
-        cu_mem_free,
-        cu_ctx_destroy,
+        primary,
         copied_bytes,
-        _lib: lib,
     })
 }
 
@@ -1458,64 +1612,36 @@ fn launch_cuda_resident_device_memory_owned_chunks<I>(
 where
     I: IntoIterator<Item = CudaOwnedDeviceMemoryChunk>,
 {
-    type CuInit = unsafe extern "C" fn(u32) -> i32;
-    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
-    type CuCtxCreate = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32;
-    type CuCtxDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
 
-    let lib = unsafe {
-        Library::new("libcuda.so.1")
-            .or_else(|_| Library::new("libcuda.so"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
+    // §9.3: allocate into the shared primary context for this GPU (created + cached on
+    // first use), not a fresh per-allocation context. Make it current on this thread so
+    // the allocation and host→device copies land in it.
+    let primary = gpu_primary_context(gpu_id)?;
+    primary.set_current()?;
 
-    let cu_init = unsafe {
-        *lib.get::<CuInit>(b"cuInit\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_device_get = unsafe {
-        *lib.get::<CuDeviceGet>(b"cuDeviceGet\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_ctx_create = unsafe {
-        *lib.get::<CuCtxCreate>(b"cuCtxCreate_v2\0")
-            .or_else(|_| lib.get::<CuCtxCreate>(b"cuCtxCreate\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_ctx_destroy = unsafe {
-        *lib.get::<CuCtxDestroy>(b"cuCtxDestroy_v2\0")
-            .or_else(|_| lib.get::<CuCtxDestroy>(b"cuCtxDestroy\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_mem_alloc = unsafe {
-        *lib.get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+        *primary
+            .lib()
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_mem_free = unsafe {
-        *lib.get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| lib.get::<CuMemFree>(b"cuMemFree\0"))
+        *primary
+            .lib()
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemFree>(b"cuMemFree\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_memcpy_htod = unsafe {
-        *lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
-            .or_else(|_| lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+        *primary
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| primary.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-
-    check_cuda(unsafe { cu_init(0) })?;
-
-    let mut device = 0;
-    check_cuda(unsafe { cu_device_get(&mut device, i32::from(gpu_id)) })?;
-
-    let mut context = std::ptr::null_mut();
-    check_cuda(unsafe { cu_ctx_create(&mut context, 0, device) })?;
-    let context_guard = CudaContextGuard {
-        context,
-        destroy: cu_ctx_destroy,
     };
 
     let mut device_ptr = 0_u64;
@@ -1560,15 +1686,11 @@ where
     }
 
     std::mem::forget(allocation_guard);
-    std::mem::forget(context_guard);
 
     Ok(RawCudaResidentDeviceMemory {
         device_ptr,
-        context,
-        cu_mem_free,
-        cu_ctx_destroy,
+        primary,
         copied_bytes,
-        _lib: lib,
     })
 }
 
@@ -1578,10 +1700,6 @@ fn launch_cuda_resident_row_count(
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
-    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuModuleGetFunction =
-        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -1595,7 +1713,6 @@ fn launch_cuda_resident_row_count(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
 
     const PTX: &[u8] = br#"
 .version 6.0
@@ -1645,34 +1762,10 @@ fn launch_cuda_resident_row_count(
             .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_module_load_data = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_unload = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleUnload>(b"cuModuleUnload\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_get_function = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_launch_kernel = unsafe {
         resident
             .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_ctx_synchronize = unsafe {
-        resident
-            .lib()
-            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
@@ -1683,21 +1776,15 @@ fn launch_cuda_resident_row_count(
         free: *cu_mem_free,
     };
 
+    // P2-M1: reuse the process-wide cached module/function (no per-launch
+    // cuModuleLoadData/Unload) and launch on a pooled private stream synced individually
+    // (no whole-context cuCtxSynchronize) — the two fixes the step-1 spike proved.
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
-
-    let mut module = std::ptr::null_mut();
-    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
-    let module_guard = CudaModuleGuard {
-        module,
-        unload: *cu_module_unload,
-    };
-
-    let mut function = std::ptr::null_mut();
-    check_cuda(unsafe {
-        cu_module_get_function(&mut function, module, c"gpu_db_resident_row_count".as_ptr())
-    })?;
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_row_count", &ptx)?;
 
     let mut resident_arg = resident.device_ptr();
     let mut output_arg = allocation_guard.ptr;
@@ -1705,7 +1792,7 @@ fn launch_cuda_resident_row_count(
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
     ];
-    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
+    launch_resident_kernel_on_pooled_stream(resident, |stream| unsafe {
         cu_launch_kernel(
             function,
             1,
@@ -1715,7 +1802,7 @@ fn launch_cuda_resident_row_count(
             1,
             1,
             0,
-            std::ptr::null_mut(),
+            stream,
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         )
@@ -1730,7 +1817,6 @@ fn launch_cuda_resident_row_count(
         )
     })?;
 
-    drop(module_guard);
     drop(allocation_guard);
 
     Ok(output)
@@ -8402,6 +8488,104 @@ where
     Ok(())
 }
 
+/// Launch a resident kernel on a **pooled private stream** and sync only that stream
+/// (P2-M1 / Phase 2) — the concurrency-friendly replacement for
+/// `launch_with_optional_cuda_event_timing`'s default-stream + whole-context
+/// `cuCtxSynchronize`. The closure receives the CUDA stream to launch on. Kernel timing is
+/// recorded with CUDA events on that stream when the event symbols resolve; the stream is
+/// always returned to the pool, even on error or panic.
+fn launch_resident_kernel_on_pooled_stream<F>(
+    resident: &CudaResidentDeviceMemory,
+    launch: F,
+) -> Result<(), CudaRuntimeProbeError>
+where
+    F: FnOnce(*mut c_void) -> i32,
+{
+    type CuStreamSynchronize = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
+    type CuEventDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuEventRecord = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+    type CuEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32;
+
+    let primary = resident.primary();
+    let cu_stream_synchronize = unsafe {
+        *primary
+            .lib()
+            .get::<CuStreamSynchronize>(b"cuStreamSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    // RAII: return the stream to the pool on every exit (success, error, panic).
+    struct StreamLease<'a> {
+        primary: &'a GpuPrimaryContext,
+        stream: *mut c_void,
+    }
+    impl Drop for StreamLease<'_> {
+        fn drop(&mut self) {
+            self.primary.release_stream(self.stream);
+        }
+    }
+    let lease = StreamLease {
+        primary,
+        stream: primary.acquire_stream()?,
+    };
+    let stream = lease.stream;
+
+    let event_symbols = unsafe {
+        let create = primary.lib().get::<CuEventCreate>(b"cuEventCreate\0");
+        let destroy = primary
+            .lib()
+            .get::<CuEventDestroy>(b"cuEventDestroy_v2\0")
+            .or_else(|_| primary.lib().get::<CuEventDestroy>(b"cuEventDestroy\0"));
+        let record = primary.lib().get::<CuEventRecord>(b"cuEventRecord\0");
+        let elapsed = primary
+            .lib()
+            .get::<CuEventElapsedTime>(b"cuEventElapsedTime\0");
+        match (create, destroy, record, elapsed) {
+            (Ok(create), Ok(destroy), Ok(record), Ok(elapsed)) => {
+                Some((*create, *destroy, *record, *elapsed))
+            }
+            _ => None,
+        }
+    };
+
+    if let Some((cu_event_create, cu_event_destroy, cu_event_record, cu_event_elapsed_time)) =
+        event_symbols
+    {
+        let mut start = std::ptr::null_mut();
+        check_cuda(unsafe { cu_event_create(&mut start, 0) })?;
+        let start_guard = CudaEventGuard {
+            event: start,
+            destroy: cu_event_destroy,
+        };
+        let mut stop = std::ptr::null_mut();
+        check_cuda(unsafe { cu_event_create(&mut stop, 0) })?;
+        let stop_guard = CudaEventGuard {
+            event: stop,
+            destroy: cu_event_destroy,
+        };
+
+        check_cuda(unsafe { cu_event_record(start_guard.event, stream) })?;
+        check_cuda(launch(stream))?;
+        check_cuda(unsafe { cu_event_record(stop_guard.event, stream) })?;
+        // Syncing the stream completes the recorded stop event, so elapsed time is valid.
+        check_cuda(unsafe { cu_stream_synchronize(stream) })?;
+
+        let mut elapsed_ms = 0.0_f32;
+        check_cuda(unsafe {
+            cu_event_elapsed_time(&mut elapsed_ms, start_guard.event, stop_guard.event)
+        })?;
+        resident
+            .record_kernel_event_elapsed_us(Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64));
+        return Ok(());
+    }
+
+    check_cuda(launch(stream))?;
+    check_cuda(unsafe { cu_stream_synchronize(stream) })?;
+    resident.record_kernel_event_elapsed_us(None);
+    Ok(())
+}
+
 pub struct DeviceRouter<R> {
     runtime: R,
 }
@@ -9539,6 +9723,53 @@ mod tests {
         assert_eq!(op.next(), Some(40));
         assert_eq!(op.next(), None);
         op.close();
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_primary_context_is_cached_and_loads_each_module_once() {
+        // P2-M1 step 2 — the substrate's packaging contract, on real hardware:
+        //   (a) the registry hands out the SAME primary context per GPU id (one shared
+        //       context, not one per allocation/generation), and
+        //   (b) a kernel's module is JIT-loaded ONCE and reused — running the migrated
+        //       COUNT route many times adds at most one entry to the module cache (the
+        //       load-once property the step-1 spike showed is the dominant concurrency
+        //       win), not one per launch.
+        use std::sync::Arc;
+
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // (a) registry caching: same Arc for the same GPU id.
+        let ctx_a = gpu_primary_context(0).expect("primary context");
+        let ctx_b = gpu_primary_context(0).expect("primary context");
+        assert!(
+            Arc::ptr_eq(&ctx_a, &ctx_b),
+            "registry must hand out one shared primary context per GPU id"
+        );
+
+        // (b) load-once: run the migrated COUNT route several times and show the cache
+        // grows by at most one (robust to other tests in the same process that may have
+        // already cached this kernel).
+        let row_count = 1234_u64;
+        let resident = runtime
+            .retain_device_memory_copy(0, &row_count.to_le_bytes())
+            .expect("retain resident device memory");
+        // The resident allocation must share the registry's context, not a private one.
+        assert_eq!(
+            resident.context(),
+            ctx_a.context(),
+            "the resident allocation must live in the registry's shared primary context"
+        );
+        let before = ctx_a.cached_module_count();
+        for _ in 0..8 {
+            assert_eq!(resident.count_rows_from_header().expect("count"), row_count);
+        }
+        let after = ctx_a.cached_module_count();
+        assert!(
+            after >= 1 && after <= before + 1,
+            "the row_count module must be loaded once and reused, not per launch \
+             (before={before}, after={after})"
+        );
     }
 
     #[test]
