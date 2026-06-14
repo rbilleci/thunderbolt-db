@@ -156,12 +156,48 @@ struct OutputBufferPool {
     pooled_bytes: usize,
 }
 
+/// Power-of-two-bucketed free list of reusable **pinned (page-locked) host** buffers, mirroring
+/// `OutputBufferPool`. The fused text route copies its results device→host with the async D2H
+/// variant on its private stream; an async D2H is only truly asynchronous (and DMA-fast) into
+/// page-locked host memory, but `cuMemHostAlloc`/`cuMemFreeHost` are themselves driver-
+/// serialized, so a per-call alloc would re-introduce exactly the contention this fix removes.
+/// Pooling the host staging buffers across calls removes that churn. Pointers are wrapped in
+/// `PinnedHostPtr` so the map is `Send`/`Sync` under the context's existing `unsafe impl`.
+#[derive(Default)]
+struct PinnedHostBufferPool {
+    free: BTreeMap<usize, Vec<PinnedHostPtr>>,
+    pooled_bytes: usize,
+}
+
+/// A raw pinned-host allocation. `Send`/`Sync` is sound for the same reason the context's other
+/// raw pointers are: the buffer is owned solely by the pool/lease (never aliased), and
+/// `cuMemFreeHost` is valid from any thread.
+#[derive(Clone, Copy)]
+struct PinnedHostPtr(*mut c_void);
+// SAFETY: see the type doc — the pointer is exclusively owned by the pool or an active lease and
+// is freed via the thread-safe `cuMemFreeHost`; it is never concurrently aliased.
+unsafe impl Send for PinnedHostPtr {}
+unsafe impl Sync for PinnedHostPtr {}
+
 struct GpuPrimaryContext {
     device: i32,
     context: *mut c_void,
     cu_mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> i32,
     cu_mem_free: unsafe extern "C" fn(u64) -> i32,
     cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> i32,
+    // P2-M2: stream-ordered (async) transfer + pinned-host primitives. The fused text route
+    // issues its HtoD/memset/D2H on its pooled private stream via the `*Async` variants behind
+    // a minimal pair of `cuStreamSynchronize` (instead of the legacy blocking default/NULL-
+    // stream ops, which the driver serializes context-wide across concurrent readers). The
+    // pinned-host alloc/free back a page-locked host-buffer pool so those D2H are truly async
+    // and DMA-fast. All five are best-effort: a route only uses them when present (else it
+    // keeps the blocking path), so an old driver still runs correctly, just unaccelerated.
+    cu_memcpy_htod_async:
+        Option<unsafe extern "C" fn(u64, *const c_void, usize, *mut c_void) -> i32>,
+    cu_memcpy_dtoh_async: Option<unsafe extern "C" fn(*mut c_void, u64, usize, *mut c_void) -> i32>,
+    cu_memset_d8_async: Option<unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32>,
+    cu_mem_host_alloc: Option<unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> i32>,
+    cu_mem_free_host: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
     cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
     cu_primary_ctx_release: unsafe extern "C" fn(i32) -> i32,
     cu_module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32,
@@ -177,6 +213,7 @@ struct GpuPrimaryContext {
     modules: Mutex<BTreeMap<&'static CStr, CachedModule>>,
     streams: Mutex<Vec<PooledStream>>,
     output_buffers: Mutex<OutputBufferPool>,
+    pinned_host_buffers: Mutex<PinnedHostBufferPool>,
     lib: Arc<Library>,
 }
 
@@ -335,6 +372,79 @@ impl GpuPrimaryContext {
         pool.free.entry(capacity).or_default().push(ptr);
     }
 
+    /// Lease a pinned (page-locked) host staging buffer of at least `min_bytes`, reusing a
+    /// pooled one of the matching bucket if available (else allocating via `cuMemHostAlloc`).
+    /// Returns `None` if the pinned-host symbols are unavailable (old driver) — callers then
+    /// fall back to plain pageable host buffers + blocking D2H. The lease returns the buffer to
+    /// the pool on drop, removing the per-call `cuMemHostAlloc`/`cuMemFreeHost` (driver-
+    /// serialized) that would otherwise re-serialize concurrent readers. Bucketing mirrors the
+    /// device pool so a release maps straight back to its bucket. The buffer is uninitialized;
+    /// callers must only read back the bytes the matching D2H actually wrote.
+    fn lease_pinned_host_buffer(&self, min_bytes: usize) -> Option<PinnedHostLease<'_>> {
+        let alloc = self.cu_mem_host_alloc?;
+        self.cu_mem_free_host?; // required for release; bail to the pageable path if absent
+        let capacity = output_buffer_bucket(min_bytes);
+        let reused = {
+            let mut pool = self
+                .pinned_host_buffers
+                .lock()
+                .expect("gpu pinned-host pool poisoned");
+            match pool.free.get_mut(&capacity).and_then(Vec::pop) {
+                Some(ptr) => {
+                    pool.pooled_bytes = pool.pooled_bytes.saturating_sub(capacity);
+                    Some(ptr)
+                }
+                None => None,
+            }
+        };
+        let ptr = match reused {
+            Some(ptr) => ptr,
+            None => {
+                let mut ptr = std::ptr::null_mut();
+                // flags = 0 (CU_MEMHOSTALLOC_PORTABLE/DEVICEMAP not needed for a staging buffer).
+                if check_cuda(unsafe { alloc(&mut ptr, capacity, 0) }).is_err() {
+                    return None;
+                }
+                PinnedHostPtr(ptr)
+            }
+        };
+        Some(PinnedHostLease {
+            primary: self,
+            ptr: ptr.0,
+            capacity,
+        })
+    }
+
+    /// Return a leased pinned-host buffer to the pool, or free it (`cuMemFreeHost`) if the idle
+    /// cap is reached.
+    fn release_pinned_host_buffer(&self, ptr: *mut c_void, capacity: usize) {
+        let Some(free_host) = self.cu_mem_free_host else {
+            return;
+        };
+        let mut pool = self
+            .pinned_host_buffers
+            .lock()
+            .expect("gpu pinned-host pool poisoned");
+        if pool.pooled_bytes.saturating_add(capacity) > POOLED_OUTPUT_BYTES_CAP {
+            drop(pool);
+            unsafe { free_host(ptr) };
+            return;
+        }
+        pool.pooled_bytes += capacity;
+        pool.free
+            .entry(capacity)
+            .or_default()
+            .push(PinnedHostPtr(ptr));
+    }
+
+    #[cfg(test)]
+    fn pooled_pinned_host_buffer_count(&self) -> usize {
+        self.pinned_host_buffers
+            .lock()
+            .map(|pool| pool.free.values().map(Vec::len).sum())
+            .unwrap_or(0)
+    }
+
     #[cfg(test)]
     fn pooled_output_buffer_count(&self) -> usize {
         self.output_buffers
@@ -384,6 +494,22 @@ impl GpuPrimaryContext {
                 *result.map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
             }};
         }
+        // Optional symbol: returns `Some(fn)` if present, `None` otherwise. Used for the async
+        // transfer + pinned-host primitives, which the fused text route accelerates on when
+        // available but does not *require* (it falls back to the blocking path on an old driver).
+        macro_rules! opt_sym {
+            ($t:ty, $primary:literal $(, $fallback:literal)*) => {{
+                let result = unsafe { lib.get::<$t>($primary) };
+                $( let result = result.or_else(|_| unsafe { lib.get::<$t>($fallback) }); )*
+                result.map(|f| *f).ok()
+            }};
+        }
+        type CuMemcpyHtoDAsync =
+            unsafe extern "C" fn(u64, *const c_void, usize, *mut c_void) -> i32;
+        type CuMemcpyDtoHAsync = unsafe extern "C" fn(*mut c_void, u64, usize, *mut c_void) -> i32;
+        type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
+        type CuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> i32;
+        type CuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> i32;
         let cu_init: CuInit = sym!(CuInit, b"cuInit\0");
         let cu_device_get: CuDeviceGet = sym!(CuDeviceGet, b"cuDeviceGet\0");
         let cu_primary_ctx_retain: CuPrimaryCtxRetain =
@@ -398,6 +524,21 @@ impl GpuPrimaryContext {
         let cu_mem_free: CuMemFree = sym!(CuMemFree, b"cuMemFree_v2\0", b"cuMemFree\0");
         let cu_memcpy_dtoh: CuMemcpyDtoH =
             sym!(CuMemcpyDtoH, b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0");
+        let cu_memcpy_htod_async: Option<CuMemcpyHtoDAsync> = opt_sym!(
+            CuMemcpyHtoDAsync,
+            b"cuMemcpyHtoDAsync_v2\0",
+            b"cuMemcpyHtoDAsync\0"
+        );
+        let cu_memcpy_dtoh_async: Option<CuMemcpyDtoHAsync> = opt_sym!(
+            CuMemcpyDtoHAsync,
+            b"cuMemcpyDtoHAsync_v2\0",
+            b"cuMemcpyDtoHAsync\0"
+        );
+        let cu_memset_d8_async: Option<CuMemsetD8Async> =
+            opt_sym!(CuMemsetD8Async, b"cuMemsetD8Async\0");
+        let cu_mem_host_alloc: Option<CuMemHostAlloc> =
+            opt_sym!(CuMemHostAlloc, b"cuMemHostAlloc\0");
+        let cu_mem_free_host: Option<CuMemFreeHost> = opt_sym!(CuMemFreeHost, b"cuMemFreeHost\0");
         let cu_module_load_data: CuModuleLoadData = sym!(CuModuleLoadData, b"cuModuleLoadData\0");
         let cu_module_unload: CuModuleUnload = sym!(CuModuleUnload, b"cuModuleUnload\0");
         let cu_module_get_function: CuModuleGetFunction =
@@ -429,6 +570,11 @@ impl GpuPrimaryContext {
             cu_mem_alloc,
             cu_mem_free,
             cu_memcpy_dtoh,
+            cu_memcpy_htod_async,
+            cu_memcpy_dtoh_async,
+            cu_memset_d8_async,
+            cu_mem_host_alloc,
+            cu_mem_free_host,
             cu_ctx_set_current,
             cu_primary_ctx_release,
             cu_module_load_data,
@@ -444,6 +590,7 @@ impl GpuPrimaryContext {
             modules: Mutex::new(BTreeMap::new()),
             streams: Mutex::new(Vec::new()),
             output_buffers: Mutex::new(OutputBufferPool::default()),
+            pinned_host_buffers: Mutex::new(PinnedHostBufferPool::default()),
             lib: Arc::new(lib),
         })
     }
@@ -479,6 +626,15 @@ impl Drop for GpuPrimaryContext {
                 }
             }
         }
+        if let Some(free_host) = self.cu_mem_free_host {
+            if let Ok(mut pool) = self.pinned_host_buffers.lock() {
+                for (_, ptrs) in std::mem::take(&mut pool.free) {
+                    for ptr in ptrs {
+                        unsafe { free_host(ptr.0) };
+                    }
+                }
+            }
+        }
         unsafe { (self.cu_primary_ctx_release)(self.device) };
     }
 }
@@ -495,6 +651,22 @@ struct PooledBufferLease<'a> {
 impl Drop for PooledBufferLease<'_> {
     fn drop(&mut self) {
         self.primary.release_device_buffer(self.ptr, self.capacity);
+    }
+}
+
+/// RAII handle to a pooled pinned (page-locked) host staging buffer; returns it to the pool on
+/// every exit (success, error, or panic). `ptr` is a raw host pointer the route reads back
+/// through after the async D2H completes (i.e. after the stream sync).
+struct PinnedHostLease<'a> {
+    primary: &'a GpuPrimaryContext,
+    ptr: *mut c_void,
+    capacity: usize,
+}
+
+impl Drop for PinnedHostLease<'_> {
+    fn drop(&mut self) {
+        self.primary
+            .release_pinned_host_buffer(self.ptr, self.capacity);
     }
 }
 
@@ -4073,20 +4245,39 @@ DONE:
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
-    // P2-M2: pooled output buffers (no per-call cuMemAlloc/cuMemFree). All 9 buffers are
-    // sized to worst-case row_count and were the bulk of this route's c64 wall (~9 allocs /
-    // ~1.9 MB per call). Reused buffers are NOT zeroed; only the two atomic-append counters
-    // are memset, the needles buffer is fully overwritten by the HtoD upload, and every
-    // output is read back only over [0, count) — so stale bytes are never observed.
-    let needles_guard = resident.primary().lease_device_buffer(needle_bytes)?;
-    check_cuda(unsafe {
-        cu_memcpy_htod(
-            needles_guard.ptr,
-            needles.as_ptr().cast::<c_void>(),
-            needle_bytes,
-        )
-    })?;
+    // P2-M2 (text-route async lever): the c64 wall of this route was its 11 synchronous,
+    // default/NULL-stream memory ops (1 HtoD + 2 memset + 8 D2H) — the driver serializes those
+    // context-wide across concurrent readers, so 64 threads × 11 ops queued behind one barrier
+    // (measured 99.7 % of a 12.8 ms c64 wall; the kernel + its private-stream sync were < 0.5 %).
+    // The fix moves every one of those ops onto the route's **already-pooled private stream**
+    // via the `*Async` variants behind exactly TWO `cuStreamSynchronize` (one after the kernel
+    // so the device-computed counts are readable to size the result reads; one after the result
+    // D2H). Two extra reductions ride along: the two atomic-append counters are fused into ONE
+    // 8-byte device buffer read back in ONE D2H (the count read was the single largest post-fix
+    // section because it forces the mid-pipeline sync), and all device→host copies stage through
+    // **pooled pinned (page-locked) host buffers** so the async D2H is truly async + DMA-fast.
+    // `cuMemAlloc`/`cuMemHostAlloc`/`cuStreamCreate` are themselves driver-serialized, so every
+    // buffer (device + pinned-host) and the stream are POOLED — a per-call alloc would
+    // re-introduce the very contention this removes (that was why the throwaway knob experiment,
+    // which created an un-pooled per-call stream, only reached 1.64× instead of more).
+    //
+    // The whole async path is gated on the optional async + pinned-host driver symbols; on an
+    // old driver lacking them the route keeps the original blocking default-stream path below,
+    // so correctness is unconditional and only the acceleration is best-effort.
+    let async_ops = match (
+        resident.primary().cu_memcpy_htod_async,
+        resident.primary().cu_memcpy_dtoh_async,
+        resident.primary().cu_memset_d8_async,
+    ) {
+        (Some(htod), Some(dtoh), Some(memset)) => Some((htod, dtoh, memset)),
+        _ => None,
+    };
 
+    // Pooled device output buffers (no per-call cuMemAlloc/cuMemFree). Reused buffers are NOT
+    // zeroed; only the fused counter buffer is memset, the needles buffer is fully overwritten
+    // by the HtoD upload, and every output is read back only over [0, count) — so stale bytes
+    // are never observed.
+    let needles_guard = resident.primary().lease_device_buffer(needle_bytes)?;
     let values_guard = resident.primary().lease_device_buffer(output_bytes)?;
     let indices_guard = resident
         .primary()
@@ -4101,14 +4292,15 @@ DONE:
         .primary()
         .lease_device_buffer(output_indices_bytes)?;
     let text_bytes_guard = resident.primary().lease_device_buffer(output_text_bytes)?;
-    let count_guard = resident
-        .primary()
-        .lease_device_buffer(std::mem::size_of::<u32>())?;
-    let text_count_guard = resident
-        .primary()
-        .lease_device_buffer(std::mem::size_of::<u32>())?;
-    check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
-    check_cuda(unsafe { cu_memset_d8(text_count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
+    // Fused counters: `count` at +0, `text_count` at +4 of one 8-byte device buffer, so both
+    // are zeroed by one memset and read back by one D2H. The kernel still receives two distinct
+    // pointers (it does `atom.add` into each independently), so no kernel change is required.
+    const COUNT_OFFSET: usize = 0;
+    const TEXT_COUNT_OFFSET: usize = std::mem::size_of::<u32>();
+    const COUNTERS_BYTES: usize = 2 * std::mem::size_of::<u32>();
+    let counters_guard = resident.primary().lease_device_buffer(COUNTERS_BYTES)?;
+    let count_ptr = counters_guard.ptr + COUNT_OFFSET as u64;
+    let text_count_ptr = counters_guard.ptr + TEXT_COUNT_OFFSET as u64;
 
     // P2-M2: cached module (no per-launch cuModuleLoadData) — the projection kernel is
     // already parallel (one thread per row + atomic-append); the c64 wall was this per-call
@@ -4140,8 +4332,8 @@ DONE:
     let mut text_starts_arg = text_starts_guard.ptr;
     let mut text_lens_arg = text_lens_guard.ptr;
     let mut text_output_arg = text_bytes_guard.ptr;
-    let mut count_arg = count_guard.ptr;
-    let mut text_count_arg = text_count_guard.ptr;
+    let mut count_arg = count_ptr;
+    let mut text_count_arg = text_count_ptr;
     let mut args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut rows_arg as *mut u64).cast::<c_void>(),
@@ -4167,47 +4359,286 @@ DONE:
     ];
     let threads_per_block = 128;
     let blocks = row_count_u32.div_ceil(threads_per_block);
-    // P2-M2: launch on a pooled private stream synced individually (no whole-context
-    // cuCtxSynchronize); the route owns its output buffers, so no pooled scratch.
-    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
-        cu_launch_kernel(
-            function,
-            blocks,
-            1,
-            1,
-            threads_per_block,
-            1,
-            1,
-            0,
-            stream,
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    })?;
+    let projection_count = projection_offsets.len();
 
-    let mut match_count = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut match_count as *mut u32).cast::<c_void>(),
-            count_guard.ptr,
-            std::mem::size_of::<u32>(),
+    // Read back the fused 8-byte counter pair; on the async path it stages through a pooled
+    // pinned host buffer, on the blocking path through a plain stack array.
+    let mut counters_host = [0_u32; 2];
+
+    let (match_count, compact_text_len) = if let Some((htod_async, dtoh_async, memset_async)) =
+        async_ops
+    {
+        // ---- async-on-pooled-stream path (the lever) ----
+        // Bind the shared primary context (idempotent) and lease the pooled private stream.
+        resident.primary().set_current()?;
+        struct StreamLease<'a> {
+            primary: &'a GpuPrimaryContext,
+            pooled: Option<PooledStream>,
+        }
+        impl Drop for StreamLease<'_> {
+            fn drop(&mut self) {
+                if let Some(pooled) = self.pooled.take() {
+                    self.primary.release_pooled_stream(pooled);
+                }
+            }
+        }
+        let lease = StreamLease {
+            primary: resident.primary(),
+            pooled: Some(resident.primary().acquire_pooled_stream()?),
+        };
+        let pooled = lease.pooled.as_ref().expect("pooled stream just set");
+        let stream = pooled.stream;
+        let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+
+        // HARDENING (error-path stream drain): once an async op is enqueued on this private
+        // stream, an early `?` would propagate and unwind the locals — returning the device +
+        // pinned buffer leases to their pools while enqueued ops may still be in flight, a
+        // use-after-free window for whoever leases those buffers next. So every fallible op
+        // from the first async enqueue through each covering `cuStreamSynchronize` propagates
+        // its error through `drain_err`, which does a best-effort blocking sync (ignoring its
+        // result) to drain the stream FIRST, *then* yields the original error.
+        //
+        // Ordering proof (drain-before-release on EVERY error path): `.map_err(drain_err)`
+        // runs the closure at the error site, BEFORE the `?` returns and hence before ANY local
+        // Drop runs — so it precedes the release of every lease regardless of scope (the device
+        // guards live in the outer fn scope and drop last on unwind; the pinned leases live in
+        // this block and drop first). A declaration-order Drop guard could not cover both,
+        // because the pinned leases are created incrementally across this region; draining at
+        // the error site sidesteps scope/order entirely. Zero success-path cost: `map_err` does
+        // not invoke the closure on `Ok`, so a successful op adds nothing — the two explicit
+        // syncs below remain the only synchronizations on the hot path. The drain is applied
+        // only to ops that may leave async work in flight (enqueues + the covering syncs); the
+        // pure-host steps between/after the syncs run when the stream is already idle, so they
+        // need no drain.
+        let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+            // SAFETY: `stream` is the live pooled private stream; a blocking synchronize on it is
+            // valid from this thread (the primary context is current). The result is intentionally
+            // ignored — this is a best-effort drain on an already-failing path.
+            unsafe {
+                let _ = (resident.primary().cu_stream_synchronize)(stream);
+            }
+            err
+        };
+
+        // (1) Stream-ordered upload + zero + kernel: HtoD(needles), memset(counters=0), kernel.
+        check_cuda(unsafe {
+            htod_async(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+                stream,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { memset_async(counters_guard.ptr, 0, COUNTERS_BYTES, stream) })
+            .map_err(drain_err)?;
+        if timed {
+            check_cuda(unsafe { (resident.primary().cu_event_record)(pooled.start_event, stream) })
+                .map_err(drain_err)?;
+        }
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+        if timed {
+            check_cuda(unsafe { (resident.primary().cu_event_record)(pooled.stop_event, stream) })
+                .map_err(drain_err)?;
+        }
+        // (2) Stream-ordered read of the fused 8-byte counter pair, then sync #1: now the
+        // counters (and the kernel) are complete and the result-array sizes are known. The
+        // counters stage through a small pooled pinned host buffer for a truly-async DMA.
+        let counters_pinned = resident.primary().lease_pinned_host_buffer(COUNTERS_BYTES);
+        let counters_dst: *mut c_void = counters_pinned
+            .as_ref()
+            .map(|p| p.ptr)
+            .unwrap_or_else(|| counters_host.as_mut_ptr().cast::<c_void>());
+        check_cuda(unsafe { dtoh_async(counters_dst, counters_guard.ptr, COUNTERS_BYTES, stream) })
+            .map_err(drain_err)?;
+        // Covering sync #1: drains on its own error too (the counter D2H is still enqueued).
+        check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
+            .map_err(drain_err)?;
+        if let Some(pinned) = &counters_pinned {
+            // SAFETY: the sync above completed the 8-byte D2H into the pinned region; copy the
+            // two u32 counters out by typed pointer (no alignment hazard: pinned host memory is
+            // page-aligned and we read u32s from a u32-array layout).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pinned.ptr.cast::<u32>(),
+                    counters_host.as_mut_ptr(),
+                    counters_host.len(),
+                );
+            }
+        }
+        if timed {
+            let mut elapsed_ms = 0.0_f32;
+            check_cuda(unsafe {
+                (resident.primary().cu_event_elapsed_time)(
+                    &mut elapsed_ms,
+                    pooled.start_event,
+                    pooled.stop_event,
+                )
+            })?;
+            resident.record_kernel_event_elapsed_us(Some(
+                (f64::from(elapsed_ms) * 1_000.0).ceil() as u64
+            ));
+        } else {
+            resident.record_kernel_event_elapsed_us(None);
+        }
+
+        let match_count = u64::from(counters_host[0]);
+        let compact_text_len = counters_host[1];
+        if match_count > row_count || u64::from(compact_text_len) > text_bytes_len {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
+        let match_count_usize = usize::try_from(match_count)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let compact_text_usize = usize::try_from(compact_text_len)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+        // (3) Stream-ordered result D2H into pooled pinned host buffers (one queued copy per
+        // result array, each reading back only the populated [0, count) prefix of its worst-
+        // case device buffer), then ONE sync #2 — so the six copies overlap on the copy engine
+        // instead of serializing as six blocking default-stream barriers. After the sync, the
+        // pinned bytes are copied into owned Vecs (pinned buffers return to the pool on drop).
+        let mut values = vec![0_i32; match_count_usize.saturating_mul(projection_count)];
+        let mut needle_indices = vec![0_u32; match_count_usize];
+        let mut row_indices = vec![0_u64; match_count_usize];
+        let mut text_starts = vec![0_u32; match_count_usize];
+        let mut text_lens = vec![0_u32; match_count_usize];
+        let mut text_bytes = vec![0_u8; compact_text_usize];
+
+        // Each staged D2H enqueues an async copy before it can return `Err`, so its error path
+        // drains the stream first (via `drain_err`) before any lease unwinds. Earlier copies in
+        // this batch are also still in flight on a later copy's failure — the single covering
+        // sync #2 below would normally wait on them, but on the error path we must drain
+        // explicitly since that sync is skipped.
+        let values_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            values_guard.ptr,
+            &mut values,
         )
-    })?;
-    let mut compact_text_len = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut compact_text_len as *mut u32).cast::<c_void>(),
-            text_count_guard.ptr,
-            std::mem::size_of::<u32>(),
+        .map_err(drain_err)?;
+        let needle_indices_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            indices_guard.ptr,
+            &mut needle_indices,
         )
-    })?;
-    let match_count = u64::from(match_count);
-    if match_count > row_count || u64::from(compact_text_len) > text_bytes_len {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
-    }
+        .map_err(drain_err)?;
+        let row_indices_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            row_indices_guard.ptr,
+            &mut row_indices,
+        )
+        .map_err(drain_err)?;
+        let text_starts_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            text_starts_guard.ptr,
+            &mut text_starts,
+        )
+        .map_err(drain_err)?;
+        let text_lens_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            text_lens_guard.ptr,
+            &mut text_lens,
+        )
+        .map_err(drain_err)?;
+        let text_bytes_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            text_bytes_guard.ptr,
+            &mut text_bytes,
+        )
+        .map_err(drain_err)?;
+        // Covering sync #2: drains on its own error too (six result D2H still enqueued).
+        check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
+            .map_err(drain_err)?;
+
+        copy_pinned_into(&values_pinned, &mut values);
+        copy_pinned_into(&needle_indices_pinned, &mut needle_indices);
+        copy_pinned_into(&row_indices_pinned, &mut row_indices);
+        copy_pinned_into(&text_starts_pinned, &mut text_starts);
+        copy_pinned_into(&text_lens_pinned, &mut text_lens);
+        copy_pinned_into(&text_bytes_pinned, &mut text_bytes);
+        drop(lease);
+
+        return assemble_i32_text_batch_projection_rows(
+            needles,
+            row_count,
+            projection_count,
+            &values,
+            &needle_indices,
+            &row_indices,
+            &text_starts,
+            &text_lens,
+            &text_bytes,
+        );
+    } else {
+        // ---- legacy blocking default-stream fallback (old driver: no async/pinned symbols) ----
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+            )
+        })?;
+        check_cuda(unsafe { cu_memset_d8(counters_guard.ptr, 0, COUNTERS_BYTES) })?;
+        // P2-M2: launch on a pooled private stream synced individually (no whole-context
+        // cuCtxSynchronize); the route owns its output buffers, so no pooled scratch.
+        launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                counters_host.as_mut_ptr().cast::<c_void>(),
+                counters_guard.ptr,
+                COUNTERS_BYTES,
+            )
+        })?;
+        let match_count = u64::from(counters_host[0]);
+        let compact_text_len = counters_host[1];
+        if match_count > row_count || u64::from(compact_text_len) > text_bytes_len {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
+        (match_count, compact_text_len)
+    };
+
     let match_count_usize = usize::try_from(match_count)
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let projection_count = projection_offsets.len();
     let mut values = vec![0_i32; match_count_usize.saturating_mul(projection_count)];
     if !values.is_empty() {
         check_cuda(unsafe {
@@ -4274,8 +4705,7 @@ DONE:
         })?;
     }
 
-    drop(text_count_guard);
-    drop(count_guard);
+    drop(counters_guard);
     drop(text_bytes_guard);
     drop(text_lens_guard);
     drop(text_starts_guard);
@@ -4283,12 +4713,84 @@ DONE:
     drop(indices_guard);
     drop(values_guard);
     drop(needles_guard);
+    assemble_i32_text_batch_projection_rows(
+        needles,
+        row_count,
+        projection_count,
+        &values,
+        &needle_indices,
+        &row_indices,
+        &text_starts,
+        &text_lens,
+        &text_bytes,
+    )
+}
+
+/// Queue ONE stream-ordered (async) D2H of `dst.len() * size_of::<T>()` bytes from `device_ptr`
+/// into a pooled pinned host staging buffer if one can be leased (truly-async + DMA-fast), else
+/// directly into `dst` (still async, just from pageable memory). Returns the pinned lease (kept
+/// alive by the caller until after the stream sync, then drained by `copy_pinned_into`), or
+/// `None` when the copy went straight to `dst`. An empty `dst` queues nothing and returns `None`.
+fn stage_result_dtoh_async<'a, T>(
+    primary: &'a GpuPrimaryContext,
+    dtoh_async: unsafe extern "C" fn(*mut c_void, u64, usize, *mut c_void) -> i32,
+    stream: *mut c_void,
+    device_ptr: u64,
+    dst: &mut [T],
+) -> Result<Option<PinnedHostLease<'a>>, CudaRuntimeProbeError> {
+    let bytes = std::mem::size_of_val(dst);
+    if bytes == 0 {
+        return Ok(None);
+    }
+    match primary.lease_pinned_host_buffer(bytes) {
+        Some(pinned) => {
+            check_cuda(unsafe { dtoh_async(pinned.ptr, device_ptr, bytes, stream) })?;
+            Ok(Some(pinned))
+        }
+        None => {
+            check_cuda(unsafe {
+                dtoh_async(dst.as_mut_ptr().cast::<c_void>(), device_ptr, bytes, stream)
+            })?;
+            Ok(None)
+        }
+    }
+}
+
+/// Copy a completed pinned-host staging buffer into its owned `dst` Vec by typed pointer (no-op
+/// when the staged copy went straight to `dst`, i.e. `pinned` is `None`). Must be called only
+/// after the stream sync that completed the D2H into the pinned region.
+fn copy_pinned_into<T>(pinned: &Option<PinnedHostLease<'_>>, dst: &mut [T]) {
+    if let Some(pinned) = pinned {
+        // SAFETY: the matching `stage_result_dtoh_async` leased `pinned` with capacity ≥
+        // size_of_val(dst) and the stream sync completed the D2H of exactly that many bytes;
+        // pinned host memory is page-aligned, so the typed read is well-aligned for `T`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pinned.ptr.cast::<T>(), dst.as_mut_ptr(), dst.len());
+        }
+    }
+}
+
+/// Shared row assembler for both the async and blocking text-route paths: validate the
+/// device-returned indices and stitch the per-row arrays into `CudaI32TextBatchProjectionRow`s
+/// with byte-identical layout to the pre-async path (same field semantics, same column order).
+#[allow(clippy::too_many_arguments)]
+fn assemble_i32_text_batch_projection_rows(
+    needles: &[i32],
+    row_count: u64,
+    projection_count: usize,
+    values: &[i32],
+    needle_indices: &[u32],
+    row_indices: &[u64],
+    text_starts: &[u32],
+    text_lens: &[u32],
+    text_bytes: &[u8],
+) -> Result<Vec<CudaI32TextBatchProjectionRow>, CudaRuntimeProbeError> {
     values
         .chunks_exact(projection_count)
-        .zip(needle_indices)
-        .zip(row_indices)
-        .zip(text_starts)
-        .zip(text_lens)
+        .zip(needle_indices.iter().copied())
+        .zip(row_indices.iter().copied())
+        .zip(text_starts.iter().copied())
+        .zip(text_lens.iter().copied())
         .map(
             |((((row, needle_index), row_index), text_start), text_len)| {
                 let needle_index = usize::try_from(needle_index)
@@ -10057,6 +10559,112 @@ mod tests {
             ptrs.len(),
             total,
             "concurrently-held leases must never alias the same device buffer"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_pinned_host_buffer_pool_reuses_buffers_and_isolates_concurrent_leases() {
+        // P2-M2 — the fused text route stages its async D2H through pooled pinned (page-locked)
+        // host buffers; `cuMemHostAlloc`/`cuMemFreeHost` are driver-serialized, so the buffers
+        // are pooled. This mirrors the device-pool isolation test for the pinned pool and proves
+        // the same contract on real hardware:
+        //   (a) a released buffer of a bucket is REUSED (same host ptr) on the next same-bucket
+        //       lease — no fresh cuMemHostAlloc;
+        //   (b) two simultaneously-held leases of one bucket get DISTINCT buffers (concurrent
+        //       calls never stage into each other's pinned region);
+        //   (c) released leases return to the idle pool, and a different size is a different
+        //       bucket (no collision);
+        //   (d) under real multi-thread contention, simultaneously-held leases never alias.
+        // This is the binary's sole pinned-pool user, so the (c) counts are stable.
+        let _runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let ctx = gpu_primary_context(0).expect("primary context");
+        // The lease allocates via cuMemHostAlloc, so the context must be current on this thread —
+        // exactly the precondition the engine dispatcher satisfies before a route runs.
+        ctx.set_current()
+            .expect("bind primary context on this thread");
+
+        // (a) reuse: lease -> drop -> pool; the next same-bucket lease pops the same ptr. The
+        // first lease also serves as the driver-capability probe: the pinned path is gated on
+        // optional driver symbols, so a `None` here means the local driver lacks
+        // cuMemHostAlloc/cuMemFreeHost (the route falls back to pageable host buffers) — skip.
+        // The probe is folded into this real lease rather than a throwaway one so it does not
+        // pre-populate the tiny bucket that step (c)'s small lease later draws from.
+        let big = 600_000_usize;
+        let Some(first) = ctx.lease_pinned_host_buffer(big) else {
+            eprintln!(
+                "skipping: driver lacks cuMemHostAlloc/cuMemFreeHost (pinned-host pool inactive)"
+            );
+            return;
+        };
+        let ptr1 = first.ptr;
+        drop(first); // return to the pool so the next same-bucket lease reuses it
+        let ptr2 = ctx.lease_pinned_host_buffer(big).expect("lease").ptr;
+        assert_eq!(
+            ptr1, ptr2,
+            "a released pinned buffer must be reused on the next same-bucket lease, not reallocated"
+        );
+
+        // (b) isolation: two leases held at once must be distinct host pointers.
+        {
+            let a = ctx.lease_pinned_host_buffer(big).expect("lease a");
+            let b = ctx.lease_pinned_host_buffer(big).expect("lease b");
+            assert_ne!(
+                a.ptr, b.ptr,
+                "concurrent leases of one bucket must not alias the same pinned host buffer"
+            );
+        } // both returned to the pool here
+
+        // (c) accounting: the big bucket now holds >= 2 idle buffers; a tiny lease uses a
+        // different bucket (distinct ptr) and does not drain the big one.
+        let big_idle = ctx.pooled_pinned_host_buffer_count();
+        assert!(
+            big_idle >= 2,
+            "both released pinned leases must return to the idle pool (got {big_idle})"
+        );
+        let small = ctx.lease_pinned_host_buffer(4).expect("lease small").ptr;
+        assert_ne!(
+            small, ptr1,
+            "a different bucket must yield a different pinned buffer"
+        );
+        assert!(
+            ctx.pooled_pinned_host_buffer_count() > big_idle,
+            "a different-bucket lease must add to, not drain, the idle pool"
+        );
+
+        // (d) the load-bearing safety property under real contention: leases held at the same
+        // instant on different threads must be DISTINCT host buffers — `pop()` removes the ptr
+        // from the free list under the mutex, so no two live leases share a buffer (which would
+        // let one concurrent route's async D2H clobber another's staged result). A barrier holds
+        // all N leases live simultaneously before their pointers are compared. Folded into this
+        // one test (rather than its own) so it is the sole pinned-pool user in the binary — the
+        // (c) counts above stay stable instead of racing a sibling test on the shared pool.
+        const N: usize = 16;
+        let barrier = std::sync::Barrier::new(N);
+        let held = std::sync::Mutex::new(Vec::with_capacity(N));
+        std::thread::scope(|scope| {
+            for _ in 0..N {
+                scope.spawn(|| {
+                    ctx.set_current()
+                        .expect("bind primary context on this thread");
+                    let lease = ctx.lease_pinned_host_buffer(big).expect("lease");
+                    held.lock().expect("held poisoned").push(lease.ptr as usize);
+                    // Keep every lease alive across the barrier so all N are live at once; no
+                    // buffer is released until every thread has recorded its pointer.
+                    barrier.wait();
+                    drop(lease);
+                });
+            }
+        });
+        let mut ptrs = held.into_inner().expect("held poisoned");
+        let total = ptrs.len();
+        assert_eq!(total, N, "every thread must have recorded a lease");
+        ptrs.sort_unstable();
+        ptrs.dedup();
+        assert_eq!(
+            ptrs.len(),
+            total,
+            "concurrently-held pinned leases must never alias the same host buffer"
         );
     }
 
