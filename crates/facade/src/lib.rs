@@ -305,8 +305,12 @@ impl Default for SharedEngine {
 /// writes serialize). Transaction-control statements take no lock and produce only the tag.
 /// This is the concurrent-dispatch counterpart of [`execute_on_engine`]; the per-statement
 /// txn id is allocated internally (still a placeholder, not a transaction handle — see
-/// [`EngineFacade::take_txn_id`]). Lock poisoning is recovered (`into_inner`) so one panicked
-/// connection does not wedge the engine for the rest.
+/// [`EngineFacade::take_txn_id`]). If a writer panics mid-statement the lock is poisoned;
+/// rather than `into_inner`-recover and risk serving a logically half-mutated engine as if
+/// committed, every subsequent statement fails loud with [`ErrorCategory::Internal`] — the
+/// engine deliberately wedges rather than expose torn state (the WAL is the durable source
+/// of truth; a restart replays it). Process-abort-on-poison is a production-hardening
+/// follow-up.
 pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
     let command = match parse_command(sql) {
         Ok(command) => command,
@@ -315,10 +319,7 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
     };
     match command {
         Command::Select(select) => {
-            let engine = shared
-                .engine
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let engine = shared.engine.read().map_err(|_| poisoned_engine_error())?;
             let result = engine
                 .execute_relational_select(&select)
                 .map_err(map_execute_error)?;
@@ -345,10 +346,7 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
         other => {
             let tag = command_tag(&other);
             let txn_id = shared.next_txn_id.fetch_add(1, Ordering::Relaxed);
-            let mut engine = shared
-                .engine
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut engine = shared.engine.write().map_err(|_| poisoned_engine_error())?;
             engine
                 .execute_text(txn_id, sql)
                 .map_err(map_execute_error)?;
@@ -357,6 +355,17 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
                 rows_affected: None,
             })
         }
+    }
+}
+
+/// The engine lock was poisoned by a panicked writer: refuse to serve possibly-torn state.
+fn poisoned_engine_error() -> DbError {
+    DbError {
+        category: ErrorCategory::Internal,
+        message: "engine unavailable: a prior statement panicked mid-execution, so engine \
+                  state may be inconsistent — restart required (the WAL is the durable source \
+                  of truth)"
+            .to_string(),
     }
 }
 

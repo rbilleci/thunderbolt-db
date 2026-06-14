@@ -10,8 +10,12 @@
 //! - **concurrent** (`serve`): thread-per-connection over one shared engine; reads run
 //!   concurrently (read lock), writes serialize (write lock).
 //! - **sequential** (`serve_sequential`): one connection at a time — the prior baseline.
-//!   At >1 offered connection it can only serve one; the rest fail the connect deadline,
-//!   so `served` stays 1 and throughput is pinned at single-connection rate.
+//!   At >1 offered connection it serves them strictly serially; only the few accepted
+//!   back-to-back within the 5 s connect window report results, so `served` is a small
+//!   run-dependent number (1–3 observed), the rest fail the connect deadline, and true
+//!   sustained throughput stays pinned at the single-connection rate. (The reported qps at
+//!   conn>1 is an artifact: it sums those serially-run clients' requests over one window —
+//!   read the c1 row as the real ceiling.)
 //!
 //! This is the *minimal* cut of the Phase-5 harness (closed-loop per client = offered
 //! concurrency via N connections, not a true open-loop offered-rate; fixed duration; one

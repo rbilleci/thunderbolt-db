@@ -405,14 +405,17 @@ honest docs; the real tech stack adopted.
     residency maps still mutate structure under `&mut self`). Tracked cosmetic follow-up
     (both maps): tombstoned empty `SnapshotCell`s are never GC'd — device memory is freed,
     only empty-cell metadata accumulates.
-- **Concurrent dispatch (P1-M4 — the immediate unlock).** The read substrate and the GPU
-  layer are concurrent-ready, but **no caller drives them concurrently** — the
-  engine-backed server is single-threaded and the benchmark server funnels through one
-  owner thread. Share one `Arc<Engine>` across a bounded worker pool so reads actually
-  dispatch in parallel. This is the *smallest* change that converts everything built in
-  P1-M3/P2-M1/P2-M2 into a measured throughput win, and it needs **no async rewrite** — it
-  runs on the existing blocking sockets. Do it **before** async ingress; async ingress then
-  swaps the acceptor underneath it for connection scale.
+- **Concurrent dispatch (P1-M4 — the immediate unlock). ✅ Done (2026-06-14).** The
+  engine-backed server (`crates/server`) now shares one engine across a thread-per-connection
+  pool (`Arc<SharedEngine>` in the façade; reads take a read lock and run concurrently,
+  writes a write lock and serialize) — the first production caller of the `&self` read path
+  (P1-M3) + GPU shared-context substrate (P2-M1), on the existing blocking sockets, no async
+  rewrite. Measured over the wire: **~58× to 106k qps at 256 connections** (sequential
+  baseline serves one at a time, ~1.4k qps). The load harness landed alongside (the
+  "measure at load first" item) and immediately surfaced + fixed a 42 ms→0.5 ms Nagle/
+  `TCP_NODELAY` latency bug. Independently audited. Run report:
+  `.../runs/2026-06-14-p1-m4-concurrent-dispatch-v1.md`. (Reads-only win; writes serialize —
+  scaling writes is the write-half.)
 - **Real MVCC.** Per-transaction snapshots, a commit-timestamp oracle distinct from
   the log index, and **write-write conflict detection** (Snapshot Isolation
   minimum; SSI for `SERIALIZABLE` ledgers). Honor the already-parsed isolation
@@ -443,7 +446,7 @@ and a harness that measures it:
 | flow layer | driven by | status |
 |---|---|---|
 | Connection ingress (async acceptor, admission) | P1-M5 async ingress + Phase 5 | not started (thread-per-conn) |
-| Server→engine **concurrent dispatch** | **P1-M4 (immediate)** | owed — substrate ready, no caller |
+| Server→engine **concurrent dispatch** | P1-M4 | ✅ done (2026-06-14): `Arc<SharedEngine>`, read-lock reads / write-lock writes; ~58× to 106k qps @ c256 |
 | Engine **read** path | P1-M3 reader/writer (read half) | ✅ done (`&self`, gate 2) |
 | Engine **write** path concurrency | P1 writer half + MVCC | owed — UAF hazards cleared (2026-06-14); needs the writer + MVCC + `&self` structural mutation |
 | GPU **execution** (parallel kernels) | Phase 2 | started (P2-M2, 1 of ~6 routes) |
@@ -607,7 +610,14 @@ thesis pays off second.
   reduction on the P2-M1 substrate, replacing the single-thread `(1,1,1)` serial loop —
   **~60× faster on a 16M-row scan** (475ms→7.9ms), exact-count-verified at 4K–16M rows
   (incl. the grid-clamp/grid-stride-wrap case). The first real GPU-native compute win. Run
-  report: `.../runs/2026-06-14-p2-m2-parallel-scan-kernel-v1.md`**.
+  report: `.../runs/2026-06-14-p2-m2-parallel-scan-kernel-v1.md`**. ·
+  **Latent UAF hazards closed ✅ (2026-06-14): partition residency → SnapshotCell<Arc>
+  (audited); cross-generation context already closed by P2-M1**. ·
+  **P1-M4 concurrent dispatch ✅ (2026-06-14): engine-backed server shares
+  `Arc<SharedEngine>` across a thread-per-connection pool (read-lock reads / write-lock
+  writes); scales reads ~58× to 106k qps @ 256 conns over the wire; load harness +
+  `TCP_NODELAY` fix landed; independently audited. Run report:
+  `.../runs/2026-06-14-p1-m4-concurrent-dispatch-v1.md`**.
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
@@ -618,15 +628,18 @@ reproduces M0 within run-to-run variance (step 1 changed nothing on the measured
 path; this is a noise characterization, not an improvement). The next *meaningful*
 (improvement) benchmark is the step-4 re-run after the `&self` read-path flip.
 
-**Immediate next: P1-M4 — concurrent dispatch (turn the substrate into throughput).**
-P1-M3 (read path), P2-M1 (GPU shared-context/stream substrate), and P2-M2 (parallel scan
-kernel) are **done**; the engine is `&self`/`Send + Sync` and the GPU layer is
-per-thread-ready, but **no caller runs them concurrently**. Next: share one `Arc<Engine>`
-across a bounded worker pool in the engine-backed server so reads dispatch in parallel, and
-land a **minimal open-loop / p99.9 / multi-hundred-connection** harness alongside it so the
-win is measured at load (not the closed-loop ≤64-conn probe). Then P1-M5 async ingress for
-connection scale, and the write-half + `partition_device_memory` → `SnapshotCell` before any
-concurrent write. See Phase 1 "Concurrency across the flow — status map".
+**Immediate next: P1-M5 async ingress, and the write-half.** P1-M3 (read path), P2-M1 (GPU
+shared-context/stream substrate), P2-M2 (parallel scan kernel), the two latent UAF hazards
+(closed), and **P1-M4 concurrent dispatch** (the engine-backed server now scales reads ~58×
+to 106k qps at 256 connections; load harness + `TCP_NODELAY` fix landed) are **done**. Two
+threads from here:
+- **P1-M5 async ingress** — replace thread-per-connection with a `tokio` acceptor + bounded
+  executor for connection *scale* (toward 100k–1M); thread-per-conn is fine at hundreds.
+- **Write-half** — concurrent writes via publish-on-commit + MVCC so writes scale too
+  (today writes take the single write lock and serialize). The UAF prerequisites are
+  already cleared.
+Also still owed: grow the harness to the Phase-5 open-loop/p99.9/steady-state shape; §9.1/
+§9.2 server consolidation. See Phase 1 "Concurrency across the flow — status map".
 
 **Completed record — P1-M3 (applied the snapshot substrate to the engine read path).**
 Full design + acceptance gates:
