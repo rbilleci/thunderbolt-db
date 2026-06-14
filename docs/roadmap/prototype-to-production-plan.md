@@ -641,7 +641,16 @@ thesis pays off second.
   **P1-M5 async ingress ✅ (2026-06-14): `serve_async` tokio acceptor (task-per-connection) +
   semaphore-bounded spawn_blocking executor; peak OS threads ⟂ connections (~641 const to
   8192 conns vs thread-per-conn 194→1073); independently audited. Run report:
-  `.../runs/2026-06-14-p1-m5-async-ingress-v1.md`**.
+  `.../runs/2026-06-14-p1-m5-async-ingress-v1.md`**. ·
+  **P2-M2 projection routes ✅/⚠ (2026-06-14): a device output-buffer pool (`OutputBufferPool` /
+  `lease_device_buffer` on `GpuPrimaryContext`) removed per-call `cuMemAlloc`/`cuMemFree` →
+  `multi_col_projection` **14.9 ms → 5.7 ms p50 @c64 (2.6×)** (it was allocation-bound; audited,
+  committed `8c476939`). Run report: `.../runs/2026-06-14-p2-m2-output-buffer-pooling-v1.md`.
+  ⚠ The text route `mixed_int_text` is UNMOVED by FOUR GPU-orchestration fixes (pooling /
+  async-prekernel / pinned-D2H / fused-packed-output — last two built+reverted); its kernel is
+  only **7 µs**, so the c64 wall (~27 ms / ~2.2k qps) is NOT in the GPU path and is UNLOCATED.
+  OPEN — handed off for a per-section timing breakdown:
+  `.../runs/2026-06-14-text-route-wall-investigation-handoff.md`.**
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
