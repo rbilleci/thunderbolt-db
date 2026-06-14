@@ -357,6 +357,25 @@ impl GpuPrimaryContext {
         })
     }
 
+    /// Owned (`'static`) variant of `lease_device_buffer`: same pool, same bucketing, but returns
+    /// a guard that holds an `Arc<Self>` instead of a borrow so it can be moved into a deferred
+    /// `Send` submission that outlives the leasing stack frame. `self` is taken as `&Arc<Self>`.
+    fn lease_device_buffer_owned(
+        self: &Arc<Self>,
+        min_bytes: usize,
+    ) -> Result<PooledDeviceBufferOwned, CudaRuntimeProbeError> {
+        let lease = self.lease_device_buffer(min_bytes)?;
+        // Transfer the leased buffer into the owned guard without round-tripping it through the
+        // pool: read its fields, then forget the borrow-scoped lease so its Drop does not release.
+        let (ptr, capacity) = (lease.ptr, lease.capacity);
+        std::mem::forget(lease);
+        Ok(PooledDeviceBufferOwned {
+            primary: Arc::clone(self),
+            ptr,
+            capacity,
+        })
+    }
+
     /// Return a leased buffer to the pool, or free it if the idle cap is reached.
     fn release_device_buffer(&self, ptr: u64, capacity: usize) {
         let mut pool = self
@@ -437,19 +456,28 @@ impl GpuPrimaryContext {
             .push(PinnedHostPtr(ptr));
     }
 
+    /// Test-only: idle count in one specific pinned-host bucket. Bucket-scoped (like
+    /// `is_module_cached`) so a pool-isolation test can assert "a different-bucket lease did not
+    /// DRAIN this bucket" without reading the process-global total, which any *other* pool user in
+    /// the binary perturbs (e.g. the migrated equal_any parity test now leases from this same
+    /// shared pool — its `complete` stages result D2H through pooled pinned buffers).
     #[cfg(test)]
-    fn pooled_pinned_host_buffer_count(&self) -> usize {
+    fn pooled_pinned_host_buffer_count_in_bucket(&self, min_bytes: usize) -> usize {
+        let bucket = output_buffer_bucket(min_bytes);
         self.pinned_host_buffers
             .lock()
-            .map(|pool| pool.free.values().map(Vec::len).sum())
+            .map(|pool| pool.free.get(&bucket).map_or(0, Vec::len))
             .unwrap_or(0)
     }
 
+    /// Test-only: idle count in one specific device-buffer bucket. See
+    /// `pooled_pinned_host_buffer_count_in_bucket` for why this is bucket-scoped.
     #[cfg(test)]
-    fn pooled_output_buffer_count(&self) -> usize {
+    fn pooled_output_buffer_count_in_bucket(&self, min_bytes: usize) -> usize {
+        let bucket = output_buffer_bucket(min_bytes);
         self.output_buffers
             .lock()
-            .map(|pool| pool.free.values().map(Vec::len).sum())
+            .map(|pool| pool.free.get(&bucket).map_or(0, Vec::len))
             .unwrap_or(0)
     }
 
@@ -658,6 +686,44 @@ impl Drop for PooledBufferLease<'_> {
     }
 }
 
+/// Owned (`'static`) analogue of `PooledBufferLease`: returns the buffer to the pool on Drop, but
+/// holds an `Arc<GpuPrimaryContext>` instead of a borrow so it can live inside a `Send`,
+/// deferred-completion submission that outlives the `submit` stack frame (the split
+/// `submit`→`complete` projection route). Same pool, same bucketed release — the only difference
+/// from `PooledBufferLease` is owned vs borrowed context, so a buffer leased here is
+/// indistinguishable to the pool from one leased the synchronous way.
+struct PooledDeviceBufferOwned {
+    primary: Arc<GpuPrimaryContext>,
+    ptr: u64,
+    capacity: usize,
+}
+
+impl Drop for PooledDeviceBufferOwned {
+    fn drop(&mut self) {
+        self.primary.release_device_buffer(self.ptr, self.capacity);
+    }
+}
+
+/// Owned (`'static`) RAII handle to a pooled private stream: returns it to the pool on Drop,
+/// holding an `Arc<GpuPrimaryContext>` so it can be carried across the `submit`→`complete`
+/// boundary of the deferred-completion projection route (the synchronous routes use the
+/// borrow-scoped `StreamLease` instead). Carrying the stream (rather than releasing it in
+/// `submit`) keeps its timing events valid for `complete` and prevents another concurrent reader
+/// from leasing — and enqueuing onto — the same stream while this route's kernel is still in
+/// flight on it.
+struct PooledStreamOwned {
+    primary: Arc<GpuPrimaryContext>,
+    pooled: Option<PooledStream>,
+}
+
+impl Drop for PooledStreamOwned {
+    fn drop(&mut self) {
+        if let Some(pooled) = self.pooled.take() {
+            self.primary.release_pooled_stream(pooled);
+        }
+    }
+}
+
 /// RAII handle to a pooled pinned (page-locked) host staging buffer; returns it to the pool on
 /// every exit (success, error, or panic). `ptr` is a raw host pointer the route reads back
 /// through after the async D2H completes (i.e. after the stream sync).
@@ -806,11 +872,14 @@ impl CudaResidentDeviceMemoryReadView {
 trait CudaResidentReadSource {
     fn metadata(&self) -> &CudaDeviceMemoryProof;
     fn device_ptr(&self) -> u64;
-    fn context(&self) -> *mut c_void;
     fn lib(&self) -> &Library;
     /// The shared primary context — entry point to the module cache + stream pool, so the
     /// generic read routes (over an owner or a read view) can migrate to the substrate.
     fn primary(&self) -> &GpuPrimaryContext;
+    /// A cloned strong handle to the shared primary context — for deferred-completion routes
+    /// (split `submit`/`complete`) that must carry pool re-entry across the boundary in a `Send`
+    /// submission, where a borrow won't outlive the `submit` frame.
+    fn primary_arc(&self) -> Arc<GpuPrimaryContext>;
     fn record_kernel_event_elapsed_us(&self, _elapsed_us: Option<u64>) {}
 }
 
@@ -823,16 +892,16 @@ impl CudaResidentReadSource for CudaResidentDeviceMemory {
         self.device_ptr
     }
 
-    fn context(&self) -> *mut c_void {
-        self.primary.context()
-    }
-
     fn lib(&self) -> &Library {
         self.primary.lib()
     }
 
     fn primary(&self) -> &GpuPrimaryContext {
         &self.primary
+    }
+
+    fn primary_arc(&self) -> Arc<GpuPrimaryContext> {
+        Arc::clone(&self.primary)
     }
 
     fn record_kernel_event_elapsed_us(&self, elapsed_us: Option<u64>) {
@@ -849,16 +918,16 @@ impl CudaResidentReadSource for CudaResidentDeviceMemoryReadView {
         self.device_ptr
     }
 
-    fn context(&self) -> *mut c_void {
-        self.primary.context()
-    }
-
     fn lib(&self) -> &Library {
         self.primary.lib()
     }
 
     fn primary(&self) -> &GpuPrimaryContext {
         &self.primary
+    }
+
+    fn primary_arc(&self) -> Arc<GpuPrimaryContext> {
+        Arc::clone(&self.primary)
     }
 }
 
@@ -1304,19 +1373,38 @@ pub struct CudaI32EqualAnyProjectSubmission {
     projection_count: usize,
     needles_len: usize,
     row_count: u64,
-    context: *mut c_void,
-    values_guard: CudaDeviceAllocationGuard,
-    indices_guard: CudaDeviceAllocationGuard,
-    row_indices_guard: CudaDeviceAllocationGuard,
-    count_guard: CudaDeviceAllocationGuard,
-    _needles_guard: CudaDeviceAllocationGuard,
-    _module_guard: CudaModuleGuard,
-    start_event_guard: CudaEventGuard,
-    stop_event_guard: CudaEventGuard,
-    cu_ctx_set_current: unsafe extern "C" fn(*mut c_void) -> i32,
-    cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> i32,
-    cu_event_synchronize: unsafe extern "C" fn(*mut c_void) -> i32,
-    cu_event_elapsed_time: unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32,
+    // Shared primary context: gives the deferred `complete` re-entry to the buffer/pinned/stream
+    // pools and the (optional) async transfer symbols, exactly like the synchronous routes get
+    // via `resident.primary()`. Cheap `Arc` clone; already `Send + Sync`.
+    primary: Arc<GpuPrimaryContext>,
+    // P2-M2 (equal_any split-route migration): the device buffers are now leased from the shared
+    // `OutputBufferPool` (no per-call `cuMemAlloc`/`cuMemFree`) and the kernel runs on a pooled
+    // private stream (no NULL-stream context-wide barrier), mirroring the text route. Because this
+    // route defers `complete` (possibly to another thread), the pooled buffers + stream are
+    // carried as owned (`Arc`-holding) guards that return to their pools on Drop — the `'static`
+    // analogue of the synchronous routes' borrow-scoped leases. The kernel's HtoD(needles) +
+    // memset(count) + launch are enqueued (not synced) on `stream` in `submit`; `complete` syncs
+    // on `stop_event`, reads the count, then reads the result arrays — using the async (pinned,
+    // stream-ordered) copies when the optional symbols are present and the blocking ones otherwise.
+    values_guard: PooledDeviceBufferOwned,
+    indices_guard: PooledDeviceBufferOwned,
+    row_indices_guard: PooledDeviceBufferOwned,
+    count_guard: PooledDeviceBufferOwned,
+    _needles_guard: PooledDeviceBufferOwned,
+    // Held (not released in `submit`) so its timing events stay valid for `complete` and no other
+    // reader leases this stream while our kernel is still enqueued on it. Released on Drop.
+    //
+    // `Option` is the success/drop coordination lever for the `Drop` impl below: a successful
+    // `complete_detached` `take()`s this stream out (after its own covering sync), leaving `None`,
+    // so the `Drop` impl sees `None` and does NOT redundantly re-sync. If the submission is dropped
+    // WITHOUT `complete` (early `Err` in the engine, or any `?`/cancel/panic in the submit→complete
+    // window), it is still `Some`, so `Drop` drains it before the field guards release the pooled
+    // device buffers + stream back to the SHARED pools — without that drain a concurrent
+    // `lease_device_buffer` could re-lease memory the in-flight kernel/HtoD/memset still writes
+    // (cross-thread use-after-free).
+    stream: Option<PooledStreamOwned>,
+    // Whether the pooled stream's start/stop events were available (best-effort timing).
+    timed: bool,
 }
 
 // Pending read submissions own their temporary CUDA allocations/events/module.
@@ -1335,64 +1423,177 @@ impl CudaI32EqualAnyProjectSubmission {
     }
 
     pub fn complete_detached(
-        self,
+        mut self,
     ) -> Result<(Vec<CudaI32BatchProjectionRow>, Option<u64>), CudaRuntimeProbeError> {
-        check_cuda(unsafe { (self.cu_ctx_set_current)(self.context) })?;
-        check_cuda(unsafe { (self.cu_event_synchronize)(self.stop_event_guard.event) })?;
+        let primary = Arc::clone(&self.primary);
+        primary.set_current()?;
+        // Take ownership of the pooled stream out of the submission. This local guard keeps the
+        // stream alive (and pool-bound only on its own Drop at the end of this function) for the
+        // whole completion, AND leaves `self.stream == None` so the submission's `Drop` does NOT
+        // re-sync on this success path (no double-drain). The covering sync below is the single
+        // drain for the success path.
+        let stream_owned = self
+            .stream
+            .take()
+            .expect("pooled stream held until complete");
+        let pooled = stream_owned
+            .pooled
+            .as_ref()
+            .expect("pooled stream held until complete");
+        let stream = pooled.stream;
 
-        let mut elapsed_ms = 0.0_f32;
-        check_cuda(unsafe {
-            (self.cu_event_elapsed_time)(
-                &mut elapsed_ms,
-                self.start_event_guard.event,
-                self.stop_event_guard.event,
-            )
-        })?;
-        let elapsed_us = Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64);
+        // The kernel + its HtoD/memset were enqueued (not synced) on this private stream in
+        // `submit`. One stream sync here drains all of that: it is the deferred counterpart of the
+        // synchronous routes' post-launch sync. (Syncing the stream also completes the recorded
+        // stop event, so the elapsed-time read below is valid.)
+        check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) })?;
 
-        let mut match_count = 0_u32;
-        check_cuda(unsafe {
-            (self.cu_memcpy_dtoh)(
-                (&mut match_count as *mut u32).cast::<c_void>(),
-                self.count_guard.ptr,
-                std::mem::size_of::<u32>(),
-            )
-        })?;
-        let match_count = u64::from(match_count);
+        let elapsed_us = if self.timed {
+            let mut elapsed_ms = 0.0_f32;
+            check_cuda(unsafe {
+                (primary.cu_event_elapsed_time)(
+                    &mut elapsed_ms,
+                    pooled.start_event,
+                    pooled.stop_event,
+                )
+            })?;
+            Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64)
+        } else {
+            None
+        };
+
+        // Optional async transfer symbols (present on a modern driver): the result D2H then stage
+        // through pooled pinned host buffers, stream-ordered, behind a single covering sync — the
+        // same lever the text route uses. On an old driver lacking them, fall back to the blocking
+        // `cuMemcpyDtoH` (the stream is already idle after the sync above, so a blocking copy on
+        // the NULL stream observes the kernel's writes correctly). Correctness is identical on
+        // both paths; only the transfer is accelerated when the symbols exist.
+        let async_dtoh = primary.cu_memcpy_dtoh_async;
+
+        // Error-path stream drain: once a result D2H is enqueued on `stream`, an early `?` would
+        // unwind the owned buffer/stream guards (returning them to their pools) while the copy may
+        // still be in flight — a use-after-free for the next leaser. `drain_err` does a best-effort
+        // blocking sync FIRST (at the error site, before any guard Drop), then yields the original
+        // error. Zero success-path cost (`map_err` skips the closure on `Ok`).
+        let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+            // SAFETY: `stream` is the live held pooled stream; a blocking sync on it is valid here
+            // (the primary context is current). The result is intentionally ignored — best-effort
+            // drain on an already-failing path.
+            unsafe {
+                let _ = (primary.cu_stream_synchronize)(stream);
+            }
+            err
+        };
+
+        // Read the match count first (sizes every result array). Stage through a pooled pinned
+        // buffer on the async path; a stack u32 otherwise.
+        let mut match_count_host = 0_u32;
+        if let Some(dtoh_async) = async_dtoh {
+            let count_pinned = primary.lease_pinned_host_buffer(std::mem::size_of::<u32>());
+            let count_dst: *mut c_void = count_pinned
+                .as_ref()
+                .map(|p| p.ptr)
+                .unwrap_or_else(|| (&mut match_count_host as *mut u32).cast::<c_void>());
+            check_cuda(unsafe {
+                dtoh_async(
+                    count_dst,
+                    self.count_guard.ptr,
+                    std::mem::size_of::<u32>(),
+                    stream,
+                )
+            })
+            .map_err(drain_err)?;
+            check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+            if let Some(pinned) = &count_pinned {
+                // SAFETY: the sync completed the 4-byte D2H into the page-aligned pinned region.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        pinned.ptr.cast::<u32>(),
+                        &mut match_count_host as *mut u32,
+                        1,
+                    );
+                }
+            }
+        } else {
+            check_cuda(unsafe {
+                (primary.cu_memcpy_dtoh)(
+                    (&mut match_count_host as *mut u32).cast::<c_void>(),
+                    self.count_guard.ptr,
+                    std::mem::size_of::<u32>(),
+                )
+            })?;
+        }
+        let match_count = u64::from(match_count_host);
         if match_count > self.row_count {
             return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
         }
         let match_count_usize = usize::try_from(match_count)
             .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
         let mut values = vec![0_i32; match_count_usize.saturating_mul(self.projection_count)];
-        if !values.is_empty() {
-            check_cuda(unsafe {
-                (self.cu_memcpy_dtoh)(
-                    values.as_mut_ptr().cast::<c_void>(),
-                    self.values_guard.ptr,
-                    values.len() * std::mem::size_of::<i32>(),
-                )
-            })?;
-        }
         let mut needle_indices = vec![0_u32; match_count_usize];
-        if !needle_indices.is_empty() {
-            check_cuda(unsafe {
-                (self.cu_memcpy_dtoh)(
-                    needle_indices.as_mut_ptr().cast::<c_void>(),
-                    self.indices_guard.ptr,
-                    needle_indices.len() * std::mem::size_of::<u32>(),
-                )
-            })?;
-        }
         let mut row_indices = vec![0_u64; match_count_usize];
-        if !row_indices.is_empty() {
-            check_cuda(unsafe {
-                (self.cu_memcpy_dtoh)(
-                    row_indices.as_mut_ptr().cast::<c_void>(),
-                    self.row_indices_guard.ptr,
-                    row_indices.len() * std::mem::size_of::<u64>(),
-                )
-            })?;
+
+        if let Some(dtoh_async) = async_dtoh {
+            // Stream-ordered result D2H into pooled pinned buffers, each only over the populated
+            // [0, count) prefix, behind ONE covering sync — so the three copies overlap on the
+            // copy engine instead of serializing as blocking barriers.
+            let values_pinned = stage_result_dtoh_async(
+                primary.as_ref(),
+                dtoh_async,
+                stream,
+                self.values_guard.ptr,
+                &mut values,
+            )
+            .map_err(drain_err)?;
+            let needle_indices_pinned = stage_result_dtoh_async(
+                primary.as_ref(),
+                dtoh_async,
+                stream,
+                self.indices_guard.ptr,
+                &mut needle_indices,
+            )
+            .map_err(drain_err)?;
+            let row_indices_pinned = stage_result_dtoh_async(
+                primary.as_ref(),
+                dtoh_async,
+                stream,
+                self.row_indices_guard.ptr,
+                &mut row_indices,
+            )
+            .map_err(drain_err)?;
+            check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
+            copy_pinned_into(&values_pinned, &mut values);
+            copy_pinned_into(&needle_indices_pinned, &mut needle_indices);
+            copy_pinned_into(&row_indices_pinned, &mut row_indices);
+        } else {
+            if !values.is_empty() {
+                check_cuda(unsafe {
+                    (primary.cu_memcpy_dtoh)(
+                        values.as_mut_ptr().cast::<c_void>(),
+                        self.values_guard.ptr,
+                        values.len() * std::mem::size_of::<i32>(),
+                    )
+                })?;
+            }
+            if !needle_indices.is_empty() {
+                check_cuda(unsafe {
+                    (primary.cu_memcpy_dtoh)(
+                        needle_indices.as_mut_ptr().cast::<c_void>(),
+                        self.indices_guard.ptr,
+                        needle_indices.len() * std::mem::size_of::<u32>(),
+                    )
+                })?;
+            }
+            if !row_indices.is_empty() {
+                check_cuda(unsafe {
+                    (primary.cu_memcpy_dtoh)(
+                        row_indices.as_mut_ptr().cast::<c_void>(),
+                        self.row_indices_guard.ptr,
+                        row_indices.len() * std::mem::size_of::<u64>(),
+                    )
+                })?;
+            }
         }
 
         let rows = values
@@ -1416,6 +1617,49 @@ impl CudaI32EqualAnyProjectSubmission {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((rows, elapsed_us))
+    }
+}
+
+impl Drop for CudaI32EqualAnyProjectSubmission {
+    fn drop(&mut self) {
+        // Drop-WITHOUT-`complete` safety drain. `submit` enqueues HtoD(needles) + memset(count) +
+        // the kernel on the held pooled private stream WITHOUT syncing; the covering
+        // `cuStreamSynchronize` lives only in `complete_detached`. If this submission is dropped
+        // before `complete` runs (the early `Err` in the engine's
+        // `complete_relational_retained_int4_projection_submission`, or any `?`/cancel/panic in the
+        // submit→complete window), the field guards below — `PooledDeviceBufferOwned` ×5 then
+        // `PooledStreamOwned` — would otherwise return the device buffers + stream to the SHARED
+        // pools WHILE that work is still in flight, so a concurrent `lease_device_buffer` on another
+        // thread could re-lease the memory the kernel still writes (cross-thread use-after-free).
+        //
+        // Drain-BEFORE-release ordering: Rust runs this explicit `Drop::drop` body in full BEFORE
+        // dropping the struct's fields (which release the pools), so syncing the held stream here
+        // guarantees the in-flight work has finished before any guard releases.
+        //
+        // No double-drain on the success path: a successful `complete_detached` `take()`s `stream`
+        // out (after its own covering sync), leaving `None`, so the `if let Some` below is skipped
+        // and this drop does no redundant sync — only the genuine drop-without-complete path (where
+        // `stream` is still `Some`) drains.
+        //
+        // Best-effort, NO PANIC (a panic in `Drop` during unwinding aborts the process): the
+        // context is bound first because this drop may run on a thread that never bound it, then the
+        // stream is synced — every result is ignored, mirroring the `drain_err` best-effort style.
+        if let Some(stream_owned) = self.stream.as_ref() {
+            if let Some(pooled) = stream_owned.pooled.as_ref() {
+                // Bind the primary context FIRST (idempotent; may run unbound here), exactly like
+                // `complete_detached`'s `set_current` and `CudaResidentDeviceMemory::drop`'s bind
+                // before its `cuMemFree`. Ignore the result — cleanup path.
+                let _ = self.primary.set_current();
+                // SAFETY: `pooled.stream` is the live held pooled stream; a blocking sync on it is
+                // valid with the primary context bound above. The result is intentionally ignored —
+                // best-effort drain on a teardown path that must never panic.
+                unsafe {
+                    let _ = (self.primary.cu_stream_synchronize)(pooled.stream);
+                }
+            }
+        }
+        // Fields drop after this body: the buffer/stream guards now return to their pools AFTER the
+        // drain above, so the next leaser never observes memory still under an in-flight kernel.
     }
 }
 
@@ -3401,15 +3645,11 @@ fn submit_cuda_resident_i32_equal_any_project<R: CudaResidentReadSource>(
     projection_offsets: &[u64],
     row_count: u64,
 ) -> Result<CudaI32EqualAnyProjectSubmission, CudaRuntimeProbeError> {
-    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
-    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    // Only the blocking-fallback HtoD/memset and the (always-used) kernel launch are still loaded
+    // here; the alloc/free/module/event symbols the un-migrated path used are replaced by the
+    // shared pool, the module cache, and the pooled stream's own events.
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
-    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
-    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuModuleGetFunction =
-        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -3423,12 +3663,6 @@ fn submit_cuda_resident_i32_equal_any_project<R: CudaResidentReadSource>(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
-    type CuEventDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuEventRecord = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
-    type CuEventSynchronize = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32;
 
     const MAX_PROJECTIONS: usize = 4;
     const PTX: &[u8] = br#"
@@ -3649,20 +3883,22 @@ DONE:
         .checked_mul(std::mem::size_of::<i32>())
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
-    let cu_mem_alloc = unsafe {
-        resident
-            .lib()
-            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_mem_free = unsafe {
-        resident
-            .lib()
-            .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
+    // P2-M2 (equal_any split-route migration — mirrors the text route's async-on-pooled-stream
+    // lever, adapted to this route's deferred `submit`→`complete`). The un-migrated path was the
+    // projection-route default-stream wall: per-call `cuMemAlloc`/`cuMemFree` (5 driver-serialized
+    // allocs), a blocking default-stream `cuMemcpyHtoD`(needles) + `cuMemsetD8`(count), a per-call
+    // `cuModuleLoadData` (re-JIT), and a kernel on the NULL stream — every one a context-wide
+    // barrier across concurrent readers. This `submit` now: leases the device buffers from the
+    // shared `OutputBufferPool` (no per-call alloc/free), uses the cached module (no re-JIT), and
+    // ENQUEUES HtoD(needles) + memset(count) + the kernel on a pooled private stream via the
+    // `*Async` variants when present (blocking variants on an old driver) — without syncing, so
+    // the kernel overlaps the host work the caller does before `complete`. `complete` syncs the
+    // stream and reads the results (async-pinned when available). The pooled buffers + stream are
+    // carried as owned (`Arc`-holding) guards because they must outlive this frame.
+    //
+    // Only `cu_memcpy_htod` / `cu_memset_d8` (blocking fallback) and `cu_launch_kernel` (always)
+    // are still loaded here; the alloc/free/module/event symbols are gone — the pool, the module
+    // cache, and the pooled stream's own events replace them.
     let cu_memset_d8 = unsafe {
         resident
             .lib()
@@ -3677,135 +3913,32 @@ DONE:
             .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_memcpy_dtoh = unsafe {
-        resident
-            .lib()
-            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_load_data = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_unload = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleUnload>(b"cuModuleUnload\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_get_function = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_launch_kernel = unsafe {
         resident
             .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_ctx_set_current = unsafe {
-        resident
-            .lib()
-            .get::<CuCtxSetCurrent>(b"cuCtxSetCurrent\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_event_create = unsafe {
-        resident
-            .lib()
-            .get::<CuEventCreate>(b"cuEventCreate\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_event_destroy = unsafe {
-        resident
-            .lib()
-            .get::<CuEventDestroy>(b"cuEventDestroy_v2\0")
-            .or_else(|_| resident.lib().get::<CuEventDestroy>(b"cuEventDestroy\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_event_record = unsafe {
-        resident
-            .lib()
-            .get::<CuEventRecord>(b"cuEventRecord\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_event_synchronize = unsafe {
-        resident
-            .lib()
-            .get::<CuEventSynchronize>(b"cuEventSynchronize\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_event_elapsed_time = unsafe {
-        resident
-            .lib()
-            .get::<CuEventElapsedTime>(b"cuEventElapsedTime\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    check_cuda(unsafe { cu_ctx_set_current(resident.context()) })?;
 
-    let mut device_needles = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_needles, needle_bytes) })?;
-    let needles_guard = CudaDeviceAllocationGuard {
-        ptr: device_needles,
-        free: *cu_mem_free,
-    };
-    check_cuda(unsafe {
-        cu_memcpy_htod(
-            needles_guard.ptr,
-            needles.as_ptr().cast::<c_void>(),
-            needle_bytes,
-        )
-    })?;
+    let primary = resident.primary_arc();
+    primary.set_current()?;
 
-    let mut device_values = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_values, output_bytes) })?;
-    let values_guard = CudaDeviceAllocationGuard {
-        ptr: device_values,
-        free: *cu_mem_free,
-    };
-    let mut device_needle_indices = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_needle_indices, output_indices_bytes) })?;
-    let indices_guard = CudaDeviceAllocationGuard {
-        ptr: device_needle_indices,
-        free: *cu_mem_free,
-    };
-    let mut device_row_indices = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_row_indices, output_row_indices_bytes) })?;
-    let row_indices_guard = CudaDeviceAllocationGuard {
-        ptr: device_row_indices,
-        free: *cu_mem_free,
-    };
-    let mut device_count = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_count, std::mem::size_of::<u32>()) })?;
-    let count_guard = CudaDeviceAllocationGuard {
-        ptr: device_count,
-        free: *cu_mem_free,
-    };
-    check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
+    // Pooled device buffers (owned guards — returned to the pool when the submission drops, after
+    // `complete` reads them). Reused buffers are NOT zeroed; only the count is memset, the needles
+    // buffer is fully overwritten by the HtoD, and every output is read back only over [0, count),
+    // so stale bytes are never observed.
+    let needles_guard = primary.lease_device_buffer_owned(needle_bytes)?;
+    let values_guard = primary.lease_device_buffer_owned(output_bytes)?;
+    let indices_guard = primary.lease_device_buffer_owned(output_indices_bytes)?;
+    let row_indices_guard = primary.lease_device_buffer_owned(output_row_indices_bytes)?;
+    let count_guard = primary.lease_device_buffer_owned(std::mem::size_of::<u32>())?;
 
+    // Cached module (no per-call cuModuleLoadData) — the kernel is already parallel (one thread
+    // per row + atomic-append); the wall was this per-call orchestration, not the kernel.
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
-
-    let mut module = std::ptr::null_mut();
-    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
-    let module_guard = CudaModuleGuard {
-        module,
-        unload: *cu_module_unload,
-    };
-
-    let mut function = std::ptr::null_mut();
-    check_cuda(unsafe {
-        cu_module_get_function(
-            &mut function,
-            module,
-            c"gpu_db_resident_i32_equal_any_project".as_ptr(),
-        )
-    })?;
+    let function = primary.cached_function(c"gpu_db_resident_i32_equal_any_project", &ptx)?;
 
     let mut resident_arg = resident.device_ptr();
     let mut rows_arg = row_count;
@@ -3840,20 +3973,73 @@ DONE:
     ];
     let threads_per_block = 128;
     let blocks = row_count_u32.div_ceil(threads_per_block);
-    let mut start = std::ptr::null_mut();
-    check_cuda(unsafe { cu_event_create(&mut start, 0) })?;
-    let start_event_guard = CudaEventGuard {
-        event: start,
-        destroy: *cu_event_destroy,
+
+    // Lease the pooled private stream (owned — held by the submission until `complete`).
+    let stream_owned = PooledStreamOwned {
+        primary: Arc::clone(&primary),
+        pooled: Some(primary.acquire_pooled_stream()?),
     };
-    let mut stop = std::ptr::null_mut();
-    check_cuda(unsafe { cu_event_create(&mut stop, 0) })?;
-    let stop_event_guard = CudaEventGuard {
-        event: stop,
-        destroy: *cu_event_destroy,
+    let pooled = stream_owned
+        .pooled
+        .as_ref()
+        .expect("pooled stream just leased");
+    let stream = pooled.stream;
+    let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+
+    // Error-path stream drain (same contract as the text route): every op below ENQUEUES async
+    // work on `stream`; an early `?` would unwind the owned buffer/stream guards (returning them
+    // to their pools) while that work may still be in flight — a use-after-free for the next
+    // leaser. `drain_err` blocking-syncs the stream FIRST (at the error site, before any guard
+    // Drop), then yields the original error. Zero success-path cost.
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        // SAFETY: `stream` is the live pooled stream; a blocking sync on it is valid here (the
+        // primary context is current). Result intentionally ignored — best-effort error-path drain.
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
     };
 
-    check_cuda(unsafe { cu_event_record(start_event_guard.event, std::ptr::null_mut()) })?;
+    // Optional stream-ordered transfer symbols; absent → the blocking fallback (still correct,
+    // just a default-stream barrier on an old driver). The kernel always launches on the pooled
+    // stream regardless.
+    let async_ops = match (primary.cu_memcpy_htod_async, primary.cu_memset_d8_async) {
+        (Some(htod), Some(memset)) => Some((htod, memset)),
+        _ => None,
+    };
+
+    if let Some((htod_async, memset_async)) = async_ops {
+        check_cuda(unsafe {
+            htod_async(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+                stream,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { memset_async(count_guard.ptr, 0, std::mem::size_of::<u32>(), stream) })
+            .map_err(drain_err)?;
+    } else {
+        // Blocking fallback: these default-stream ops complete (host-blocking) before the kernel
+        // is enqueued on the pooled stream below, so the kernel still observes the uploaded needles
+        // and the zeroed counter.
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                needles_guard.ptr,
+                needles.as_ptr().cast::<c_void>(),
+                needle_bytes,
+            )
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })
+            .map_err(drain_err)?;
+    }
+
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })
+            .map_err(drain_err)?;
+    }
     check_cuda(unsafe {
         cu_launch_kernel(
             function,
@@ -3864,30 +4050,31 @@ DONE:
             1,
             1,
             0,
-            std::ptr::null_mut(),
+            stream,
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         )
-    })?;
-    check_cuda(unsafe { cu_event_record(stop_event_guard.event, std::ptr::null_mut()) })?;
+    })
+    .map_err(drain_err)?;
+    if timed {
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.stop_event, stream) })
+            .map_err(drain_err)?;
+    }
+    // NB: deliberately NOT synced here — `complete` does the single covering sync, so the kernel
+    // overlaps the caller's host work between `submit` and `complete`.
 
     Ok(CudaI32EqualAnyProjectSubmission {
         projection_count: projection_offsets.len(),
         needles_len: needles.len(),
         row_count,
-        context: resident.context(),
+        primary,
         values_guard,
         indices_guard,
         row_indices_guard,
         count_guard,
         _needles_guard: needles_guard,
-        _module_guard: module_guard,
-        start_event_guard,
-        stop_event_guard,
-        cu_ctx_set_current: *cu_ctx_set_current,
-        cu_memcpy_dtoh: *cu_memcpy_dtoh,
-        cu_event_synchronize: *cu_event_synchronize,
-        cu_event_elapsed_time: *cu_event_elapsed_time,
+        stream: Some(stream_owned),
+        timed,
     })
 }
 
@@ -10140,6 +10327,166 @@ mod tests {
 
     #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_i32_equal_any_project_drop_without_complete_drains_before_pool_reuse() {
+        // P2-M2 BLOCKER regression: `submit` enqueues HtoD(needles) + memset(count) + the kernel on
+        // the held pooled private stream WITHOUT syncing (the covering sync lives only in
+        // `complete`). If the submission is DROPPED before `complete` runs (the engine's early `Err`
+        // return, or any `?`/cancel/panic in the submit→complete window), its `Drop` MUST drain the
+        // stream before its field guards return the pooled device buffers + stream to the SHARED
+        // pools — otherwise a concurrent `lease_device_buffer` on another thread re-leases memory the
+        // in-flight kernel is still writing (cross-thread use-after-free → silent corruption).
+        //
+        // This test repeatedly submits-then-drops-without-complete on N threads while OTHER threads
+        // hammer the full submit→complete path on the SAME resident allocation (same pools). The
+        // dropped submissions return their buffers/stream to the pools mid-flight; the concurrent
+        // completers immediately re-lease them. Without the `Drop` drain, a completer would read a
+        // buffer still under a dropped submission's kernel and observe wrong rows (or the run would
+        // crash). The exact-match assertion on every completion makes a missing drain surface
+        // deterministically. With the drain, every completion is exactly the known result.
+        use std::sync::Arc;
+
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // Known payload: header(row_count) + i32 filter column + i32 projection column.
+        let row_count = 5_u64;
+        let filter_offset = std::mem::size_of::<u64>() as u64;
+        let projection_offset = filter_offset + row_count * std::mem::size_of::<i32>() as u64;
+        let mut header = Vec::new();
+        header.extend_from_slice(&row_count.to_le_bytes());
+        let mut filter = Vec::new();
+        for value in [1_i32, 2, 3, 2, 4] {
+            filter.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut projection = Vec::new();
+        for value in [10_i32, 20, 30, 21, 40] {
+            projection.extend_from_slice(&value.to_le_bytes());
+        }
+        let allocated_len = projection_offset + projection.len() as u64;
+
+        // Shared resident allocation (one device buffer, one shared primary context with its shared
+        // buffer/stream pools) so the droppers and completers contend on the very same pools.
+        let resident = Arc::new(
+            runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated_len,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: filter_offset,
+                            bytes: &filter,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: projection_offset,
+                            bytes: &projection,
+                        },
+                    ],
+                )
+                .expect("retain resident device memory"),
+        );
+
+        // needles [2,4] over filter [1,2,3,2,4] → rows 1,3 (=2) and 4 (=4), projecting [20],[21],[40].
+        let expected = vec![
+            CudaI32BatchProjectionRow {
+                needle_index: 0,
+                row_index: 1,
+                values: vec![20],
+            },
+            CudaI32BatchProjectionRow {
+                needle_index: 0,
+                row_index: 3,
+                values: vec![21],
+            },
+            CudaI32BatchProjectionRow {
+                needle_index: 1,
+                row_index: 4,
+                values: vec![40],
+            },
+        ];
+
+        const ITERS: usize = 200;
+        const DROPPER_THREADS: usize = 3;
+        const COMPLETER_THREADS: usize = 3;
+
+        let mut handles = Vec::new();
+
+        // Droppers: submit then DROP without `complete`, repeatedly. Each drop runs the `Drop` impl's
+        // safety drain, then returns the buffers/stream to the shared pools.
+        for _ in 0..DROPPER_THREADS {
+            let resident = Arc::clone(&resident);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ITERS {
+                    let submission = resident
+                        .submit_match_project_i32_equal_any_from_payload(
+                            filter_offset,
+                            &[2, 4],
+                            &[projection_offset],
+                            row_count,
+                        )
+                        .expect("submit (to be dropped without complete)");
+                    // Explicit drop = the BLOCKER's drop-without-complete path. If `Drop` did not
+                    // drain, the just-returned pooled buffers are re-leasable while this kernel is
+                    // still in flight.
+                    drop(submission);
+                }
+            }));
+        }
+
+        // Completers: full submit→complete on the SAME pools, repeatedly. Re-leases buffers the
+        // droppers just returned; a missing drain would corrupt these reads.
+        for _ in 0..COMPLETER_THREADS {
+            let resident = Arc::clone(&resident);
+            let expected = expected.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ITERS {
+                    let rows = resident
+                        .submit_match_project_i32_equal_any_from_payload(
+                            filter_offset,
+                            &[2, 4],
+                            &[projection_offset],
+                            row_count,
+                        )
+                        .expect("submit on completer")
+                        .complete(&resident)
+                        .expect("complete on completer");
+                    assert_eq!(
+                        rows, expected,
+                        "completer observed wrong rows — a dropped submission's buffer/stream was \
+                         re-leased while its kernel was still in flight (Drop drain missing?)"
+                    );
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("worker thread panicked (crash under pool reuse?)");
+        }
+
+        // After the contention storm, a final completion on the (heavily reused) pools must still be
+        // exactly correct — the pools are left in a sound state.
+        let final_rows = resident
+            .submit_match_project_i32_equal_any_from_payload(
+                filter_offset,
+                &[2, 4],
+                &[projection_offset],
+                row_count,
+            )
+            .expect("final submit")
+            .complete(&resident)
+            .expect("final complete");
+        assert_eq!(
+            final_rows, expected,
+            "pools left unsound after drop-without-complete reuse"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
     fn published_resident_generation_survives_a_replacement_publish_and_is_freed_after_drain() {
         // P1-M3 step 1 — the real-GPU soundness probe (doc 14 acceptance gate 1).
         //
@@ -10523,20 +10870,24 @@ mod tests {
         } // both returned to the pool here
 
         // (c) accounting: the big bucket now holds >= 2 idle buffers; a tiny lease uses a
-        // different bucket (distinct ptr) and does not drain the big one.
-        let big_idle = ctx.pooled_output_buffer_count();
+        // different bucket (distinct ptr) and does not drain the big one. Counts are read
+        // BUCKET-SCOPED (not the process-global total) so this stays correct even though the
+        // migrated equal_any parity test now also leases from this shared pool — only the big
+        // bucket's own idle count is load-bearing here.
+        let big_idle = ctx.pooled_output_buffer_count_in_bucket(big);
         assert!(
             big_idle >= 2,
-            "both released leases must return to the idle pool (got {big_idle})"
+            "both released leases must return to the big bucket's idle pool (got {big_idle})"
         );
         let small = ctx.lease_device_buffer(4).expect("lease small").ptr;
         assert_ne!(
             small, ptr1,
             "a different bucket must yield a different buffer"
         );
-        assert!(
-            ctx.pooled_output_buffer_count() > big_idle,
-            "a different-bucket lease must add to, not drain, the idle pool"
+        assert_eq!(
+            ctx.pooled_output_buffer_count_in_bucket(big),
+            big_idle,
+            "a different-bucket (tiny) lease must NOT drain the big bucket's idle pool"
         );
 
         // (d) the load-bearing safety property under real contention: leases held at the same
@@ -10629,20 +10980,25 @@ mod tests {
         } // both returned to the pool here
 
         // (c) accounting: the big bucket now holds >= 2 idle buffers; a tiny lease uses a
-        // different bucket (distinct ptr) and does not drain the big one.
-        let big_idle = ctx.pooled_pinned_host_buffer_count();
+        // different bucket (distinct ptr) and does not drain the big one. Counts are read
+        // BUCKET-SCOPED (not the process-global total) so this stays correct even though the
+        // migrated equal_any parity test now also leases pinned buffers from this shared pool
+        // (its `complete` stages result D2H through pooled pinned buffers) — only the big bucket's
+        // own idle count is load-bearing here.
+        let big_idle = ctx.pooled_pinned_host_buffer_count_in_bucket(big);
         assert!(
             big_idle >= 2,
-            "both released pinned leases must return to the idle pool (got {big_idle})"
+            "both released pinned leases must return to the big bucket's idle pool (got {big_idle})"
         );
         let small = ctx.lease_pinned_host_buffer(4).expect("lease small").ptr;
         assert_ne!(
             small, ptr1,
             "a different bucket must yield a different pinned buffer"
         );
-        assert!(
-            ctx.pooled_pinned_host_buffer_count() > big_idle,
-            "a different-bucket lease must add to, not drain, the idle pool"
+        assert_eq!(
+            ctx.pooled_pinned_host_buffer_count_in_bucket(big),
+            big_idle,
+            "a different-bucket (tiny) lease must NOT drain the big bucket's idle pool"
         );
 
         // (d) the load-bearing safety property under real contention: leases held at the same
