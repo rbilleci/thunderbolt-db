@@ -533,7 +533,9 @@ thesis pays off second.
 - M0 baseline ✅ · P0-M1 façade ✅ · P0-M2 first serving path ✅ ·
   P0-M3 engine-backed server (`crates/server`) ✅ · P1-M2 snapshot spike
   (`crates/snapshot`) ✅ · **P1-M3 step 1 snapshot soundness probe ✅ (2026-06-13)** ·
-  **P1-M3 step 2a per-table residency invalidation ✅ (2026-06-13)**.
+  **P1-M3 step 2a per-table residency invalidation ✅ (2026-06-13)** ·
+  **P1-M3 step 2b SnapshotCell residency ✅** · **P1-M3 step 3 `&self` read flip /
+  gate 2 (concurrent reads) ✅ (2026-06-14)**.
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
@@ -598,27 +600,41 @@ Full design, ordered steps, and acceptance gates:
          lock helper. (`last_decisions` stays a plain map — mutated only on the
          write/admission path.) Also fixed the 3a engine-test ripple (~120 test reads of
          now-private metric fields routed through `snapshot()`). Suite 371 green.
-       - **Step 3c (remaining — the actual flip):** (i) make `cached_cuda_probe_runtime`
-         interior-mutable (`OnceLock`/`Mutex`) so `cuda_driver_probe_runtime` is `&self`
-         — the read path lazily inits it today (`get_or_insert_with`, the third and last
-         `&mut self` mutation); (ii) flip `execute_relational_select`, `plan_*` (its
-         `_inner` is already `&self`), the dispatcher, the ~30 resident-route probe
-         methods, and the CPU path (`execute_mvcc_query*`/bind/finalize) from `&mut self`
-         to `&self` — compiler-guided now that metrics/route-decisions/cuda-probe are all
-         interior-mutable; (iii) the telemetry-coherence fix (one loaded owner `Arc`
-         threaded through the dispatcher's clear→probe→read); (iv) a gate-2 concurrent
-         test (≥2 reader threads on a shared `&Engine`); then its own adversarial audit.
-         This is atomic (won't compile until the whole read call-tree is `&self`) — a
-         focused effort.
-       - **Two follow-ups the B2 audit surfaced, both owed at 3c:** (a) the
-         telemetry-coherence fix above; (b) migrate `partition_device_memory` to
-       the same tombstone/`SnapshotCell` model — it is still freed in place and is not
-       `&self`-read-safe for concurrent free.
+       - **Step 3c ✅ (2026-06-14): the flip — GATE 2 MET.** `cached_cuda_probe_runtime`
+         → `OnceLock` (third interior-mut); flipped `execute_relational_select`, `plan`,
+         the dispatcher, the ~30 resident-route probe methods, the CPU path, and the
+         retained-read/metric-observe helpers to `&self`; added
+         `CudaResidentDeviceMemory::set_current_context()` (`cuCtxSetCurrent` per read)
+         so concurrent readers don't hit `INVALID_CONTEXT` (201). New test
+         `concurrent_readers_execute_relational_select_on_shared_engine` runs 8 threads ×
+         `execute_relational_select` on one `Arc<Engine>` / one published generation on
+         real GPU (3/3 deterministic); `Engine: Send + Sync` guarded. Engine suite 373
+         green. Report:
+         `.../runs/2026-06-14-p1-m3-step3-self-read-flip-gate2-v1.md`.
+       - **⚠ Two MAJOR latent hazards (3c audit) — safe now, BLOCKERs before concurrent
+         writes; must fix before the reader/writer split lets a write overlap a read:**
+         (1) `partition_device_memory` is a plain map of **owned** allocations on the
+         `&self` read path — a concurrent `install_partitions`/`remove_table` frees an
+         allocation mid-launch (UAF). Migrate it to `SnapshotCell<Option<Arc<…>>>` like
+         the main residency map. (2) Dispatcher bind/launch **TOCTOU**: it binds the
+         context on one `SnapshotCell::get()` but the probe re-`get()`s and launches —
+         a publish in between mismatches context (gen N) vs `device_ptr` (gen N+1).
+         Load the owner once (one `SnapshotHandle`) and thread it through bind→launch
+         (this also subsumes the telemetry-coherence fix).
+       - **Lower-priority follow-ups:** move per-read timing into the read result (fixes
+         telemetry cross-attribution under concurrent readers); shared primary context
+         (§9.3) makes `set_current_context` once-per-thread and enables the single-context
+         model hazard #2 wants.
 3. Flip `execute_relational_select` + the resident-route methods from `&mut self`
    to `&self` over a loaded generation.
 4. Re-run M0 **with Phase-5 noise controls** (median-of-N + CI) and show the
    queue-wait term drop — this is the first milestone that may claim a real latency
-   improvement.
+   improvement. **Requires a server change first:** gate 2 (step 3c) made the *engine*
+   support concurrent `&self` reads, but the engine-backed benchmark server still
+   funnels reads through its single owner-thread scheduler, so the numbers are unchanged
+   until the server shares the engine (`Arc<Engine>`) across its IO workers and
+   dispatches reads concurrently. The `&self` flip is the enabler; step 4 = make the
+   server exploit it, then re-run + measure.
    - **Noise controls + baseline now exist (2026-06-13)**:
      `scripts/run_p8_engine_pgwire_median_of_n.sh` + the committed median-of-10
      baseline (resolves ~13% median before/after deltas — A/B MDE at N=10, α=0.05,

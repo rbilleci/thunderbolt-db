@@ -18,11 +18,13 @@
 //!   statement-by-statement. The wire stays in sync (one message in, one error +
 //!   ReadyForQuery out); splitting on top-level `;` is a tracked follow-up.
 //!   Empty statements correctly return `EmptyQueryResponse`.
-//! - **Single-threaded, one connection at a time.** The `Engine` owns raw CUDA
-//!   device handles and is not `Send`; this server keeps it on the serve thread
-//!   and handles connections sequentially. Concurrent connections require the
-//!   Phase 1 reader/writer split (or an owner-thread command queue) and are
-//!   explicitly deferred.
+//! - **Single-threaded, one connection at a time.** As of P1-M3 step 3c the `Engine`
+//!   is `Send + Sync` and its relational read path is `&self` (concurrent reads are
+//!   supported and tested at the engine level), but this server still keeps the engine
+//!   on the serve thread and handles connections sequentially. Sharing the engine
+//!   (`Arc<Engine>`) across IO workers to dispatch reads concurrently — the actual
+//!   latency win — is the next step (P1-M3 step 4); the concurrent `&self` read path
+//!   has no production caller yet.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
