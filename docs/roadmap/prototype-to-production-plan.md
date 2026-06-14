@@ -527,7 +527,7 @@ thesis pays off second.
 ## 8. Current state & immediate next step (session handoff)
 
 **Branch:** `phase0-m1-engine-facade` (pushed to origin). **Last updated:**
-2026-06-13.
+2026-06-14.
 
 **Milestone ladder — done, all independently audited and the audit findings fixed:**
 - M0 baseline ✅ · P0-M1 façade ✅ · P0-M2 first serving path ✅ ·
@@ -537,7 +537,16 @@ thesis pays off second.
   **P1-M3 step 2b SnapshotCell residency ✅** · **P1-M3 step 3 `&self` read flip /
   gate 2 (concurrent reads) ✅ (2026-06-14)** · **P1-M3 step 4 concurrency benchmark ✅
   (2026-06-14): CPU reads scale ~40×; GPU resident path bottlenecked by shallow
-  execution → Phase 2/§9.3**.
+  execution → Phase 2/§9.3**. ·
+  **P2-M1 GPU shared-context substrate ✅ (2026-06-14): one shared primary context per GPU
+  (`cuDevicePrimaryCtxRetain`) + process-wide module/function cache + stream pool with
+  pooled per-stream scratch; residency owns no context (auto-`Send`/`Sync`). §9.3
+  acceptance met. Resident COUNT ~6× faster single-thread (p50 92µs→15µs) and the P1-M3
+  concurrency *regression* is gone (c64 3478→19240 qps, p50 11.5ms→3.5ms) — but the GPU
+  COUNT path still does NOT scale *up* (synchronous per-op GPU round-trip; needs async
+  submission / batched completion / parallel kernels). Independently audited (no live
+  blocker). Run report:
+  `.../runs/2026-06-14-p2-m1-step4-gpu-shared-context-scaling-v1.md`**.
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
@@ -710,6 +719,21 @@ this). The façade also still carries a conversion layer because of it.
   dependency assertion) prevents the back-edge from returning.
 
 ### 9.3 GPU context model: per-allocation → one shared primary context
+
+**Status: DONE for residency ✅ (P2-M1, 2026-06-14).** `GpuPrimaryContext` (one
+`cuDevicePrimaryCtxRetain` per GPU, process-wide registry) + module/function cache +
+stream pool with pooled scratch landed in `crates/execution`; the two residency
+allocation fns and the COUNT route are migrated; `CudaResidentDeviceMemory` holds an
+`Arc<GpuPrimaryContext>`, owns no context, and is auto-`Send`/`Sync`; `Drop` frees only
+device memory. **Acceptance met** (one primary context per GPU; no per-allocation
+`cuCtxCreate`/`cuCtxDestroy`; modules loaded once and cached — proven by
+`gpu_primary_context_is_cached_and_loads_each_module_once`; resident tests + step-1 probe
+green; residency owns no context). **Residual:** the ~15 other resident routes + the ~7
+one-shot smoke kernels still create per-call contexts/modules (correct, run on the shared
+context now, not yet cache/stream-migrated); and a 512-row COUNT still does not scale *up*
+under concurrency (synchronous per-op round-trip — needs the Phase-2 async/parallel work,
+not more context substrate). Run report:
+`.../runs/2026-06-14-p2-m1-step4-gpu-shared-context-scaling-v1.md`. Original debt below.
 
 **Debt:** each `CudaResidentDeviceMemory` creates its own CUDA context
 (`cuCtxCreate`, `execution/lib.rs:1323`) and destroys it on `Drop`
