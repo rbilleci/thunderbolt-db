@@ -289,6 +289,24 @@ impl CudaResidentDeviceMemory {
         self.context
     }
 
+    /// Bind this allocation's CUDA context to the calling thread. The driver keeps the
+    /// current context per-thread, so a reader thread that did not create the context
+    /// must make it current before launching a kernel — otherwise the launch fails with
+    /// `CUDA_ERROR_INVALID_CONTEXT` (201). Safe to call concurrently from many reader
+    /// threads: a context may be current on multiple threads at once (driver ≥ 4.0).
+    /// This is what makes the `&self` concurrent read path work on the per-allocation
+    /// context model; the shared-primary-context milestone (plan §9.3) will make it a
+    /// once-per-thread bind instead of once-per-read.
+    pub fn set_current_context(&self) -> Result<(), CudaRuntimeProbeError> {
+        type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
+        let cu_ctx_set_current = unsafe {
+            self.lib()
+                .get::<CuCtxSetCurrent>(b"cuCtxSetCurrent\0")
+                .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+        };
+        check_cuda(unsafe { cu_ctx_set_current(self.context) })
+    }
+
     fn lib(&self) -> &Library {
         self._lib.as_ref()
     }

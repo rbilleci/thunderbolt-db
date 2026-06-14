@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
@@ -6026,7 +6026,9 @@ pub struct Engine {
     batcher: DualTriggerBatcher<PendingMutation>,
     planner: Planner,
     router: DeviceRouter<MockGpuRuntime>,
-    cached_cuda_probe_runtime: Option<CudaDriverRuntime>,
+    // Lazily-probed CUDA runtime, behind a OnceLock so the probe getter is `&self`
+    // (the read path lazily initializes it — P1-M3 step 3c).
+    cached_cuda_probe_runtime: OnceLock<CudaDriverRuntime>,
 }
 
 /// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]
@@ -8866,7 +8868,7 @@ impl Engine {
             batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
             planner: Planner::new(planner_cfg),
             router: DeviceRouter::new(MockGpuRuntime::default()),
-            cached_cuda_probe_runtime: None,
+            cached_cuda_probe_runtime: OnceLock::new(),
         }
     }
 
@@ -15054,7 +15056,7 @@ impl Engine {
     }
 
     pub fn execute_relational_select(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         if let Some(view) = self.relational_views.get(&select.table).cloned() {
@@ -15096,7 +15098,7 @@ impl Engine {
     }
 
     pub fn execute_relational_function(
-        &mut self,
+        &self,
         call: &SelectFunction,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let Some(function) = self.relational_functions.get(&call.name) else {
@@ -15128,7 +15130,7 @@ impl Engine {
     }
 
     pub fn execute_relational_select_with_cuda_driver_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -15138,7 +15140,7 @@ impl Engine {
     }
 
     pub fn execute_relational_select_with_resident_snapshot_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -15181,7 +15183,7 @@ impl Engine {
     }
 
     pub fn execute_relational_select_with_resident_route(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let decision = self.plan_relational_resident_route(select);
@@ -15198,12 +15200,17 @@ impl Engine {
             .device_memory
             .get(&decision.table)
         {
+            // Make this allocation's CUDA context current on the calling thread so a
+            // concurrent reader (not the context's creator) can launch — without it the
+            // kernel fails with INVALID_CONTEXT (P1-M3 step 3c / gate 2).
+            let _ = device_memory.set_current_context();
             device_memory.clear_last_kernel_event_elapsed_us();
         }
         for ((table, _partition_id), device_memory) in
             &self.relational_resident_cache.partition_device_memory
         {
             if table == &decision.table {
+                let _ = device_memory.set_current_context();
                 device_memory.clear_last_kernel_event_elapsed_us();
             }
         }
@@ -15432,7 +15439,7 @@ impl Engine {
     }
 
     pub fn execute_relational_retained_read_jobs_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         jobs: &[RelationalRetainedReadJob],
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         let submission =
@@ -15441,7 +15448,7 @@ impl Engine {
     }
 
     pub fn submit_relational_retained_read_jobs_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         jobs: &[RelationalRetainedReadJob],
     ) -> Result<RelationalRetainedReadSubmission, ExecuteError> {
         for job in jobs {
@@ -15506,7 +15513,7 @@ impl Engine {
     }
 
     pub fn complete_relational_retained_read_submission(
-        &mut self,
+        &self,
         submission: RelationalRetainedReadSubmission,
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         match submission.inner {
@@ -15518,7 +15525,7 @@ impl Engine {
     }
 
     fn try_submit_relational_retained_int4_projection_jobs(
-        &mut self,
+        &self,
         jobs: &[RelationalRetainedReadJob],
         submit_started: Instant,
     ) -> Result<Option<RelationalRetainedReadSubmission>, ExecuteError> {
@@ -15688,7 +15695,7 @@ impl Engine {
     }
 
     fn complete_relational_retained_int4_projection_submission(
-        &mut self,
+        &self,
         pending: RelationalRetainedInt4ProjectionSubmission,
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         if !self
@@ -15822,7 +15829,7 @@ impl Engine {
     }
 
     pub fn execute_relational_count_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -15907,7 +15914,7 @@ impl Engine {
     }
 
     pub fn execute_relational_partitioned_count_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -16018,7 +16025,7 @@ impl Engine {
     }
 
     pub fn execute_relational_partitioned_equality_projection_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -16157,7 +16164,7 @@ impl Engine {
     }
 
     pub fn execute_relational_partitioned_equality_multi_column_projection_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -16373,7 +16380,7 @@ impl Engine {
     }
 
     pub fn execute_relational_partitioned_equality_sum_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -16582,7 +16589,7 @@ impl Engine {
     }
 
     pub fn execute_relational_partitioned_between_avg_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -16836,7 +16843,7 @@ impl Engine {
     }
 
     pub fn execute_relational_partitioned_filtered_max_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -17027,7 +17034,7 @@ impl Engine {
     }
 
     pub fn execute_relational_partitioned_filtered_avg_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -17220,7 +17227,7 @@ impl Engine {
     }
 
     pub fn execute_relational_partitioned_filtered_min_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -17411,7 +17418,7 @@ impl Engine {
     }
 
     pub fn execute_relational_filtered_count_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -17507,7 +17514,7 @@ impl Engine {
     }
 
     pub fn execute_relational_text_prefix_count_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -17608,7 +17615,7 @@ impl Engine {
     }
 
     pub fn execute_relational_membership_count_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -17731,7 +17738,7 @@ impl Engine {
     }
 
     pub fn execute_relational_range_count_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -17827,7 +17834,7 @@ impl Engine {
     }
 
     pub fn execute_relational_between_count_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -17967,7 +17974,7 @@ impl Engine {
     }
 
     pub fn execute_relational_filter_group_count_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -18108,7 +18115,7 @@ impl Engine {
     }
 
     pub fn execute_relational_sum_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -18198,7 +18205,7 @@ impl Engine {
     }
 
     pub fn execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -18352,7 +18359,7 @@ impl Engine {
     }
 
     pub fn execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -18531,7 +18538,7 @@ impl Engine {
     }
 
     pub fn execute_relational_scalar_aggregate_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -18662,14 +18669,14 @@ impl Engine {
     }
 
     pub fn execute_relational_grouped_sum_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         self.execute_relational_grouped_aggregate_with_resident_device_memory_probe(select)
     }
 
     pub fn execute_relational_grouped_aggregate_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -18872,7 +18879,7 @@ impl Engine {
     }
 
     pub fn execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -19098,7 +19105,7 @@ impl Engine {
     }
 
     pub fn execute_relational_projection_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -19227,7 +19234,7 @@ impl Engine {
     }
 
     pub fn execute_relational_equality_projection_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -19342,7 +19349,7 @@ impl Engine {
     }
 
     pub fn execute_relational_equality_multi_column_projection_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -19646,14 +19653,14 @@ impl Engine {
     }
 
     pub fn execute_relational_equality_multi_column_projection_batch_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         selects: &[Select],
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         self.execute_relational_equality_multi_column_projection_batch_inner(selects, None)
     }
 
     fn execute_relational_equality_multi_column_projection_batch_inner(
-        &mut self,
+        &self,
         selects: &[Select],
         planned_jobs: Option<&[RelationalRetainedReadJob]>,
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
@@ -20157,7 +20164,7 @@ impl Engine {
     }
 
     pub fn execute_relational_distinct_projection_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -20283,7 +20290,7 @@ impl Engine {
     }
 
     pub fn execute_relational_filtered_distinct_projection_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -20427,7 +20434,7 @@ impl Engine {
     }
 
     pub fn execute_relational_ordered_projection_with_resident_device_memory_probe(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
@@ -21037,7 +21044,7 @@ impl Engine {
     }
 
     fn finalize_relational_select(
-        &mut self,
+        &self,
         select: &Select,
         table: RelationalTable,
         bound: BoundRelationalSelect,
@@ -22779,7 +22786,7 @@ impl Engine {
     }
 
     pub fn plan_relational_resident_route(
-        &mut self,
+        &self,
         select: &Select,
     ) -> RelationalResidentRouteDecisionStatus {
         let decision = self.plan_relational_resident_route_inner(select);
@@ -23288,7 +23295,7 @@ impl Engine {
     }
 
     pub fn execute_mvcc_query(
-        &mut self,
+        &self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
         let backend = CpuMvccExecutionBackend;
@@ -23301,7 +23308,7 @@ impl Engine {
     }
 
     pub fn execute_mvcc_query_with_cuda_driver_probe(
-        &mut self,
+        &self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
         let runtime = self.cuda_driver_probe_runtime();
@@ -23313,9 +23320,9 @@ impl Engine {
         self.execute_mvcc_query_with_fallback_reason(query, &backend, None, true)
     }
 
-    fn cuda_driver_probe_runtime(&mut self) -> CudaDriverRuntime {
+    fn cuda_driver_probe_runtime(&self) -> CudaDriverRuntime {
         self.cached_cuda_probe_runtime
-            .get_or_insert_with(|| {
+            .get_or_init(|| {
                 CudaDriverRuntime::probe().unwrap_or_else(|_| CudaDriverRuntime::unavailable())
             })
             .clone()
@@ -23340,7 +23347,7 @@ impl Engine {
     }
 
     fn execute_mvcc_query_with_fallback_reason<B: MvccExecutionBackend>(
-        &mut self,
+        &self,
         query: &MvccReadQuery,
         backend: &B,
         fallback_reason: Option<FallbackReason>,
@@ -23375,7 +23382,7 @@ impl Engine {
     }
 
     fn execute_cuda_native_source_query(
-        &mut self,
+        &self,
         query: &MvccReadQuery,
         backend: &CudaMvccExecutionBackend,
     ) -> Result<MvccReadResult, ExecuteError> {
@@ -23475,7 +23482,7 @@ impl Engine {
     }
 
     fn observe_cuda_probe_execution_metrics(
-        &mut self,
+        &self,
         result: &MvccReadResult,
         h2d_bytes: u64,
         elapsed: Duration,
@@ -23491,7 +23498,7 @@ impl Engine {
             .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
     }
 
-    fn observe_mvcc_read_result_metrics(&mut self, result: &MvccReadResult) {
+    fn observe_mvcc_read_result_metrics(&self, result: &MvccReadResult) {
         if let Some(reason) = result.fallback_reason {
             self.metrics.inc_fallback(reason);
         }
@@ -24233,6 +24240,66 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_is_send_sync_for_concurrent_reads() {
+        // The &self read path (P1-M3 step 3c) is only useful if the engine can be shared
+        // across reader threads. Guard that it stays Send + Sync.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Engine>();
+    }
+
+    #[test]
+    fn concurrent_readers_execute_relational_select_on_shared_engine() {
+        // Gate 2 (doc 14): with reads flipped to `&self`, multiple threads run
+        // execute_relational_select against ONE shared engine (one published residency
+        // generation) concurrently — there is no `&mut self` bottleneck. This is the
+        // property the whole P1-M3 substrate exists to enable.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta'), (3, 'alpine')",
+        )
+        .unwrap();
+        // One published residency generation, shared immutably across all readers.
+        e.populate_relational_residency_snapshot("events").unwrap();
+        let engine = Arc::new(e);
+
+        let Command::Select(select) = parse_command("SELECT COUNT(*) FROM events").unwrap() else {
+            unreachable!()
+        };
+        // &self call through the Arc — the baseline result every reader must reproduce.
+        let expected = engine.execute_relational_select(&select).unwrap();
+
+        const READERS: usize = 8;
+        const READS_PER_THREAD: usize = 200;
+        let barrier = Arc::new(std::sync::Barrier::new(READERS));
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let select = select.clone();
+                let barrier = Arc::clone(&barrier);
+                let expected = expected.clone();
+                std::thread::spawn(move || {
+                    barrier.wait(); // maximize real overlap of the read bodies
+                    for _ in 0..READS_PER_THREAD {
+                        let result = engine.execute_relational_select(&select).unwrap();
+                        assert_eq!(result.rows, expected.rows, "concurrent read diverged");
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().expect("reader thread panicked");
+        }
+        // Residency survived concurrent reads and is still valid afterward.
+        assert!(engine
+            .relational_residency_snapshot("events")
+            .unwrap()
+            .is_valid());
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use gpu_db_execution::DeviceTarget;
@@ -26772,7 +26839,9 @@ mod tests {
     #[test]
     fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() {
         let mut e = Engine::new_local();
-        e.cached_cuda_probe_runtime = Some(CudaDriverRuntime::unavailable());
+        let _ = e
+            .cached_cuda_probe_runtime
+            .set(CudaDriverRuntime::unavailable());
         e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
@@ -46897,7 +46966,9 @@ mod tests {
     #[test]
     fn relational_sql_cuda_probe_reuses_cached_runtime_snapshot() {
         let mut e = Engine::new_local();
-        e.cached_cuda_probe_runtime = Some(CudaDriverRuntime::unavailable());
+        let _ = e
+            .cached_cuda_probe_runtime
+            .set(CudaDriverRuntime::unavailable());
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
         e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
@@ -46919,7 +46990,7 @@ mod tests {
         assert_eq!(first.fallback_reason, Some(FallbackReason::GpuUnavailable));
         assert_eq!(second.fallback_reason, Some(FallbackReason::GpuUnavailable));
         assert_eq!(
-            e.cached_cuda_probe_runtime.as_ref().unwrap().snapshot(),
+            e.cached_cuda_probe_runtime.get().unwrap().snapshot(),
             CudaDriverRuntime::unavailable().snapshot()
         );
     }
