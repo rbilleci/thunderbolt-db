@@ -676,26 +676,41 @@ Also still owed: grow the harness to the Phase-5 open-loop/p99.9/steady-state sh
 §9.2 server consolidation. See Phase 1 "Concurrency across the flow — status map".
 
 **Open threads — where a NEW SESSION can continue (each is independent; all have pointers):**
-1. **Text-route GPU throughput wall** (perf, in-flight) — locate `mixed_int_text`'s c64 wall
-   (~27 ms / ~2.2k qps; kernel is only 7 µs so it is NOT the GPU path) via a per-section
-   wall-clock breakdown, then a targeted GENERIC fix. **Self-contained handoff doc:**
-   `.../runs/2026-06-14-text-route-wall-investigation-handoff.md`. Do the measurement before any
-   fix — four GPU-orchestration guesses already failed.
+1. **Text-route GPU throughput wall** (perf) — ✅ **RESOLVED 2026-06-14.** The wall WAS the GPU
+   path after all. The live `mixed_int_text` path took a 4-launch per-column cascade (closed by
+   gate `ee13fa32` → one fused launch), and the fused path's 11 memory ops still ran BLOCKING on
+   the synchronizing default/NULL stream — only the kernel had been pooled. The "7 µs kernel" was
+   a fused fn never on the live path, which is why four earlier orchestration guesses missed it;
+   per-section wall-clock breakdowns (c1+c64) located it (mem ops = 99.7% of the c64 wall;
+   executor/locks/kernel ruled out by direct measurement). Fix `b4c37234`: all mem ops → pooled
+   private stream via `*Async` behind 2 syncs + fused counters (one 8-byte D2H) + new
+   `PinnedHostBufferPool` + a `.map_err(drain_err)?` error-path stream-drain guard.
+   **c64 ~12.5 ms → sub-ms (~0.55–0.85 ms), ~12× qps (~4.4k → ~45–52k); now the fastest GPU
+   route.** Reports: `.../runs/2026-06-14-mixed-int-text-c64-cost-breakdown-analysis.md`,
+   `.../runs/2026-06-14-mixed-int-text-async-stream-pinned-v1.md`. NEW ceiling = the per-call host
+   CUDA driver-submit floor (~89% @c64) → thread 3. Open follow-ups: generalize the drain to the
+   shared `launch_on_pooled_stream` (pre-existing identical window, 3 routes); wire the `#[ignore]`
+   GPU e2e parity gate into CI. (Telemetry double-count + a parallel-flaky GPU module-cache test were both fixed in the thread-1 wrap-up.)
 2. **Remaining projection/gather routes** (perf) — `equal_any_project`, `compare_project`,
-   `row_indices` still use the pre-pool per-call orchestration; apply the device output-buffer
-   pool (`8c476939`) — and whatever output shape the text-route investigation validates.
-3. **Batched / async GPU submission** (perf, architectural) — the per-op floor is ~50 µs
-   serialized / ~20k qps; batch many concurrent point-lookups into one GPU submission to exceed
-   it (recovers M0's owner-thread batching). The big lever for high-concurrency OLTP, and what
-   P2-M1/P2-M2 reports repeatedly flagged.
+   `row_indices` still use the pre-pool per-call orchestration. Apply the now-PROVEN recipe from
+   thread 1: pooled private stream + `*Async` mem ops + pinned-D2H + the output-buffer pool
+   (`8c476939`) + the `.map_err(drain_err)?` drain guard. Expect similar multi-× wins. Lead-in:
+   first wire the `#[ignore]` GPU e2e parity gate into CI so each route is validated by default
+   as the recipe is applied.
+3. **Batched / async GPU submission** (perf, architectural) — now the **VALIDATED** next perf
+   lever: thread 1 removed the default-stream serializer, exposing the per-call host CUDA
+   driver-submit floor (~19 µs/op serialized ⇒ the ~45–52k qps plateau / sub-ms p50 measured on
+   the text route). Batch many concurrent point-lookups into one GPU submission to amortize that
+   floor (recovers M0's owner-thread batching). The big lever for high-concurrency OLTP.
 4. **Write-half** (concurrency) — concurrent writes via publish-on-commit + MVCC (today writes
    take the single write lock and serialize). UAF prerequisites cleared; the largest remaining
    concurrency piece (detailed just above).
 5. **Phase-0 closure** (§9.1/§9.2) — consolidate the three pgwire servers; external load
    generator + Phase-5 open-loop/p99.9 harness shape.
 
-Recommended order if unsure: **(1)** is in-flight with a ready handoff; **(3)** and **(4)** are
-the highest-leverage net-new work. Run reports for everything are under
+Recommended order if unsure: **(1)** is ✅ done; next is **(2)** (cheap — apply thread 1's proven
+recipe for quick multi-× across three routes) then **(3)** (the validated ceiling-raiser), or
+**(4)** (write-half) to pivot off read-perf. Run reports for everything are under
 `docs/testing/reports/series/prototype-to-production/runs/`; the `gpu-projection-routes-perf`
 memory summarizes the GPU-perf state.
 

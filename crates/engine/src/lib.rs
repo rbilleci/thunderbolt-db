@@ -6203,6 +6203,11 @@ struct RelationalResidentCache {
     // read path writes after each query) updates through `&self` — the second half of
     // the read path's interior-mutability needs for the `&self` flip (P1-M3 step 3b).
     latest_route_decisions: Mutex<BTreeMap<String, RelationalResidentRouteDecisionStatus>>,
+    // Test-only counter of `record_route_execution_observation` calls. Lets tests assert a
+    // route's telemetry observation is recorded exactly once per execution (guards against the
+    // single-predicate mixed int4+text delegation double-counting it).
+    #[cfg(test)]
+    route_execution_observation_count: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6286,6 +6291,9 @@ impl RelationalResidentCache {
         table: &str,
         observation: RelationalResidentRouteExecutionObservation,
     ) {
+        #[cfg(test)]
+        self.route_execution_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut decisions = self.route_decisions();
         if let Some(decision) = decisions.get_mut(table) {
             decision.last_execution_h2d_bytes = Some(observation.h2d_bytes);
@@ -15584,6 +15592,7 @@ impl Engine {
         let results = self.execute_relational_equality_multi_column_projection_batch_inner(
             &selects,
             Some(jobs),
+            true,
         )?;
         let first_job = jobs.first();
         Ok(RelationalRetainedReadSubmission {
@@ -19622,10 +19631,15 @@ impl Engine {
         // the batch path, so it retains the legacy cascade below — correct, just unmigrated; it is
         // not on any benchmarked hot path.
         if filter_offsets.len() == 1 {
+            // The dispatcher (`execute_relational_select_with_resident_route`) that called this
+            // method records the route-execution observation for the whole route, so the
+            // delegated batch path must NOT record its own — otherwise the route telemetry is
+            // double-counted. Pass `record_route_observation: false`.
             let mut results = self
                 .execute_relational_equality_multi_column_projection_batch_inner(
                     std::slice::from_ref(select),
                     None,
+                    false,
                 )?;
             return results.pop().ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
@@ -19779,13 +19793,14 @@ impl Engine {
         &self,
         selects: &[Select],
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
-        self.execute_relational_equality_multi_column_projection_batch_inner(selects, None)
+        self.execute_relational_equality_multi_column_projection_batch_inner(selects, None, true)
     }
 
     fn execute_relational_equality_multi_column_projection_batch_inner(
         &self,
         selects: &[Select],
         planned_jobs: Option<&[RelationalRetainedReadJob]>,
+        record_route_observation: bool,
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         if selects.is_empty() {
             return Ok(Vec::new());
@@ -20243,32 +20258,40 @@ impl Engine {
                 materialization_micros,
                 total_rows,
             );
-        let after_metrics = self.metrics.snapshot();
-        self.relational_resident_cache
-            .record_route_execution_observation(
-                &table.name,
-                RelationalResidentRouteExecutionObservation {
-                    h2d_bytes: after_metrics
-                        .h2d_bytes_total
-                        .saturating_sub(before_metrics.h2d_bytes_total),
-                    d2h_bytes: after_metrics
-                        .d2h_bytes_total
-                        .saturating_sub(before_metrics.d2h_bytes_total),
-                    kernel_samples: after_metrics
-                        .kernel_exec_samples
-                        .saturating_sub(before_metrics.kernel_exec_samples),
-                    kernel_ms: after_metrics
-                        .kernel_exec_total_ms
-                        .saturating_sub(before_metrics.kernel_exec_total_ms),
-                    kernel_event_elapsed_us,
-                    rows: total_rows,
-                    wall_micros: batch_started
-                        .elapsed()
-                        .as_micros()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                },
-            );
+        // The route-execution observation is recorded once per route execution. When the
+        // single-predicate mixed int4+text dispatcher path delegates here (a 1-element slice),
+        // that caller's `execute_relational_select_with_resident_route` already records the
+        // observation for the whole route, so the delegated call suppresses its own to avoid a
+        // double-count (telemetry-only; results are unaffected). The standalone batch/submit
+        // callers are not wrapped by the dispatcher and own the record themselves.
+        if record_route_observation {
+            let after_metrics = self.metrics.snapshot();
+            self.relational_resident_cache
+                .record_route_execution_observation(
+                    &table.name,
+                    RelationalResidentRouteExecutionObservation {
+                        h2d_bytes: after_metrics
+                            .h2d_bytes_total
+                            .saturating_sub(before_metrics.h2d_bytes_total),
+                        d2h_bytes: after_metrics
+                            .d2h_bytes_total
+                            .saturating_sub(before_metrics.d2h_bytes_total),
+                        kernel_samples: after_metrics
+                            .kernel_exec_samples
+                            .saturating_sub(before_metrics.kernel_exec_samples),
+                        kernel_ms: after_metrics
+                            .kernel_exec_total_ms
+                            .saturating_sub(before_metrics.kernel_exec_total_ms),
+                        kernel_event_elapsed_us,
+                        rows: total_rows,
+                        wall_micros: batch_started
+                            .elapsed()
+                            .as_micros()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    },
+                );
+        }
 
         Ok(members
             .into_iter()
@@ -20718,6 +20741,15 @@ impl Engine {
         let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let result = self.execute_mvcc_query_with_backend(&query, backend)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
+    }
+
+    /// Test-only: total number of route-execution telemetry observations recorded so far.
+    /// Used to assert that a route records its observation exactly once per execution.
+    #[cfg(test)]
+    fn route_execution_observation_count(&self) -> u64 {
+        self.relational_resident_cache
+            .route_execution_observation_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn bind_relational_select_for_execution(
@@ -29310,6 +29342,65 @@ mod tests {
                     + std::mem::size_of::<u64>()
                     + std::mem::size_of::<u64>()) as u64
             )
+        );
+
+        // Single-predicate mixed int4+text projection. The dispatcher delegates this shape to the
+        // fused batch path (`..._batch_inner`); the route-execution telemetry observation must be
+        // recorded EXACTLY ONCE for the delegation (the dispatcher owns it; the delegated batch
+        // path suppresses its own), not double-counted. Assert via the observation counter.
+        let Command::Select(mixed_single) =
+            parse_command("SELECT id, amount, label FROM events WHERE id = 3").unwrap()
+        else {
+            unreachable!()
+        };
+        let route = e.plan_relational_resident_route(&mixed_single);
+        assert_eq!(route.query_shape, "int4_equality_mixed_column_projection");
+        if !route.accepted {
+            assert_eq!(
+                route.reason,
+                "resident snapshot has no retained device memory"
+            );
+            return;
+        }
+        let observations_before = e.route_execution_observation_count();
+        let before = e.metrics().snapshot();
+        let result = e
+            .execute_relational_select(&mixed_single)
+            .expect("single-predicate mixed int4/text projection should use resident route");
+        let after = e.metrics().snapshot();
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                SqlValue::Int4(3),
+                SqlValue::Int4(40),
+                SqlValue::Text("gamma".to_string())
+            ]]
+        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        // The delegation records the route-execution observation exactly once (no double-count).
+        assert_eq!(
+            e.route_execution_observation_count()
+                .saturating_sub(observations_before),
+            1,
+            "single-predicate mixed int4+text route must record its execution observation exactly once"
+        );
+        let decision = e
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision("events")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            decision.query_shape,
+            "int4_equality_mixed_column_projection"
+        );
+        assert_eq!(decision.last_execution_h2d_bytes, Some(0));
+        assert_eq!(decision.last_execution_rows, Some(1));
+        // The stored d2h-bytes observation reflects the (single) delegated batch execution.
+        assert_eq!(
+            decision.last_execution_d2h_bytes,
+            Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
         );
     }
 

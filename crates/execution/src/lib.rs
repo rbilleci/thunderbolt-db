@@ -453,12 +453,16 @@ impl GpuPrimaryContext {
             .unwrap_or(0)
     }
 
+    /// Test-only: whether a specific kernel's module is present in the cache. The cache is
+    /// keyed by entry name, so a given key can hold at most one entry no matter how many times
+    /// it is launched — letting a test assert "this module is loaded once and reused" without
+    /// reading the process-global module count (which sibling tests' kernels perturb).
     #[cfg(test)]
-    fn cached_module_count(&self) -> usize {
+    fn is_module_cached(&self, entry_name: &CStr) -> bool {
         self.modules
             .lock()
-            .map(|modules| modules.len())
-            .unwrap_or(0)
+            .map(|modules| modules.contains_key(entry_name))
+            .unwrap_or(false)
     }
 
     fn create(gpu_id: u16) -> Result<Self, CudaRuntimeProbeError> {
@@ -10445,9 +10449,18 @@ mod tests {
             "registry must hand out one shared primary context per GPU id"
         );
 
-        // (b) load-once: run the migrated COUNT route several times and show the cache
-        // grows by at most one (robust to other tests in the same process that may have
-        // already cached this kernel).
+        // (b) load-once: run the migrated COUNT route several times and show its module is
+        // JIT-loaded once and then reused, not reloaded per launch.
+        //
+        // The module cache is PROCESS-WIDE (one shared primary context per GPU id), so sibling
+        // tests running in PARALLEL load their own kernels' modules into the same cache. Asserting
+        // on the global `cached_module_count()` is therefore racy (a sibling loading a different
+        // kernel between our before/after snapshots inflates the delta and fails the bound). We
+        // instead assert against THIS route's specific module key (`gpu_db_resident_row_count`):
+        // the cache is keyed by entry name, so this key can hold at most one entry regardless of
+        // how many times we launch — and siblings' kernels touch other keys, so they cannot
+        // perturb this assertion.
+        const COUNT_ROUTE_MODULE: &CStr = c"gpu_db_resident_row_count";
         let row_count = 1234_u64;
         let resident = runtime
             .retain_device_memory_copy(0, &row_count.to_le_bytes())
@@ -10458,15 +10471,15 @@ mod tests {
             ctx_a.context(),
             "the resident allocation must live in the registry's shared primary context"
         );
-        let before = ctx_a.cached_module_count();
         for _ in 0..8 {
             assert_eq!(resident.count_rows_from_header().expect("count"), row_count);
         }
-        let after = ctx_a.cached_module_count();
+        // After repeated launches the route's module is present exactly once (keyed cache ⇒ a
+        // single entry per key ⇒ loaded once and reused, not per launch).
         assert!(
-            after >= 1 && after <= before + 1,
-            "the row_count module must be loaded once and reused, not per launch \
-             (before={before}, after={after})"
+            ctx_a.is_module_cached(COUNT_ROUTE_MODULE),
+            "the COUNT route's module ({COUNT_ROUTE_MODULE:?}) must be JIT-loaded once and cached \
+             for reuse, not reloaded per launch"
         );
     }
 
