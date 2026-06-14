@@ -591,13 +591,27 @@ Full design, ordered steps, and acceptance gates:
          mutex tail; all `inc_*`/`observe_*` now `&self`, saturating preserved). The
          metrics foundation for the `&self` read path. Contained to `crates/metrics`,
          behavior-preserving (12 tests green).
-       - **Remaining:** step 3b (make the route-decision recording —
-         `record_route_execution_observation`/`record_decision` — interior-mutable);
-         step 3c (flip the read signatures to `&self` + the telemetry-coherence fix +
-         a concurrent-reads test) then audit. **Two follow-ups the B2 audit surfaced,
-       both owed here:** (a) capture one loaded owner `Arc` per dispatch and thread it
-       through clear→probe→read so kernel-event telemetry can't read a different
-       generation's `Mutex` under concurrency; (b) migrate `partition_device_memory` to
+       - **Step 3b ✅ (2026-06-14): route-decision recording is interior-mutable.**
+         `latest_route_decisions` wrapped in a `Mutex`; `record_route_decision` /
+         `record_route_execution_observation` / `record_route_device_lookup_micros` /
+         `record_route_selected_projection_micros` now `&self` via a `route_decisions()`
+         lock helper. (`last_decisions` stays a plain map — mutated only on the
+         write/admission path.) Also fixed the 3a engine-test ripple (~120 test reads of
+         now-private metric fields routed through `snapshot()`). Suite 371 green.
+       - **Step 3c (remaining — the actual flip):** (i) make `cached_cuda_probe_runtime`
+         interior-mutable (`OnceLock`/`Mutex`) so `cuda_driver_probe_runtime` is `&self`
+         — the read path lazily inits it today (`get_or_insert_with`, the third and last
+         `&mut self` mutation); (ii) flip `execute_relational_select`, `plan_*` (its
+         `_inner` is already `&self`), the dispatcher, the ~30 resident-route probe
+         methods, and the CPU path (`execute_mvcc_query*`/bind/finalize) from `&mut self`
+         to `&self` — compiler-guided now that metrics/route-decisions/cuda-probe are all
+         interior-mutable; (iii) the telemetry-coherence fix (one loaded owner `Arc`
+         threaded through the dispatcher's clear→probe→read); (iv) a gate-2 concurrent
+         test (≥2 reader threads on a shared `&Engine`); then its own adversarial audit.
+         This is atomic (won't compile until the whole read call-tree is `&self`) — a
+         focused effort.
+       - **Two follow-ups the B2 audit surfaced, both owed at 3c:** (a) the
+         telemetry-coherence fix above; (b) migrate `partition_device_memory` to
        the same tombstone/`SnapshotCell` model — it is still freed in place and is not
        `&self`-read-safe for concurrent free.
 3. Flip `execute_relational_select` + the resident-route methods from `&mut self`
