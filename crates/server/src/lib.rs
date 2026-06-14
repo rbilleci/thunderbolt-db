@@ -63,7 +63,12 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// This is the P1-M4 concurrent dispatch (the first production caller of the `&self` engine
 /// read path); `serve_sequential` is the prior one-at-a-time loop, kept as the A/B baseline.
 pub fn serve(listener: TcpListener) -> io::Result<()> {
-    let engine = Arc::new(SharedEngine::new());
+    serve_with_engine(listener, Arc::new(SharedEngine::new()))
+}
+
+/// `serve` over a caller-provided shared engine — e.g. one pre-warmed to GPU residency
+/// before serving (the GPU-retained benchmark).
+pub fn serve_with_engine(listener: TcpListener, engine: Arc<SharedEngine>) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
         // Disable Nagle: pgwire responses are several small frames (RowDescription, DataRow,
@@ -363,7 +368,21 @@ pub async fn serve_async_with_permits(
     listener: TokioTcpListener,
     max_concurrent_executions: usize,
 ) -> io::Result<()> {
-    let engine = Arc::new(SharedEngine::new());
+    serve_async_with_engine(
+        listener,
+        Arc::new(SharedEngine::new()),
+        max_concurrent_executions,
+    )
+    .await
+}
+
+/// `serve_async` over a caller-provided shared engine — e.g. one pre-warmed to GPU residency
+/// before serving (the GPU-retained benchmark).
+pub async fn serve_async_with_engine(
+    listener: TokioTcpListener,
+    engine: Arc<SharedEngine>,
+    max_concurrent_executions: usize,
+) -> io::Result<()> {
     let executor = Arc::new(tokio::sync::Semaphore::new(
         max_concurrent_executions.max(1),
     ));

@@ -287,8 +287,15 @@ pub struct SharedEngine {
 impl SharedEngine {
     /// Construct a shared façade over a local single-node engine.
     pub fn new() -> Self {
+        Self::from_engine(Engine::new_local())
+    }
+
+    /// Wrap an already-built engine — e.g. one pre-seeded and warmed to GPU residency before
+    /// serving, so the served read path takes the resident route (used by the GPU-retained
+    /// benchmark).
+    pub fn from_engine(engine: Engine) -> Self {
         Self {
-            engine: RwLock::new(Engine::new_local()),
+            engine: RwLock::new(engine),
             next_txn_id: AtomicU64::new(1),
         }
     }
