@@ -1850,7 +1850,7 @@ fn launch_cuda_resident_row_count(
         .cached_function(c"gpu_db_resident_row_count", &ptx)?;
 
     let mut output_bytes = [0_u8; std::mem::size_of::<u64>()];
-    launch_resident_kernel_on_pooled_stream(resident, &mut output_bytes, |stream, output_ptr| {
+    launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
         let mut resident_arg = resident.device_ptr();
         let mut output_arg = output_ptr;
         let mut args = [
@@ -2229,7 +2229,7 @@ done:
     let grid: u32 = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
 
     let mut output_bytes = [0_u8; std::mem::size_of::<u64>()];
-    launch_resident_kernel_on_pooled_stream(resident, &mut output_bytes, |stream, output_ptr| {
+    launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
         // Zero the scratch on the stream (the kernel red-adds into it), ordered before the
         // kernel launch on the same stream.
         let memset_rc =
@@ -2734,10 +2734,6 @@ fn launch_cuda_resident_i32_equal_project(
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
-    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuModuleGetFunction =
-        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -2751,7 +2747,6 @@ fn launch_cuda_resident_i32_equal_project(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
 
     const MAX_FILTERS: usize = 4;
     const MAX_PROJECTIONS: usize = 4;
@@ -2997,34 +2992,10 @@ DONE:
             .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_module_load_data = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_unload = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleUnload>(b"cuModuleUnload\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_get_function = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_launch_kernel = unsafe {
         resident
             .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_ctx_synchronize = unsafe {
-        resident
-            .lib()
-            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
@@ -3042,25 +3013,15 @@ DONE:
     };
     check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
 
+    // P2-M2: cached module (no per-launch cuModuleLoadData) — the projection kernel is
+    // already parallel (one thread per row + atomic-append); the c64 wall was this per-call
+    // orchestration (per-launch JIT + whole-context sync), not the kernel.
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
-
-    let mut module = std::ptr::null_mut();
-    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
-    let module_guard = CudaModuleGuard {
-        module,
-        unload: *cu_module_unload,
-    };
-
-    let mut function = std::ptr::null_mut();
-    check_cuda(unsafe {
-        cu_module_get_function(
-            &mut function,
-            module,
-            c"gpu_db_resident_i32_equal_project".as_ptr(),
-        )
-    })?;
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_equal_project", &ptx)?;
 
     let mut resident_arg = resident.device_ptr();
     let mut rows_arg = row_count;
@@ -3102,7 +3063,9 @@ DONE:
     ];
     let threads_per_block = 128;
     let blocks = row_count_u32.div_ceil(threads_per_block);
-    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
+    // P2-M2: launch on a pooled private stream synced individually (no whole-context
+    // cuCtxSynchronize); the route owns its values/count buffers, so no pooled scratch.
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
         cu_launch_kernel(
             function,
             blocks,
@@ -3112,7 +3075,7 @@ DONE:
             1,
             1,
             0,
-            std::ptr::null_mut(),
+            stream,
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         )
@@ -3144,7 +3107,6 @@ DONE:
         })?;
     }
 
-    drop(module_guard);
     drop(count_guard);
     drop(values_guard);
     Ok(values
@@ -8729,9 +8691,22 @@ where
 /// `cuCtxSynchronize`. The closure receives the CUDA stream to launch on. Kernel timing is
 /// recorded with CUDA events on that stream when the event symbols resolve; the stream is
 /// always returned to the pool, even on error or panic.
-fn launch_resident_kernel_on_pooled_stream<F>(
+/// Run a kernel launch on a **pooled private stream** synced individually
+/// (`cuStreamSynchronize`, not a whole-context `cuCtxSynchronize`) with CUDA-event timing —
+/// the concurrency-friendly launch path (P2-M1). The closure receives `(stream,
+/// pooled_scratch_ptr)`.
+///
+/// `scratch_out`:
+/// - `Some(buf)` — scalar routes (e.g. COUNT): the kernel writes its small result to the
+///   pooled scratch (`buf.len() <= POOLED_STREAM_SCRATCH_BYTES`), and it is copied back here
+///   after the stream syncs — no per-call output `cuMemAlloc`/`cuEvent*`.
+/// - `None` — multi-buffer routes (projection/gather) that manage their own large device
+///   output buffers; they ignore the scratch ptr and do their own D2H after this returns
+///   (the stream is already synced, so the data is ready). They still get the cached-module +
+///   pooled-stream + per-stream-sync win.
+fn launch_on_pooled_stream<F>(
     resident: &CudaResidentDeviceMemory,
-    output: &mut [u8],
+    scratch_out: Option<&mut [u8]>,
     launch: F,
 ) -> Result<(), CudaRuntimeProbeError>
 where
@@ -8742,11 +8717,13 @@ where
     // the migrated path is self-contained (a reader thread that hasn't bound yet would
     // otherwise hit INVALID_CONTEXT). Idempotent + cheap with one shared context.
     primary.set_current()?;
-    assert!(
-        output.len() <= POOLED_STREAM_SCRATCH_BYTES,
-        "kernel output ({}) exceeds pooled stream scratch ({POOLED_STREAM_SCRATCH_BYTES})",
-        output.len()
-    );
+    if let Some(buf) = &scratch_out {
+        assert!(
+            buf.len() <= POOLED_STREAM_SCRATCH_BYTES,
+            "scratch output ({}) exceeds pooled stream scratch ({POOLED_STREAM_SCRATCH_BYTES})",
+            buf.len()
+        );
+    }
 
     // RAII: return the pooled stream (and its scratch) on every exit (success/error/panic).
     struct StreamLease<'a> {
@@ -8768,8 +8745,6 @@ where
     let stream = pooled.stream;
     let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
 
-    // No per-call cuModuleLoadData (cached function) and no per-call cuMemAlloc/cuEvent*
-    // (pooled scratch + events): the launch runs on a private stream synced individually.
     if timed {
         check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })?;
     }
@@ -8790,13 +8765,11 @@ where
         resident.record_kernel_event_elapsed_us(None);
     }
 
-    check_cuda(unsafe {
-        (primary.cu_memcpy_dtoh)(
-            output.as_mut_ptr().cast::<c_void>(),
-            pooled.output,
-            output.len(),
-        )
-    })?;
+    if let Some(buf) = scratch_out {
+        check_cuda(unsafe {
+            (primary.cu_memcpy_dtoh)(buf.as_mut_ptr().cast::<c_void>(), pooled.output, buf.len())
+        })?;
+    }
     Ok(())
 }
 
