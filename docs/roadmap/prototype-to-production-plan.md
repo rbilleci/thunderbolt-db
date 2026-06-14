@@ -535,7 +535,9 @@ thesis pays off second.
   (`crates/snapshot`) ✅ · **P1-M3 step 1 snapshot soundness probe ✅ (2026-06-13)** ·
   **P1-M3 step 2a per-table residency invalidation ✅ (2026-06-13)** ·
   **P1-M3 step 2b SnapshotCell residency ✅** · **P1-M3 step 3 `&self` read flip /
-  gate 2 (concurrent reads) ✅ (2026-06-14)**.
+  gate 2 (concurrent reads) ✅ (2026-06-14)** · **P1-M3 step 4 concurrency benchmark ✅
+  (2026-06-14): CPU reads scale ~40×; GPU resident path bottlenecked by shallow
+  execution → Phase 2/§9.3**.
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
@@ -627,20 +629,25 @@ Full design, ordered steps, and acceptance gates:
          model hazard #2 wants.
 3. Flip `execute_relational_select` + the resident-route methods from `&mut self`
    to `&self` over a loaded generation.
-4. Re-run M0 **with Phase-5 noise controls** (median-of-N + CI) and show the
-   queue-wait term drop — this is the first milestone that may claim a real latency
-   improvement. **Requires a server change first:** gate 2 (step 3c) made the *engine*
-   support concurrent `&self` reads, but the engine-backed benchmark server still
-   funnels reads through its single owner-thread scheduler, so the numbers are unchanged
-   until the server shares the engine (`Arc<Engine>`) across its IO workers and
-   dispatches reads concurrently. The `&self` flip is the enabler; step 4 = make the
-   server exploit it, then re-run + measure.
-   - **Noise controls + baseline now exist (2026-06-13)**:
-     `scripts/run_p8_engine_pgwire_median_of_n.sh` + the committed median-of-10
-     baseline (resolves ~13% median before/after deltas — A/B MDE at N=10, α=0.05,
-     power=0.80). Step 4 re-runs that exact command and accepts only deltas above
-     each cell's A/B minimum-detectable-effect. Report:
-     `.../runs/2026-06-13-p1-m3-noise-controlled-baseline-v1.md`.
+4. Measure the gate-2 payoff and show where the bottleneck moved. **Done
+   ✅ (2026-06-14)** via an engine-level concurrent-read A/B (same `Arc<Engine>`, same
+   resident query, serialized-access vs concurrent `&self`), median-of-5 on real GPU.
+   Report: `.../runs/2026-06-14-p1-m3-step4-concurrent-read-scaling-v1.md`. **Findings:**
+   - **CPU read path: concurrent `&self` reads scale ~40× at c64** (4.4k→97.7k qps, p50
+     flat) vs serialized's plateau (~2.4k qps). The concurrency substrate works — the
+     `&mut self` bottleneck removal is a real, large unlock, confirming §1.2/§7.
+   - **GPU resident path: concurrency *regresses*** (p50 92µs→11.5ms at c64; qps drops).
+     Once CPU serialization is gone, the GPU execution's shallowness dominates: the
+     resident kernel path does `cuModuleLoadData`/`Unload` **per launch** on a
+     **per-allocation context + default stream**, so concurrent launches thrash.
+   - **Refinement to the plan:** the GPU latency-under-load win is **gated on Phase 2
+     (cache modules/functions, stream pool, async copies) + §9.3 (shared primary
+     context)**, NOT on the concurrency substrate alone. The pgwire median-of-N re-run
+     (`scripts/run_p8_engine_pgwire_median_of_n.sh`, committed median-of-10 baseline,
+     `.../runs/2026-06-13-p1-m3-noise-controlled-baseline-v1.md`) is **deferred until
+     after** that GPU work — wiring the server for concurrent dispatch now would just
+     expose the same GPU thrash. Step 4's engine-level A/B is the honest measurement
+     until then.
 
 **Gotcha (found 2026-06-13):** `CudaResidentDeviceMemoryReadView` is *non-owning*;
 a `SnapshotCell<ReadView>` would be a GPU use-after-free on invalidation — the
