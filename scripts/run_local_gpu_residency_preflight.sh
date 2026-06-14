@@ -64,14 +64,20 @@ run_gate \
   scripts/run_p8_resident_maintenance_smoke.sh \
   "p8 resident maintenance smoke passed"
 
+run_gate \
+  gpu_tests \
+  scripts/run_local_gpu_tests.sh \
+  "local_gpu_tests=passed"
+
 printf 'local_gpu_residency_preflight=passed\n'
-printf 'local_gpu_residency_preflight_scope=residency_baseline_warmup_maintenance\n'
+printf 'local_gpu_residency_preflight_scope=residency_baseline_warmup_maintenance_gpu_tests\n'
 printf 'local_gpu_residency_preflight_resident_device_memory=retained_cuda_allocation\n'
 printf 'local_gpu_residency_preflight_resident_routes=zero_h2d_supported_kernel_shapes\n'
 printf 'local_gpu_residency_preflight_cache_manager=budget_admission_eviction_invalidation_refresh\n'
 printf 'local_gpu_residency_preflight_cuda_event_timing=first_accepted_route_samples\n'
 printf 'local_gpu_residency_preflight_warmup=operator_triggered_dry_run_apply\n'
 printf 'local_gpu_residency_preflight_maintenance=scheduler_friendly_tick\n'
+printf 'local_gpu_residency_preflight_gpu_tests=ignored_gpu_suite_execution_engine\n'
 printf 'local_gpu_residency_preflight_gap_durable_gpu_pages=missing\n'
 printf 'local_gpu_residency_preflight_gap_autonomous_cache_daemon=missing\n'
 printf 'local_gpu_residency_preflight_gap_external_orchestration=missing\n'
