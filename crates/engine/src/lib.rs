@@ -19603,6 +19603,37 @@ impl Engine {
                 access_path,
             });
         }
+        // Mixed int4+text projection. The legacy path below issues a CASCADE of separate
+        // synchronous GPU launches — `match_i32_equal_row_indices` (one launch) followed by a
+        // per-projected-column `project_i32_rows` / `project_text_rows` launch — each on the
+        // default/NULL stream with a whole-context `cuCtxSynchronize`, a per-call
+        // `cuModuleLoadData` re-JIT, and a per-call `cuMemAlloc`/`cuMemFree`. A per-section
+        // wall-clock breakdown localized ~99.8% of this route's c64 wall to that cascade (the
+        // row-indices launch alone was ~20.7 ms/call @c64; ~73% of the wall), all on the
+        // un-migrated synchronous substrate.
+        //
+        // For the common SINGLE-predicate int4+text shape (the `mixed_int_text` benchmark route),
+        // delegate to the single-statement batch path, which fuses int4 + a single text column into
+        // ONE pooled-stream launch (`match_project_i32_equal_any_text_from_payload`, the
+        // P2-M1/P2-M2 substrate: cached module, private pooled stream, pooled output buffers) and
+        // falls back internally to a cascade only for the rare multi-text shape. The all-int4
+        // branch above is already a single fused launch and is left untouched. The MULTI-predicate
+        // mixed shape (e.g. `WHERE a = 1 AND b = 2` with a text projection) is not yet accepted by
+        // the batch path, so it retains the legacy cascade below — correct, just unmigrated; it is
+        // not on any benchmarked hot path.
+        if filter_offsets.len() == 1 {
+            let mut results = self
+                .execute_relational_equality_multi_column_projection_batch_inner(
+                    std::slice::from_ref(select),
+                    None,
+                )?;
+            return results.pop().ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory equality mixed-column projection returned no result"
+                        .to_string(),
+                ))
+            });
+        }
         let match_started = Instant::now();
         let matching_row_indices = device_memory
             .match_i32_equal_row_indices_from_payload(&filter_offsets, row_count)

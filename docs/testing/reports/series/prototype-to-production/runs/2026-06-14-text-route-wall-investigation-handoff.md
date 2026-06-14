@@ -1,10 +1,60 @@
 # HANDOFF — locate the `mixed_int_text` GPU-retained throughput wall (per-section timing breakdown)
 
-Status: OPEN investigation, handoff to a fresh session
+Status: **RESOLVED (2026-06-14).** Wall located by per-section breakdown; targeted generic fix
+landed. `mixed_int_text` c64 **25.1 ms → 12.8 ms p50 / 2.29k → 4.36k qps (~1.95×)**. Partially
+resolved — see "Resolution" below for the remaining (different) lever.
 Date: 2026-06-14
 Branch: `phase0-m1-engine-facade` (HEAD `8c476939` at handoff time — clean working tree)
 Plan: `docs/roadmap/prototype-to-production-plan.md` Phase 2 ("Parallel kernels")
 Related memory: `gpu-projection-routes-perf` (in the session memory dir)
+
+---
+
+## RESOLUTION (2026-06-14) — read this first
+
+Full write-up: **`.../runs/2026-06-14-text-route-wall-located-and-fused-v1.md`**.
+
+**Where the wall was (located by the per-section breakdown this doc asked for):** ~**99.8 %** of the
+c64 wall is the **GPU compute path** — but a **cascade of 4 separate synchronous GPU launches** the
+live `mixed_int_text` path issues per query, NOT a single kernel:
+
+| section | c1 µs/call | c64 µs/call | share of c64 |
+|---|---:|---:|---:|
+| **gpu_row_indices** (`match_i32_equal_row_indices`) | 121 | **20,658** | **73 %** |
+| gpu_project_int (`project_i32_rows` ×2) | 12.4 | 4,587 | 16 % |
+| gpu_project_text (`project_text_rows` ×1) | 12.5 | 3,031 | 11 % |
+| engine_prep + materialize + metrics | 3.2 | 10.7 | <0.1 % |
+
+All four GPU sub-calls serialize **170–370×** from c1→c64 — the fingerprint of the **un-migrated**
+default/NULL-stream + per-call `cuModuleLoadData` + per-call `cuMemAlloc` substrate
+(`launch_cuda_resident_i32_equal_row_indices`, `launch_cuda_resident_i32_project`,
+`copy_cuda_resident_text_rows` never got the P2-M1/P2-M2 treatment).
+
+**Why the four prior fixes did nothing (the actual lesson):** they all tuned
+`launch_cuda_resident_i32_equal_any_project_text` (the *fused* text kernel). **The live single-query
+`mixed_int_text` path never calls it** — it takes the per-column **cascade** branch of
+`execute_relational_equality_multi_column_projection_with_resident_device_memory_probe`. A correct
+change to a function that isn't on the path yields exactly the observed zero delta. The "kernel is
+only 7 µs" was a real measurement of a kernel that wasn't on the path. (Hypothesis ranking in §4
+below was therefore moot — the wall was structural, in the engine's choice of execution path.)
+
+**Fix (generic, audited reuse):** for the **single-predicate** mixed shape, delegate to the
+**single-statement batch path** (`…_batch_inner`, 1-element slice), which already fuses the
+int4+single-text shape into **one** pooled-stream launch
+(`match_project_i32_equal_any_text_from_payload`) and keeps a cascade fallback only for the rare
+multi-text shape. 4 GPU round-trips → 1. The **multi-predicate** mixed shape (e.g. `a=1 AND b=2` with
+a text column) retains the legacy cascade — the batch path doesn't accept multi-predicate equality,
+so delegating it unconditionally *rejected* a query the cascade served (caught by the existing test
+`p8_resident_route_executes_same_column_equality_projection`; fixed with a `filter_offsets.len()==1`
+gate). 14 execution + 39 engine GPU + 373 engine non-GPU tests green; fmt clean; no new clippy.
+
+**Still owed (different lever, now the recommended next step):** the route is ~1.95× faster but not
+at `multi_col` parity (12.8 ms vs 5.5 ms @c64) because the single fused text launch still does **11
+synchronous round-trips** (1 HtoD + 2 memset + 8 D2H) vs `multi_col`'s 3 — the residual the
+`output-buffer-pooling` report already flagged. Next: **async those round-trips on the pooled
+stream** (11 → ~2–3 sync points). Generalizes to Open thread (2)'s routes verbatim.
+
+The detailed task description below is **retained as the historical record** of what was asked.
 
 ---
 
@@ -208,10 +258,13 @@ edit appears to have no effect.
 
 ## 8. Definition of done for the next session
 
-1. A per-section timing breakdown (c1 + c64, text vs multi_col) that **names the dominant
-   section**. Write it up as a dated run report.
-2. A targeted, GENERIC fix for that section, with before/after benchmark numbers, 14 execution +
-   39 engine GPU tests green (on a clean build), fmt + clippy clean, an adversarial audit, and a
-   commit. Target: move `mixed_int_text` c64 meaningfully toward `multi_col` (~9k qps) or beyond.
-3. Update the `gpu-projection-routes-perf` memory with the located wall (replacing the
-   "UNLOCATED" status).
+1. ✅ A per-section timing breakdown (c1 + c64) that **names the dominant section** — done; the
+   dominant section is the 4-launch GPU cascade (row_indices 73 % @c64). Run report:
+   `.../runs/2026-06-14-text-route-wall-located-and-fused-v1.md`.
+2. ✅ A targeted, GENERIC fix (route the mixed path through the fused/pooled batch path), with
+   before/after numbers (c64 25.1→12.8 ms / 2.29k→4.36k qps, ~1.95×), 14 execution + 39 engine GPU
+   tests green on a clean build, fmt clean, no new clippy. Partial vs the `multi_col` target (12.8
+   vs 5.5 ms) — the remaining gap is the fused route's 11 sync round-trips, a separate generic lever
+   (async the round-trips; = Open thread 2). Adversarial audit + commit: pending the user.
+3. ⏳ Update the `gpu-projection-routes-perf` memory with the located wall (replacing "UNLOCATED").
+   The user handles the memory write; recommended one-liner is in the session summary.
