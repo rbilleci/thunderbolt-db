@@ -6094,12 +6094,109 @@ impl ResidentDeviceMemoryMap {
     }
 }
 
+/// Per-partition resident device memory, keyed by `(table, partition_id)`, under the same
+/// publish-don't-mutate discipline as `ResidentDeviceMemoryMap` (P1-M3 slice B; doc 14).
+/// Before this, partitions were a plain `BTreeMap<(String,u32), CudaResidentDeviceMemory>`
+/// freed *in place* on invalidate/replace/drop while a reader borrowed `&owner` across a
+/// kernel launch — a use-after-free the moment a writer overlaps a reader. Now each
+/// partition is a `SnapshotCell<Option<Arc<…>>>`: readers `get()` an owned `Arc` (no map
+/// borrow held across the launch), and the writer publishes a new generation / `None`
+/// tombstone, so an in-flight reader's generation is freed only after it drains.
+#[derive(Debug, Default)]
+struct PartitionResidentDeviceMemoryMap {
+    cells: BTreeMap<(String, u32), SnapshotCell<Option<Arc<CudaResidentDeviceMemory>>>>,
+}
+
+impl PartitionResidentDeviceMemoryMap {
+    /// Load the published owner for one partition, if any (owned `Arc` — the borrow of the
+    /// map ends here, so it is never held across a kernel launch).
+    fn get(&self, key: &(String, u32)) -> Option<Arc<CudaResidentDeviceMemory>> {
+        self.cells
+            .get(key)
+            .and_then(|cell| cell.load().get().clone())
+    }
+
+    /// Whether this partition currently has a published owner (tombstones excluded).
+    fn contains_key(&self, key: &(String, u32)) -> bool {
+        self.cells
+            .get(key)
+            .is_some_and(|cell| cell.load().get().is_some())
+    }
+
+    /// Published owners for every partition of `table` (tombstones excluded), owned `Arc`s.
+    fn published_owners_for_table(&self, table: &str) -> Vec<Arc<CudaResidentDeviceMemory>> {
+        self.cells
+            .iter()
+            .filter(|((cell_table, _), _)| cell_table == table)
+            .filter_map(|(_, cell)| cell.load().get().clone())
+            .collect()
+    }
+
+    /// Replace a table's partitions: publish each new partition as a new generation
+    /// (creating the cell on first residency) and publish a `None` tombstone for any prior
+    /// partition of this table not in the new set. In-flight readers keep the generation
+    /// they already loaded.
+    fn install_table_partitions(
+        &mut self,
+        table: &str,
+        device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
+    ) {
+        let prior_ids: Vec<u32> = self
+            .cells
+            .keys()
+            .filter(|(cell_table, _)| cell_table == table)
+            .map(|(_, partition_id)| *partition_id)
+            .collect();
+        for partition_id in prior_ids {
+            if !device_memory.contains_key(&partition_id) {
+                if let Some(cell) = self.cells.get(&(table.to_string(), partition_id)) {
+                    cell.publish(None);
+                }
+            }
+        }
+        for (partition_id, memory) in device_memory {
+            let owner = Some(Arc::new(memory));
+            let key = (table.to_string(), partition_id);
+            if let Some(cell) = self.cells.get(&key) {
+                cell.publish(owner);
+            } else {
+                self.cells.insert(key, SnapshotCell::new(owner));
+            }
+        }
+    }
+
+    /// Publish a `None` tombstone for every partition of `table` (invalidation): cells are
+    /// retained so in-flight readers keep their generation; new loads see "not resident".
+    fn invalidate_table(&mut self, table: &str) {
+        for ((cell_table, _), cell) in self.cells.iter() {
+            if cell_table == table {
+                cell.publish(None);
+            }
+        }
+    }
+
+    /// Remove every partition cell of `table` (DROP TABLE). In-flight readers retain their
+    /// own loaded generation via its `Arc`, so this never frees memory under a reader.
+    fn remove_table(&mut self, table: &str) {
+        self.cells.retain(|(cell_table, _), _| cell_table != table);
+    }
+
+    /// Number of partitions with a published owner (tombstones excluded). Test-only.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.cells
+            .values()
+            .filter(|cell| cell.load().get().is_some())
+            .count()
+    }
+}
+
 #[derive(Debug, Default)]
 struct RelationalResidentCache {
     snapshots: BTreeMap<String, RelationalResidencySnapshot>,
     device_memory: ResidentDeviceMemoryMap,
     partitions: BTreeMap<String, Vec<RelationalResidentPartition>>,
-    partition_device_memory: BTreeMap<(String, u32), CudaResidentDeviceMemory>,
+    partition_device_memory: PartitionResidentDeviceMemoryMap,
     budget_bytes_by_gpu: BTreeMap<u16, u64>,
     last_decisions: BTreeMap<String, RelationalResidentCacheDecision>,
     // Mutex-guarded so route-decision recording (and the per-execution telemetry the
@@ -6236,8 +6333,7 @@ impl RelationalResidentCache {
         self.snapshots.remove(table);
         self.device_memory.remove(table);
         self.partitions.remove(table);
-        self.partition_device_memory
-            .retain(|(partition_table, _partition_id), _memory| partition_table != table);
+        self.partition_device_memory.remove_table(table);
         self.route_decisions().remove(table);
     }
 
@@ -6263,13 +6359,9 @@ impl RelationalResidentCache {
         partitions: Vec<RelationalResidentPartition>,
         device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
     ) {
-        self.partitions.insert(table.clone(), partitions);
         self.partition_device_memory
-            .retain(|(partition_table, _partition_id), _memory| partition_table != &table);
-        for (partition_id, memory) in device_memory {
-            self.partition_device_memory
-                .insert((table.clone(), partition_id), memory);
-        }
+            .install_table_partitions(&table, device_memory);
+        self.partitions.insert(table, partitions);
     }
 }
 
@@ -9149,7 +9241,7 @@ impl Engine {
         }
         self.relational_resident_cache
             .partition_device_memory
-            .retain(|(partition_table, _partition_id), _memory| partition_table != table);
+            .invalidate_table(table);
     }
 
     /// The set of tables a committed batch invalidates, or `None` to fall back to a
@@ -9236,7 +9328,7 @@ impl Engine {
             if table_pressured {
                 self.relational_resident_cache
                     .partition_device_memory
-                    .retain(|(partition_table, _partition_id), _memory| partition_table != table);
+                    .invalidate_table(table);
             }
         }
     }
@@ -15206,13 +15298,13 @@ impl Engine {
             let _ = device_memory.set_current_context();
             device_memory.clear_last_kernel_event_elapsed_us();
         }
-        for ((table, _partition_id), device_memory) in
-            &self.relational_resident_cache.partition_device_memory
+        for device_memory in self
+            .relational_resident_cache
+            .partition_device_memory
+            .published_owners_for_table(&decision.table)
         {
-            if table == &decision.table {
-                let _ = device_memory.set_current_context();
-                device_memory.clear_last_kernel_event_elapsed_us();
-            }
+            let _ = device_memory.set_current_context();
+            device_memory.clear_last_kernel_event_elapsed_us();
         }
         let route_started = Instant::now();
         let result = match decision.query_shape.as_str() {
