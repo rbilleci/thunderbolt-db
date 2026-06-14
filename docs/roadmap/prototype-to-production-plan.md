@@ -409,6 +409,12 @@ honest docs; the real tech stack adopted.
   fatbins for `sm_80/90/100/120` (or formalize runtime-PTX with module caching).
 - **Parallel kernels.** Replace `(1,1,1)` serial loops with real grid/block sizing,
   strided per-thread scans, and block/grid reductions for counts/aggregates.
+  - **Started ✅ (P2-M2, 2026-06-14):** the filtered-count route
+    (`gpu_db_resident_i32_equal_count`) is now a real grid-stride scan + `red.global.add.u64`
+    reduction (block 256, clamped grid) on the P2-M1 substrate — **~60× faster on a 16M-row
+    scan** (475ms→7.9ms), exact-count-verified vs the serial baseline. Remaining serial
+    routes (compare-count, sum, project, `_equal_any_project`) are the tracked follow-up.
+    Run report: `.../runs/2026-06-14-p2-m2-parallel-scan-kernel-v1.md`.
 - **Stream pool + async copies + pinned memory.** Real `cuStream*`, async H2D/D2H,
   `cuMemHostAlloc` staging, so submit/complete actually overlap. Measure D2H from
   real copy sizes (not row/col estimates) and time uniformly with `cuEventElapsedTime`.
@@ -546,7 +552,13 @@ thesis pays off second.
   COUNT path still does NOT scale *up* (synchronous per-op GPU round-trip; needs async
   submission / batched completion / parallel kernels). Independently audited (no live
   blocker). Run report:
-  `.../runs/2026-06-14-p2-m1-step4-gpu-shared-context-scaling-v1.md`**.
+  `.../runs/2026-06-14-p2-m1-step4-gpu-shared-context-scaling-v1.md`**. ·
+  **P2-M2 parallel scan kernel ✅ (2026-06-14): the filtered-count route
+  (`gpu_db_resident_i32_equal_count`) is now a real grid-stride scan + `red.global.add.u64`
+  reduction on the P2-M1 substrate, replacing the single-thread `(1,1,1)` serial loop —
+  **~60× faster on a 16M-row scan** (475ms→7.9ms), exact-count-verified at 4K–16M rows
+  (incl. the grid-clamp/grid-stride-wrap case). The first real GPU-native compute win. Run
+  report: `.../runs/2026-06-14-p2-m2-parallel-scan-kernel-v1.md`**.
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).

@@ -2220,6 +2220,11 @@ done:
         .primary()
         .cached_function(c"gpu_db_resident_i32_equal_count_parallel", &ptx)?;
 
+    // The grid-stride loop covers any row_count regardless of grid size, so clamping the
+    // grid is correctness-safe (extra rows are handled by wrapping). The kernel computes
+    // `stride = gridDim * blockDim` in u32: with grid ≤ 65_535 and BLOCK ≤ 1024 (the CUDA
+    // block-size max) the product stays ≤ ~67M, well within u32 — do not raise BLOCK such
+    // that `65_535 * BLOCK` could overflow u32.
     const BLOCK: u32 = 256;
     let grid: u32 = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
 
