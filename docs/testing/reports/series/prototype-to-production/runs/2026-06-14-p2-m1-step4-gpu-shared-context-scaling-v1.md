@@ -93,6 +93,45 @@ parallel compute with no cross-thread driver serialization.
 - No claim against `DESIGN.md §1.1` targets — this sizes the substrate's effect and
   locates the next bottleneck.
 
+## Independent adversarial audit
+
+A reviewer was tasked to **refute** (A) `unsafe impl Send + Sync for GpuPrimaryContext`
+soundness, (B) lifetime / no use-after-free / no double-free, (C) the COUNT-route
+migration, (D) no overclaim in this report, (E) the write-time hazard claims — reading the
+full diff `f3d7a745..d8ca7b59`, the live call paths, and re-running both GPU suites + the
+benchmark on the real GPU.
+
+**Result: no LIVE BLOCKER.** All five claims upheld. The module cache load is serialized
+under its mutex (no double-load / leak), the returned function handle is stable for
+concurrent launches; each concurrent reader gets a **distinct** pooled stream + scratch
+(no output aliasing); residency holds the `Arc<GpuPrimaryContext>` so device memory cannot
+outlive its context; the COUNT route syncs the stream before the D2H copy and the
+`StreamLease` returns the stream on success/`?`/panic; the report's numbers reproduced
+(serial 15µs @c1, concurrent ~18k qps @c64, "does not scale up" confirmed). The reviewer
+re-ran 12 execution GPU tests + gate-2 — all green.
+
+**Two MINOR robustness gaps the audit found were fixed in this milestone:**
+- The migrated launch path now binds the context itself (`launch_resident_kernel_on_pooled_stream`
+  calls `set_current()`), so it no longer relies on the caller having bound it — removing an
+  undocumented precondition on the `pub` read API.
+- `Drop for CudaResidentDeviceMemory` now binds the context before `cuMemFree`, closing a
+  rare silent-leak path when the last reader drops the owner on an unbound thread.
+
+**Tracked follow-ups (not fixed; rationale):**
+- **LATENT — pooled stream returned even after a launch/sync error** without draining. Low
+  severity: CUDA errors are sticky (the context faults, so subsequent ops on a reused
+  stream also error — no silent corruption); fixing it adds a discard-on-error path for a
+  hosed-context scenario. Tracked for the async/error-handling hardening.
+- **MINOR — module cache keyed by entry name, not PTX.** Correct while each name maps to
+  one kernel; a future name/PTX collision would silently return the wrong function. Harden
+  with a name↔PTX assertion when more routes are migrated.
+- **MINOR — pooled streams use flag 0 (default/blocking).** Consistent with the "does not
+  scale up" diagnosis; the async follow-up will use non-blocking streams.
+- **LATENT (write-time) — `partition_device_memory`** remains a plain owned
+  `BTreeMap<…, CudaResidentDeviceMemory>` freed in place under `&mut self` writes while
+  readers borrow it; the principal remaining hazard before concurrent writes (the shared
+  context does **not** address it; the non-partitioned path is already `Arc`+`SnapshotCell`).
+
 ## Next
 
 - **Async submission / batched completion** for resident reads (the gating work to make

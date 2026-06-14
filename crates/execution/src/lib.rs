@@ -1151,7 +1151,10 @@ impl Drop for CudaResidentDeviceMemory {
     fn drop(&mut self) {
         // §9.3: residency frees only its own device memory. The shared primary context is
         // owned by `GpuPrimaryContext` (released when the last `Arc` — registry + every
-        // allocation — drops), not destroyed per allocation.
+        // allocation — drops), not destroyed per allocation. Bind the context first so the
+        // free lands in the right context even when the last reader drops this owner on a
+        // thread that never bound it (otherwise cuMemFree would no-op + leak).
+        let _ = self.primary.set_current();
         unsafe {
             (self.primary.cu_mem_free)(self.device_ptr);
         }
@@ -8555,6 +8558,10 @@ where
     F: FnOnce(*mut c_void, u64) -> i32,
 {
     let primary = resident.primary();
+    // Bind the shared primary context on this thread before creating/using the stream, so
+    // the migrated path is self-contained (a reader thread that hasn't bound yet would
+    // otherwise hit INVALID_CONTEXT). Idempotent + cheap with one shared context.
+    primary.set_current()?;
     assert!(
         output.len() <= POOLED_STREAM_SCRATCH_BYTES,
         "kernel output ({}) exceeds pooled stream scratch ({POOLED_STREAM_SCRATCH_BYTES})",
