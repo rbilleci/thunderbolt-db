@@ -62,19 +62,29 @@ server (concurrent, 64-row, to match M0):
 |---|---:|---:|---:|---:|---:|
 | count_all (O(1)) | 59 µs | 221 µs | 3,855 µs | 11,813 µs | 16,995 |
 | equality_count (parallel scan) | 389 µs | 526 µs | 3,193 µs | 11,800 µs | **19,989** |
-| multi_col_projection (serial kernel) | 202 µs | 3,202 µs | 24,690 µs | 165,543 µs | 2,142 |
-| mixed_int_text (serial kernel) | 217 µs | 2,906 µs | 26,669 µs | 107,355 µs | 2,199 |
+| multi_col_projection (parallel kernel, pre-migration) | 202 µs | 3,202 µs | 24,690 µs | 165,543 µs | 2,142 |
+| mixed_int_text (parallel kernel, pre-migration) | 217 µs | 2,906 µs | 26,669 µs | 107,355 µs | 2,199 |
 
 The query-type split is the load-bearing finding:
 
 - **Parallelized routes scale.** `count_all` (precomputed) and `equality_count` — the
   **P2-M2 parallel grid/stride scan** over 50k rows — reach ~17k and ~20k qps at c64. The
   parallel-kernel work pays off.
-- **Unmigrated serial-kernel routes hit a wall.** `multi_col_projection` and `mixed_int_text`
-  still use single-thread `(1,1,1)` projection kernels, so under concurrency they serialize
-  on the GPU — p50 balloons to ~24–27 ms at c64 and throughput is flat (~2k qps). This is
-  exactly the P2-M1/P2-M2 story per query type: **the projection/gather kernels are the next
-  parallelization target** (P2-M2 only did the equality-count scan).
+- **Unmigrated-orchestration routes hit a wall.** `multi_col_projection` and `mixed_int_text`
+  balloon to ~24–27 ms p50 at c64 / flat ~2k qps. **Correction (verified by reading the
+  launch code, 2026-06-14):** these projection kernels are **already parallel** (one thread
+  per row + `atom.global.add` append, `blocks = ceil(rows/128)`) — *not* the single-thread
+  `(1,1,1)` this report first claimed. The wall is the **unmigrated per-call orchestration**:
+  per-launch `cuModuleLoadData` + a whole-context `cuCtxSynchronize` on the default stream
+  (the P2-M1 pre-substrate shape), plus a per-call ~800 KB output `cuMemAlloc` and a
+  synchronous `cuMemsetD8`. **Migrating `equal_project` (`multi_col_projection`) to the
+  substrate** (cached module + pooled stream) — done 2026-06-14 — improved it: c1 202→106 µs,
+  c64 24.7 ms→14.9 ms p50 / 2.1k→3.8k qps (~1.7×). It still trails the scalar routes because
+  the per-call 800 KB output alloc + synchronous memset remain (the next bottleneck: pool the
+  output buffer + async memset). `mixed_int_text` (and `equal_any_project` / `compare_project`
+  / `row_indices`) share the same parallel-kernel-on-old-orchestration shape and are the
+  remaining follow-ups via the same helper. Follow-up report:
+  `.../runs/2026-06-14-p2-m2-projection-migration-v1.md`.
 
 ## Dispatch A/B: async vs concurrent (50k rows)
 
@@ -133,8 +143,12 @@ Acted on its findings (all report refinements; no code defect):
 
 ## Next (what this benchmark makes concrete)
 
-1. **Parallelize the projection/gather kernels** (`multi_col_projection`, `mixed_int_text`)
-   the way P2-M2 did the equality-count scan — they are the worst high-concurrency offenders.
+1. **Migrate the remaining projection/gather routes to the substrate** (`mixed_int_text` =
+   `equal_any_project_text`, plus `equal_any_project` / `compare_project` / `row_indices`) —
+   the kernels are already parallel; they just need the cached-module + pooled-stream
+   treatment `equal_project` got (the worst high-concurrency offenders). **Then pool the
+   per-call output buffer + use async-on-stream memset** — the remaining wall on the projection
+   routes after the orchestration migration.
 2. **Batched / async GPU submission** in the new dispatch, to recover (and exceed) M0's
    owner-thread batching advantage at high concurrency without giving up the low-latency
    independent-dispatch win — the P2-M1 tracked item, now quantified.

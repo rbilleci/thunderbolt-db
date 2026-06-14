@@ -8685,12 +8685,6 @@ where
     Ok(())
 }
 
-/// Launch a resident kernel on a **pooled private stream** and sync only that stream
-/// (P2-M1 / Phase 2) — the concurrency-friendly replacement for
-/// `launch_with_optional_cuda_event_timing`'s default-stream + whole-context
-/// `cuCtxSynchronize`. The closure receives the CUDA stream to launch on. Kernel timing is
-/// recorded with CUDA events on that stream when the event symbols resolve; the stream is
-/// always returned to the pool, even on error or panic.
 /// Run a kernel launch on a **pooled private stream** synced individually
 /// (`cuStreamSynchronize`, not a whole-context `cuCtxSynchronize`) with CUDA-event timing —
 /// the concurrency-friendly launch path (P2-M1). The closure receives `(stream,
