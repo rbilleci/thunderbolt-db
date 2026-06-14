@@ -21,6 +21,12 @@ where the time actually goes — at c1 AND c64. Do NOT attempt another fix befor
 breakdown.** The previous session guessed the wall four times (allocation → D2H sync count →
 kernel occupancy → per-call op count) and was wrong every time. Measure, don't guess.
 
+> This is ONE of several open plan threads. For the **broader plan and the full menu of
+> next-step options** (remaining projection routes, batched GPU submission, the write-half,
+> Phase-0 closure), see **`docs/roadmap/prototype-to-production-plan.md` §8 → "Open threads —
+> where a NEW SESSION can continue"**. That section is the project's live handoff entrypoint;
+> this document is the deep-dive for thread (1).
+
 ---
 
 ## 1. Background: what is already done (do not redo)

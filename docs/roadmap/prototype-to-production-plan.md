@@ -675,6 +675,30 @@ the harness to the Phase-5 open-loop/p99.9/steady-state shape.
 Also still owed: grow the harness to the Phase-5 open-loop/p99.9/steady-state shape; §9.1/
 §9.2 server consolidation. See Phase 1 "Concurrency across the flow — status map".
 
+**Open threads — where a NEW SESSION can continue (each is independent; all have pointers):**
+1. **Text-route GPU throughput wall** (perf, in-flight) — locate `mixed_int_text`'s c64 wall
+   (~27 ms / ~2.2k qps; kernel is only 7 µs so it is NOT the GPU path) via a per-section
+   wall-clock breakdown, then a targeted GENERIC fix. **Self-contained handoff doc:**
+   `.../runs/2026-06-14-text-route-wall-investigation-handoff.md`. Do the measurement before any
+   fix — four GPU-orchestration guesses already failed.
+2. **Remaining projection/gather routes** (perf) — `equal_any_project`, `compare_project`,
+   `row_indices` still use the pre-pool per-call orchestration; apply the device output-buffer
+   pool (`8c476939`) — and whatever output shape the text-route investigation validates.
+3. **Batched / async GPU submission** (perf, architectural) — the per-op floor is ~50 µs
+   serialized / ~20k qps; batch many concurrent point-lookups into one GPU submission to exceed
+   it (recovers M0's owner-thread batching). The big lever for high-concurrency OLTP, and what
+   P2-M1/P2-M2 reports repeatedly flagged.
+4. **Write-half** (concurrency) — concurrent writes via publish-on-commit + MVCC (today writes
+   take the single write lock and serialize). UAF prerequisites cleared; the largest remaining
+   concurrency piece (detailed just above).
+5. **Phase-0 closure** (§9.1/§9.2) — consolidate the three pgwire servers; external load
+   generator + Phase-5 open-loop/p99.9 harness shape.
+
+Recommended order if unsure: **(1)** is in-flight with a ready handoff; **(3)** and **(4)** are
+the highest-leverage net-new work. Run reports for everything are under
+`docs/testing/reports/series/prototype-to-production/runs/`; the `gpu-projection-routes-perf`
+memory summarizes the GPU-perf state.
+
 **Completed record — P1-M3 (applied the snapshot substrate to the engine read path).**
 Full design + acceptance gates:
 `docs/architecture/14-engine-snapshot-integration-design.md`. It landed incrementally:
