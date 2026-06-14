@@ -50,6 +50,12 @@ use gpu_db_protocol::{
     parse_frontend_message, parse_startup_packet, FrontendMessage, StartupPacket,
 };
 
+/// Maximum accepted pgwire frame length (DoS guard): a malicious/huge length prefix would
+/// otherwise `resize` a buffer to that size before reading a byte — reachable pre-auth, and
+/// more exposed now that async ingress holds many untrusted connections. 64 MiB is far above
+/// any reasonable simple-query statement (bulk payloads belong in COPY, out of scope here).
+const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// Serve connections **concurrently** on `listener`: one engine shared across a
 /// thread-per-connection worker pool (`Arc<SharedEngine>`), each statement dispatched
 /// through `execute_on_shared_engine` — read-only statements take a read lock and run
@@ -291,6 +297,12 @@ fn read_startup_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
             "startup frame length is shorter than length field",
         ));
     }
+    if frame_len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "startup frame length exceeds maximum",
+        ));
+    }
     let mut frame = len.to_vec();
     frame.resize(frame_len, 0);
     stream.read_exact(&mut frame[4..])?;
@@ -312,6 +324,12 @@ fn read_tagged_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "frontend frame length is shorter than length field",
+        ));
+    }
+    if frame_len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "frontend frame length exceeds maximum",
         ));
     }
     let mut frame = vec![tag[0]];
@@ -490,6 +508,9 @@ async fn read_startup_frame_async(stream: &mut TokioTcpStream) -> Result<Option<
     if frame_len < 4 {
         return Err("startup frame length is shorter than length field".to_string());
     }
+    if frame_len > MAX_FRAME_LEN {
+        return Err("startup frame length exceeds maximum".to_string());
+    }
     let mut frame = len.to_vec();
     frame.resize(frame_len, 0);
     stream
@@ -515,6 +536,9 @@ async fn read_tagged_frame_async(stream: &mut TokioTcpStream) -> Result<Option<V
     let frame_len = u32::from_be_bytes(len) as usize;
     if frame_len < 4 {
         return Err("frontend frame length is shorter than length field".to_string());
+    }
+    if frame_len > MAX_FRAME_LEN {
+        return Err("frontend frame length exceeds maximum".to_string());
     }
     let mut frame = vec![tag[0]];
     frame.extend_from_slice(&len);

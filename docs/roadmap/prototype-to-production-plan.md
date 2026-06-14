@@ -423,10 +423,15 @@ honest docs; the real tech stack adopted.
 - **Real commit durability.** Make `WalBuffer::flush_all` fsync (with **group
   commit** — one fsync per batch); add LSN, CRC, and parent-dir fsync. Gate
   visibility on real durability.
-- **Async ingress (P1-M5).** On top of the concurrent dispatcher, replace
-  thread-per-connection with a `tokio` acceptor + bounded executor (for connection
-  *scale*, not just parallelism); introduce a real bounded command/owner ring for the
-  writer.
+- **Async ingress (P1-M5). ✅ Done (2026-06-14).** `serve_async` — a `tokio` acceptor
+  spawns a task per connection (not an OS thread) + a semaphore-bounded `spawn_blocking`
+  executor over the blocking engine. Measured: peak OS threads stay ~constant (641) from
+  512→8192 connections vs thread-per-conn's linear growth (194→628→1073) — thread count
+  decoupled from connection count. Trades a little throughput for connection scale.
+  Independently audited. Run report: `.../runs/2026-06-14-p1-m5-async-ingress-v1.md`.
+  (Still owed for full connection scale: an external load generator + larger listen backlog
+  to prove a hard ≥10k-accepted number; the "bounded command/owner ring for the writer" is
+  the write-half's concern.)
 - **Measure at load *before* the heavy lifts.** Stand up a minimal open-loop /
   offered-rate, multi-hundred-connection, **p99.9** harness (a cut-down of the Phase-5
   harness) *first*, so every concurrency milestone above is validated end-to-end at load —
@@ -445,7 +450,7 @@ and a harness that measures it:
 
 | flow layer | driven by | status |
 |---|---|---|
-| Connection ingress (async acceptor, admission) | P1-M5 async ingress + Phase 5 | not started (thread-per-conn) |
+| Connection ingress (async acceptor) | P1-M5 | ✅ done (2026-06-14): `serve_async` tokio acceptor + bounded executor; peak threads ⟂ connections (~641 const to 8192 conns). Admission/100k–1M still Phase 5 |
 | Server→engine **concurrent dispatch** | P1-M4 | ✅ done (2026-06-14): `Arc<SharedEngine>`, read-lock reads / write-lock writes; ~58× to 106k qps @ c256 |
 | Engine **read** path | P1-M3 reader/writer (read half) | ✅ done (`&self`, gate 2) |
 | Engine **write** path concurrency | P1 writer half + MVCC | owed — UAF hazards cleared (2026-06-14); needs the writer + MVCC + `&self` structural mutation |
@@ -617,7 +622,11 @@ thesis pays off second.
   `Arc<SharedEngine>` across a thread-per-connection pool (read-lock reads / write-lock
   writes); scales reads ~58× to 106k qps @ 256 conns over the wire; load harness +
   `TCP_NODELAY` fix landed; independently audited. Run report:
-  `.../runs/2026-06-14-p1-m4-concurrent-dispatch-v1.md`**.
+  `.../runs/2026-06-14-p1-m4-concurrent-dispatch-v1.md`**. ·
+  **P1-M5 async ingress ✅ (2026-06-14): `serve_async` tokio acceptor (task-per-connection) +
+  semaphore-bounded spawn_blocking executor; peak OS threads ⟂ connections (~641 const to
+  8192 conns vs thread-per-conn 194→1073); independently audited. Run report:
+  `.../runs/2026-06-14-p1-m5-async-ingress-v1.md`**.
 - Run reports: `docs/testing/reports/series/prototype-to-production/runs/` and
   `.../p8-concurrency-steady-state/runs/2026-06-13-phase0-m0-baseline-v1.md`.
 - **Phase 0 is NOT closed** — three pgwire servers still exist (§9.1/§9.2 owed).
@@ -628,16 +637,17 @@ reproduces M0 within run-to-run variance (step 1 changed nothing on the measured
 path; this is a noise characterization, not an improvement). The next *meaningful*
 (improvement) benchmark is the step-4 re-run after the `&self` read-path flip.
 
-**Immediate next: P1-M5 async ingress, and the write-half.** P1-M3 (read path), P2-M1 (GPU
+**Immediate next: the write-half.** Done so far: P1-M3 (read path), P2-M1 (GPU
 shared-context/stream substrate), P2-M2 (parallel scan kernel), the two latent UAF hazards
-(closed), and **P1-M4 concurrent dispatch** (the engine-backed server now scales reads ~58×
-to 106k qps at 256 connections; load harness + `TCP_NODELAY` fix landed) are **done**. Two
-threads from here:
-- **P1-M5 async ingress** — replace thread-per-connection with a `tokio` acceptor + bounded
-  executor for connection *scale* (toward 100k–1M); thread-per-conn is fine at hundreds.
-- **Write-half** — concurrent writes via publish-on-commit + MVCC so writes scale too
-  (today writes take the single write lock and serialize). The UAF prerequisites are
-  already cleared.
+(closed), **P1-M4 concurrent dispatch** (reads ~58× to 106k qps @ 256 conns over the wire),
+and **P1-M5 async ingress** (`serve_async`: threads ⟂ connections, ~641 const to 8192 conns).
+The read + ingress concurrency story is in place; the main remaining concurrency lift is:
+- **Write-half** — concurrent writes via publish-on-commit + MVCC so writes scale too (today
+  writes take the single write lock and serialize). The UAF prerequisites are already
+  cleared; this is the largest remaining piece.
+Also owed: an **external** load generator + larger listen backlog to prove a hard
+≥10k-accepted number (P1-M5 showed the bounded-thread property, not the literal count); grow
+the harness to the Phase-5 open-loop/p99.9/steady-state shape.
 Also still owed: grow the harness to the Phase-5 open-loop/p99.9/steady-state shape; §9.1/
 §9.2 server consolidation. See Phase 1 "Concurrency across the flow — status map".
 
