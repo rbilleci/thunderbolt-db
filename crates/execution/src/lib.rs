@@ -493,6 +493,7 @@ impl CudaResidentDeviceMemoryReadView {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn match_project_i32_equal_any_text_from_payload(
         &self,
         filter_offset: u64,
@@ -521,6 +522,9 @@ trait CudaResidentReadSource {
     fn device_ptr(&self) -> u64;
     fn context(&self) -> *mut c_void;
     fn lib(&self) -> &Library;
+    /// The shared primary context — entry point to the module cache + stream pool, so the
+    /// generic read routes (over an owner or a read view) can migrate to the substrate.
+    fn primary(&self) -> &GpuPrimaryContext;
     fn record_kernel_event_elapsed_us(&self, _elapsed_us: Option<u64>) {}
 }
 
@@ -539,6 +543,10 @@ impl CudaResidentReadSource for CudaResidentDeviceMemory {
 
     fn lib(&self) -> &Library {
         self.primary.lib()
+    }
+
+    fn primary(&self) -> &GpuPrimaryContext {
+        &self.primary
     }
 
     fn record_kernel_event_elapsed_us(&self, elapsed_us: Option<u64>) {
@@ -561,6 +569,10 @@ impl CudaResidentReadSource for CudaResidentDeviceMemoryReadView {
 
     fn lib(&self) -> &Library {
         self.primary.lib()
+    }
+
+    fn primary(&self) -> &GpuPrimaryContext {
+        &self.primary
     }
 }
 
@@ -835,6 +847,7 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn match_project_i32_equal_any_text_from_payload(
         &self,
         filter_offset: u64,
@@ -3612,6 +3625,7 @@ DONE:
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentReadSource>(
     resident: &R,
     filter_offset: u64,
@@ -3627,10 +3641,6 @@ fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentReadSource>(
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
-    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuModuleGetFunction =
-        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -3644,8 +3654,6 @@ fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentReadSource>(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
-    type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
 
     const MAX_PROJECTIONS: usize = 4;
     const PTX: &[u8] = br#"
@@ -3984,43 +3992,12 @@ DONE:
             .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_module_load_data = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_unload = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleUnload>(b"cuModuleUnload\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_get_function = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_launch_kernel = unsafe {
         resident
             .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_ctx_synchronize = unsafe {
-        resident
-            .lib()
-            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_ctx_set_current = unsafe {
-        resident
-            .lib()
-            .get::<CuCtxSetCurrent>(b"cuCtxSetCurrent\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    check_cuda(unsafe { cu_ctx_set_current(resident.context()) })?;
 
     let mut device_needles = 0_u64;
     check_cuda(unsafe { cu_mem_alloc(&mut device_needles, needle_bytes) })?;
@@ -4087,25 +4064,15 @@ DONE:
     check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
     check_cuda(unsafe { cu_memset_d8(text_count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
 
+    // P2-M2: cached module (no per-launch cuModuleLoadData) — the projection kernel is
+    // already parallel (one thread per row + atomic-append); the c64 wall was this per-call
+    // orchestration (per-launch JIT + whole-context sync), not the kernel.
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
-
-    let mut module = std::ptr::null_mut();
-    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
-    let module_guard = CudaModuleGuard {
-        module,
-        unload: *cu_module_unload,
-    };
-
-    let mut function = std::ptr::null_mut();
-    check_cuda(unsafe {
-        cu_module_get_function(
-            &mut function,
-            module,
-            c"gpu_db_resident_i32_equal_any_project_text".as_ptr(),
-        )
-    })?;
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_equal_any_project_text", &ptx)?;
 
     let mut resident_arg = resident.device_ptr();
     let mut rows_arg = row_count;
@@ -4154,7 +4121,9 @@ DONE:
     ];
     let threads_per_block = 128;
     let blocks = row_count_u32.div_ceil(threads_per_block);
-    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
+    // P2-M2: launch on a pooled private stream synced individually (no whole-context
+    // cuCtxSynchronize); the route owns its output buffers, so no pooled scratch.
+    launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
         cu_launch_kernel(
             function,
             blocks,
@@ -4164,7 +4133,7 @@ DONE:
             1,
             1,
             0,
-            std::ptr::null_mut(),
+            stream,
             args.as_mut_ptr(),
             std::ptr::null_mut(),
         )
@@ -4259,7 +4228,6 @@ DONE:
         })?;
     }
 
-    drop(module_guard);
     drop(text_count_guard);
     drop(count_guard);
     drop(text_bytes_guard);
@@ -8698,12 +8666,13 @@ where
 ///   output buffers; they ignore the scratch ptr and do their own D2H after this returns
 ///   (the stream is already synced, so the data is ready). They still get the cached-module +
 ///   pooled-stream + per-stream-sync win.
-fn launch_on_pooled_stream<F>(
-    resident: &CudaResidentDeviceMemory,
+fn launch_on_pooled_stream<R, F>(
+    resident: &R,
     scratch_out: Option<&mut [u8]>,
     launch: F,
 ) -> Result<(), CudaRuntimeProbeError>
 where
+    R: CudaResidentReadSource,
     F: FnOnce(*mut c_void, u64) -> i32,
 {
     let primary = resident.primary();
