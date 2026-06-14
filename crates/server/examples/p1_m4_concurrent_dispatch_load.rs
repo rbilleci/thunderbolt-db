@@ -27,6 +27,8 @@
 use std::env;
 use std::error::Error;
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio_postgres::NoTls;
@@ -36,6 +38,20 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Process OS-thread count (Linux), the connection-scale signal: thread-per-connection grows
+/// it ~linearly with connections, async ingress keeps it ~constant.
+fn current_thread_count() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Threads:"))
+                .and_then(|n| n.trim().parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -58,18 +74,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let rows: usize = env_parse("GPU_DB_LOAD_ROWS", 1000);
     let query = "SELECT COUNT(*) FROM load_t";
 
-    // Bind first (so we know the port), then run the chosen server on its own OS thread —
-    // `serve`/`serve_sequential` are blocking.
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    let server_mode = mode.clone();
-    std::thread::spawn(move || {
-        let _ = if server_mode == "sequential" {
-            gpu_db_server::serve_sequential(listener)
-        } else {
-            gpu_db_server::serve(listener)
-        };
-    });
+    // `async` runs serve_async on this tokio runtime (task-per-connection); the sync modes
+    // (`concurrent`/`sequential`) run their blocking serve on a std thread with a std listener.
+    let port;
+    if mode == "async" {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        port = listener.local_addr()?.port();
+        tokio::spawn(async move {
+            let _ = gpu_db_server::serve_async(listener).await;
+        });
+    } else {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        port = listener.local_addr()?.port();
+        let server_mode = mode.clone();
+        std::thread::spawn(move || {
+            let _ = if server_mode == "sequential" {
+                gpu_db_server::serve_sequential(listener)
+            } else {
+                gpu_db_server::serve(listener)
+            };
+        });
+    }
     let conn_str = format!("host=127.0.0.1 port={port} user=postgres dbname=postgres");
 
     // Seed a small table on one connection.
@@ -92,11 +117,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "p1_m4_concurrent_dispatch_load: mode={mode} rows={rows} duration={duration_secs}s query=\"{query}\""
     );
-    println!("| conn | served | requests | qps | p50 us | p95 us | p99 us | p99.9 us |");
-    println!("|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!(
+        "| conn | served | requests | qps | p50 us | p95 us | p99 us | p99.9 us | peak threads |"
+    );
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 
     let mut json_cells: Vec<String> = Vec::new();
     for &c in &connections {
+        // Sample peak process OS-thread count during this sweep point — the connection-scale
+        // signal (thread-per-conn grows it with c; async ingress keeps it ~constant).
+        let peak_threads = Arc::new(AtomicUsize::new(0));
+        let stop_sampler = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let peak_threads = Arc::clone(&peak_threads);
+            let stop_sampler = Arc::clone(&stop_sampler);
+            tokio::spawn(async move {
+                while !stop_sampler.load(Ordering::Relaxed) {
+                    peak_threads.fetch_max(current_thread_count(), Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+        };
         let mut handles = Vec::new();
         for _ in 0..c {
             let conn_str = conn_str.clone();
@@ -137,6 +178,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             all_latencies.extend(latencies);
         }
+        stop_sampler.store(true, Ordering::Relaxed);
+        let _ = sampler.await;
+        let peak_threads = peak_threads.load(Ordering::Relaxed);
         all_latencies.sort_unstable();
         // Aggregate throughput: total requests over the per-client measurement window
         // (all served clients overlap for ~duration_secs).
@@ -148,11 +192,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             percentile(&all_latencies, 0.999),
         );
         println!(
-            "| {c} | {served} | {} | {qps:.0} | {p50} | {p95} | {p99} | {p999} |",
+            "| {c} | {served} | {} | {qps:.0} | {p50} | {p95} | {p99} | {p999} | {peak_threads} |",
             all_latencies.len()
         );
         json_cells.push(format!(
-            "{{\"connections\":{c},\"served\":{served},\"requests\":{},\"qps\":{qps:.1},\"p50_us\":{p50},\"p95_us\":{p95},\"p99_us\":{p99},\"p999_us\":{p999}}}",
+            "{{\"connections\":{c},\"served\":{served},\"requests\":{},\"qps\":{qps:.1},\"p50_us\":{p50},\"p95_us\":{p95},\"p99_us\":{p99},\"p999_us\":{p999},\"peak_threads\":{peak_threads}}}",
             all_latencies.len()
         ));
     }

@@ -17,7 +17,16 @@ path = "src/main.rs"
 [dependencies]
 gpu_db_protocol = { path = "../protocol" }
 gpu_db_facade = { path = "../facade" }
+# Async ingress (P1-M5): a tokio acceptor + per-connection tasks so idle connections are
+# cheap parked tasks (connection scale), bridging to the blocking engine via spawn_blocking.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "macros",
+    "time",
+] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"

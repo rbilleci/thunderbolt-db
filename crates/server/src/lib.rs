@@ -25,12 +25,22 @@
 //!   ("N concurrent readers, one serialized writer"). This is the first production caller
 //!   of the `&self` engine read path (P1-M3) + the GPU shared-context substrate (P2-M1).
 //!   `serve_sequential` retains the prior one-connection-at-a-time loop as the A/B baseline.
-//!   Full async ingress (a `tokio` acceptor for connection *scale*) is the next step (P1-M5).
+//! - **Async ingress (P1-M5).** `serve_async` is a `tokio` acceptor that spawns a
+//!   lightweight task per connection (not an OS thread), so idle connections are cheap and
+//!   the server scales to far more concurrent connections than thread-per-connection can.
+//!   Statement execution is dispatched to the blocking engine via `spawn_blocking`, gated by
+//!   a semaphore (bounded executor) so the runtime is never blocked. Measured: peak OS-thread
+//!   count stays ~constant as connections grow, vs thread-per-conn's linear growth. Trades a
+//!   little throughput for connection *scale*; thread-per-conn `serve` stays the
+//!   higher-throughput choice at a few hundred connections.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 use gpu_db_facade::{
     execute_on_shared_engine, pg_adapter, DbError, EngineFacade, QueryOutcome, SharedEngine,
@@ -211,48 +221,59 @@ fn run_simple_query_loop(
     Ok(())
 }
 
-/// Translate a neutral façade outcome into pgwire backend messages. All
-/// PostgreSQL-specific encoding lives in `gpu_db_facade::pg_adapter`.
-fn write_outcome(stream: &mut TcpStream, outcome: Result<QueryOutcome, DbError>) -> io::Result<()> {
-    let mut writer = BackendWriter::new(&mut *stream);
-    match outcome {
-        // An empty statement gets EmptyQueryResponse (not CommandComplete), per
-        // the wire protocol.
-        Ok(QueryOutcome::Empty) => {
-            writer.empty_query_response()?;
-        }
-        Ok(outcome) => {
-            let tag = pg_adapter::command_complete_tag(&outcome);
-            if let QueryOutcome::Rows { columns, rows } = &outcome {
-                let backend_columns: Vec<BackendColumn> = columns
-                    .iter()
-                    .map(|column| {
-                        BackendColumn::new(
-                            column.name.clone(),
-                            pg_adapter::logical_type_oid(column.logical_type),
-                            pg_adapter::logical_type_size(column.logical_type),
-                        )
-                    })
-                    .collect();
-                writer.row_description(&backend_columns)?;
-                for row in rows {
-                    let values: Vec<Option<String>> = row
-                        .iter()
-                        .map(|value| Some(pg_adapter::db_value_text(value)))
-                        .collect();
-                    writer.data_row(&values)?;
-                }
+/// Encode a neutral façade outcome into pgwire backend message bytes (EmptyQueryResponse /
+/// RowDescription+DataRow+CommandComplete / ErrorResponse, then ReadyForQuery). All
+/// PostgreSQL-specific encoding lives in `gpu_db_facade::pg_adapter`. Built into a buffer so
+/// it is shared by the sync (`write_outcome`) and async (`serve_async`) write paths.
+fn encode_outcome(outcome: Result<QueryOutcome, DbError>) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = BackendWriter::new(&mut buf);
+        match outcome {
+            // An empty statement gets EmptyQueryResponse (not CommandComplete), per
+            // the wire protocol.
+            Ok(QueryOutcome::Empty) => {
+                writer.empty_query_response()?;
             }
-            writer.command_complete(&tag)?;
+            Ok(outcome) => {
+                let tag = pg_adapter::command_complete_tag(&outcome);
+                if let QueryOutcome::Rows { columns, rows } = &outcome {
+                    let backend_columns: Vec<BackendColumn> = columns
+                        .iter()
+                        .map(|column| {
+                            BackendColumn::new(
+                                column.name.clone(),
+                                pg_adapter::logical_type_oid(column.logical_type),
+                                pg_adapter::logical_type_size(column.logical_type),
+                            )
+                        })
+                        .collect();
+                    writer.row_description(&backend_columns)?;
+                    for row in rows {
+                        let values: Vec<Option<String>> = row
+                            .iter()
+                            .map(|value| Some(pg_adapter::db_value_text(value)))
+                            .collect();
+                        writer.data_row(&values)?;
+                    }
+                }
+                writer.command_complete(&tag)?;
+            }
+            Err(error) => {
+                writer.error_response(&BackendError::new(
+                    pg_adapter::error_sqlstate(error.category).to_string(),
+                    error.message,
+                ))?;
+            }
         }
-        Err(error) => {
-            writer.error_response(&BackendError::new(
-                pg_adapter::error_sqlstate(error.category).to_string(),
-                error.message,
-            ))?;
-        }
+        writer.ready_for_query(false)?;
     }
-    writer.ready_for_query(false)
+    Ok(buf)
+}
+
+/// Translate a neutral façade outcome into pgwire backend messages on the sync stream.
+fn write_outcome(stream: &mut TcpStream, outcome: Result<QueryOutcome, DbError>) -> io::Result<()> {
+    stream.write_all(&encode_outcome(outcome)?)
 }
 
 /// Read one untagged startup-style frame (4-byte length prefix, no type byte).
@@ -297,5 +318,210 @@ fn read_tagged_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     frame.extend_from_slice(&len);
     frame.resize(frame_len + 1, 0);
     stream.read_exact(&mut frame[5..])?;
+    Ok(Some(frame))
+}
+
+// ---------------------------------------------------------------------------
+// Async ingress (P1-M5): tokio acceptor + per-connection tasks + bounded executor
+// ---------------------------------------------------------------------------
+
+/// Default cap on concurrent blocking engine executions (the "bounded executor"). Idle
+/// connections hold no permit, so this bounds *in-flight engine work*, not connection count.
+const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 256;
+
+/// Async-ingress server (P1-M5): a `tokio` acceptor spawns a lightweight task per connection
+/// (not an OS thread), so idle connections are cheap parked tasks and the server scales to
+/// far more concurrent connections than thread-per-connection can. Each statement runs on
+/// the blocking engine via `spawn_blocking`, gated by a semaphore so at most
+/// `DEFAULT_MAX_CONCURRENT_EXECUTIONS` engine calls run at once (bounded executor — the
+/// blocking engine never stalls the async runtime). Reads run concurrently / writes serialize
+/// via the shared engine's `RwLock`. Must be run inside a tokio runtime.
+pub async fn serve_async(listener: TokioTcpListener) -> io::Result<()> {
+    serve_async_with_permits(listener, DEFAULT_MAX_CONCURRENT_EXECUTIONS).await
+}
+
+/// `serve_async` with an explicit bound on concurrent blocking executions (for benchmarks).
+pub async fn serve_async_with_permits(
+    listener: TokioTcpListener,
+    max_concurrent_executions: usize,
+) -> io::Result<()> {
+    let engine = Arc::new(SharedEngine::new());
+    let executor = Arc::new(tokio::sync::Semaphore::new(
+        max_concurrent_executions.max(1),
+    ));
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let engine = Arc::clone(&engine);
+        let executor = Arc::clone(&executor);
+        tokio::spawn(async move {
+            if let Err(err) = handle_connection_async(stream, &engine, &executor).await {
+                eprintln!("gpu-db-engine-server async connection error: {err}");
+            }
+        });
+    }
+}
+
+async fn handle_connection_async(
+    mut stream: TokioTcpStream,
+    engine: &Arc<SharedEngine>,
+    executor: &Arc<tokio::sync::Semaphore>,
+) -> Result<(), String> {
+    if !complete_startup_async(&mut stream).await? {
+        return Ok(());
+    }
+    run_async_query_loop(&mut stream, engine, executor).await
+}
+
+async fn complete_startup_async(stream: &mut TokioTcpStream) -> Result<bool, String> {
+    let mut frame = match read_startup_frame_async(stream).await? {
+        Some(frame) => frame,
+        None => return Ok(false),
+    };
+    loop {
+        match parse_startup_packet(&frame).map_err(|err| err.to_string())? {
+            StartupPacket::SslRequest | StartupPacket::GssEncRequest => {
+                stream
+                    .write_all(b"N")
+                    .await
+                    .map_err(|err| err.to_string())?;
+                frame = match read_startup_frame_async(stream).await? {
+                    Some(frame) => frame,
+                    None => return Ok(false),
+                };
+            }
+            StartupPacket::CancelRequest { .. } => return Ok(false),
+            StartupPacket::Startup { .. } => break,
+        }
+    }
+    let handshake = encode_startup_handshake().map_err(|err| err.to_string())?;
+    stream
+        .write_all(&handshake)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(true)
+}
+
+/// Build the startup-OK handshake (AuthenticationOk, ParameterStatus×4, ReadyForQuery).
+fn encode_startup_handshake() -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = BackendWriter::new(&mut buf);
+        writer.authentication_ok()?;
+        writer.parameter_status("server_version", "16.0-gpu-db-engine-facade")?;
+        writer.parameter_status("client_encoding", "UTF8")?;
+        writer.parameter_status("DateStyle", "ISO, MDY")?;
+        writer.parameter_status("integer_datetimes", "on")?;
+        writer.ready_for_query(false)?;
+    }
+    Ok(buf)
+}
+
+async fn run_async_query_loop(
+    stream: &mut TokioTcpStream,
+    engine: &Arc<SharedEngine>,
+    executor: &Arc<tokio::sync::Semaphore>,
+) -> Result<(), String> {
+    while let Some(frame) = read_tagged_frame_async(stream).await? {
+        match parse_frontend_message(&frame).map_err(|err| err.to_string())? {
+            FrontendMessage::SimpleQuery(sql) => {
+                // Execute on the blocking engine via the bounded blocking pool: an idle
+                // connection holds no permit, so only `max_concurrent_executions` engine
+                // calls run at once and the async runtime is never blocked. The permit is
+                // released before the (async) response write.
+                let outcome = {
+                    let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
+                    let engine = Arc::clone(engine);
+                    tokio::task::spawn_blocking(move || execute_on_shared_engine(&engine, &sql))
+                        .await
+                        .map_err(|err| err.to_string())?
+                };
+                let buf = encode_outcome(outcome).map_err(|err| err.to_string())?;
+                stream
+                    .write_all(&buf)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            FrontendMessage::Terminate => break,
+            FrontendMessage::Sync => {
+                let mut buf = Vec::new();
+                BackendWriter::new(&mut buf)
+                    .ready_for_query(false)
+                    .map_err(|err| err.to_string())?;
+                stream
+                    .write_all(&buf)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            _ => {
+                let mut buf = Vec::new();
+                {
+                    let mut writer = BackendWriter::new(&mut buf);
+                    writer
+                        .error_response(&BackendError::new(
+                            "0A000",
+                            "only the simple query protocol is supported by the engine-backed \
+                             facade server",
+                        ))
+                        .map_err(|err| err.to_string())?;
+                    writer
+                        .ready_for_query(false)
+                        .map_err(|err| err.to_string())?;
+                }
+                stream
+                    .write_all(&buf)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Async read of one untagged startup frame (4-byte length prefix, no type byte).
+async fn read_startup_frame_async(stream: &mut TokioTcpStream) -> Result<Option<Vec<u8>>, String> {
+    let mut len = [0_u8; 4];
+    match stream.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    }
+    let frame_len = u32::from_be_bytes(len) as usize;
+    if frame_len < 4 {
+        return Err("startup frame length is shorter than length field".to_string());
+    }
+    let mut frame = len.to_vec();
+    frame.resize(frame_len, 0);
+    stream
+        .read_exact(&mut frame[4..])
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(Some(frame))
+}
+
+/// Async read of one tagged frame (1-byte type + 4-byte length prefix + payload).
+async fn read_tagged_frame_async(stream: &mut TokioTcpStream) -> Result<Option<Vec<u8>>, String> {
+    let mut tag = [0_u8; 1];
+    match stream.read_exact(&mut tag).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    }
+    let mut len = [0_u8; 4];
+    stream
+        .read_exact(&mut len)
+        .await
+        .map_err(|err| err.to_string())?;
+    let frame_len = u32::from_be_bytes(len) as usize;
+    if frame_len < 4 {
+        return Err("frontend frame length is shorter than length field".to_string());
+    }
+    let mut frame = vec![tag[0]];
+    frame.extend_from_slice(&len);
+    frame.resize(frame_len + 1, 0);
+    stream
+        .read_exact(&mut frame[5..])
+        .await
+        .map_err(|err| err.to_string())?;
     Ok(Some(frame))
 }
