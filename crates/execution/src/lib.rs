@@ -1877,7 +1877,11 @@ fn launch_cuda_resident_row_count(
     Ok(u64::from_le_bytes(output_bytes))
 }
 
-fn launch_cuda_resident_i32_equal_count(
+/// Single-thread `(1,1,1)` serial filtered-count — retained ONLY as the A/B baseline for
+/// the P2-M2 parallel-scan spike. The production route is the parallel
+/// `launch_cuda_resident_i32_equal_count`.
+#[cfg(test)]
+fn launch_cuda_resident_i32_equal_count_serial(
     resident: &CudaResidentDeviceMemory,
     byte_offset: u64,
     row_count: u64,
@@ -2087,6 +2091,177 @@ done:
     drop(module_guard);
     drop(allocation_guard);
     Ok(output)
+}
+
+/// Filtered-count over an i32 column: a real grid/block strided scan + global reduction
+/// (Phase 2). Each thread grid-strides over the column counting matches into a register,
+/// then `red.global.add.u64` accumulates into a zeroed scratch. Runs on the P2-M1 substrate
+/// (cached module — no per-launch JIT — and a pooled private stream). This replaced the
+/// original single-thread `(1,1,1)` serial loop (kept as `_serial`, test-only, for the A/B);
+/// ~60× faster on a 16M-row scan (run report `2026-06-14-p2-m2-...`).
+fn launch_cuda_resident_i32_equal_count(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    row_count: u64,
+    needle: i32,
+) -> Result<u64, CudaRuntimeProbeError> {
+    type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_equal_count_parallel(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 row_count,
+    .param .s32 needle,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %tmp32;
+    .reg .u64 %resident;
+    .reg .u64 %offset;
+    .reg .u64 %rows;
+    .reg .u64 %out;
+    .reg .u64 %base;
+    .reg .u64 %idx;
+    .reg .u64 %stride;
+    .reg .u64 %addr;
+    .reg .u64 %off_bytes;
+    .reg .u64 %matches;
+    .reg .s32 %needle;
+    .reg .s32 %r_value;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %offset, [byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.s32 %needle, [needle];
+    ld.param.u64 %out, [out_ptr];
+
+    add.u64 %base, %resident, %offset;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %tmp32, %bid, %bdim, %lane;
+    cvt.u64.u32 %idx, %tmp32;
+    mul.lo.u32 %tmp32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %tmp32;
+
+    mov.u64 %matches, 0;
+
+loop:
+    setp.ge.u64 %p_done, %idx, %rows;
+    @%p_done bra done;
+    mul.lo.u64 %off_bytes, %idx, 4;
+    add.u64 %addr, %base, %off_bytes;
+    ld.global.s32 %r_value, [%addr];
+    setp.eq.s32 %p_match, %r_value, %needle;
+    @!%p_match bra next;
+    add.u64 %matches, %matches, 1;
+
+next:
+    add.u64 %idx, %idx, %stride;
+    bra loop;
+
+done:
+    red.global.add.u64 [%out], %matches;
+    ret;
+}
+"#;
+
+    let bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if bytes > resident.metadata().allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+    }
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memset_d8_async = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8Async>(b"cuMemsetD8Async\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_equal_count_parallel", &ptx)?;
+
+    const BLOCK: u32 = 256;
+    let grid: u32 = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+
+    let mut output_bytes = [0_u8; std::mem::size_of::<u64>()];
+    launch_resident_kernel_on_pooled_stream(resident, &mut output_bytes, |stream, output_ptr| {
+        // Zero the scratch on the stream (the kernel red-adds into it), ordered before the
+        // kernel launch on the same stream.
+        let memset_rc =
+            unsafe { cu_memset_d8_async(output_ptr, 0, std::mem::size_of::<u64>(), stream) };
+        if memset_rc != 0 {
+            return memset_rc;
+        }
+        let mut resident_arg = resident.device_ptr();
+        let mut offset_arg = byte_offset;
+        let mut rows_arg = row_count;
+        let mut needle_arg = needle;
+        let mut output_arg = output_ptr;
+        let mut args = [
+            (&mut resident_arg as *mut u64).cast::<c_void>(),
+            (&mut offset_arg as *mut u64).cast::<c_void>(),
+            (&mut rows_arg as *mut u64).cast::<c_void>(),
+            (&mut needle_arg as *mut i32).cast::<c_void>(),
+            (&mut output_arg as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                function,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+
+    Ok(u64::from_le_bytes(output_bytes))
 }
 
 fn launch_cuda_resident_i32_compare_count(
@@ -10238,6 +10413,97 @@ mod tests {
             top_cached_qps > top_per_launch_qps,
             "milestone premise unmet: at c64 the cached/per-stream model ({top_cached_qps:.0} qps) \
              did not beat the per-launch/ctx-sync model ({top_per_launch_qps:.0} qps)"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_parallel_i32_equal_count_matches_serial_and_wins_on_large_tables() {
+        // P2-M2 step 1 — parallel scan kernel spike.
+        //
+        // The resident filtered-count route (`gpu_db_resident_i32_equal_count`) is a
+        // single-thread `(1,1,1)` serial loop — one GPU thread scanning every row, the
+        // "shallow GPU" the plan §1.2 calls out. This probe proves the Phase-2 fix BEFORE
+        // wiring it into the route: a real grid/block strided scan + global reduction
+        // (`launch_cuda_resident_i32_equal_count_parallel`). It A/Bs the parallel kernel
+        // vs the serial one across a row-count sweep, hard-asserting (a) the parallel count
+        // EQUALS the serial count EQUALS the CPU-computed expected at every size (the
+        // soundness claim — atomic reduction + grid-stride bounds are correct), and (b) on
+        // a large table the parallel kernel is faster (the milestone hypothesis).
+        use std::time::Instant;
+
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let needle = 3_i32;
+        let sizes: [u64; 5] = [4_096, 65_536, 1 << 20, 1 << 22, 1 << 24];
+        println!("p2_m2_parallel_scan_spike: needle={needle} (value[i] = i % 7)");
+        println!("| rows | expected | serial ms | parallel ms | speedup |");
+        println!("|---:|---:|---:|---:|---:|");
+
+        let mut largest_serial_ms = 0.0_f64;
+        let mut largest_parallel_ms = 0.0_f64;
+        for &n in &sizes {
+            let values: Vec<i32> = (0..n).map(|i| (i % 7) as i32).collect();
+            // SAFETY: `i32` is plain-old-data with no padding; viewing the Vec as native
+            // (little-endian) bytes matches what the kernel's `ld.global.s32` reads, and
+            // `values` outlives this borrow (retain copies to the device synchronously).
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let allocated = std::mem::size_of::<u64>() as u64 + column_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: std::mem::size_of::<u64>() as u64,
+                            bytes: column_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident column");
+            let offset = std::mem::size_of::<u64>() as u64;
+            let expected = values.iter().filter(|&&v| v == needle).count() as u64;
+
+            // Correctness (also warms each kernel's module load).
+            let serial = launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle)
+                .expect("serial count");
+            let parallel = launch_cuda_resident_i32_equal_count(&resident, offset, n, needle)
+                .expect("parallel count");
+            assert_eq!(serial, expected, "serial count wrong at rows={n}");
+            assert_eq!(parallel, expected, "parallel count wrong at rows={n}");
+
+            // Timing: best of 3 (latency).
+            let mut serial_ms = f64::MAX;
+            let mut parallel_ms = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                launch_cuda_resident_i32_equal_count_serial(&resident, offset, n, needle).unwrap();
+                serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                let t = Instant::now();
+                launch_cuda_resident_i32_equal_count(&resident, offset, n, needle).unwrap();
+                parallel_ms = parallel_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let speedup = if parallel_ms > 0.0 {
+                serial_ms / parallel_ms
+            } else {
+                0.0
+            };
+            println!("| {n} | {expected} | {serial_ms:.3} | {parallel_ms:.3} | {speedup:.1}x |");
+            largest_serial_ms = serial_ms;
+            largest_parallel_ms = parallel_ms;
+        }
+
+        assert!(
+            largest_parallel_ms < largest_serial_ms,
+            "parallel kernel ({largest_parallel_ms:.3} ms) did not beat the serial (1,1,1) \
+             kernel ({largest_serial_ms:.3} ms) on the largest table — milestone premise unmet"
         );
     }
 }
