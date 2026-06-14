@@ -9540,4 +9540,439 @@ mod tests {
         assert_eq!(op.next(), None);
         op.close();
     }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_shared_primary_context_with_cached_module_and_per_stream_scales_concurrent_count() {
+        // P2-M1 step 1 — the GPU concurrent-execution soundness/perf spike.
+        //
+        // The P1-M3 step-4 benchmark found the resident GPU read path *regresses* under
+        // concurrency (p50 92µs→11.5ms at c64). The cause: each launch does
+        // cuModuleLoadData/Unload (JIT the PTX every call) and then cuCtxSynchronize (a
+        // WHOLE-context barrier) on the default stream — so N concurrent readers serialize
+        // on one global sync and re-JIT the same kernel N times. This probe proves the fix
+        // BEFORE refactoring production: it builds the target model in isolation —
+        //   * ONE shared primary context (cuDevicePrimaryCtxRetain), not a context per
+        //     allocation/generation;
+        //   * the row_count module loaded ONCE, its function handle reused across every
+        //     launch on every thread (a process-wide module/function cache stand-in);
+        //   * each reader thread launches on its OWN stream and syncs only that stream
+        //     (cuStreamSynchronize), never the whole context —
+        // and A/B-times it against the current production shape (per-launch load/unload +
+        // cuCtxSynchronize on the default stream) over the SAME shared context, so the
+        // measured delta is exactly the two Phase-2 fixes (module cache + per-stream sync).
+        // The context model is identical in both arms, so this isolates those two effects;
+        // the shared-context change is validated here as "correct + concurrency-safe" (it
+        // is the prerequisite for a cross-allocation module cache), not A/B'd.
+        //
+        // Hard gates: (a) EVERY concurrent launch returns the correct row count — the
+        // soundness claim that concurrent reuse of one cached function over one shared
+        // primary context from many threads is sound; (b) at the top concurrency the
+        // cached/per-stream model out-throughputs the per-launch/ctx-sync model — the
+        // milestone hypothesis. If (b) fails, the premise is wrong and the substrate
+        // should not be built, so the probe is allowed to fail loudly.
+        use std::sync::Barrier;
+        use std::time::{Duration, Instant};
+
+        // Raw CUDA handles (context, function) are `*mut c_void`, hence !Send. Wrap to
+        // move them into reader threads: sound here because the retained primary context
+        // and the loaded module's function handle are immutable for the probe's duration
+        // and the CUDA driver API is thread-safe (concurrent launches of one function on
+        // distinct streams are explicitly allowed).
+        #[derive(Clone, Copy)]
+        struct SendPtr(*mut c_void);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+        impl SendPtr {
+            // Access through `&self` so closures capture the whole (Send) struct rather
+            // than the raw `*mut c_void` field (Rust 2021 disjoint capture would grab the
+            // !Send field and refuse to cross the thread boundary).
+            fn get(&self) -> *mut c_void {
+                self.0
+            }
+        }
+
+        // Bare driver-call signatures (mirroring the production launch sites above).
+        type CuInit = unsafe extern "C" fn(u32) -> i32;
+        type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+        type CuPrimaryCtxRetain = unsafe extern "C" fn(*mut *mut c_void, i32) -> i32;
+        type CuPrimaryCtxRelease = unsafe extern "C" fn(i32) -> i32;
+        type CuCtxSetCurrent = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+        type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+        type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+        type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+        type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+        type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+        type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuModuleGetFunction =
+            unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+        type CuLaunchKernel = unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+        type CuStreamCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
+        type CuStreamSynchronize = unsafe extern "C" fn(*mut c_void) -> i32;
+        type CuStreamDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+
+        // The exact production row_count kernel (lib.rs `launch_cuda_resident_row_count`):
+        // reads the u64 row-count header at [resident] and stores it to [out].
+        const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_row_count(
+    .param .u64 resident_ptr,
+    .param .u64 out_ptr
+)
+{
+    .reg .u64 %resident;
+    .reg .u64 %out;
+    .reg .u64 %rows;
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.global.u64 %rows, [%resident];
+    st.global.u64 [%out], %rows;
+    ret;
+}
+"#;
+
+        fn check(code: i32, what: &str) {
+            assert_eq!(code, 0, "{what} failed with CUDA driver code {code}");
+        }
+
+        let lib = unsafe {
+            Library::new("libcuda.so.1")
+                .or_else(|_| Library::new("libcuda.so"))
+                .expect("requires a local NVIDIA driver and GPU")
+        };
+
+        macro_rules! load_sym {
+            ($t:ty, $primary:literal $(, $fallback:literal)*) => {{
+                let result = unsafe { lib.get::<$t>($primary) };
+                $( let result = result.or_else(|_| unsafe { lib.get::<$t>($fallback) }); )*
+                *result.expect("missing required CUDA driver symbol")
+            }};
+        }
+
+        let cu_init: CuInit = load_sym!(CuInit, b"cuInit\0");
+        let cu_device_get: CuDeviceGet = load_sym!(CuDeviceGet, b"cuDeviceGet\0");
+        let cu_primary_ctx_retain: CuPrimaryCtxRetain =
+            load_sym!(CuPrimaryCtxRetain, b"cuDevicePrimaryCtxRetain\0");
+        let cu_primary_ctx_release: CuPrimaryCtxRelease = load_sym!(
+            CuPrimaryCtxRelease,
+            b"cuDevicePrimaryCtxRelease_v2\0",
+            b"cuDevicePrimaryCtxRelease\0"
+        );
+        let cu_ctx_set_current: CuCtxSetCurrent = load_sym!(CuCtxSetCurrent, b"cuCtxSetCurrent\0");
+        let cu_ctx_synchronize: CuCtxSynchronize =
+            load_sym!(CuCtxSynchronize, b"cuCtxSynchronize\0");
+        let cu_mem_alloc: CuMemAlloc = load_sym!(CuMemAlloc, b"cuMemAlloc_v2\0", b"cuMemAlloc\0");
+        let cu_mem_free: CuMemFree = load_sym!(CuMemFree, b"cuMemFree_v2\0", b"cuMemFree\0");
+        let cu_memcpy_htod: CuMemcpyHtoD =
+            load_sym!(CuMemcpyHtoD, b"cuMemcpyHtoD_v2\0", b"cuMemcpyHtoD\0");
+        let cu_memcpy_dtoh: CuMemcpyDtoH =
+            load_sym!(CuMemcpyDtoH, b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0");
+        let cu_module_load_data: CuModuleLoadData =
+            load_sym!(CuModuleLoadData, b"cuModuleLoadData\0");
+        let cu_module_unload: CuModuleUnload = load_sym!(CuModuleUnload, b"cuModuleUnload\0");
+        let cu_module_get_function: CuModuleGetFunction =
+            load_sym!(CuModuleGetFunction, b"cuModuleGetFunction\0");
+        let cu_launch_kernel: CuLaunchKernel = load_sym!(CuLaunchKernel, b"cuLaunchKernel\0");
+        let cu_stream_create: CuStreamCreate = load_sym!(CuStreamCreate, b"cuStreamCreate\0");
+        let cu_stream_synchronize: CuStreamSynchronize =
+            load_sym!(CuStreamSynchronize, b"cuStreamSynchronize\0");
+        let cu_stream_destroy: CuStreamDestroy = load_sym!(
+            CuStreamDestroy,
+            b"cuStreamDestroy_v2\0",
+            b"cuStreamDestroy\0"
+        );
+
+        // One shared primary context for the whole probe.
+        check(unsafe { cu_init(0) }, "cuInit");
+        let mut device = 0_i32;
+        check(unsafe { cu_device_get(&mut device, 0) }, "cuDeviceGet");
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        check(
+            unsafe { cu_primary_ctx_retain(&mut ctx, device) },
+            "cuDevicePrimaryCtxRetain",
+        );
+        check(unsafe { cu_ctx_set_current(ctx) }, "cuCtxSetCurrent(main)");
+
+        // Payload = the 8-byte u64 row-count header the kernel reads.
+        let row_count: u64 = 4096;
+        let payload = row_count.to_le_bytes();
+        let mut device_payload = 0_u64;
+        check(
+            unsafe { cu_mem_alloc(&mut device_payload, payload.len()) },
+            "cuMemAlloc(payload)",
+        );
+        check(
+            unsafe {
+                cu_memcpy_htod(
+                    device_payload,
+                    payload.as_ptr().cast::<c_void>(),
+                    payload.len(),
+                )
+            },
+            "cuMemcpyHtoD(payload)",
+        );
+
+        // Load the module ONCE; reuse this function handle on every launch/thread.
+        let mut ptx = PTX.to_vec();
+        ptx.push(0);
+        let mut module: *mut c_void = std::ptr::null_mut();
+        check(
+            unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) },
+            "cuModuleLoadData(once)",
+        );
+        let mut function: *mut c_void = std::ptr::null_mut();
+        check(
+            unsafe {
+                cu_module_get_function(&mut function, module, c"gpu_db_resident_row_count".as_ptr())
+            },
+            "cuModuleGetFunction(once)",
+        );
+
+        // Target model: cached function + a private stream per thread + per-stream sync.
+        let run_cached = |threads: usize, ops: usize| -> Duration {
+            let barrier = Arc::new(Barrier::new(threads + 1));
+            let ctx = SendPtr(ctx);
+            let function = SendPtr(function);
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        check(
+                            unsafe { cu_ctx_set_current(ctx.get()) },
+                            "cuCtxSetCurrent(cached)",
+                        );
+                        let mut stream: *mut c_void = std::ptr::null_mut();
+                        check(
+                            unsafe { cu_stream_create(&mut stream, 0) },
+                            "cuStreamCreate",
+                        );
+                        let mut out = 0_u64;
+                        check(
+                            unsafe { cu_mem_alloc(&mut out, std::mem::size_of::<u64>()) },
+                            "cuMemAlloc(out,cached)",
+                        );
+                        barrier.wait();
+                        for _ in 0..ops {
+                            let mut resident_arg = device_payload;
+                            let mut out_arg = out;
+                            let mut args = [
+                                (&mut resident_arg as *mut u64).cast::<c_void>(),
+                                (&mut out_arg as *mut u64).cast::<c_void>(),
+                            ];
+                            check(
+                                unsafe {
+                                    cu_launch_kernel(
+                                        function.get(),
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        0,
+                                        stream,
+                                        args.as_mut_ptr(),
+                                        std::ptr::null_mut(),
+                                    )
+                                },
+                                "cuLaunchKernel(cached)",
+                            );
+                            check(
+                                unsafe { cu_stream_synchronize(stream) },
+                                "cuStreamSynchronize",
+                            );
+                            let mut got = 0_u64;
+                            check(
+                                unsafe {
+                                    cu_memcpy_dtoh(
+                                        (&mut got as *mut u64).cast::<c_void>(),
+                                        out,
+                                        std::mem::size_of::<u64>(),
+                                    )
+                                },
+                                "cuMemcpyDtoH(cached)",
+                            );
+                            assert_eq!(
+                                got, row_count,
+                                "cached concurrent count returned wrong value"
+                            );
+                        }
+                        unsafe {
+                            cu_mem_free(out);
+                            cu_stream_destroy(stream);
+                        }
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let start = Instant::now();
+            for handle in handles {
+                handle.join().expect("cached reader panicked");
+            }
+            start.elapsed()
+        };
+
+        // Production shape: load+unload the module every call, launch on the default
+        // stream, sync the whole context. Same shared primary context as the cached arm.
+        let run_per_launch = |threads: usize, ops: usize| -> Duration {
+            let barrier = Arc::new(Barrier::new(threads + 1));
+            let ctx = SendPtr(ctx);
+            let ptx = Arc::new({
+                let mut p = PTX.to_vec();
+                p.push(0);
+                p
+            });
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let ptx = Arc::clone(&ptx);
+                    std::thread::spawn(move || {
+                        check(
+                            unsafe { cu_ctx_set_current(ctx.get()) },
+                            "cuCtxSetCurrent(perlaunch)",
+                        );
+                        let mut out = 0_u64;
+                        check(
+                            unsafe { cu_mem_alloc(&mut out, std::mem::size_of::<u64>()) },
+                            "cuMemAlloc(out,perlaunch)",
+                        );
+                        barrier.wait();
+                        for _ in 0..ops {
+                            let mut m: *mut c_void = std::ptr::null_mut();
+                            check(
+                                unsafe {
+                                    cu_module_load_data(&mut m, ptx.as_ptr().cast::<c_void>())
+                                },
+                                "cuModuleLoadData(perlaunch)",
+                            );
+                            let mut f: *mut c_void = std::ptr::null_mut();
+                            check(
+                                unsafe {
+                                    cu_module_get_function(
+                                        &mut f,
+                                        m,
+                                        c"gpu_db_resident_row_count".as_ptr(),
+                                    )
+                                },
+                                "cuModuleGetFunction(perlaunch)",
+                            );
+                            let mut resident_arg = device_payload;
+                            let mut out_arg = out;
+                            let mut args = [
+                                (&mut resident_arg as *mut u64).cast::<c_void>(),
+                                (&mut out_arg as *mut u64).cast::<c_void>(),
+                            ];
+                            check(
+                                unsafe {
+                                    cu_launch_kernel(
+                                        f,
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        1,
+                                        0,
+                                        std::ptr::null_mut(),
+                                        args.as_mut_ptr(),
+                                        std::ptr::null_mut(),
+                                    )
+                                },
+                                "cuLaunchKernel(perlaunch)",
+                            );
+                            check(unsafe { cu_ctx_synchronize() }, "cuCtxSynchronize");
+                            let mut got = 0_u64;
+                            check(
+                                unsafe {
+                                    cu_memcpy_dtoh(
+                                        (&mut got as *mut u64).cast::<c_void>(),
+                                        out,
+                                        std::mem::size_of::<u64>(),
+                                    )
+                                },
+                                "cuMemcpyDtoH(perlaunch)",
+                            );
+                            assert_eq!(
+                                got, row_count,
+                                "per-launch concurrent count returned wrong value"
+                            );
+                            unsafe { cu_module_unload(m) };
+                        }
+                        unsafe { cu_mem_free(out) };
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let start = Instant::now();
+            for handle in handles {
+                handle.join().expect("per-launch reader panicked");
+            }
+            start.elapsed()
+        };
+
+        let ops = 100usize;
+        let concurrencies = [1usize, 2, 4, 8, 16, 32, 64];
+        // Warm both paths (driver lazy-init, JIT cache for the per-launch arm) so we
+        // measure steady state — this is conservative, it helps the per-launch baseline.
+        let _ = run_per_launch(1, 10);
+        let _ = run_cached(1, 10);
+
+        println!(
+            "p2_m1_spike: shared primary ctx + load-once module + per-stream  vs  per-launch load + ctx-sync"
+        );
+        println!("row_count={row_count} ops/thread={ops}");
+        println!("| conc | per-launch qps | cached qps | speedup |");
+        println!("|---:|---:|---:|---:|");
+        let mut json_cells: Vec<String> = Vec::new();
+        let mut top_cached_qps = 0.0_f64;
+        let mut top_per_launch_qps = 0.0_f64;
+        for &c in &concurrencies {
+            let total = (c * ops) as f64;
+            let d_pl = run_per_launch(c, ops);
+            let d_ca = run_cached(c, ops);
+            let qps_pl = total / d_pl.as_secs_f64();
+            let qps_ca = total / d_ca.as_secs_f64();
+            let speedup = if qps_pl > 0.0 { qps_ca / qps_pl } else { 0.0 };
+            println!("| {c} | {qps_pl:.0} | {qps_ca:.0} | {speedup:.2}x |");
+            json_cells.push(format!(
+                "{{\"concurrency\":{c},\"per_launch_qps\":{qps_pl:.1},\"cached_qps\":{qps_ca:.1},\"speedup\":{speedup:.3}}}"
+            ));
+            if c == 64 {
+                top_cached_qps = qps_ca;
+                top_per_launch_qps = qps_pl;
+            }
+        }
+        println!(
+            "json={{\"kind\":\"p2_m1_gpu_concurrency_spike\",\"row_count\":{row_count},\"ops_per_thread\":{ops},\"cells\":[{}]}}",
+            json_cells.join(",")
+        );
+
+        unsafe {
+            cu_mem_free(device_payload);
+            cu_module_unload(module);
+            cu_primary_ctx_release(device);
+        }
+
+        assert!(
+            top_cached_qps > top_per_launch_qps,
+            "milestone premise unmet: at c64 the cached/per-stream model ({top_cached_qps:.0} qps) \
+             did not beat the per-launch/ctx-sync model ({top_per_launch_qps:.0} qps)"
+        );
+    }
 }
