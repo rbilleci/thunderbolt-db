@@ -396,9 +396,15 @@ honest docs; the real tech stack adopted.
     gate 2 (concurrent readers over one generation) proven. The GPU layer is also
     per-thread-ready (P2-M1 shared context + stream pool).
   - **Write half — owed:** the serialized writer that publishes the next generation
-    *while readers run*. Blocked on the tracked hazard `partition_device_memory` →
-    `SnapshotCell` (the only residency still freed in place under `&mut self`); fix that
-    before any write overlaps a read.
+    *while readers run*. The two latent hazards that blocked it are now cleared:
+    `partition_device_memory` → `SnapshotCell<Arc>` ✅ (2026-06-14, audited, no live
+    blocker — both residency maps now publish-don't-mutate), and the cross-generation
+    context-mismatch hazard ✅ (closed by P2-M1's shared primary context). Remaining for
+    the write half: the writer itself (publish-on-commit under concurrent reads), MVCC
+    conflict detection, and making structural cell insert/remove `&self` (today both
+    residency maps still mutate structure under `&mut self`). Tracked cosmetic follow-up
+    (both maps): tombstoned empty `SnapshotCell`s are never GC'd — device memory is freed,
+    only empty-cell metadata accumulates.
 - **Concurrent dispatch (P1-M4 — the immediate unlock).** The read substrate and the GPU
   layer are concurrent-ready, but **no caller drives them concurrently** — the
   engine-backed server is single-threaded and the benchmark server funnels through one
@@ -439,7 +445,7 @@ and a harness that measures it:
 | Connection ingress (async acceptor, admission) | P1-M5 async ingress + Phase 5 | not started (thread-per-conn) |
 | Server→engine **concurrent dispatch** | **P1-M4 (immediate)** | owed — substrate ready, no caller |
 | Engine **read** path | P1-M3 reader/writer (read half) | ✅ done (`&self`, gate 2) |
-| Engine **write** path concurrency | P1 writer half + MVCC | owed — blocked on `partition_device_memory` |
+| Engine **write** path concurrency | P1 writer half + MVCC | owed — UAF hazards cleared (2026-06-14); needs the writer + MVCC + `&self` structural mutation |
 | GPU **execution** (parallel kernels) | Phase 2 | started (P2-M2, 1 of ~6 routes) |
 | GPU **shared context + stream pool** | §9.3 / Phase 2 | ✅ done (P2-M1) |
 | GPU **async submit/complete** (overlap) | Phase 2 | owed — caps concurrent throughput for small ops |
