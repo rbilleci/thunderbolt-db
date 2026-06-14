@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
@@ -6100,7 +6100,10 @@ struct RelationalResidentCache {
     partition_device_memory: BTreeMap<(String, u32), CudaResidentDeviceMemory>,
     budget_bytes_by_gpu: BTreeMap<u16, u64>,
     last_decisions: BTreeMap<String, RelationalResidentCacheDecision>,
-    latest_route_decisions: BTreeMap<String, RelationalResidentRouteDecisionStatus>,
+    // Mutex-guarded so route-decision recording (and the per-execution telemetry the
+    // read path writes after each query) updates through `&self` — the second half of
+    // the read path's interior-mutability needs for the `&self` flip (P1-M3 step 3b).
+    latest_route_decisions: Mutex<BTreeMap<String, RelationalResidentRouteDecisionStatus>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6164,17 +6167,28 @@ impl RelationalResidentCache {
         self.last_decisions.get(table)
     }
 
-    fn record_route_decision(&mut self, decision: RelationalResidentRouteDecisionStatus) {
+    /// Lock the route-decision map, recovering from poison (a panicking reader must not
+    /// wedge route recording for everyone).
+    fn route_decisions(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<String, RelationalResidentRouteDecisionStatus>> {
         self.latest_route_decisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record_route_decision(&self, decision: RelationalResidentRouteDecisionStatus) {
+        self.route_decisions()
             .insert(decision.table.clone(), decision);
     }
 
     fn record_route_execution_observation(
-        &mut self,
+        &self,
         table: &str,
         observation: RelationalResidentRouteExecutionObservation,
     ) {
-        if let Some(decision) = self.latest_route_decisions.get_mut(table) {
+        let mut decisions = self.route_decisions();
+        if let Some(decision) = decisions.get_mut(table) {
             decision.last_execution_h2d_bytes = Some(observation.h2d_bytes);
             decision.last_execution_d2h_bytes = Some(observation.d2h_bytes);
             decision.last_execution_kernel_samples = Some(observation.kernel_samples);
@@ -6186,26 +6200,28 @@ impl RelationalResidentCache {
     }
 
     fn record_route_device_lookup_micros(
-        &mut self,
+        &self,
         table: &str,
         elapsed_micros: u64,
         matched_rows: usize,
     ) {
-        if let Some(decision) = self.latest_route_decisions.get_mut(table) {
+        let mut decisions = self.route_decisions();
+        if let Some(decision) = decisions.get_mut(table) {
             decision.last_execution_device_lookup_micros = Some(elapsed_micros);
             decision.last_execution_matched_rows = Some(matched_rows);
         }
     }
 
     fn record_route_selected_projection_micros(
-        &mut self,
+        &self,
         table: &str,
         match_index_micros: u64,
         selected_projection_micros: u64,
         result_materialization_micros: u64,
         matched_rows: usize,
     ) {
-        if let Some(decision) = self.latest_route_decisions.get_mut(table) {
+        let mut decisions = self.route_decisions();
+        if let Some(decision) = decisions.get_mut(table) {
             decision.last_execution_match_index_micros = Some(match_index_micros);
             decision.last_execution_selected_projection_micros = Some(selected_projection_micros);
             decision.last_execution_result_materialization_micros =
@@ -6220,7 +6236,7 @@ impl RelationalResidentCache {
         self.partitions.remove(table);
         self.partition_device_memory
             .retain(|(partition_table, _partition_id), _memory| partition_table != table);
-        self.latest_route_decisions.remove(table);
+        self.route_decisions().remove(table);
     }
 
     fn install_snapshot(
@@ -23262,7 +23278,7 @@ impl Engine {
             tables,
             latest_route_decisions: self
                 .relational_resident_cache
-                .latest_route_decisions
+                .route_decisions()
                 .values()
                 .cloned()
                 .collect(),
@@ -24283,7 +24299,7 @@ mod tests {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET balance=100").unwrap();
         assert_eq!(e.get("balance"), Some("100"));
-        assert_eq!(e.metrics().commits_total, 1);
+        assert_eq!(e.metrics().snapshot().commits_total, 1);
     }
 
     #[test]
@@ -24293,7 +24309,7 @@ mod tests {
         e.execute_text(2, "SET LOCAL balance TO 101").unwrap();
 
         assert_eq!(e.get("balance"), Some("101"));
-        assert_eq!(e.metrics().commits_total, 2);
+        assert_eq!(e.metrics().snapshot().commits_total, 2);
     }
 
     #[test]
@@ -24303,7 +24319,7 @@ mod tests {
         e.execute_text(2, "DEL balance").unwrap();
 
         assert_eq!(e.get("balance"), None);
-        assert_eq!(e.metrics().commits_total, 2);
+        assert_eq!(e.metrics().snapshot().commits_total, 2);
     }
 
     #[test]
@@ -24313,7 +24329,7 @@ mod tests {
         e.execute_text(2, "DELETE balance").unwrap();
 
         assert_eq!(e.get("balance"), None);
-        assert_eq!(e.metrics().commits_total, 2);
+        assert_eq!(e.metrics().snapshot().commits_total, 2);
     }
 
     #[test]
@@ -24323,10 +24339,10 @@ mod tests {
 
         let value = e.execute_read_text("GET balance").unwrap();
         assert_eq!(value, Some("100"));
-        assert_eq!(e.metrics().commits_total, 1);
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().commits_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
         assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 1);
-        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, "100".len() as u64);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
@@ -24339,8 +24355,8 @@ mod tests {
         let value = e.execute_read_text("GET absent").unwrap();
 
         assert_eq!(value, None);
-        assert_eq!(e.metrics().fallback_total, 1);
-        assert_eq!(e.metrics().d2h_bytes_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, 0);
     }
 
     #[test]
@@ -24371,8 +24387,8 @@ mod tests {
             ExecuteError::NonReadCommand("DEL/DELETE")
         ));
 
-        assert_eq!(e.metrics().fallback_total, 0);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -24384,8 +24400,8 @@ mod tests {
         let err = e.execute_read_text("GET balance").unwrap_err();
 
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
-        assert_eq!(e.metrics().fallback_total, 0);
-        assert_eq!(e.metrics().d2h_bytes_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, 0);
     }
 
     #[test]
@@ -24396,8 +24412,8 @@ mod tests {
         let err = e.execute_text(1, "GET balance").unwrap_err();
 
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
-        assert_eq!(e.metrics().fallback_total, 0);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -24408,8 +24424,8 @@ mod tests {
         let err = e.execute_text(1, "GET balance").unwrap_err();
 
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
-        assert_eq!(e.metrics().fallback_total, 0);
-        assert_eq!(e.metrics().d2h_bytes_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, 0);
     }
 
     #[test]
@@ -24418,10 +24434,10 @@ mod tests {
         e.execute_text(1, "SET balance=100").unwrap();
 
         e.execute_text(2, "GET balance").unwrap();
-        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, "100".len() as u64);
 
         e.execute_text(3, "GET missing").unwrap();
-        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, "100".len() as u64);
     }
 
     #[test]
@@ -24433,8 +24449,8 @@ mod tests {
         let err = e.execute_read_text("GET balance").unwrap_err();
 
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
-        assert_eq!(e.metrics().fallback_total, 0);
-        assert_eq!(e.metrics().d2h_bytes_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, 0);
     }
 
     #[test]
@@ -24445,28 +24461,31 @@ mod tests {
         e.enqueue_set_text(2, "SET b=2", t0).unwrap();
         assert_eq!(e.get("a"), Some("1"));
         assert_eq!(e.get("b"), Some("2"));
-        assert_eq!(e.metrics().batch_flush_count, 1);
+        assert_eq!(e.metrics().snapshot().batch_flush_count, 1);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 1);
         assert_eq!(
             e.metrics().last_batch_flush_reason(),
             Some(BatchFlushReason::Count)
         );
-        assert_eq!(e.metrics().batch_wait_samples, 2);
-        assert_eq!(e.metrics().batch_wait_total_ms, 0);
+        assert_eq!(e.metrics().snapshot().batch_wait_samples, 2);
+        assert_eq!(e.metrics().snapshot().batch_wait_total_ms, 0);
         assert_eq!(e.metrics().last_batch_wait_ms(), Some(0));
         assert_eq!(
-            e.metrics().h2d_bytes_total,
+            e.metrics().snapshot().h2d_bytes_total,
             "SET a=1".len() as u64 + "SET b=2".len() as u64
         );
-        assert_eq!(e.metrics().kernel_exec_samples, 2);
-        assert_eq!(e.metrics().kernel_exec_total_ms, 2);
+        assert_eq!(e.metrics().snapshot().kernel_exec_samples, 2);
+        assert_eq!(e.metrics().snapshot().kernel_exec_total_ms, 2);
         assert_eq!(e.metrics().last_kernel_exec_ms(), Some(1));
-        assert_eq!(e.metrics().kernel_occupancy_samples, 2);
-        assert_eq!(e.metrics().kernel_occupancy_total_permyriad, 6400);
+        assert_eq!(e.metrics().snapshot().kernel_occupancy_samples, 2);
+        assert_eq!(
+            e.metrics().snapshot().kernel_occupancy_total_permyriad,
+            6400
+        );
         assert_eq!(e.metrics().last_kernel_occupancy_permyriad(), Some(3200));
-        assert_eq!(e.metrics().pending_batch_peak, 2);
+        assert_eq!(e.metrics().snapshot().pending_batch_peak, 2);
         assert_eq!(e.metrics().last_pending_batch_len(), Some(0));
-        assert_eq!(e.metrics().commits_total, 2);
+        assert_eq!(e.metrics().snapshot().commits_total, 2);
     }
 
     #[test]
@@ -24480,10 +24499,10 @@ mod tests {
         assert_eq!(e.get("a"), Some("7"));
         assert!(!e.has_pending_batch());
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().batch_flush_count, 1);
+        assert_eq!(e.metrics().snapshot().batch_flush_count, 1);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Time), 1);
-        assert_eq!(e.metrics().batch_wait_samples, 1);
-        assert_eq!(e.metrics().batch_wait_total_ms, 3);
+        assert_eq!(e.metrics().snapshot().batch_wait_samples, 1);
+        assert_eq!(e.metrics().snapshot().batch_wait_total_ms, 3);
         assert_eq!(e.metrics().last_batch_wait_ms(), Some(3));
     }
 
@@ -24495,9 +24514,12 @@ mod tests {
 
         e.enqueue_set_text(1, &payload, t0).unwrap();
 
-        assert_eq!(e.metrics().kernel_occupancy_samples, 1);
+        assert_eq!(e.metrics().snapshot().kernel_occupancy_samples, 1);
         assert_eq!(e.metrics().last_kernel_occupancy_permyriad(), Some(10_000));
-        assert_eq!(e.metrics().kernel_occupancy_total_permyriad, 10_000);
+        assert_eq!(
+            e.metrics().snapshot().kernel_occupancy_total_permyriad,
+            10_000
+        );
     }
 
     #[test]
@@ -24523,10 +24545,10 @@ mod tests {
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.pending_batch_oldest_age(t0), None);
         assert_eq!(e.pending_batch_time_until_deadline(t0), None);
-        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().snapshot().batch_flush_count, 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 0);
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -24599,7 +24621,7 @@ mod tests {
 
         assert_eq!(e.get("a"), None);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 1);
-        assert_eq!(e.metrics().commits_total, 2);
+        assert_eq!(e.metrics().snapshot().commits_total, 2);
     }
 
     #[test]
@@ -24749,10 +24771,10 @@ mod tests {
 
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().snapshot().batch_flush_count, 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 0);
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -24765,8 +24787,8 @@ mod tests {
 
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().fallback_total, 0);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -24779,9 +24801,9 @@ mod tests {
 
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().fallback_total, 0);
-        assert_eq!(e.metrics().d2h_bytes_total, 0);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -24793,10 +24815,10 @@ mod tests {
         e.flush_admin().unwrap();
 
         e.enqueue_set_text(2, "GET balance", t0).unwrap();
-        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, "100".len() as u64);
 
         e.enqueue_set_text(3, "GET missing", t0).unwrap();
-        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
+        assert_eq!(e.metrics().snapshot().d2h_bytes_total, "100".len() as u64);
     }
 
     #[test]
@@ -24807,8 +24829,8 @@ mod tests {
         e.execute_text(1, "SET balance=100").unwrap();
 
         assert_eq!(e.get("balance"), Some("100"));
-        assert_eq!(e.metrics().commits_total, 1);
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().commits_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
         assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
 
         let snapshot = e.telemetry_snapshot();
@@ -24836,8 +24858,8 @@ mod tests {
 
         assert_eq!(e.get("balance"), Some("100"));
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().commits_total, 1);
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().commits_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
         assert_eq!(
             e.metrics().fallback_for(FallbackReason::GpuMemoryPressure),
             1
@@ -24854,8 +24876,8 @@ mod tests {
 
         assert_eq!(e.get("balance"), Some("100"));
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().commits_total, 1);
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().commits_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
         assert_eq!(
             e.metrics().fallback_for(FallbackReason::GpuQueueSaturated),
             1
@@ -24884,7 +24906,7 @@ mod tests {
         ));
 
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
         assert_eq!(e.visible_up_to(), 0);
     }
 
@@ -24898,10 +24920,10 @@ mod tests {
         let err = e.flush_admin().unwrap_err();
 
         assert!(matches!(err, EngineError::NotLeader));
-        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().snapshot().batch_flush_count, 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 0);
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
         assert_eq!(e.pending_batch_len(), 1);
     }
 
@@ -24921,18 +24943,18 @@ mod tests {
             ExecuteError::Engine(EngineError::Durability(_))
         ));
         assert_eq!(e.pending_batch_len(), 2);
-        assert_eq!(e.metrics().batch_flush_count, 0);
-        assert_eq!(e.metrics().batch_wait_samples, 0);
-        assert_eq!(e.metrics().pending_batch_peak, 2);
+        assert_eq!(e.metrics().snapshot().batch_flush_count, 0);
+        assert_eq!(e.metrics().snapshot().batch_wait_samples, 0);
+        assert_eq!(e.metrics().snapshot().pending_batch_peak, 2);
         assert_eq!(e.metrics().last_pending_batch_len(), Some(2));
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
 
         e.flush_admin().unwrap();
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.get("a"), Some("1"));
         assert_eq!(e.get("b"), Some("2"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
-        assert_eq!(e.metrics().commits_total, 2);
+        assert_eq!(e.metrics().snapshot().commits_total, 2);
     }
 
     #[test]
@@ -24963,7 +24985,7 @@ mod tests {
             e.metrics().fallback_for(FallbackReason::GpuQueueSaturated),
             1
         );
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
 
         let snapshot = e.telemetry_snapshot();
         assert!(snapshot.has_gpu_parity_fallbacks());
@@ -24989,8 +25011,8 @@ mod tests {
 
         assert!(matches!(err, EngineError::NotLeader));
         assert_eq!(e.pending_batch_len(), 1);
-        assert_eq!(e.metrics().batch_flush_count, 0);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().batch_flush_count, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -25001,8 +25023,8 @@ mod tests {
         e.tick_batching(Instant::now()).unwrap();
 
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().batch_flush_count, 0);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().batch_flush_count, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -25024,7 +25046,7 @@ mod tests {
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.get("a"), Some("1"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
-        assert_eq!(e.metrics().commits_total, 1);
+        assert_eq!(e.metrics().snapshot().commits_total, 1);
     }
 
     #[test]
@@ -25046,13 +25068,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 9);
+        assert_eq!(e.metrics().snapshot().fallback_total, 9);
         assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 9);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
         );
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -25094,7 +25116,7 @@ mod tests {
             ExecuteError::Engine(EngineError::ApplyFailed(message))
                 if message == "plpgsql extension creation is only supported in pg_catalog"
         ));
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -25131,7 +25153,7 @@ mod tests {
             ExecuteError::Engine(EngineError::ApplyFailed(message))
                 if message == "extension \"hstore\" does not exist"
         ));
-        assert_eq!(e.metrics().commits_total, 1);
+        assert_eq!(e.metrics().snapshot().commits_total, 1);
     }
 
     #[test]
@@ -25404,10 +25426,10 @@ mod tests {
         e.enqueue_set_text(6, "DISCARD TEMP", t0).unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 8);
+        assert_eq!(e.metrics().snapshot().fallback_total, 8);
         assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 8);
         assert_eq!(e.pending_batch_len(), 0);
-        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.metrics().snapshot().commits_total, 0);
     }
 
     #[test]
@@ -25433,7 +25455,7 @@ mod tests {
             ExecuteError::Txn(TxnError::AlreadyExists(12))
         ));
 
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
         assert_eq!(e.active_txn_count(), 1);
     }
 
@@ -25574,7 +25596,7 @@ mod tests {
 
         assert!(matches!(err, ExecuteError::Txn(TxnError::IdExhausted)));
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -31782,7 +31804,7 @@ mod tests {
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(result.fallback_reason, None);
         assert_eq!(result.rows, backend.rows);
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32060,7 +32082,7 @@ mod tests {
                 value: Some("open".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32111,7 +32133,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32162,7 +32184,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32226,7 +32248,7 @@ mod tests {
                 value: Some("open".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32281,9 +32303,9 @@ mod tests {
             .collect::<Vec<_>>();
         let compact_h2d_bytes = cuda_mvcc_row_batch_transfer_bytes(&compact_rows);
 
-        assert_eq!(e.metrics().h2d_bytes_total, compact_h2d_bytes);
+        assert_eq!(e.metrics().snapshot().h2d_bytes_total, compact_h2d_bytes);
         assert!(compact_h2d_bytes < cuda_mvcc_row_batch_transfer_bytes(&all_version_rows));
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32332,7 +32354,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32387,7 +32409,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32437,7 +32459,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32482,7 +32504,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32527,7 +32549,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32582,7 +32604,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32622,7 +32644,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32667,7 +32689,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32710,7 +32732,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32750,7 +32772,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32790,7 +32812,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32830,7 +32852,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32869,7 +32891,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32910,7 +32932,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -32961,7 +32983,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33021,7 +33043,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33072,7 +33094,7 @@ mod tests {
                 value: Some("Alpha Team".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33133,7 +33155,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33181,7 +33203,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33225,7 +33247,7 @@ mod tests {
                 value: Some("profile:1".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33285,7 +33307,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33347,7 +33369,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     fn seed_native_composition_rows(e: &mut Engine) {
@@ -33449,7 +33471,7 @@ mod tests {
             assert_eq!(result.rows, key_only_rows(&expected_keys), "{name}");
         }
 
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33499,7 +33521,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33559,7 +33581,7 @@ mod tests {
                 value: Some("member:2".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33625,7 +33647,7 @@ mod tests {
                 value: Some("member:2".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33686,7 +33708,7 @@ mod tests {
                 value: Some("profile:1".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33744,7 +33766,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33803,7 +33825,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33878,7 +33900,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
@@ -33913,7 +33935,7 @@ mod tests {
         assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(backend.fallback_reason, None);
         assert_eq!(backend.rows, cpu.rows);
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -33952,7 +33974,7 @@ mod tests {
         assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(backend.fallback_reason, None);
         assert_eq!(backend.rows, cpu.rows);
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34005,7 +34027,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34067,7 +34089,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34148,7 +34170,11 @@ mod tests {
             assert_eq!(backend.fallback_reason, None, "{name}");
             assert_eq!(backend.rows, cpu.rows, "{name}");
             assert_eq!(backend.rows, key_only_rows(&expected_keys), "{name}");
-            assert_eq!(backend_engine.metrics().fallback_total, 0, "{name}");
+            assert_eq!(
+                backend_engine.metrics().snapshot().fallback_total,
+                0,
+                "{name}"
+            );
         }
     }
 
@@ -34216,7 +34242,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34268,7 +34294,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34332,7 +34358,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34426,7 +34452,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34473,7 +34499,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34623,7 +34649,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34681,7 +34707,7 @@ mod tests {
                 value: Some("Alpha Team".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34749,7 +34775,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34800,7 +34826,7 @@ mod tests {
                 value: Some("profile:1".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34867,7 +34893,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -34938,7 +34964,7 @@ mod tests {
                 value: Some("member:2".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -35011,7 +35037,7 @@ mod tests {
                 value: Some("member:2".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -35079,7 +35105,7 @@ mod tests {
                 value: Some("profile:1".to_string()),
             }]
         );
-        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().snapshot().fallback_total, 1);
     }
 
     #[test]
@@ -35131,7 +35157,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().snapshot().fallback_total, 0);
     }
 
     #[test]
