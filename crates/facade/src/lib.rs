@@ -26,6 +26,8 @@
 //!   does not yet drive real MVCC isolation — that is Phase 1 (P1-M3).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use gpu_db_engine::{Engine, ExecuteError, RelationalColumn};
 use gpu_db_protocol::{parse_command, Command, ParseError, SqlType, SqlValue};
@@ -271,6 +273,93 @@ pub fn execute_on_engine(
     }
 }
 
+/// A `Send + Sync` engine wrapper for concurrent dispatch (plan P1-M4): one engine shared
+/// across a server's worker pool behind an `RwLock`, so read-only statements run
+/// concurrently (read lock) while writes serialize (write lock) — "N concurrent readers,
+/// one serialized writer" without the write-half's interior mutability. The server holds an
+/// `Arc<SharedEngine>` and reaches the engine only through this neutral type, never naming
+/// `Engine` directly (keeps the §5.0 protocol-neutral boundary intact).
+pub struct SharedEngine {
+    engine: RwLock<Engine>,
+    next_txn_id: AtomicU64,
+}
+
+impl SharedEngine {
+    /// Construct a shared façade over a local single-node engine.
+    pub fn new() -> Self {
+        Self {
+            engine: RwLock::new(Engine::new_local()),
+            next_txn_id: AtomicU64::new(1),
+        }
+    }
+}
+
+impl Default for SharedEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Execute one SQL statement against a shared engine, taking a **read** lock for read-only
+/// statements (so they execute concurrently) and a **write** lock for everything else (so
+/// writes serialize). Transaction-control statements take no lock and produce only the tag.
+/// This is the concurrent-dispatch counterpart of [`execute_on_engine`]; the per-statement
+/// txn id is allocated internally (still a placeholder, not a transaction handle — see
+/// [`EngineFacade::take_txn_id`]). Lock poisoning is recovered (`into_inner`) so one panicked
+/// connection does not wedge the engine for the rest.
+pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
+    let command = match parse_command(sql) {
+        Ok(command) => command,
+        Err(ParseError::Empty) => return Ok(QueryOutcome::Empty),
+        Err(err) => return Err(map_parse_error(err)),
+    };
+    match command {
+        Command::Select(select) => {
+            let engine = shared
+                .engine
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let result = engine
+                .execute_relational_select(&select)
+                .map_err(map_execute_error)?;
+            let columns = result.columns.iter().map(map_column).collect();
+            let rows = result
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().map(map_value).collect())
+                .collect();
+            Ok(QueryOutcome::Rows { columns, rows })
+        }
+        Command::Begin => Ok(QueryOutcome::Command {
+            tag: CommandTag::Begin,
+            rows_affected: None,
+        }),
+        Command::Commit { .. } => Ok(QueryOutcome::Command {
+            tag: CommandTag::Commit,
+            rows_affected: None,
+        }),
+        Command::Rollback { .. } => Ok(QueryOutcome::Command {
+            tag: CommandTag::Rollback,
+            rows_affected: None,
+        }),
+        other => {
+            let tag = command_tag(&other);
+            let txn_id = shared.next_txn_id.fetch_add(1, Ordering::Relaxed);
+            let mut engine = shared
+                .engine
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            engine
+                .execute_text(txn_id, sql)
+                .map_err(map_execute_error)?;
+            Ok(QueryOutcome::Command {
+                tag,
+                rows_affected: None,
+            })
+        }
+    }
+}
+
 fn map_parse_error(err: ParseError) -> DbError {
     DbError {
         category: ErrorCategory::Syntax,
@@ -463,5 +552,53 @@ mod tests {
         let mut facade = EngineFacade::new();
         let error = facade.execute(SessionId(999), "SELECT 1").unwrap_err();
         assert_eq!(error.category, ErrorCategory::Internal);
+    }
+
+    fn shared_count(shared: &SharedEngine) -> i64 {
+        match execute_on_shared_engine(shared, "SELECT COUNT(*) FROM t").unwrap() {
+            QueryOutcome::Rows { rows, .. } => match &rows[0][0] {
+                DbValue::Int4(value) => i64::from(*value),
+                DbValue::Int8(value) => *value,
+                other => panic!("expected integer count, got {other:?}"),
+            },
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_engine_round_trips_write_then_read() {
+        // The read/write-lock split (P1-M4): writes go through the write lock, reads the
+        // read lock, both via the single shared entry point.
+        let shared = SharedEngine::new();
+        execute_on_shared_engine(&shared, "CREATE TABLE t (a INT)").unwrap();
+        execute_on_shared_engine(&shared, "INSERT INTO t (a) VALUES (1)").unwrap();
+        execute_on_shared_engine(&shared, "INSERT INTO t (a) VALUES (2)").unwrap();
+        assert_eq!(shared_count(&shared), 2);
+    }
+
+    #[test]
+    fn shared_engine_serves_concurrent_readers() {
+        // Many threads read one shared engine concurrently (read lock) and all see the
+        // correct committed state — the concurrent-dispatch property the server relies on.
+        use std::sync::Arc;
+        use std::thread;
+
+        let shared = Arc::new(SharedEngine::new());
+        execute_on_shared_engine(&shared, "CREATE TABLE t (a INT)").unwrap();
+        for i in 0..50 {
+            execute_on_shared_engine(&shared, &format!("INSERT INTO t (a) VALUES ({i})")).unwrap();
+        }
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let shared = Arc::clone(&shared);
+            handles.push(thread::spawn(move || {
+                for _ in 0..25 {
+                    assert_eq!(shared_count(&shared), 50);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

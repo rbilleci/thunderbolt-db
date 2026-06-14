@@ -18,31 +18,103 @@
 //!   statement-by-statement. The wire stays in sync (one message in, one error +
 //!   ReadyForQuery out); splitting on top-level `;` is a tracked follow-up.
 //!   Empty statements correctly return `EmptyQueryResponse`.
-//! - **Single-threaded, one connection at a time.** As of P1-M3 step 3c the `Engine`
-//!   is `Send + Sync` and its relational read path is `&self` (concurrent reads are
-//!   supported and tested at the engine level), but this server still keeps the engine
-//!   on the serve thread and handles connections sequentially. Sharing the engine
-//!   (`Arc<Engine>`) across IO workers to dispatch reads concurrently — the actual
-//!   latency win — is the next step (P1-M3 step 4); the concurrent `&self` read path
-//!   has no production caller yet.
+//! - **Concurrent dispatch (P1-M4).** `serve` shares one engine across a worker pool
+//!   (`Arc<SharedEngine>`, thread-per-connection on the existing blocking sockets) and
+//!   dispatches each statement through `execute_on_shared_engine`: read-only statements
+//!   take a read lock and run **concurrently**; writes take a write lock and **serialize**
+//!   ("N concurrent readers, one serialized writer"). This is the first production caller
+//!   of the `&self` engine read path (P1-M3) + the GPU shared-context substrate (P2-M1).
+//!   `serve_sequential` retains the prior one-connection-at-a-time loop as the A/B baseline.
+//!   Full async ingress (a `tokio` acceptor for connection *scale*) is the next step (P1-M5).
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::thread;
 
-use gpu_db_facade::{pg_adapter, DbError, EngineFacade, QueryOutcome};
+use gpu_db_facade::{
+    execute_on_shared_engine, pg_adapter, DbError, EngineFacade, QueryOutcome, SharedEngine,
+};
 use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
 use gpu_db_protocol::{
     parse_frontend_message, parse_startup_packet, FrontendMessage, StartupPacket,
 };
 
-/// Serve connections sequentially on `listener`, executing every statement
-/// through a single engine-backed façade. Blocks until the listener stops.
+/// Serve connections **concurrently** on `listener`: one engine shared across a
+/// thread-per-connection worker pool (`Arc<SharedEngine>`), each statement dispatched
+/// through `execute_on_shared_engine` — read-only statements take a read lock and run
+/// concurrently; writes take a write lock and serialize. Blocks until the listener stops.
+/// This is the P1-M4 concurrent dispatch (the first production caller of the `&self` engine
+/// read path); `serve_sequential` is the prior one-at-a-time loop, kept as the A/B baseline.
 pub fn serve(listener: TcpListener) -> io::Result<()> {
+    let engine = Arc::new(SharedEngine::new());
+    for stream in listener.incoming() {
+        let stream = stream?;
+        // Disable Nagle: pgwire responses are several small frames (RowDescription, DataRow,
+        // CommandComplete, ReadyForQuery), and Nagle + delayed-ACK otherwise stalls each
+        // reply ~40ms on loopback. Surfaced by the P1-M4 load harness.
+        let _ = stream.set_nodelay(true);
+        let engine = Arc::clone(&engine);
+        thread::spawn(move || {
+            let mut stream = stream;
+            if let Err(err) = handle_connection_shared(&mut stream, &engine) {
+                eprintln!("gpu-db-engine-server connection error: {err}");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Serve connections sequentially on `listener` (one connection at a time, one owned
+/// façade). Retained as the A/B baseline for the P1-M4 concurrency benchmark.
+pub fn serve_sequential(listener: TcpListener) -> io::Result<()> {
     let mut facade = EngineFacade::new();
     for stream in listener.incoming() {
         let mut stream = stream?;
+        let _ = stream.set_nodelay(true);
         if let Err(err) = handle_connection(&mut stream, &mut facade) {
             eprintln!("gpu-db-engine-server connection error: {err}");
+        }
+    }
+    Ok(())
+}
+
+/// Handle one connection against the shared engine: startup handshake, then a simple-query
+/// loop dispatched through `execute_on_shared_engine` (an implicit session per connection).
+fn handle_connection_shared(stream: &mut TcpStream, engine: &SharedEngine) -> Result<(), String> {
+    if !complete_startup(stream)? {
+        return Ok(());
+    }
+    run_shared_query_loop(stream, engine)
+}
+
+fn run_shared_query_loop(stream: &mut TcpStream, engine: &SharedEngine) -> Result<(), String> {
+    while let Some(frame) = read_tagged_frame(stream).map_err(|err| err.to_string())? {
+        match parse_frontend_message(&frame).map_err(|err| err.to_string())? {
+            FrontendMessage::SimpleQuery(sql) => {
+                let outcome = execute_on_shared_engine(engine, &sql);
+                write_outcome(stream, outcome).map_err(|err| err.to_string())?;
+            }
+            FrontendMessage::Terminate => break,
+            FrontendMessage::Sync => {
+                let mut writer = BackendWriter::new(&mut *stream);
+                writer
+                    .ready_for_query(false)
+                    .map_err(|err| err.to_string())?;
+            }
+            _ => {
+                let mut writer = BackendWriter::new(&mut *stream);
+                writer
+                    .error_response(&BackendError::new(
+                        "0A000",
+                        "only the simple query protocol is supported by the engine-backed \
+                         facade server",
+                    ))
+                    .map_err(|err| err.to_string())?;
+                writer
+                    .ready_for_query(false)
+                    .map_err(|err| err.to_string())?;
+            }
         }
     }
     Ok(())
