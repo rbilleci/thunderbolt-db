@@ -132,6 +132,30 @@ struct PooledStream {
     stop_event: *mut c_void,
 }
 
+/// Lower bound on a pooled output buffer — one bucket holds all the tiny counter/needle
+/// allocations so they reuse too.
+const MIN_POOLED_BUFFER_BYTES: usize = 256;
+/// Cap on idle (freed-but-retained) pooled output bytes; a release beyond this frees instead
+/// of pooling, so a one-off oversized request can't pin device memory for process lifetime.
+const POOLED_OUTPUT_BYTES_CAP: usize = 1 << 30; // 1 GiB
+
+/// Round a buffer request up to its pool bucket (power of two, floored at
+/// `MIN_POOLED_BUFFER_BYTES`) so a release maps straight back to the bucket it came from.
+fn output_buffer_bucket(min_bytes: usize) -> usize {
+    min_bytes.max(MIN_POOLED_BUFFER_BYTES).next_power_of_two()
+}
+
+/// Power-of-two-bucketed free list of reusable device output buffers. The projection/gather
+/// routes allocate several output buffers per call sized to the worst-case `row_count` (the
+/// P2-M2 text-route benchmark measured ~9 allocs / ~2 MB per call); `cuMemAlloc`/`cuMemFree`
+/// are driver-serialized and dominated those routes at high concurrency. Reusing buffers
+/// across calls removes that churn. `pooled_bytes` bounds the idle retained set.
+#[derive(Default)]
+struct OutputBufferPool {
+    free: BTreeMap<usize, Vec<u64>>,
+    pooled_bytes: usize,
+}
+
 struct GpuPrimaryContext {
     device: i32,
     context: *mut c_void,
@@ -152,6 +176,7 @@ struct GpuPrimaryContext {
     cu_event_elapsed_time: unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32,
     modules: Mutex<BTreeMap<&'static CStr, CachedModule>>,
     streams: Mutex<Vec<PooledStream>>,
+    output_buffers: Mutex<OutputBufferPool>,
     lib: Arc<Library>,
 }
 
@@ -256,6 +281,68 @@ impl GpuPrimaryContext {
             .push(pooled);
     }
 
+    /// Lease a device output buffer of at least `min_bytes`, reusing a pooled one of the
+    /// matching bucket if available (else allocating). The lease returns it to the pool on
+    /// drop — removing the per-call `cuMemAlloc`/`cuMemFree` the projection/gather routes
+    /// otherwise serialize on at high concurrency. The buffer is **not** zeroed; callers that
+    /// need a zeroed region (e.g. the atomic-append counters) must memset it, and callers must
+    /// only read back the region the kernel actually wrote (the routes read `[0, count)`).
+    fn lease_device_buffer(
+        &self,
+        min_bytes: usize,
+    ) -> Result<PooledBufferLease<'_>, CudaRuntimeProbeError> {
+        let capacity = output_buffer_bucket(min_bytes);
+        let reused = {
+            let mut pool = self
+                .output_buffers
+                .lock()
+                .expect("gpu output-buffer pool poisoned");
+            match pool.free.get_mut(&capacity).and_then(Vec::pop) {
+                Some(ptr) => {
+                    pool.pooled_bytes = pool.pooled_bytes.saturating_sub(capacity);
+                    Some(ptr)
+                }
+                None => None,
+            }
+        };
+        let ptr = match reused {
+            Some(ptr) => ptr,
+            None => {
+                let mut ptr = 0_u64;
+                check_cuda(unsafe { (self.cu_mem_alloc)(&mut ptr, capacity) })?;
+                ptr
+            }
+        };
+        Ok(PooledBufferLease {
+            primary: self,
+            ptr,
+            capacity,
+        })
+    }
+
+    /// Return a leased buffer to the pool, or free it if the idle cap is reached.
+    fn release_device_buffer(&self, ptr: u64, capacity: usize) {
+        let mut pool = self
+            .output_buffers
+            .lock()
+            .expect("gpu output-buffer pool poisoned");
+        if pool.pooled_bytes.saturating_add(capacity) > POOLED_OUTPUT_BYTES_CAP {
+            drop(pool);
+            unsafe { (self.cu_mem_free)(ptr) };
+            return;
+        }
+        pool.pooled_bytes += capacity;
+        pool.free.entry(capacity).or_default().push(ptr);
+    }
+
+    #[cfg(test)]
+    fn pooled_output_buffer_count(&self) -> usize {
+        self.output_buffers
+            .lock()
+            .map(|pool| pool.free.values().map(Vec::len).sum())
+            .unwrap_or(0)
+    }
+
     #[cfg(test)]
     fn cached_module_count(&self) -> usize {
         self.modules
@@ -356,6 +443,7 @@ impl GpuPrimaryContext {
             cu_event_elapsed_time,
             modules: Mutex::new(BTreeMap::new()),
             streams: Mutex::new(Vec::new()),
+            output_buffers: Mutex::new(OutputBufferPool::default()),
             lib: Arc::new(lib),
         })
     }
@@ -384,7 +472,29 @@ impl Drop for GpuPrimaryContext {
                 }
             }
         }
+        if let Ok(mut pool) = self.output_buffers.lock() {
+            for (_, ptrs) in std::mem::take(&mut pool.free) {
+                for ptr in ptrs {
+                    unsafe { (self.cu_mem_free)(ptr) };
+                }
+            }
+        }
         unsafe { (self.cu_primary_ctx_release)(self.device) };
+    }
+}
+
+/// RAII handle to a pooled device output buffer; returns it to the pool on every exit
+/// (success, error, or panic). `ptr` is a plain field — migrated routes read `lease.ptr`
+/// exactly like the old `CudaDeviceAllocationGuard.ptr`, so only the construction site changes.
+struct PooledBufferLease<'a> {
+    primary: &'a GpuPrimaryContext,
+    ptr: u64,
+    capacity: usize,
+}
+
+impl Drop for PooledBufferLease<'_> {
+    fn drop(&mut self) {
+        self.primary.release_device_buffer(self.ptr, self.capacity);
     }
 }
 
@@ -2743,8 +2853,6 @@ fn launch_cuda_resident_i32_equal_project(
     projection_offsets: &[u64],
     row_count: u64,
 ) -> Result<Vec<Vec<i32>>, CudaRuntimeProbeError> {
-    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
-    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
@@ -2977,20 +3085,6 @@ DONE:
     )
     .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
-    let cu_mem_alloc = unsafe {
-        resident
-            .lib()
-            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_mem_free = unsafe {
-        resident
-            .lib()
-            .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_memset_d8 = unsafe {
         resident
             .lib()
@@ -3012,18 +3106,14 @@ DONE:
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
-    let mut device_values = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_values, output_bytes) })?;
-    let values_guard = CudaDeviceAllocationGuard {
-        ptr: device_values,
-        free: *cu_mem_free,
-    };
-    let mut device_count = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_count, std::mem::size_of::<u32>()) })?;
-    let count_guard = CudaDeviceAllocationGuard {
-        ptr: device_count,
-        free: *cu_mem_free,
-    };
+    // P2-M2: pooled output buffers (no per-call cuMemAlloc/cuMemFree) — those driver-
+    // serialized allocs, sized to worst-case row_count, were the projection routes' c64 wall.
+    // Reused buffers are NOT zeroed; only the atomic-append counter is memset, and only
+    // [0, count) is read back, so stale bytes in the values buffer are never observed.
+    let values_guard = resident.primary().lease_device_buffer(output_bytes)?;
+    let count_guard = resident
+        .primary()
+        .lease_device_buffer(std::mem::size_of::<u32>())?;
     check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
 
     // P2-M2: cached module (no per-launch cuModuleLoadData) — the projection kernel is
@@ -3636,8 +3726,6 @@ fn launch_cuda_resident_i32_equal_any_project_text<R: CudaResidentReadSource>(
     text_bytes_len: u64,
     row_count: u64,
 ) -> Result<Vec<CudaI32TextBatchProjectionRow>, CudaRuntimeProbeError> {
-    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
-    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
@@ -3957,20 +4045,6 @@ DONE:
         .checked_mul(std::mem::size_of::<i32>())
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
-    let cu_mem_alloc = unsafe {
-        resident
-            .lib()
-            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_mem_free = unsafe {
-        resident
-            .lib()
-            .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_memset_d8 = unsafe {
         resident
             .lib()
@@ -3999,12 +4073,12 @@ DONE:
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
-    let mut device_needles = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_needles, needle_bytes) })?;
-    let needles_guard = CudaDeviceAllocationGuard {
-        ptr: device_needles,
-        free: *cu_mem_free,
-    };
+    // P2-M2: pooled output buffers (no per-call cuMemAlloc/cuMemFree). All 9 buffers are
+    // sized to worst-case row_count and were the bulk of this route's c64 wall (~9 allocs /
+    // ~1.9 MB per call). Reused buffers are NOT zeroed; only the two atomic-append counters
+    // are memset, the needles buffer is fully overwritten by the HtoD upload, and every
+    // output is read back only over [0, count) — so stale bytes are never observed.
+    let needles_guard = resident.primary().lease_device_buffer(needle_bytes)?;
     check_cuda(unsafe {
         cu_memcpy_htod(
             needles_guard.ptr,
@@ -4013,54 +4087,26 @@ DONE:
         )
     })?;
 
-    let mut device_values = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_values, output_bytes) })?;
-    let values_guard = CudaDeviceAllocationGuard {
-        ptr: device_values,
-        free: *cu_mem_free,
-    };
-    let mut device_needle_indices = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_needle_indices, output_indices_bytes) })?;
-    let indices_guard = CudaDeviceAllocationGuard {
-        ptr: device_needle_indices,
-        free: *cu_mem_free,
-    };
-    let mut device_row_indices = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_row_indices, output_row_indices_bytes) })?;
-    let row_indices_guard = CudaDeviceAllocationGuard {
-        ptr: device_row_indices,
-        free: *cu_mem_free,
-    };
-    let mut device_text_starts = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_text_starts, output_indices_bytes) })?;
-    let text_starts_guard = CudaDeviceAllocationGuard {
-        ptr: device_text_starts,
-        free: *cu_mem_free,
-    };
-    let mut device_text_lens = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_text_lens, output_indices_bytes) })?;
-    let text_lens_guard = CudaDeviceAllocationGuard {
-        ptr: device_text_lens,
-        free: *cu_mem_free,
-    };
-    let mut device_text_bytes = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_text_bytes, output_text_bytes) })?;
-    let text_bytes_guard = CudaDeviceAllocationGuard {
-        ptr: device_text_bytes,
-        free: *cu_mem_free,
-    };
-    let mut device_count = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_count, std::mem::size_of::<u32>()) })?;
-    let count_guard = CudaDeviceAllocationGuard {
-        ptr: device_count,
-        free: *cu_mem_free,
-    };
-    let mut device_text_count = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_text_count, std::mem::size_of::<u32>()) })?;
-    let text_count_guard = CudaDeviceAllocationGuard {
-        ptr: device_text_count,
-        free: *cu_mem_free,
-    };
+    let values_guard = resident.primary().lease_device_buffer(output_bytes)?;
+    let indices_guard = resident
+        .primary()
+        .lease_device_buffer(output_indices_bytes)?;
+    let row_indices_guard = resident
+        .primary()
+        .lease_device_buffer(output_row_indices_bytes)?;
+    let text_starts_guard = resident
+        .primary()
+        .lease_device_buffer(output_indices_bytes)?;
+    let text_lens_guard = resident
+        .primary()
+        .lease_device_buffer(output_indices_bytes)?;
+    let text_bytes_guard = resident.primary().lease_device_buffer(output_text_bytes)?;
+    let count_guard = resident
+        .primary()
+        .lease_device_buffer(std::mem::size_of::<u32>())?;
+    let text_count_guard = resident
+        .primary()
+        .lease_device_buffer(std::mem::size_of::<u32>())?;
     check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
     check_cuda(unsafe { cu_memset_d8(text_count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
 
@@ -9919,6 +9965,98 @@ mod tests {
             after >= 1 && after <= before + 1,
             "the row_count module must be loaded once and reused, not per launch \
              (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_output_buffer_pool_reuses_buffers_and_isolates_concurrent_leases() {
+        // P2-M2 — the projection routes' c64 wall was per-call cuMemAlloc/cuMemFree of
+        // worst-case-sized output buffers. This proves the pool's contract on real hardware:
+        //   (a) a released buffer of a bucket is REUSED (same device ptr) on the next
+        //       same-size lease — no fresh cuMemAlloc;
+        //   (b) two simultaneously-held leases of one bucket get DISTINCT buffers (concurrent
+        //       calls never alias each other's output);
+        //   (c) released leases return to the idle pool, and a different size is a different
+        //       bucket (no collision);
+        //   (d) under real multi-thread contention, simultaneously-held leases never alias.
+        // This is the binary's sole pool user, so the (c) counts are stable (no sibling race).
+        let _runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+        let ctx = gpu_primary_context(0).expect("primary context");
+        // The lease allocates via cuMemAlloc, so the context must be current on this thread —
+        // exactly the precondition the engine dispatcher satisfies before a route runs.
+        ctx.set_current()
+            .expect("bind primary context on this thread");
+
+        // (a) reuse: lease -> drop -> pool; the next same-bucket lease pops the same ptr.
+        let big = 600_000_usize;
+        let ptr1 = ctx.lease_device_buffer(big).expect("lease").ptr;
+        let ptr2 = ctx.lease_device_buffer(big).expect("lease").ptr;
+        assert_eq!(
+            ptr1, ptr2,
+            "a released buffer must be reused on the next same-bucket lease, not reallocated"
+        );
+
+        // (b) isolation: two leases held at once must be distinct device pointers.
+        {
+            let a = ctx.lease_device_buffer(big).expect("lease a");
+            let b = ctx.lease_device_buffer(big).expect("lease b");
+            assert_ne!(
+                a.ptr, b.ptr,
+                "concurrent leases of one bucket must not alias the same device buffer"
+            );
+        } // both returned to the pool here
+
+        // (c) accounting: the big bucket now holds >= 2 idle buffers; a tiny lease uses a
+        // different bucket (distinct ptr) and does not drain the big one.
+        let big_idle = ctx.pooled_output_buffer_count();
+        assert!(
+            big_idle >= 2,
+            "both released leases must return to the idle pool (got {big_idle})"
+        );
+        let small = ctx.lease_device_buffer(4).expect("lease small").ptr;
+        assert_ne!(
+            small, ptr1,
+            "a different bucket must yield a different buffer"
+        );
+        assert!(
+            ctx.pooled_output_buffer_count() > big_idle,
+            "a different-bucket lease must add to, not drain, the idle pool"
+        );
+
+        // (d) the load-bearing safety property under real contention: leases held at the same
+        // instant on different threads must be DISTINCT device buffers — `pop()` removes the
+        // ptr from the free list under the mutex, so no two live leases share a buffer (which
+        // would let one concurrent kernel clobber another's output). A barrier holds all N
+        // leases live simultaneously before their pointers are compared. Folded into this one
+        // test (rather than its own) so it is the sole pool user in the binary — the (c)
+        // counts above stay stable instead of racing a sibling test on the shared pool.
+        const N: usize = 16;
+        let barrier = std::sync::Barrier::new(N);
+        let held = std::sync::Mutex::new(Vec::with_capacity(N));
+        std::thread::scope(|scope| {
+            for _ in 0..N {
+                scope.spawn(|| {
+                    ctx.set_current()
+                        .expect("bind primary context on this thread");
+                    let lease = ctx.lease_device_buffer(big).expect("lease");
+                    held.lock().expect("held poisoned").push(lease.ptr);
+                    // Keep every lease alive across the barrier so all N are live at once; no
+                    // buffer is released until every thread has recorded its pointer.
+                    barrier.wait();
+                    drop(lease);
+                });
+            }
+        });
+        let mut ptrs = held.into_inner().expect("held poisoned");
+        let total = ptrs.len();
+        assert_eq!(total, N, "every thread must have recorded a lease");
+        ptrs.sort_unstable();
+        ptrs.dedup();
+        assert_eq!(
+            ptrs.len(),
+            total,
+            "concurrently-held leases must never alias the same device buffer"
         );
     }
 
