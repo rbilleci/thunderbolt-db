@@ -472,6 +472,17 @@ and a harness that measures it:
     scan** (475ms→7.9ms), exact-count-verified vs the serial baseline. Remaining serial
     routes (compare-count, sum, project, `_equal_any_project`) are the tracked follow-up.
     Run report: `.../runs/2026-06-14-p2-m2-parallel-scan-kernel-v1.md`.
+  - **Next target = the projection/gather kernels** (`multi_col_projection`,
+    `mixed_int_text`): the GPU-retained query-mix benchmark
+    (`.../runs/2026-06-14-gpu-retained-query-mix-v1.md`) shows the parallelized routes
+    (count, equality-count) scale to ~17–20k qps @c64 while these still-serial `(1,1,1)`
+    projection kernels wall out (p50 ~24–27 ms @c64, ~2k qps). Parallelizing them the same
+    way is the highest-value remaining Phase-2 kernel work.
+  - **Batched / async GPU submission** is the other half: that benchmark also shows the old
+    M0 owner-thread server beat the new independent-dispatch server at c64 on the GPU path
+    (count 25k vs 17k qps) because M0 *batched* the retained reads. Recovering that batching
+    (async submit / grouped completion) without losing the new low-latency dispatch is the
+    tracked next concurrency item (also the P2-M1 async follow-up).
 - **Stream pool + async copies + pinned memory.** Real `cuStream*`, async H2D/D2H,
   `cuMemHostAlloc` staging, so submit/complete actually overlap. Measure D2H from
   real copy sizes (not row/col estimates) and time uniformly with `cuEventElapsedTime`.
