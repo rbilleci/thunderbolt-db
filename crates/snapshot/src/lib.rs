@@ -27,13 +27,18 @@
 //! engine-invalidated) — that risk is retired only when this substrate is applied
 //! to the real resident types.
 //!
-//! Note: the publish slot is guarded by a `Mutex` whose critical section is a
-//! single `Arc` clone/swap (sub-microsecond) — the read *body* runs outside it.
-//! A production version may use `arc-swap`/`RwLock` for a fully lock-free load;
-//! the ownership and reclamation semantics proven here are identical.
+//! Note: the publish slot is an [`arc_swap::ArcSwap`], so [`SnapshotCell::load`]
+//! is a **wait-free atomic `Arc` load** — readers never lock and never contend
+//! with the publisher (which does a wait-free atomic store). Ownership and epoch
+//! reclamation are unchanged: an old generation is freed when its last
+//! [`SnapshotHandle`] `Arc` drops. (Generation-id allocation assumes one publisher
+//! per cell — honored by every caller: the data path publishes under the commit
+//! lock, residency under its serialized update path.)
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 /// An immutable published generation: a monotonically increasing id plus the
 /// payload readers execute against.
@@ -83,7 +88,7 @@ impl<T> SnapshotHandle<T> {
 /// The published-generation slot. One writer publishes; many readers load.
 #[derive(Debug)]
 pub struct SnapshotCell<T> {
-    current: Mutex<Arc<Generation<T>>>,
+    current: ArcSwap<Generation<T>>,
     next_id: AtomicU64,
 }
 
@@ -91,7 +96,7 @@ impl<T> SnapshotCell<T> {
     /// Create a cell with an initial generation (id 1).
     pub fn new(initial: T) -> Self {
         Self {
-            current: Mutex::new(Arc::new(Generation {
+            current: ArcSwap::new(Arc::new(Generation {
                 id: 1,
                 payload: initial,
             })),
@@ -99,39 +104,32 @@ impl<T> SnapshotCell<T> {
         }
     }
 
-    /// Lock the publish slot, recovering from poison. The critical section only
-    /// ever clones/swaps an `Arc` (it cannot leave the slot in a torn state), so
-    /// continuing past a poisoned lock is safe — and avoids one panicking thread
-    /// taking down every reader and the writer.
-    fn slot(&self) -> std::sync::MutexGuard<'_, Arc<Generation<T>>> {
-        self.current
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Load the currently-published generation as a reader handle. The returned
-    /// handle pins that generation until dropped. Lock-free read body afterward.
+    /// Load the currently-published generation as a reader handle — a **wait-free
+    /// atomic `Arc` load** (no lock taken). The returned handle pins that
+    /// generation until dropped; the read body afterward is lock-free and never
+    /// contends with a concurrent `publish`.
     pub fn load(&self) -> SnapshotHandle<T> {
-        let generation = Arc::clone(&self.slot());
-        SnapshotHandle { generation }
+        SnapshotHandle {
+            generation: self.current.load_full(),
+        }
     }
 
-    /// Publish a new generation and return its id. The previous generation
-    /// remains alive for any readers still holding a handle to it.
+    /// Publish a new generation and return its id — a wait-free atomic store. The
+    /// previous generation remains alive for any readers still holding a handle to
+    /// it (freed when the last such `Arc` drops).
     ///
-    /// The id is allocated **inside** the lock so that generation-id order always
-    /// matches install order — making `current_generation()` monotonic even if the
-    /// single-writer contract is ever relaxed to multiple concurrent writers.
+    /// One publisher per cell is assumed (every caller serializes publishes: the
+    /// data path under the commit lock, residency under its update path), so the
+    /// `fetch_add` id and the store stay in install order.
     pub fn publish(&self, payload: T) -> u64 {
-        let mut slot = self.slot();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        *slot = Arc::new(Generation { id, payload });
+        self.current.store(Arc::new(Generation { id, payload }));
         id
     }
 
     /// The id of the currently-published generation.
     pub fn current_generation(&self) -> u64 {
-        self.slot().id
+        self.current.load().id
     }
 }
 

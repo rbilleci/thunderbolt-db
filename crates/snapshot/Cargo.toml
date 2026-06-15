@@ -8,4 +8,8 @@ license.workspace = true
 # spike). The concurrency substrate the engine adopts: an immutable, Arc-shared
 # generation that many readers execute against lock-free while a serialized
 # writer atomically publishes the next generation; old generations are retired by
-# Arc refcount (epoch reclamation) only after their last reader drains. std-only.
+# Arc refcount (epoch reclamation) only after their last reader drains.
+
+[dependencies]
+# Lock-free atomic Arc load/store for the publish slot (wait-free reader `load()`).
+arc-swap.workspace = true
