@@ -43,7 +43,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 use gpu_db_facade::{
-    execute_on_shared_engine, pg_adapter, DbError, EngineFacade, QueryOutcome, SharedEngine,
+    execute_on_shared_engine, execute_on_shared_engine_batched, pg_adapter, BatchedDispatch,
+    DbError, EngineFacade, PointLookupBatcher, QueryOutcome, SharedEngine,
 };
 use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
 use gpu_db_protocol::{
@@ -378,21 +379,63 @@ pub async fn serve_async_with_permits(
 
 /// `serve_async` over a caller-provided shared engine — e.g. one pre-warmed to GPU residency
 /// before serving (the GPU-retained benchmark).
+///
+/// **A/B gate (Thread-3 Stage 1).** If the environment variable `GPU_DB_BATCHING` is set to a
+/// truthy value (`1`/`true`/`on`/`yes`, case-insensitive), batchable point-lookups are routed
+/// through a shared [`PointLookupBatcher`] (one coalescer thread, one GPU submission per batch)
+/// and the connection task `await`s a `oneshot` while holding no semaphore permit; every other
+/// statement keeps the unchanged per-query `spawn_blocking` path. When the flag is off (default)
+/// the server behaves exactly as before — this is the OFF arm of the Stage-1 A/B comparison.
+/// `serve_async_with_engine_batching` sets the flag explicitly for benchmarks.
 pub async fn serve_async_with_engine(
     listener: TokioTcpListener,
     engine: Arc<SharedEngine>,
     max_concurrent_executions: usize,
 ) -> io::Result<()> {
+    serve_async_with_engine_batching(
+        listener,
+        engine,
+        max_concurrent_executions,
+        batching_enabled_from_env(),
+    )
+    .await
+}
+
+/// Read the `GPU_DB_BATCHING` A/B flag from the environment (default off).
+fn batching_enabled_from_env() -> bool {
+    std::env::var("GPU_DB_BATCHING")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "on" | "yes")
+        })
+        .unwrap_or(false)
+}
+
+/// `serve_async_with_engine` with the point-lookup batching A/B arm chosen explicitly (instead
+/// of via the `GPU_DB_BATCHING` env flag) — for benchmarks that drive ON vs OFF directly. When
+/// `batching` is true a single [`PointLookupBatcher`] is shared across all connections for the
+/// lifetime of this server; dropping it (on shutdown) drains its queue so no waiter is stranded.
+pub async fn serve_async_with_engine_batching(
+    listener: TokioTcpListener,
+    engine: Arc<SharedEngine>,
+    max_concurrent_executions: usize,
+    batching: bool,
+) -> io::Result<()> {
     let executor = Arc::new(tokio::sync::Semaphore::new(
         max_concurrent_executions.max(1),
     ));
+    // One coalescer for the whole server when batching is on; `None` keeps the unchanged path.
+    let batcher = batching.then(|| Arc::new(PointLookupBatcher::new(Arc::clone(&engine))));
     loop {
         let (stream, _addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let engine = Arc::clone(&engine);
         let executor = Arc::clone(&executor);
+        let batcher = batcher.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection_async(stream, &engine, &executor).await {
+            if let Err(err) =
+                handle_connection_async(stream, &engine, &executor, batcher.as_ref()).await
+            {
                 eprintln!("gpu-db-engine-server async connection error: {err}");
             }
         });
@@ -403,11 +446,12 @@ async fn handle_connection_async(
     mut stream: TokioTcpStream,
     engine: &Arc<SharedEngine>,
     executor: &Arc<tokio::sync::Semaphore>,
+    batcher: Option<&Arc<PointLookupBatcher>>,
 ) -> Result<(), String> {
     if !complete_startup_async(&mut stream).await? {
         return Ok(());
     }
-    run_async_query_loop(&mut stream, engine, executor).await
+    run_async_query_loop(&mut stream, engine, executor, batcher).await
 }
 
 async fn complete_startup_async(stream: &mut TokioTcpStream) -> Result<bool, String> {
@@ -458,20 +502,34 @@ async fn run_async_query_loop(
     stream: &mut TokioTcpStream,
     engine: &Arc<SharedEngine>,
     executor: &Arc<tokio::sync::Semaphore>,
+    batcher: Option<&Arc<PointLookupBatcher>>,
 ) -> Result<(), String> {
     while let Some(frame) = read_tagged_frame_async(stream).await? {
         match parse_frontend_message(&frame).map_err(|err| err.to_string())? {
             FrontendMessage::SimpleQuery(sql) => {
-                // Execute on the blocking engine via the bounded blocking pool: an idle
-                // connection holds no permit, so only `max_concurrent_executions` engine
-                // calls run at once and the async runtime is never blocked. The permit is
-                // released before the (async) response write.
-                let outcome = {
-                    let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
-                    let engine = Arc::clone(engine);
-                    tokio::task::spawn_blocking(move || execute_on_shared_engine(&engine, &sql))
-                        .await
-                        .map_err(|err| err.to_string())?
+                let outcome = match batcher {
+                    // Batching ON: classify-or-fallback. Classification + the unchanged
+                    // per-query path still run under a permit on the blocking pool; a
+                    // batchable point-lookup instead parks on a `oneshot` with NO permit
+                    // held and NO `spawn_blocking` (the coalescer thread does the GPU work),
+                    // so many parked lookups coalesce into one submission.
+                    Some(batcher) => {
+                        execute_batchable_or_fallback(
+                            Arc::clone(engine),
+                            executor,
+                            Arc::clone(batcher),
+                            sql,
+                        )
+                        .await?
+                    }
+                    // Batching OFF (default A/B arm): the original path, unchanged.
+                    None => {
+                        let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
+                        let engine = Arc::clone(engine);
+                        tokio::task::spawn_blocking(move || execute_on_shared_engine(&engine, &sql))
+                            .await
+                            .map_err(|err| err.to_string())?
+                    }
                 };
                 let buf = encode_outcome(outcome).map_err(|err| err.to_string())?;
                 stream
@@ -513,6 +571,57 @@ async fn run_async_query_loop(
         }
     }
     Ok(())
+}
+
+/// Batching-ON dispatch for one SimpleQuery (Thread-3 Stage 1). Classification + the unchanged
+/// per-query fallback run inside `spawn_blocking` under a permit (so the runtime never blocks on
+/// the engine lock or a slow query). A batchable point-lookup returns a `oneshot::Receiver`,
+/// whose permit is then released and the connection task `await`s the receiver with NO permit
+/// held — so parked lookups don't consume the bounded-executor budget while they coalesce. A
+/// dropped/closed coalescer makes the receiver resolve to a `RecvError`, surfaced as a neutral
+/// engine error rather than a hang.
+async fn execute_batchable_or_fallback(
+    engine: Arc<SharedEngine>,
+    executor: &Arc<tokio::sync::Semaphore>,
+    batcher: Arc<PointLookupBatcher>,
+    sql: String,
+) -> Result<Result<QueryOutcome, DbError>, String> {
+    // Phase 1 (permit held): classify under the engine read lock and either resolve the
+    // unchanged path or enqueue on the batcher. Both are short or self-bounded.
+    let dispatch = {
+        let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
+        tokio::task::spawn_blocking(move || {
+            // `execute_on_shared_engine_batched` returns `Immediate(result)` for everything
+            // non-batchable (running the unchanged per-query path here) or `Batched(receiver)`.
+            match execute_on_shared_engine_batched(&engine, &batcher, &sql) {
+                BatchedDispatch::Immediate(result) => DispatchOut::Immediate(result),
+                BatchedDispatch::Batched(receiver) => DispatchOut::Batched(receiver),
+            }
+        })
+        .await
+        .map_err(|err| err.to_string())?
+        // permit drops here
+    };
+    // Phase 2 (no permit): if batched, park on the oneshot off the bounded executor.
+    match dispatch {
+        DispatchOut::Immediate(result) => Ok(result),
+        DispatchOut::Batched(receiver) => match receiver.await {
+            Ok(result) => Ok(result),
+            // The coalescer dropped the sender (shutdown / unexpected): a neutral error, never
+            // a hung connection.
+            Err(_) => Ok(Err(DbError {
+                category: gpu_db_facade::ErrorCategory::Internal,
+                message: "batched point-lookup did not produce a response (coalescer unavailable)"
+                    .to_string(),
+            })),
+        },
+    }
+}
+
+/// Internal owned form of `BatchedDispatch` so it can cross the `spawn_blocking` boundary.
+enum DispatchOut {
+    Immediate(Result<QueryOutcome, DbError>),
+    Batched(tokio::sync::oneshot::Receiver<Result<QueryOutcome, DbError>>),
 }
 
 /// Async read of one untagged startup frame (4-byte length prefix, no type byte).

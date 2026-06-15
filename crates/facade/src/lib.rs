@@ -30,9 +30,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use gpu_db_engine::{Engine, ExecuteError, RelationalColumn};
-use gpu_db_protocol::{parse_command, Command, ParseError, SqlType, SqlValue};
+use gpu_db_protocol::{parse_command, Command, ParseError, Select, SqlType, SqlValue};
 
 pub mod pg_adapter;
+mod point_lookup_batcher;
+
+pub use point_lookup_batcher::PointLookupBatcher;
 
 /// Neutral logical column type. Carries no wire OID; adapters derive the wire
 /// type from this.
@@ -299,6 +302,15 @@ impl SharedEngine {
             next_txn_id: AtomicU64::new(1),
         }
     }
+
+    /// Acquire the engine **read** lock, mapping a poisoned lock to `Err(())`. The
+    /// point-lookup batcher uses this to hold ONE read lock across a whole batch's
+    /// submit+complete (the "one read-lock per batch" invariant); on poison the
+    /// caller fails every waiter loud rather than serve possibly-torn state (same
+    /// policy as [`execute_on_shared_engine`]).
+    pub(crate) fn read_engine(&self) -> Result<std::sync::RwLockReadGuard<'_, Engine>, ()> {
+        self.engine.read().map_err(|_| ())
+    }
 }
 
 impl Default for SharedEngine {
@@ -362,6 +374,93 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
                 rows_affected: None,
             })
         }
+    }
+}
+
+/// Classify-or-fallback entry (Thread-3 Stage 1, strictly additive). If `sql` is a
+/// batchable `int4_equality_projection` point-lookup on a resident, valid-generation
+/// table, it is enqueued on the `batcher` (the caller `await`s the returned `oneshot`,
+/// holding no semaphore permit while parked). EVERYTHING else — a non-SELECT, a SELECT
+/// of any other shape, a non-resident/stale table, a parse-empty statement — falls
+/// through to [`execute_on_shared_engine`] UNCHANGED. Misclassification only ever costs
+/// a slow path, never a wrong result: a query that slipped through as "batchable" but is
+/// actually unbatchable is rejected by the engine's job preparation and the waiter gets
+/// that error (it is never silently mis-executed).
+///
+/// Returns either the resolved outcome or, when batched, the `oneshot::Receiver` to
+/// `await`. Kept as a two-variant return (rather than `async` here) so the façade does
+/// not pull in a tokio runtime feature; the async ingress drives the await.
+pub fn execute_on_shared_engine_batched(
+    shared: &SharedEngine,
+    batcher: &PointLookupBatcher,
+    sql: &str,
+) -> BatchedDispatch {
+    // Parse + classify under a read lock; non-batchable (including parse errors and
+    // non-SELECTs) falls straight through to the unchanged per-query path.
+    match classify_batchable_point_lookup(shared, sql) {
+        Some((select, needle)) => BatchedDispatch::Batched(batcher.enqueue(select, needle)),
+        None => BatchedDispatch::Immediate(execute_on_shared_engine(shared, sql)),
+    }
+}
+
+/// Outcome of [`execute_on_shared_engine_batched`]: either an already-resolved result
+/// (the statement took the unchanged per-query path) or a `oneshot` the caller awaits
+/// (the statement was handed to the batcher).
+pub enum BatchedDispatch {
+    Immediate(Result<QueryOutcome, DbError>),
+    Batched(tokio::sync::oneshot::Receiver<Result<QueryOutcome, DbError>>),
+}
+
+/// Decide whether `sql` is a batchable single-column int4 equality point-lookup against
+/// a resident, valid-generation table, and if so return the parsed `Select` + its int4
+/// needle. Conservative: it returns `Some` only when the engine's own resident-route
+/// planner accepts the statement AND reports the `int4_equality_projection` shape (the
+/// one route class Stage 1 batches). The needle is extracted from the equality filter
+/// with the SAME `filter_groups`/`filters`/`filter` precedence the engine uses to bind
+/// the job, so the batcher's needle-dedup key matches the engine's bound needle exactly.
+fn classify_batchable_point_lookup(shared: &SharedEngine, sql: &str) -> Option<(Select, i32)> {
+    let Ok(Command::Select(select)) = parse_command(sql) else {
+        return None;
+    };
+    // A read lock just for the planning probe; released before the batcher takes its own
+    // (single) read lock for the batch. The planner is `&self`. Only an accepted
+    // `int4_equality_projection` (resident + valid-generation) is batchable; anything else
+    // returns `None` and the caller takes the unchanged per-query path.
+    {
+        let engine = shared.read_engine().ok()?;
+        let decision = engine.plan_relational_resident_route(&select);
+        if !decision.accepted || decision.query_shape != "int4_equality_projection" {
+            return None;
+        }
+    }
+    let needle = select_int4_equality_needle(&select)?;
+    Some((select, needle))
+}
+
+/// Extract the int4 needle from a single-equality-predicate `Select`, mirroring the
+/// engine's `filter_groups` → `filters` → `filter` precedence. Returns `None` if the
+/// predicate is not exactly one int4 equality (the planner should already have rejected
+/// such shapes, so this is a belt-and-suspenders guard).
+fn select_int4_equality_needle(select: &Select) -> Option<i32> {
+    let filter = if !select.filter_groups.is_empty() {
+        if select.filter_groups.len() != 1 || select.filter_groups[0].len() != 1 {
+            return None;
+        }
+        &select.filter_groups[0][0]
+    } else if !select.filters.is_empty() {
+        if select.filters.len() != 1 {
+            return None;
+        }
+        &select.filters[0]
+    } else {
+        select.filter.as_ref()?
+    };
+    if filter.op != gpu_db_protocol::SelectFilterOp::Eq {
+        return None;
+    }
+    match filter.value {
+        SqlValue::Int4(needle) => Some(needle),
+        _ => None,
     }
 }
 

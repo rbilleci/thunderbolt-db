@@ -522,9 +522,11 @@ dependencies = [
 name = "gpu_db_facade"
 version = "0.1.0"
 dependencies = [
+ "gpu_db_batching",
  "gpu_db_engine",
  "gpu_db_protocol",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

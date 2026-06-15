@@ -15443,8 +15443,14 @@ impl Engine {
         Ok(result)
     }
 
+    // Stage-0 (Thread-3 batched/async submission): this takes `&self`, not `&mut self`.
+    // Its body only calls `plan_relational_resident_route`, `bind_relational_select_for_execution`,
+    // and `relational_retained_snapshot_handle` — all `&self` — so job preparation needs no
+    // exclusive access. Flipping to `&self` lets the façade build a whole batch of jobs under a
+    // single shared read lock (the "one read-lock per batch" invariant), exactly as the `&self`
+    // read path `execute_relational_select` already does.
     pub fn prepare_relational_retained_read_job(
-        &mut self,
+        &self,
         select: &Select,
     ) -> Result<RelationalRetainedReadJob, ExecuteError> {
         let decision = self.plan_relational_resident_route(select);

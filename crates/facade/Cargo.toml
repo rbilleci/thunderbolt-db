@@ -14,3 +14,11 @@ license.workspace = true
 thiserror.workspace = true
 gpu_db_engine = { path = "../engine" }
 gpu_db_protocol = { path = "../protocol" }
+# Thread-3 batched/async GPU submission (P0-M? staged): the façade owns the
+# point-lookup batcher (coalescer thread + per-batch read lock). It reuses the
+# generic dual-trigger batcher rather than re-deriving M0's ad-hoc backlog loop.
+gpu_db_batching = { path = "../batching" }
+# `oneshot` is the park-point: an async ingress task enqueues a point-lookup and
+# `await`s the receiver while holding no semaphore permit. Only the `sync` feature
+# is needed (oneshot/mpsc), not the runtime — the coalescer is a plain OS thread.
+tokio = { version = "1", features = ["sync"] }
