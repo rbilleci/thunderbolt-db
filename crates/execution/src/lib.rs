@@ -5021,14 +5021,8 @@ fn launch_cuda_resident_i32_equal_row_indices(
     filters: &[(u64, i32)],
     row_count: u64,
 ) -> Result<Vec<u64>, CudaRuntimeProbeError> {
-    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
-    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
-    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
-    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
-    type CuModuleGetFunction =
-        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -5042,7 +5036,6 @@ fn launch_cuda_resident_i32_equal_row_indices(
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> i32;
-    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
 
     const MAX_FILTERS: usize = 4;
     const PTX: &[u8] = br#"
@@ -5191,20 +5184,32 @@ DONE:
     )
     .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
-    let cu_mem_alloc = unsafe {
-        resident
-            .lib()
-            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemAlloc>(b"cuMemAlloc\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_mem_free = unsafe {
-        resident
-            .lib()
-            .get::<CuMemFree>(b"cuMemFree_v2\0")
-            .or_else(|_| resident.lib().get::<CuMemFree>(b"cuMemFree\0"))
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
+    // P2-M2 (row-index-gather async lever): this gather route had the same default/NULL-stream-
+    // serialized wall as the other resident routes — a per-call `cuMemAlloc` (indices + count) +
+    // `cuMemFree`, a blocking default-stream `cuMemsetD8` to zero the atomic-append counter, a
+    // per-call `cuModuleLoadData` re-JIT, a whole-context sync (the legacy event-timing helper
+    // falls back to `cuCtxSynchronize`, and even its timed path records events on the NULL stream),
+    // and two blocking default-stream `cuMemcpyDtoH` (the count, then the indices). The driver
+    // serializes those memory ops + the JIT + the whole-context sync across concurrent readers, so
+    // a per-section breakdown localized ~73% of the engine's c64 multi-column cascade wall to this
+    // single launch (~20.7 ms/call @c64) — no scaling. Unlike the serial compare/range kernels,
+    // THIS kernel is already parallel (one thread per row + an `atom.global.add` append), so the
+    // wall is purely the per-call orchestration, not the kernel — removing the serializer should
+    // restore concurrency. The fix moves the counter-zero (memset), the kernel, and both D2H onto
+    // the route's pooled private stream via the `*Async` variants behind exactly TWO
+    // `cuStreamSynchronize` (one after the kernel so the device-computed match count is readable to
+    // size the indices read; one after the indices D2H), stages both readbacks through pooled
+    // pinned (page-locked) host buffers, leases its device output buffers + private stream + module
+    // from the shared pools/cache (no per-call alloc/JIT), and removes the whole-context sync. No
+    // HtoD is needed: the kernel takes the offsets/needles as scalar params; the count buffer is
+    // the only region that must be zeroed (the indices buffer is read back only over [0, count) so
+    // pooled stale bytes are never observed). The PTX kernel + grid shape are byte-for-byte
+    // unchanged, so the appended indices — and thus the result bytes — are identical.
+    //
+    // The whole async path is gated on the optional async + pinned-host driver symbols; on an old
+    // driver lacking them the route keeps a blocking path (still cached-module + pooled-buffer +
+    // pooled-stream, just blocking memset/D2H), so correctness is unconditional and only the
+    // acceleration is best-effort.
     let cu_memset_d8 = unsafe {
         resident
             .lib()
@@ -5219,70 +5224,38 @@ DONE:
             .or_else(|_| resident.lib().get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_module_load_data = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_unload = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleUnload>(b"cuModuleUnload\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
-    let cu_module_get_function = unsafe {
-        resident
-            .lib()
-            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
-    };
     let cu_launch_kernel = unsafe {
         resident
             .lib()
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
-    let cu_ctx_synchronize = unsafe {
-        resident
-            .lib()
-            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
-            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+
+    let async_ops = match (
+        resident.primary().cu_memcpy_dtoh_async,
+        resident.primary().cu_memset_d8_async,
+    ) {
+        (Some(dtoh), Some(memset)) => Some((dtoh, memset)),
+        _ => None,
     };
 
-    let mut device_indices = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_indices, output_bytes) })?;
-    let indices_guard = CudaDeviceAllocationGuard {
-        ptr: device_indices,
-        free: *cu_mem_free,
-    };
-    let mut device_count = 0_u64;
-    check_cuda(unsafe { cu_mem_alloc(&mut device_count, std::mem::size_of::<u32>()) })?;
-    let count_guard = CudaDeviceAllocationGuard {
-        ptr: device_count,
-        free: *cu_mem_free,
-    };
-    check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
+    // Pooled device output buffers (no per-call cuMemAlloc/cuMemFree). Reused buffers are NOT
+    // zeroed; only the atomic-append counter is memset, and the indices buffer is read back only
+    // over the [0, count) prefix — so stale bytes are never observed.
+    let indices_guard = resident
+        .primary()
+        .lease_device_buffer(output_bytes.max(1))?;
+    const COUNT_BYTES: usize = std::mem::size_of::<u32>();
+    let count_guard = resident.primary().lease_device_buffer(COUNT_BYTES)?;
 
+    // P2-M2: cached module (no per-launch cuModuleLoadData) — keyed by the kernel entry name and
+    // launched concurrently on distinct streams.
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
-
-    let mut module = std::ptr::null_mut();
-    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
-    let module_guard = CudaModuleGuard {
-        module,
-        unload: *cu_module_unload,
-    };
-
-    let mut function = std::ptr::null_mut();
-    check_cuda(unsafe {
-        cu_module_get_function(
-            &mut function,
-            module,
-            c"gpu_db_resident_i32_equal_row_indices".as_ptr(),
-        )
-    })?;
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_equal_row_indices", &ptx)?;
 
     let mut resident_arg = resident.device_ptr();
     let mut rows_arg = row_count;
@@ -5313,51 +5286,191 @@ DONE:
     ];
     let threads_per_block = 128;
     let blocks = row_count_u32.div_ceil(threads_per_block);
-    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
-        cu_launch_kernel(
-            function,
-            blocks,
-            1,
-            1,
-            threads_per_block,
-            1,
-            1,
-            0,
-            std::ptr::null_mut(),
-            args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    })?;
 
-    let mut match_count = 0_u32;
-    check_cuda(unsafe {
-        cu_memcpy_dtoh(
-            (&mut match_count as *mut u32).cast::<c_void>(),
-            count_guard.ptr,
-            std::mem::size_of::<u32>(),
-        )
-    })?;
-    let match_count = u64::from(match_count);
-    if match_count > row_count {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
-    }
-    let match_count_usize = usize::try_from(match_count)
-        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let mut indices = vec![0_u64; match_count_usize];
-    if match_count_usize > 0 {
+    // This kernel is already parallel (one thread per row + an `atom.global.add` ordered append);
+    // its grid shape is preserved exactly so the appended order — and thus the result bytes — is
+    // identical (the append order is the atomic schedule, which the grid shape does not change).
+    if let Some((dtoh_async, memset_async)) = async_ops {
+        // ---- async-on-pooled-stream path (the lever) ----
+        // Bind the shared primary context (idempotent) and lease the pooled private stream.
+        resident.primary().set_current()?;
+        struct StreamLease<'a> {
+            primary: &'a GpuPrimaryContext,
+            pooled: Option<PooledStream>,
+        }
+        impl Drop for StreamLease<'_> {
+            fn drop(&mut self) {
+                if let Some(pooled) = self.pooled.take() {
+                    self.primary.release_pooled_stream(pooled);
+                }
+            }
+        }
+        let lease = StreamLease {
+            primary: resident.primary(),
+            pooled: Some(resident.primary().acquire_pooled_stream()?),
+        };
+        let pooled = lease.pooled.as_ref().expect("pooled stream just set");
+        let stream = pooled.stream;
+        let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
+
+        // HARDENING (error-path stream drain): once an async op is enqueued on this private
+        // stream, an early `?` would unwind the locals — returning the device + pinned buffer
+        // leases to their shared pools while enqueued ops may still be in flight, a
+        // use-after-free window for whoever leases those buffers next. So every fallible op from
+        // the first async enqueue through each covering `cuStreamSynchronize` propagates its error
+        // through `drain_err`, a best-effort blocking sync (result ignored) that drains the stream
+        // FIRST, *then* yields the original error. `map_err` runs the closure at the error site
+        // BEFORE `?` returns and hence before ANY local Drop, so it precedes the release of every
+        // lease regardless of scope; on `Ok` the closure is not invoked, so the success path adds
+        // nothing beyond the two explicit syncs below.
+        let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+            // SAFETY: `stream` is the live pooled private stream; a blocking synchronize on it is
+            // valid from this thread (the primary context is current). The result is intentionally
+            // ignored — this is a best-effort drain on an already-failing path.
+            unsafe {
+                let _ = (resident.primary().cu_stream_synchronize)(stream);
+            }
+            err
+        };
+
+        // (1) Stream-ordered zero of the atomic-append counter, then the kernel launch (no HtoD
+        // needed for this route — the offsets/needles are scalar params).
+        check_cuda(unsafe { memset_async(count_guard.ptr, 0, COUNT_BYTES, stream) })
+            .map_err(drain_err)?;
+        if timed {
+            check_cuda(unsafe { (resident.primary().cu_event_record)(pooled.start_event, stream) })
+                .map_err(drain_err)?;
+        }
         check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                indices.as_mut_ptr().cast::<c_void>(),
-                indices_guard.ptr,
-                match_count_usize * std::mem::size_of::<u64>(),
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+        if timed {
+            check_cuda(unsafe { (resident.primary().cu_event_record)(pooled.stop_event, stream) })
+                .map_err(drain_err)?;
+        }
+
+        // (2) Stream-ordered read of the 4-byte match count, then sync #1: now the kernel is
+        // complete and the count is known, so the indices read can be sized. The count stages
+        // through a small pooled pinned host buffer for a truly-async DMA.
+        let mut match_count = 0_u32;
+        let count_pinned = resident.primary().lease_pinned_host_buffer(COUNT_BYTES);
+        let count_dst: *mut c_void = count_pinned
+            .as_ref()
+            .map(|p| p.ptr)
+            .unwrap_or_else(|| (&mut match_count as *mut u32).cast::<c_void>());
+        check_cuda(unsafe { dtoh_async(count_dst, count_guard.ptr, COUNT_BYTES, stream) })
+            .map_err(drain_err)?;
+        // Covering sync #1: drains on its own error too (the count D2H is still enqueued).
+        check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
+            .map_err(drain_err)?;
+        if let Some(pinned) = &count_pinned {
+            // SAFETY: the sync above completed the 4-byte D2H into the pinned region; read the
+            // u32 out by typed pointer (pinned host memory is page-aligned).
+            unsafe {
+                match_count = pinned.ptr.cast::<u32>().read();
+            }
+        }
+        if timed {
+            let mut elapsed_ms = 0.0_f32;
+            check_cuda(unsafe {
+                (resident.primary().cu_event_elapsed_time)(
+                    &mut elapsed_ms,
+                    pooled.start_event,
+                    pooled.stop_event,
+                )
+            })?;
+            resident.record_kernel_event_elapsed_us(Some(
+                (f64::from(elapsed_ms) * 1_000.0).ceil() as u64
+            ));
+        } else {
+            resident.record_kernel_event_elapsed_us(None);
+        }
+
+        let match_count = u64::from(match_count);
+        if match_count > row_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
+        let match_count_usize = usize::try_from(match_count)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+        // (3) Stream-ordered result D2H of the populated [0, count) indices prefix into a pooled
+        // pinned host buffer, then ONE sync #2; copy the pinned bytes into the owned Vec.
+        let mut indices = vec![0_u64; match_count_usize];
+        let indices_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            indices_guard.ptr,
+            &mut indices,
+        )
+        .map_err(drain_err)?;
+        // Covering sync #2: drains on its own error too (the indices D2H is still enqueued).
+        check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
+            .map_err(drain_err)?;
+        copy_pinned_into(&indices_pinned, &mut indices);
+        drop(lease);
+        Ok(indices)
+    } else {
+        // ---- legacy blocking fallback (old driver: no async/pinned symbols) ----
+        // Still cached-module + pooled-buffer + pooled-stream (per-stream sync, no whole-context
+        // cuCtxSynchronize); just blocking memset/D2H. The route owns its output buffers, so no
+        // pooled scratch is requested.
+        check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, COUNT_BYTES) })?;
+        launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+            cu_launch_kernel(
+                function,
+                blocks,
+                1,
+                1,
+                threads_per_block,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         })?;
-    }
 
-    drop(module_guard);
-    drop(count_guard);
-    drop(indices_guard);
-    Ok(indices)
+        let mut match_count = 0_u32;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                (&mut match_count as *mut u32).cast::<c_void>(),
+                count_guard.ptr,
+                COUNT_BYTES,
+            )
+        })?;
+        let match_count = u64::from(match_count);
+        if match_count > row_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+        }
+        let match_count_usize = usize::try_from(match_count)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let mut indices = vec![0_u64; match_count_usize];
+        if !indices.is_empty() {
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(
+                    indices.as_mut_ptr().cast::<c_void>(),
+                    indices_guard.ptr,
+                    indices.len() * std::mem::size_of::<u64>(),
+                )
+            })?;
+        }
+        Ok(indices)
+    }
 }
 
 fn launch_cuda_resident_i32_between_row_indices(
@@ -10714,6 +10827,153 @@ mod tests {
             )
             .expect("final project_i32_compare");
         assert_eq!(final_rows, vec![20, 30, 20, 40]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_i32_equal_row_indices_matches_expected_under_concurrent_pool_reuse() {
+        // P2-M2 regression for the `equal_row_indices` migration to the pooled-async substrate.
+        // This gather route is MORE exposed than its `compare_project` twin: it drives TWO device
+        // buffers (the indices buffer + the atomic-append count buffer) with a count→indices data
+        // dependency (sync #1 reads the device-computed count to size the indices D2H; sync #2
+        // covers the indices D2H), and — unlike the serial single-thread compare/range kernels —
+        // its kernel is PARALLEL (one thread per row + an `atom.global.add` ordered append). The
+        // migration leases the indices/count buffers + the private stream + the cached module from
+        // the SHARED pools while mid-flight, so the new hazard is concurrent contention on those
+        // shared buckets: a buffer (or stream) re-leased before its async D2H drained would surface
+        // as a wrong count, garbage/out-of-range indices, or a duplicated/missing index. Single-
+        // threaded parity cannot exercise that shared-pool reuse, so this test (a) pins byte-exact
+        // ordered parity against known results for the 0-row / all-rows / partial / multi-filter
+        // cases, then (b) hammers the route on N threads over ONE shared resident allocation (hence
+        // the same shared pools) asserting the EXACT ordered result on every call — a reuse bug
+        // surfaces deterministically as a mismatch or a crash.
+        //
+        // Determinism of the EXACT order: the kernel appends via `atom.global.add`, so the physical
+        // order in the output buffer is the atomic SCHEDULE order, which is ascending-by-row only
+        // while every matching row lives in a single warp. With `threads_per_block = 128` a payload
+        // of <= 32 rows launches exactly one warp, so the append order is deterministically
+        // ascending row order (empirically 200/200 stable at <= 32 rows; it stops being stable the
+        // moment a second warp races the atomic). We therefore keep the payload tiny (5 rows, like
+        // the twin), which lets us assert the exact ordered vector without flakiness.
+        use std::sync::{Arc, Barrier};
+
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // Known payload: header(row_count) + two i32 columns (5 rows => single warp).
+        //   col A (constant 5)   @ a_offset : [5, 5, 5, 5, 5]
+        //   col B                @ b_offset : [10, 20, 10, 20, 30]
+        let row_count = 5_u64;
+        let a_offset = std::mem::size_of::<u64>() as u64;
+        let b_offset = a_offset + row_count * std::mem::size_of::<i32>() as u64;
+        let column_a = [5_i32, 5, 5, 5, 5];
+        let column_b = [10_i32, 20, 10, 20, 30];
+        let mut header = Vec::new();
+        header.extend_from_slice(&row_count.to_le_bytes());
+        let mut bytes_a = Vec::new();
+        for value in column_a {
+            bytes_a.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut bytes_b = Vec::new();
+        for value in column_b {
+            bytes_b.extend_from_slice(&value.to_le_bytes());
+        }
+        let allocated_len = b_offset + bytes_b.len() as u64;
+        let resident = Arc::new(
+            runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated_len,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: a_offset,
+                            bytes: &bytes_a,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: b_offset,
+                            bytes: &bytes_b,
+                        },
+                    ],
+                )
+                .expect("retain resident device memory"),
+        );
+
+        // Each case is (filters, expected ordered matching row indices). The matching rows in every
+        // case fit in the single warp, so the atomic-append order is ascending row order.
+        //   all rows : A == 5            -> [0, 1, 2, 3, 4]   (edge: matches ALL rows)
+        //   no rows  : A == 9            -> []                (edge: matches 0 rows)
+        //   partial  : B == 10           -> [0, 2]            (single filter, normal partial)
+        //   AND      : A == 5 AND B == 20-> [1, 3]            (two device-read columns + count dep)
+        type Case = (Vec<(u64, i32)>, Vec<u64>);
+        let cases: &[Case] = &[
+            (vec![(a_offset, 5)], vec![0, 1, 2, 3, 4]),
+            (vec![(a_offset, 9)], vec![]),
+            (vec![(b_offset, 10)], vec![0, 2]),
+            (vec![(a_offset, 5), (b_offset, 20)], vec![1, 3]),
+        ];
+
+        // (a) Single-threaded parity: each filter set returns exactly the expected indices.
+        for (filters, expected) in cases {
+            let got = resident
+                .match_i32_equal_row_indices_from_payload(filters, row_count)
+                .expect("match_i32_equal_row_indices");
+            assert_eq!(
+                &got, expected,
+                "row_indices parity failed for filters {filters:?}"
+            );
+        }
+
+        // Empty input short-circuits to an empty vector (no device work).
+        assert!(resident
+            .match_i32_equal_row_indices_from_payload(&[(a_offset, 5)], 0)
+            .expect("empty match_i32_equal_row_indices")
+            .is_empty());
+
+        // (b) Concurrent pool-reuse storm: every thread runs all cases in a loop on the shared
+        // allocation (shared device/pinned/stream pools + shared module cache), asserting the exact
+        // ordered vector each time. The 0-row and all-rows edges exercise the count→indices
+        // dependency at both extremes (a zero-length and a full-length indices D2H).
+        const THREADS: usize = 8;
+        const ITERS: usize = 300;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let resident = Arc::clone(&resident);
+            let barrier = Arc::clone(&barrier);
+            let cases = cases.to_vec();
+            handles.push(std::thread::spawn(move || {
+                resident
+                    .set_current_context()
+                    .expect("bind primary context on reader thread");
+                barrier.wait();
+                for _ in 0..ITERS {
+                    for (filters, expected) in &cases {
+                        let got = resident
+                            .match_i32_equal_row_indices_from_payload(filters, row_count)
+                            .expect("concurrent match_i32_equal_row_indices");
+                        assert_eq!(
+                            &got, expected,
+                            "concurrent row_indices returned wrong indices for filters {filters:?} \
+                             — a pooled buffer/stream was reused before its async D2H drained?"
+                        );
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("reader thread panicked (crash under pool reuse?)");
+        }
+
+        // After the storm the pools are left sound: a final call is still exactly correct.
+        let final_rows = resident
+            .match_i32_equal_row_indices_from_payload(&[(a_offset, 5), (b_offset, 20)], row_count)
+            .expect("final match_i32_equal_row_indices");
+        assert_eq!(final_rows, vec![1, 3]);
     }
 
     #[test]
