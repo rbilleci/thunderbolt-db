@@ -7119,15 +7119,19 @@ fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
     //   `block_base[G-1] + block_counts[G-1]`. Tiny (G is the block count), so a host scan avoids a
     //   third device scan kernel + a hand-authored shared-memory prefix sum.
     //
-    //   Pass B (`..._scatter_blocks`, G blocks x 1 thread): block `b` re-scans ITS range ASCENDING
-    //   and appends each matching value at `block_base[b] + local++`. One thread per block makes the
-    //   intra-block order ascending BY CONSTRUCTION (no atomics in the ordering path), and disjoint
-    //   `block_base` ranges keep blocks independent — so the global output is exactly the ascending
-    //   per-row matches, identical to the old serial kernel for ANY row_count and match pattern. The
-    //   serial span drops from `rows` to one `chunk` (the longest single-thread pass-B range).
+    //   Pass B (`..._scatter_blocks`, G blocks x BLOCK threads): block `b` compacts ITS range in
+    //   PARALLEL via an ORDERED intra-block prefix-sum — each thread tests its row(s) to a 0/1 flag,
+    //   an intra-block EXCLUSIVE scan (warp `shfl` scan + a tiny shared cross-warp combine) gives
+    //   each match its within-block rank, and the value is scattered at `block_base[b] + rank`
+    //   (+ a per-iteration running base when `chunk > blockDim`). The scan is monotonic in row index,
+    //   so the within-block order is ASCENDING BY CONSTRUCTION (no atomics in the ordering path), and
+    //   disjoint `block_base` ranges keep blocks independent — so the global output is exactly the
+    //   ascending per-row matches, byte-identical to the old serial kernel for ANY row_count and
+    //   match pattern. The serial span drops from one `chunk` (the prior one-thread-per-block scan)
+    //   to `ceil(chunk / blockDim)` ordered-scan steps.
     //
-    // Both kernels loop over `[start, end)` (grid-stride in A, serial in B), so they are correct for
-    // any `chunk`/grid; the host sizes `chunk` so `G = ceil(rows/chunk) <= 65535` for every row_count
+    // Both kernels loop over `[start, end)` (block grid-stride), so they are correct for any
+    // `chunk`/grid; the host sizes `chunk` so `G = ceil(rows/chunk) <= 65535` for every row_count
     // (the CUDA grid-x max), rounding `chunk` up when rows would exceed `65535 * CHUNK_ROWS`.
     const PTX: &[u8] = br#"
 .version 6.0
@@ -7243,6 +7247,27 @@ done:
     ret;
 }
 
+// Pass B (PARALLEL intra-block ordered compaction). Block `b` owns the contiguous row range
+// `[b*chunk, min(b*chunk+chunk, rows))` and ALL `blockDim` threads cooperate (the prior version used
+// ONE thread per block, a serial re-scan ~= the kernel floor). Per iteration of the within-block
+// grid-stride (one row per thread per iteration), every thread computes a 0/1 match `%flag`, then an
+// ORDERED intra-block EXCLUSIVE prefix-sum of the flags assigns each matching row its within-block
+// rank; the value is scattered to `block_base[b] + running + rank`. The scan is monotonic in row
+// index, so the output is ASCENDING by row - byte-identical to the serial append for ANY shape.
+//
+// The intra-block scan is two-level (warp-shuffle + a tiny shared cross-warp combine): (1) a warp
+// inclusive scan of `%flag` via `shfl.sync.up.b32` over the 32 lanes; warp-local exclusive =
+// inclusive - own flag. (2) lane 31 of each warp writes its warp total to `s_scan[warp]`; after a
+// barrier WARP 0 exclusive-scans the warp totals `s_scan[0..nwarps)` (nwarps = blockDim/32 <= 32,
+// since blockDim <= 1024, one warp suffices) and publishes per-warp exclusive prefixes to
+// `s_scan[32+w]` plus the block total to `s_scan[64]`. (3) each thread's within-iteration offset =
+// (warp-local exclusive) + (per-warp prefix). `%running` accumulates the per-iteration block total
+// (matches from earlier stride iterations = strictly lower rows) and stays uniform across the block,
+// so the multi-iteration `chunk > blockDim` path also stays ascending. Loop trip count is
+// block-uniform (iter_base/end are uniform), so every `bar.sync` is reached by the whole block; each
+// `shfl.sync` runs with the full warp converged (the only per-lane branch reconverges before it).
+// Pass A and Pass B test the SAME predicate over the SAME range, so the per-block scatter count
+// equals Pass A's per-block count (count <-> scatter consistency preserved).
 .visible .entry gpu_db_resident_i32_compare_scatter_blocks(
     .param .u64 resident_ptr,
     .param .u64 byte_offset,
@@ -7254,6 +7279,9 @@ done:
     .param .u64 out_values_ptr
 )
 {
+    // shared scratch: [0..32) warp totals, [32..64) per-warp exclusive prefixes, [64] block total.
+    .shared .align 4 .b32 s_scan[65];
+
     .reg .pred %p_done;
     .reg .pred %p_lt;
     .reg .pred %p_lte;
@@ -7264,8 +7292,27 @@ done:
     .reg .pred %p_code_gt;
     .reg .pred %p_code_gte;
     .reg .pred %p_match;
+    .reg .pred %p_recv;
+    .reg .pred %p_inrange;
+    .reg .pred %p_islast;
+    .reg .pred %p_warp0;
+    .reg .pred %p_lane_in;
+    .reg .u32 %thr;
+    .reg .u32 %bdim;
     .reg .u32 %bid;
+    .reg .u32 %lane;
+    .reg .u32 %warp;
+    .reg .u32 %nwarps;
     .reg .u32 %comparison;
+    .reg .u32 %flag;
+    .reg .u32 %incl;
+    .reg .u32 %recv;
+    .reg .u32 %wexcl;
+    .reg .u32 %wtot;
+    .reg .u32 %prefix;
+    .reg .u32 %btot;
+    .reg .u32 %off32;
+    .reg .u32 %tmp32;
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
@@ -7275,12 +7322,16 @@ done:
     .reg .u64 %out_values;
     .reg .u64 %start;
     .reg .u64 %end;
-    .reg .u64 %idx;
+    .reg .u64 %row;
+    .reg .u64 %iter_base;
+    .reg .u64 %stride;
     .reg .u64 %tmp64;
     .reg .u64 %input_addr;
     .reg .u64 %slot;
     .reg .u64 %output_addr;
     .reg .u64 %base_addr;
+    .reg .u64 %running;
+    .reg .u64 %sh_addr;
     .reg .s32 %needle;
     .reg .s32 %r_value;
 
@@ -7296,6 +7347,14 @@ done:
     add.u64 %base, %resident, %offset;
 
     mov.u32 %bid, %ctaid.x;
+    mov.u32 %thr, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+
+    // lane = thr & 31; warp = thr >> 5; nwarps = (bdim + 31) >> 5
+    and.b32 %lane, %thr, 31;
+    shr.u32 %warp, %thr, 5;
+    add.u32 %tmp32, %bdim, 31;
+    shr.u32 %nwarps, %tmp32, 5;
 
     // start = bid * chunk; end = min(start + chunk, rows)
     cvt.u64.u32 %tmp64, %bid;
@@ -7309,12 +7368,28 @@ done:
     add.u64 %base_addr, %block_base, %base_addr;
     ld.global.u64 %slot, [%base_addr];
 
-    mov.u64 %idx, %start;
+    cvt.u64.u32 %stride, %bdim;
+    // iter_base walks start, start+bdim, start+2*bdim, ...; row = iter_base + thr.
+    mov.u64 %iter_base, %start;
+    mov.u64 %running, 0;
+    setp.eq.u32 %p_warp0, %warp, 0;
 
-loop:
-    setp.ge.u64 %p_done, %idx, %end;
-    @%p_done bra done;
-    mul.lo.u64 %input_addr, %idx, 4;
+iter_loop:
+    // Continue while the block still has rows to cover: iter_base < end (block-uniform trip count).
+    setp.ge.u64 %p_done, %iter_base, %end;
+    @%p_done bra iter_done;
+
+    // row = iter_base + thr ; in-range = row < end
+    cvt.u64.u32 %tmp64, %thr;
+    add.u64 %row, %iter_base, %tmp64;
+    setp.lt.u64 %p_inrange, %row, %end;
+
+    mov.u32 %flag, 0;
+    mov.s32 %r_value, 0;
+    @!%p_inrange bra after_pred;
+
+    // value = input[row]; flag = 1 iff the value matches the comparison predicate.
+    mul.lo.u64 %input_addr, %row, 4;
     add.u64 %input_addr, %base, %input_addr;
     ld.global.s32 %r_value, [%input_addr];
     setp.lt.s32 %p_lt, %r_value, %needle;
@@ -7334,18 +7409,108 @@ loop:
     or.pred %p_match, %p_match, %p_gt;
     and.pred %p_gte, %p_gte, %p_code_gte;
     or.pred %p_match, %p_match, %p_gte;
-    @!%p_match bra next;
-    // Append ascending within this block: output[slot] = value; slot += 1.
-    mul.lo.u64 %output_addr, %slot, 4;
+    selp.u32 %flag, 1, 0, %p_match;
+
+after_pred:
+    // ---- warp inclusive scan of %flag over 32 lanes (Hillis-Steele via shfl.sync.up.b32) ----
+    // All 32 lanes participate (the in-range branch reconverged at after_pred); membermask = full.
+    mov.u32 %incl, %flag;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %incl, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %incl, %incl, %recv;
+    // warp-local exclusive = inclusive - own flag
+    sub.u32 %wexcl, %incl, %flag;
+
+    // lane 31 writes the warp total (= inclusive at the top lane) to s_scan[warp].
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra skip_wtot_write;
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    st.shared.u32 [%sh_addr], %incl;
+skip_wtot_write:
+    bar.sync 0;
+
+    // ---- warp 0 exclusive-scans the warp totals s_scan[0..nwarps) ----
+    @!%p_warp0 bra skip_combine;
+    // each lane of warp 0 loads s_scan[lane] if lane < nwarps else 0
+    setp.lt.u32 %p_lane_in, %lane, %nwarps;
+    mov.u32 %wtot, 0;
+    @!%p_lane_in bra have_wtot;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    ld.shared.u32 %wtot, [%sh_addr];
+have_wtot:
+    // inclusive scan of %wtot over the warp (nwarps <= 32, so one warp covers every warp slot)
+    mov.u32 %prefix, %wtot;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 1, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 2, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 4, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 8, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    shfl.sync.up.b32 %recv|%p_recv, %prefix, 16, 0, 0xffffffff;
+    @%p_recv add.u32 %prefix, %prefix, %recv;
+    // exclusive per-warp prefix = inclusive - own total; write to s_scan[32 + lane] (byte 128 + 4*lane).
+    sub.u32 %tmp32, %prefix, %wtot;
+    @!%p_lane_in bra skip_excl_write;
+    mul.wide.u32 %tmp64, %lane, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    st.shared.u32 [%sh_addr], %tmp32;
+skip_excl_write:
+    // lane 31 holds the inclusive scan of ALL warp totals (lanes >= nwarps loaded 0) = block total;
+    // store it to s_scan[64] (byte 256).
+    setp.eq.u32 %p_islast, %lane, 31;
+    @!%p_islast bra skip_combine;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    st.shared.u32 [%sh_addr], %prefix;
+skip_combine:
+    bar.sync 0;
+
+    // ---- scatter: out[slot + running + per-warp-prefix + warp-local-exclusive] = value ----
+    mul.wide.u32 %tmp64, %warp, 4;
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, %tmp64;
+    add.u64 %sh_addr, %sh_addr, 128;
+    ld.shared.u32 %prefix, [%sh_addr];
+    mov.u64 %sh_addr, s_scan;
+    add.u64 %sh_addr, %sh_addr, 256;
+    ld.shared.u32 %btot, [%sh_addr];
+
+    @!%p_inrange bra after_scatter;
+    setp.eq.u32 %p_match, %flag, 1;
+    @!%p_match bra after_scatter;
+    add.u32 %off32, %wexcl, %prefix;
+    cvt.u64.u32 %tmp64, %off32;
+    add.u64 %tmp64, %tmp64, %running;
+    add.u64 %tmp64, %tmp64, %slot;
+    mul.lo.u64 %output_addr, %tmp64, 4;
     add.u64 %output_addr, %out_values, %output_addr;
     st.global.s32 [%output_addr], %r_value;
-    add.u64 %slot, %slot, 1;
 
-next:
-    add.u64 %idx, %idx, 1;
-    bra loop;
+after_scatter:
+    // running += block total (uniform across the block); advance one stride window; fence the
+    // shared scratch before the next iteration's lane-31 writes overwrite it.
+    cvt.u64.u32 %tmp64, %btot;
+    add.u64 %running, %running, %tmp64;
+    add.u64 %iter_base, %iter_base, %stride;
+    bar.sync 0;
+    bra iter_loop;
 
-done:
+iter_done:
     ret;
 }
 "#;
@@ -7422,8 +7587,9 @@ done:
     // `<<<1,1,1>>>` scan, so the route plateaued serial-kernel-bound (~277 µs for a 50k-row scan).
     // The kernel is now an ORDERED PARALLEL COMPACTION (two passes over a contiguous block
     // partition; see the PTX header): a parallel per-block match count, a tiny host exclusive scan
-    // of those counts into per-block base offsets, then a parallel scatter that appends each block's
-    // matches ascending at its base. The output is byte-identical ascending-per-row values for any
+    // of those counts into per-block base offsets, then a parallel scatter that compacts each block's
+    // matches ascending at its base via an ordered intra-block prefix-sum (warp `shfl` scan + a tiny
+    // shared cross-warp combine). The output is byte-identical ascending-per-row values for any
     // row_count and match pattern (no atomic-append, so no atomic-schedule non-determinism). The
     // device scratch is the `block_counts` / `block_base` arrays (G u64 each), leased from the same
     // `OutputBufferPool` as the values buffer.
@@ -7606,8 +7772,9 @@ done:
         }
 
         // (3) Upload the host-scanned base offsets (HtoD, staged through a pooled pinned buffer for
-        // a truly-async DMA), then launch the parallel SCATTER kernel (pass B: one thread per block,
-        // ascending append within each block's range at base+local), then stop the timer.
+        // a truly-async DMA), then launch the parallel SCATTER kernel (pass B: BLOCK threads/block,
+        // ordered intra-block compaction — each match scattered ascending at base+rank), then stop
+        // the timer.
         let base_pinned = resident
             .primary()
             .lease_pinned_host_buffer(block_scratch_bytes);
@@ -7636,7 +7803,7 @@ done:
                 grid,
                 1,
                 1,
-                1,
+                BLOCK,
                 1,
                 1,
                 0,
@@ -7746,7 +7913,7 @@ done:
                 grid,
                 1,
                 1,
-                1,
+                BLOCK,
                 1,
                 1,
                 0,
