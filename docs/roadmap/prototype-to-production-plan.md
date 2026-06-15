@@ -525,6 +525,23 @@ and a harness that measures it:
   RequestVote, heartbeats, election timers, leases/fencing, automatic failover.
 - **Synchronous commit.** `wait_committed` blocks on **fsync'd** quorum acks; durable
   replica acks (not RAM).
+- **Group commit + WAL/fsync optimization (the write-throughput lever — MUST be done here).**
+  Once a durable WAL is the default, the per-commit `fsync` is the write-throughput ceiling: it
+  is the dominant commit cost, and the current commit path serializes **one WAL record per
+  fsync**. Wire true **group commit** — a leader batches every waiting committer's WAL records
+  into ONE fsync (and amortizes the short commit critical section), with **batch-internal SI
+  conflict handling** (a later txn in the same group still aborts first-committer-wins) — so
+  write throughput scales with concurrency instead of capping at 1/fsync. Also cover the rest of
+  the WAL/durability hot path properly: pipelined/async fsync, segment write coalescing, and
+  group-fsync of the replication-ack path. `WalGroupCommitStats` (batch-ratio) instrumentation +
+  `WalDurableSegment` already exist; the leader/follower batching + the async-fsync work are
+  owed. **Benchmark it on the durable WAL** — the in-memory default makes `flush_all` free, so
+  this lever measures ~0 there. (Discovered during the write-half (Thread 4) work: group commit
+  yields ~0 on the in-memory benchmark and is a **durable-WAL-only** win, which is exactly why it
+  belongs in this durability phase rather than in the concurrency flip. The concurrency flip
+  itself is done — optimistic MVCC + short commit-lock + lock-free reads; what remains for write
+  *throughput* is this fsync amortization.) Sweep it together with the Phase 7 data-structure
+  audit over the WAL buffer + replication log.
 - **Crash safety.** Real kill+reopen+replay tests in a `tests/` integration suite;
   wire the offline PITR/archive tooling to continuous object-store archival.
 - **Exit:** a 3-node cluster survives leader kill with zero committed-txn loss and
@@ -555,7 +572,9 @@ and a harness that measures it:
 - **Working set > VRAM.** Multi-GPU / partitioned residency to unblock the 125%
   tier (currently one allocation per table).
 - **Drive the honest path** to >100k TPS sustained and sub-0.5ms p50 without the
-  forbidden response cache; close the COPY ingest gap vs PostgreSQL.
+  forbidden response cache; close the COPY ingest gap vs PostgreSQL. (Write throughput
+  here depends on **Phase 4's group-commit / WAL-fsync optimization**; read-under-write
+  throughput on the lock-free read path + the **Phase 7** data-structure sweep.)
 - **Exit:** published, reproducible curves meeting the `§1.1` targets on the
   execute-from-snapshot path.
 
