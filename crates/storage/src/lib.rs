@@ -229,6 +229,53 @@ impl InMemoryTupleStore {
         );
         Ok(tuple_id)
     }
+
+    /// Insert a fresh version chain at a CALLER-supplied `tuple_id`, skipping the live-key
+    /// uniqueness check (the reserved-key contract). Used when tuple ids are allocated by an
+    /// external shared allocator (the engine's per-table `MvccData` partitions a single
+    /// monotonic id space across partition stores, so ids stay globally unique and identical
+    /// to the pre-partition single store). `tuple_id` must not already exist in this store.
+    pub fn tuple_insert_reserved_key_with_id(
+        &mut self,
+        tuple_id: TupleId,
+        tuple: NewTuple,
+        txn_id: TxnId,
+    ) -> Result<TupleId, StorageError> {
+        if txn_id == 0 {
+            return Err(StorageError::InvalidVisibility);
+        }
+        if self.versions.contains_key(&tuple_id) {
+            return Err(StorageError::AlreadyExists);
+        }
+        self.versions.insert(
+            tuple_id,
+            vec![TupleVersion {
+                tuple_id,
+                key: tuple.key,
+                value: tuple.value,
+                created_by: txn_id,
+                deleted_by: None,
+            }],
+        );
+        Ok(tuple_id)
+    }
+
+    /// Insert a fresh version chain at a CALLER-supplied `tuple_id`, enforcing the live-key
+    /// uniqueness check (the `tuple_insert` contract) within THIS partition store.
+    pub fn tuple_insert_with_id(
+        &mut self,
+        tuple_id: TupleId,
+        tuple: NewTuple,
+        txn_id: TxnId,
+    ) -> Result<TupleId, StorageError> {
+        if txn_id == 0 {
+            return Err(StorageError::InvalidVisibility);
+        }
+        if self.key_exists(&tuple.key) {
+            return Err(StorageError::AlreadyExists);
+        }
+        self.tuple_insert_reserved_key_with_id(tuple_id, tuple, txn_id)
+    }
 }
 
 #[derive(Debug)]
@@ -714,5 +761,77 @@ mod tests {
             }
         );
         assert_eq!(store.tuple_chain_count(), 0);
+    }
+
+    #[test]
+    fn explicit_tuple_id_inserts_place_at_caller_id_and_enforce_contracts() {
+        let mut store = InMemoryTupleStore::new();
+        // Reserved-key variant skips the live-key uniqueness check (relational row keys are unique
+        // per table by construction) and places the chain at the caller-supplied id.
+        let id = store
+            .tuple_insert_reserved_key_with_id(
+                42,
+                NewTuple {
+                    key: "rel/people/0000000000000000001".to_string(),
+                    value: "Ada".to_string(),
+                },
+                7,
+            )
+            .unwrap();
+        assert_eq!(id, 42);
+        assert_eq!(
+            store
+                .tuple_fetch(42, Visibility { read_txn_id: 7 })
+                .unwrap()
+                .map(|v| v.value),
+            Some("Ada".to_string())
+        );
+        // A caller-supplied id that already exists is rejected (never silently overwrites a chain).
+        assert_eq!(
+            store.tuple_insert_reserved_key_with_id(
+                42,
+                NewTuple {
+                    key: "rel/people/0000000000000000002".to_string(),
+                    value: "dupe".to_string(),
+                },
+                8,
+            ),
+            Err(StorageError::AlreadyExists)
+        );
+
+        // The checked variant enforces live-key uniqueness within the partition (KV-namespace use).
+        store
+            .tuple_insert_with_id(
+                43,
+                NewTuple {
+                    key: "kv-key".to_string(),
+                    value: "v1".to_string(),
+                },
+                9,
+            )
+            .unwrap();
+        assert_eq!(
+            store.tuple_insert_with_id(
+                44,
+                NewTuple {
+                    key: "kv-key".to_string(),
+                    value: "v2".to_string(),
+                },
+                10,
+            ),
+            Err(StorageError::AlreadyExists)
+        );
+        // Zero visibility (txn id 0) is rejected by both variants.
+        assert_eq!(
+            store.tuple_insert_reserved_key_with_id(
+                99,
+                NewTuple {
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                },
+                0,
+            ),
+            Err(StorageError::InvalidVisibility)
+        );
     }
 }

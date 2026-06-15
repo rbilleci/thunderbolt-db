@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,9 +36,9 @@ use gpu_db_protocol::{
     TablespacePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
-use gpu_db_snapshot::SnapshotCell;
+use gpu_db_snapshot::{SnapshotCell, SnapshotHandle};
 use gpu_db_storage::{
-    InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleStore, TupleVersion,
+    InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleId, TupleStore, TupleVersion,
     Visibility as StorageVisibility,
 };
 use gpu_db_txn::{TxnError, TxnManager};
@@ -5996,7 +5997,11 @@ pub struct Engine {
     repl: LocalReplicator,
     wal: WalBuffer,
     sm: KvStateMachine,
-    mvcc_store: InMemoryTupleStore,
+    // Versioned, publish-on-commit MVCC data: per-table `SnapshotCell<Arc<TableVersionData>>`
+    // (rows + value-index) + a KV partition, `&self`-readable / lock-free (write-half Stage 3).
+    // Replaces the former mutate-in-place `mvcc_store: InMemoryTupleStore`,
+    // `relational_value_index`, and `relational_next_row_id`.
+    mvcc: MvccData,
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_views: BTreeMap<String, RelationalView>,
     relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
@@ -6013,11 +6018,11 @@ pub struct Engine {
     relational_schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
     relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
-    relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
+    // The value-index and the relational row-id allocator are now folded into `mvcc`
+    // (per-table `TableVersionData::value_index` + `MvccData::next_row_id`).
     relational_resident_cache: RelationalResidentCache,
     relational_next_oid: u32,
     relational_next_column_id: u32,
-    relational_next_row_id: u64,
     wal_commit_timestamps_micros: BTreeMap<TxnId, u64>,
     txn_manager: TxnManager,
     visible_up_to: Index,
@@ -6187,6 +6192,267 @@ impl PartitionResidentDeviceMemoryMap {
             .values()
             .filter(|cell| cell.load().get().is_some())
             .count()
+    }
+}
+
+/// One `(column, value)` slot of a table's equality value-index. The owning table is implied by
+/// the per-table [`SnapshotCell`] the index lives in (write-half MVCC, Stage 3), so unlike the old
+/// global `RelationalIndexKey` this carries no `table` field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ColumnValueKey {
+    column: String,
+    value: String,
+}
+
+/// One table's publish-on-commit MVCC payload: its row version chains **and** its (now versioned)
+/// equality value-index, held together so a reader that `load()`s one generation sees rows and
+/// value-index that are mutually consistent at the same `commit_seq` (write-half MVCC, Stage 3,
+/// design §3.1). The serialized writer publishes ONE new `Arc<TableVersionData>` for the mutated
+/// table per commit; readers run `&self` against the immutable payload with no lock held, exactly
+/// as the GPU residency `SnapshotCell`s already do.
+///
+/// `rows` is an [`InMemoryTupleStore`] holding ONLY this table's `rel/<table>/…` version chains
+/// (the KV namespace lives in its own [`MvccData::kv`] partition). Tuple ids are still allocated
+/// from one process-wide monotonic space ([`MvccData::next_tuple_id`]) so they remain globally
+/// unique and byte-identical to the pre-partition single store — recovery / `all_versions` / prune
+/// are unchanged. `value_index` is the per-table equality index the fast-path reads; it is
+/// append-only under DML (stale entries are filtered out by row visibility + the final predicate
+/// recheck, exactly as before), so a loaded generation's index is always a *superset* consistent
+/// with that generation's rows.
+#[derive(Debug, Clone, Default)]
+struct TableVersionData {
+    rows: InMemoryTupleStore,
+    value_index: BTreeMap<ColumnValueKey, Vec<String>>,
+}
+
+impl TableVersionData {
+    /// The row keys the value-index records for `(column, value)` (the equality fast-path lookup).
+    /// Empty when the slot has no entries — matching the old `relational_value_index.get(...)`
+    /// `.cloned().unwrap_or_default()`.
+    fn index_keys(&self, column: &str, value: &str) -> Vec<String> {
+        self.value_index
+            .get(&ColumnValueKey {
+                column: column.to_string(),
+                value: value.to_string(),
+            })
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// The whole engine's versioned, publish-on-commit MVCC data: a per-table map of
+/// [`SnapshotCell<Arc<TableVersionData>>`] (rows + value-index together) plus a single KV-namespace
+/// partition, behind the residency `SnapshotCell` discipline — monotonic generation ids and epoch
+/// reclamation, so an old `Arc<TableVersionData>` is freed only after its last reader handle drops
+/// (write-half MVCC, Stage 3).
+///
+/// Reads `load()` a partition's current generation once and run `&self` against the immutable
+/// payload. The serialized writer (still under the existing commit lock until Stage 4) mutates a
+/// cheap clone of the relevant partition and `publish`es a fresh `Arc`; in-flight readers keep the
+/// generation they already loaded. `next_row_id`/`next_tuple_id` are atomics so the writer advances
+/// them through `&self` (and so a `prepare_*` can snapshot `next_row_id` off-lock in Stage 4).
+#[derive(Debug)]
+struct MvccData {
+    /// `rel/<table>/…` row chains + the table's value-index, one published generation per table.
+    tables: BTreeMap<String, SnapshotCell<Arc<TableVersionData>>>,
+    /// The non-relational KV namespace (`SET`/`DELETE` keys), published as its own generation. Has
+    /// no value-index (the equality fast-path is relational-only).
+    kv: SnapshotCell<Arc<InMemoryTupleStore>>,
+    /// Process-wide monotonic tuple-id allocator shared across ALL partitions, so tuple ids stay
+    /// globally unique and identical to the pre-partition single `InMemoryTupleStore`.
+    next_tuple_id: AtomicU64,
+    /// The relational row-id allocator (was `relational_next_row_id`), now an atomic.
+    next_row_id: AtomicU64,
+}
+
+impl Default for MvccData {
+    fn default() -> Self {
+        Self {
+            tables: BTreeMap::new(),
+            kv: SnapshotCell::new(Arc::new(InMemoryTupleStore::new())),
+            next_tuple_id: AtomicU64::new(1),
+            next_row_id: AtomicU64::new(1),
+        }
+    }
+}
+
+impl MvccData {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserve the next globally-unique tuple id (serialized writer; `&self` for Stage 4 symmetry).
+    fn reserve_tuple_id(&self) -> TupleId {
+        self.next_tuple_id.fetch_add(1, AtomicOrdering::Relaxed)
+    }
+
+    /// The current relational row-id (the value a `prepare_*` snapshots as its insert base).
+    fn current_row_id(&self) -> u64 {
+        self.next_row_id.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Advance the relational row-id allocator by `n` (serialized writer, on apply).
+    fn advance_row_id(&self, n: u64) {
+        self.next_row_id.fetch_add(n, AtomicOrdering::Relaxed);
+    }
+
+    /// Load the KV partition's currently-published generation (a refcount bump; the read body runs
+    /// lock-free afterward and pins the generation until the handle drops).
+    fn load_kv(&self) -> SnapshotHandle<Arc<InMemoryTupleStore>> {
+        self.kv.load()
+    }
+
+    /// Load `table`'s currently-published generation, if the table has any MVCC data yet. Returns
+    /// `None` before the table's first write (no cell published) — callers treat that as "empty
+    /// table" exactly as a prefix scan over a store with no matching keys did.
+    fn load_table(&self, table: &str) -> Option<SnapshotHandle<Arc<TableVersionData>>> {
+        self.tables.get(table).map(|cell| cell.load())
+    }
+
+    /// A loaded, immutable view of `table`'s rows for the read path — an empty store when the table
+    /// has no cell yet. Returned as an owned value (either the published `Arc`'s payload borrow via
+    /// the handle, or a shared empty store) so callers resolve a `MvccReadQuery` against it.
+    fn table_rows(&self, table: &str) -> TableRowsView {
+        match self.load_table(table) {
+            Some(handle) => TableRowsView::Resident(handle),
+            None => TableRowsView::Empty(Arc::clone(&EMPTY_TABLE_VERSION_DATA)),
+        }
+    }
+
+    /// Mutate a table's payload via copy-on-write and publish the new generation: clone the current
+    /// `TableVersionData` (or start empty), run `mutate`, then `publish` a fresh `Arc`. In-flight
+    /// readers keep the generation they already loaded (epoch reclamation). Serialized writer only.
+    fn with_table_mut<R>(
+        &mut self,
+        table: &str,
+        mutate: impl FnOnce(&mut TableVersionData) -> R,
+    ) -> R {
+        let mut data = match self.tables.get(table) {
+            Some(cell) => TableVersionData::clone(&cell.load().get().clone()),
+            None => TableVersionData::default(),
+        };
+        let result = mutate(&mut data);
+        let data = Arc::new(data);
+        match self.tables.get(table) {
+            Some(cell) => {
+                cell.publish(data);
+            }
+            None => {
+                self.tables
+                    .insert(table.to_string(), SnapshotCell::new(data));
+            }
+        }
+        result
+    }
+
+    /// Mutate the KV partition via copy-on-write and publish the new generation. Serialized writer.
+    fn with_kv_mut<R>(&mut self, mutate: impl FnOnce(&mut InMemoryTupleStore) -> R) -> R {
+        let mut store = InMemoryTupleStore::clone(&self.kv.load().get().clone());
+        let result = mutate(&mut store);
+        self.kv.publish(Arc::new(store));
+        result
+    }
+
+    /// Fetch the visible version of a KV-namespace `key` (test-only helper mirroring the old
+    /// `mvcc_store.tuple_fetch_by_key` for KV keys).
+    #[cfg(test)]
+    fn kv_tuple_fetch_by_key(
+        &self,
+        key: &str,
+        visibility: StorageVisibility,
+    ) -> Result<Option<TupleVersion>, StorageError> {
+        self.load_kv().get().tuple_fetch_by_key(key, visibility)
+    }
+
+    /// Reconstruct the whole-engine value-index keyed by `(table, column, value)` from every
+    /// per-table generation (test-only — the production value-index is the per-table one).
+    #[cfg(test)]
+    fn value_index_snapshot(&self) -> BTreeMap<RelationalIndexKey, Vec<String>> {
+        let mut index = BTreeMap::new();
+        for (table, cell) in self.tables.iter() {
+            for (key, row_keys) in cell.load().get().value_index.iter() {
+                index.insert(
+                    RelationalIndexKey {
+                        table: table.clone(),
+                        column: key.column.clone(),
+                        value: key.value.clone(),
+                    },
+                    row_keys.clone(),
+                );
+            }
+        }
+        index
+    }
+
+    /// Every version in every partition (KV + all tables), sorted by tuple id so the order matches
+    /// the pre-partition single `BTreeMap<TupleId, …>` store — recovery / CUDA all-versions / the
+    /// stamp-determinism tests depend on this order. Test-only (the production all-versions reads
+    /// go through `resolve_mvcc_all_versions` on a single partition).
+    #[cfg(test)]
+    fn all_versions(&self) -> Vec<TupleVersion> {
+        let mut versions = self.kv.load().get().all_versions();
+        for cell in self.tables.values() {
+            versions.extend(cell.load().get().rows.all_versions());
+        }
+        versions.sort_by_key(|version| version.tuple_id);
+        versions
+    }
+
+    /// Total live version count across all partitions (test-only).
+    #[cfg(test)]
+    fn version_count(&self) -> usize {
+        let mut count = self.kv.load().get().version_count();
+        for cell in self.tables.values() {
+            count += cell.load().get().rows.version_count();
+        }
+        count
+    }
+
+    /// Prune versions deleted at or before `safe_txn_id` across every partition, republishing each
+    /// touched partition. Aggregates the per-partition [`PruneStats`].
+    fn prune_versions_deleted_at_or_before(&mut self, safe_txn_id: TxnId) -> PruneStats {
+        let mut total = PruneStats {
+            removed_versions: 0,
+            removed_tuples: 0,
+            remaining_versions: 0,
+        };
+        let kv_stats =
+            self.with_kv_mut(|store| store.prune_versions_deleted_at_or_before(safe_txn_id));
+        total.removed_versions += kv_stats.removed_versions;
+        total.removed_tuples += kv_stats.removed_tuples;
+        total.remaining_versions += kv_stats.remaining_versions;
+        let table_names: Vec<String> = self.tables.keys().cloned().collect();
+        for table in table_names {
+            let stats = self.with_table_mut(&table, |data| {
+                data.rows.prune_versions_deleted_at_or_before(safe_txn_id)
+            });
+            total.removed_versions += stats.removed_versions;
+            total.removed_tuples += stats.removed_tuples;
+            total.remaining_versions += stats.remaining_versions;
+        }
+        total
+    }
+}
+
+/// A shared, permanently-empty `TableVersionData` so [`MvccData::table_rows`] can hand out a view of
+/// a not-yet-written table without allocating a new store per read.
+static EMPTY_TABLE_VERSION_DATA: std::sync::LazyLock<Arc<TableVersionData>> =
+    std::sync::LazyLock::new(|| Arc::new(TableVersionData::default()));
+
+/// A loaded, immutable view of one table's rows for the read path: either the pinned published
+/// generation (the common case) or a shared empty payload for a table with no MVCC data yet.
+enum TableRowsView {
+    Resident(SnapshotHandle<Arc<TableVersionData>>),
+    Empty(Arc<TableVersionData>),
+}
+
+impl TableRowsView {
+    /// Borrow the underlying row store to resolve a `MvccReadQuery` against.
+    fn store(&self) -> &InMemoryTupleStore {
+        match self {
+            TableRowsView::Resident(handle) => &handle.get().rows,
+            TableRowsView::Empty(data) => &data.rows,
+        }
     }
 }
 
@@ -7819,6 +8085,10 @@ fn resident_route_d2h_bytes_estimate(
     }
 }
 
+/// The whole-engine value-index key `(table, column, value)`. With the value-index now folded
+/// per-table into `TableVersionData` (keyed by [`ColumnValueKey`]), this whole-engine flattened
+/// key is only used by test assertions that snapshot the value-index across all tables.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RelationalIndexKey {
     table: String,
@@ -7908,7 +8178,7 @@ enum PreparedMutation {
     Insert {
         table: String,
         inserted_rows: Vec<(String, Vec<SqlValue>)>,
-        value_index_entries: BTreeMap<RelationalIndexKey, Vec<String>>,
+        value_index_entries: BTreeMap<ColumnValueKey, Vec<String>>,
         seq_advances: BTreeMap<String, (i64, bool)>,
     },
     /// In-place version rewrites; `installs` is `(tuple_id, row_key, new_values)` (tuple_id is the
@@ -7916,10 +8186,10 @@ enum PreparedMutation {
     Update {
         table: String,
         installs: Vec<(u64, String, Vec<SqlValue>)>,
-        value_index_entries: BTreeMap<RelationalIndexKey, Vec<String>>,
+        value_index_entries: BTreeMap<ColumnValueKey, Vec<String>>,
     },
-    /// Existing versions to tombstone, by tuple_id.
-    Delete { tuple_ids: Vec<u64> },
+    /// Existing versions to tombstone, by tuple_id, in `table`'s partition.
+    Delete { table: String, tuple_ids: Vec<u64> },
 }
 
 /// A prepared (but not yet installed) write: the [`WriteSet`] for conflict detection plus the
@@ -8018,17 +8288,18 @@ fn relational_index_value(value: &SqlValue) -> String {
     }
 }
 
+/// The per-table value-index entries `rows` contribute, keyed by `(column, value)` (the owning
+/// table is implied by the per-table [`SnapshotCell`]). Append-only: `apply_delta` merges these
+/// into the table's `TableVersionData::value_index`.
 fn relational_value_index_entries_for_rows(
-    table: &str,
     columns: &[RelationalColumn],
     rows: &[(String, Vec<SqlValue>)],
-) -> BTreeMap<RelationalIndexKey, Vec<String>> {
+) -> BTreeMap<ColumnValueKey, Vec<String>> {
     let mut entries = BTreeMap::new();
     for (row_key, values) in rows {
         for (column, value) in columns.iter().zip(values.iter()) {
             entries
-                .entry(RelationalIndexKey {
-                    table: table.to_string(),
+                .entry(ColumnValueKey {
                     column: column.name.clone(),
                     value: relational_index_value(value),
                 })
@@ -9049,7 +9320,7 @@ impl Engine {
             repl: LocalReplicator::leader(),
             wal: WalBuffer::default(),
             sm: KvStateMachine::default(),
-            mvcc_store: InMemoryTupleStore::new(),
+            mvcc: MvccData::new(),
             relational_catalog: BTreeMap::new(),
             relational_views: BTreeMap::new(),
             relational_materialized_views: BTreeMap::new(),
@@ -9066,11 +9337,9 @@ impl Engine {
             relational_schema_acl: BTreeMap::new(),
             relational_default_table_acl: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
-            relational_value_index: BTreeMap::new(),
             relational_resident_cache: RelationalResidentCache::default(),
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
-            relational_next_row_id: 1,
             wal_commit_timestamps_micros: BTreeMap::new(),
             txn_manager: TxnManager::default(),
             visible_up_to: 0,
@@ -9548,29 +9817,49 @@ impl Engine {
 
         match cmd {
             Command::SetKv { key, value } => {
-                if let Some(tuple) = self
-                    .mvcc_store
+                // KV lives in its own partition. Read the current version under the loaded
+                // generation, then publish a new KV generation with the update/insert applied.
+                let existing = self
+                    .mvcc
+                    .load_kv()
+                    .get()
                     .tuple_fetch_by_key(&key, visibility)
-                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
-                {
-                    self.mvcc_store
-                        .tuple_update(tuple.tuple_id, value, commit_seq)
-                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                let tuple_id = if existing.is_none() {
+                    Some(self.mvcc.reserve_tuple_id())
                 } else {
-                    self.mvcc_store
-                        .tuple_insert(NewTuple { key, value }, commit_seq)
-                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                }
+                    None
+                };
+                self.mvcc.with_kv_mut(|store| {
+                    if let Some(tuple) = existing {
+                        store
+                            .tuple_update(tuple.tuple_id, value, commit_seq)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))
+                    } else {
+                        store
+                            .tuple_insert_with_id(
+                                tuple_id.expect("fresh id reserved for new key"),
+                                NewTuple { key, value },
+                                commit_seq,
+                            )
+                            .map(|_| ())
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))
+                    }
+                })?;
             }
             Command::DeleteKv { key } => {
-                if let Some(tuple) = self
-                    .mvcc_store
+                let existing = self
+                    .mvcc
+                    .load_kv()
+                    .get()
                     .tuple_fetch_by_key(&key, visibility)
-                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
-                {
-                    self.mvcc_store
-                        .tuple_delete(tuple.tuple_id, commit_seq)
-                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                if let Some(tuple) = existing {
+                    self.mvcc.with_kv_mut(|store| {
+                        store
+                            .tuple_delete(tuple.tuple_id, commit_seq)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))
+                    })?;
                 }
             }
             Command::CreateSchema(create) => self.apply_create_schema(create)?,
@@ -10913,8 +11202,12 @@ impl Engine {
     ) -> Result<Vec<Vec<SqlValue>>, EngineError> {
         let prefix = relational_key_prefix(&table.name);
         let mut rows = Vec::new();
-        let mut cursor = self
-            .mvcc_store
+        // Load this table's published MVCC generation; the cursor reads its immutable rows
+        // lock-free (the prefix filter is redundant now each partition is single-table, but kept
+        // so the read stays correct regardless of partition contents — write-half Stage 3).
+        let table_rows = self.mvcc.table_rows(&table.name);
+        let mut cursor = table_rows
+            .store()
             .seq_scan_open(visibility)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
         while let Some(tuple) = cursor.next() {
@@ -11350,36 +11643,24 @@ impl Engine {
         let visibility = StorageVisibility {
             read_txn_id: txn_id,
         };
+        // Read the rows to move out of the OLD partition's published generation.
         let mut moves = Vec::new();
-        let mut cursor = self
-            .mvcc_store
-            .seq_scan_open(visibility)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        while let Some(tuple) = cursor.next() {
-            if tuple.key.starts_with(&old_prefix) {
-                moves.push((tuple.tuple_id, tuple.value.clone()));
+        {
+            let old_rows = self.mvcc.table_rows(&rename.old_name);
+            let mut cursor = old_rows
+                .store()
+                .seq_scan_open(visibility)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            while let Some(tuple) = cursor.next() {
+                if tuple.key.starts_with(&old_prefix) {
+                    moves.push((tuple.tuple_id, tuple.value.clone()));
+                }
             }
         }
-        drop(cursor);
 
-        for (tuple_id, value) in moves {
-            let row_id = self.relational_next_row_id;
-            self.relational_next_row_id += 1;
-            let new_key = relational_row_key(&rename.new_name, row_id);
-            self.mvcc_store
-                .tuple_insert(
-                    NewTuple {
-                        key: new_key,
-                        value,
-                    },
-                    txn_id,
-                )
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            self.mvcc_store
-                .tuple_delete(tuple_id, txn_id)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        }
-
+        // Build the moved rows + their value-index for the NEW table (decoded against the renamed
+        // table's columns), reserving fresh global tuple ids and relational row ids — identical to
+        // the old in-line per-row bumps.
         table.name = rename.new_name.clone();
         for index in &mut table.indexes {
             index.table = rename.new_name.clone();
@@ -11389,6 +11670,63 @@ impl Engine {
                 foreign_key.referenced_table = rename.new_name.clone();
             }
         }
+        let mut new_rows: Vec<(TupleId, String, String)> = Vec::with_capacity(moves.len());
+        let mut new_value_index: BTreeMap<ColumnValueKey, Vec<String>> = BTreeMap::new();
+        let old_tuple_ids: Vec<TupleId> = moves.iter().map(|(tuple_id, _)| *tuple_id).collect();
+        for (_old_tuple_id, value) in &moves {
+            let row_id = self.mvcc.current_row_id();
+            self.mvcc.advance_row_id(1);
+            let new_key = relational_row_key(&rename.new_name, row_id);
+            let new_tuple_id = self.mvcc.reserve_tuple_id();
+            let values = decode_relational_row(value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            for (column, column_value) in table.columns.iter().zip(values.iter()) {
+                new_value_index
+                    .entry(ColumnValueKey {
+                        column: column.name.clone(),
+                        value: relational_index_value(column_value),
+                    })
+                    .or_default()
+                    .push(new_key.clone());
+            }
+            new_rows.push((new_tuple_id, new_key, value.clone()));
+        }
+
+        // Publish the NEW table partition with the moved rows + rebuilt value-index.
+        self.mvcc.with_table_mut(&rename.new_name, |data| {
+            for (tuple_id, new_key, value) in &new_rows {
+                data.rows
+                    .tuple_insert_with_id(
+                        *tuple_id,
+                        NewTuple {
+                            key: new_key.clone(),
+                            value: value.clone(),
+                        },
+                        txn_id,
+                    )
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            }
+            for (key, keys) in &new_value_index {
+                data.value_index
+                    .entry(key.clone())
+                    .or_default()
+                    .extend(keys.iter().cloned());
+            }
+            Ok::<(), EngineError>(())
+        })?;
+
+        // Tombstone the moved rows in the OLD partition (keeping their history, exactly as the
+        // old in-line `tuple_delete` did) and clear the old partition's value-index.
+        self.mvcc.with_table_mut(&rename.old_name, |data| {
+            for old_tuple_id in &old_tuple_ids {
+                data.rows
+                    .tuple_delete(*old_tuple_id, txn_id)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            }
+            data.value_index.clear();
+            Ok::<(), EngineError>(())
+        })?;
+
         self.relational_catalog
             .insert(rename.new_name.clone(), table.clone());
         for candidate in self.relational_catalog.values_mut() {
@@ -11396,34 +11734,6 @@ impl Engine {
                 if foreign_key.referenced_table == rename.old_name {
                     foreign_key.referenced_table = rename.new_name.clone();
                 }
-            }
-        }
-
-        self.relational_value_index
-            .retain(|key, _| key.table != rename.old_name);
-        let visibility = StorageVisibility {
-            read_txn_id: txn_id,
-        };
-        let new_prefix = relational_key_prefix(&rename.new_name);
-        let mut cursor = self
-            .mvcc_store
-            .seq_scan_open(visibility)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        while let Some(tuple) = cursor.next() {
-            if !tuple.key.starts_with(&new_prefix) {
-                continue;
-            }
-            let values = decode_relational_row(&tuple.value, &table.columns)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            for (column, value) in table.columns.iter().zip(values.iter()) {
-                self.relational_value_index
-                    .entry(RelationalIndexKey {
-                        table: rename.new_name.clone(),
-                        column: column.name.clone(),
-                        value: relational_index_value(value),
-                    })
-                    .or_default()
-                    .push(tuple.key.clone());
             }
         }
 
@@ -11487,20 +11797,31 @@ impl Engine {
                 read_txn_id: txn_id,
             };
             let mut tuple_ids = Vec::new();
-            let mut cursor = self
-                .mvcc_store
-                .seq_scan_open(visibility)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            while let Some(tuple) = cursor.next() {
-                if tuple.key.starts_with(&prefix) {
-                    tuple_ids.push(tuple.tuple_id);
+            {
+                let table_rows = self.mvcc.table_rows(name);
+                let mut cursor = table_rows
+                    .store()
+                    .seq_scan_open(visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                while let Some(tuple) = cursor.next() {
+                    if tuple.key.starts_with(&prefix) {
+                        tuple_ids.push(tuple.tuple_id);
+                    }
                 }
             }
-            std::mem::drop(cursor);
-            for tuple_id in tuple_ids {
-                self.mvcc_store
-                    .tuple_delete(tuple_id, txn_id)
-                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            // Tombstone the dropped table's rows in place (keeping their version history, exactly
+            // as the old single-store `tuple_delete` did), publishing one new generation. The
+            // partition cell + (now-stale) value-index are retained — `all_versions` still sees the
+            // tombstoned versions, matching the pre-partition behavior.
+            if !tuple_ids.is_empty() {
+                self.mvcc.with_table_mut(name, |data| {
+                    for tuple_id in &tuple_ids {
+                        data.rows
+                            .tuple_delete(*tuple_id, txn_id)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    }
+                    Ok::<(), EngineError>(())
+                })?;
             }
 
             let index_names = table
@@ -11625,20 +11946,30 @@ impl Engine {
             read_txn_id: txn_id,
         };
         let mut tuple_ids = Vec::new();
-        let mut cursor = self
-            .mvcc_store
-            .seq_scan_open(visibility)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        while let Some(tuple) = cursor.next() {
-            if tuple.key.starts_with(&prefix) {
-                tuple_ids.push(tuple.tuple_id);
+        {
+            let table_rows = self.mvcc.table_rows(&truncate.name);
+            let mut cursor = table_rows
+                .store()
+                .seq_scan_open(visibility)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            while let Some(tuple) = cursor.next() {
+                if tuple.key.starts_with(&prefix) {
+                    tuple_ids.push(tuple.tuple_id);
+                }
             }
         }
-        std::mem::drop(cursor);
-        for tuple_id in tuple_ids {
-            self.mvcc_store
-                .tuple_delete(tuple_id, txn_id)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        // Tombstone all rows in place (keeping history), publishing one new generation. As before,
+        // the value-index is left as-is; its now-stale entries point to tombstoned rows and are
+        // filtered out by visibility + the predicate recheck.
+        if !tuple_ids.is_empty() {
+            self.mvcc.with_table_mut(&truncate.name, |data| {
+                for tuple_id in &tuple_ids {
+                    data.rows
+                        .tuple_delete(*tuple_id, txn_id)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+                Ok::<(), EngineError>(())
+            })?;
         }
         if truncate.restart_identity {
             for sequence in restart_sequences {
@@ -13072,43 +13403,50 @@ impl Engine {
         };
         let mut updates = Vec::new();
         let mut default_values = default_values.into_iter();
-        let mut cursor = self
-            .mvcc_store
-            .seq_scan_open(visibility)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        while let Some(tuple) = cursor.next() {
-            if !tuple.key.starts_with(&prefix) {
-                continue;
-            }
-            let mut row = decode_relational_row(&tuple.value, &table.columns)
+        {
+            let table_rows = self.mvcc.table_rows(&add.table);
+            let mut cursor = table_rows
+                .store()
+                .seq_scan_open(visibility)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            let default_value = default_values.next().ok_or_else(|| {
-                EngineError::ApplyFailed("ADD COLUMN default rewrite row count drifted".to_string())
-            })?;
-            row.push(default_value);
-            updates.push((tuple.tuple_id, tuple.key.clone(), row));
+            while let Some(tuple) = cursor.next() {
+                if !tuple.key.starts_with(&prefix) {
+                    continue;
+                }
+                let mut row = decode_relational_row(&tuple.value, &table.columns)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                let default_value = default_values.next().ok_or_else(|| {
+                    EngineError::ApplyFailed(
+                        "ADD COLUMN default rewrite row count drifted".to_string(),
+                    )
+                })?;
+                row.push(default_value);
+                updates.push((tuple.tuple_id, tuple.key.clone(), row));
+            }
         }
-        drop(cursor);
         if default_values.next().is_some() {
             return Err(EngineError::ApplyFailed(
                 "ADD COLUMN default rewrite row count drifted".to_string(),
             ));
         }
 
-        for (tuple_id, row_key, values) in updates {
-            let index_value = values.last().expect("new column default appended").clone();
-            self.mvcc_store
-                .tuple_update(tuple_id, encode_relational_row(&values), txn_id)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            self.relational_value_index
-                .entry(RelationalIndexKey {
-                    table: add.table.clone(),
-                    column: new_column.name.clone(),
-                    value: relational_index_value(&index_value),
-                })
-                .or_default()
-                .push(row_key);
-        }
+        let new_column_name = new_column.name.clone();
+        self.mvcc.with_table_mut(&add.table, |data| {
+            for (tuple_id, row_key, values) in &updates {
+                let index_value = values.last().expect("new column default appended").clone();
+                data.rows
+                    .tuple_update(*tuple_id, encode_relational_row(values), txn_id)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                data.value_index
+                    .entry(ColumnValueKey {
+                        column: new_column_name.clone(),
+                        value: relational_index_value(&index_value),
+                    })
+                    .or_default()
+                    .push(row_key.clone());
+            }
+            Ok::<(), EngineError>(())
+        })?;
         let table_ref = self
             .relational_catalog
             .get_mut(&add.table)
@@ -13158,25 +13496,28 @@ impl Engine {
             )));
         }
 
-        let mut renamed_index_entries = Vec::new();
-        self.relational_value_index.retain(|key, row_keys| {
-            if key.table == rename.table && key.column == rename.old_name {
-                renamed_index_entries.push((
-                    RelationalIndexKey {
-                        table: key.table.clone(),
-                        column: rename.new_name.clone(),
-                        value: key.value.clone(),
-                    },
-                    row_keys.clone(),
-                ));
-                false
-            } else {
-                true
+        // Rename the column within this table's per-table value-index (keys are `(column, value)`),
+        // publishing one new generation.
+        self.mvcc.with_table_mut(&rename.table, |data| {
+            let mut renamed_index_entries = Vec::new();
+            data.value_index.retain(|key, row_keys| {
+                if key.column == rename.old_name {
+                    renamed_index_entries.push((
+                        ColumnValueKey {
+                            column: rename.new_name.clone(),
+                            value: key.value.clone(),
+                        },
+                        row_keys.clone(),
+                    ));
+                    false
+                } else {
+                    true
+                }
+            });
+            for (key, row_keys) in renamed_index_entries {
+                data.value_index.insert(key, row_keys);
             }
         });
-        for (key, row_keys) in renamed_index_entries {
-            self.relational_value_index.insert(key, row_keys);
-        }
 
         let table_ref = self
             .relational_catalog
@@ -13295,28 +13636,34 @@ impl Engine {
             read_txn_id: txn_id,
         };
         let mut updates = Vec::new();
-        let mut cursor = self
-            .mvcc_store
-            .seq_scan_open(visibility)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        while let Some(tuple) = cursor.next() {
-            if !tuple.key.starts_with(&prefix) {
-                continue;
+        {
+            let table_rows = self.mvcc.table_rows(&drop_column.table);
+            let mut cursor = table_rows
+                .store()
+                .seq_scan_open(visibility)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            while let Some(tuple) = cursor.next() {
+                if !tuple.key.starts_with(&prefix) {
+                    continue;
+                }
+                let mut row = decode_relational_row(&tuple.value, &table.columns)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                row.remove(drop_idx);
+                updates.push((tuple.tuple_id, row));
             }
-            let mut row = decode_relational_row(&tuple.value, &table.columns)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            row.remove(drop_idx);
-            updates.push((tuple.tuple_id, row));
         }
-        drop(cursor);
 
-        for (tuple_id, values) in updates {
-            self.mvcc_store
-                .tuple_update(tuple_id, encode_relational_row(&values), txn_id)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        }
-        self.relational_value_index
-            .retain(|key, _| !(key.table == drop_column.table && key.column == drop_column.column));
+        let dropped_column_name = drop_column.column.clone();
+        self.mvcc.with_table_mut(&drop_column.table, |data| {
+            for (tuple_id, values) in &updates {
+                data.rows
+                    .tuple_update(*tuple_id, encode_relational_row(values), txn_id)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            }
+            data.value_index
+                .retain(|key, _| key.column != dropped_column_name);
+            Ok::<(), EngineError>(())
+        })?;
 
         let dropped_attnum = table.columns[drop_idx].attnum;
         let table_ref = self
@@ -13380,7 +13727,7 @@ impl Engine {
     fn dml_read_snapshot(&self, commit_seq: TxnId) -> DmlReadSnapshot {
         DmlReadSnapshot {
             commit_seq,
-            next_row_id: self.relational_next_row_id,
+            next_row_id: self.mvcc.current_row_id(),
         }
     }
 
@@ -13532,7 +13879,7 @@ impl Engine {
             inserted_rows.push((row_key, values));
         }
         let value_index_entries =
-            relational_value_index_entries_for_rows(&insert.table, &table.columns, &inserted_rows);
+            relational_value_index_entries_for_rows(&table.columns, &inserted_rows);
 
         let mut write_set = WriteSet::default();
         for (row_key, values) in &inserted_rows {
@@ -13579,11 +13926,12 @@ impl Engine {
             read_txn_id: txn_id,
         };
         let prefix = relational_key_prefix(&delete.table);
-        // Resolve (tuple_id, key, row) for each matching version: tuple_id is what apply
-        // tombstones; key/row feed the write-set's row + unique-slot entries.
+        // Resolve (tuple_id, key, row) for each matching version against this table's published
+        // generation: tuple_id is what apply tombstones; key/row feed the write-set entries.
+        let table_rows = self.mvcc.table_rows(&delete.table);
         let mut deletes: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
-        let mut cursor = self
-            .mvcc_store
+        let mut cursor = table_rows
+            .store()
             .seq_scan_open(visibility)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
 
@@ -13614,8 +13962,8 @@ impl Engine {
                 .map(|(tuple_id, _, _)| *tuple_id)
                 .collect::<BTreeSet<_>>();
             let mut candidate_rows = Vec::new();
-            let mut cursor = self
-                .mvcc_store
+            let mut cursor = table_rows
+                .store()
                 .seq_scan_open(visibility)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             while let Some(tuple) = cursor.next() {
@@ -13646,7 +13994,10 @@ impl Engine {
         Ok(WriteDelta {
             write_set,
             rows_consumed: 0,
-            mutation: PreparedMutation::Delete { tuple_ids },
+            mutation: PreparedMutation::Delete {
+                table: delete.table.clone(),
+                tuple_ids,
+            },
         })
     }
 
@@ -13685,8 +14036,9 @@ impl Engine {
         let prefix = relational_key_prefix(&update.table);
         let mut updates = Vec::new();
         let mut candidate_rows = Vec::new();
-        let mut cursor = self
-            .mvcc_store
+        let table_rows = self.mvcc.table_rows(&update.table);
+        let mut cursor = table_rows
+            .store()
             .seq_scan_open(visibility)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
 
@@ -13745,7 +14097,7 @@ impl Engine {
             .map(|(_, key, row)| (key.clone(), row.clone()))
             .collect();
         let value_index_entries =
-            relational_value_index_entries_for_rows(&update.table, &table.columns, &updated_rows);
+            relational_value_index_entries_for_rows(&table.columns, &updated_rows);
 
         let mut write_set = WriteSet::default();
         for (_, key, row) in &updates {
@@ -13774,10 +14126,12 @@ impl Engine {
     /// Install a prepared [`WriteDelta`], stamping new versions with `commit_seq` (Stage 0
     /// stamp/boundary unification: `commit_seq == entry.index`). This is the ONLY `&mut self`
     /// half of the write apply. It mutates exactly the structures the write-set names — the
-    /// mvcc store (version inserts / tombstones), `relational_value_index`, and
-    /// `relational_next_row_id` — and nothing else. Still called under the existing commit lock
-    /// (no concurrency until Stage 4); the combination `prepare_* (off-lock) + apply_delta`
-    /// is byte-identical to the old direct apply.
+    /// mutated table's `TableVersionData` (its row chains + value-index) and the relational
+    /// row-id allocator — and nothing else, then **publishes** one new `Arc<TableVersionData>`
+    /// for that table (write-half Stage 3: per-table publish-on-commit). Still called under the
+    /// existing commit lock (no concurrency until Stage 4); `prepare_* (off-lock) + apply_delta`
+    /// is byte-identical to the old direct apply. Single-table per mutation is the norm; each
+    /// `PreparedMutation` names exactly one table, so each apply publishes exactly one generation.
     fn apply_delta(
         &mut self,
         delta: WriteDelta,
@@ -13786,7 +14140,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         match delta.mutation {
             PreparedMutation::Insert {
-                table: _table,
+                table,
                 inserted_rows,
                 value_index_entries,
                 seq_advances,
@@ -13801,59 +14155,76 @@ impl Engine {
                         seq.is_called = is_called;
                     }
                 }
+                // Reserve the globally-unique tuple ids up front (the old in-line bump consumed one
+                // per row from the single shared allocator; `next_tuple_id` is now shared across all
+                // partitions so ids are identical). Advance the relational row-id allocator by the
+                // same count `prepare_insert` already computed its row keys from.
+                let tuple_ids: Vec<TupleId> = (0..inserted_rows.len())
+                    .map(|_| self.mvcc.reserve_tuple_id())
+                    .collect();
+                self.mvcc.advance_row_id(inserted_rows.len() as u64);
                 let mvcc_insert_started = Instant::now();
-                for (row_key, values) in &inserted_rows {
-                    // Reserve the row-id this insert consumes (matches the old in-line bump);
-                    // `prepare_insert` already computed `row_key` from the same base.
-                    self.relational_next_row_id += 1;
-                    self.mvcc_store
-                        .tuple_insert_reserved_key(
-                            NewTuple {
-                                key: row_key.clone(),
-                                value: encode_relational_row(values),
-                            },
-                            commit_seq,
-                        )
-                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                }
+                let insert_result = self.mvcc.with_table_mut(&table, |data| {
+                    for (tuple_id, (row_key, values)) in tuple_ids.iter().zip(inserted_rows.iter())
+                    {
+                        data.rows
+                            .tuple_insert_reserved_key_with_id(
+                                *tuple_id,
+                                NewTuple {
+                                    key: row_key.clone(),
+                                    value: encode_relational_row(values),
+                                },
+                                commit_seq,
+                            )
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    }
+                    // Append the value-index entries within the SAME published generation, so a
+                    // reader that loads it sees rows + value-index mutually consistent.
+                    for (key, mut row_keys) in value_index_entries {
+                        data.value_index
+                            .entry(key)
+                            .or_default()
+                            .append(&mut row_keys);
+                    }
+                    Ok::<(), EngineError>(())
+                });
+                insert_result?;
                 if let Some(profile) = profile.as_mut() {
+                    // The row inserts and the value-index append now happen inside one published
+                    // mutation (`with_table_mut`); attribute the whole window to the insert timer.
                     profile.mvcc_insert_micros += mvcc_insert_started.elapsed().as_micros();
-                }
-                let value_index_started = Instant::now();
-                for (key, mut row_keys) in value_index_entries {
-                    self.relational_value_index
-                        .entry(key)
-                        .or_default()
-                        .append(&mut row_keys);
-                }
-                if let Some(profile) = profile.as_mut() {
-                    profile.value_index_append_micros += value_index_started.elapsed().as_micros();
                 }
                 debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
             }
             PreparedMutation::Update {
-                table: _table,
+                table,
                 installs,
                 value_index_entries,
             } => {
-                for (tuple_id, _row_key, values) in &installs {
-                    self.mvcc_store
-                        .tuple_update(*tuple_id, encode_relational_row(values), commit_seq)
-                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                }
-                for (key, mut row_keys) in value_index_entries {
-                    self.relational_value_index
-                        .entry(key)
-                        .or_default()
-                        .append(&mut row_keys);
-                }
+                self.mvcc.with_table_mut(&table, |data| {
+                    for (tuple_id, _row_key, values) in &installs {
+                        data.rows
+                            .tuple_update(*tuple_id, encode_relational_row(values), commit_seq)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    }
+                    for (key, mut row_keys) in value_index_entries {
+                        data.value_index
+                            .entry(key)
+                            .or_default()
+                            .append(&mut row_keys);
+                    }
+                    Ok::<(), EngineError>(())
+                })?;
             }
-            PreparedMutation::Delete { tuple_ids } => {
-                for tuple_id in tuple_ids {
-                    self.mvcc_store
-                        .tuple_delete(tuple_id, commit_seq)
-                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                }
+            PreparedMutation::Delete { table, tuple_ids } => {
+                self.mvcc.with_table_mut(&table, |data| {
+                    for tuple_id in tuple_ids {
+                        data.rows
+                            .tuple_delete(tuple_id, commit_seq)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    }
+                    Ok::<(), EngineError>(())
+                })?;
             }
         }
         Ok(())
@@ -14945,8 +15316,9 @@ impl Engine {
                 };
                 let prefix = relational_key_prefix(&update.table);
                 let mut candidate_rows = Vec::new();
-                let mut cursor = self
-                    .mvcc_store
+                let table_rows = self.mvcc.table_rows(&update.table);
+                let mut cursor = table_rows
+                    .store()
                     .seq_scan_open(visibility)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 while let Some(tuple) = cursor.next() {
@@ -14996,8 +15368,9 @@ impl Engine {
                 };
                 let prefix = relational_key_prefix(&delete.table);
                 let mut candidate_rows = Vec::new();
-                let mut cursor = self
-                    .mvcc_store
+                let table_rows = self.mvcc.table_rows(&delete.table);
+                let mut cursor = table_rows
+                    .store()
                     .seq_scan_open(visibility)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 while let Some(tuple) = cursor.next() {
@@ -15622,7 +15995,7 @@ impl Engine {
         }
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
         let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
-        let result = self.execute_mvcc_query(&query)?;
+        let result = self.execute_mvcc_query_on_table(&select.table, &query)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
@@ -15664,7 +16037,8 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
         let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
-        let result = self.execute_mvcc_query_with_cuda_driver_probe(&query)?;
+        let result =
+            self.execute_mvcc_query_with_cuda_driver_probe_on_table(&select.table, &query)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
@@ -21217,7 +21591,8 @@ impl Engine {
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
         let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
-        let result = self.execute_mvcc_query_with_backend(&query, backend)?;
+        let result =
+            self.execute_mvcc_query_with_backend_on_table(&select.table, &query, backend)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
@@ -21393,14 +21768,15 @@ impl Engine {
                 .get(*column_idx)
                 .expect("bound filter column came from table");
             let mut keys = if *op == SelectFilterOp::Eq {
-                self.relational_value_index
-                    .get(&RelationalIndexKey {
-                        table: select.table.clone(),
-                        column: table_column.name.clone(),
-                        value: relational_index_value(value),
-                    })
-                    .cloned()
-                    .unwrap_or_default()
+                // Equality fast-path: read this table's versioned value-index from its loaded
+                // generation (one `load()` — the index is per-table, so no other table's writes
+                // touch it). Stays O(log) + snapshot-consistent; does NOT scan version chains.
+                match self.mvcc.load_table(&select.table) {
+                    Some(handle) => handle
+                        .get()
+                        .index_keys(&table_column.name, &relational_index_value(value)),
+                    None => Vec::new(),
+                }
             } else {
                 self.relational_keys_matching_filter(table, *column_idx, *op, value)?
             };
@@ -21492,6 +21868,9 @@ impl Engine {
         table_name: &str,
         filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
     ) -> Option<(usize, Vec<String>)> {
+        // Load this table's generation once; every equality slot reads its versioned value-index
+        // (per-table, snapshot-consistent — write-half Stage 3).
+        let table_data = self.mvcc.load_table(table_name);
         let mut column_idx = None;
         let mut keys = BTreeSet::new();
         for group in filter_groups {
@@ -21510,12 +21889,12 @@ impl Engine {
                 .columns
                 .get(*idx)
                 .expect("bound filter column came from table");
-            if let Some(index_keys) = self.relational_value_index.get(&RelationalIndexKey {
-                table: table_name.to_string(),
-                column: column.name.clone(),
-                value: relational_index_value(value),
-            }) {
-                keys.extend(index_keys.iter().cloned());
+            if let Some(handle) = table_data.as_ref() {
+                keys.extend(
+                    handle
+                        .get()
+                        .index_keys(&column.name, &relational_index_value(value)),
+                );
             }
         }
         column_idx.map(|idx| (idx, keys.into_iter().collect()))
@@ -21531,9 +21910,10 @@ impl Engine {
         let visibility = StorageVisibility {
             read_txn_id: self.visible_up_to,
         };
+        let table_rows = self.mvcc.table_rows(&table.name);
         let mut keyed_rows = Vec::new();
         for key in keys {
-            let Some(tuple) = self.mvcc_store.tuple_fetch_by_key(&key, visibility)? else {
+            let Some(tuple) = table_rows.store().tuple_fetch_by_key(&key, visibility)? else {
                 continue;
             };
             let decoded = decode_relational_row(&tuple.value, &table.columns)?;
@@ -21553,7 +21933,8 @@ impl Engine {
         let visibility = StorageVisibility {
             read_txn_id: self.visible_up_to,
         };
-        let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
+        let table_rows = self.mvcc.table_rows(&table.name);
+        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
         let prefix = relational_key_prefix(&table.name);
         let mut keys = Vec::new();
         while let Some(tuple) = cursor.next() {
@@ -21575,6 +21956,9 @@ impl Engine {
         filters: &[(usize, SelectFilterOp, SqlValue)],
     ) -> Result<Vec<String>, ExecuteError> {
         if filters.iter().all(|(_, op, _)| *op == SelectFilterOp::Eq) {
+            // Conjunctive equality fast-path: intersect the per-column value-index hit sets, all
+            // read from one loaded generation of this table (per-table index, snapshot-consistent).
+            let table_data = self.mvcc.load_table(&table.name);
             let mut sets = filters
                 .iter()
                 .map(|(idx, _op, value)| {
@@ -21582,14 +21966,14 @@ impl Engine {
                         .columns
                         .get(*idx)
                         .expect("bound filter column came from table");
-                    self.relational_value_index
-                        .get(&RelationalIndexKey {
-                            table: table.name.clone(),
-                            column: column.name.clone(),
-                            value: relational_index_value(value),
-                        })
-                        .map(|keys| keys.iter().cloned().collect::<BTreeSet<_>>())
-                        .unwrap_or_default()
+                    match table_data.as_ref() {
+                        Some(handle) => handle
+                            .get()
+                            .index_keys(&column.name, &relational_index_value(value))
+                            .into_iter()
+                            .collect::<BTreeSet<_>>(),
+                        None => BTreeSet::new(),
+                    }
                 })
                 .collect::<Vec<_>>();
             if sets.is_empty() {
@@ -21609,7 +21993,8 @@ impl Engine {
         let visibility = StorageVisibility {
             read_txn_id: self.visible_up_to,
         };
-        let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
+        let table_rows = self.mvcc.table_rows(&table.name);
+        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
         let prefix = relational_key_prefix(&table.name);
         let mut keys = Vec::new();
         while let Some(tuple) = cursor.next() {
@@ -21636,7 +22021,8 @@ impl Engine {
         let visibility = StorageVisibility {
             read_txn_id: self.visible_up_to,
         };
-        let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
+        let table_rows = self.mvcc.table_rows(&table.name);
+        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
         let prefix = relational_key_prefix(&table.name);
         let mut keys = BTreeSet::new();
         while let Some(tuple) = cursor.next() {
@@ -21662,7 +22048,8 @@ impl Engine {
         order_idx: usize,
         descending: bool,
     ) -> Result<Vec<String>, ExecuteError> {
-        let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
+        let table_rows = self.mvcc.table_rows(&table.name);
+        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
         let prefix = relational_key_prefix(&table.name);
         let mut keyed_rows = Vec::new();
         while let Some(tuple) = cursor.next() {
@@ -22337,28 +22724,31 @@ impl Engine {
             read_txn_id: self.visible_up_to,
         };
         let prefix = relational_key_prefix(table);
-        let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
         let mut row_count = 0usize;
         let mut resident_bytes = 0u64;
         let mut resident_rows = Vec::new();
         let mut raw_device_tail = Vec::new();
-        while let Some(tuple) = cursor.next() {
-            if !tuple.key.starts_with(&prefix) {
-                continue;
+        {
+            let table_rows = self.mvcc.table_rows(table);
+            let mut cursor = table_rows.store().seq_scan_open(visibility)?;
+            while let Some(tuple) = cursor.next() {
+                if !tuple.key.starts_with(&prefix) {
+                    continue;
+                }
+                raw_device_tail.extend_from_slice(tuple.key.as_bytes());
+                raw_device_tail.extend_from_slice(tuple.value.as_bytes());
+                let decoded = decode_relational_row(&tuple.value, &catalog_table.columns)?;
+                row_count += 1;
+                resident_bytes = resident_bytes
+                    .saturating_add(tuple.key.len() as u64)
+                    .saturating_add(
+                        decoded
+                            .iter()
+                            .map(relational_resident_value_bytes)
+                            .sum::<u64>(),
+                    );
+                resident_rows.push(decoded);
             }
-            raw_device_tail.extend_from_slice(tuple.key.as_bytes());
-            raw_device_tail.extend_from_slice(tuple.value.as_bytes());
-            let decoded = decode_relational_row(&tuple.value, &catalog_table.columns)?;
-            row_count += 1;
-            resident_bytes = resident_bytes
-                .saturating_add(tuple.key.len() as u64)
-                .saturating_add(
-                    decoded
-                        .iter()
-                        .map(relational_resident_value_bytes)
-                        .sum::<u64>(),
-                );
-            resident_rows.push(decoded);
         }
         let resident_device_int4_columns = catalog_table
             .columns
@@ -22431,7 +22821,6 @@ impl Engine {
         device_payload.extend_from_slice(&raw_device_tail);
         device_payload[..std::mem::size_of::<u64>()]
             .copy_from_slice(&(row_count as u64).to_le_bytes());
-        drop(cursor);
 
         let memory_pressure_active = self
             .router
@@ -23040,7 +23429,8 @@ impl Engine {
             read_txn_id: self.visible_up_to,
         };
         let prefix = relational_key_prefix(table);
-        let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
+        let table_rows = self.mvcc.table_rows(table);
+        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
         let mut row_count = 0usize;
         while let Some(tuple) = cursor.next() {
             if tuple.key.starts_with(&prefix) {
@@ -23929,12 +24319,35 @@ impl Engine {
         }
     }
 
+    /// Resolve a `MvccReadQuery` against the **KV partition** (the non-relational namespace).
+    /// This is the table-agnostic entry the KV `MvccReadSource` machinery uses; relational reads
+    /// go through [`Engine::execute_mvcc_query_on_table`] so they resolve against their table's
+    /// published generation (write-half Stage 3).
     pub fn execute_mvcc_query(
         &self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
         let backend = CpuMvccExecutionBackend;
+        let kv = self.mvcc.load_kv();
         self.execute_mvcc_query_with_fallback_reason(
+            kv.get(),
+            query,
+            &backend,
+            Some(FallbackReason::GpuMvccReadParityGap),
+            false,
+        )
+    }
+
+    /// Resolve a `MvccReadQuery` against `table`'s published generation (the relational read path).
+    fn execute_mvcc_query_on_table(
+        &self,
+        table: &str,
+        query: &MvccReadQuery,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        let backend = CpuMvccExecutionBackend;
+        let table_rows = self.mvcc.table_rows(table);
+        self.execute_mvcc_query_with_fallback_reason(
+            table_rows.store(),
             query,
             &backend,
             Some(FallbackReason::GpuMvccReadParityGap),
@@ -23946,13 +24359,32 @@ impl Engine {
         &self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
+        let kv = self.mvcc.load_kv();
+        self.execute_mvcc_query_with_cuda_driver_probe_on_store(kv.get(), query)
+    }
+
+    /// `execute_mvcc_query_with_cuda_driver_probe`, resolving against `table`'s generation.
+    fn execute_mvcc_query_with_cuda_driver_probe_on_table(
+        &self,
+        table: &str,
+        query: &MvccReadQuery,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        let table_rows = self.mvcc.table_rows(table);
+        self.execute_mvcc_query_with_cuda_driver_probe_on_store(table_rows.store(), query)
+    }
+
+    fn execute_mvcc_query_with_cuda_driver_probe_on_store(
+        &self,
+        read_store: &InMemoryTupleStore,
+        query: &MvccReadQuery,
+    ) -> Result<MvccReadResult, ExecuteError> {
         let runtime = self.cuda_driver_probe_runtime();
         let backend = CudaMvccExecutionBackend::new(runtime, self.planner.default_gpu_id());
         if is_cuda_native_source_query(query) {
-            return self.execute_cuda_native_source_query(query, &backend);
+            return self.execute_cuda_native_source_query(read_store, query, &backend);
         }
 
-        self.execute_mvcc_query_with_fallback_reason(query, &backend, None, true)
+        self.execute_mvcc_query_with_fallback_reason(read_store, query, &backend, None, true)
     }
 
     fn cuda_driver_probe_runtime(&self) -> CudaDriverRuntime {
@@ -23969,7 +24401,25 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &B,
     ) -> Result<MvccReadResult, ExecuteError> {
-        self.execute_mvcc_query_with_fallback_reason(query, backend, None, false)
+        let kv = self.mvcc.load_kv();
+        self.execute_mvcc_query_with_fallback_reason(kv.get(), query, backend, None, false)
+    }
+
+    #[cfg(test)]
+    fn execute_mvcc_query_with_backend_on_table<B: MvccExecutionBackend>(
+        &self,
+        table: &str,
+        query: &MvccReadQuery,
+        backend: &B,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        let table_rows = self.mvcc.table_rows(table);
+        self.execute_mvcc_query_with_fallback_reason(
+            table_rows.store(),
+            query,
+            backend,
+            None,
+            false,
+        )
     }
 
     #[cfg(test)]
@@ -23978,11 +24428,25 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &B,
     ) -> Result<MvccReadResult, ExecuteError> {
-        self.execute_mvcc_query_with_fallback_reason(query, backend, None, false)
+        let kv = self.mvcc.load_kv();
+        self.execute_mvcc_query_with_fallback_reason(kv.get(), query, backend, None, false)
+    }
+
+    /// Test-only: `execute_cuda_native_source_query` resolving against the KV partition (the
+    /// KV-namespace CUDA-native tests use this).
+    #[cfg(test)]
+    fn execute_cuda_native_source_query_kv(
+        &self,
+        query: &MvccReadQuery,
+        backend: &CudaMvccExecutionBackend,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        let kv = self.mvcc.load_kv();
+        self.execute_cuda_native_source_query(kv.get(), query, backend)
     }
 
     fn execute_mvcc_query_with_fallback_reason<B: MvccExecutionBackend>(
         &self,
+        read_store: &InMemoryTupleStore,
         query: &MvccReadQuery,
         backend: &B,
         fallback_reason: Option<FallbackReason>,
@@ -23993,7 +24457,7 @@ impl Engine {
         }
 
         let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
-        let rows = resolve_mvcc_source(&self.mvcc_store, &query.source, query.visibility)?;
+        let rows = resolve_mvcc_source(read_store, &query.source, query.visibility)?;
         let cuda_h2d_bytes = if observe_cuda_probe_metrics {
             cuda_mvcc_row_batch_transfer_bytes(&rows)
         } else {
@@ -24018,6 +24482,7 @@ impl Engine {
 
     fn execute_cuda_native_source_query(
         &self,
+        read_store: &InMemoryTupleStore,
         query: &MvccReadQuery,
         backend: &CudaMvccExecutionBackend,
     ) -> Result<MvccReadResult, ExecuteError> {
@@ -24026,7 +24491,7 @@ impl Engine {
         }
 
         let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
-        let rows = resolve_mvcc_all_versions(&self.mvcc_store, query.visibility)?;
+        let rows = resolve_mvcc_all_versions(read_store, query.visibility)?;
         let mut cuda_h2d_bytes = cuda_mvcc_row_batch_transfer_bytes(&rows);
 
         let cuda_start = Instant::now();
@@ -24089,9 +24554,8 @@ impl Engine {
             _ => execute_cuda_native_single_source_query(query, rows, backend),
         }
         .unwrap_or_else(|reason| {
-            let visible_rows =
-                resolve_mvcc_source(&self.mvcc_store, &query.source, query.visibility)
-                    .expect("visibility was validated before native CUDA dispatch");
+            let visible_rows = resolve_mvcc_source(read_store, &query.source, query.visibility)
+                .expect("visibility was validated before native CUDA dispatch");
             let cpu_execution = match CpuMvccExecutionBackend.execute(query, visible_rows) {
                 MvccBackendDispatch::Executed(executed) => executed,
                 MvccBackendDispatch::Fallback { .. } => {
@@ -24579,7 +25043,7 @@ impl Engine {
         let checkpoint = self.wal.checkpoint_meta();
         match checkpoint.last_durable_txn_id {
             Some(last_durable) if safe_txn_id <= last_durable => {
-                Ok(self.mvcc_store.prune_versions_deleted_at_or_before(safe_txn_id))
+                Ok(self.mvcc.prune_versions_deleted_at_or_before(safe_txn_id))
             }
             Some(last_durable) => Err(EngineError::Durability(format!(
                 "checkpoint vacuum safe transaction id {safe_txn_id} is newer than durable WAL transaction {last_durable}"
@@ -24935,6 +25399,253 @@ mod tests {
             .unwrap()
             .is_valid());
     }
+
+    // ----------------------------------------------------------------------------------------
+    // Write-half MVCC — Stage 3: per-table publish-on-commit `&self`-readable data.
+    // ----------------------------------------------------------------------------------------
+
+    /// Drain a sequential cursor into a `Vec` of its visible versions (Stage-3 substrate tests).
+    #[cfg(test)]
+    fn drain_cursor(mut cursor: Box<dyn gpu_db_storage::SeqScanCursor + '_>) -> Vec<TupleVersion> {
+        let mut rows = Vec::new();
+        while let Some(tuple) = cursor.next() {
+            rows.push(tuple);
+        }
+        rows
+    }
+
+    /// Insert one `rel/people/<row_id>` row into `data`, recording its `(name, value)` value-index
+    /// entry — a tiny stand-in for an `apply_delta` insert, used by the Stage-3 substrate tests.
+    #[cfg(test)]
+    fn seed_people_row(
+        data: &mut TableVersionData,
+        tuple_id: TupleId,
+        row_id: u64,
+        id: i32,
+        name: &str,
+        commit_seq: TxnId,
+    ) {
+        let row_key = relational_row_key("people", row_id);
+        let values = vec![SqlValue::Int4(id), SqlValue::Text(name.to_string())];
+        data.rows
+            .tuple_insert_reserved_key_with_id(
+                tuple_id,
+                NewTuple {
+                    key: row_key.clone(),
+                    value: encode_relational_row(&values),
+                },
+                commit_seq,
+            )
+            .unwrap();
+        data.value_index
+            .entry(ColumnValueKey {
+                column: "name".to_string(),
+                value: relational_index_value(&SqlValue::Text(name.to_string())),
+            })
+            .or_default()
+            .push(row_key);
+    }
+
+    /// Stage 3 reader-stability: a reader that has `load()`ed a table's generation keeps seeing the
+    /// SAME rows AND value-index even as the (serialized) writer publishes a new generation that
+    /// adds rows + value-index entries. New loads see the new generation. This is the per-table
+    /// `SnapshotCell` discipline applied to the MVCC data (mirrors the residency reader-stability
+    /// guarantee, now for rows + value-index together in one `Arc<TableVersionData>`).
+    #[test]
+    fn stage3_reader_sees_stable_rows_and_value_index_while_writer_publishes() {
+        let mut mvcc = MvccData::new();
+        // Generation 1: one row, one value-index entry.
+        mvcc.with_table_mut("people", |data| {
+            seed_people_row(data, 1, 1, 1, "Ada", 1);
+        });
+        let vis = StorageVisibility { read_txn_id: 100 };
+
+        // A reader pins generation 1.
+        let reader = mvcc.load_table("people").expect("table published");
+        let reader_rows_before = drain_cursor(reader.get().rows.seq_scan_open(vis).unwrap());
+        assert_eq!(reader_rows_before.len(), 1);
+        let ada_index = reader.get().index_keys(
+            "name",
+            &relational_index_value(&SqlValue::Text("Ada".to_string())),
+        );
+        assert_eq!(ada_index.len(), 1);
+        // No value-index entry for the not-yet-inserted "Linus".
+        assert!(reader
+            .get()
+            .index_keys(
+                "name",
+                &relational_index_value(&SqlValue::Text("Linus".to_string()))
+            )
+            .is_empty());
+
+        // The serialized writer publishes generation 2: a second row + its value-index entry.
+        mvcc.with_table_mut("people", |data| {
+            seed_people_row(data, 2, 2, 2, "Linus", 2);
+        });
+
+        // The reader STILL sees exactly generation 1's rows and value-index — stable snapshot.
+        let reader_rows_after = drain_cursor(reader.get().rows.seq_scan_open(vis).unwrap());
+        assert_eq!(
+            reader_rows_after, reader_rows_before,
+            "reader's pinned generation changed under a concurrent publish"
+        );
+        assert!(
+            reader
+                .get()
+                .index_keys(
+                    "name",
+                    &relational_index_value(&SqlValue::Text("Linus".to_string()))
+                )
+                .is_empty(),
+            "reader's pinned value-index gained an entry from a later generation"
+        );
+
+        // A FRESH load sees generation 2: both rows + both value-index entries.
+        let newer = mvcc.load_table("people").expect("table published");
+        assert!(newer.generation() > reader.generation());
+        assert_eq!(
+            drain_cursor(newer.get().rows.seq_scan_open(vis).unwrap()).len(),
+            2
+        );
+        assert_eq!(
+            newer
+                .get()
+                .index_keys(
+                    "name",
+                    &relational_index_value(&SqlValue::Text("Linus".to_string()))
+                )
+                .len(),
+            1
+        );
+    }
+
+    /// Stage 3 epoch reclamation: an old `Arc<TableVersionData>` generation is freed only after its
+    /// last reader handle drains — never under an in-flight reader (mirrors the residency / snapshot
+    /// reclamation tests). We observe this through the generation's reference count.
+    #[test]
+    fn stage3_old_table_generation_retired_only_after_last_reader_drains() {
+        let mut mvcc = MvccData::new();
+        mvcc.with_table_mut("people", |data| seed_people_row(data, 1, 1, 1, "Ada", 1));
+
+        // A reader pins generation 1.
+        let reader = mvcc.load_table("people").expect("table published");
+        let g1 = reader.generation();
+        // The payload Arc is shared by the reader handle AND the cell's current slot.
+        assert_eq!(reader.reader_refcount(), 2, "g1 held by reader + cell slot");
+
+        // Writer publishes generations 2 and 3. g1 is no longer current, but the reader still holds
+        // it, so its generation must NOT be reclaimed — only the reader references it now.
+        mvcc.with_table_mut("people", |data| seed_people_row(data, 2, 2, 2, "Linus", 2));
+        mvcc.with_table_mut("people", |data| seed_people_row(data, 3, 3, 3, "Grace", 3));
+        assert_eq!(
+            reader.reader_refcount(),
+            1,
+            "g1 must stay alive (refcount 1 = the in-flight reader) until that reader drains"
+        );
+        assert_eq!(reader.generation(), g1, "reader still pinned to g1");
+        // The reader's rows are still exactly g1's single row.
+        assert_eq!(
+            drain_cursor(
+                reader
+                    .get()
+                    .rows
+                    .seq_scan_open(StorageVisibility { read_txn_id: 100 })
+                    .unwrap()
+            )
+            .len(),
+            1
+        );
+
+        // The current generation is g3 with three rows, independent of the pinned g1.
+        let current = mvcc.load_table("people").unwrap();
+        assert!(current.generation() > g1);
+        assert_eq!(
+            drain_cursor(
+                current
+                    .get()
+                    .rows
+                    .seq_scan_open(StorageVisibility { read_txn_id: 100 })
+                    .unwrap()
+            )
+            .len(),
+            3
+        );
+    }
+
+    /// Stage 3 read-perf sanity: the equality fast-path still reads the versioned value-index (a
+    /// per-table map lookup), NOT a version-chain scan. On a many-row table where only a handful
+    /// match, the chosen access path is `EqualityIndex` with `matched_keys` ≪ the row count, and a
+    /// direct value-index lookup on the loaded generation returns exactly those keys — i.e. the
+    /// per-table refactor kept the fast-path index-targeted (the whole reason for per-table cells).
+    #[test]
+    fn stage3_resident_equality_read_still_uses_value_index_fast_path() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        // 200 rows; only 2 carry name='Ada'. A version-chain scan would touch all 200; the
+        // value-index route touches just the 2 matching keys.
+        let mut values = Vec::new();
+        for id in 0..200 {
+            let name = if id == 7 || id == 142 { "Ada" } else { "Other" };
+            values.push(format!("({id}, '{name}')"));
+        }
+        e.execute_text(
+            2,
+            &format!("INSERT INTO people (id, name) VALUES {}", values.join(", ")),
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name = 'Ada'").unwrap()
+        else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        // The equality predicate resolved through the per-table versioned value-index, touching
+        // only the 2 matching keys (index-targeted, not a 200-row scan).
+        assert!(
+            matches!(
+                result.access_path,
+                RelationalAccessPath::EqualityIndex {
+                    matched_keys: 2,
+                    ..
+                }
+            ),
+            "equality fast-path regressed off the value-index: {:?}",
+            result.access_path
+        );
+        assert_eq!(
+            result.rows.len(),
+            2,
+            "both 'Ada' rows returned, no scan miss"
+        );
+
+        // Directly: the loaded generation's value-index returns exactly the 2 'Ada' row keys
+        // (an O(log) map lookup), and far fewer than the 200 stored rows — proving the read hit
+        // the versioned value-index, not a chain scan.
+        let handle = e.mvcc.load_table("people").expect("table published");
+        let ada_keys = handle.get().index_keys(
+            "name",
+            &relational_index_value(&SqlValue::Text("Ada".to_string())),
+        );
+        assert_eq!(ada_keys.len(), 2);
+        let total_rows = drain_cursor(
+            handle
+                .get()
+                .rows
+                .seq_scan_open(StorageVisibility {
+                    read_txn_id: e.visible_up_to(),
+                })
+                .unwrap(),
+        )
+        .len();
+        assert_eq!(total_rows, 200);
+        assert!(
+            ada_keys.len() * 10 < total_rows,
+            "value-index lookup must be selective (index-targeted), not a full scan"
+        );
+    }
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use gpu_db_execution::DeviceTarget;
@@ -32942,8 +33653,9 @@ mod tests {
         e.execute_text(3, "SET acct:1=closed").unwrap();
         e.execute_text(4, "DELETE acct:2").unwrap();
 
+        let kv = e.mvcc.load_kv();
         let rows =
-            resolve_mvcc_all_versions(&e.mvcc_store, StorageVisibility { read_txn_id: 2 }).unwrap();
+            resolve_mvcc_all_versions(kv.get(), StorageVisibility { read_txn_id: 2 }).unwrap();
         let identities = rows
             .iter()
             .map(|row| {
@@ -32975,7 +33687,7 @@ mod tests {
         e.execute_text(4, "DELETE acct:2").unwrap();
 
         let result = e
-            .execute_cuda_native_source_query(
+            .execute_cuda_native_source_query_kv(
                 &MvccReadQuery {
                     source: MvccReadSource::FullScan,
                     visibility: StorageVisibility { read_txn_id: 2 },
@@ -33017,7 +33729,7 @@ mod tests {
         e.execute_text(3, "SET acct:1=closed").unwrap();
 
         let result = e
-            .execute_cuda_native_source_query(
+            .execute_cuda_native_source_query_kv(
                 &MvccReadQuery {
                     source: MvccReadSource::KeyLookup {
                         key: "acct:1".to_string(),
@@ -33054,7 +33766,7 @@ mod tests {
         e.execute_text(3, "SET acct:3=closed").unwrap();
 
         let result = e
-            .execute_cuda_native_source_query(
+            .execute_cuda_native_source_query_kv(
                 &MvccReadQuery {
                     source: MvccReadSource::KeyBatchLookup {
                         keys: vec!["acct:3".to_string(), "acct:1".to_string()],
@@ -33099,7 +33811,7 @@ mod tests {
         e.execute_text(4, "DELETE acct:2").unwrap();
 
         let result = e
-            .execute_cuda_native_source_query(
+            .execute_cuda_native_source_query_kv(
                 &MvccReadQuery {
                     source: MvccReadSource::IntersectAll {
                         sources: vec![
@@ -33143,7 +33855,7 @@ mod tests {
         e.execute_text(3, "SET profile:1=team:beta").unwrap();
 
         let result = e
-            .execute_cuda_native_source_query(
+            .execute_cuda_native_source_query_kv(
                 &MvccReadQuery {
                     source: MvccReadSource::FollowValueChain {
                         keys: vec!["acct:1".to_string()],
@@ -33417,8 +34129,9 @@ mod tests {
                 },
             ]
         );
+        let kv = e.mvcc.load_kv();
         let all_version_rows =
-            resolve_mvcc_all_versions(&e.mvcc_store, StorageVisibility { read_txn_id: 3 }).unwrap();
+            resolve_mvcc_all_versions(kv.get(), StorageVisibility { read_txn_id: 3 }).unwrap();
         let compact_rows = ["acct:3", "acct:1"]
             .iter()
             .flat_map(|key| {
@@ -52357,10 +53070,10 @@ mod tests {
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:1=closed").unwrap();
 
-        assert_eq!(e.mvcc_store.version_count(), 2);
+        assert_eq!(e.mvcc.version_count(), 2);
         assert_eq!(
-            e.mvcc_store
-                .tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
+            e.mvcc
+                .kv_tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
                 .unwrap()
                 .map(|version| version.value),
             Some("open".to_string())
@@ -52386,15 +53099,15 @@ mod tests {
             }
         );
         assert_eq!(
-            e.mvcc_store
-                .tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 2 })
+            e.mvcc
+                .kv_tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 2 })
                 .unwrap()
                 .map(|version| version.value),
             Some("closed".to_string())
         );
         assert_eq!(
-            e.mvcc_store
-                .tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
+            e.mvcc
+                .kv_tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
                 .unwrap(),
             None
         );
@@ -52404,8 +53117,8 @@ mod tests {
         let _ = std::fs::remove_file(path);
         assert_eq!(
             recovered
-                .mvcc_store
-                .tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
+                .mvcc
+                .kv_tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
                 .unwrap()
                 .map(|version| version.value),
             Some("open".to_string())
@@ -52502,7 +53215,7 @@ mod tests {
             .unwrap();
 
         // Capture the full version set (ALL versions, visible or not) including stamps.
-        let live_versions = live.mvcc_store.all_versions();
+        let live_versions = live.mvcc.all_versions();
         let live_visible_up_to = live.visible_up_to();
 
         // The live stamps must be the commit `Index` sequence (1..=6 for our six commits), NOT the
@@ -52531,7 +53244,7 @@ mod tests {
 
         // Replay from the durable WAL into a fresh engine.
         let recovered = Engine::recover_from_durable_wal(live.durable_wal_records()).unwrap();
-        let recovered_versions = recovered.mvcc_store.all_versions();
+        let recovered_versions = recovered.mvcc.all_versions();
 
         // The crux: byte-identical version chains, stamps and all.
         assert_eq!(
@@ -52579,7 +53292,7 @@ mod tests {
             .unwrap();
 
         let row = e
-            .mvcc_store
+            .mvcc
             .all_versions()
             .into_iter()
             .find(|v| v.deleted_by.is_none())
@@ -52590,8 +53303,9 @@ mod tests {
         // Helper: how many row versions of table `t` are visible at a given boundary.
         let table_prefix = relational_key_prefix("t");
         let visible_at = |engine: &Engine, boundary: TxnId| -> usize {
-            let mut cursor = engine
-                .mvcc_store
+            let table_rows = engine.mvcc.table_rows("t");
+            let mut cursor = table_rows
+                .store()
                 .seq_scan_open(StorageVisibility {
                     read_txn_id: boundary,
                 })
@@ -52613,7 +53327,7 @@ mod tests {
         // commit 3: DELETE id=1 -> the version's deleted_by stamped = 3
         e.execute_text(502, "DELETE FROM t WHERE id = 1").unwrap();
         let deleted = e
-            .mvcc_store
+            .mvcc
             .all_versions()
             .into_iter()
             .find(|v| v.created_by == n)
@@ -52667,12 +53381,12 @@ mod tests {
     }
 
     fn capture_mutable_state(e: &Engine) -> MutableEngineState {
-        let mut versions = e.mvcc_store.all_versions();
+        let mut versions = e.mvcc.all_versions();
         versions.sort_by(|a, b| (a.tuple_id, &a.value).cmp(&(b.tuple_id, &b.value)));
         MutableEngineState {
             versions,
-            value_index: e.relational_value_index.clone(),
-            next_row_id: e.relational_next_row_id,
+            value_index: e.mvcc.value_index_snapshot(),
+            next_row_id: e.mvcc.current_row_id(),
             sequences: e
                 .relational_sequences
                 .iter()
@@ -52713,7 +53427,7 @@ mod tests {
     /// tombstoned by `commit_seq` (delete / update-old). Derived purely from the version chains so
     /// it is independent of the write-set under test.
     fn keys_touched_at(e: &Engine, commit_seq: TxnId) -> BTreeSet<String> {
-        e.mvcc_store
+        e.mvcc
             .all_versions()
             .into_iter()
             .filter(|v| v.created_by == commit_seq || v.deleted_by == Some(commit_seq))
