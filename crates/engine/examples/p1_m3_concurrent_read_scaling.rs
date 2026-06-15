@@ -167,41 +167,52 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("query=SELECT COUNT(*) FROM order_line  (route: resident count_all when GPU present)");
     println!();
     println!(
-        "| conc | serial p50 us | serial qps | concurrent p50 us | concurrent qps | p50 speedup | qps speedup |"
+        "| conc | serial p50 us | serial p99 us | serial qps | conc p50 us | conc p99 us | conc qps | p50 speedup | p99 speedup | qps speedup |"
     );
-    println!("|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 
     let mut json_rows: Vec<String> = Vec::new();
     for &c in &targets {
         let mut serial_p50s = Vec::new();
+        let mut serial_p99s = Vec::new();
         let mut serial_qpss = Vec::new();
         let mut conc_p50s = Vec::new();
+        let mut conc_p99s = Vec::new();
         let mut conc_qpss = Vec::new();
         for _ in 0..reps {
-            let (sq, sp50, _sp95, _sp99) =
+            let (sq, sp50, _sp95, sp99) =
                 run_cell(&engine, &select, c, ops_per_thread, true, &serial_lock);
-            let (cq, cp50, _cp95, _cp99) =
+            let (cq, cp50, _cp95, cp99) =
                 run_cell(&engine, &select, c, ops_per_thread, false, &serial_lock);
             serial_p50s.push(sp50);
+            serial_p99s.push(sp99);
             serial_qpss.push(sq);
             conc_p50s.push(cp50);
+            conc_p99s.push(cp99);
             conc_qpss.push(cq);
         }
         let sp50 = median_u64(&mut serial_p50s);
+        let sp99 = median_u64(&mut serial_p99s);
         let sq = median_f64(&mut serial_qpss);
         let cp50 = median_u64(&mut conc_p50s);
+        let cp99 = median_u64(&mut conc_p99s);
         let cq = median_f64(&mut conc_qpss);
         let p50_speedup = if cp50 > 0 {
             sp50 as f64 / cp50 as f64
         } else {
             0.0
         };
+        let p99_speedup = if cp99 > 0 {
+            sp99 as f64 / cp99 as f64
+        } else {
+            0.0
+        };
         let qps_speedup = if sq > 0.0 { cq / sq } else { 0.0 };
         println!(
-            "| {c} | {sp50} | {sq:.0} | {cp50} | {cq:.0} | {p50_speedup:.2}x | {qps_speedup:.2}x |"
+            "| {c} | {sp50} | {sp99} | {sq:.0} | {cp50} | {cp99} | {cq:.0} | {p50_speedup:.2}x | {p99_speedup:.2}x | {qps_speedup:.2}x |"
         );
         json_rows.push(format!(
-            "{{\"concurrency\":{c},\"serial_p50_us\":{sp50},\"serial_qps\":{sq:.3},\"concurrent_p50_us\":{cp50},\"concurrent_qps\":{cq:.3},\"p50_speedup\":{p50_speedup:.3},\"qps_speedup\":{qps_speedup:.3}}}"
+            "{{\"concurrency\":{c},\"serial_p50_us\":{sp50},\"serial_p99_us\":{sp99},\"serial_qps\":{sq:.3},\"concurrent_p50_us\":{cp50},\"concurrent_p99_us\":{cp99},\"concurrent_qps\":{cq:.3},\"p50_speedup\":{p50_speedup:.3},\"p99_speedup\":{p99_speedup:.3},\"qps_speedup\":{qps_speedup:.3}}}"
         ));
     }
     println!();
