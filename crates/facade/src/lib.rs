@@ -104,6 +104,12 @@ pub enum ErrorCategory {
     Unsupported,
     Engine,
     Internal,
+    /// A retryable Snapshot-Isolation write-write serialization conflict (write-half MVCC, Stage 4):
+    /// a concurrent transaction committed a write to a key in this transaction's write-set after it
+    /// took its read snapshot, so first-committer-wins aborted this one. The transaction made no
+    /// durable or visible change; the client may retry it. Adapters map this to a retryable class-40
+    /// code (PostgreSQL `40001` serialization_failure).
+    Serialization,
 }
 
 /// Neutral error. Carries a category and a human message — never a wire code.
@@ -319,17 +325,27 @@ impl Default for SharedEngine {
     }
 }
 
-/// Execute one SQL statement against a shared engine, taking a **read** lock for read-only
-/// statements (so they execute concurrently) and a **write** lock for everything else (so
-/// writes serialize). Transaction-control statements take no lock and produce only the tag.
-/// This is the concurrent-dispatch counterpart of [`execute_on_engine`]; the per-statement
-/// txn id is allocated internally (still a placeholder, not a transaction handle — see
-/// [`EngineFacade::take_txn_id`]). If a writer panics mid-statement the lock is poisoned;
-/// rather than `into_inner`-recover and risk serving a logically half-mutated engine as if
-/// committed, every subsequent statement fails loud with [`ErrorCategory::Internal`] — the
-/// engine deliberately wedges rather than expose torn state (the WAL is the durable source
-/// of truth; a restart replays it). Process-abort-on-poison is a production-hardening
-/// follow-up.
+/// Execute one SQL statement against a shared engine (write-half MVCC, Stage 4 — the concurrency
+/// flip). The engine `RwLock` is now used asymmetrically:
+///
+/// - **Reads** (`SELECT`) take a **read** lock and run lock-free against a pinned snapshot.
+/// - **Concurrent DML** (`INSERT`/`UPDATE`/`DELETE` on a base table without `nextval` defaults) also
+///   takes only a **read** lock and goes through the engine's `execute_dml_concurrent` — off-lock
+///   prepare + a short internal `commit_mutex`. So concurrent writers OVERLAP each other and never
+///   block readers; they serialize only briefly on the commit_mutex inside the engine.
+/// - **DDL and everything else** take the **write** lock, which acts as the **catalog latch**: DDL
+///   serializes against DML and readers for its duration (this milestone's confirmed scope — no
+///   online DDL).
+///
+/// Transaction-control statements take no lock and produce only the tag. The per-statement txn id is
+/// allocated internally (a durable-identity placeholder, not a transaction handle).
+///
+/// **Poison-on-panic (re-homed to the commit path).** If a writer panics mid-commit, the engine's
+/// internal commit_mutex is poisoned; a DDL panic poisons the engine `RwLock`. Either way every
+/// subsequent statement fails loud with [`ErrorCategory::Internal`] rather than serve possibly-torn
+/// state — the engine deliberately wedges (the WAL is the durable source of truth; a restart
+/// replays it). A retryable SI serialization conflict is NOT a poison: it maps to
+/// [`ErrorCategory::Serialization`] (class-40) and the client retries.
 pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<QueryOutcome, DbError> {
     let command = match parse_command(sql) {
         Ok(command) => command,
@@ -339,6 +355,11 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
     match command {
         Command::Select(select) => {
             let engine = shared.engine.read().map_err(|_| poisoned_engine_error())?;
+            // A writer that panicked mid-commit poisons the commit path; refuse to serve a read
+            // against possibly-torn published state (re-homed poison policy).
+            if engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
             let result = engine
                 .execute_relational_select(&select)
                 .map_err(map_execute_error)?;
@@ -365,7 +386,29 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
         other => {
             let tag = command_tag(&other);
             let txn_id = shared.next_txn_id.fetch_add(1, Ordering::Relaxed);
+            // A READ lock (shared with readers and other concurrent writers) probes whether this
+            // statement is concurrent-eligible DML. The probe and the concurrent commit both run
+            // under the read lock, so writers overlap and never block readers.
+            {
+                let engine = shared.engine.read().map_err(|_| poisoned_engine_error())?;
+                if engine.is_commit_path_poisoned() {
+                    return Err(poisoned_engine_error());
+                }
+                if engine.is_concurrent_dml(sql) {
+                    engine
+                        .execute_dml_concurrent(txn_id, sql)
+                        .map_err(map_execute_error)?;
+                    return Ok(QueryOutcome::Command {
+                        tag,
+                        rows_affected: None,
+                    });
+                }
+            }
+            // DDL / sequence-default INSERT / KV / other: the WRITE lock is the catalog latch.
             let mut engine = shared.engine.write().map_err(|_| poisoned_engine_error())?;
+            if engine.is_commit_path_poisoned() {
+                return Err(poisoned_engine_error());
+            }
             engine
                 .execute_text(txn_id, sql)
                 .map_err(map_execute_error)?;
@@ -375,6 +418,28 @@ pub fn execute_on_shared_engine(shared: &SharedEngine, sql: &str) -> Result<Quer
             })
         }
     }
+}
+
+/// Test-support: run a concurrent DML statement through the shared engine with a hook invoked
+/// between the off-lock snapshot capture+prepare and the commit critical section (write-half MVCC,
+/// Stage 4). The concurrency-correctness suite uses this to rendezvous two writers at a barrier in
+/// that window, deterministically forcing the SI write-write conflict (both snapshot, then both
+/// commit). Takes only a READ lock (the concurrent-DML path), so the hook runs while the engine is
+/// reader-shared. The supplied `txn_id` is the durable identity (the caller picks a unique one).
+#[doc(hidden)]
+pub fn execute_concurrent_dml_with_prepared_hook(
+    shared: &SharedEngine,
+    txn_id: u64,
+    sql: &str,
+    on_prepared: impl FnOnce(),
+) -> Result<(), DbError> {
+    let engine = shared.engine.read().map_err(|_| poisoned_engine_error())?;
+    if engine.is_commit_path_poisoned() {
+        return Err(poisoned_engine_error());
+    }
+    engine
+        .execute_dml_concurrent_instrumented(txn_id, sql, on_prepared)
+        .map_err(map_execute_error)
 }
 
 /// Classify-or-fallback entry (Thread-3 Stage 1/Stage 4, strictly additive). If `sql` is a
@@ -498,14 +563,14 @@ fn map_parse_error(err: ParseError) -> DbError {
 }
 
 fn map_execute_error(err: ExecuteError) -> DbError {
-    // Coarse on purpose: `Engine`/`Txn`/`Storage` all collapse to `Engine` (→
-    // SQLSTATE XX000). A serialization/conflict error (`Txn`) ideally maps to a
-    // retryable class-40 code, but the engine does not yet expose typed error
-    // categories, and string-sniffing its messages would be fragile. Finer
-    // categorization waits on typed engine errors (Phase 3).
+    // `Serialization` maps to the retryable class-40 category (write-half MVCC, Stage 4 — the
+    // engine now exposes a typed `ExecuteError::Serialization` for SI write-write conflicts, so no
+    // message string-sniffing). The remaining `Engine`/`Txn`/`Storage` cases collapse to `Engine`
+    // (→ SQLSTATE XX000); finer categorization of those waits on typed engine errors (Phase 3).
     let category = match &err {
         ExecuteError::Parse(_) => ErrorCategory::Syntax,
         ExecuteError::NonReadCommand(_) => ErrorCategory::Unsupported,
+        ExecuteError::Serialization(_) => ErrorCategory::Serialization,
         _ => ErrorCategory::Engine,
     };
     DbError {

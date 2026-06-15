@@ -105,14 +105,19 @@ pub trait IndexScanCursor {
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryTupleStore {
     next_tuple_id: TupleId,
-    versions: std::collections::BTreeMap<TupleId, Vec<TupleVersion>>,
+    // Persistent immutable ordered map (`imbl::OrdMap`): O(1) clone (refcount bump) and O(log n)
+    // structurally-shared update. The per-commit whole-table clone the engine does becomes O(1),
+    // and a commit touching k chains is O(k·log n) — no more O(table) deep copy per write. Each
+    // version chain is `Arc`-wrapped so a clone shares chains until one is mutated, at which point
+    // `Arc::make_mut` copies ONLY that chain (copy-on-write). Iteration stays in `TupleId` order.
+    versions: imbl::OrdMap<TupleId, std::sync::Arc<Vec<TupleVersion>>>,
 }
 
 impl InMemoryTupleStore {
     pub fn new() -> Self {
         Self {
             next_tuple_id: 1,
-            versions: std::collections::BTreeMap::new(),
+            versions: imbl::OrdMap::new(),
         }
     }
 
@@ -124,7 +129,7 @@ impl InMemoryTupleStore {
     }
 
     pub fn version_count(&self) -> usize {
-        self.versions.values().map(Vec::len).sum()
+        self.versions.values().map(|versions| versions.len()).sum()
     }
 
     pub fn tuple_chain_count(&self) -> usize {
@@ -135,14 +140,24 @@ impl InMemoryTupleStore {
         let before_versions = self.version_count();
         let before_tuples = self.tuple_chain_count();
 
-        self.versions.retain(|_, versions| {
-            versions.retain(|version| {
+        // `imbl::OrdMap` has no in-place `retain`; rebuild the surviving chains into a fresh map.
+        // This is the GC path (off the hot commit path), so the rebuild cost is not critical —
+        // correctness (and preserving `TupleId` order, which OrdMap maintains) is. `Arc::make_mut`
+        // shrinks a chain in place when it is uniquely owned, copying only a chain shared with a
+        // live snapshot (COW), exactly as the per-version mutation sites do.
+        let mut pruned = imbl::OrdMap::new();
+        for (id, chain) in self.versions.iter() {
+            let mut chain = std::sync::Arc::clone(chain);
+            std::sync::Arc::make_mut(&mut chain).retain(|version| {
                 version
                     .deleted_by
                     .is_none_or(|deleted_by| deleted_by > safe_txn_id)
             });
-            !versions.is_empty()
-        });
+            if !chain.is_empty() {
+                pruned.insert(*id, chain);
+            }
+        }
+        self.versions = pruned;
 
         let remaining_versions = self.version_count();
         PruneStats {
@@ -170,10 +185,13 @@ impl InMemoryTupleStore {
         &mut self,
         tuple_id: TupleId,
     ) -> Result<&mut TupleVersion, StorageError> {
+        // `OrdMap::get_mut` structurally clones the path to this entry; `Arc::make_mut` then copies
+        // the chain ONLY if it is still shared with a live snapshot (copy-on-write), so an in-flight
+        // reader's pinned generation is never mutated.
         self.versions
             .get_mut(&tuple_id)
-            .and_then(|versions| {
-                versions
+            .and_then(|chain| {
+                std::sync::Arc::make_mut(chain)
                     .iter_mut()
                     .rev()
                     .find(|version| version.deleted_by.is_none())
@@ -219,13 +237,13 @@ impl InMemoryTupleStore {
         self.next_tuple_id += 1;
         self.versions.insert(
             tuple_id,
-            vec![TupleVersion {
+            std::sync::Arc::new(vec![TupleVersion {
                 tuple_id,
                 key: tuple.key,
                 value: tuple.value,
                 created_by: txn_id,
                 deleted_by: None,
-            }],
+            }]),
         );
         Ok(tuple_id)
     }
@@ -249,13 +267,13 @@ impl InMemoryTupleStore {
         }
         self.versions.insert(
             tuple_id,
-            vec![TupleVersion {
+            std::sync::Arc::new(vec![TupleVersion {
                 tuple_id,
                 key: tuple.key,
                 value: tuple.value,
                 created_by: txn_id,
                 deleted_by: None,
-            }],
+            }]),
         );
         Ok(tuple_id)
     }
@@ -350,7 +368,9 @@ impl TupleStore for InMemoryTupleStore {
             .versions
             .get_mut(&tuple_id)
             .ok_or(StorageError::NotFound)?;
-        versions.push(TupleVersion {
+        // `current_version_mut` already made this chain uniquely owned, so this `make_mut` is the
+        // O(1) refcount==1 case; it stays correct (COW) regardless.
+        std::sync::Arc::make_mut(versions).push(TupleVersion {
             tuple_id,
             key,
             value: new_value,

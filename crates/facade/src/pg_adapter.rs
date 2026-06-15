@@ -43,6 +43,9 @@ pub fn error_sqlstate(category: ErrorCategory) -> &'static str {
         ErrorCategory::Unsupported => "0A000",
         ErrorCategory::Engine => "XX000",
         ErrorCategory::Internal => "XX000",
+        // Class 40 — Transaction Rollback; 40001 serialization_failure is the retryable code
+        // PostgreSQL clients already retry on (write-half MVCC, Stage 4).
+        ErrorCategory::Serialization => "40001",
     }
 }
 

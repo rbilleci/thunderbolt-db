@@ -1151,6 +1151,14 @@ impl LocalReplicator {
         self.role = Role::Candidate;
     }
 
+    /// The `Index` the NEXT [`LogReplicator::propose`] will assign, WITHOUT consuming it. The
+    /// concurrent commit path peeks this (under the single-proposer commit_mutex) to re-resolve a
+    /// transaction's delta at its would-be `commit_seq` BEFORE proposing, so a re-validation failure
+    /// can abort without ever consuming an index (no commit-seq hole, nothing durable).
+    pub fn peek_next_index(&self) -> Index {
+        self.next_index
+    }
+
     pub fn drain_committed_from(&self, start_exclusive: Index) -> impl Iterator<Item = &LogEntry> {
         self.entries
             .iter()

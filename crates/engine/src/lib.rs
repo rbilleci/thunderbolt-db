@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
@@ -172,9 +172,46 @@ pub enum ExecuteError {
     Txn(#[from] TxnError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    /// A retryable Snapshot-Isolation write-write serialization conflict (write-half MVCC, Stage 4):
+    /// a concurrent transaction committed a write to a key in this transaction's write-set after this
+    /// transaction took its read snapshot, so first-committer-wins aborts this one. The transaction
+    /// made NO durable or visible change (it never published); the caller should retry it with a
+    /// fresh snapshot. The façade maps this to a retryable class-40 error
+    /// (`ErrorCategory::Serialization`).
+    #[error("could not serialize access due to concurrent update: {0}")]
+    Serialization(String),
     #[error("command is not readable via execute_read_text: {0}")]
     NonReadCommand(&'static str),
 }
+
+impl ExecuteError {
+    /// Whether this error is a retryable Snapshot-Isolation serialization conflict (the caller may
+    /// retry the whole statement against a fresh snapshot). Lets adapters classify the retryable
+    /// class-40 case without string-matching the message.
+    pub fn is_serialization_conflict(&self) -> bool {
+        matches!(self, ExecuteError::Serialization(_))
+    }
+
+    /// Whether this error is the resident-route "the table's GPU residency was invalidated out from
+    /// under this statement" case (write-half MVCC, Stage 4): a concurrent committer tombstoned the
+    /// table's device-memory `SnapshotCell` (`publish(None)`) between this statement's resident-route
+    /// plan (which saw it published) and the GPU probe (which loaded the now-`None` cell). It is NOT a
+    /// genuine GPU/CUDA failure — the engine can transparently re-serve the statement from the CPU
+    /// pinned-read path against the current published data generation. Matched on the precise probe
+    /// message so a real device error (which carries a different message) is never masked.
+    fn is_residency_invalidated(&self) -> bool {
+        matches!(
+            self,
+            ExecuteError::Engine(EngineError::ApplyFailed(msg))
+                if msg.contains(RESIDENT_DEVICE_MEMORY_MISSING)
+        )
+    }
+}
+
+/// The substring every GPU resident-route probe uses when a table's device-memory cell is `None`
+/// (tombstoned/never-populated). Used to detect the residency-invalidated-mid-statement case so the
+/// read can fall back to the CPU pinned-read path (write-half MVCC, Stage 4).
+const RESIDENT_DEVICE_MEMORY_MISSING: &str = "has no retained resident device memory";
 
 #[derive(Debug, Clone)]
 struct PendingMutation {
@@ -5994,8 +6031,18 @@ fn percent_decode_lossy(input: &str) -> String {
 }
 
 pub struct Engine {
-    repl: LocalReplicator,
-    wal: WalBuffer,
+    /// The commit-critical mutable substate — the replicator (commit-`Index` oracle), the WAL, the
+    /// per-txn commit timestamps, and the recent-commits conflict ledger — bundled behind ONE mutex
+    /// that IS the **commit_mutex** (write-half MVCC, Stage 4). The concurrent DML commit path locks
+    /// it for its short critical section (validate → assign `commit_seq` → WAL fsync → publish), so
+    /// commits serialize ONLY here while prepare runs off-lock and readers stay lock-free. Code that
+    /// already holds `&mut self` (serialized DDL apply, recovery, checkpoint/snapshot admin) reaches
+    /// it via `commit_state_mut()` (a zero-cost `Mutex::get_mut`, no actual locking).
+    commit: Mutex<CommitState>,
+    /// In-flight transactions' read snapshots (write-half MVCC, Stage 4), for the oldest-active GC
+    /// boundary. Separate from `commit` so a transaction can register its snapshot at prepare-begin
+    /// WITHOUT serializing on the commit_mutex (prepare is off-lock).
+    active_snapshots: Mutex<ActiveSnapshots>,
     sm: KvStateMachine,
     // Versioned, publish-on-commit MVCC data: per-table `SnapshotCell<Arc<TableVersionData>>`
     // (rows + value-index) + a KV partition, `&self`-readable / lock-free (write-half Stage 3).
@@ -6023,9 +6070,12 @@ pub struct Engine {
     relational_resident_cache: RelationalResidentCache,
     relational_next_oid: u32,
     relational_next_column_id: u32,
-    wal_commit_timestamps_micros: BTreeMap<TxnId, u64>,
     txn_manager: TxnManager,
-    visible_up_to: Index,
+    // The single MVCC visibility/publish boundary (the highest committed `commit_seq`), as an atomic
+    // so the concurrent commit critical section can bump it via `&self` (release-store, LAST — the
+    // publish point) while lock-free readers acquire-load it once per statement (write-half Stage 4).
+    // Was a plain `Index` under the serialized writer.
+    committed_seq: AtomicU64,
     metrics: RuntimeMetrics,
     batcher: DualTriggerBatcher<PendingMutation>,
     planner: Planner,
@@ -6033,6 +6083,27 @@ pub struct Engine {
     // Lazily-probed CUDA runtime, behind a OnceLock so the probe getter is `&self`
     // (the read path lazily initializes it — P1-M3 step 3c).
     cached_cuda_probe_runtime: OnceLock<CudaDriverRuntime>,
+}
+
+/// The commit-critical mutable substate bundled behind the engine's commit_mutex (write-half MVCC,
+/// Stage 4). Holding the lock on this is exactly the "short commit critical section": validate the
+/// write-set against the ledger, assign a `commit_seq` from the replicator, append + fsync the WAL,
+/// then (back in the engine) publish and bump `committed_seq`. Code holding `&mut Engine` reaches it
+/// lock-free via `Mutex::get_mut`.
+struct CommitState {
+    /// The commit-`Index` oracle + log: `propose` assigns the next monotonic `commit_seq` inside the
+    /// critical section (Stage 0 unification — `commit_seq == commit Index`).
+    repl: LocalReplicator,
+    /// The write-ahead log; `append` + `flush_all` inside the critical section make the commit
+    /// crash-durable before it is published (the group-commit mechanism amortizes concurrent
+    /// committers' fsyncs).
+    wal: WalBuffer,
+    /// Per-txn commit timestamps (durable transaction identity → wall-clock micros), for
+    /// PITR-by-timestamp lookups. Keyed by the façade txn_id (the durable identity), distinct from
+    /// the MVCC `commit_seq`.
+    wal_commit_timestamps_micros: BTreeMap<TxnId, u64>,
+    /// The recent-commits conflict ledger (SI write-write, first-committer-wins).
+    ledger: RecentCommitsLedger,
 }
 
 /// Per-table GPU-resident device memory, each table behind its own [`SnapshotCell`]
@@ -6084,8 +6155,9 @@ impl ResidentDeviceMemoryMap {
 
     /// Publish a `None` tombstone (invalidation): the cell is retained so in-flight
     /// readers keep their generation; new loads see "not resident". No-op if the table
-    /// has no cell.
-    fn invalidate(&mut self, table: &str) {
+    /// has no cell. `&self` (the cell publishes via `&self`) so the concurrent commit path can
+    /// invalidate a mutated table's GPU residency without an engine write lock (write-half Stage 4).
+    fn invalidate(&self, table: &str) {
         if let Some(cell) = self.cells.get(table) {
             cell.publish(None);
         }
@@ -6170,8 +6242,9 @@ impl PartitionResidentDeviceMemoryMap {
     }
 
     /// Publish a `None` tombstone for every partition of `table` (invalidation): cells are
-    /// retained so in-flight readers keep their generation; new loads see "not resident".
-    fn invalidate_table(&mut self, table: &str) {
+    /// retained so in-flight readers keep their generation; new loads see "not resident". `&self`
+    /// (cells publish via `&self`) for the concurrent commit path (write-half Stage 4).
+    fn invalidate_table(&self, table: &str) {
         for ((cell_table, _), cell) in self.cells.iter() {
             if cell_table == table {
                 cell.publish(None);
@@ -6222,7 +6295,12 @@ struct ColumnValueKey {
 #[derive(Debug, Clone, Default)]
 struct TableVersionData {
     rows: InMemoryTupleStore,
-    value_index: BTreeMap<ColumnValueKey, Vec<String>>,
+    // Persistent immutable ordered map (`imbl::OrdMap`): O(1) clone (so `with_table_mut`'s per-commit
+    // `TableVersionData::clone` no longer deep-copies every `Vec<String>`) and O(log n)
+    // structurally-shared update. Each slot's row-key list is `Arc`-wrapped, so a clone shares lists
+    // until one is mutated, at which point `Arc::make_mut` copies ONLY that list (copy-on-write).
+    // Iteration stays in `ColumnValueKey` order, matching the old `BTreeMap`.
+    value_index: imbl::OrdMap<ColumnValueKey, std::sync::Arc<Vec<String>>>,
 }
 
 impl TableVersionData {
@@ -6235,7 +6313,7 @@ impl TableVersionData {
                 column: column.to_string(),
                 value: value.to_string(),
             })
-            .cloned()
+            .map(|keys| keys.as_ref().clone())
             .unwrap_or_default()
     }
 }
@@ -6254,7 +6332,14 @@ impl TableVersionData {
 #[derive(Debug)]
 struct MvccData {
     /// `rel/<table>/…` row chains + the table's value-index, one published generation per table.
-    tables: BTreeMap<String, SnapshotCell<Arc<TableVersionData>>>,
+    ///
+    /// Behind a `RwLock` for STRUCTURAL access only (write-half Stage 4): the per-cell publish is
+    /// already `&self` (`SnapshotCell::publish`), so the lock is held only briefly to find a cell
+    /// (read-lock, then `load()` clones an owned handle and the lock drops — never held across a read
+    /// body or a kernel launch) or to INSERT a new cell on a table's first write (write-lock). This
+    /// lets the concurrent commit critical section publish a mutated table's generation through
+    /// `&self`, so lock-free readers run concurrently with a committer.
+    tables: RwLock<BTreeMap<String, SnapshotCell<Arc<TableVersionData>>>>,
     /// The non-relational KV namespace (`SET`/`DELETE` keys), published as its own generation. Has
     /// no value-index (the equality fast-path is relational-only).
     kv: SnapshotCell<Arc<InMemoryTupleStore>>,
@@ -6268,7 +6353,7 @@ struct MvccData {
 impl Default for MvccData {
     fn default() -> Self {
         Self {
-            tables: BTreeMap::new(),
+            tables: RwLock::new(BTreeMap::new()),
             kv: SnapshotCell::new(Arc::new(InMemoryTupleStore::new())),
             next_tuple_id: AtomicU64::new(1),
             next_row_id: AtomicU64::new(1),
@@ -6302,11 +6387,33 @@ impl MvccData {
         self.kv.load()
     }
 
+    /// Lock the `tables` map for reading, recovering from poison (the only mutation under the lock is
+    /// a `BTreeMap` insert of a fresh cell, which cannot leave the map torn, so continuing past a
+    /// poisoned lock is safe — and one panicking committer must not wedge every reader).
+    fn tables_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, SnapshotCell<Arc<TableVersionData>>>> {
+        self.tables
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn tables_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, SnapshotCell<Arc<TableVersionData>>>>
+    {
+        self.tables
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Load `table`'s currently-published generation, if the table has any MVCC data yet. Returns
     /// `None` before the table's first write (no cell published) — callers treat that as "empty
-    /// table" exactly as a prefix scan over a store with no matching keys did.
+    /// table" exactly as a prefix scan over a store with no matching keys did. The map read-lock is
+    /// held only to clone the cell's current `Arc` (`load()`), then released — the lock-free read
+    /// body runs against the pinned handle with no lock held.
     fn load_table(&self, table: &str) -> Option<SnapshotHandle<Arc<TableVersionData>>> {
-        self.tables.get(table).map(|cell| cell.load())
+        self.tables_read().get(table).map(|cell| cell.load())
     }
 
     /// A loaded, immutable view of `table`'s rows for the read path — an empty store when the table
@@ -6321,33 +6428,46 @@ impl MvccData {
 
     /// Mutate a table's payload via copy-on-write and publish the new generation: clone the current
     /// `TableVersionData` (or start empty), run `mutate`, then `publish` a fresh `Arc`. In-flight
-    /// readers keep the generation they already loaded (epoch reclamation). Serialized writer only.
-    fn with_table_mut<R>(
-        &mut self,
-        table: &str,
-        mutate: impl FnOnce(&mut TableVersionData) -> R,
-    ) -> R {
-        let mut data = match self.tables.get(table) {
-            Some(cell) => TableVersionData::clone(&cell.load().get().clone()),
+    /// readers keep the generation they already loaded (epoch reclamation).
+    ///
+    /// `&self` (write-half Stage 4): the COW mutate + the per-cell `publish` are `&self`; the map
+    /// read-lock is held only to clone the existing cell's `Arc` and again to publish onto it, and a
+    /// write-lock is taken only to insert a cell on a table's FIRST write. The CALLER (the commit
+    /// critical section or a serialized DDL apply) provides the serialization that makes the
+    /// read-clone → mutate → publish sequence atomic w.r.t. other writers; lock-free readers are
+    /// never blocked by it.
+    fn with_table_mut<R>(&self, table: &str, mutate: impl FnOnce(&mut TableVersionData) -> R) -> R {
+        let mut data = match self.tables_read().get(table) {
+            Some(cell) => TableVersionData::clone(cell.load().get()),
             None => TableVersionData::default(),
         };
         let result = mutate(&mut data);
         let data = Arc::new(data);
-        match self.tables.get(table) {
+        // Re-resolve the cell: publish onto an existing one (read-lock), or insert a new one
+        // (write-lock) on first write. Under the caller's serialization no other writer raced in.
+        if let Some(cell) = self.tables_read().get(table) {
+            cell.publish(data);
+            return result;
+        }
+        let mut map = self.tables_write();
+        match map.get(table) {
+            // A concurrent first-writer beat us to creating the cell between the read-unlock and the
+            // write-lock (does not happen under the caller's serialization, but is correct anyway):
+            // publish our generation onto it.
             Some(cell) => {
                 cell.publish(data);
             }
             None => {
-                self.tables
-                    .insert(table.to_string(), SnapshotCell::new(data));
+                map.insert(table.to_string(), SnapshotCell::new(data));
             }
         }
         result
     }
 
-    /// Mutate the KV partition via copy-on-write and publish the new generation. Serialized writer.
-    fn with_kv_mut<R>(&mut self, mutate: impl FnOnce(&mut InMemoryTupleStore) -> R) -> R {
-        let mut store = InMemoryTupleStore::clone(&self.kv.load().get().clone());
+    /// Mutate the KV partition via copy-on-write and publish the new generation. `&self` (the cell
+    /// publishes via `&self`); the caller serializes (commit critical section / serialized DDL apply).
+    fn with_kv_mut<R>(&self, mutate: impl FnOnce(&mut InMemoryTupleStore) -> R) -> R {
+        let mut store = InMemoryTupleStore::clone(self.kv.load().get());
         let result = mutate(&mut store);
         self.kv.publish(Arc::new(store));
         result
@@ -6369,7 +6489,7 @@ impl MvccData {
     #[cfg(test)]
     fn value_index_snapshot(&self) -> BTreeMap<RelationalIndexKey, Vec<String>> {
         let mut index = BTreeMap::new();
-        for (table, cell) in self.tables.iter() {
+        for (table, cell) in self.tables_read().iter() {
             for (key, row_keys) in cell.load().get().value_index.iter() {
                 index.insert(
                     RelationalIndexKey {
@@ -6377,7 +6497,7 @@ impl MvccData {
                         column: key.column.clone(),
                         value: key.value.clone(),
                     },
-                    row_keys.clone(),
+                    row_keys.as_ref().clone(),
                 );
             }
         }
@@ -6391,7 +6511,7 @@ impl MvccData {
     #[cfg(test)]
     fn all_versions(&self) -> Vec<TupleVersion> {
         let mut versions = self.kv.load().get().all_versions();
-        for cell in self.tables.values() {
+        for cell in self.tables_read().values() {
             versions.extend(cell.load().get().rows.all_versions());
         }
         versions.sort_by_key(|version| version.tuple_id);
@@ -6402,7 +6522,7 @@ impl MvccData {
     #[cfg(test)]
     fn version_count(&self) -> usize {
         let mut count = self.kv.load().get().version_count();
-        for cell in self.tables.values() {
+        for cell in self.tables_read().values() {
             count += cell.load().get().rows.version_count();
         }
         count
@@ -6410,7 +6530,7 @@ impl MvccData {
 
     /// Prune versions deleted at or before `safe_txn_id` across every partition, republishing each
     /// touched partition. Aggregates the per-partition [`PruneStats`].
-    fn prune_versions_deleted_at_or_before(&mut self, safe_txn_id: TxnId) -> PruneStats {
+    fn prune_versions_deleted_at_or_before(&self, safe_txn_id: TxnId) -> PruneStats {
         let mut total = PruneStats {
             removed_versions: 0,
             removed_tuples: 0,
@@ -6421,7 +6541,7 @@ impl MvccData {
         total.removed_versions += kv_stats.removed_versions;
         total.removed_tuples += kv_stats.removed_tuples;
         total.remaining_versions += kv_stats.remaining_versions;
-        let table_names: Vec<String> = self.tables.keys().cloned().collect();
+        let table_names: Vec<String> = self.tables_read().keys().cloned().collect();
         for table in table_names {
             let stats = self.with_table_mut(&table, |data| {
                 data.rows.prune_versions_deleted_at_or_before(safe_txn_id)
@@ -6453,6 +6573,45 @@ impl TableRowsView {
             TableRowsView::Resident(handle) => &handle.get().rows,
             TableRowsView::Empty(data) => &data.rows,
         }
+    }
+
+    /// Borrow the value-index of THIS pinned generation. Prereq #1 (Stage 4): a relational read
+    /// pins ONE `TableVersionData` generation for the whole statement and reads BOTH its
+    /// `value_index` (the equality fast-path) and its `rows` (resolution) from it, so a concurrent
+    /// publish can never interleave the index of one generation with the rows of another.
+    fn payload(&self) -> &TableVersionData {
+        match self {
+            TableRowsView::Resident(handle) => handle.get(),
+            TableRowsView::Empty(data) => data,
+        }
+    }
+
+    /// The value-index row keys for `(column, value)` in this pinned generation.
+    fn index_keys(&self, column: &str, value: &str) -> Vec<String> {
+        self.payload().index_keys(column, value)
+    }
+}
+
+/// One pinned, statement-stable relational read snapshot (prereq #1, write-half Stage 4). Holds the
+/// single visibility boundary (`committed_seq` read once at statement start) AND one pinned
+/// generation of the read table (its rows + value-index together). Every part of a relational
+/// statement — the equality fast-path value-index lookup, key resolution, ordering scans, the final
+/// row materialization — reads from THIS one generation, so a concurrent committer that publishes a
+/// new generation mid-statement can never make the read see the value-index of one `commit_seq` and
+/// the rows of another (the exact hazard the audit flagged). The handle keeps its generation alive
+/// (epoch reclamation) until the statement drops the pin.
+struct RelationalReadPin {
+    visibility: StorageVisibility,
+    table_rows: TableRowsView,
+}
+
+impl RelationalReadPin {
+    fn store(&self) -> &InMemoryTupleStore {
+        self.table_rows.store()
+    }
+
+    fn index_keys(&self, column: &str, value: &str) -> Vec<String> {
+        self.table_rows.index_keys(column, value)
     }
 }
 
@@ -8199,13 +8358,113 @@ enum PreparedMutation {
 /// advances `relational_next_row_id` by (inserts only).
 #[derive(Debug, Clone)]
 struct WriteDelta {
-    // Computed and asserted-on now (write-set-correctness tests); the production reader is Stage
-    // 4's SI conflict detector (validate the prepared write-set against commits since the
-    // snapshot). Not yet read by non-test code, hence the scoped allow until Stage 4 lands.
-    #[allow(dead_code)]
+    // Read by Stage 4's SI conflict detector (`RecentCommitsLedger::conflicts`) to validate the
+    // prepared write-set against commits since the snapshot, AND recorded into the ledger after a
+    // successful commit.
     write_set: WriteSet,
     rows_consumed: u64,
     mutation: PreparedMutation,
+}
+
+/// The recent-commits ledger: every committed write's `(table, row-key)` and unique-index slot →
+/// the highest `commit_seq` that wrote it (write-half MVCC, Stage 4, conflict-detection §3.3). The
+/// SI write-write check (first-committer-wins) is: a prepared txn with `read_snapshot = S` conflicts
+/// iff ANY key in its write-set has a recorded `commit_seq > S` — i.e. some other transaction wrote
+/// the same key AFTER this one took its snapshot. Pruned below the oldest active read snapshot (no
+/// active transaction can still be reading before that boundary, so older ledger entries can never
+/// be the "winner" of a future conflict) — which is also the safe MVCC GC boundary.
+#[derive(Debug, Default)]
+struct RecentCommitsLedger {
+    rows: BTreeMap<RowWriteKey, Index>,
+    unique_slots: BTreeMap<UniqueIndexSlotKey, Index>,
+}
+
+impl RecentCommitsLedger {
+    /// First-committer-wins SI validation: does any key in `write_set` carry a recorded commit
+    /// strictly newer than `read_snapshot`? If so the preparing txn read a now-stale snapshot of
+    /// that key and must abort (retryable). Equality on `read_snapshot` does NOT conflict — that is
+    /// a commit this txn's snapshot already saw.
+    fn conflicts(&self, write_set: &WriteSet, read_snapshot: Index) -> bool {
+        write_set
+            .rows
+            .iter()
+            .any(|key| self.rows.get(key).is_some_and(|&seq| seq > read_snapshot))
+            || write_set.unique_slots.iter().any(|key| {
+                self.unique_slots
+                    .get(key)
+                    .is_some_and(|&seq| seq > read_snapshot)
+            })
+    }
+
+    /// Record a committed write-set at `commit_seq` (the highest writer of each key wins — commits
+    /// are assigned monotonically increasing `commit_seq` under the commit_mutex, so a later commit
+    /// always overwrites with a larger value).
+    fn record(&mut self, write_set: &WriteSet, commit_seq: Index) {
+        for key in &write_set.rows {
+            self.rows.insert(key.clone(), commit_seq);
+        }
+        for key in &write_set.unique_slots {
+            self.unique_slots.insert(key.clone(), commit_seq);
+        }
+    }
+
+    /// Drop entries written at or before `boundary` (no active snapshot reads before it, so they can
+    /// never win a future conflict). Keeps the ledger bounded by the active-snapshot window.
+    fn prune_below(&mut self, boundary: Index) {
+        self.rows.retain(|_, &mut seq| seq > boundary);
+        self.unique_slots.retain(|_, &mut seq| seq > boundary);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.rows.len() + self.unique_slots.len()
+    }
+}
+
+/// Tracks the read snapshots of in-flight transactions (write-half MVCC, Stage 4) as an ordered
+/// multiset of `read_snapshot` `commit_seq` values. A transaction registers its snapshot at
+/// prepare-begin (off-lock) and deregisters at commit/abort. The MINIMUM registered snapshot is the
+/// oldest-active boundary: ledger entries and MVCC versions older than it can be reclaimed because no
+/// active transaction can still observe (or conflict against) them. This is the concrete
+/// oldest-active-`commit_seq` the Stage-0 GC-boundary debt needed.
+#[derive(Debug, Default)]
+struct ActiveSnapshots {
+    counts: BTreeMap<Index, usize>,
+}
+
+impl ActiveSnapshots {
+    fn register(&mut self, snapshot: Index) {
+        *self.counts.entry(snapshot).or_insert(0) += 1;
+    }
+
+    fn deregister(&mut self, snapshot: Index) {
+        if let Some(count) = self.counts.get_mut(&snapshot) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&snapshot);
+            }
+        }
+    }
+
+    /// The oldest active read snapshot, or `None` when no transaction is in flight.
+    fn oldest(&self) -> Option<Index> {
+        self.counts.keys().next().copied()
+    }
+}
+
+/// RAII guard that deregisters a transaction's read snapshot from [`ActiveSnapshots`] on drop
+/// (write-half MVCC, Stage 4), so a snapshot is released even if prepare/commit returns early (a
+/// serialization abort, a constraint error) — keeping the oldest-active GC boundary from getting
+/// stuck behind an aborted transaction.
+struct ActiveSnapshotGuard<'a> {
+    engine: &'a Engine,
+    snapshot: Index,
+}
+
+impl Drop for ActiveSnapshotGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.deregister_active_snapshot(self.snapshot);
+    }
 }
 
 const PUBLIC_SCHEMA_NAME: &str = "public";
@@ -9317,8 +9576,13 @@ impl Engine {
 
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
-            repl: LocalReplicator::leader(),
-            wal: WalBuffer::default(),
+            commit: Mutex::new(CommitState {
+                repl: LocalReplicator::leader(),
+                wal: WalBuffer::default(),
+                wal_commit_timestamps_micros: BTreeMap::new(),
+                ledger: RecentCommitsLedger::default(),
+            }),
+            active_snapshots: Mutex::new(ActiveSnapshots::default()),
             sm: KvStateMachine::default(),
             mvcc: MvccData::new(),
             relational_catalog: BTreeMap::new(),
@@ -9340,15 +9604,48 @@ impl Engine {
             relational_resident_cache: RelationalResidentCache::default(),
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
-            wal_commit_timestamps_micros: BTreeMap::new(),
             txn_manager: TxnManager::default(),
-            visible_up_to: 0,
+            committed_seq: AtomicU64::new(0),
             metrics: RuntimeMetrics::default(),
             batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
             planner: Planner::new(planner_cfg),
             router: DeviceRouter::new(MockGpuRuntime::default()),
             cached_cuda_probe_runtime: OnceLock::new(),
         }
+    }
+
+    /// Lock the commit_mutex, recovering from poison. Continuing past a poisoned commit lock is the
+    /// engine's existing wedge-don't-recover policy's counterpart here: the façade re-homes the
+    /// poison-on-panic decision to the commit path (a committer that panics mid-section poisons this
+    /// lock, and the façade refuses to serve), so this `into_inner` recovery is the path the façade
+    /// then trips on — it never silently serves torn state.
+    fn commit_state(&self) -> std::sync::MutexGuard<'_, CommitState> {
+        self.commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `&mut`-access the commit substate WITHOUT locking — sound because `&mut self` already proves
+    /// exclusive access (no other thread can hold `&self`). Used by the serialized DDL apply,
+    /// recovery, and checkpoint/snapshot admin paths, which all run under the façade's exclusive
+    /// (catalog-latch) write lock.
+    fn commit_state_mut(&mut self) -> &mut CommitState {
+        self.commit
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether the commit_mutex is currently poisoned (a committer panicked mid-section). The façade
+    /// checks this to re-home its poison-on-panic policy onto the commit path (write-half Stage 4).
+    pub fn is_commit_path_poisoned(&self) -> bool {
+        self.commit.is_poisoned()
+    }
+
+    // `&self` read-only shims over the commit substate, for the scattered leader-checks and admin
+    // queries that used to read `self.repl`/`self.wal` directly. Each takes the commit lock only
+    // briefly (a cheap field read) — never across a read body.
+    fn repl_role(&self) -> Role {
+        self.commit_state().repl.role()
     }
 
     pub fn with_batching(max_items: usize, max_wait: Duration) -> Self {
@@ -9378,7 +9675,7 @@ impl Engine {
         planner_cfg: PlannerConfig,
     ) -> Self {
         let mut engine = Self::with_planner_config(planner_cfg);
-        engine.wal = WalBuffer::with_durable_segment(segment_path);
+        engine.commit_state_mut().wal = WalBuffer::with_durable_segment(segment_path);
         engine
     }
 
@@ -9416,23 +9713,26 @@ impl Engine {
         for record in &recovered_records {
             engine.commit_mutation(record.txn_id, record.payload.clone())?;
         }
-        engine.wal = WalBuffer::with_durable_segment(segment_path);
-        engine.wal.reinstate_durable_records(recovered_records);
+        engine.commit_state_mut().wal = WalBuffer::with_durable_segment(segment_path);
+        engine
+            .commit_state_mut()
+            .wal
+            .reinstate_durable_records(recovered_records);
         Ok(engine)
     }
 
     pub fn simulate_next_wal_flush_failure(&mut self) {
-        self.wal.fail_next_flush();
+        self.commit_state_mut().wal.fail_next_flush();
     }
 
     /// Group-commit accounting for the live WAL (fsync groups, durable records, largest group).
     pub fn wal_group_commit_stats(&self) -> WalGroupCommitStats {
-        self.wal.group_commit_stats()
+        self.commit_state().wal.group_commit_stats()
     }
 
     /// Whether the engine's commit path is crash-durable (WAL fsynced before visibility).
     pub fn wal_is_durable(&self) -> bool {
-        self.wal.is_durable()
+        self.commit_state().wal.is_durable()
     }
 
     pub fn mark_gpu_unavailable(&mut self, gpu_id: u16) {
@@ -9495,15 +9795,15 @@ impl Engine {
     }
 
     pub fn become_follower(&mut self, term: Term) {
-        self.repl.become_follower(term);
+        self.commit_state_mut().repl.become_follower(term);
     }
 
     pub fn become_leader(&mut self, term: Term) {
-        self.repl.become_leader(term);
+        self.commit_state_mut().repl.become_leader(term);
     }
 
     pub fn become_candidate(&mut self, term: Term) {
-        self.repl.become_candidate(term);
+        self.commit_state_mut().repl.become_candidate(term);
     }
 
     pub fn commit_mutation(
@@ -9517,7 +9817,8 @@ impl Engine {
 
     fn next_commit_timestamp_micros(&self) -> u64 {
         let wall_clock = current_timestamp_micros();
-        self.wal_commit_timestamps_micros
+        self.commit_state()
+            .wal_commit_timestamps_micros
             .values()
             .copied()
             .max()
@@ -9531,50 +9832,63 @@ impl Engine {
         payload: Vec<u8>,
         timestamp_micros: u64,
     ) -> Result<CommitToken, EngineError> {
-        if self.repl.role() != Role::Leader {
+        if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
 
-        let wal_len_before = self.wal.len();
-        self.wal.append(WalRecord {
-            txn_id,
-            payload: payload.clone(),
-        });
-
-        let token = match self.repl.propose(payload) {
-            Ok(token) => token,
-            Err(err) => {
-                self.wal.truncate(wal_len_before);
+        // Durable-commit critical section over the bundled commit substate (this method is the
+        // SERIALIZED commit path — DDL / COPY-less single mutations / replay — reached under the
+        // façade's exclusive write lock, so `commit_state_mut()` is a no-lock `get_mut`). The
+        // concurrent DML path uses `commit_dml_concurrent`, which performs the same WAL-before-publish
+        // sequence under the actual commit_mutex.
+        let token = {
+            let commit = self.commit_state_mut();
+            let wal_len_before = commit.wal.len();
+            commit.wal.append(WalRecord {
+                txn_id,
+                payload: payload.clone(),
+            });
+            let token = match commit.repl.propose(payload) {
+                Ok(token) => token,
+                Err(err) => {
+                    commit.wal.truncate(wal_len_before);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = commit.wal.flush_all() {
+                commit.repl.rollback_unapplied_from(token.index);
+                commit.wal.truncate(wal_len_before);
                 return Err(err);
             }
+            commit
+                .repl
+                .wait_committed(token, Duration::from_millis(0))?;
+            // `txn_id` (the façade `next_txn_id`) is the durable transaction *identity* — recorded in
+            // the WAL record and keyed here for PITR lookups. Intentionally DECOUPLED from the MVCC
+            // version stamp, which uses the commit `Index` (see `apply_mvcc_entry`).
+            commit
+                .wal_commit_timestamps_micros
+                .insert(txn_id, timestamp_micros);
+            token
         };
-        if let Err(err) = self.wal.flush_all() {
-            self.repl.rollback_unapplied_from(token.index);
-            self.wal.truncate(wal_len_before);
-            return Err(err);
-        }
 
-        self.repl.wait_committed(token, Duration::from_millis(0))?;
-        // `txn_id` (the façade `next_txn_id`) is the durable transaction *identity* — recorded in the
-        // WAL record and keyed here for PITR-by-txn/commit-timestamp lookups. It is intentionally
-        // DECOUPLED from the MVCC version stamp, which uses the commit `Index` (see `apply_mvcc_entry`).
-        self.wal_commit_timestamps_micros
-            .insert(txn_id, timestamp_micros);
-
-        let to_apply: Vec<LogEntry> = self
-            .repl
-            .drain_committed_from(self.repl.applied_index())
-            .cloned()
-            .collect();
+        let to_apply: Vec<LogEntry> = {
+            let commit = self.commit_state_mut();
+            commit
+                .repl
+                .drain_committed_from(commit.repl.applied_index())
+                .cloned()
+                .collect()
+        };
 
         for e in &to_apply {
             self.sm.apply(e)?;
             self.apply_mvcc_entry(e)?;
-            self.repl.mark_applied(e.index);
+            self.commit_state_mut().repl.mark_applied(e.index);
         }
 
         self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
-        self.visible_up_to = self.visible_up_to.max(token.index);
+        self.publish_committed_seq(token.index);
         self.metrics.inc_commit();
 
         Ok(token)
@@ -9594,41 +9908,47 @@ impl Engine {
         // byte-identical to a WAL replay of the same record (Stage 0 stamp/boundary unification).
         F: FnMut(&mut Self, Index) -> Result<(), EngineError>,
     {
-        if self.repl.role() != Role::Leader {
+        if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
 
-        let wal_len_before = self.wal.len();
-        self.wal.append(WalRecord {
-            txn_id,
-            payload: payload.clone(),
-        });
-
-        let token = match self.repl.propose(payload) {
-            Ok(token) => token,
-            Err(err) => {
-                self.wal.truncate(wal_len_before);
+        let token = {
+            let commit = self.commit_state_mut();
+            let wal_len_before = commit.wal.len();
+            commit.wal.append(WalRecord {
+                txn_id,
+                payload: payload.clone(),
+            });
+            let token = match commit.repl.propose(payload) {
+                Ok(token) => token,
+                Err(err) => {
+                    commit.wal.truncate(wal_len_before);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = commit.wal.flush_all() {
+                commit.repl.rollback_unapplied_from(token.index);
+                commit.wal.truncate(wal_len_before);
                 return Err(err);
             }
+            commit
+                .repl
+                .wait_committed(token, Duration::from_millis(0))?;
+            // `txn_id` is the durable transaction identity (decoupled from the MVCC `commit_seq`).
+            commit
+                .wal_commit_timestamps_micros
+                .insert(txn_id, timestamp_micros);
+            token
         };
-        if let Err(err) = self.wal.flush_all() {
-            self.repl.rollback_unapplied_from(token.index);
-            self.wal.truncate(wal_len_before);
-            return Err(err);
-        }
 
-        self.repl.wait_committed(token, Duration::from_millis(0))?;
-        // `txn_id` (the façade `next_txn_id`) is the durable transaction *identity* — recorded in the
-        // WAL record and keyed here for PITR-by-txn/commit-timestamp lookups. It is intentionally
-        // DECOUPLED from the MVCC version stamp, which uses the commit `Index` (see `apply_mvcc_entry`).
-        self.wal_commit_timestamps_micros
-            .insert(txn_id, timestamp_micros);
-
-        let to_apply: Vec<LogEntry> = self
-            .repl
-            .drain_committed_from(self.repl.applied_index())
-            .cloned()
-            .collect();
+        let to_apply: Vec<LogEntry> = {
+            let commit = self.commit_state_mut();
+            commit
+                .repl
+                .drain_committed_from(commit.repl.applied_index())
+                .cloned()
+                .collect()
+        };
 
         for e in &to_apply {
             if e.index == token.index {
@@ -9641,13 +9961,13 @@ impl Engine {
                 self.sm.apply(e)?;
                 self.apply_mvcc_entry(e)?;
             }
-            self.repl.mark_applied(e.index);
+            self.commit_state_mut().repl.mark_applied(e.index);
         }
 
         let residency_invalidation_started = Instant::now();
         self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
         let residency_invalidation_micros = residency_invalidation_started.elapsed().as_micros();
-        self.visible_up_to = self.visible_up_to.max(token.index);
+        self.publish_committed_seq(token.index);
         self.metrics.inc_commit();
 
         Ok((token, residency_invalidation_micros))
@@ -9704,6 +10024,35 @@ impl Engine {
         self.relational_resident_cache
             .partition_device_memory
             .invalidate_table(table);
+    }
+
+    /// Invalidate the GPU residency of the `tables` a CONCURRENT commit mutated, via `&self`
+    /// (write-half MVCC, Stage 4). Publishes a `None` tombstone on each table's resident
+    /// device-memory cell(s) — the authoritative gate the read-path's `plan_relational_resident_route`
+    /// checks (`has_retained_device_memory`), so after this a reader takes the CPU route on the new
+    /// committed data rather than a stale GPU snapshot (residency↔data consistency, design Risk #3).
+    /// Called INSIDE the commit critical section, before `committed_seq` is bumped, so a reader that
+    /// observes the new `committed_seq` also observes the residency tombstone.
+    ///
+    /// It deliberately does NOT mutate the `snapshots`/`partitions` flag maps (those are not
+    /// interior-mutable and are read lock-free by `&self` readers): the cell tombstone alone forces
+    /// the CPU route. The flag-based telemetry / the explicit resident-snapshot-probe API are kept
+    /// current only on the serialized invalidation path (`invalidate_relational_residency_table`),
+    /// which runs under the exclusive catalog latch.
+    fn invalidate_relational_residency_tables_concurrent(
+        &self,
+        tables: &BTreeSet<String>,
+        _txn_id: TxnId,
+        _index: Index,
+    ) {
+        for table in tables {
+            self.relational_resident_cache
+                .device_memory
+                .invalidate(table);
+            self.relational_resident_cache
+                .partition_device_memory
+                .invalidate_table(table);
+        }
     }
 
     /// The set of tables a committed batch invalidates, or `None` to fall back to a
@@ -10993,7 +11342,7 @@ impl Engine {
         };
         if create.unique {
             let visibility = StorageVisibility {
-                read_txn_id: self.visible_up_to as TxnId,
+                read_txn_id: self.committed_seq() as TxnId,
             };
             let rows = self.visible_relational_rows(&table, visibility)?;
             Self::validate_unique_values(&rows, column_idx, &create.name)?;
@@ -11370,7 +11719,7 @@ impl Engine {
         let rows = self.visible_relational_rows(
             table,
             StorageVisibility {
-                read_txn_id: self.visible_up_to as TxnId,
+                read_txn_id: self.committed_seq() as TxnId,
             },
         )?;
         for row in rows {
@@ -11707,10 +12056,9 @@ impl Engine {
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             }
             for (key, keys) in &new_value_index {
-                data.value_index
-                    .entry(key.clone())
-                    .or_default()
-                    .extend(keys.iter().cloned());
+                let mut slot = data.value_index.get(key).cloned().unwrap_or_default();
+                std::sync::Arc::make_mut(&mut slot).extend(keys.iter().cloned());
+                data.value_index.insert(key.clone(), slot);
             }
             Ok::<(), EngineError>(())
         })?;
@@ -11723,7 +12071,7 @@ impl Engine {
                     .tuple_delete(*old_tuple_id, txn_id)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             }
-            data.value_index.clear();
+            data.value_index = imbl::OrdMap::new();
             Ok::<(), EngineError>(())
         })?;
 
@@ -13437,13 +13785,17 @@ impl Engine {
                 data.rows
                     .tuple_update(*tuple_id, encode_relational_row(values), txn_id)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                data.value_index
-                    .entry(ColumnValueKey {
-                        column: new_column_name.clone(),
-                        value: relational_index_value(&index_value),
-                    })
-                    .or_default()
-                    .push(row_key.clone());
+                let index_key = ColumnValueKey {
+                    column: new_column_name.clone(),
+                    value: relational_index_value(&index_value),
+                };
+                let mut slot = data
+                    .value_index
+                    .get(&index_key)
+                    .cloned()
+                    .unwrap_or_default();
+                std::sync::Arc::make_mut(&mut slot).push(row_key.clone());
+                data.value_index.insert(index_key, slot);
             }
             Ok::<(), EngineError>(())
         })?;
@@ -13497,26 +13849,23 @@ impl Engine {
         }
 
         // Rename the column within this table's per-table value-index (keys are `(column, value)`),
-        // publishing one new generation.
+        // publishing one new generation. `imbl::OrdMap` has no in-place `retain`; rebuild the index,
+        // re-keying the matching column's slots (carrying the same `Arc` row-key list, an O(1) move)
+        // and keeping the rest by `Arc`-clone. Order is preserved (OrdMap is ordered).
         self.mvcc.with_table_mut(&rename.table, |data| {
-            let mut renamed_index_entries = Vec::new();
-            data.value_index.retain(|key, row_keys| {
-                if key.column == rename.old_name {
-                    renamed_index_entries.push((
-                        ColumnValueKey {
-                            column: rename.new_name.clone(),
-                            value: key.value.clone(),
-                        },
-                        row_keys.clone(),
-                    ));
-                    false
+            let mut rebuilt = imbl::OrdMap::new();
+            for (key, row_keys) in data.value_index.iter() {
+                let new_key = if key.column == rename.old_name {
+                    ColumnValueKey {
+                        column: rename.new_name.clone(),
+                        value: key.value.clone(),
+                    }
                 } else {
-                    true
-                }
-            });
-            for (key, row_keys) in renamed_index_entries {
-                data.value_index.insert(key, row_keys);
+                    key.clone()
+                };
+                rebuilt.insert(new_key, std::sync::Arc::clone(row_keys));
             }
+            data.value_index = rebuilt;
         });
 
         let table_ref = self
@@ -13660,8 +14009,14 @@ impl Engine {
                     .tuple_update(*tuple_id, encode_relational_row(values), txn_id)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             }
-            data.value_index
-                .retain(|key, _| key.column != dropped_column_name);
+            // `imbl::OrdMap` has no in-place `retain`; rebuild keeping every slot whose column is
+            // not the dropped one (`Arc`-clone is O(1), and OrdMap preserves key order).
+            data.value_index = data
+                .value_index
+                .iter()
+                .filter(|(key, _)| key.column != dropped_column_name)
+                .map(|(key, row_keys)| (key.clone(), std::sync::Arc::clone(row_keys)))
+                .collect();
             Ok::<(), EngineError>(())
         })?;
 
@@ -13882,13 +14237,16 @@ impl Engine {
             relational_value_index_entries_for_rows(&table.columns, &inserted_rows);
 
         let mut write_set = WriteSet::default();
-        for (row_key, values) in &inserted_rows {
-            // Each inserted version claims its own row slot.
-            write_set.rows.push(RowWriteKey {
-                table: insert.table.clone(),
-                row_key: row_key.clone(),
-            });
-            // ... and any unique-index slot the new row occupies (first-committer-wins point).
+        for (_row_key, values) in &inserted_rows {
+            // An INSERT claims a FRESH, unique row id at install time (`apply_delta` reserves the
+            // tuple id + advances `relational_next_row_id` under the commit lock), so its row slot
+            // can never truly collide with another writer's — the predicted `row_key` here is only
+            // a snapshot-relative label and is re-derived live on install. Putting it in the
+            // conflict `write_set.rows` would make two concurrent disjoint inserts whose prepare
+            // windows overlap (and therefore read the SAME off-lock `next_row_id`) predict the SAME
+            // key and FALSELY conflict. Inserts conflict ONLY on the unique-index slots they
+            // occupy (the genuine first-committer-wins point); the row slot is intentionally NOT a
+            // conflict dimension for inserts.
             write_set.add_unique_slots(&table, values);
         }
 
@@ -14036,6 +14394,15 @@ impl Engine {
         let prefix = relational_key_prefix(&update.table);
         let mut updates = Vec::new();
         let mut candidate_rows = Vec::new();
+        // Unique slots the OLD images RELEASE (prereq #2, Stage-4 audit). An UPDATE that changes a
+        // unique column frees its old `(table, column, value)` slot; record those freed slots in the
+        // write-set so a CONCURRENT insert/update reusing the freed value conflicts under
+        // first-committer-wins — matching the DELETE path, which already records the released slots.
+        // This is the conservative choice: it never admits a phantom unique duplicate across a
+        // concurrent free+reuse (a slot-release left unrecorded could). A no-op-on-the-unique-column
+        // UPDATE records the same slot as both released (old) and claimed (new) — harmless (the
+        // write-set dedups to one slot), so an idempotent rewrite does not self-conflict.
+        let mut released_unique_slots: Vec<UniqueIndexSlotKey> = Vec::new();
         let table_rows = self.mvcc.table_rows(&update.table);
         let mut cursor = table_rows
             .store()
@@ -14053,6 +14420,10 @@ impl Engine {
                     .iter()
                     .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
             }) {
+                // Capture the old image's unique slots BEFORE the assignments overwrite them.
+                let mut old_slots = WriteSet::default();
+                old_slots.add_unique_slots(&table, &row);
+                released_unique_slots.append(&mut old_slots.unique_slots);
                 for (idx, value) in &assignments {
                     row[*idx] = value.clone();
                 }
@@ -14110,6 +14481,12 @@ impl Engine {
             // The new image's unique-index slots are claimed by this txn.
             write_set.add_unique_slots(&table, row);
         }
+        // The old images' RELEASED unique slots are also conflict points (prereq #2). Dedup so a
+        // value carried unchanged through the UPDATE (same slot released and re-claimed) is recorded
+        // once and never self-conflicts.
+        write_set.unique_slots.append(&mut released_unique_slots);
+        write_set.unique_slots.sort();
+        write_set.unique_slots.dedup();
 
         // `updates` is already `(tuple_id, row_key, new_values)` — exactly the install shape.
         Ok(WriteDelta {
@@ -14123,17 +14500,20 @@ impl Engine {
         })
     }
 
-    /// Install a prepared [`WriteDelta`], stamping new versions with `commit_seq` (Stage 0
-    /// stamp/boundary unification: `commit_seq == entry.index`). This is the ONLY `&mut self`
-    /// half of the write apply. It mutates exactly the structures the write-set names — the
-    /// mutated table's `TableVersionData` (its row chains + value-index) and the relational
-    /// row-id allocator — and nothing else, then **publishes** one new `Arc<TableVersionData>`
-    /// for that table (write-half Stage 3: per-table publish-on-commit). Still called under the
-    /// existing commit lock (no concurrency until Stage 4); `prepare_* (off-lock) + apply_delta`
-    /// is byte-identical to the old direct apply. Single-table per mutation is the norm; each
-    /// `PreparedMutation` names exactly one table, so each apply publishes exactly one generation.
+    /// Install a prepared [`WriteDelta`]'s data, stamping new versions with `commit_seq` (Stage 0
+    /// stamp/boundary unification: `commit_seq == commit Index`). `&self` (write-half Stage 4): it
+    /// mutates exactly the structures the write-set names — the mutated table's `TableVersionData`
+    /// (row chains + value-index, via the now-`&self` COW `with_table_mut`) and the atomic
+    /// relational row-id / tuple-id allocators — then **publishes** one new generation for that
+    /// table. The CALLER provides serialization (the commit critical section under the commit_mutex,
+    /// or a serialized DDL apply under the catalog latch), so concurrent committers never interleave.
+    ///
+    /// `nextval` sequence advancement is NOT applied here (sequences are not interior-mutable): a
+    /// delta carrying `seq_advances` MUST go through the serialized [`Engine::apply_delta_serialized`]
+    /// (`&mut self`), which applies the advancement first. `apply_delta` asserts the delta is
+    /// sequence-free.
     fn apply_delta(
-        &mut self,
+        &self,
         delta: WriteDelta,
         commit_seq: TxnId,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
@@ -14145,16 +14525,11 @@ impl Engine {
                 value_index_entries,
                 seq_advances,
             } => {
-                // Install the sequence advancement `prepare_insert` computed for `nextval`
-                // column defaults (before the row inserts, matching the old apply where defaults
-                // were evaluated first). Idempotent assignment of the final `(last_value,
-                // is_called)` — same end-state as the old in-line `apply_sequence_nextval` calls.
-                for (sequence, (last_value, is_called)) in seq_advances {
-                    if let Some(seq) = self.relational_sequences.get_mut(&sequence) {
-                        seq.last_value = last_value;
-                        seq.is_called = is_called;
-                    }
-                }
+                debug_assert!(
+                    seq_advances.is_empty(),
+                    "apply_delta (&self) cannot install nextval sequence advances; route through \
+                     apply_delta_serialized"
+                );
                 // Reserve the globally-unique tuple ids up front (the old in-line bump consumed one
                 // per row from the single shared allocator; `next_tuple_id` is now shared across all
                 // partitions so ids are identical). Advance the relational row-id allocator by the
@@ -14179,12 +14554,13 @@ impl Engine {
                             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                     }
                     // Append the value-index entries within the SAME published generation, so a
-                    // reader that loads it sees rows + value-index mutually consistent.
+                    // reader that loads it sees rows + value-index mutually consistent. `Arc::make_mut`
+                    // copies a slot's row-key list ONLY if a live snapshot still shares it (COW),
+                    // keeping the per-commit cost O(k·log n) for the k touched slots.
                     for (key, mut row_keys) in value_index_entries {
-                        data.value_index
-                            .entry(key)
-                            .or_default()
-                            .append(&mut row_keys);
+                        let mut slot = data.value_index.get(&key).cloned().unwrap_or_default();
+                        std::sync::Arc::make_mut(&mut slot).append(&mut row_keys);
+                        data.value_index.insert(key, slot);
                     }
                     Ok::<(), EngineError>(())
                 });
@@ -14208,10 +14584,9 @@ impl Engine {
                             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                     }
                     for (key, mut row_keys) in value_index_entries {
-                        data.value_index
-                            .entry(key)
-                            .or_default()
-                            .append(&mut row_keys);
+                        let mut slot = data.value_index.get(&key).cloned().unwrap_or_default();
+                        std::sync::Arc::make_mut(&mut slot).append(&mut row_keys);
+                        data.value_index.insert(key, slot);
                     }
                     Ok::<(), EngineError>(())
                 })?;
@@ -14230,6 +14605,32 @@ impl Engine {
         Ok(())
     }
 
+    /// `&mut self` install for the SERIALIZED commit path (DDL / COPY / replay): apply any `nextval`
+    /// sequence advancement (needs `&mut self` — sequences are not interior-mutable) and then install
+    /// the rest of the delta via the `&self` [`Engine::apply_delta`]. Behaviorally identical to the
+    /// pre-Stage-4 `apply_delta` (sequence advance first, then rows + value-index), so the live
+    /// serialized apply stays byte-identical to a WAL replay.
+    fn apply_delta_serialized(
+        &mut self,
+        mut delta: WriteDelta,
+        commit_seq: TxnId,
+        profile: Option<&mut RelationalCopyAdmissionProfile>,
+    ) -> Result<(), EngineError> {
+        if let PreparedMutation::Insert { seq_advances, .. } = &mut delta.mutation {
+            // Install the sequence advancement `prepare_insert` computed for `nextval` column
+            // defaults (before the row inserts, matching the old apply). Idempotent assignment of the
+            // final `(last_value, is_called)`.
+            let advances = std::mem::take(seq_advances);
+            for (sequence, (last_value, is_called)) in advances {
+                if let Some(seq) = self.relational_sequences.get_mut(&sequence) {
+                    seq.last_value = last_value;
+                    seq.is_called = is_called;
+                }
+            }
+        }
+        self.apply_delta(delta, commit_seq, profile)
+    }
+
     fn apply_insert_with_profile(
         &mut self,
         insert: Insert,
@@ -14243,7 +14644,7 @@ impl Engine {
         // `next_row_id` and the read visibility match what the in-line apply used.
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_insert(&insert, snapshot, profile.as_deref_mut())?;
-        self.apply_delta(delta, txn_id, profile)
+        self.apply_delta_serialized(delta, txn_id, profile)
     }
 
     fn apply_delete(&mut self, delete: Delete, txn_id: TxnId) -> Result<(), EngineError> {
@@ -14252,7 +14653,7 @@ impl Engine {
         // and the version stamp, identical to the old direct apply (still under the commit lock).
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_delete(&delete, snapshot)?;
-        self.apply_delta(delta, txn_id, None)
+        self.apply_delta_serialized(delta, txn_id, None)
     }
 
     fn apply_update(&mut self, update: Update, txn_id: TxnId) -> Result<(), EngineError> {
@@ -14261,7 +14662,7 @@ impl Engine {
         // both the read boundary and the version stamp, identical to the old direct apply.
         let snapshot = self.dml_read_snapshot(txn_id);
         let delta = self.prepare_update(&update, snapshot)?;
-        self.apply_delta(delta, txn_id, None)
+        self.apply_delta_serialized(delta, txn_id, None)
     }
 
     fn preflight_unique_index_constraints(
@@ -14486,7 +14887,7 @@ impl Engine {
                 let rows = self.visible_relational_rows(
                     table,
                     StorageVisibility {
-                        read_txn_id: self.visible_up_to as TxnId,
+                        read_txn_id: self.committed_seq() as TxnId,
                     },
                 )?;
                 Self::validate_unique_values(&rows, column_idx, &create.name)?;
@@ -14528,7 +14929,7 @@ impl Engine {
                 let rows = self.visible_relational_rows(
                     table,
                     StorageVisibility {
-                        read_txn_id: self.visible_up_to as TxnId,
+                        read_txn_id: self.committed_seq() as TxnId,
                     },
                 )?;
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
@@ -14564,7 +14965,7 @@ impl Engine {
                 let rows = self.visible_relational_rows(
                     table,
                     StorageVisibility {
-                        read_txn_id: self.visible_up_to as TxnId,
+                        read_txn_id: self.committed_seq() as TxnId,
                     },
                 )?;
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
@@ -15521,7 +15922,7 @@ impl Engine {
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => {
-                if self.repl.role() != Role::Leader {
+                if self.repl_role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
                 self.preflight_unique_index_constraints(&cmd, txn_id)?;
@@ -15602,7 +16003,7 @@ impl Engine {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { key } => {
-                if self.repl.role() != Role::Leader {
+                if self.repl_role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -15618,7 +16019,7 @@ impl Engine {
     }
 
     pub fn tick_batching(&mut self, now: Instant) -> Result<(), EngineError> {
-        if self.repl.role() != Role::Leader {
+        if self.repl_role() != Role::Leader {
             if self.has_pending_batch() {
                 return Err(EngineError::NotLeader);
             }
@@ -15632,7 +16033,7 @@ impl Engine {
     }
 
     pub fn flush_admin(&mut self) -> Result<(), EngineError> {
-        if self.repl.role() != Role::Leader {
+        if self.repl_role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
 
@@ -15693,6 +16094,317 @@ impl Engine {
     pub fn plan_text(&self, text: &str) -> Result<ExecutionPlan, ParseError> {
         let cmd = parse_command(text)?;
         Ok(self.planner.plan_command(&cmd))
+    }
+
+    /// Whether `text` is a DML statement (`INSERT`/`UPDATE`/`DELETE` on an existing base table whose
+    /// columns carry no `nextval` sequence default) that the **concurrent** commit path can execute
+    /// via off-lock prepare + the short commit critical section (write-half MVCC, Stage 4). Anything
+    /// else — DDL, KV, sequence-default INSERTs, transaction control, parse errors, unknown tables —
+    /// returns `false` and the caller routes it through the SERIALIZED `execute_text` under the
+    /// catalog latch. Conservative by construction: it never returns `true` for a statement the
+    /// concurrent path can't faithfully execute (a wrong "yes" only ever means a serialized fallback,
+    /// never a wrong result — but here a wrong "yes" would mis-route, so the checks are exact).
+    pub fn is_concurrent_dml(&self, text: &str) -> bool {
+        let Ok(cmd) = parse_command(text) else {
+            return false;
+        };
+        let table_name = match &cmd {
+            Command::Insert(insert) => &insert.table,
+            Command::Update(update) => &update.table,
+            Command::Delete(delete) => &delete.table,
+            _ => return false,
+        };
+        let Some(table) = self.relational_catalog.get(table_name) else {
+            return false;
+        };
+        // INSERTs that evaluate a `nextval` column default mutate sequence state, which is not
+        // interior-mutable; route those through the serialized path (which applies the advance under
+        // `&mut self`). UPDATE/DELETE never touch sequences, so they are always eligible.
+        if matches!(cmd, Command::Insert(_)) {
+            let touches_sequence_default = table.columns.iter().any(|column| {
+                matches!(column.default, Some(ColumnDefault::SequenceNextVal { .. }))
+            });
+            if touches_sequence_default {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Register a transaction's read snapshot (its `read_snapshot` `commit_seq`) for the
+    /// oldest-active GC/ledger-prune boundary, returning a guard that deregisters on drop (write-half
+    /// MVCC, Stage 4). Done off-lock at prepare-begin so taking a snapshot never serializes on the
+    /// commit_mutex.
+    fn register_active_snapshot(&self, snapshot: Index) -> ActiveSnapshotGuard<'_> {
+        self.active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .register(snapshot);
+        ActiveSnapshotGuard {
+            engine: self,
+            snapshot,
+        }
+    }
+
+    fn deregister_active_snapshot(&self, snapshot: Index) {
+        self.active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .deregister(snapshot);
+    }
+
+    /// Execute one autocommit DML statement (`INSERT`/`UPDATE`/`DELETE`) on the CONCURRENT commit
+    /// path under Snapshot Isolation (write-half MVCC, Stage 4 — the concurrency flip):
+    ///
+    /// 1. **Begin (off-lock):** pin a read snapshot `S = committed_seq` and register it.
+    /// 2. **Prepare (off-lock, no commit_mutex):** parse, constraint-preflight against `S`, and
+    ///    compute the conflict write-set (`prepare_*` at `S`). Many writers run this concurrently,
+    ///    and concurrently with lock-free readers.
+    /// 3. **Commit (short critical section under the commit_mutex):** validate the write-set against
+    ///    the recent-commits ledger (overlap since `S` ⇒ retryable [`ExecuteError::Serialization`],
+    ///    first-committer-wins) → assign `commit_seq` (the commit `Index`) → WAL append + group-commit
+    ///    fsync → install the delta RE-RESOLVED at `commit_seq` (so the live apply is byte-identical
+    ///    to a WAL replay) + publish the table generation → record the write-set in the ledger → bump
+    ///    `committed_seq` LAST (release-store: the publish point).
+    /// 4. **Abort/retry:** a conflict (or any prepare error) publishes nothing and is returned; a
+    ///    serialization conflict is retryable with a fresh snapshot.
+    ///
+    /// `&self`: the whole path runs without an engine write lock, so writers overlap on prepare and
+    /// serialize only briefly on the commit_mutex, and a writer never blocks a reader.
+    pub fn execute_dml_concurrent(&self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
+        self.execute_dml_concurrent_instrumented(txn_id, text, || {})
+    }
+
+    /// [`Engine::execute_dml_concurrent`] with a hook invoked AFTER the off-lock snapshot capture +
+    /// prepare but BEFORE the commit critical section. The concurrency-correctness suite uses this to
+    /// rendezvous two writers at a barrier between snapshot and commit, deterministically forcing the
+    /// SI write-write conflict window (both read the same snapshot, then both try to commit) — the
+    /// lost-update exit criterion. The production entry point passes an empty hook, so this is a
+    /// zero-overhead extraction of the real path, not a separate code path.
+    pub fn execute_dml_concurrent_instrumented(
+        &self,
+        txn_id: u64,
+        text: &str,
+        on_prepared: impl FnOnce(),
+    ) -> Result<(), ExecuteError> {
+        let cmd = parse_command(text)?;
+        if self.repl_role() != Role::Leader {
+            return Err(ExecuteError::Engine(EngineError::NotLeader));
+        }
+        // (1) Begin: pin + register the read snapshot for the off-lock prepare.
+        let read_snapshot = self.committed_seq();
+        let _snapshot_guard = self.register_active_snapshot(read_snapshot);
+
+        // (2) Prepare OFF-LOCK at the read snapshot: validate constraints + compute the conflict
+        // write-set. (The delta itself is recomputed at commit_seq under the lock so the live apply
+        // matches a WAL replay; this off-lock pass is the expensive validation + the write-set.)
+        self.preflight_unique_index_constraints(&cmd, txn_id)
+            .map_err(ExecuteError::Engine)?;
+        let snapshot = self.dml_read_snapshot(read_snapshot);
+        let prepared = self.prepare_dml(&cmd, snapshot)?;
+        let residency_tables = Self::dml_mutated_tables(&cmd);
+
+        // The snapshot is now pinned and prepare is done; the commit critical section has not started.
+        // (Tests barrier here to align two writers' snapshots before their commits race.)
+        on_prepared();
+
+        // (3) Commit critical section under the commit_mutex.
+        self.commit_dml_concurrent(
+            txn_id,
+            &cmd,
+            text,
+            prepared.write_set,
+            read_snapshot,
+            residency_tables,
+        )
+    }
+
+    /// Off-lock prepare dispatch: run the pure `prepare_*` for a DML command against `snapshot`.
+    fn prepare_dml(
+        &self,
+        cmd: &Command,
+        snapshot: DmlReadSnapshot,
+    ) -> Result<WriteDelta, ExecuteError> {
+        let delta = match cmd {
+            Command::Insert(insert) => self.prepare_insert(insert, snapshot, None),
+            Command::Update(update) => self.prepare_update(update, snapshot),
+            Command::Delete(delete) => self.prepare_delete(delete, snapshot),
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "execute_dml_concurrent received a non-DML command".to_string(),
+                )))
+            }
+        }?;
+        Ok(delta)
+    }
+
+    /// The set of tables a DML command mutates (for per-table residency invalidation on commit).
+    fn dml_mutated_tables(cmd: &Command) -> BTreeSet<String> {
+        let mut tables = BTreeSet::new();
+        match cmd {
+            Command::Insert(insert) => {
+                tables.insert(insert.table.clone());
+            }
+            Command::Update(update) => {
+                tables.insert(update.table.clone());
+            }
+            Command::Delete(delete) => {
+                tables.insert(delete.table.clone());
+            }
+            _ => {}
+        }
+        tables
+    }
+
+    /// The short commit critical section (write-half MVCC, Stage 4). Holds the commit_mutex for:
+    /// SI conflict validation → RE-RESOLVE/re-validate the delta at the peeked `commit_seq` → WAL
+    /// append+fsync (`commit_seq` assignment) → delta install + table publish → ledger record →
+    /// `committed_seq` release-store. Returns the retryable [`ExecuteError::Serialization`] on a
+    /// first-committer-wins conflict OR on a re-resolve/constraint failure under a legal concurrent
+    /// interleaving (a phantom absorbed since the snapshot, or a read-only FK parent a concurrent
+    /// committer deleted) — in BOTH cases nothing was proposed/published/made durable and no
+    /// commit-seq hole is left. The re-resolve runs the same `prepare_*` the serialized path uses
+    /// (and `apply_delta` installs it), so the live apply is byte-identical to a WAL replay of the
+    /// recorded SQL (the kill-mid-commit-under-concurrency invariant). The re-resolve happens BEFORE
+    /// the WAL append/`propose`, so an abort never has anything durable to roll back.
+    fn commit_dml_concurrent(
+        &self,
+        txn_id: u64,
+        cmd: &Command,
+        text: &str,
+        write_set: WriteSet,
+        read_snapshot: Index,
+        residency_tables: BTreeSet<String>,
+    ) -> Result<(), ExecuteError> {
+        let timestamp_micros = self.next_commit_timestamp_micros();
+        let payload = text.as_bytes().to_vec();
+
+        // === enter the commit critical section ===
+        let mut commit = self.commit_state();
+
+        // (3a) Validate the prepared write-set against commits since the read snapshot. Any overlap
+        // means a concurrent transaction committed a write to one of our keys after we snapshotted —
+        // first-committer-wins aborts us (retryable). Nothing has been proposed/written yet, so the
+        // abort is side-effect-free.
+        if commit.ledger.conflicts(&write_set, read_snapshot) {
+            return Err(ExecuteError::Serialization(format!(
+                "write-write conflict on a key committed after read snapshot {read_snapshot}"
+            )));
+        }
+
+        // (3b) PEEK the commit_seq this txn WILL be assigned, then RE-RESOLVE + re-validate the delta
+        // at it — BEFORE anything durable (WAL/propose) happens. We hold the commit_mutex, so no other
+        // committer can `propose` between this peek and ours, and our own delta is not installed yet;
+        // therefore re-resolving at `committed_seq = next_index` now sees EXACTLY the state it would
+        // see after `propose` but before `apply` (the highest existing version stamp is < commit_seq,
+        // so resolving at `commit_seq` admits all currently-committed versions and none of our own).
+        //
+        // The re-prepare re-runs the FULL unique/CHECK/FK preflight + UPDATE/DELETE predicate
+        // resolution against `commit_seq`. The off-lock prepare validated only against an OLDER
+        // snapshot and the SI conflict check (3a) only covers keys in our WRITE-set; a phantom
+        // committed in (snapshot, commit_seq] — e.g. an FK PARENT we merely READ then a concurrent
+        // DELETE removed, or a row a re-resolve now absorbs into a unique/CHECK violation — can break
+        // a constraint at commit_seq even though (3a) passed. That is a LEGAL concurrent interleaving,
+        // not an invariant violation, so it is a RETRYABLE serialization abort: because we have not
+        // proposed or appended to the WAL yet, the abort leaves NOTHING durable and NO commit-seq hole
+        // (we never consumed the index). The caller retries against a fresh snapshot.
+        let commit_seq = commit.repl.peek_next_index();
+        let install_snapshot = self.dml_read_snapshot(commit_seq);
+        let delta = self.prepare_dml(cmd, install_snapshot).map_err(|err| {
+            // A re-prepare failure under a legal concurrent interleaving (phantom absorbed by the
+            // re-resolve, or a read-only FK parent deleted by a concurrent committer). Surface as a
+            // retryable Serialization abort rather than a panic — nothing was made durable.
+            match err {
+                ExecuteError::Serialization(_) => err,
+                other => ExecuteError::Serialization(format!(
+                    "re-resolve at commit_seq {commit_seq} failed on a concurrent interleaving \
+                     (retryable): {other}"
+                )),
+            }
+        })?;
+
+        // (3c) Only NOW assign commit_seq for real (WAL append + propose + group-commit fsync). The
+        // `propose` MUST return the index we peeked, since we hold the commit_mutex (single proposer).
+        // The WAL-before-visibility invariant: the fsync completes before we publish or bump
+        // committed_seq.
+        let wal_len_before = commit.wal.len();
+        commit.wal.append(WalRecord {
+            txn_id,
+            payload: payload.clone(),
+        });
+        let token = match commit.repl.propose(payload) {
+            Ok(token) => token,
+            Err(err) => {
+                commit.wal.truncate(wal_len_before);
+                return Err(ExecuteError::Engine(err));
+            }
+        };
+        debug_assert_eq!(
+            token.index, commit_seq,
+            "commit_mutex is the single proposer: the proposed index must equal the peeked one"
+        );
+        let commit_seq = token.index;
+        if let Err(err) = commit.wal.flush_all() {
+            commit.repl.rollback_unapplied_from(commit_seq);
+            commit.wal.truncate(wal_len_before);
+            return Err(ExecuteError::Engine(err));
+        }
+        commit
+            .repl
+            .wait_committed(token, Duration::from_millis(0))?;
+        commit
+            .wal_commit_timestamps_micros
+            .insert(txn_id, timestamp_micros);
+
+        // (3d) Install the already-validated delta + publish the table generation. The delta was
+        // re-resolved at exactly this `commit_seq` above, so this is a PURE install (reserve fresh
+        // tuple ids, advance the row-id allocator, mutate the per-table version chains + value index
+        // under the commit_mutex). The MvccData publish + the atomic allocators are `&self`; the
+        // commit_mutex (held here) serializes installs so row-id assignment + the per-table publish
+        // are atomic w.r.t. other committers. A failure HERE is unreachable on any legal interleaving
+        // (the validation already succeeded at this seq and we hold the lock) AND the WAL record is
+        // already durable, so it would be a true unrecoverable invariant violation — we PANIC, which
+        // poisons the commit_mutex; the façade's re-homed poison-on-panic policy then refuses further
+        // service rather than serve state inconsistent with the durable WAL (a restart replays the
+        // WAL, the source of truth). Mark the entry applied so the replicator's applied_index tracks
+        // the directly-applied commit (no later re-drain / re-apply).
+        self.apply_delta(delta, commit_seq, None).unwrap_or_else(|err| {
+            panic!(
+                "commit-path invariant violation: apply at commit_seq {commit_seq} failed after the \
+                 WAL was made durable, although re-validation at this seq succeeded: {err}"
+            )
+        });
+        commit.repl.mark_applied(commit_seq);
+
+        // (3e) Record OUR write-set in the ledger for future conflict detection, then prune entries
+        // below the oldest active snapshot (the safe GC/ledger boundary).
+        commit.ledger.record(&write_set, commit_seq);
+        let prune_boundary = self
+            .active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .oldest()
+            .map(|oldest| oldest.saturating_sub(1))
+            .unwrap_or(commit_seq);
+        commit.ledger.prune_below(prune_boundary);
+
+        // Residency invalidation for the mutated tables, INSIDE the critical section so it is atomic
+        // with the data publish (residency↔data consistency, design Risk #3): a reader that observes
+        // the new committed_seq also sees the table's GPU residency invalidated.
+        self.invalidate_relational_residency_tables_concurrent(
+            &residency_tables,
+            txn_id,
+            commit_seq,
+        );
+
+        // (3f) Publish point: bump committed_seq LAST (release-store). Strictly after the WAL fsync
+        // and the data/value-index publish, so an acquire-load by a reader observes a fully durable,
+        // fully published commit.
+        self.publish_committed_seq(commit_seq);
+        self.metrics.inc_commit();
+        drop(commit);
+        // === leave the commit critical section ===
+        Ok(())
     }
 
     pub fn execute_text(&mut self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
@@ -15829,7 +16541,7 @@ impl Engine {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { key } => {
-                if self.repl.role() != Role::Leader {
+                if self.repl_role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -15850,7 +16562,7 @@ impl Engine {
 
         match cmd {
             Command::GetKv { key } => {
-                if self.repl.role() != Role::Leader {
+                if self.repl_role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
 
@@ -15957,6 +16669,27 @@ impl Engine {
         }
     }
 
+    /// Pin one statement-stable relational read snapshot (prereq #1, write-half Stage 4): read the
+    /// visibility boundary (`committed_seq`) ONCE and pin ONE generation of `table` (its rows +
+    /// value-index together). The whole statement then reads from this one pin, so a concurrent
+    /// committer can never interleave the value-index of one `commit_seq` with the rows of another.
+    fn pin_relational_read(&self, table: &str) -> RelationalReadPin {
+        RelationalReadPin {
+            visibility: self.read_visibility(),
+            table_rows: self.mvcc.table_rows(table),
+        }
+    }
+
+    /// The single visibility boundary a read pins at statement start: an acquire-load of
+    /// `committed_seq` (the publish point bumped release-last by the commit critical section). Read
+    /// exactly once per statement (via [`Engine::pin_relational_read`]) so every part of the
+    /// statement filters against one boundary — no non-repeatable read within a statement.
+    fn read_visibility(&self) -> StorageVisibility {
+        StorageVisibility {
+            read_txn_id: self.committed_seq(),
+        }
+    }
+
     pub fn execute_relational_select(
         &self,
         select: &Select,
@@ -15991,11 +16724,40 @@ impl Engine {
         }
         let resident_route = self.plan_relational_resident_route(select);
         if resident_route.accepted {
-            return self.execute_relational_select_with_resident_route(select);
+            match self.execute_relational_select_with_resident_route(select) {
+                Ok(result) => return Ok(result),
+                // A concurrent committer can tombstone the table's GPU residency (publish(None))
+                // under the commit_mutex AFTER we accepted the resident route but BEFORE the probe
+                // loaded the device-memory cell (the writer holds only the engine READ lock, so it
+                // races our read). That surfaces as the precise "no retained resident device memory"
+                // probe error — NOT a genuine device failure. Transparently fall back to the CPU
+                // pinned-read path (which reads the current published data generation at one pinned
+                // boundary), exactly as a non-resident table would. Any OTHER error (a real
+                // GPU/CUDA failure, a bind error, etc.) propagates unchanged so we never mask it.
+                Err(err) if err.is_residency_invalidated() => {
+                    return self.execute_relational_select_cpu_pinned(select);
+                }
+                Err(err) => return Err(err),
+            }
         }
+        self.execute_relational_select_cpu_pinned(select)
+    }
+
+    /// The CPU pinned-read path for a relational SELECT (write-half MVCC, Stage 4): bind, pin ONE
+    /// generation + ONE visibility boundary for the whole statement (prereq #1 — the value-index
+    /// lookup AND the row resolution both read from `pin`, never two `load_table()`s), build + run
+    /// the MVCC query, finalize. Used both when the table is not GPU-resident AND as the transparent
+    /// fallback when a resident route's residency was invalidated mid-statement by a concurrent
+    /// committer (see [`Engine::execute_relational_select`]).
+    fn execute_relational_select_cpu_pinned(
+        &self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
-        let result = self.execute_mvcc_query_on_table(&select.table, &query)?;
+        let pin = self.pin_relational_read(&select.table);
+        let (query, access_path) =
+            self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
+        let result = self.execute_mvcc_query_on_pin(&pin, &query)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
@@ -16036,9 +16798,11 @@ impl Engine {
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let pin = self.pin_relational_read(&select.table);
+        let (query, access_path) =
+            self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
         let result =
-            self.execute_mvcc_query_with_cuda_driver_probe_on_table(&select.table, &query)?;
+            self.execute_mvcc_query_with_cuda_driver_probe_on_store(pin.store(), &query)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
@@ -16047,7 +16811,9 @@ impl Engine {
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let pin = self.pin_relational_read(&select.table);
+        let (_query, access_path) =
+            self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -16523,7 +17289,7 @@ impl Engine {
             }
             batch_selected_indexes = Some(bound.selected_indexes.clone());
             let (_query, access_path) =
-                self.relational_select_mvcc_query(&job.select, &table, &bound)?;
+                self.relational_select_mvcc_query_pinned(&job.select, &table, &bound)?;
             members.push((bound, access_path, needle));
         }
 
@@ -16777,7 +17543,8 @@ impl Engine {
                     .to_string(),
             )));
         }
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -16862,7 +17629,8 @@ impl Engine {
                     .to_string(),
             )));
         }
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
             .relational_resident_cache
             .partitions
@@ -16999,7 +17767,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
             .relational_resident_cache
             .partitions
@@ -17144,7 +17913,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
             .relational_resident_cache
             .partitions
@@ -17360,7 +18130,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
             .relational_resident_cache
             .partitions
@@ -17608,7 +18379,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
             .relational_resident_cache
             .partitions
@@ -17825,7 +18597,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
             .relational_resident_cache
             .partitions
@@ -18016,7 +18789,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
             .relational_resident_cache
             .partitions
@@ -18209,7 +18983,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
             .relational_resident_cache
             .partitions
@@ -18385,7 +19160,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -18475,7 +19251,8 @@ impl Engine {
             )));
         };
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -18608,7 +19385,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -18705,7 +19483,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -18837,7 +19616,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -18943,7 +19723,8 @@ impl Engine {
             }
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19075,7 +19856,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19189,7 +19971,8 @@ impl Engine {
             ))));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19378,7 +20161,8 @@ impl Engine {
             ))));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19504,7 +20288,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19666,7 +20451,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -19883,7 +20669,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -20088,7 +20875,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -20208,7 +20996,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         // Borrow the stored snapshot (`_ref`) instead of `relational_residency_snapshot`, whose
         // `.clone()` deep-copies `resident_rows: Vec<Vec<SqlValue>>` — an O(rows) host allocation on
         // EVERY per-call lookup. That clone (not the kernel) was this route's per-call wall: ~99% of
@@ -20341,7 +21130,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
@@ -20753,7 +21543,7 @@ impl Engine {
             }
             batch_selected_indexes = Some(bound.selected_indexes.clone());
             let (_query, access_path) =
-                self.relational_select_mvcc_query(select, &table, &bound)?;
+                self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
             members.push((bound, access_path, needle));
         }
 
@@ -21204,7 +21994,8 @@ impl Engine {
             None
         };
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -21348,7 +22139,8 @@ impl Engine {
             None
         };
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -21503,7 +22295,8 @@ impl Engine {
             )));
         }
 
-        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let (_query, access_path) =
+            self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let snapshot = self
             .relational_residency_snapshot(&table.name)
             .ok_or_else(|| {
@@ -21590,9 +22383,16 @@ impl Engine {
         backend: &B,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
-        let result =
-            self.execute_mvcc_query_with_backend_on_table(&select.table, &query, backend)?;
+        let pin = self.pin_relational_read(&select.table);
+        let (query, access_path) =
+            self.relational_select_mvcc_query(select, &table, &bound, &pin)?;
+        let result = self.execute_mvcc_query_with_fallback_reason(
+            pin.store(),
+            &query,
+            backend,
+            None,
+            false,
+        )?;
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
@@ -21623,15 +22423,30 @@ impl Engine {
         Ok((table, bound))
     }
 
-    fn relational_select_mvcc_query(
+    /// `relational_select_mvcc_query` with the read pin taken internally. For callers that resolve
+    /// the result rows from a SEPARATE residency generation (the GPU resident-route projection/
+    /// aggregate methods) rather than the pinned CPU store — they need only the `MvccReadQuery`
+    /// (key set / access path) and resolve against device memory, so a per-call pin is sufficient
+    /// (the residency↔data snapshot consistency for those is enforced by the residency generation's
+    /// `valid_through_index`/`invalidated_at_index`, not this pin).
+    fn relational_select_mvcc_query_pinned(
         &self,
         select: &Select,
         table: &RelationalTable,
         bound: &BoundRelationalSelect,
     ) -> Result<(MvccReadQuery, RelationalAccessPath), ExecuteError> {
-        let visibility = StorageVisibility {
-            read_txn_id: self.visible_up_to,
-        };
+        let pin = self.pin_relational_read(&select.table);
+        self.relational_select_mvcc_query(select, table, bound, &pin)
+    }
+
+    fn relational_select_mvcc_query(
+        &self,
+        select: &Select,
+        table: &RelationalTable,
+        bound: &BoundRelationalSelect,
+        pin: &RelationalReadPin,
+    ) -> Result<(MvccReadQuery, RelationalAccessPath), ExecuteError> {
+        let visibility = pin.visibility;
         let query_order = if select_is_aggregate(select) {
             None
         } else {
@@ -21641,8 +22456,8 @@ impl Engine {
             if let Some((column_idx, keys)) = self
                 .relational_keys_matching_same_column_equality_groups(
                     table,
-                    &select.table,
                     &bound.filter_groups,
+                    pin,
                 )
             {
                 let mut keys = keys;
@@ -21650,8 +22465,8 @@ impl Engine {
                     .as_ref()
                     .map(|(idx, _)| table.columns[*idx].clone());
                 if let Some((order_idx, descending)) = query_order {
-                    keys =
-                        self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
+                    keys = self
+                        .relational_sort_keys_by_column(table, keys, order_idx, descending, pin)?;
                 }
                 let matched_keys = keys.len();
                 let query = MvccReadQuery {
@@ -21687,12 +22502,13 @@ impl Engine {
                 return Ok((query, access_path));
             }
             let mut keys =
-                self.relational_keys_matching_filter_groups(table, &bound.filter_groups)?;
+                self.relational_keys_matching_filter_groups(table, &bound.filter_groups, pin)?;
             let order_column = query_order
                 .as_ref()
                 .map(|(idx, _)| table.columns[*idx].clone());
             if let Some((order_idx, descending)) = query_order {
-                keys = self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
+                keys =
+                    self.relational_sort_keys_by_column(table, keys, order_idx, descending, pin)?;
             }
             let matched_keys = keys.len();
             let query = MvccReadQuery {
@@ -21725,12 +22541,13 @@ impl Engine {
         }
 
         if bound.filters.len() > 1 {
-            let mut keys = self.relational_keys_matching_filters(table, &bound.filters)?;
+            let mut keys = self.relational_keys_matching_filters(table, &bound.filters, pin)?;
             let order_column = query_order
                 .as_ref()
                 .map(|(idx, _)| table.columns[*idx].clone());
             if let Some((order_idx, descending)) = query_order {
-                keys = self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
+                keys =
+                    self.relational_sort_keys_by_column(table, keys, order_idx, descending, pin)?;
             }
             let matched_keys = keys.len();
             let query = MvccReadQuery {
@@ -21768,23 +22585,30 @@ impl Engine {
                 .get(*column_idx)
                 .expect("bound filter column came from table");
             let mut keys = if *op == SelectFilterOp::Eq {
-                // Equality fast-path: read this table's versioned value-index from its loaded
-                // generation (one `load()` — the index is per-table, so no other table's writes
-                // touch it). Stays O(log) + snapshot-consistent; does NOT scan version chains.
-                match self.mvcc.load_table(&select.table) {
-                    Some(handle) => handle
-                        .get()
-                        .index_keys(&table_column.name, &relational_index_value(value)),
-                    None => Vec::new(),
-                }
+                // Equality fast-path: read the value-index from the SAME pinned generation the rows
+                // will be resolved against (prereq #1, Stage 4). No second `load_table()` — so a
+                // concurrent publish cannot slip a newer generation between the index lookup and the
+                // row resolution. Stays O(log) + snapshot-consistent; does NOT scan version chains.
+                //
+                // The value-index is APPEND-ONLY, so a row updated in place appends its row_key once
+                // per version that wrote this `(column, value)` slot — the same key can appear more
+                // than once. Dedup before resolution; otherwise `KeyBatchLookup` would fetch (and
+                // return) the row's single visible version multiple times. (The multi-predicate
+                // equality paths already dedup via a `BTreeSet`; this single-predicate path is the
+                // one that returned a raw `Vec`.)
+                let mut keys = pin.index_keys(&table_column.name, &relational_index_value(value));
+                keys.sort();
+                keys.dedup();
+                keys
             } else {
-                self.relational_keys_matching_filter(table, *column_idx, *op, value)?
+                self.relational_keys_matching_filter(table, *column_idx, *op, value, pin)?
             };
             let order_column = query_order
                 .as_ref()
                 .map(|(idx, _)| table.columns[*idx].clone());
             if let Some((order_idx, descending)) = query_order {
-                keys = self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
+                keys =
+                    self.relational_sort_keys_by_column(table, keys, order_idx, descending, pin)?;
             }
             let matched_keys = keys.len();
             let query = MvccReadQuery {
@@ -21825,7 +22649,7 @@ impl Engine {
 
         if let Some((order_idx, descending)) = query_order {
             let keys =
-                self.relational_ordered_table_keys(table, visibility, order_idx, descending)?;
+                self.relational_ordered_table_keys(table, visibility, order_idx, descending, pin)?;
             let matched_keys = keys.len();
             return Ok((
                 MvccReadQuery {
@@ -21865,12 +22689,11 @@ impl Engine {
     fn relational_keys_matching_same_column_equality_groups(
         &self,
         table: &RelationalTable,
-        table_name: &str,
         filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        pin: &RelationalReadPin,
     ) -> Option<(usize, Vec<String>)> {
-        // Load this table's generation once; every equality slot reads its versioned value-index
-        // (per-table, snapshot-consistent — write-half Stage 3).
-        let table_data = self.mvcc.load_table(table_name);
+        // Every equality slot reads the value-index of the SINGLE pinned generation (prereq #1):
+        // rows + value-index are mutually consistent at one `commit_seq`.
         let mut column_idx = None;
         let mut keys = BTreeSet::new();
         for group in filter_groups {
@@ -21889,13 +22712,7 @@ impl Engine {
                 .columns
                 .get(*idx)
                 .expect("bound filter column came from table");
-            if let Some(handle) = table_data.as_ref() {
-                keys.extend(
-                    handle
-                        .get()
-                        .index_keys(&column.name, &relational_index_value(value)),
-                );
-            }
+            keys.extend(pin.index_keys(&column.name, &relational_index_value(value)));
         }
         column_idx.map(|idx| (idx, keys.into_iter().collect()))
     }
@@ -21906,14 +22723,12 @@ impl Engine {
         keys: Vec<String>,
         order_idx: usize,
         descending: bool,
+        pin: &RelationalReadPin,
     ) -> Result<Vec<String>, ExecuteError> {
-        let visibility = StorageVisibility {
-            read_txn_id: self.visible_up_to,
-        };
-        let table_rows = self.mvcc.table_rows(&table.name);
+        let visibility = pin.visibility;
         let mut keyed_rows = Vec::new();
         for key in keys {
-            let Some(tuple) = table_rows.store().tuple_fetch_by_key(&key, visibility)? else {
+            let Some(tuple) = pin.store().tuple_fetch_by_key(&key, visibility)? else {
                 continue;
             };
             let decoded = decode_relational_row(&tuple.value, &table.columns)?;
@@ -21929,12 +22744,10 @@ impl Engine {
         filter_idx: usize,
         op: SelectFilterOp,
         value: &SqlValue,
+        pin: &RelationalReadPin,
     ) -> Result<Vec<String>, ExecuteError> {
-        let visibility = StorageVisibility {
-            read_txn_id: self.visible_up_to,
-        };
-        let table_rows = self.mvcc.table_rows(&table.name);
-        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
+        let visibility = pin.visibility;
+        let mut cursor = pin.store().seq_scan_open(visibility)?;
         let prefix = relational_key_prefix(&table.name);
         let mut keys = Vec::new();
         while let Some(tuple) = cursor.next() {
@@ -21954,11 +22767,11 @@ impl Engine {
         &self,
         table: &RelationalTable,
         filters: &[(usize, SelectFilterOp, SqlValue)],
+        pin: &RelationalReadPin,
     ) -> Result<Vec<String>, ExecuteError> {
         if filters.iter().all(|(_, op, _)| *op == SelectFilterOp::Eq) {
             // Conjunctive equality fast-path: intersect the per-column value-index hit sets, all
-            // read from one loaded generation of this table (per-table index, snapshot-consistent).
-            let table_data = self.mvcc.load_table(&table.name);
+            // read from the SINGLE pinned generation (prereq #1, snapshot-consistent with the rows).
             let mut sets = filters
                 .iter()
                 .map(|(idx, _op, value)| {
@@ -21966,14 +22779,9 @@ impl Engine {
                         .columns
                         .get(*idx)
                         .expect("bound filter column came from table");
-                    match table_data.as_ref() {
-                        Some(handle) => handle
-                            .get()
-                            .index_keys(&column.name, &relational_index_value(value))
-                            .into_iter()
-                            .collect::<BTreeSet<_>>(),
-                        None => BTreeSet::new(),
-                    }
+                    pin.index_keys(&column.name, &relational_index_value(value))
+                        .into_iter()
+                        .collect::<BTreeSet<_>>()
                 })
                 .collect::<Vec<_>>();
             if sets.is_empty() {
@@ -21990,11 +22798,8 @@ impl Engine {
             return Ok(matched.into_iter().collect());
         }
 
-        let visibility = StorageVisibility {
-            read_txn_id: self.visible_up_to,
-        };
-        let table_rows = self.mvcc.table_rows(&table.name);
-        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
+        let visibility = pin.visibility;
+        let mut cursor = pin.store().seq_scan_open(visibility)?;
         let prefix = relational_key_prefix(&table.name);
         let mut keys = Vec::new();
         while let Some(tuple) = cursor.next() {
@@ -22017,12 +22822,10 @@ impl Engine {
         &self,
         table: &RelationalTable,
         filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+        pin: &RelationalReadPin,
     ) -> Result<Vec<String>, ExecuteError> {
-        let visibility = StorageVisibility {
-            read_txn_id: self.visible_up_to,
-        };
-        let table_rows = self.mvcc.table_rows(&table.name);
-        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
+        let visibility = pin.visibility;
+        let mut cursor = pin.store().seq_scan_open(visibility)?;
         let prefix = relational_key_prefix(&table.name);
         let mut keys = BTreeSet::new();
         while let Some(tuple) = cursor.next() {
@@ -22047,9 +22850,9 @@ impl Engine {
         visibility: StorageVisibility,
         order_idx: usize,
         descending: bool,
+        pin: &RelationalReadPin,
     ) -> Result<Vec<String>, ExecuteError> {
-        let table_rows = self.mvcc.table_rows(&table.name);
-        let mut cursor = table_rows.store().seq_scan_open(visibility)?;
+        let mut cursor = pin.store().seq_scan_open(visibility)?;
         let prefix = relational_key_prefix(&table.name);
         let mut keyed_rows = Vec::new();
         while let Some(tuple) = cursor.next() {
@@ -22721,7 +23524,7 @@ impl Engine {
             })?
             .clone();
         let visibility = StorageVisibility {
-            read_txn_id: self.visible_up_to,
+            read_txn_id: self.committed_seq(),
         };
         let prefix = relational_key_prefix(table);
         let mut row_count = 0usize;
@@ -22847,7 +23650,7 @@ impl Engine {
             resident_device_int4_columns,
             resident_device_int4_column_stats,
             resident_device_text_columns,
-            valid_through_index: self.visible_up_to,
+            valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
             invalidated_by_memory_pressure: memory_pressure_active,
@@ -22861,7 +23664,7 @@ impl Engine {
                     refreshed_resident_bytes: resident_bytes,
                     resident_byte_delta: resident_bytes as i128 - previous.resident_bytes as i128,
                     refreshed_from_index: previous.valid_through_index,
-                    refreshed_through_index: self.visible_up_to,
+                    refreshed_through_index: self.committed_seq(),
                     invalidated_by_txn_id: previous.invalidated_by_txn_id,
                     invalidated_at_index: previous.invalidated_at_index,
                     invalidated_by_memory_pressure: previous.invalidated_by_memory_pressure,
@@ -23100,7 +23903,7 @@ impl Engine {
             resident_device_int4_columns: install.resident_device_int4_columns,
             resident_device_int4_column_stats: install.resident_device_int4_column_stats,
             resident_device_text_columns: install.resident_device_text_columns,
-            valid_through_index: self.visible_up_to,
+            valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
             invalidated_by_memory_pressure: memory_pressure_active,
@@ -23114,7 +23917,7 @@ impl Engine {
                     refreshed_resident_bytes: resident_bytes,
                     resident_byte_delta: resident_bytes as i128 - previous.resident_bytes as i128,
                     refreshed_from_index: previous.valid_through_index,
-                    refreshed_through_index: self.visible_up_to,
+                    refreshed_through_index: self.committed_seq(),
                     invalidated_by_txn_id: previous.invalidated_by_txn_id,
                     invalidated_at_index: previous.invalidated_at_index,
                     invalidated_by_memory_pressure: previous.invalidated_by_memory_pressure,
@@ -23205,7 +24008,7 @@ impl Engine {
             resident_device_int4_columns: install.resident_device_int4_columns,
             resident_device_int4_column_stats: install.resident_device_int4_column_stats,
             resident_device_text_columns: install.resident_device_text_columns,
-            valid_through_index: self.visible_up_to,
+            valid_through_index: self.committed_seq(),
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
             invalidated_by_memory_pressure: memory_pressure_active,
@@ -23219,7 +24022,7 @@ impl Engine {
                     refreshed_resident_bytes: resident_bytes,
                     resident_byte_delta: resident_bytes as i128 - previous.resident_bytes as i128,
                     refreshed_from_index: previous.valid_through_index,
-                    refreshed_through_index: self.visible_up_to,
+                    refreshed_through_index: self.committed_seq(),
                     invalidated_by_txn_id: previous.invalidated_by_txn_id,
                     invalidated_at_index: previous.invalidated_at_index,
                     invalidated_by_memory_pressure: previous.invalidated_by_memory_pressure,
@@ -23426,7 +24229,7 @@ impl Engine {
 
     fn visible_relational_row_count(&self, table: &str) -> Result<usize, ExecuteError> {
         let visibility = StorageVisibility {
-            read_txn_id: self.visible_up_to,
+            read_txn_id: self.committed_seq(),
         };
         let prefix = relational_key_prefix(table);
         let table_rows = self.mvcc.table_rows(table);
@@ -24321,8 +25124,8 @@ impl Engine {
 
     /// Resolve a `MvccReadQuery` against the **KV partition** (the non-relational namespace).
     /// This is the table-agnostic entry the KV `MvccReadSource` machinery uses; relational reads
-    /// go through [`Engine::execute_mvcc_query_on_table`] so they resolve against their table's
-    /// published generation (write-half Stage 3).
+    /// go through [`Engine::execute_mvcc_query_on_pin`] so they resolve against the SAME pinned
+    /// generation their value-index lookup used (write-half Stage 4, prereq #1).
     pub fn execute_mvcc_query(
         &self,
         query: &MvccReadQuery,
@@ -24338,16 +25141,17 @@ impl Engine {
         )
     }
 
-    /// Resolve a `MvccReadQuery` against `table`'s published generation (the relational read path).
-    fn execute_mvcc_query_on_table(
+    /// Resolve a `MvccReadQuery` against the SAME pinned generation the query was built from
+    /// (prereq #1, Stage 4) — the rows come from the exact `commit_seq` whose value-index produced
+    /// the keys, so no concurrent publish can interleave index and rows.
+    fn execute_mvcc_query_on_pin(
         &self,
-        table: &str,
+        pin: &RelationalReadPin,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
         let backend = CpuMvccExecutionBackend;
-        let table_rows = self.mvcc.table_rows(table);
         self.execute_mvcc_query_with_fallback_reason(
-            table_rows.store(),
+            pin.store(),
             query,
             &backend,
             Some(FallbackReason::GpuMvccReadParityGap),
@@ -24361,16 +25165,6 @@ impl Engine {
     ) -> Result<MvccReadResult, ExecuteError> {
         let kv = self.mvcc.load_kv();
         self.execute_mvcc_query_with_cuda_driver_probe_on_store(kv.get(), query)
-    }
-
-    /// `execute_mvcc_query_with_cuda_driver_probe`, resolving against `table`'s generation.
-    fn execute_mvcc_query_with_cuda_driver_probe_on_table(
-        &self,
-        table: &str,
-        query: &MvccReadQuery,
-    ) -> Result<MvccReadResult, ExecuteError> {
-        let table_rows = self.mvcc.table_rows(table);
-        self.execute_mvcc_query_with_cuda_driver_probe_on_store(table_rows.store(), query)
     }
 
     fn execute_mvcc_query_with_cuda_driver_probe_on_store(
@@ -24406,23 +25200,6 @@ impl Engine {
     }
 
     #[cfg(test)]
-    fn execute_mvcc_query_with_backend_on_table<B: MvccExecutionBackend>(
-        &self,
-        table: &str,
-        query: &MvccReadQuery,
-        backend: &B,
-    ) -> Result<MvccReadResult, ExecuteError> {
-        let table_rows = self.mvcc.table_rows(table);
-        self.execute_mvcc_query_with_fallback_reason(
-            table_rows.store(),
-            query,
-            backend,
-            None,
-            false,
-        )
-    }
-
-    #[cfg(test)]
     fn execute_mvcc_query_with_backend_fallback<B: MvccExecutionBackend>(
         &mut self,
         query: &MvccReadQuery,
@@ -24452,7 +25229,7 @@ impl Engine {
         fallback_reason: Option<FallbackReason>,
         observe_cuda_probe_metrics: bool,
     ) -> Result<MvccReadResult, ExecuteError> {
-        if self.repl.role() != Role::Leader {
+        if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
 
@@ -24486,7 +25263,7 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &CudaMvccExecutionBackend,
     ) -> Result<MvccReadResult, ExecuteError> {
-        if self.repl.role() != Role::Leader {
+        if self.repl_role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
 
@@ -24609,7 +25386,35 @@ impl Engine {
     }
 
     pub fn visible_up_to(&self) -> Index {
-        self.visible_up_to
+        self.committed_seq()
+    }
+
+    /// Acquire-load the MVCC visibility/publish boundary (the highest committed `commit_seq`). The
+    /// commit critical section release-stores it LAST, so an acquire-load here observes a fully
+    /// published commit's data (rows + value-index generation) — the reader-side half of the
+    /// publish-on-commit memory ordering (write-half Stage 4).
+    fn committed_seq(&self) -> Index {
+        self.committed_seq.load(AtomicOrdering::Acquire)
+    }
+
+    /// Release-store the visibility/publish boundary to `at least` `seq` (monotonic). Called LAST in
+    /// the commit critical section — strictly AFTER the WAL fsync and the data/value-index publish —
+    /// so it is the single point at which a commit becomes visible to lock-free readers.
+    fn publish_committed_seq(&self, seq: Index) {
+        // Monotonic max via a release CAS loop: under the commit_mutex commits are assigned strictly
+        // increasing `commit_seq`, but a CAS keeps this correct even if two paths race.
+        let mut current = self.committed_seq.load(AtomicOrdering::Relaxed);
+        while seq > current {
+            match self.committed_seq.compare_exchange_weak(
+                current,
+                seq,
+                AtomicOrdering::Release,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     pub fn applied_len(&self) -> usize {
@@ -24617,26 +25422,33 @@ impl Engine {
     }
 
     pub fn wal_flushed_count(&self) -> usize {
-        self.wal.flushed_count()
+        self.commit_state().wal.flushed_count()
     }
 
     pub fn wal_buffered_count(&self) -> usize {
-        self.wal.len()
+        self.commit_state().wal.len()
     }
 
     pub fn wal_unflushed_count(&self) -> usize {
-        self.wal.unflushed_count()
+        self.commit_state().wal.unflushed_count()
     }
 
-    pub fn durable_wal_records(&self) -> &[WalRecord] {
-        self.wal.flushed_records()
+    /// The durable (fsynced) WAL record prefix, cloned out (the WAL now lives behind the commit_mutex
+    /// so a borrow cannot escape the guard). Callers that re-serialize or replay it take the owned
+    /// `Vec` by reference.
+    pub fn durable_wal_records(&self) -> Vec<WalRecord> {
+        self.commit_state().wal.flushed_records().to_vec()
     }
 
     pub fn durable_wal_record_timestamps(&self) -> Vec<WalArchiveRecordTimestamp> {
-        self.durable_wal_records()
+        let commit = self.commit_state();
+        commit
+            .wal
+            .flushed_records()
             .iter()
             .filter_map(|record| {
-                self.wal_commit_timestamps_micros
+                commit
+                    .wal_commit_timestamps_micros
                     .get(&record.txn_id)
                     .map(|timestamp_micros| WalArchiveRecordTimestamp {
                         txn_id: record.txn_id,
@@ -24650,7 +25462,7 @@ impl Engine {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), EngineError> {
-        write_wal_segment(path, self.durable_wal_records())
+        write_wal_segment(path, &self.durable_wal_records())
     }
 
     pub fn persist_durable_wal_checkpoint(
@@ -24660,7 +25472,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let control_path = control_path.as_ref();
         let segment_path = segment_path.as_ref();
-        write_wal_segment(segment_path, self.durable_wal_records())?;
+        write_wal_segment(segment_path, &self.durable_wal_records())?;
         let control_segment_path = segment_path
             .strip_prefix(
                 control_path
@@ -24673,7 +25485,7 @@ impl Engine {
             control_path,
             &WalControlFile {
                 segment_path: control_segment_path,
-                checkpoint: self.wal.checkpoint_meta(),
+                checkpoint: self.commit_state().wal.checkpoint_meta(),
             },
         )
     }
@@ -24688,7 +25500,7 @@ impl Engine {
         write_wal_archive_with_timestamps(
             manifest_path,
             segment_dir,
-            self.durable_wal_records(),
+            &self.durable_wal_records(),
             records_per_segment,
             &record_timestamps,
         )
@@ -25024,34 +25836,57 @@ impl Engine {
         })
     }
 
+    /// Vacuum MVCC versions whose `deleted_by` (a **`commit_seq`** = commit `Index`) is `<=`
+    /// `safe_commit_seq`. Stage 0 introduced this prune by-`commit_seq` while its guards still reasoned
+    /// in façade-`txn_id` space; that mismatch is data-corrupting once `txn_id ≠ Index` (it could
+    /// over-prune below an active reader). Stage 4 fixes it to reason ENTIRELY in `commit_seq`/`Index`
+    /// space (write-half MVCC, design Risk #6 / Stage-0 GC-boundary debt):
+    ///
+    /// - The active-snapshot guard is the oldest active READ SNAPSHOT (a `commit_seq`, from
+    ///   [`ActiveSnapshots`]) — pruning at/after it could remove a version an in-flight reader still
+    ///   needs. (The old guard used `txn_manager.oldest_active_txn_id()`, a different id space.)
+    /// - The durability guard is `committed_seq` — the published boundary, which the commit path
+    ///   bumps strictly AFTER the WAL fsync, so any version at/below it is already durable. (The old
+    ///   guard compared against `wal.last_durable_txn_id`, again the wrong id space.)
     pub fn checkpoint_vacuum_mvcc_versions(
-        &mut self,
-        safe_txn_id: TxnId,
+        &self,
+        safe_commit_seq: Index,
     ) -> Result<PruneStats, EngineError> {
-        if safe_txn_id == 0 {
+        if safe_commit_seq == 0 {
             return Err(EngineError::Durability(
-                "checkpoint vacuum safe transaction id must be non-zero".to_string(),
+                "checkpoint vacuum safe commit_seq must be non-zero".to_string(),
             ));
         }
-        if let Some(oldest_active) = self.txn_manager.oldest_active_txn_id() {
-            if safe_txn_id >= oldest_active {
+        if let Some(oldest_active) = self.active_snapshots_oldest() {
+            if safe_commit_seq >= oldest_active {
                 return Err(EngineError::Durability(format!(
-                    "checkpoint vacuum safe transaction id {safe_txn_id} crosses active transaction {oldest_active}"
+                    "checkpoint vacuum safe commit_seq {safe_commit_seq} crosses active read snapshot {oldest_active}"
                 )));
             }
         }
-        let checkpoint = self.wal.checkpoint_meta();
-        match checkpoint.last_durable_txn_id {
-            Some(last_durable) if safe_txn_id <= last_durable => {
-                Ok(self.mvcc.prune_versions_deleted_at_or_before(safe_txn_id))
-            }
-            Some(last_durable) => Err(EngineError::Durability(format!(
-                "checkpoint vacuum safe transaction id {safe_txn_id} is newer than durable WAL transaction {last_durable}"
-            ))),
-            None => Err(EngineError::Durability(
-                "checkpoint vacuum requires a durable WAL boundary".to_string(),
-            )),
+        let durable_boundary = self.committed_seq();
+        if durable_boundary == 0 {
+            return Err(EngineError::Durability(
+                "checkpoint vacuum requires a durable commit boundary".to_string(),
+            ));
         }
+        if safe_commit_seq > durable_boundary {
+            return Err(EngineError::Durability(format!(
+                "checkpoint vacuum safe commit_seq {safe_commit_seq} is newer than the durable commit boundary {durable_boundary}"
+            )));
+        }
+        Ok(self
+            .mvcc
+            .prune_versions_deleted_at_or_before(safe_commit_seq))
+    }
+
+    /// The oldest active read snapshot (`commit_seq`), or `None` when no transaction is in flight —
+    /// the safe MVCC GC / ledger-prune boundary (write-half Stage 4).
+    fn active_snapshots_oldest(&self) -> Option<Index> {
+        self.active_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .oldest()
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -25088,9 +25923,31 @@ impl Engine {
         let now = Instant::now();
         let pending_batch_len = self.batcher.len();
         let pending_batch_cap = self.batcher.max_items();
-        let wal_unflushed_count = self.wal.unflushed_count();
+        // Read all the commit-substate watermarks under ONE commit_mutex acquisition (a snapshot of
+        // the replicator + WAL counters), then release before the rest of the computation.
+        let (
+            wal_unflushed_count,
+            role,
+            commit_index,
+            applied_index,
+            term,
+            snapshot_id,
+            wal_checkpoint,
+            wal_buffered_count,
+        ) = {
+            let commit = self.commit_state();
+            (
+                commit.wal.unflushed_count(),
+                commit.repl.role(),
+                commit.repl.commit_index(),
+                commit.repl.applied_index(),
+                commit.repl.current_term(),
+                commit.repl.snapshot_meta().snapshot_id,
+                commit.wal.checkpoint_meta(),
+                commit.wal.len(),
+            )
+        };
         let active_txn_count = self.txn_manager.active_count();
-        let role = self.repl.role();
         let pending_batch_remaining_capacity = pending_batch_cap.saturating_sub(pending_batch_len);
         let pending_batch_utilization_permyriad = if pending_batch_cap == 0 {
             0
@@ -25102,9 +25959,7 @@ impl Engine {
         let pending_batch_remaining_capacity_permyriad =
             10_000u16.saturating_sub(pending_batch_utilization_permyriad);
 
-        let commit_index = self.repl.commit_index();
-        let applied_index = self.repl.applied_index();
-        let visible_index = self.visible_up_to;
+        let visible_index = self.committed_seq();
 
         let commit_apply_gap = commit_index.saturating_sub(applied_index);
         let apply_visible_gap = applied_index.saturating_sub(visible_index);
@@ -25131,20 +25986,18 @@ impl Engine {
         let has_backlog_blockers =
             ReplicationWatermarks::has_backlog_blockers_in_mask(backlog_blocker_mask);
 
-        let wal_checkpoint = self.wal.checkpoint_meta();
-
         ReplicationWatermarks {
             role,
-            term: self.repl.current_term(),
+            term,
             commit_index,
             applied_index,
             visible_index,
             commit_apply_gap,
             apply_visible_gap,
-            snapshot_id: self.repl.snapshot_meta().snapshot_id,
+            snapshot_id,
             wal_flushed_count: wal_checkpoint.durable_record_count,
             wal_last_durable_txn_id: wal_checkpoint.last_durable_txn_id,
-            wal_buffered_count: self.wal.len(),
+            wal_buffered_count,
             wal_unflushed_count,
             pending_batch_len,
             pending_batch_cap,
@@ -25183,18 +26036,20 @@ impl Engine {
     }
 
     pub fn export_snapshot_meta(&mut self) -> SnapshotMeta {
-        self.repl.export_snapshot_meta()
+        self.commit_state_mut().repl.export_snapshot_meta()
     }
 
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
-        self.repl.install_snapshot(meta);
-        self.visible_up_to = self
-            .visible_up_to
-            .max(self.repl.snapshot_meta().last_included_index);
+        let last_included_index = {
+            let commit = self.commit_state_mut();
+            commit.repl.install_snapshot(meta);
+            commit.repl.snapshot_meta().last_included_index
+        };
+        self.publish_committed_seq(last_included_index);
     }
 
     pub fn snapshot_meta(&self) -> SnapshotMeta {
-        self.repl.snapshot_meta()
+        self.commit_state().repl.snapshot_meta()
     }
 
     pub fn metrics(&self) -> &RuntimeMetrics {
@@ -25400,6 +26255,80 @@ mod tests {
             .is_valid());
     }
 
+    #[test]
+    fn residency_invalidated_error_is_classified_precisely() {
+        // BUG 3 seam (classification half). The CPU-fallback decision in
+        // `execute_relational_select` keys off `ExecuteError::is_residency_invalidated`. It must be
+        // TRUE for exactly the GPU-probe "no retained resident device memory" tombstone error (the
+        // case a concurrent committer creates by `publish(None)` mid-statement) and FALSE for every
+        // other error, so a genuine device/bind error is never masked by the fallback.
+        let invalidated = ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "relation \"{}\" has no retained resident device memory",
+            "events"
+        )));
+        assert!(
+            invalidated.is_residency_invalidated(),
+            "the exact probe tombstone message must be recognized as residency-invalidated"
+        );
+
+        // Genuine, non-fallbackable errors must NOT be misclassified.
+        let real_gpu_error = ExecuteError::Engine(EngineError::ApplyFailed(
+            "CUDA_ERROR_INVALID_CONTEXT launching kernel".to_string(),
+        ));
+        assert!(!real_gpu_error.is_residency_invalidated());
+        let route_rejected = ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident route rejected: query shape not eligible".to_string(),
+        ));
+        assert!(!route_rejected.is_residency_invalidated());
+        let serialization = ExecuteError::Serialization("write-write conflict".to_string());
+        assert!(!serialization.is_residency_invalidated());
+        let not_leader = ExecuteError::Engine(EngineError::NotLeader);
+        assert!(!not_leader.is_residency_invalidated());
+    }
+
+    #[test]
+    fn execute_relational_select_cpu_pinned_matches_the_public_select() {
+        // BUG 3 seam (fallback-target half). When a resident route's residency is invalidated
+        // mid-statement, `execute_relational_select` re-serves the statement from
+        // `execute_relational_select_cpu_pinned`. That fallback target must produce exactly the
+        // result the public CPU path does (a full deterministic resident-route→fallback repro needs a
+        // GPU; this asserts the seam the fallback lands on is correct CPU-only). The two are wired to
+        // the same bind + pinned MVCC read, so for a non-resident table they must agree on rows,
+        // columns, and access path.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE t (id INT, v INT)").unwrap();
+        for id in 1..=5 {
+            e.execute_text(
+                (id + 1) as u64,
+                &format!("INSERT INTO t (id, v) VALUES ({id}, {})", id * 10),
+            )
+            .unwrap();
+        }
+        for sql in [
+            "SELECT id FROM t ORDER BY id",
+            "SELECT COUNT(*) FROM t",
+            "SELECT id, v FROM t WHERE id = 3",
+        ] {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!("{sql} is a SELECT")
+            };
+            let via_public = e.execute_relational_select(&select).unwrap();
+            let via_fallback = e.execute_relational_select_cpu_pinned(&select).unwrap();
+            assert_eq!(
+                via_fallback.rows, via_public.rows,
+                "{sql}: CPU-fallback rows must equal the public select"
+            );
+            assert_eq!(
+                via_fallback.columns, via_public.columns,
+                "{sql}: CPU-fallback columns must equal the public select"
+            );
+            assert_eq!(
+                via_fallback.access_path, via_public.access_path,
+                "{sql}: CPU-fallback access path must equal the public select"
+            );
+        }
+    }
+
     // ----------------------------------------------------------------------------------------
     // Write-half MVCC — Stage 3: per-table publish-on-commit `&self`-readable data.
     // ----------------------------------------------------------------------------------------
@@ -25437,13 +26366,17 @@ mod tests {
                 commit_seq,
             )
             .unwrap();
-        data.value_index
-            .entry(ColumnValueKey {
-                column: "name".to_string(),
-                value: relational_index_value(&SqlValue::Text(name.to_string())),
-            })
-            .or_default()
-            .push(row_key);
+        let index_key = ColumnValueKey {
+            column: "name".to_string(),
+            value: relational_index_value(&SqlValue::Text(name.to_string())),
+        };
+        let mut slot = data
+            .value_index
+            .get(&index_key)
+            .cloned()
+            .unwrap_or_default();
+        std::sync::Arc::make_mut(&mut slot).push(row_key);
+        data.value_index.insert(index_key, slot);
     }
 
     /// Stage 3 reader-stability: a reader that has `load()`ed a table's generation keeps seeing the
@@ -25453,7 +26386,7 @@ mod tests {
     /// guarantee, now for rows + value-index together in one `Arc<TableVersionData>`).
     #[test]
     fn stage3_reader_sees_stable_rows_and_value_index_while_writer_publishes() {
-        let mut mvcc = MvccData::new();
+        let mvcc = MvccData::new();
         // Generation 1: one row, one value-index entry.
         mvcc.with_table_mut("people", |data| {
             seed_people_row(data, 1, 1, 1, "Ada", 1);
@@ -25524,7 +26457,7 @@ mod tests {
     /// reclamation tests). We observe this through the generation's reference count.
     #[test]
     fn stage3_old_table_generation_retired_only_after_last_reader_drains() {
-        let mut mvcc = MvccData::new();
+        let mvcc = MvccData::new();
         mvcc.with_table_mut("people", |data| seed_people_row(data, 1, 1, 1, "Ada", 1));
 
         // A reader pins generation 1.
@@ -26545,7 +27478,7 @@ mod tests {
             Some("bootstrap extension")
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered.relational_extension_comment("plpgsql"),
             Some("bootstrap extension")
@@ -26580,7 +27513,7 @@ mod tests {
             Some("bootstrap extension")
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered.relational_extension_comment("plpgsql"),
             Some("bootstrap extension")
@@ -26667,7 +27600,7 @@ mod tests {
         assert!(e.relational_role("app_analyst").is_none());
         assert!(e.relational_role("app_writer").is_some());
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_role("app_analyst").is_none());
         assert!(recovered.relational_role("app_writer").unwrap().login);
         assert!(recovered
@@ -26790,13 +27723,13 @@ mod tests {
         e.execute_text(12, "DROP DATABASE IF EXISTS missing_db")
             .unwrap();
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_database("appdb_renamed").is_none());
         assert_eq!(recovered.relational_database_comment("appdb_renamed"), None);
 
         let mut kept = Engine::new_local();
         kept.execute_text(1, "CREATE DATABASE appdb").unwrap();
-        let recovered_kept = Engine::recover_from_durable_wal(kept.durable_wal_records()).unwrap();
+        let recovered_kept = Engine::recover_from_durable_wal(&kept.durable_wal_records()).unwrap();
         assert!(recovered_kept.relational_database("appdb").is_some());
 
         assert!(Engine::new_local()
@@ -27803,7 +28736,7 @@ mod tests {
         assert_eq!(snapshot.column_count, 2);
         assert_eq!(snapshot.resident_device_int4_columns, vec!["id"]);
         assert!(snapshot.resident_bytes >= 8 + "alpha".len() as u64 + "beta".len() as u64);
-        assert_eq!(snapshot.valid_through_index, e.visible_up_to);
+        assert_eq!(snapshot.valid_through_index, e.visible_up_to());
         assert!(snapshot.is_valid());
         assert!(!snapshot.memory_pressure_active);
         assert_eq!(snapshot.last_refresh_cost, None);
@@ -27827,7 +28760,7 @@ mod tests {
         let refreshed = e.populate_relational_residency_snapshot("events").unwrap();
         assert_eq!(refreshed.row_count, 3);
         assert!(refreshed.resident_bytes > snapshot.resident_bytes);
-        assert_eq!(refreshed.valid_through_index, e.visible_up_to);
+        assert_eq!(refreshed.valid_through_index, e.visible_up_to());
         assert!(refreshed.is_valid());
         assert!(!refreshed.memory_pressure_active);
         assert!(!refreshed.invalidated_by_memory_pressure);
@@ -46055,7 +46988,7 @@ mod tests {
         let after_reject = e.execute_relational_select(&select).unwrap();
         assert_eq!(after_reject.rows, result.rows);
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
         let recovered_indexed = recovered
@@ -46120,7 +47053,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let table = recovered
             .relational_catalog_table("default_people")
             .unwrap();
@@ -46188,7 +47121,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let table = recovered
             .relational_catalog_table("default_people")
             .unwrap();
@@ -46277,7 +47210,7 @@ mod tests {
         assert_eq!(sequence.last_value, 3);
         assert!(sequence.is_called);
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_table = recovered
             .relational_catalog_table("default_people")
             .unwrap();
@@ -46319,7 +47252,7 @@ mod tests {
             .contains("INSERT must provide every column without a default"));
 
         let recovered_after_drop =
-            Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+            Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_table = recovered_after_drop
             .relational_catalog_table("default_people")
             .unwrap();
@@ -46419,7 +47352,7 @@ mod tests {
             Some("keep me")
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
         assert_eq!(
@@ -46544,7 +47477,7 @@ mod tests {
         };
         assert!(e.execute_relational_select(&old_select).is_err());
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
         assert_eq!(
@@ -46650,7 +47583,7 @@ mod tests {
             Some("display name")
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
         assert_eq!(
@@ -46773,7 +47706,7 @@ mod tests {
             "{duplicate_insert}"
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_indexes = &recovered
             .relational_catalog_table("rename_constraint_people")
             .unwrap()
@@ -46851,7 +47784,7 @@ mod tests {
         );
         assert_eq!(e.durable_wal_records().len(), 3);
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
 
@@ -46906,7 +47839,7 @@ mod tests {
         );
         assert_eq!(e.durable_wal_records().len(), 3);
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
 
@@ -46972,7 +47905,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_view("active_people")
@@ -47040,7 +47973,7 @@ mod tests {
             vec![vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())]]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_view("active_people")
@@ -47113,7 +48046,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_view("active_people_names")
@@ -47226,7 +48159,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_catalog_view("active_people").is_none());
         assert_eq!(
             recovered
@@ -47287,7 +48220,7 @@ mod tests {
         assert!(e.relational_catalog_view("other_people").is_none());
         assert!(e.relational_catalog_table("people").is_some());
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_catalog_view("active_people").is_none());
         assert!(recovered.relational_catalog_view("other_people").is_none());
 
@@ -47391,7 +48324,7 @@ mod tests {
         );
         assert_eq!(e.relational_sequence_comment("people_seq"), None);
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered
             .relational_catalog_sequence("people_seq")
             .is_none());
@@ -47413,7 +48346,7 @@ mod tests {
         assert_eq!(e.relational_sequence_comment("people_id_seq"), None);
 
         let recovered_after_drop =
-            Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+            Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered_after_drop
             .relational_catalog_sequence("people_id_seq")
             .is_none());
@@ -47491,7 +48424,7 @@ mod tests {
         assert_eq!(sequence.last_value, 10);
         assert!(sequence.is_called);
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let sequence = recovered.relational_catalog_sequence("people_seq").unwrap();
         assert_eq!(sequence.last_value, 10);
         assert!(sequence.is_called);
@@ -47583,7 +48516,7 @@ mod tests {
             ]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_serial = recovered.execute_relational_select(&serial_select).unwrap();
         assert_eq!(recovered_serial.rows, serial_result.rows);
         let recovered_manual = recovered.execute_relational_select(&manual_select).unwrap();
@@ -47706,7 +48639,7 @@ mod tests {
             Some("people snapshot")
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let Command::Select(renamed_select) =
             parse_command("SELECT * FROM mv_people_snapshot").unwrap()
         else {
@@ -49038,7 +49971,7 @@ mod tests {
             }]
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_table("people")
@@ -49135,7 +50068,7 @@ mod tests {
             ]
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_table("people")
@@ -49222,7 +50155,7 @@ mod tests {
             "{duplicate_update}"
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_table("people")
@@ -49331,7 +50264,7 @@ mod tests {
             .to_string()
             .contains("index or constraint depends on it"));
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_table("people")
@@ -49432,7 +50365,7 @@ mod tests {
         e.execute_text(12, "DELETE FROM customers WHERE customer_id = 1")
             .unwrap();
 
-        let replayed = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let replayed = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let orders = replayed.relational_catalog_table("orders").unwrap();
         assert!(orders.foreign_keys.is_empty());
         let customers = replayed.relational_catalog_table("customers").unwrap();
@@ -49484,7 +50417,7 @@ mod tests {
             "{duplicate_update}"
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_table("people")
@@ -49550,7 +50483,7 @@ mod tests {
             .indexes
             .is_empty());
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered
             .relational_catalog_table("people")
             .unwrap()
@@ -49646,7 +50579,7 @@ mod tests {
             vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]]
         );
 
-        let recovered = Engine::recover_from_durable_wal(multi.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&multi.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_table("people")
@@ -49711,7 +50644,7 @@ mod tests {
         );
         assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_table("people")
@@ -49803,7 +50736,7 @@ mod tests {
         )
         .unwrap();
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered
             .relational_catalog_table("people")
             .unwrap()
@@ -49906,7 +50839,7 @@ mod tests {
             "{missing_select}"
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_catalog_table("people").is_none());
         assert!(recovered.relational_catalog_table("teams").is_some());
         assert_eq!(recovered.relational_table_comment("people"), None);
@@ -49998,7 +50931,7 @@ mod tests {
         assert_eq!(e.relational_index_comment("batch_people_name_idx"), None);
         assert!(e.relational_residency_snapshot("batch_people").is_none());
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_catalog_table("batch_people").is_none());
         assert!(recovered.relational_catalog_table("batch_teams").is_none());
         assert!(recovered.relational_catalog_table("batch_keep").is_some());
@@ -50128,7 +51061,7 @@ mod tests {
             vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]]
         );
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&empty_people).unwrap();
         assert_eq!(
             recovered_result.rows,
@@ -50174,7 +51107,7 @@ mod tests {
             vec![vec![SqlValue::Int4(1), SqlValue::Text("Linus".to_string())]]
         );
         let mut recovered_restart =
-            Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+            Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered_restart
                 .execute_relational_select(&restart_select)
@@ -50242,7 +51175,7 @@ mod tests {
             ])
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_acl = recovered.relational_table_acl("people").unwrap();
         assert_eq!(recovered_acl, acl);
 
@@ -50302,7 +51235,7 @@ mod tests {
             &BTreeSet::from([TablePrivilege::Select, TablePrivilege::Update])
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_relation_acl("people_view")
@@ -50335,7 +51268,7 @@ mod tests {
             .unwrap()
             .contains_key("public"));
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(!recovered
             .relational_relation_acl("people_view")
             .unwrap()
@@ -50379,7 +51312,7 @@ mod tests {
             &BTreeSet::from([TablePrivilege::Select])
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_table_acl("first_people")
@@ -50424,7 +51357,7 @@ mod tests {
             &BTreeSet::from([SchemaPrivilege::Usage, SchemaPrivilege::Create])
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(recovered.relational_schema_acl(), e.relational_schema_acl());
 
         let missing = e
@@ -50439,7 +51372,7 @@ mod tests {
         e.execute_text(5, "DROP SCHEMA public").unwrap();
         assert!(e.relational_schema_acl().is_empty());
         let recovered_after_drop =
-            Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+            Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered_after_drop.relational_schema_acl().is_empty());
     }
 
@@ -50467,7 +51400,7 @@ mod tests {
             &BTreeSet::from([FunctionPrivilege::Execute])
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(recovered.relational_function_acl("answer").unwrap(), acl);
 
         e.execute_text(5, "ALTER ROLE app_reader RENAME TO app_executor")
@@ -50526,7 +51459,7 @@ mod tests {
         assert!(all_pub.all_tables);
         assert!(all_pub.tables.is_empty());
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_publication("app_pub")
@@ -50587,7 +51520,7 @@ mod tests {
         );
         assert!(!subscription.enabled);
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_catalog_subscription("app_sub")
@@ -50657,7 +51590,7 @@ mod tests {
             Some("subscription metadata")
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered.relational_publication_comment("app_pub"),
             Some("publication metadata")
@@ -50738,7 +51671,7 @@ mod tests {
             Some("account ids")
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_domain = recovered.relational_catalog_domain("account_id").unwrap();
         assert_eq!(recovered_domain.oid, oid);
         assert_eq!(recovered_domain.base_type, SqlType::Int4);
@@ -50822,7 +51755,7 @@ mod tests {
         );
         assert_eq!(e.relational_function_comment("answer"), None);
 
-        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         let recovered_function = recovered
             .relational_catalog_function("ultimate_answer")
             .unwrap();
@@ -50974,7 +51907,7 @@ mod tests {
         e.execute_text(10, "CREATE TABLE recreated (id INT)")
             .unwrap();
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert!(recovered.relational_public_schema_exists);
         assert!(recovered.relational_catalog_table("recreated").is_some());
         assert_eq!(recovered.relational_schema_comment("public"), None);
@@ -51027,7 +51960,7 @@ mod tests {
         );
         assert_eq!(e.relational_tablespace_comment("appspace"), None);
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
                 .relational_tablespace("appspace_fast")
@@ -51180,7 +52113,7 @@ mod tests {
             Some("lookup view")
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered.relational_database_comment("postgres"),
             Some("primary database")
@@ -53127,25 +54060,220 @@ mod tests {
 
     #[test]
     fn checkpoint_vacuum_rejects_unsafe_boundaries() {
+        // Stage 4 reasons in `commit_seq`/`Index` space (was façade-`txn_id`): the durable boundary is
+        // `committed_seq`, and the active-snapshot guard is the oldest active READ SNAPSHOT.
         let mut e = Engine::new_local();
-        let no_wal_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
-        assert!(no_wal_err
-            .to_string()
-            .contains("requires a durable WAL boundary"));
+        let no_commit_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
+        assert!(
+            no_commit_err
+                .to_string()
+                .contains("requires a durable commit boundary"),
+            "got: {no_commit_err}"
+        );
 
+        // Two committed writes → committed_seq advances to 2 (the durable boundary).
         e.execute_text(1, "SET acct:1=open").unwrap();
-        e.execute_text(2, "BEGIN").unwrap();
+        e.execute_text(2, "SET acct:1=closed").unwrap();
+        assert_eq!(e.committed_seq(), 2);
 
-        let active_err = e.checkpoint_vacuum_mvcc_versions(2).unwrap_err();
-        assert!(active_err
-            .to_string()
-            .contains("crosses active transaction 2"));
-
-        e.execute_text(2, "COMMIT").unwrap();
+        // safe_commit_seq newer than the durable boundary is rejected.
         let newer_than_durable_err = e.checkpoint_vacuum_mvcc_versions(3).unwrap_err();
-        assert!(newer_than_durable_err
-            .to_string()
-            .contains("newer than durable WAL transaction 1"));
+        assert!(
+            newer_than_durable_err
+                .to_string()
+                .contains("newer than the durable commit boundary 2"),
+            "got: {newer_than_durable_err}"
+        );
+
+        // An in-flight read snapshot at commit_seq 1 makes safe_commit_seq >= 1 unsafe (it could
+        // prune a version that snapshot still needs).
+        let guard = e.register_active_snapshot(1);
+        let active_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
+        assert!(
+            active_err
+                .to_string()
+                .contains("crosses active read snapshot 1"),
+            "got: {active_err}"
+        );
+        drop(guard);
+
+        // With no active snapshot, pruning strictly below the durable boundary is allowed.
+        e.checkpoint_vacuum_mvcc_versions(1).unwrap();
+    }
+
+    #[test]
+    fn recent_commits_ledger_conflict_record_and_prune() {
+        // Unit-level proof of the SI conflict-detection + GC-boundary logic the concurrent commit
+        // path relies on (write-half MVCC, Stage 4).
+        let mut ledger = RecentCommitsLedger::default();
+        let row = |id: u64| RowWriteKey {
+            table: "t".to_string(),
+            row_key: format!("rel/t/{id:020}"),
+        };
+        let slot = |v: &str| UniqueIndexSlotKey {
+            table: "t".to_string(),
+            column: "u".to_string(),
+            value: v.to_string(),
+        };
+
+        // Txn at read_snapshot 5 commits at seq 6, writing row 1 and unique slot "a".
+        let mut ws = WriteSet::default();
+        ws.rows.push(row(1));
+        ws.unique_slots.push(slot("a"));
+        assert!(
+            !ledger.conflicts(&ws, 5),
+            "empty ledger: no conflict against any snapshot"
+        );
+        ledger.record(&ws, 6);
+        assert_eq!(ledger.len(), 2);
+
+        // A txn that snapshotted at 5 and writes the SAME row conflicts (row written at 6 > 5).
+        let mut overlap = WriteSet::default();
+        overlap.rows.push(row(1));
+        assert!(
+            ledger.conflicts(&overlap, 5),
+            "row written after the snapshot must conflict (first-committer-wins)"
+        );
+        // A txn that snapshotted at 6 (saw the commit) does NOT conflict.
+        assert!(
+            !ledger.conflicts(&overlap, 6),
+            "equality on the snapshot is a commit the txn already saw — no conflict"
+        );
+        // The unique-slot conflict dimension behaves the same.
+        let mut slot_overlap = WriteSet::default();
+        slot_overlap.unique_slots.push(slot("a"));
+        assert!(ledger.conflicts(&slot_overlap, 5));
+        assert!(!ledger.conflicts(&slot_overlap, 6));
+        // A disjoint write (different row + slot) never conflicts.
+        let mut disjoint = WriteSet::default();
+        disjoint.rows.push(row(2));
+        disjoint.unique_slots.push(slot("b"));
+        assert!(!ledger.conflicts(&disjoint, 0));
+
+        // Pruning below the oldest active snapshot drops entries no active txn can still win against.
+        ledger.record(&disjoint, 10); // now seqs 6 and 10 are recorded
+        assert_eq!(ledger.len(), 4);
+        ledger.prune_below(6); // oldest active snapshot is 7 → prune <= 6
+        assert_eq!(
+            ledger.len(),
+            2,
+            "entries at seq 6 pruned, seq-10 entries kept"
+        );
+        assert!(
+            !ledger.conflicts(&overlap, 5),
+            "a pruned-out commit no longer reported (its snapshot floor moved past it)"
+        );
+        assert!(
+            ledger.conflicts(&disjoint, 9),
+            "the seq-10 entry still conflicts a snapshot below it"
+        );
+    }
+
+    #[test]
+    fn active_snapshots_track_oldest_boundary() {
+        // The oldest-active read-snapshot boundary (the GC/ledger-prune floor) under registration +
+        // deregistration (write-half MVCC, Stage 4).
+        let mut active = ActiveSnapshots::default();
+        assert_eq!(active.oldest(), None);
+        active.register(10);
+        active.register(7);
+        active.register(7);
+        active.register(12);
+        assert_eq!(active.oldest(), Some(7));
+        active.deregister(7); // one of the two at 7 remains
+        assert_eq!(active.oldest(), Some(7));
+        active.deregister(7);
+        assert_eq!(
+            active.oldest(),
+            Some(10),
+            "both 7s gone → next oldest is 10"
+        );
+        active.deregister(10);
+        active.deregister(12);
+        assert_eq!(active.oldest(), None, "no in-flight snapshots");
+    }
+
+    #[test]
+    fn concurrent_dml_classification_routes_sequence_inserts_to_serialized_path() {
+        // `is_concurrent_dml` gates which statements take the off-lock concurrent path vs the
+        // serialized catalog-latch path (write-half MVCC, Stage 4).
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE plain (id INT, v INT)")
+            .unwrap();
+        e.execute_text(2, "CREATE TABLE serial_t (id SERIAL, v TEXT)")
+            .unwrap();
+
+        // Plain INSERT/UPDATE/DELETE on a base table → concurrent.
+        assert!(e.is_concurrent_dml("INSERT INTO plain (id, v) VALUES (1, 2)"));
+        assert!(e.is_concurrent_dml("UPDATE plain SET v = 3 WHERE id = 1"));
+        assert!(e.is_concurrent_dml("DELETE FROM plain WHERE id = 1"));
+        // An INSERT that consumes a nextval default → serialized (sequence mutation needs &mut self).
+        assert!(!e.is_concurrent_dml("INSERT INTO serial_t (v) VALUES ('x')"));
+        // UPDATE/DELETE never touch sequences → still concurrent even on the SERIAL table.
+        assert!(e.is_concurrent_dml("UPDATE serial_t SET v = 'y' WHERE id = 1"));
+        // DDL, KV, unknown tables, transaction control, SELECT, parse errors → not concurrent DML.
+        assert!(!e.is_concurrent_dml("CREATE TABLE z (a INT)"));
+        assert!(!e.is_concurrent_dml("SET k=v"));
+        assert!(!e.is_concurrent_dml("INSERT INTO missing (id) VALUES (1)"));
+        assert!(!e.is_concurrent_dml("BEGIN"));
+        assert!(!e.is_concurrent_dml("SELECT * FROM plain"));
+        assert!(!e.is_concurrent_dml("not valid sql ;;;"));
+    }
+
+    #[test]
+    fn execute_dml_concurrent_matches_the_serialized_path_single_threaded() {
+        // Run the SAME mixed workload through the concurrent path (`execute_dml_concurrent`) and the
+        // serialized path (`execute_text`), single-threaded, and assert identical visible state —
+        // the concurrent path is behavior-preserving (the prepare→commit split + re-resolve at
+        // commit_seq is byte-identical to the serialized apply).
+        let read_ids = |e: &Engine| -> Vec<(i64, i64)> {
+            let Command::Select(select) = parse_command("SELECT id, v FROM t ORDER BY id").unwrap()
+            else {
+                unreachable!()
+            };
+            e.execute_relational_select(&select)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| match (&row[0], &row[1]) {
+                    (SqlValue::Int4(id), SqlValue::Int4(v)) => (*id as i64, *v as i64),
+                    other => panic!("unexpected row {other:?}"),
+                })
+                .collect()
+        };
+
+        let mut concurrent = Engine::new_local();
+        concurrent
+            .execute_text(1, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        concurrent
+            .execute_dml_concurrent(2, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+        concurrent
+            .execute_dml_concurrent(3, "UPDATE t SET v = 99 WHERE id = 2")
+            .unwrap();
+        concurrent
+            .execute_dml_concurrent(4, "DELETE FROM t WHERE id = 1")
+            .unwrap();
+
+        let mut serialized = Engine::new_local();
+        serialized
+            .execute_text(1, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        serialized
+            .execute_text(2, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+        serialized
+            .execute_text(3, "UPDATE t SET v = 99 WHERE id = 2")
+            .unwrap();
+        serialized
+            .execute_text(4, "DELETE FROM t WHERE id = 1")
+            .unwrap();
+
+        assert_eq!(read_ids(&concurrent), read_ids(&serialized));
+        assert_eq!(read_ids(&concurrent), vec![(2, 99), (3, 30)]);
+        // Both reached the same visibility boundary (3 commits after the CREATE).
+        assert_eq!(concurrent.committed_seq(), serialized.committed_seq());
     }
 
     #[test]
@@ -53243,7 +54371,7 @@ mod tests {
         );
 
         // Replay from the durable WAL into a fresh engine.
-        let recovered = Engine::recover_from_durable_wal(live.durable_wal_records()).unwrap();
+        let recovered = Engine::recover_from_durable_wal(&live.durable_wal_records()).unwrap();
         let recovered_versions = recovered.mvcc.all_versions();
 
         // The crux: byte-identical version chains, stamps and all.
@@ -53491,8 +54619,13 @@ mod tests {
             "prepare_delete mutated engine state"
         );
 
-        // The prepared deltas are non-trivial (we actually exercised the work).
-        assert!(!insert_delta.write_set.rows.is_empty());
+        // The prepared deltas are non-trivial (we actually exercised the work). An INSERT contributes
+        // NO row keys to the conflict write-set (it claims a fresh row id at install time, so its row
+        // slot can never truly conflict — BUG-1 fix); its non-triviality is the prepared mutation +
+        // the row it will consume. UPDATE/DELETE DO record their (stable) row keys for same-row
+        // conflict detection.
+        assert!(insert_delta.write_set.rows.is_empty());
+        assert_eq!(insert_delta.rows_consumed, 1);
         assert!(matches!(
             insert_delta.mutation,
             PreparedMutation::Insert { .. }
@@ -53557,9 +54690,12 @@ mod tests {
             .execute_text(2, "INSERT INTO s (v) VALUES ('x'), ('y')")
             .unwrap();
 
-        // Apply the prepared delta on `e` and compare the sequence state.
+        // Apply the prepared delta on `e` and compare the sequence state. A delta carrying nextval
+        // advances goes through the SERIALIZED apply (`apply_delta_serialized`), which applies the
+        // advance under `&mut self`; the `&self` `apply_delta` deliberately rejects seq-carrying
+        // deltas (write-half Stage 4).
         let commit_seq = snapshot.commit_seq;
-        e.apply_delta(delta, commit_seq, None).unwrap();
+        e.apply_delta_serialized(delta, commit_seq, None).unwrap();
         let seq_e = e
             .relational_sequences
             .get(seq_name)
@@ -53604,8 +54740,12 @@ mod tests {
 
     #[test]
     fn write_set_is_exactly_the_keys_apply_touches_for_insert() {
-        // Stage 2 invariant (b), INSERT: the write-set's row keys equal exactly the row keys
-        // `apply_delta` installs — no missing, no spurious entries.
+        // INSERT conflict-write-set invariant (BUG-1 fix): an INSERT claims a FRESH, unique row id at
+        // install time, so its row slot can never truly collide with another writer's. Therefore the
+        // conflict write-set records NO row keys for an INSERT (putting the predicted snapshot-base
+        // key there would spuriously conflict two concurrent disjoint inserts), even though
+        // `apply_delta` DOES install those row keys. Inserts conflict ONLY on the unique-index slots
+        // they occupy.
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
             .unwrap();
@@ -53621,21 +54761,58 @@ mod tests {
                 None,
             )
             .unwrap();
-        let declared: BTreeSet<String> = delta
-            .write_set
-            .rows
-            .iter()
-            .map(|r| r.row_key.clone())
-            .collect();
-        assert_eq!(
-            declared.len(),
-            delta.write_set.rows.len(),
-            "no duplicate row keys"
+        // The conflict write-set carries NO insert row keys (BUG-1 fix) and (no unique index here) no
+        // unique slots either: a plain INSERT has no genuine conflict dimension.
+        assert!(
+            delta.write_set.rows.is_empty(),
+            "INSERT must contribute NO row keys to the conflict write-set"
         );
+        assert!(delta.write_set.unique_slots.is_empty());
+        assert_eq!(delta.rows_consumed, 2);
 
+        // Apply STILL installs both rows (install is independent of the conflict write-set): exactly
+        // two new fresh-id row keys become visible at commit_seq, even though none were conflict keys.
         e.apply_delta(delta, commit_seq, None).unwrap();
         let touched = keys_touched_at(&e, commit_seq);
-        assert_eq!(declared, touched, "INSERT write-set != keys apply touched");
+        assert_eq!(
+            touched.len(),
+            2,
+            "apply must install both new rows even though they are not conflict keys"
+        );
+        assert!(
+            touched.iter().all(|k| k.starts_with("rel/t/")),
+            "the installed keys are this table's fresh-id row keys: {touched:?}"
+        );
+    }
+
+    #[test]
+    fn insert_write_set_records_unique_slots_but_not_row_keys() {
+        // BUG-1 fix, complement: an INSERT into a table WITH a unique index records the unique slot it
+        // occupies (the genuine first-committer-wins conflict dimension) but STILL records no row key.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE u (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE UNIQUE INDEX u_id ON u (id)")
+            .unwrap();
+
+        let snapshot = next_commit_snapshot(&e);
+        let delta = e
+            .prepare_insert(
+                &parse_insert("INSERT INTO u (id, label) VALUES (7, 'g')"),
+                snapshot,
+                None,
+            )
+            .unwrap();
+        assert!(
+            delta.write_set.rows.is_empty(),
+            "INSERT must contribute NO row keys to the conflict write-set"
+        );
+        assert_eq!(
+            delta.write_set.unique_slots.len(),
+            1,
+            "INSERT must record the unique-index slot it occupies"
+        );
+        assert_eq!(delta.write_set.unique_slots[0].column, "id");
     }
 
     #[test]
@@ -53793,7 +54970,7 @@ mod tests {
             )
             .unwrap();
         manual.apply_delta(insert_delta, insert_seq, None).unwrap();
-        manual.visible_up_to = manual.visible_up_to.max(insert_seq);
+        manual.publish_committed_seq(insert_seq);
 
         let update_snapshot = next_commit_snapshot(&manual);
         let update_seq = update_snapshot.commit_seq;
@@ -53804,7 +54981,7 @@ mod tests {
             )
             .unwrap();
         manual.apply_delta(update_delta, update_seq, None).unwrap();
-        manual.visible_up_to = manual.visible_up_to.max(update_seq);
+        manual.publish_committed_seq(update_seq);
 
         let delete_snapshot = next_commit_snapshot(&manual);
         let delete_seq = delete_snapshot.commit_seq;
@@ -53812,7 +54989,7 @@ mod tests {
             .prepare_delete(&parse_delete("DELETE FROM t WHERE id = 1"), delete_snapshot)
             .unwrap();
         manual.apply_delta(delete_delta, delete_seq, None).unwrap();
-        manual.visible_up_to = manual.visible_up_to.max(delete_seq);
+        manual.publish_committed_seq(delete_seq);
 
         // The same statements through the public path on `golden`.
         golden
