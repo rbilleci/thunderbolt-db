@@ -9982,14 +9982,40 @@ where
     let stream = pooled.stream;
     let timed = !pooled.start_event.is_null() && !pooled.stop_event.is_null();
 
+    // Centralized error-path stream drain for ALL callers of this helper. Each step below ENQUEUES
+    // work on `stream` (start-event record, the caller's `launch` closure — kernel and possibly
+    // memset/HtoD — the stop-event record). An early `?` from any of them would return `Err` with
+    // that work still in flight, then unwind the caller's pooled device/pinned leases — returning
+    // their buffers to the shared pool while the GPU is still reading/writing them (a cross-thread
+    // use-after-free for the next leaser). `drain_err` blocking-syncs the stream FIRST (before the
+    // error propagates and any caller lease Drops), then yields the original error. This gives the
+    // un-migrated direct callers (row_count / equal_count / equal_project) and the migrated routes'
+    // blocking fallbacks the same drain-before-release guarantee the per-op `drain_err` callers
+    // already have. Success-path cost is zero (`map_err` skips the closure on `Ok`, so the single
+    // covering sync below stays the only success-path sync — no redundant drain).
+    let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+        // SAFETY: `stream` is the live pooled stream and the shared primary context is current
+        // (bound above via `set_current`). The result is intentionally ignored — best-effort drain
+        // on an already-failing path, mirroring the per-route `drain_err` style.
+        unsafe {
+            let _ = (primary.cu_stream_synchronize)(stream);
+        }
+        err
+    };
+
     if timed {
-        check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })?;
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.start_event, stream) })
+            .map_err(drain_err)?;
     }
-    check_cuda(launch(stream, pooled.output))?;
+    check_cuda(launch(stream, pooled.output)).map_err(drain_err)?;
     if timed {
-        check_cuda(unsafe { (primary.cu_event_record)(pooled.stop_event, stream) })?;
+        check_cuda(unsafe { (primary.cu_event_record)(pooled.stop_event, stream) })
+            .map_err(drain_err)?;
     }
-    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) })?;
+    // Covering sync: drains on its own error too (in-flight work above may remain if the sync call
+    // itself failed). Past this point the stream is already drained, so the post-sync steps keep a
+    // plain `?` — adding a drain there would be a redundant no-op on an idle stream.
+    check_cuda(unsafe { (primary.cu_stream_synchronize)(stream) }).map_err(drain_err)?;
 
     if timed {
         let mut elapsed_ms = 0.0_f32;
@@ -11146,6 +11172,157 @@ mod tests {
             )
             .expect("final project_i32_compare");
         assert_eq!(final_rows, vec![20, 30, 20, 40]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_i32_equal_project_matches_expected_under_concurrent_pool_reuse() {
+        // P2-M2 follow-up 3 regression for centralizing the error-path stream drain into
+        // `launch_on_pooled_stream`. `match_project_i32_equal_from_payload` (→
+        // `launch_cuda_resident_i32_equal_project`) is a PRIMARY-path DIRECT caller of that helper
+        // with NO per-op `drain_err` of its own: it leases `values_guard`/`count_guard` from the
+        // SHARED device-buffer pool, hands their pointers to the kernel, and relies entirely on the
+        // helper to drain the stream before any error unwinds those leases back to the pool. The
+        // helper's success path now routes the in-flight steps through `map_err(drain_err)`, which
+        // skips the closure on `Ok`, so the single covering sync stays the only success-path sync —
+        // this test pins that the success path is byte-exact AND unchanged under contention. It
+        // (a) checks single-threaded parity for the multi-column projection shape, then (b) hammers
+        // the route on N threads over ONE shared resident allocation (same pools) asserting the
+        // exact result each call. A buffer re-leased before its kernel drained, or a regressed sync,
+        // would surface as a mismatch or a crash. Output rows arrive in atomic-append (warp) order,
+        // so every comparison sorts both sides — order-independent, like the row-indices route.
+        use std::sync::{Arc, Barrier};
+
+        fn sorted(mut rows: Vec<Vec<i32>>) -> Vec<Vec<i32>> {
+            rows.sort();
+            rows
+        }
+
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // Known payload: header(row_count) + filter column + two projection columns (so the
+        // `Vec<Vec<i32>>` multi-column row shape is exercised, not just a single value per row).
+        let row_count = 6_u64;
+        let i32_bytes = std::mem::size_of::<i32>() as u64;
+        let filter_offset = std::mem::size_of::<u64>() as u64;
+        let proj_a_offset = filter_offset + row_count * i32_bytes;
+        let proj_b_offset = proj_a_offset + row_count * i32_bytes;
+
+        let filter_values = [5_i32, 9, 5, 7, 5, 9];
+        let proj_a_values = [100_i32, 200, 300, 400, 500, 600];
+        let proj_b_values = [101_i32, 201, 301, 401, 501, 601];
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&row_count.to_le_bytes());
+        let mut filter = Vec::new();
+        for value in filter_values {
+            filter.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut proj_a = Vec::new();
+        for value in proj_a_values {
+            proj_a.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut proj_b = Vec::new();
+        for value in proj_b_values {
+            proj_b.extend_from_slice(&value.to_le_bytes());
+        }
+        let allocated_len = proj_b_offset + proj_b.len() as u64;
+
+        let resident = Arc::new(
+            runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated_len,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: filter_offset,
+                            bytes: &filter,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: proj_a_offset,
+                            bytes: &proj_a,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: proj_b_offset,
+                            bytes: &proj_b,
+                        },
+                    ],
+                )
+                .expect("retain resident device memory"),
+        );
+
+        // filter == 5 → rows 0,2,4 → projecting [A,B] = [100,101],[300,301],[500,501].
+        let filters: &[(u64, i32)] = &[(filter_offset, 5)];
+        let projections: &[u64] = &[proj_a_offset, proj_b_offset];
+        let expected = sorted(vec![vec![100, 101], vec![300, 301], vec![500, 501]]);
+
+        // (a) Single-threaded parity (order-independent).
+        let got = resident
+            .match_project_i32_equal_from_payload(filters, projections, row_count)
+            .expect("match_project_i32_equal");
+        assert_eq!(sorted(got), expected, "equal_project single-thread parity");
+
+        // A needle that matches nothing returns an empty result (kernel ran, count stayed 0).
+        assert!(resident
+            .match_project_i32_equal_from_payload(&[(filter_offset, -1)], projections, row_count)
+            .expect("no-match equal_project")
+            .is_empty());
+
+        // Empty input short-circuits to an empty vector (no device work).
+        assert!(resident
+            .match_project_i32_equal_from_payload(filters, projections, 0)
+            .expect("empty equal_project")
+            .is_empty());
+
+        // (b) Concurrent pool-reuse storm: every thread runs the route in a loop on the shared
+        // allocation (shared pools), asserting the exact expected rows each time.
+        const THREADS: usize = 8;
+        const ITERS: usize = 300;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let resident = Arc::clone(&resident);
+            let barrier = Arc::clone(&barrier);
+            let expected = expected.clone();
+            let filters = filters.to_vec();
+            let projections = projections.to_vec();
+            handles.push(std::thread::spawn(move || {
+                resident
+                    .set_current_context()
+                    .expect("bind primary context on reader thread");
+                barrier.wait();
+                for _ in 0..ITERS {
+                    let got = resident
+                        .match_project_i32_equal_from_payload(&filters, &projections, row_count)
+                        .expect("concurrent match_project_i32_equal");
+                    assert_eq!(
+                        sorted(got),
+                        expected,
+                        "concurrent equal_project returned wrong rows — a pooled buffer/stream was \
+                         reused before its kernel drained, or the helper's success sync regressed?"
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("reader thread panicked (crash under pool reuse?)");
+        }
+
+        // After the storm the pools are left sound: a final call is still exactly correct.
+        let final_rows = resident
+            .match_project_i32_equal_from_payload(filters, projections, row_count)
+            .expect("final match_project_i32_equal");
+        assert_eq!(
+            sorted(final_rows),
+            expected,
+            "pools left unsound after reuse"
+        );
     }
 
     #[test]
