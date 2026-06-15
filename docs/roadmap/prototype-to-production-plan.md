@@ -605,7 +605,7 @@ thesis pays off second.
 ## 8. Current state & immediate next step (session handoff)
 
 **Branch:** `phase0-m1-engine-facade` (pushed to origin). **Last updated:**
-2026-06-14.
+2026-06-15.
 
 **Milestone ladder — done, all independently audited and the audit findings fixed:**
 - M0 baseline ✅ · P0-M1 façade ✅ · P0-M2 first serving path ✅ ·
@@ -707,22 +707,31 @@ Also still owed: grow the harness to the Phase-5 open-loop/p99.9/steady-state sh
    `indices.sort_unstable()` on both paths + >32-match parity tests (`4b750a94`); (c) the `drain_err`
    drop-guard was centralized into `launch_on_pooled_stream` (`cbb13032`), closing the drop-without-
    complete window for the 3 un-migrated direct callers (`row_count`/`equal_count`/`equal_project`)
-   and the migrated routes' blocking fallbacks. Optional remaining: a fully-parallel intra-block scan
-   for `compare_project` (one-thread-per-block scatter is ~6× of a serial kernel, not the max).
-3. **Batched / async GPU submission** (perf, architectural) — now the **VALIDATED** next perf
-   lever: thread 1 removed the default-stream serializer, exposing the per-call host CUDA
-   driver-submit floor (~19 µs/op serialized ⇒ the ~45–52k qps plateau / sub-ms p50 measured on
-   the text route). Batch many concurrent point-lookups into one GPU submission to amortize that
-   floor (recovers M0's owner-thread batching). The big lever for high-concurrency OLTP.
+   and the migrated routes' blocking fallbacks. Also ✅ done 2026-06-15: the fully-parallel
+   intra-block warp-scan for `compare_project` (`d4dc7835`) — c1 p50 −27% (kernel ~45→~27 µs); its
+   c64 is now host-submit-bound (GPU util 99.6%→91%) like the other routes.
+3. **Batched / async GPU submission** (perf, architectural) — ✅ **RESOLVED 2026-06-15.** Recovered
+   M0's owner-thread batching behind the façade: an engine-side coalescing `PointLookupBatcher`
+   (`crates/facade/src/point_lookup_batcher.rs`) collects concurrent equality point-lookups into one
+   GPU submission per batch, with adaptive `max_wait` (lone client ≈ 0 wait, bursts coalesce) and is
+   **default-ON** (`GPU_DB_BATCHING=0` disables). Design:
+   `docs/architecture/15-batched-async-submission-design.md` (key finding — the batched
+   kernel/submit/complete/slicing already existed, so this was wiring, not CUDA). Result: int4
+   equality routes **3–5× qps @ high-c** (single ~72k@c64 / ~86k@c256; multi ~49k), c1 ≈ the per-call
+   path, p99.9 bounded; mixed-route batching also bounds a catastrophic OFF tail (135 ms → <9 ms @c64).
+   Commits `5baee601`→`94f4c40b`→`a83f046e`→`b0fb8324` (+ `fa5ae0b9` per-call ~43× snapshot-clone fix).
+   Deferred (evidence-gated): coalescer pool, Model-2 detached completion, range-route batching. The
+   remaining ceiling is the per-call host driver-submit floor, now amortized for batched routes.
 4. **Write-half** (concurrency) — concurrent writes via publish-on-commit + MVCC (today writes
    take the single write lock and serialize). UAF prerequisites cleared; the largest remaining
    concurrency piece (detailed just above).
 5. **Phase-0 closure** (§9.1/§9.2) — consolidate the three pgwire servers; external load
    generator + Phase-5 open-loop/p99.9 harness shape.
 
-Recommended order if unsure: **(1)** is ✅ done; next is **(2)** (cheap — apply thread 1's proven
-recipe for quick multi-× across three routes) then **(3)** (the validated ceiling-raiser), or
-**(4)** (write-half) to pivot off read-perf. Run reports for everything are under
+Recommended order if unsure: **(1)(2)(3)** are all ✅ done — the GPU read path is fully scaled
+(batched, parallel kernels, order-correct). **Next: (4) the write-half** — the largest remaining
+concurrency piece (reads / ingress / batched-reads all scale now; writes still serialize on the
+single write lock) — interleaved with **(5) Phase-0 server consolidation**. Run reports for everything are under
 `docs/testing/reports/series/prototype-to-production/runs/`; the `gpu-projection-routes-perf`
 memory summarizes the GPU-perf state.
 
