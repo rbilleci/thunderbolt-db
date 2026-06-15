@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32Comparison,
@@ -6030,6 +6031,200 @@ fn percent_decode_lossy(input: &str) -> String {
     decoded
 }
 
+/// The engine's lock-free read-path state, shared by value-Arc between the owning [`Engine`] and the
+/// concurrent-dispatch façade (`SharedEngine`) so reads and the concurrent-DML path reach it WITHOUT
+/// taking the engine `RwLock` (lock-free read path, write-half MVCC).
+///
+/// Every field is interior-mutable (atomic / [`SnapshotCell`] / [`arc_swap::ArcSwap`] / [`Mutex`]),
+/// so a holder of `&Engine` (a lock-free reader) and a holder of `&mut Engine` (serialized DDL) only
+/// ever obtain `&ReadState` through the shared `Arc` and never alias the same byte mutably. The
+/// engine `RwLock`'s remaining job is purely the **catalog latch** (DDL / KV / sequential-INSERT
+/// mutual exclusion); the read state below is published to lock-free readers via the
+/// `committed_seq`-last release-store discipline (see `publish_committed_seq`).
+///
+/// Stage 1 holds the already-lock-free fields (`mvcc`, `committed_seq`, the resident device-memory
+/// maps, route telemetry). The catalog (Stage 2) and the resident snapshot/partition metadata
+/// (Stage 3) move in behind `ArcSwap` later.
+///
+/// Public as an **opaque** type (all fields private): the concurrent-dispatch façade holds an
+/// `Arc<ReadState>` (Stage 4) to drive the lock-free read path without naming the engine's internals.
+pub struct ReadState {
+    // The read-path-consulted catalog maps (tables / views / materialized views / functions),
+    // published as ONE immutable `Arc<CatalogSnapshot>` behind an `ArcSwap` (Stage 2 — blocker #1).
+    // DDL edits a *working* copy of these maps on `Engine` under the catalog latch and then publishes
+    // a fresh snapshot here; lock-free readers + the concurrent-DML path load it. A statement pins one
+    // snapshot for its whole duration so a concurrent DDL publish can never split it across two
+    // catalogs (the same single-snapshot-per-statement discipline as the data pin).
+    catalog: ArcSwap<CatalogSnapshot>,
+    // Versioned, publish-on-commit MVCC data: per-table `SnapshotCell<Arc<TableVersionData>>`
+    // (rows + value-index) + a KV partition, `&self`-readable / lock-free (write-half Stage 3).
+    mvcc: MvccData,
+    // The single MVCC visibility/publish boundary (the highest committed `commit_seq`), as an atomic
+    // so the concurrent commit critical section can bump it via `&self` (release-store, LAST — the
+    // publish point) while lock-free readers acquire-load it once per statement (write-half Stage 4).
+    committed_seq: AtomicU64,
+    // GPU-resident read-route metadata (device memory + — from Stage 3 — snapshot/partition maps).
+    residency: ResidencyReadState,
+    // Per-execution route telemetry the read path records through `&self` (Mutex + a test counter).
+    route_telemetry: RouteTelemetry,
+}
+
+impl ReadState {
+    fn new() -> Self {
+        Self {
+            catalog: ArcSwap::new(Arc::new(CatalogSnapshot::default())),
+            mvcc: MvccData::new(),
+            committed_seq: AtomicU64::new(0),
+            residency: ResidencyReadState::default(),
+            route_telemetry: RouteTelemetry::default(),
+        }
+    }
+}
+
+/// The immutable, read-path-consulted slice of the catalog, published as one `Arc` per DDL commit
+/// (Stage 2 — blocker #1). It holds ONLY the maps the lock-free read path + concurrent-DML path
+/// actually consult — tables, views, materialized views, functions — NOT the full catalog (acl /
+/// comments / roles / databases / tablespaces / domains / publications / subscriptions / sequences /
+/// the oid+column-id allocators stay on `Engine` for DDL `&mut self`; the read path never reads them).
+/// The field names mirror the `Engine` working maps so the publish is a straight clone-and-store.
+#[derive(Debug, Clone, Default)]
+struct CatalogSnapshot {
+    relational_catalog: BTreeMap<String, RelationalTable>,
+    relational_views: BTreeMap<String, RelationalView>,
+    relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
+    relational_functions: BTreeMap<String, RelationalFunction>,
+}
+
+/// The GPU-resident read-route metadata reached by the lock-free read path. The device-memory maps
+/// are the authoritative residency tombstone gate the concurrent commit path flips via `&self`; the
+/// snapshot/partition metadata (Stage 3 — blocker #2) is published behind `ArcSwap` so the resident
+/// route can `load()` a guard whose pinned `Arc` outlives the across-kernel-launch read, and the
+/// serialized catalog-latch path (warm-up / DDL drop / invalidate / memory-pressure — NEVER the
+/// concurrent commit path) mutates it copy-on-write.
+#[derive(Debug, Default)]
+struct ResidencyReadState {
+    device_memory: ResidentDeviceMemoryMap,
+    partition_device_memory: PartitionResidentDeviceMemoryMap,
+    // The per-table resident snapshot metadata + partition metadata, each an immutable published map
+    // (Stage 3 — blocker #2). Readers `load()` (wait-free) and pin the `Arc` across the kernel launch;
+    // the single serialized publisher COW-stores a fresh map on warm-up / DDL drop / invalidate /
+    // memory-pressure.
+    snapshots: ArcSwap<BTreeMap<String, RelationalResidencySnapshot>>,
+    partitions: ArcSwap<BTreeMap<String, Vec<RelationalResidentPartition>>>,
+}
+
+impl ResidencyReadState {
+    /// COW-mutate the resident snapshot map under the serialized catalog latch: clone the published
+    /// map, apply `mutate`, then atomically store it. In-flight readers keep the generation they
+    /// loaded. One publisher (the catalog-latch path), so the load→clone→store is race-free.
+    fn with_snapshots_mut<R>(
+        &self,
+        mutate: impl FnOnce(&mut BTreeMap<String, RelationalResidencySnapshot>) -> R,
+    ) -> R {
+        let mut next = (**self.snapshots.load()).clone();
+        let result = mutate(&mut next);
+        self.snapshots.store(Arc::new(next));
+        result
+    }
+
+    /// COW-mutate the resident partition map under the serialized catalog latch (see
+    /// [`ResidencyReadState::with_snapshots_mut`]).
+    fn with_partitions_mut<R>(
+        &self,
+        mutate: impl FnOnce(&mut BTreeMap<String, Vec<RelationalResidentPartition>>) -> R,
+    ) -> R {
+        let mut next = (**self.partitions.load()).clone();
+        let result = mutate(&mut next);
+        self.partitions.store(Arc::new(next));
+        result
+    }
+}
+
+/// Per-execution route telemetry, recorded by the read path through `&self` (the read path writes the
+/// latest route decision + measured timings after each query). The `Mutex` recovers from poison so a
+/// panicking reader never wedges route recording for everyone.
+#[derive(Debug, Default)]
+struct RouteTelemetry {
+    latest_route_decisions: Mutex<BTreeMap<String, RelationalResidentRouteDecisionStatus>>,
+    // Test-only counter of `record_route_execution_observation` calls. Lets tests assert a
+    // route's telemetry observation is recorded exactly once per execution (guards against the
+    // single-predicate mixed int4+text delegation double-counting it).
+    #[cfg(test)]
+    route_execution_observation_count: std::sync::atomic::AtomicU64,
+}
+
+impl RouteTelemetry {
+    /// Lock the route-decision map, recovering from poison (a panicking reader must not
+    /// wedge route recording for everyone).
+    fn route_decisions(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<String, RelationalResidentRouteDecisionStatus>> {
+        self.latest_route_decisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record_route_decision(&self, decision: RelationalResidentRouteDecisionStatus) {
+        self.route_decisions()
+            .insert(decision.table.clone(), decision);
+    }
+
+    fn record_route_execution_observation(
+        &self,
+        table: &str,
+        observation: RelationalResidentRouteExecutionObservation,
+    ) {
+        #[cfg(test)]
+        self.route_execution_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut decisions = self.route_decisions();
+        if let Some(decision) = decisions.get_mut(table) {
+            decision.last_execution_h2d_bytes = Some(observation.h2d_bytes);
+            decision.last_execution_d2h_bytes = Some(observation.d2h_bytes);
+            decision.last_execution_kernel_samples = Some(observation.kernel_samples);
+            decision.last_execution_kernel_ms = Some(observation.kernel_ms);
+            decision.last_execution_kernel_event_elapsed_us = observation.kernel_event_elapsed_us;
+            decision.last_execution_rows = Some(observation.rows);
+            decision.last_execution_wall_micros = Some(observation.wall_micros);
+        }
+    }
+
+    fn record_route_device_lookup_micros(
+        &self,
+        table: &str,
+        elapsed_micros: u64,
+        matched_rows: usize,
+    ) {
+        let mut decisions = self.route_decisions();
+        if let Some(decision) = decisions.get_mut(table) {
+            decision.last_execution_device_lookup_micros = Some(elapsed_micros);
+            decision.last_execution_matched_rows = Some(matched_rows);
+        }
+    }
+
+    fn record_route_selected_projection_micros(
+        &self,
+        table: &str,
+        match_index_micros: u64,
+        selected_projection_micros: u64,
+        result_materialization_micros: u64,
+        matched_rows: usize,
+    ) {
+        let mut decisions = self.route_decisions();
+        if let Some(decision) = decisions.get_mut(table) {
+            decision.last_execution_match_index_micros = Some(match_index_micros);
+            decision.last_execution_selected_projection_micros = Some(selected_projection_micros);
+            decision.last_execution_result_materialization_micros =
+                Some(result_materialization_micros);
+            decision.last_execution_matched_rows = Some(matched_rows);
+        }
+    }
+
+    fn remove_table(&self, table: &str) {
+        self.route_decisions().remove(table);
+    }
+}
+
 pub struct Engine {
     /// The commit-critical mutable substate — the replicator (commit-`Index` oracle), the WAL, the
     /// per-txn commit timestamps, and the recent-commits conflict ledger — bundled behind ONE mutex
@@ -6044,11 +6239,12 @@ pub struct Engine {
     /// WITHOUT serializing on the commit_mutex (prepare is off-lock).
     active_snapshots: Mutex<ActiveSnapshots>,
     sm: KvStateMachine,
-    // Versioned, publish-on-commit MVCC data: per-table `SnapshotCell<Arc<TableVersionData>>`
-    // (rows + value-index) + a KV partition, `&self`-readable / lock-free (write-half Stage 3).
-    // Replaces the former mutate-in-place `mvcc_store: InMemoryTupleStore`,
-    // `relational_value_index`, and `relational_next_row_id`.
-    mvcc: MvccData,
+    /// The lock-free read-path state, shared by value-`Arc` with the concurrent-dispatch façade so
+    /// reads and the concurrent-DML path reach `mvcc` / `committed_seq` / resident device-memory /
+    /// route telemetry WITHOUT the engine `RwLock` (lock-free read path, write-half MVCC). A holder
+    /// of `&mut Engine` (serialized DDL) still only ever gets `&ReadState` through this `Arc`, and
+    /// every field is interior-mutable, so a reader and a DDL writer never alias the same byte.
+    read_state: Arc<ReadState>,
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_views: BTreeMap<String, RelationalView>,
     relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
@@ -6071,11 +6267,6 @@ pub struct Engine {
     relational_next_oid: u32,
     relational_next_column_id: u32,
     txn_manager: TxnManager,
-    // The single MVCC visibility/publish boundary (the highest committed `commit_seq`), as an atomic
-    // so the concurrent commit critical section can bump it via `&self` (release-store, LAST — the
-    // publish point) while lock-free readers acquire-load it once per statement (write-half Stage 4).
-    // Was a plain `Index` under the serialized writer.
-    committed_seq: AtomicU64,
     metrics: RuntimeMetrics,
     batcher: DualTriggerBatcher<PendingMutation>,
     planner: Planner,
@@ -6112,15 +6303,31 @@ struct CommitState {
 /// generation on (re)population and a `None` tombstone on invalidation instead of
 /// freeing in place, so an in-flight reader's generation is never dropped under it
 /// (P1-M3 slice B; doc 14). `Some` = resident, `None` = tombstoned (not resident).
+///
+/// The cell *map* itself is an [`arc_swap::ArcSwap`] so its structural mutations
+/// (first-time `insert`, `remove`) are wait-free copy-on-write through `&self` — needed
+/// now that this map lives inside the shared `Arc<ReadState>`, where even a holder of
+/// `&mut Engine` only ever has `&self` access (lock-free read path, write-half Stage 4).
+/// The COW clones only `Arc<SnapshotCell>` pointers, not the cells, and structural
+/// changes happen solely on the serialized catalog-latch path (warm-up / DDL / drop), so
+/// reads stay wait-free: a reader loads the map snapshot, finds its cell, and loads the
+/// cell — never blocking and never contending with the publisher.
+///
+/// One table's resident device-memory cell: a [`SnapshotCell`] whose payload is `Some(owner)` when
+/// resident and `None` when tombstoned, behind an `Arc` so the cell map's copy-on-write store only
+/// clones pointers (not cells).
+type ResidentDeviceMemoryCell = Arc<SnapshotCell<Option<Arc<CudaResidentDeviceMemory>>>>;
+
 #[derive(Debug, Default)]
 struct ResidentDeviceMemoryMap {
-    cells: BTreeMap<String, SnapshotCell<Option<Arc<CudaResidentDeviceMemory>>>>,
+    cells: ArcSwap<BTreeMap<String, ResidentDeviceMemoryCell>>,
 }
 
 impl ResidentDeviceMemoryMap {
     /// Load the currently-published resident owner for `table`, if any (owned `Arc`).
     fn get(&self, table: &str) -> Option<Arc<CudaResidentDeviceMemory>> {
         self.cells
+            .load()
             .get(table)
             .and_then(|cell| cell.load().get().clone())
     }
@@ -6128,6 +6335,7 @@ impl ResidentDeviceMemoryMap {
     /// Whether `table` currently has a published resident owner.
     fn contains_key(&self, table: &str) -> bool {
         self.cells
+            .load()
             .get(table)
             .is_some_and(|cell| cell.load().get().is_some())
     }
@@ -6137,6 +6345,7 @@ impl ResidentDeviceMemoryMap {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.cells
+            .load()
             .values()
             .filter(|cell| cell.load().get().is_some())
             .count()
@@ -6144,13 +6353,17 @@ impl ResidentDeviceMemoryMap {
 
     /// Publish a table's resident owner as a new generation (creating the cell on
     /// first residency); an in-flight reader keeps the generation it already loaded.
-    fn insert(&mut self, table: String, owner: CudaResidentDeviceMemory) {
+    /// `&self`: if the cell exists we publish on it directly (no map change); only a
+    /// first-time residency COW-installs a new cell into the map.
+    fn insert(&self, table: String, owner: CudaResidentDeviceMemory) {
         let owner = Some(Arc::new(owner));
-        if let Some(cell) = self.cells.get(&table) {
+        if let Some(cell) = self.cells.load().get(&table) {
             cell.publish(owner);
             return;
         }
-        self.cells.insert(table, SnapshotCell::new(owner));
+        let mut next = (**self.cells.load()).clone();
+        next.insert(table, Arc::new(SnapshotCell::new(owner)));
+        self.cells.store(Arc::new(next));
     }
 
     /// Publish a `None` tombstone (invalidation): the cell is retained so in-flight
@@ -6158,15 +6371,21 @@ impl ResidentDeviceMemoryMap {
     /// has no cell. `&self` (the cell publishes via `&self`) so the concurrent commit path can
     /// invalidate a mutated table's GPU residency without an engine write lock (write-half Stage 4).
     fn invalidate(&self, table: &str) {
-        if let Some(cell) = self.cells.get(table) {
+        if let Some(cell) = self.cells.load().get(table) {
             cell.publish(None);
         }
     }
 
-    /// Remove a table's cell entirely (DROP TABLE). In-flight readers retain their own
-    /// loaded generation via its `Arc`, so this never frees memory under a reader.
-    fn remove(&mut self, table: &str) {
-        self.cells.remove(table);
+    /// Remove a table's cell entirely (DROP TABLE) via a COW store. In-flight readers
+    /// retain their own loaded generation via its `Arc`, so this never frees memory under
+    /// a reader.
+    fn remove(&self, table: &str) {
+        if !self.cells.load().contains_key(table) {
+            return;
+        }
+        let mut next = (**self.cells.load()).clone();
+        next.remove(table);
+        self.cells.store(Arc::new(next));
     }
 }
 
@@ -6178,9 +6397,13 @@ impl ResidentDeviceMemoryMap {
 /// partition is a `SnapshotCell<Option<Arc<…>>>`: readers `get()` an owned `Arc` (no map
 /// borrow held across the launch), and the writer publishes a new generation / `None`
 /// tombstone, so an in-flight reader's generation is freed only after it drains.
+/// The cell map is an [`arc_swap::ArcSwap`] (same rationale as [`ResidentDeviceMemoryMap`]):
+/// structural mutation (`install_table_partitions`, `remove_table`) is wait-free copy-on-write
+/// through `&self`, so it works from inside the shared `Arc<ReadState>`, while `get`/`invalidate`
+/// stay wait-free.
 #[derive(Debug, Default)]
 struct PartitionResidentDeviceMemoryMap {
-    cells: BTreeMap<(String, u32), SnapshotCell<Option<Arc<CudaResidentDeviceMemory>>>>,
+    cells: ArcSwap<BTreeMap<(String, u32), ResidentDeviceMemoryCell>>,
 }
 
 impl PartitionResidentDeviceMemoryMap {
@@ -6188,6 +6411,7 @@ impl PartitionResidentDeviceMemoryMap {
     /// map ends here, so it is never held across a kernel launch).
     fn get(&self, key: &(String, u32)) -> Option<Arc<CudaResidentDeviceMemory>> {
         self.cells
+            .load()
             .get(key)
             .and_then(|cell| cell.load().get().clone())
     }
@@ -6195,6 +6419,7 @@ impl PartitionResidentDeviceMemoryMap {
     /// Whether this partition currently has a published owner (tombstones excluded).
     fn contains_key(&self, key: &(String, u32)) -> bool {
         self.cells
+            .load()
             .get(key)
             .is_some_and(|cell| cell.load().get().is_some())
     }
@@ -6202,6 +6427,7 @@ impl PartitionResidentDeviceMemoryMap {
     /// Published owners for every partition of `table` (tombstones excluded), owned `Arc`s.
     fn published_owners_for_table(&self, table: &str) -> Vec<Arc<CudaResidentDeviceMemory>> {
         self.cells
+            .load()
             .iter()
             .filter(|((cell_table, _), _)| cell_table == table)
             .filter_map(|(_, cell)| cell.load().get().clone())
@@ -6211,33 +6437,40 @@ impl PartitionResidentDeviceMemoryMap {
     /// Replace a table's partitions: publish each new partition as a new generation
     /// (creating the cell on first residency) and publish a `None` tombstone for any prior
     /// partition of this table not in the new set. In-flight readers keep the generation
-    /// they already loaded.
+    /// they already loaded. `&self`: existing cells are republished in place; only newly-keyed
+    /// partitions COW-install a cell, so the map is stored at most once per call.
     fn install_table_partitions(
-        &mut self,
+        &self,
         table: &str,
         device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
     ) {
-        let prior_ids: Vec<u32> = self
-            .cells
+        let snapshot = self.cells.load();
+        let prior_ids: Vec<u32> = snapshot
             .keys()
             .filter(|(cell_table, _)| cell_table == table)
             .map(|(_, partition_id)| *partition_id)
             .collect();
         for partition_id in prior_ids {
             if !device_memory.contains_key(&partition_id) {
-                if let Some(cell) = self.cells.get(&(table.to_string(), partition_id)) {
+                if let Some(cell) = snapshot.get(&(table.to_string(), partition_id)) {
                     cell.publish(None);
                 }
             }
         }
+        let mut new_cells: BTreeMap<(String, u32), ResidentDeviceMemoryCell> = BTreeMap::new();
         for (partition_id, memory) in device_memory {
             let owner = Some(Arc::new(memory));
             let key = (table.to_string(), partition_id);
-            if let Some(cell) = self.cells.get(&key) {
+            if let Some(cell) = snapshot.get(&key) {
                 cell.publish(owner);
             } else {
-                self.cells.insert(key, SnapshotCell::new(owner));
+                new_cells.insert(key, Arc::new(SnapshotCell::new(owner)));
             }
+        }
+        if !new_cells.is_empty() {
+            let mut next = (**snapshot).clone();
+            next.extend(new_cells);
+            self.cells.store(Arc::new(next));
         }
     }
 
@@ -6245,23 +6478,34 @@ impl PartitionResidentDeviceMemoryMap {
     /// retained so in-flight readers keep their generation; new loads see "not resident". `&self`
     /// (cells publish via `&self`) for the concurrent commit path (write-half Stage 4).
     fn invalidate_table(&self, table: &str) {
-        for ((cell_table, _), cell) in self.cells.iter() {
+        for ((cell_table, _), cell) in self.cells.load().iter() {
             if cell_table == table {
                 cell.publish(None);
             }
         }
     }
 
-    /// Remove every partition cell of `table` (DROP TABLE). In-flight readers retain their
-    /// own loaded generation via its `Arc`, so this never frees memory under a reader.
-    fn remove_table(&mut self, table: &str) {
-        self.cells.retain(|(cell_table, _), _| cell_table != table);
+    /// Remove every partition cell of `table` (DROP TABLE) via a COW store. In-flight readers
+    /// retain their own loaded generation via its `Arc`, so this never frees memory under a reader.
+    fn remove_table(&self, table: &str) {
+        if !self
+            .cells
+            .load()
+            .keys()
+            .any(|(cell_table, _)| cell_table == table)
+        {
+            return;
+        }
+        let mut next = (**self.cells.load()).clone();
+        next.retain(|(cell_table, _), _| cell_table != table);
+        self.cells.store(Arc::new(next));
     }
 
     /// Number of partitions with a published owner (tombstones excluded). Test-only.
     #[cfg(test)]
     fn len(&self) -> usize {
         self.cells
+            .load()
             .values()
             .filter(|cell| cell.load().get().is_some())
             .count()
@@ -6615,23 +6859,16 @@ impl RelationalReadPin {
     }
 }
 
+/// The serialized-path resident-route metadata kept on [`Engine`] (mutated only by the catalog-latch
+/// path). The lock-free read path's parts all moved to `Engine::read_state`: the device-memory maps
+/// (the tombstone gate) and the snapshot/partition metadata to [`ResidencyReadState`] (Stage 3 —
+/// blocker #2), the route telemetry to [`RouteTelemetry`]. What remains here is purely the
+/// admission-time accounting the read path never consults: per-GPU residency budgets and the last
+/// admission decision per table.
 #[derive(Debug, Default)]
 struct RelationalResidentCache {
-    snapshots: BTreeMap<String, RelationalResidencySnapshot>,
-    device_memory: ResidentDeviceMemoryMap,
-    partitions: BTreeMap<String, Vec<RelationalResidentPartition>>,
-    partition_device_memory: PartitionResidentDeviceMemoryMap,
     budget_bytes_by_gpu: BTreeMap<u16, u64>,
     last_decisions: BTreeMap<String, RelationalResidentCacheDecision>,
-    // Mutex-guarded so route-decision recording (and the per-execution telemetry the
-    // read path writes after each query) updates through `&self` — the second half of
-    // the read path's interior-mutability needs for the `&self` flip (P1-M3 step 3b).
-    latest_route_decisions: Mutex<BTreeMap<String, RelationalResidentRouteDecisionStatus>>,
-    // Test-only counter of `record_route_execution_observation` calls. Lets tests assert a
-    // route's telemetry observation is recorded exactly once per execution (guards against the
-    // single-predicate mixed int4+text delegation double-counting it).
-    #[cfg(test)]
-    route_execution_observation_count: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6695,105 +6932,54 @@ impl RelationalResidentCache {
         self.last_decisions.get(table)
     }
 
-    /// Lock the route-decision map, recovering from poison (a panicking reader must not
-    /// wedge route recording for everyone).
-    fn route_decisions(
-        &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<String, RelationalResidentRouteDecisionStatus>> {
-        self.latest_route_decisions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn record_route_decision(&self, decision: RelationalResidentRouteDecisionStatus) {
-        self.route_decisions()
-            .insert(decision.table.clone(), decision);
-    }
-
-    fn record_route_execution_observation(
+    /// Drop a table's serialized-path metadata, plus its device memory (now in `residency`) and its
+    /// route telemetry (now in `telemetry`). The device-memory/route-telemetry stores live in the
+    /// shared `Arc<ReadState>`; the catalog-latch caller passes `&self`-views of them in.
+    /// Drop a table's resident metadata. The snapshot/partition maps + device memory now live in the
+    /// shared `residency` (Stage 3); the route telemetry in `telemetry`. `&self` (nothing on the
+    /// `RelationalResidentCache` itself is removed — its budget/last-decision accounting is keyed
+    /// independently and pruned elsewhere); the catalog-latch caller passes `&self`-views in.
+    fn remove_table(
         &self,
         table: &str,
-        observation: RelationalResidentRouteExecutionObservation,
+        residency: &ResidencyReadState,
+        telemetry: &RouteTelemetry,
     ) {
-        #[cfg(test)]
-        self.route_execution_observation_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut decisions = self.route_decisions();
-        if let Some(decision) = decisions.get_mut(table) {
-            decision.last_execution_h2d_bytes = Some(observation.h2d_bytes);
-            decision.last_execution_d2h_bytes = Some(observation.d2h_bytes);
-            decision.last_execution_kernel_samples = Some(observation.kernel_samples);
-            decision.last_execution_kernel_ms = Some(observation.kernel_ms);
-            decision.last_execution_kernel_event_elapsed_us = observation.kernel_event_elapsed_us;
-            decision.last_execution_rows = Some(observation.rows);
-            decision.last_execution_wall_micros = Some(observation.wall_micros);
-        }
-    }
-
-    fn record_route_device_lookup_micros(
-        &self,
-        table: &str,
-        elapsed_micros: u64,
-        matched_rows: usize,
-    ) {
-        let mut decisions = self.route_decisions();
-        if let Some(decision) = decisions.get_mut(table) {
-            decision.last_execution_device_lookup_micros = Some(elapsed_micros);
-            decision.last_execution_matched_rows = Some(matched_rows);
-        }
-    }
-
-    fn record_route_selected_projection_micros(
-        &self,
-        table: &str,
-        match_index_micros: u64,
-        selected_projection_micros: u64,
-        result_materialization_micros: u64,
-        matched_rows: usize,
-    ) {
-        let mut decisions = self.route_decisions();
-        if let Some(decision) = decisions.get_mut(table) {
-            decision.last_execution_match_index_micros = Some(match_index_micros);
-            decision.last_execution_selected_projection_micros = Some(selected_projection_micros);
-            decision.last_execution_result_materialization_micros =
-                Some(result_materialization_micros);
-            decision.last_execution_matched_rows = Some(matched_rows);
-        }
-    }
-
-    fn remove_table(&mut self, table: &str) {
-        self.snapshots.remove(table);
-        self.device_memory.remove(table);
-        self.partitions.remove(table);
-        self.partition_device_memory.remove_table(table);
-        self.route_decisions().remove(table);
+        residency.with_snapshots_mut(|snapshots| snapshots.remove(table));
+        residency.device_memory.remove(table);
+        residency.with_partitions_mut(|partitions| partitions.remove(table));
+        residency.partition_device_memory.remove_table(table);
+        telemetry.remove_table(table);
     }
 
     fn install_snapshot(
-        &mut self,
+        &self,
         table: String,
         snapshot: RelationalResidencySnapshot,
         device_memory: Option<CudaResidentDeviceMemory>,
+        residency: &ResidencyReadState,
     ) {
         if let Some(device_memory) = device_memory {
-            self.device_memory.insert(table.clone(), device_memory);
+            residency.device_memory.insert(table.clone(), device_memory);
         } else {
             // Refreshed without device memory (e.g. no GPU): publish a tombstone so any
             // in-flight reader of a prior resident generation keeps it.
-            self.device_memory.invalidate(&table);
+            residency.device_memory.invalidate(&table);
         }
-        self.snapshots.insert(table, snapshot);
+        residency.with_snapshots_mut(|snapshots| snapshots.insert(table, snapshot));
     }
 
     fn install_partitions(
-        &mut self,
+        &self,
         table: String,
         partitions: Vec<RelationalResidentPartition>,
         device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
+        residency: &ResidencyReadState,
     ) {
-        self.partition_device_memory
+        residency
+            .partition_device_memory
             .install_table_partitions(&table, device_memory);
-        self.partitions.insert(table, partitions);
+        residency.with_partitions_mut(|map| map.insert(table, partitions));
     }
 }
 
@@ -9584,7 +9770,7 @@ impl Engine {
             }),
             active_snapshots: Mutex::new(ActiveSnapshots::default()),
             sm: KvStateMachine::default(),
-            mvcc: MvccData::new(),
+            read_state: Arc::new(ReadState::new()),
             relational_catalog: BTreeMap::new(),
             relational_views: BTreeMap::new(),
             relational_materialized_views: BTreeMap::new(),
@@ -9605,7 +9791,6 @@ impl Engine {
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
             txn_manager: TxnManager::default(),
-            committed_seq: AtomicU64::new(0),
             metrics: RuntimeMetrics::default(),
             batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
             planner: Planner::new(planner_cfg),
@@ -9639,6 +9824,15 @@ impl Engine {
     /// checks this to re-home its poison-on-panic policy onto the commit path (write-half Stage 4).
     pub fn is_commit_path_poisoned(&self) -> bool {
         self.commit.is_poisoned()
+    }
+
+    /// A value-`Arc` clone of the lock-free read-path state. The concurrent-dispatch façade pins this
+    /// once (e.g. at `SharedEngine` construction) so reads + the concurrent-DML path reach `mvcc`,
+    /// `committed_seq`, resident device memory, and route telemetry WITHOUT taking the engine
+    /// `RwLock` (lock-free read path, write-half MVCC). Cheap (one refcount bump); the returned
+    /// handle shares the *same* interior-mutable state the engine mutates under the catalog latch.
+    pub fn read_state(&self) -> Arc<ReadState> {
+        Arc::clone(&self.read_state)
     }
 
     // `&self` read-only shims over the commit substate, for the scattered leader-checks and admin
@@ -9773,15 +9967,19 @@ impl Engine {
 
     pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
         let snapshot_bytes: u64 = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .snapshots
+            .load()
             .values()
             .filter(|snapshot| snapshot.gpu_id == gpu_id)
             .map(|snapshot| snapshot.resident_bytes)
             .sum();
         let partition_bytes: u64 = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .values()
             .flatten()
             .filter(|partition| partition.gpu_id == gpu_id)
@@ -9887,8 +10085,18 @@ impl Engine {
             self.commit_state_mut().repl.mark_applied(e.index);
         }
 
+        // Publish ordering (Stage 2 — blocker #1). The apply loop already published this commit's data
+        // generation(s) and mutated the working catalog maps (for any DDL entries). Order the rest so
+        // a lock-free reader gets a consistent (catalog, data) pair:
+        //   1. residency tombstones, then 2. `committed_seq` release-store, then 3. catalog snapshot.
+        // The catalog is published LAST (after `committed_seq`) so a reader that loads the new catalog
+        // (acquire) is guaranteed to also observe `committed_seq >= this commit` — i.e. the data is
+        // ALWAYS at least as new as the catalog the reader bound against (the reader loads the catalog
+        // at bind, before it reads `committed_seq` at the data pin). That rules out the "new column in
+        // schema but pre-backfill data" tear for an ADD COLUMN committed concurrently with a reader.
         self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
         self.publish_committed_seq(token.index);
+        self.publish_catalog_snapshot();
         self.metrics.inc_commit();
 
         Ok(token)
@@ -9964,10 +10172,14 @@ impl Engine {
             self.commit_state_mut().repl.mark_applied(e.index);
         }
 
+        // Publish ordering (Stage 2 — blocker #1): residency → `committed_seq` → catalog snapshot LAST
+        // (mirrors `commit_mutation_at`; see that method for why the catalog is published after
+        // `committed_seq`). The current-apply closure already published data + mutated the working maps.
         let residency_invalidation_started = Instant::now();
         self.invalidate_relational_residency_for_commit(&to_apply, txn_id, token.index);
         let residency_invalidation_micros = residency_invalidation_started.elapsed().as_micros();
         self.publish_committed_seq(token.index);
+        self.publish_catalog_snapshot();
         self.metrics.inc_commit();
 
         Ok((token, residency_invalidation_micros))
@@ -9979,11 +10191,13 @@ impl Engine {
     /// returns `None`). Equivalent to invalidating each resident table individually.
     fn invalidate_relational_residency(&mut self, txn_id: TxnId, index: Index) {
         let tables: BTreeSet<String> = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .snapshots
+            .load()
             .keys()
             .cloned()
-            .chain(self.relational_resident_cache.partitions.keys().cloned())
+            .chain(self.read_state.residency.partitions.load().keys().cloned())
             .collect();
         for table in &tables {
             self.invalidate_relational_residency_table(table, txn_id, index);
@@ -9998,30 +10212,37 @@ impl Engine {
     /// unconditional, so in degenerate cache states it may clear a stray cross-map
     /// entry the old two-loop form left — strictly-safe extra cleanup, never stale.
     fn invalidate_relational_residency_table(&mut self, table: &str, txn_id: TxnId, index: Index) {
-        if let Some(snapshot) = self.relational_resident_cache.snapshots.get_mut(table) {
-            if snapshot.invalidated_by_txn_id.is_none() {
-                snapshot.invalidated_by_txn_id = Some(txn_id);
-                snapshot.invalidated_at_index = Some(index);
-            }
-            if let Some(proof) = snapshot.device_memory_proof.as_mut() {
-                proof.retained = false;
-            }
-        }
-        self.relational_resident_cache
-            .device_memory
-            .invalidate(table);
-        if let Some(partitions) = self.relational_resident_cache.partitions.get_mut(table) {
-            for partition in partitions.iter_mut() {
-                if partition.invalidated_by_txn_id.is_none() {
-                    partition.invalidated_by_txn_id = Some(txn_id);
-                    partition.invalidated_at_index = Some(index);
+        // Stage 3 — blocker #2: the snapshot/partition flag maps are now published behind `ArcSwap`,
+        // so flag the invalidation copy-on-write under the serialized catalog latch (this never runs
+        // on the concurrent commit path — that uses `invalidate_relational_residency_tables_concurrent`
+        // which only tombstones the device-memory cells via `&self`).
+        self.read_state.residency.with_snapshots_mut(|snapshots| {
+            if let Some(snapshot) = snapshots.get_mut(table) {
+                if snapshot.invalidated_by_txn_id.is_none() {
+                    snapshot.invalidated_by_txn_id = Some(txn_id);
+                    snapshot.invalidated_at_index = Some(index);
                 }
-                if let Some(proof) = partition.device_memory_proof.as_mut() {
+                if let Some(proof) = snapshot.device_memory_proof.as_mut() {
                     proof.retained = false;
                 }
             }
-        }
-        self.relational_resident_cache
+        });
+        self.read_state.residency.device_memory.invalidate(table);
+        self.read_state.residency.with_partitions_mut(|partitions| {
+            if let Some(partitions) = partitions.get_mut(table) {
+                for partition in partitions.iter_mut() {
+                    if partition.invalidated_by_txn_id.is_none() {
+                        partition.invalidated_by_txn_id = Some(txn_id);
+                        partition.invalidated_at_index = Some(index);
+                    }
+                    if let Some(proof) = partition.device_memory_proof.as_mut() {
+                        proof.retained = false;
+                    }
+                }
+            }
+        });
+        self.read_state
+            .residency
             .partition_device_memory
             .invalidate_table(table);
     }
@@ -10046,10 +10267,9 @@ impl Engine {
         _index: Index,
     ) {
         for table in tables {
-            self.relational_resident_cache
-                .device_memory
-                .invalidate(table);
-            self.relational_resident_cache
+            self.read_state.residency.device_memory.invalidate(table);
+            self.read_state
+                .residency
                 .partition_device_memory
                 .invalidate_table(table);
         }
@@ -10112,35 +10332,52 @@ impl Engine {
     }
 
     fn invalidate_relational_residency_for_memory_pressure(&mut self, gpu_id: u16) {
-        for (table, snapshot) in self.relational_resident_cache.snapshots.iter_mut() {
-            if snapshot.gpu_id == gpu_id {
-                snapshot.invalidated_by_memory_pressure = true;
-                snapshot.memory_pressure_active = true;
-                if let Some(proof) = snapshot.device_memory_proof.as_mut() {
-                    proof.retained = false;
-                }
-                self.relational_resident_cache
-                    .device_memory
-                    .invalidate(table);
-            }
-        }
-        for (table, partitions) in self.relational_resident_cache.partitions.iter_mut() {
-            let mut table_pressured = false;
-            for partition in partitions {
-                if partition.gpu_id == gpu_id {
-                    partition.invalidated_by_memory_pressure = true;
-                    partition.memory_pressure_active = true;
-                    table_pressured = true;
-                    if let Some(proof) = partition.device_memory_proof.as_mut() {
+        // Stage 3 — blocker #2: COW the snapshot/partition flag maps under the catalog latch, then
+        // tombstone the device-memory cells of every table that was pressured (the cell `invalidate`
+        // is `&self`, done outside the COW closure on the collected tables).
+        let pressured_snapshot_tables = self.read_state.residency.with_snapshots_mut(|snapshots| {
+            let mut tables = Vec::new();
+            for (table, snapshot) in snapshots.iter_mut() {
+                if snapshot.gpu_id == gpu_id {
+                    snapshot.invalidated_by_memory_pressure = true;
+                    snapshot.memory_pressure_active = true;
+                    if let Some(proof) = snapshot.device_memory_proof.as_mut() {
                         proof.retained = false;
                     }
+                    tables.push(table.clone());
                 }
             }
-            if table_pressured {
-                self.relational_resident_cache
-                    .partition_device_memory
-                    .invalidate_table(table);
-            }
+            tables
+        });
+        for table in &pressured_snapshot_tables {
+            self.read_state.residency.device_memory.invalidate(table);
+        }
+        let pressured_partition_tables =
+            self.read_state.residency.with_partitions_mut(|partitions| {
+                let mut tables = Vec::new();
+                for (table, table_partitions) in partitions.iter_mut() {
+                    let mut table_pressured = false;
+                    for partition in table_partitions {
+                        if partition.gpu_id == gpu_id {
+                            partition.invalidated_by_memory_pressure = true;
+                            partition.memory_pressure_active = true;
+                            table_pressured = true;
+                            if let Some(proof) = partition.device_memory_proof.as_mut() {
+                                proof.retained = false;
+                            }
+                        }
+                    }
+                    if table_pressured {
+                        tables.push(table.clone());
+                    }
+                }
+                tables
+            });
+        for table in &pressured_partition_tables {
+            self.read_state
+                .residency
+                .partition_device_memory
+                .invalidate_table(table);
         }
     }
 
@@ -10169,17 +10406,18 @@ impl Engine {
                 // KV lives in its own partition. Read the current version under the loaded
                 // generation, then publish a new KV generation with the update/insert applied.
                 let existing = self
+                    .read_state
                     .mvcc
                     .load_kv()
                     .get()
                     .tuple_fetch_by_key(&key, visibility)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 let tuple_id = if existing.is_none() {
-                    Some(self.mvcc.reserve_tuple_id())
+                    Some(self.read_state.mvcc.reserve_tuple_id())
                 } else {
                     None
                 };
-                self.mvcc.with_kv_mut(|store| {
+                self.read_state.mvcc.with_kv_mut(|store| {
                     if let Some(tuple) = existing {
                         store
                             .tuple_update(tuple.tuple_id, value, commit_seq)
@@ -10198,13 +10436,14 @@ impl Engine {
             }
             Command::DeleteKv { key } => {
                 let existing = self
+                    .read_state
                     .mvcc
                     .load_kv()
                     .get()
                     .tuple_fetch_by_key(&key, visibility)
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 if let Some(tuple) = existing {
-                    self.mvcc.with_kv_mut(|store| {
+                    self.read_state.mvcc.with_kv_mut(|store| {
                         store
                             .tuple_delete(tuple.tuple_id, commit_seq)
                             .map_err(|err| EngineError::ApplyFailed(err.to_string()))
@@ -11554,7 +11793,7 @@ impl Engine {
         // Load this table's published MVCC generation; the cursor reads its immutable rows
         // lock-free (the prefix filter is redundant now each partition is single-table, but kept
         // so the read stays correct regardless of partition contents — write-half Stage 3).
-        let table_rows = self.mvcc.table_rows(&table.name);
+        let table_rows = self.read_state.mvcc.table_rows(&table.name);
         let mut cursor = table_rows
             .store()
             .seq_scan_open(visibility)
@@ -11629,14 +11868,19 @@ impl Engine {
         changed_rows: &[Vec<SqlValue>],
         visibility: StorageVisibility,
     ) -> Result<(), EngineError> {
-        for child_table in self.relational_catalog.values() {
+        // Lock-free concurrent-DML path (Stage 2 — blocker #1): pin ONE catalog snapshot for the whole
+        // cross-table FK scan so a concurrent DDL cannot change FK definitions mid-validation.
+        let catalog = self.catalog_snapshot();
+        for child_table in catalog.relational_catalog.values() {
             let child_rows = if child_table.name == changed_table {
                 changed_rows.to_vec()
             } else {
                 self.visible_relational_rows(child_table, visibility)?
             };
             for foreign_key in &child_table.foreign_keys {
-                let Some(parent_table) = self.relational_catalog.get(&foreign_key.referenced_table)
+                let Some(parent_table) = catalog
+                    .relational_catalog
+                    .get(&foreign_key.referenced_table)
                 else {
                     continue;
                 };
@@ -11995,7 +12239,7 @@ impl Engine {
         // Read the rows to move out of the OLD partition's published generation.
         let mut moves = Vec::new();
         {
-            let old_rows = self.mvcc.table_rows(&rename.old_name);
+            let old_rows = self.read_state.mvcc.table_rows(&rename.old_name);
             let mut cursor = old_rows
                 .store()
                 .seq_scan_open(visibility)
@@ -12023,10 +12267,10 @@ impl Engine {
         let mut new_value_index: BTreeMap<ColumnValueKey, Vec<String>> = BTreeMap::new();
         let old_tuple_ids: Vec<TupleId> = moves.iter().map(|(tuple_id, _)| *tuple_id).collect();
         for (_old_tuple_id, value) in &moves {
-            let row_id = self.mvcc.current_row_id();
-            self.mvcc.advance_row_id(1);
+            let row_id = self.read_state.mvcc.current_row_id();
+            self.read_state.mvcc.advance_row_id(1);
             let new_key = relational_row_key(&rename.new_name, row_id);
-            let new_tuple_id = self.mvcc.reserve_tuple_id();
+            let new_tuple_id = self.read_state.mvcc.reserve_tuple_id();
             let values = decode_relational_row(value, &table.columns)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             for (column, column_value) in table.columns.iter().zip(values.iter()) {
@@ -12042,38 +12286,42 @@ impl Engine {
         }
 
         // Publish the NEW table partition with the moved rows + rebuilt value-index.
-        self.mvcc.with_table_mut(&rename.new_name, |data| {
-            for (tuple_id, new_key, value) in &new_rows {
-                data.rows
-                    .tuple_insert_with_id(
-                        *tuple_id,
-                        NewTuple {
-                            key: new_key.clone(),
-                            value: value.clone(),
-                        },
-                        txn_id,
-                    )
-                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            }
-            for (key, keys) in &new_value_index {
-                let mut slot = data.value_index.get(key).cloned().unwrap_or_default();
-                std::sync::Arc::make_mut(&mut slot).extend(keys.iter().cloned());
-                data.value_index.insert(key.clone(), slot);
-            }
-            Ok::<(), EngineError>(())
-        })?;
+        self.read_state
+            .mvcc
+            .with_table_mut(&rename.new_name, |data| {
+                for (tuple_id, new_key, value) in &new_rows {
+                    data.rows
+                        .tuple_insert_with_id(
+                            *tuple_id,
+                            NewTuple {
+                                key: new_key.clone(),
+                                value: value.clone(),
+                            },
+                            txn_id,
+                        )
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+                for (key, keys) in &new_value_index {
+                    let mut slot = data.value_index.get(key).cloned().unwrap_or_default();
+                    std::sync::Arc::make_mut(&mut slot).extend(keys.iter().cloned());
+                    data.value_index.insert(key.clone(), slot);
+                }
+                Ok::<(), EngineError>(())
+            })?;
 
         // Tombstone the moved rows in the OLD partition (keeping their history, exactly as the
         // old in-line `tuple_delete` did) and clear the old partition's value-index.
-        self.mvcc.with_table_mut(&rename.old_name, |data| {
-            for old_tuple_id in &old_tuple_ids {
-                data.rows
-                    .tuple_delete(*old_tuple_id, txn_id)
-                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            }
-            data.value_index = imbl::OrdMap::new();
-            Ok::<(), EngineError>(())
-        })?;
+        self.read_state
+            .mvcc
+            .with_table_mut(&rename.old_name, |data| {
+                for old_tuple_id in &old_tuple_ids {
+                    data.rows
+                        .tuple_delete(*old_tuple_id, txn_id)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+                data.value_index = imbl::OrdMap::new();
+                Ok::<(), EngineError>(())
+            })?;
 
         self.relational_catalog
             .insert(rename.new_name.clone(), table.clone());
@@ -12124,10 +12372,11 @@ impl Engine {
         for (target, comment) in retargeted_comments {
             self.relational_comments.insert(target, comment);
         }
-        self.relational_resident_cache
-            .snapshots
-            .remove(&rename.old_name);
-        self.relational_resident_cache
+        self.read_state
+            .residency
+            .with_snapshots_mut(|snapshots| snapshots.remove(&rename.old_name));
+        self.read_state
+            .residency
             .device_memory
             .remove(&rename.old_name);
         Ok(())
@@ -12146,7 +12395,7 @@ impl Engine {
             };
             let mut tuple_ids = Vec::new();
             {
-                let table_rows = self.mvcc.table_rows(name);
+                let table_rows = self.read_state.mvcc.table_rows(name);
                 let mut cursor = table_rows
                     .store()
                     .seq_scan_open(visibility)
@@ -12162,7 +12411,7 @@ impl Engine {
             // partition cell + (now-stale) value-index are retained — `all_versions` still sees the
             // tombstoned versions, matching the pre-partition behavior.
             if !tuple_ids.is_empty() {
-                self.mvcc.with_table_mut(name, |data| {
+                self.read_state.mvcc.with_table_mut(name, |data| {
                     for tuple_id in &tuple_ids {
                         data.rows
                             .tuple_delete(*tuple_id, txn_id)
@@ -12195,8 +12444,10 @@ impl Engine {
                 | RelationalCommentTarget::Publication { .. }
                 | RelationalCommentTarget::Subscription { .. } => true,
             });
-            self.relational_resident_cache.snapshots.remove(name);
-            self.relational_resident_cache.device_memory.remove(name);
+            self.read_state
+                .residency
+                .with_snapshots_mut(|snapshots| snapshots.remove(name));
+            self.read_state.residency.device_memory.remove(name);
         }
         Ok(())
     }
@@ -12295,7 +12546,7 @@ impl Engine {
         };
         let mut tuple_ids = Vec::new();
         {
-            let table_rows = self.mvcc.table_rows(&truncate.name);
+            let table_rows = self.read_state.mvcc.table_rows(&truncate.name);
             let mut cursor = table_rows
                 .store()
                 .seq_scan_open(visibility)
@@ -12310,14 +12561,16 @@ impl Engine {
         // the value-index is left as-is; its now-stale entries point to tombstoned rows and are
         // filtered out by visibility + the predicate recheck.
         if !tuple_ids.is_empty() {
-            self.mvcc.with_table_mut(&truncate.name, |data| {
-                for tuple_id in &tuple_ids {
-                    data.rows
-                        .tuple_delete(*tuple_id, txn_id)
-                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-                }
-                Ok::<(), EngineError>(())
-            })?;
+            self.read_state
+                .mvcc
+                .with_table_mut(&truncate.name, |data| {
+                    for tuple_id in &tuple_ids {
+                        data.rows
+                            .tuple_delete(*tuple_id, txn_id)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    }
+                    Ok::<(), EngineError>(())
+                })?;
         }
         if truncate.restart_identity {
             for sequence in restart_sequences {
@@ -13752,7 +14005,7 @@ impl Engine {
         let mut updates = Vec::new();
         let mut default_values = default_values.into_iter();
         {
-            let table_rows = self.mvcc.table_rows(&add.table);
+            let table_rows = self.read_state.mvcc.table_rows(&add.table);
             let mut cursor = table_rows
                 .store()
                 .seq_scan_open(visibility)
@@ -13779,7 +14032,7 @@ impl Engine {
         }
 
         let new_column_name = new_column.name.clone();
-        self.mvcc.with_table_mut(&add.table, |data| {
+        self.read_state.mvcc.with_table_mut(&add.table, |data| {
             for (tuple_id, row_key, values) in &updates {
                 let index_value = values.last().expect("new column default appended").clone();
                 data.rows
@@ -13805,10 +14058,10 @@ impl Engine {
             .expect("table existence validated");
         table_ref.columns.push(new_column.clone());
         self.relational_next_column_id = next_column_id;
-        self.relational_resident_cache.snapshots.remove(&add.table);
-        self.relational_resident_cache
-            .device_memory
-            .remove(&add.table);
+        self.read_state
+            .residency
+            .with_snapshots_mut(|snapshots| snapshots.remove(&add.table));
+        self.read_state.residency.device_memory.remove(&add.table);
         Ok(())
     }
 
@@ -13852,7 +14105,7 @@ impl Engine {
         // publishing one new generation. `imbl::OrdMap` has no in-place `retain`; rebuild the index,
         // re-keying the matching column's slots (carrying the same `Arc` row-key list, an O(1) move)
         // and keeping the rest by `Arc`-clone. Order is preserved (OrdMap is ordered).
-        self.mvcc.with_table_mut(&rename.table, |data| {
+        self.read_state.mvcc.with_table_mut(&rename.table, |data| {
             let mut rebuilt = imbl::OrdMap::new();
             for (key, row_keys) in data.value_index.iter() {
                 let new_key = if key.column == rename.old_name {
@@ -13910,10 +14163,11 @@ impl Engine {
                 }
             }
         }
-        self.relational_resident_cache
-            .snapshots
-            .remove(&rename.table);
-        self.relational_resident_cache
+        self.read_state
+            .residency
+            .with_snapshots_mut(|snapshots| snapshots.remove(&rename.table));
+        self.read_state
+            .residency
             .device_memory
             .remove(&rename.table);
         Ok(())
@@ -13986,7 +14240,7 @@ impl Engine {
         };
         let mut updates = Vec::new();
         {
-            let table_rows = self.mvcc.table_rows(&drop_column.table);
+            let table_rows = self.read_state.mvcc.table_rows(&drop_column.table);
             let mut cursor = table_rows
                 .store()
                 .seq_scan_open(visibility)
@@ -14003,22 +14257,24 @@ impl Engine {
         }
 
         let dropped_column_name = drop_column.column.clone();
-        self.mvcc.with_table_mut(&drop_column.table, |data| {
-            for (tuple_id, values) in &updates {
-                data.rows
-                    .tuple_update(*tuple_id, encode_relational_row(values), txn_id)
-                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            }
-            // `imbl::OrdMap` has no in-place `retain`; rebuild keeping every slot whose column is
-            // not the dropped one (`Arc`-clone is O(1), and OrdMap preserves key order).
-            data.value_index = data
-                .value_index
-                .iter()
-                .filter(|(key, _)| key.column != dropped_column_name)
-                .map(|(key, row_keys)| (key.clone(), std::sync::Arc::clone(row_keys)))
-                .collect();
-            Ok::<(), EngineError>(())
-        })?;
+        self.read_state
+            .mvcc
+            .with_table_mut(&drop_column.table, |data| {
+                for (tuple_id, values) in &updates {
+                    data.rows
+                        .tuple_update(*tuple_id, encode_relational_row(values), txn_id)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+                // `imbl::OrdMap` has no in-place `retain`; rebuild keeping every slot whose column is
+                // not the dropped one (`Arc`-clone is O(1), and OrdMap preserves key order).
+                data.value_index = data
+                    .value_index
+                    .iter()
+                    .filter(|(key, _)| key.column != dropped_column_name)
+                    .map(|(key, row_keys)| (key.clone(), std::sync::Arc::clone(row_keys)))
+                    .collect();
+                Ok::<(), EngineError>(())
+            })?;
 
         let dropped_attnum = table.columns[drop_idx].attnum;
         let table_ref = self
@@ -14060,10 +14316,11 @@ impl Engine {
         for (_, new_target, comment) in shifted_comments {
             self.relational_comments.insert(new_target, comment);
         }
-        self.relational_resident_cache
-            .snapshots
-            .remove(&drop_column.table);
-        self.relational_resident_cache
+        self.read_state
+            .residency
+            .with_snapshots_mut(|snapshots| snapshots.remove(&drop_column.table));
+        self.read_state
+            .residency
             .device_memory
             .remove(&drop_column.table);
         Ok(())
@@ -14082,7 +14339,7 @@ impl Engine {
     fn dml_read_snapshot(&self, commit_seq: TxnId) -> DmlReadSnapshot {
         DmlReadSnapshot {
             commit_seq,
-            next_row_id: self.mvcc.current_row_id(),
+            next_row_id: self.read_state.mvcc.current_row_id(),
         }
     }
 
@@ -14104,7 +14361,10 @@ impl Engine {
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
     ) -> Result<WriteDelta, EngineError> {
         let txn_id = snapshot.commit_seq;
+        // Lock-free concurrent-DML path (Stage 2 — blocker #1): bind the target against a pinned
+        // catalog snapshot, cloning it out. FK validation pins its own snapshot internally.
         let table = self
+            .catalog_snapshot()
             .relational_catalog
             .get(&insert.table)
             .ok_or_else(|| {
@@ -14271,7 +14531,10 @@ impl Engine {
         snapshot: DmlReadSnapshot,
     ) -> Result<WriteDelta, EngineError> {
         let txn_id = snapshot.commit_seq;
-        let table = self
+        // Lock-free concurrent-DML path (Stage 2 — blocker #1): pin ONE catalog snapshot for both the
+        // target bind and the inbound-FK-dependents scan below.
+        let catalog = self.catalog_snapshot();
+        let table = catalog
             .relational_catalog
             .get(&delete.table)
             .ok_or_else(|| {
@@ -14286,7 +14549,7 @@ impl Engine {
         let prefix = relational_key_prefix(&delete.table);
         // Resolve (tuple_id, key, row) for each matching version against this table's published
         // generation: tuple_id is what apply tombstones; key/row feed the write-set entries.
-        let table_rows = self.mvcc.table_rows(&delete.table);
+        let table_rows = self.read_state.mvcc.table_rows(&delete.table);
         let mut deletes: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
         let mut cursor = table_rows
             .store()
@@ -14309,7 +14572,7 @@ impl Engine {
         }
         drop(cursor);
 
-        if self.relational_catalog.values().any(|candidate| {
+        if catalog.relational_catalog.values().any(|candidate| {
             candidate
                 .foreign_keys
                 .iter()
@@ -14369,7 +14632,10 @@ impl Engine {
         snapshot: DmlReadSnapshot,
     ) -> Result<WriteDelta, EngineError> {
         let txn_id = snapshot.commit_seq;
-        let table = self
+        // Lock-free concurrent-DML path (Stage 2 — blocker #1): pin ONE catalog snapshot for the
+        // target bind and the inbound-FK-dependents scan below.
+        let catalog = self.catalog_snapshot();
+        let table = catalog
             .relational_catalog
             .get(&update.table)
             .ok_or_else(|| {
@@ -14403,7 +14669,7 @@ impl Engine {
         // UPDATE records the same slot as both released (old) and claimed (new) — harmless (the
         // write-set dedups to one slot), so an idempotent rewrite does not self-conflict.
         let mut released_unique_slots: Vec<UniqueIndexSlotKey> = Vec::new();
-        let table_rows = self.mvcc.table_rows(&update.table);
+        let table_rows = self.read_state.mvcc.table_rows(&update.table);
         let mut cursor = table_rows
             .store()
             .seq_scan_open(visibility)
@@ -14437,7 +14703,7 @@ impl Engine {
         if table.indexes.iter().any(|index| index.unique)
             || !table.check_constraints.is_empty()
             || !table.foreign_keys.is_empty()
-            || self.relational_catalog.values().any(|candidate| {
+            || catalog.relational_catalog.values().any(|candidate| {
                 candidate
                     .foreign_keys
                     .iter()
@@ -14535,11 +14801,13 @@ impl Engine {
                 // partitions so ids are identical). Advance the relational row-id allocator by the
                 // same count `prepare_insert` already computed its row keys from.
                 let tuple_ids: Vec<TupleId> = (0..inserted_rows.len())
-                    .map(|_| self.mvcc.reserve_tuple_id())
+                    .map(|_| self.read_state.mvcc.reserve_tuple_id())
                     .collect();
-                self.mvcc.advance_row_id(inserted_rows.len() as u64);
+                self.read_state
+                    .mvcc
+                    .advance_row_id(inserted_rows.len() as u64);
                 let mvcc_insert_started = Instant::now();
-                let insert_result = self.mvcc.with_table_mut(&table, |data| {
+                let insert_result = self.read_state.mvcc.with_table_mut(&table, |data| {
                     for (tuple_id, (row_key, values)) in tuple_ids.iter().zip(inserted_rows.iter())
                     {
                         data.rows
@@ -14577,7 +14845,7 @@ impl Engine {
                 installs,
                 value_index_entries,
             } => {
-                self.mvcc.with_table_mut(&table, |data| {
+                self.read_state.mvcc.with_table_mut(&table, |data| {
                     for (tuple_id, _row_key, values) in &installs {
                         data.rows
                             .tuple_update(*tuple_id, encode_relational_row(values), commit_seq)
@@ -14592,7 +14860,7 @@ impl Engine {
                 })?;
             }
             PreparedMutation::Delete { table, tuple_ids } => {
-                self.mvcc.with_table_mut(&table, |data| {
+                self.read_state.mvcc.with_table_mut(&table, |data| {
                     for tuple_id in tuple_ids {
                         data.rows
                             .tuple_delete(tuple_id, commit_seq)
@@ -15565,12 +15833,18 @@ impl Engine {
                 self.preflight_acl_grantee(&revoke.grantee)?;
             }
             Command::Insert(insert) => {
-                let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
-                    EngineError::ApplyFailed(format!(
-                        "relation \"{}\" does not exist",
-                        insert.table
-                    ))
-                })?;
+                // Lock-free concurrent-DML preflight (Stage 2 — blocker #1): pin ONE catalog snapshot
+                // for the whole arm (its `table` borrow + the inbound-FK-dependents scan).
+                let catalog = self.catalog_snapshot();
+                let table = catalog
+                    .relational_catalog
+                    .get(&insert.table)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "relation \"{}\" does not exist",
+                            insert.table
+                        ))
+                    })?;
                 let column_indexes = if insert.columns.is_empty() {
                     (0..table.columns.len()).collect::<Vec<_>>()
                 } else {
@@ -15655,7 +15929,7 @@ impl Engine {
                 if !table.indexes.iter().any(|index| index.unique)
                     && table.check_constraints.is_empty()
                     && table.foreign_keys.is_empty()
-                    && !self.relational_catalog.values().any(|candidate| {
+                    && !catalog.relational_catalog.values().any(|candidate| {
                         candidate
                             .foreign_keys
                             .iter()
@@ -15682,16 +15956,22 @@ impl Engine {
                 )?;
             }
             Command::Update(update) => {
-                let table = self.relational_catalog.get(&update.table).ok_or_else(|| {
-                    EngineError::ApplyFailed(format!(
-                        "relation \"{}\" does not exist",
-                        update.table
-                    ))
-                })?;
+                // Lock-free concurrent-DML preflight (Stage 2 — blocker #1): pin ONE catalog snapshot
+                // for the whole arm.
+                let catalog = self.catalog_snapshot();
+                let table = catalog
+                    .relational_catalog
+                    .get(&update.table)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "relation \"{}\" does not exist",
+                            update.table
+                        ))
+                    })?;
                 if !table.indexes.iter().any(|index| index.unique)
                     && table.check_constraints.is_empty()
                     && table.foreign_keys.is_empty()
-                    && !self.relational_catalog.values().any(|candidate| {
+                    && !catalog.relational_catalog.values().any(|candidate| {
                         candidate
                             .foreign_keys
                             .iter()
@@ -15717,7 +15997,7 @@ impl Engine {
                 };
                 let prefix = relational_key_prefix(&update.table);
                 let mut candidate_rows = Vec::new();
-                let table_rows = self.mvcc.table_rows(&update.table);
+                let table_rows = self.read_state.mvcc.table_rows(&update.table);
                 let mut cursor = table_rows
                     .store()
                     .seq_scan_open(visibility)
@@ -15748,13 +16028,19 @@ impl Engine {
                 )?;
             }
             Command::Delete(delete) => {
-                let table = self.relational_catalog.get(&delete.table).ok_or_else(|| {
-                    EngineError::ApplyFailed(format!(
-                        "relation \"{}\" does not exist",
-                        delete.table
-                    ))
-                })?;
-                if !self.relational_catalog.values().any(|candidate| {
+                // Lock-free concurrent-DML preflight (Stage 2 — blocker #1): pin ONE catalog snapshot
+                // for the whole arm.
+                let catalog = self.catalog_snapshot();
+                let table = catalog
+                    .relational_catalog
+                    .get(&delete.table)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "relation \"{}\" does not exist",
+                            delete.table
+                        ))
+                    })?;
+                if !catalog.relational_catalog.values().any(|candidate| {
                     candidate
                         .foreign_keys
                         .iter()
@@ -15769,7 +16055,7 @@ impl Engine {
                 };
                 let prefix = relational_key_prefix(&delete.table);
                 let mut candidate_rows = Vec::new();
-                let table_rows = self.mvcc.table_rows(&delete.table);
+                let table_rows = self.read_state.mvcc.table_rows(&delete.table);
                 let mut cursor = table_rows
                     .store()
                     .seq_scan_open(visibility)
@@ -16114,7 +16400,9 @@ impl Engine {
             Command::Delete(delete) => &delete.table,
             _ => return false,
         };
-        let Some(table) = self.relational_catalog.get(table_name) else {
+        // Lock-free concurrent-DML classify (Stage 2 — blocker #1): probe the pinned catalog snapshot.
+        let catalog = self.catalog_snapshot();
+        let Some(table) = catalog.relational_catalog.get(table_name) else {
             return false;
         };
         // INSERTs that evaluate a `nextval` column default mutate sequence state, which is not
@@ -16676,7 +16964,7 @@ impl Engine {
     fn pin_relational_read(&self, table: &str) -> RelationalReadPin {
         RelationalReadPin {
             visibility: self.read_visibility(),
-            table_rows: self.mvcc.table_rows(table),
+            table_rows: self.read_state.mvcc.table_rows(table),
         }
     }
 
@@ -16694,7 +16982,10 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        if let Some(view) = self.relational_views.get(&select.table).cloned() {
+        // Lock-free read path (Stage 2 — blocker #1): one pinned catalog snapshot for the view +
+        // materialized-view lookups (cloning the matched definition out before the guard drops).
+        let catalog = self.catalog_snapshot();
+        if let Some(view) = catalog.relational_views.get(&select.table).cloned() {
             if !select_is_plain_view_scan(select) {
                 return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                     "only plain SELECT * FROM view is supported for views".to_string(),
@@ -16702,7 +16993,7 @@ impl Engine {
             }
             return self.execute_relational_select(&view.query);
         }
-        if let Some(view) = self
+        if let Some(view) = catalog
             .relational_materialized_views
             .get(&select.table)
             .cloned()
@@ -16765,7 +17056,9 @@ impl Engine {
         &self,
         call: &SelectFunction,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let Some(function) = self.relational_functions.get(&call.name) else {
+        // Lock-free read path (Stage 2 — blocker #1): pin the catalog snapshot for the function lookup.
+        let catalog = self.catalog_snapshot();
+        let Some(function) = catalog.relational_functions.get(&call.name) else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "function \"{}\" does not exist",
                 call.name
@@ -16864,11 +17157,7 @@ impl Engine {
         }
 
         let before_metrics = self.metrics.snapshot();
-        if let Some(device_memory) = self
-            .relational_resident_cache
-            .device_memory
-            .get(&decision.table)
-        {
+        if let Some(device_memory) = self.read_state.residency.device_memory.get(&decision.table) {
             // Make this allocation's CUDA context current on the calling thread so a
             // concurrent reader (not the context's creator) can launch — without it the
             // kernel fails with INVALID_CONTEXT (P1-M3 step 3c / gate 2).
@@ -16876,7 +17165,8 @@ impl Engine {
             device_memory.clear_last_kernel_event_elapsed_us();
         }
         for device_memory in self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partition_device_memory
             .published_owners_for_table(&decision.table)
         {
@@ -16976,7 +17266,8 @@ impl Engine {
             )))),
         }?;
         let kernel_event_elapsed_us = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&decision.table)
             .and_then(|device_memory| device_memory.last_kernel_event_elapsed_us());
@@ -16984,7 +17275,8 @@ impl Engine {
             self.metrics.observe_kernel_event_elapsed_us(elapsed_us);
         }
         let after_metrics = self.metrics.snapshot();
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_execution_observation(
                 &decision.table,
                 RelationalResidentRouteExecutionObservation {
@@ -17314,17 +17606,18 @@ impl Engine {
                     .to_string(),
             ))
         })?;
-        let filter_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
+        let filter_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
         let projection_offsets = selected_indexes
             .iter()
-            .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+            .map(|idx| resident_device_int4_column_offset(&snapshot, &table, *idx))
             .collect::<Result<Vec<_>, ExecuteError>>()?;
         let needles = members
             .iter()
             .map(|(_bound, _access_path, needle)| *needle)
             .collect::<Vec<_>>();
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -17375,7 +17668,8 @@ impl Engine {
         pending: RelationalRetainedInt4ProjectionSubmission,
     ) -> Result<Vec<RelationalSelectResult>, ExecuteError> {
         if !self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .contains_key(&pending.table.name)
         {
@@ -17404,7 +17698,8 @@ impl Engine {
         if let Some(elapsed_us) = completion.kernel_event_elapsed_us {
             self.metrics.observe_kernel_event_elapsed_us(elapsed_us);
         }
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &completion.table_name,
                 completion.batch_micros,
@@ -17413,7 +17708,8 @@ impl Engine {
                 completion.total_rows,
             );
         let after_metrics = self.metrics.snapshot();
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_execution_observation(
                 &completion.table_name,
                 RelationalResidentRouteExecutionObservation {
@@ -17566,7 +17862,8 @@ impl Engine {
         }
         let snapshot_gpu_id = snapshot.gpu_id;
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -17595,7 +17892,8 @@ impl Engine {
                 "resident device-memory row count {row_count} exceeds supported COUNT(*) result range"
             )))
         })?;
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_device_lookup_micros(&table.name, lookup_micros, 1);
 
         Ok(RelationalSelectResult {
@@ -17632,8 +17930,10 @@ impl Engine {
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
@@ -17669,7 +17969,8 @@ impl Engine {
                 ))));
             }
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .get(&(table.name.clone(), partition.partition_id))
                 .ok_or_else(|| {
@@ -17707,7 +18008,8 @@ impl Engine {
                 "partitioned resident row count {total_count} exceeds supported COUNT(*) result range"
             )))
         })?;
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_device_lookup_micros(&table.name, lookup_micros, partitions.len());
 
         Ok(RelationalSelectResult {
@@ -17770,8 +18072,10 @@ impl Engine {
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
@@ -17807,7 +18111,8 @@ impl Engine {
                 ))));
             }
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .get(&(table.name.clone(), partition.partition_id))
                 .ok_or_else(|| {
@@ -17847,7 +18152,8 @@ impl Engine {
                 .unwrap_or(u64::MAX)
                 .saturating_mul(std::mem::size_of::<u64>() as u64),
         );
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_device_lookup_micros(&table.name, lookup_micros, rows.len());
 
         Ok(RelationalSelectResult {
@@ -17916,8 +18222,10 @@ impl Engine {
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
@@ -17957,7 +18265,8 @@ impl Engine {
                 ))));
             }
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .get(&(table.name.clone(), partition.partition_id))
                 .ok_or_else(|| {
@@ -18056,9 +18365,11 @@ impl Engine {
         }
         self.metrics
             .observe_d2h_bytes(int4_d2h_bytes.saturating_add(match_index_d2h_bytes));
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_device_lookup_micros(&table.name, match_index_micros, rows.len());
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &table.name,
                 match_index_micros,
@@ -18133,8 +18444,10 @@ impl Engine {
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
@@ -18174,7 +18487,8 @@ impl Engine {
                 ))));
             }
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .get(&(table.name.clone(), partition.partition_id))
                 .ok_or_else(|| {
@@ -18268,7 +18582,8 @@ impl Engine {
         }
         result_d2h_bytes = result_d2h_bytes.saturating_add(std::mem::size_of::<i64>() as u64);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &table.name,
                 match_index_micros,
@@ -18382,8 +18697,10 @@ impl Engine {
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
@@ -18423,7 +18740,8 @@ impl Engine {
                 ))));
             }
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .get(&(table.name.clone(), partition.partition_id))
                 .ok_or_else(|| {
@@ -18523,7 +18841,8 @@ impl Engine {
             .saturating_add(std::mem::size_of::<u64>() as u64)
             .saturating_add(std::mem::size_of::<i64>() as u64);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &table.name,
                 match_index_micros,
@@ -18600,8 +18919,10 @@ impl Engine {
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
@@ -18640,7 +18961,8 @@ impl Engine {
                 ))));
             }
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .get(&(table.name.clone(), partition.partition_id))
                 .ok_or_else(|| {
@@ -18713,7 +19035,8 @@ impl Engine {
         }
         result_d2h_bytes = result_d2h_bytes.saturating_add(std::mem::size_of::<i32>() as u64);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &table.name,
                 match_index_micros,
@@ -18792,8 +19115,10 @@ impl Engine {
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
@@ -18832,7 +19157,8 @@ impl Engine {
                 ))));
             }
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .get(&(table.name.clone(), partition.partition_id))
                 .ok_or_else(|| {
@@ -18909,7 +19235,8 @@ impl Engine {
             .saturating_add(std::mem::size_of::<u64>() as u64)
             .saturating_add(std::mem::size_of::<i64>() as u64);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &table.name,
                 match_index_micros,
@@ -18986,8 +19313,10 @@ impl Engine {
         let (_query, access_path) =
             self.relational_select_mvcc_query_pinned(select, &table, &bound)?;
         let partitions = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .get(&table.name)
             .cloned()
             .ok_or_else(|| {
@@ -19026,7 +19355,8 @@ impl Engine {
                 ))));
             }
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .get(&(table.name.clone(), partition.partition_id))
                 .ok_or_else(|| {
@@ -19099,7 +19429,8 @@ impl Engine {
         }
         result_d2h_bytes = result_d2h_bytes.saturating_add(std::mem::size_of::<i32>() as u64);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &table.name,
                 match_index_micros,
@@ -19182,7 +19513,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -19191,7 +19523,7 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let byte_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
@@ -19273,7 +19605,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -19407,7 +19740,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -19505,7 +19839,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -19638,7 +19973,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -19745,7 +20081,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -19878,7 +20215,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -20009,7 +20347,8 @@ impl Engine {
             });
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -20183,7 +20522,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -20310,7 +20650,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -20473,7 +20814,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -20692,7 +21034,8 @@ impl Engine {
         }
         let snapshot_gpu_id = snapshot.gpu_id;
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -20701,9 +21044,9 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let group_offset = resident_device_int4_column_offset(snapshot, &table, group_idx)?;
-        let value_offset = resident_device_int4_column_offset(snapshot, &table, value_idx)?;
-        let filter_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
+        let group_offset = resident_device_int4_column_offset(&snapshot, &table, group_idx)?;
+        let value_offset = resident_device_int4_column_offset(&snapshot, &table, value_idx)?;
+        let filter_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
@@ -20897,7 +21240,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -21025,7 +21369,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -21034,7 +21379,7 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let byte_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
@@ -21057,7 +21402,8 @@ impl Engine {
         })?;
         self.metrics
             .observe_d2h_bytes(std::mem::size_of::<u64>() as u64);
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_device_lookup_micros(&table.name, lookup_micros, matched_len);
 
         Ok(RelationalSelectResult {
@@ -21153,7 +21499,8 @@ impl Engine {
         }
         let snapshot_gpu_id = snapshot.gpu_id;
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -21165,7 +21512,7 @@ impl Engine {
         let filter_offsets = filters
             .iter()
             .map(|(filter_idx, needle)| {
-                resident_device_int4_column_offset(snapshot, &table, *filter_idx)
+                resident_device_int4_column_offset(&snapshot, &table, *filter_idx)
                     .map(|offset| (offset, *needle))
             })
             .collect::<Result<Vec<_>, ExecuteError>>()?;
@@ -21183,7 +21530,7 @@ impl Engine {
             let projection_offsets = bound
                 .selected_indexes
                 .iter()
-                .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+                .map(|idx| resident_device_int4_column_offset(&snapshot, &table, *idx))
                 .collect::<Result<Vec<_>, ExecuteError>>()?;
             let fused_started = Instant::now();
             let projected_rows = device_memory
@@ -21218,7 +21565,8 @@ impl Engine {
             self.metrics.observe_d2h_bytes(result_d2h_bytes);
             self.metrics
                 .observe_kernel_exec_ms(fused_micros.div_ceil(1000).max(1));
-            self.relational_resident_cache
+            self.read_state
+                .route_telemetry
                 .record_route_selected_projection_micros(
                     &table.name,
                     fused_micros,
@@ -21292,7 +21640,7 @@ impl Engine {
         for idx in std::mem::take(&mut projected_columns) {
             match table.columns[idx].ty {
                 SqlType::Int4 => {
-                    let byte_offset = resident_device_int4_column_offset(snapshot, &table, idx)?;
+                    let byte_offset = resident_device_int4_column_offset(&snapshot, &table, idx)?;
                     let values = device_memory
                         .project_i32_rows_from_payload(byte_offset, &matching_row_indices)
                         .map_err(|err| {
@@ -21308,7 +21656,7 @@ impl Engine {
                     column_values.insert(idx, values);
                 }
                 SqlType::Text => {
-                    let layout = resident_device_text_column_layout(snapshot, &table, idx)?;
+                    let layout = resident_device_text_column_layout(&snapshot, &table, idx)?;
                     let values = device_memory
                         .project_text_rows_from_payload(
                             layout.offsets_byte_offset,
@@ -21394,7 +21742,8 @@ impl Engine {
             self.metrics
                 .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
         }
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &table.name,
                 match_index_micros,
@@ -21576,14 +21925,14 @@ impl Engine {
                     .to_string(),
             ))
         })?;
-        let filter_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
+        let filter_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
         let all_int4_projection = selected_indexes
             .iter()
             .all(|idx| table.columns[*idx].ty == SqlType::Int4);
         let projection_offsets = if all_int4_projection {
             selected_indexes
                 .iter()
-                .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+                .map(|idx| resident_device_int4_column_offset(&snapshot, &table, *idx))
                 .collect::<Result<Vec<_>, ExecuteError>>()?
         } else {
             vec![filter_offset]
@@ -21593,11 +21942,7 @@ impl Engine {
             .map(|(_bound, _access_path, needle)| *needle)
             .collect::<Vec<_>>();
 
-        if let Some(device_memory) = self
-            .relational_resident_cache
-            .device_memory
-            .get(&table.name)
-        {
+        if let Some(device_memory) = self.read_state.residency.device_memory.get(&table.name) {
             device_memory.clear_last_kernel_event_elapsed_us();
         }
         let text_projection_indexes = selected_indexes
@@ -21615,13 +21960,14 @@ impl Engine {
             .collect::<Vec<_>>();
         let int4_projection_offsets = int4_projection_indexes
             .iter()
-            .map(|idx| resident_device_int4_column_offset(snapshot, &table, *idx))
+            .map(|idx| resident_device_int4_column_offset(&snapshot, &table, *idx))
             .collect::<Result<Vec<_>, ExecuteError>>()?;
         let before_metrics = self.metrics.snapshot();
         let batch_started = Instant::now();
         let compact_text_rows = if let Some(text_idx) = compact_text_projection_idx {
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .device_memory
                 .get(&table.name)
                 .ok_or_else(|| {
@@ -21630,7 +21976,7 @@ impl Engine {
                         table.name
                     )))
                 })?;
-            let layout = resident_device_text_column_layout(snapshot, &table, text_idx)?;
+            let layout = resident_device_text_column_layout(&snapshot, &table, text_idx)?;
             Some(
                 device_memory
                     .match_project_i32_equal_any_text_from_payload(
@@ -21651,7 +21997,8 @@ impl Engine {
         };
         let projected_rows = if compact_text_rows.is_none() {
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .device_memory
                 .get(&table.name)
                 .ok_or_else(|| {
@@ -21750,7 +22097,8 @@ impl Engine {
                 .map(|projected| projected.row_index)
                 .collect::<Vec<_>>();
             let device_memory = self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .device_memory
                 .get(&table.name)
                 .ok_or_else(|| {
@@ -21765,7 +22113,7 @@ impl Engine {
                 match table.columns[*idx].ty {
                     SqlType::Int4 => {
                         let byte_offset =
-                            resident_device_int4_column_offset(snapshot, &table, *idx)?;
+                            resident_device_int4_column_offset(&snapshot, &table, *idx)?;
                         let values = device_memory
                             .project_i32_rows_from_payload(byte_offset, &matched_row_indices)
                             .map_err(|err| {
@@ -21781,7 +22129,7 @@ impl Engine {
                         int4_values.insert(*idx, values);
                     }
                     SqlType::Text => {
-                        let layout = resident_device_text_column_layout(snapshot, &table, *idx)?;
+                        let layout = resident_device_text_column_layout(&snapshot, &table, *idx)?;
                         let values = device_memory
                             .project_text_rows_from_payload(
                                 layout.offsets_byte_offset,
@@ -21885,14 +22233,16 @@ impl Engine {
                 .observe_kernel_exec_ms(batch_micros.div_ceil(1000).max(1));
         }
         let kernel_event_elapsed_us = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .and_then(|device_memory| device_memory.last_kernel_event_elapsed_us());
         if let Some(elapsed_us) = kernel_event_elapsed_us {
             self.metrics.observe_kernel_event_elapsed_us(elapsed_us);
         }
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_selected_projection_micros(
                 &table.name,
                 batch_micros,
@@ -21908,7 +22258,8 @@ impl Engine {
         // callers are not wrapped by the dispatcher and own the record themselves.
         if record_route_observation {
             let after_metrics = self.metrics.snapshot();
-            self.relational_resident_cache
+            self.read_state
+                .route_telemetry
                 .record_route_execution_observation(
                     &table.name,
                     RelationalResidentRouteExecutionObservation {
@@ -22016,7 +22367,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -22161,7 +22513,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -22317,7 +22670,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .get(&table.name)
             .ok_or_else(|| {
@@ -22400,7 +22754,8 @@ impl Engine {
     /// Used to assert that a route records its observation exactly once per execution.
     #[cfg(test)]
     fn route_execution_observation_count(&self) -> u64 {
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .route_execution_observation_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -22409,7 +22764,12 @@ impl Engine {
         &self,
         select: &Select,
     ) -> Result<(RelationalTable, BoundRelationalSelect), ExecuteError> {
+        // Lock-free read path (Stage 2 — blocker #1): bind against a pinned catalog snapshot, cloning
+        // the table out so the statement holds a stable owned definition (the snapshot guard is not
+        // held past this clone). Every resident-route projection/aggregate method binds through here,
+        // so this one redirect covers the whole read path's table lookup.
         let table = self
+            .catalog_snapshot()
             .relational_catalog
             .get(&select.table)
             .ok_or_else(|| {
@@ -23513,7 +23873,13 @@ impl Engine {
         table: &str,
         gpu_id: u16,
     ) -> Result<RelationalResidencySnapshot, ExecuteError> {
-        let previous_snapshot = self.relational_resident_cache.snapshots.get(table).cloned();
+        let previous_snapshot = self
+            .read_state
+            .residency
+            .snapshots
+            .load()
+            .get(table)
+            .cloned();
         let catalog_table = self
             .relational_catalog
             .get(table)
@@ -23532,7 +23898,7 @@ impl Engine {
         let mut resident_rows = Vec::new();
         let mut raw_device_tail = Vec::new();
         {
-            let table_rows = self.mvcc.table_rows(table);
+            let table_rows = self.read_state.mvcc.table_rows(table);
             let mut cursor = table_rows.store().seq_scan_open(visibility)?;
             while let Some(tuple) = cursor.next() {
                 if !tuple.key.starts_with(&prefix) {
@@ -23679,6 +24045,7 @@ impl Engine {
             catalog_table.name,
             snapshot.clone(),
             device_memory,
+            &self.read_state.residency,
         );
         Ok(snapshot)
     }
@@ -23747,8 +24114,10 @@ impl Engine {
         }
 
         let mut candidates = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .snapshots
+            .load()
             .iter()
             .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
             .map(|(name, snapshot)| {
@@ -23765,7 +24134,11 @@ impl Engine {
             if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
                 break;
             }
-            self.relational_resident_cache.remove_table(&map_key);
+            self.relational_resident_cache.remove_table(
+                &map_key,
+                &self.read_state.residency,
+                &self.read_state.route_telemetry,
+            );
             current_bytes = current_bytes.saturating_sub(bytes);
             evicted_tables.push(map_key);
         }
@@ -23872,7 +24245,13 @@ impl Engine {
             )));
         }
 
-        let previous_snapshot = self.relational_resident_cache.snapshots.get(table).cloned();
+        let previous_snapshot = self
+            .read_state
+            .residency
+            .snapshots
+            .load()
+            .get(table)
+            .cloned();
         let memory_pressure_active = self
             .router
             .runtime()
@@ -23932,6 +24311,7 @@ impl Engine {
             catalog_table.name,
             snapshot.clone(),
             Some(device_memory),
+            &self.read_state.residency,
         );
         Ok(snapshot)
     }
@@ -23977,7 +24357,13 @@ impl Engine {
             &install.resident_device_text_columns,
         )?;
 
-        let previous_snapshot = self.relational_resident_cache.snapshots.get(table).cloned();
+        let previous_snapshot = self
+            .read_state
+            .residency
+            .snapshots
+            .load()
+            .get(table)
+            .cloned();
         let memory_pressure_active = self
             .router
             .runtime()
@@ -24037,6 +24423,7 @@ impl Engine {
             catalog_table.name,
             snapshot.clone(),
             Some(device_memory),
+            &self.read_state.residency,
         );
         Ok(snapshot)
     }
@@ -24170,6 +24557,7 @@ impl Engine {
             catalog_table.name,
             partitions,
             device_memory,
+            &self.read_state.residency,
         );
         Ok(())
     }
@@ -24232,7 +24620,7 @@ impl Engine {
             read_txn_id: self.committed_seq(),
         };
         let prefix = relational_key_prefix(table);
-        let table_rows = self.mvcc.table_rows(table);
+        let table_rows = self.read_state.mvcc.table_rows(table);
         let mut cursor = table_rows.store().seq_scan_open(visibility)?;
         let mut row_count = 0usize;
         while let Some(tuple) = cursor.next() {
@@ -24249,15 +24637,19 @@ impl Engine {
 
     fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
         let snapshot_bytes: u64 = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .snapshots
+            .load()
             .iter()
             .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
             .map(|(_name, snapshot)| snapshot.resident_bytes)
             .sum();
         let partition_bytes: u64 = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .partitions
+            .load()
             .iter()
             .filter(|(name, _partitions)| name.as_str() != table)
             .flat_map(|(_name, partitions)| partitions)
@@ -24271,8 +24663,10 @@ impl Engine {
         &self,
         table: &str,
     ) -> Option<RelationalResidencySnapshot> {
-        self.relational_resident_cache
+        self.read_state
+            .residency
             .snapshots
+            .load()
             .get(table)
             .map(|snapshot| {
                 let mut snapshot = snapshot.clone();
@@ -24290,8 +24684,10 @@ impl Engine {
         &self,
         table: &str,
     ) -> Option<RelationalRetainedSnapshotHandle> {
-        self.relational_resident_cache
+        self.read_state
+            .residency
             .snapshots
+            .load()
             .get(table)
             .map(|snapshot| {
                 let memory_pressure_active = self
@@ -24314,7 +24710,8 @@ impl Engine {
                         && !snapshot.invalidated_by_memory_pressure
                         && !memory_pressure_active,
                     has_retained_device_memory: self
-                        .relational_resident_cache
+                        .read_state
+                        .residency
                         .device_memory
                         .contains_key(table),
                     resident_device_int4_columns: snapshot.resident_device_int4_columns.clone(),
@@ -24331,17 +24728,30 @@ impl Engine {
         if !handle.valid || !handle.has_retained_device_memory {
             return None;
         }
-        self.relational_resident_cache
+        self.read_state
+            .residency
             .device_memory
             .get(table)
             .map(|device_memory| device_memory.read_view())
     }
 
+    /// Pin the resident snapshot metadata for `table` as an OWNED clone (Stage 3 — blocker #2). The
+    /// resident-route consumers used to hold a `&` borrow of the snapshot map across the kernel launch;
+    /// now the map is published behind `ArcSwap`, so this loads the published generation and clones the
+    /// table's entry out. The clone is owned (no map/guard borrow held across the submission), and the
+    /// consumers only read scalar fields + column layouts off it before submitting — so an owned clone
+    /// is a drop-in for the former borrow with no lifetime entanglement. Cloning a single snapshot's
+    /// metadata once per resident-route statement is negligible against the GPU kernel it precedes.
     fn relational_residency_snapshot_ref(
         &self,
         table: &str,
-    ) -> Option<&RelationalResidencySnapshot> {
-        self.relational_resident_cache.snapshots.get(table)
+    ) -> Option<RelationalResidencySnapshot> {
+        self.read_state
+            .residency
+            .snapshots
+            .load()
+            .get(table)
+            .cloned()
     }
 
     pub fn warm_relational_residency_with_policy(
@@ -24404,10 +24814,7 @@ impl Engine {
             let existing_valid = existing
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.is_valid());
-            let existing_retained = self
-                .relational_resident_cache
-                .device_memory
-                .contains_key(&table);
+            let existing_retained = self.read_state.residency.device_memory.contains_key(&table);
             if existing_valid && existing_retained && !policy_sets_budget && !policy_sets_gpu {
                 let route_decision = self.warmup_route_readiness_decision(&table);
                 entries.push(RelationalResidencyWarmupEntry {
@@ -24618,7 +25025,8 @@ impl Engine {
         select: &Select,
     ) -> RelationalResidentRouteDecisionStatus {
         let decision = self.plan_relational_resident_route_inner(select);
-        self.relational_resident_cache
+        self.read_state
+            .route_telemetry
             .record_route_decision(decision.clone());
         decision
     }
@@ -24627,8 +25035,11 @@ impl Engine {
         &self,
         select: &Select,
     ) -> RelationalResidentRouteDecisionStatus {
-        if self.relational_views.contains_key(&select.table)
-            || self
+        // Lock-free read path (Stage 2 — blocker #1): pin the catalog snapshot for the relation-kind
+        // check (the subsequent table bind pins its own; both are immutable published snapshots).
+        let catalog = self.catalog_snapshot();
+        if catalog.relational_views.contains_key(&select.table)
+            || catalog
                 .relational_materialized_views
                 .contains_key(&select.table)
         {
@@ -24650,11 +25061,17 @@ impl Engine {
             }
         };
 
+        // Stage 3 — blocker #2: pin the published resident partition + snapshot maps for the rest of
+        // the planning decision (the partition slice is passed by reference into the partitioned-route
+        // planner, and the snapshot is read field-by-field below — both must outlive those uses, so the
+        // guards are bound here and held to the end of the function).
+        let partitions_guard = self.read_state.residency.partitions.load();
+        let snapshots_guard = self.read_state.residency.snapshots.load();
+
         let query_shape = match resident_route_query_shape(select, &table, &bound) {
             Some(shape) => shape,
             None => {
-                if let Some(partitions) = self.relational_resident_cache.partitions.get(&table.name)
-                {
+                if let Some(partitions) = partitions_guard.get(&table.name) {
                     if let Some(shape) =
                         partitioned_resident_route_query_shape(select, &table, &bound)
                     {
@@ -24671,7 +25088,7 @@ impl Engine {
             }
         };
 
-        if let Some(partitions) = self.relational_resident_cache.partitions.get(&table.name) {
+        if let Some(partitions) = partitions_guard.get(&table.name) {
             return self.plan_relational_partitioned_resident_route(
                 select,
                 &table,
@@ -24680,7 +25097,7 @@ impl Engine {
             );
         }
 
-        let Some(snapshot) = self.relational_resident_cache.snapshots.get(&table.name) else {
+        let Some(snapshot) = snapshots_guard.get(&table.name) else {
             return Self::resident_route_reject(
                 &table.name,
                 "relation has no resident snapshot",
@@ -24699,7 +25116,8 @@ impl Engine {
             && !snapshot.invalidated_by_memory_pressure
             && !memory_pressure_active;
         let has_retained_device_memory = self
-            .relational_resident_cache
+            .read_state
+            .residency
             .device_memory
             .contains_key(&table.name);
         let d2h_bytes_estimate = resident_route_d2h_bytes_estimate(select, &query_shape, snapshot);
@@ -25016,7 +25434,8 @@ impl Engine {
                 return decision;
             }
             if !self
-                .relational_resident_cache
+                .read_state
+                .residency
                 .partition_device_memory
                 .contains_key(&(table.name.clone(), partition.partition_id))
             {
@@ -25050,9 +25469,10 @@ impl Engine {
     }
 
     fn relational_residency_status(&self) -> RelationalResidencyStatus {
-        let mut tables = self
-            .relational_resident_cache
-            .snapshots
+        // Stage 3 — blocker #2: iterate a pinned snapshot generation (the per-table `last_decision` it
+        // joins to still lives on the resident cache and is read via `&self` inside the closure).
+        let snapshots_guard = self.read_state.residency.snapshots.load();
+        let mut tables = snapshots_guard
             .values()
             .map(|snapshot| {
                 let memory_pressure_active = self
@@ -25112,7 +25532,8 @@ impl Engine {
         RelationalResidencyStatus {
             tables,
             latest_route_decisions: self
-                .relational_resident_cache
+                .read_state
+                .route_telemetry
                 .route_decisions()
                 .values()
                 .cloned()
@@ -25131,7 +25552,7 @@ impl Engine {
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
         let backend = CpuMvccExecutionBackend;
-        let kv = self.mvcc.load_kv();
+        let kv = self.read_state.mvcc.load_kv();
         self.execute_mvcc_query_with_fallback_reason(
             kv.get(),
             query,
@@ -25163,7 +25584,7 @@ impl Engine {
         &self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
-        let kv = self.mvcc.load_kv();
+        let kv = self.read_state.mvcc.load_kv();
         self.execute_mvcc_query_with_cuda_driver_probe_on_store(kv.get(), query)
     }
 
@@ -25195,7 +25616,7 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &B,
     ) -> Result<MvccReadResult, ExecuteError> {
-        let kv = self.mvcc.load_kv();
+        let kv = self.read_state.mvcc.load_kv();
         self.execute_mvcc_query_with_fallback_reason(kv.get(), query, backend, None, false)
     }
 
@@ -25205,7 +25626,7 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &B,
     ) -> Result<MvccReadResult, ExecuteError> {
-        let kv = self.mvcc.load_kv();
+        let kv = self.read_state.mvcc.load_kv();
         self.execute_mvcc_query_with_fallback_reason(kv.get(), query, backend, None, false)
     }
 
@@ -25217,7 +25638,7 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &CudaMvccExecutionBackend,
     ) -> Result<MvccReadResult, ExecuteError> {
-        let kv = self.mvcc.load_kv();
+        let kv = self.read_state.mvcc.load_kv();
         self.execute_cuda_native_source_query(kv.get(), query, backend)
     }
 
@@ -25394,7 +25815,32 @@ impl Engine {
     /// published commit's data (rows + value-index generation) — the reader-side half of the
     /// publish-on-commit memory ordering (write-half Stage 4).
     fn committed_seq(&self) -> Index {
-        self.committed_seq.load(AtomicOrdering::Acquire)
+        self.read_state.committed_seq.load(AtomicOrdering::Acquire)
+    }
+
+    /// Pin the currently-published catalog snapshot as an owned `Arc` for the whole statement (Stage 2
+    /// — blocker #1). A statement loads this ONCE and threads `&CatalogSnapshot` through its read /
+    /// concurrent-DML helpers, so a concurrent DDL publish (a fresh `Arc` via
+    /// [`Engine::publish_catalog_snapshot`]) can never split the statement across two catalogs — the
+    /// same single-snapshot-per-statement discipline the data pin already uses.
+    fn catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
+        self.read_state.catalog.load_full()
+    }
+
+    /// Publish a fresh immutable catalog snapshot from the current `Engine` working maps (Stage 2 —
+    /// blocker #1). Called by the catalog-latch path (serialized DDL apply) AFTER it has mutated the
+    /// working `relational_catalog`/`relational_views`/`relational_materialized_views`/
+    /// `relational_functions` and BEFORE it release-stores `committed_seq` — so a lock-free reader that
+    /// observes the new `committed_seq` also observes (at least) this catalog (publish ordering:
+    /// working maps → catalog → residency → `committed_seq` LAST). Cheap relative to a DDL commit; DDL
+    /// is the only writer and runs under the exclusive catalog latch, so there is one publisher.
+    fn publish_catalog_snapshot(&self) {
+        self.read_state.catalog.store(Arc::new(CatalogSnapshot {
+            relational_catalog: self.relational_catalog.clone(),
+            relational_views: self.relational_views.clone(),
+            relational_materialized_views: self.relational_materialized_views.clone(),
+            relational_functions: self.relational_functions.clone(),
+        }));
     }
 
     /// Release-store the visibility/publish boundary to `at least` `seq` (monotonic). Called LAST in
@@ -25403,9 +25849,9 @@ impl Engine {
     fn publish_committed_seq(&self, seq: Index) {
         // Monotonic max via a release CAS loop: under the commit_mutex commits are assigned strictly
         // increasing `commit_seq`, but a CAS keeps this correct even if two paths race.
-        let mut current = self.committed_seq.load(AtomicOrdering::Relaxed);
+        let mut current = self.read_state.committed_seq.load(AtomicOrdering::Relaxed);
         while seq > current {
-            match self.committed_seq.compare_exchange_weak(
+            match self.read_state.committed_seq.compare_exchange_weak(
                 current,
                 seq,
                 AtomicOrdering::Release,
@@ -25876,6 +26322,7 @@ impl Engine {
             )));
         }
         Ok(self
+            .read_state
             .mvcc
             .prune_versions_deleted_at_or_before(safe_commit_seq))
     }
@@ -26556,7 +27003,11 @@ mod tests {
         // Directly: the loaded generation's value-index returns exactly the 2 'Ada' row keys
         // (an O(log) map lookup), and far fewer than the 200 stored rows — proving the read hit
         // the versioned value-index, not a chain scan.
-        let handle = e.mvcc.load_table("people").expect("table published");
+        let handle = e
+            .read_state
+            .mvcc
+            .load_table("people")
+            .expect("table published");
         let ada_keys = handle.get().index_keys(
             "name",
             &relational_index_value(&SqlValue::Text("Ada".to_string())),
@@ -29128,7 +29579,7 @@ mod tests {
 
         let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
         assert_eq!(snapshot.device_memory_proof, None);
-        assert_eq!(e.relational_resident_cache.device_memory.len(), 0);
+        assert_eq!(e.read_state.residency.device_memory.len(), 0);
 
         let status = e.status_snapshot();
         assert_eq!(
@@ -34586,7 +35037,7 @@ mod tests {
         e.execute_text(3, "SET acct:1=closed").unwrap();
         e.execute_text(4, "DELETE acct:2").unwrap();
 
-        let kv = e.mvcc.load_kv();
+        let kv = e.read_state.mvcc.load_kv();
         let rows =
             resolve_mvcc_all_versions(kv.get(), StorageVisibility { read_txn_id: 2 }).unwrap();
         let identities = rows
@@ -35062,7 +35513,7 @@ mod tests {
                 },
             ]
         );
-        let kv = e.mvcc.load_kv();
+        let kv = e.read_state.mvcc.load_kv();
         let all_version_rows =
             resolve_mvcc_all_versions(kv.get(), StorageVisibility { read_txn_id: 3 }).unwrap();
         let compact_rows = ["acct:3", "acct:1"]
@@ -50815,10 +51266,7 @@ mod tests {
         assert!(e.relational_catalog_table("people").is_none());
         assert!(e.relational_catalog_table("teams").is_some());
         assert!(e.relational_residency_snapshot("people").is_none());
-        assert!(!e
-            .relational_resident_cache
-            .device_memory
-            .contains_key("people"));
+        assert!(!e.read_state.residency.device_memory.contains_key("people"));
         assert_eq!(e.relational_table_comment("people"), None);
         assert_eq!(e.relational_column_comment("people", 2), None);
         assert_eq!(e.relational_index_comment("people_name_idx"), None);
@@ -54003,9 +54451,10 @@ mod tests {
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:1=closed").unwrap();
 
-        assert_eq!(e.mvcc.version_count(), 2);
+        assert_eq!(e.read_state.mvcc.version_count(), 2);
         assert_eq!(
-            e.mvcc
+            e.read_state
+                .mvcc
                 .kv_tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
                 .unwrap()
                 .map(|version| version.value),
@@ -54032,14 +54481,16 @@ mod tests {
             }
         );
         assert_eq!(
-            e.mvcc
+            e.read_state
+                .mvcc
                 .kv_tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 2 })
                 .unwrap()
                 .map(|version| version.value),
             Some("closed".to_string())
         );
         assert_eq!(
-            e.mvcc
+            e.read_state
+                .mvcc
                 .kv_tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
                 .unwrap(),
             None
@@ -54050,6 +54501,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
         assert_eq!(
             recovered
+                .read_state
                 .mvcc
                 .kv_tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
                 .unwrap()
@@ -54343,7 +54795,7 @@ mod tests {
             .unwrap();
 
         // Capture the full version set (ALL versions, visible or not) including stamps.
-        let live_versions = live.mvcc.all_versions();
+        let live_versions = live.read_state.mvcc.all_versions();
         let live_visible_up_to = live.visible_up_to();
 
         // The live stamps must be the commit `Index` sequence (1..=6 for our six commits), NOT the
@@ -54372,7 +54824,7 @@ mod tests {
 
         // Replay from the durable WAL into a fresh engine.
         let recovered = Engine::recover_from_durable_wal(&live.durable_wal_records()).unwrap();
-        let recovered_versions = recovered.mvcc.all_versions();
+        let recovered_versions = recovered.read_state.mvcc.all_versions();
 
         // The crux: byte-identical version chains, stamps and all.
         assert_eq!(
@@ -54420,6 +54872,7 @@ mod tests {
             .unwrap();
 
         let row = e
+            .read_state
             .mvcc
             .all_versions()
             .into_iter()
@@ -54431,7 +54884,7 @@ mod tests {
         // Helper: how many row versions of table `t` are visible at a given boundary.
         let table_prefix = relational_key_prefix("t");
         let visible_at = |engine: &Engine, boundary: TxnId| -> usize {
-            let table_rows = engine.mvcc.table_rows("t");
+            let table_rows = engine.read_state.mvcc.table_rows("t");
             let mut cursor = table_rows
                 .store()
                 .seq_scan_open(StorageVisibility {
@@ -54455,6 +54908,7 @@ mod tests {
         // commit 3: DELETE id=1 -> the version's deleted_by stamped = 3
         e.execute_text(502, "DELETE FROM t WHERE id = 1").unwrap();
         let deleted = e
+            .read_state
             .mvcc
             .all_versions()
             .into_iter()
@@ -54509,12 +54963,12 @@ mod tests {
     }
 
     fn capture_mutable_state(e: &Engine) -> MutableEngineState {
-        let mut versions = e.mvcc.all_versions();
+        let mut versions = e.read_state.mvcc.all_versions();
         versions.sort_by(|a, b| (a.tuple_id, &a.value).cmp(&(b.tuple_id, &b.value)));
         MutableEngineState {
             versions,
-            value_index: e.mvcc.value_index_snapshot(),
-            next_row_id: e.mvcc.current_row_id(),
+            value_index: e.read_state.mvcc.value_index_snapshot(),
+            next_row_id: e.read_state.mvcc.current_row_id(),
             sequences: e
                 .relational_sequences
                 .iter()
@@ -54555,7 +55009,8 @@ mod tests {
     /// tombstoned by `commit_seq` (delete / update-old). Derived purely from the version chains so
     /// it is independent of the write-set under test.
     fn keys_touched_at(e: &Engine, commit_seq: TxnId) -> BTreeSet<String> {
-        e.mvcc
+        e.read_state
+            .mvcc
             .all_versions()
             .into_iter()
             .filter(|v| v.created_by == commit_seq || v.deleted_by == Some(commit_seq))

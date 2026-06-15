@@ -518,6 +518,7 @@ dependencies = [
 name = "gpu_db_engine"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "gpu_db_batching",
  "gpu_db_execution",
  "gpu_db_facade",

@@ -900,3 +900,119 @@ fn residency_data_consistency_concurrent_writer_invalidates_while_reader_reads()
         },
     );
 }
+
+// ----- DDL ↔ read consistency (lock-free catalog snapshot) ------------------------------------
+
+#[test]
+fn ddl_concurrent_with_reads_sees_a_consistent_catalog_and_data_pair() {
+    // The lock-free read path pins the catalog behind an `ArcSwap<CatalogSnapshot>` published per DDL
+    // commit, ordered AFTER `committed_seq` so a reader's data is always at least as new as the
+    // catalog it bound against (Stage 2 — blocker #1). This asserts that property under contention:
+    // while a writer thread runs a stream of committed DDL — ADD COLUMN on the table being read, plus
+    // CREATE/DROP of a SECOND table — many reader threads repeatedly SELECT the first table and must
+    // ALWAYS see a consistent (catalog, data) pair: never a panic, never a torn/half-applied catalog,
+    // and never a column whose backfilled values are not yet visible at the read's snapshot.
+    with_deadline(
+        TEST_DEADLINE_SECS,
+        "ddl_concurrent_with_reads_sees_a_consistent_catalog_and_data_pair",
+        || {
+            for rep in 0..REPS {
+                let shared = Arc::new(SharedEngine::new());
+                run_ok(&shared, "CREATE TABLE t (id INT)");
+                let base = 20;
+                for id in 1..=base {
+                    run_ok(&shared, &format!("INSERT INTO t (id) VALUES ({id})"));
+                }
+
+                let barrier = Arc::new(Barrier::new(THREADS));
+                // One writer runs committed DDL the whole time: it ADD COLUMNs a new column with a
+                // constant DEFAULT to `t` (which backfills every existing row at the commit), and
+                // independently CREATE/DROPs a second table `t2`. The barrier is the first thing each
+                // worker touches — nothing that can panic runs before it.
+                let writer = {
+                    let shared = Arc::clone(&shared);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        for n in 0..30 {
+                            // ADD COLUMN with a constant default backfills all rows at this commit;
+                            // the catalog change + the data backfill commit together. A reader must
+                            // never see the new column in the schema without its backfilled data.
+                            let _ = run_write(
+                                &shared,
+                                &format!("ALTER TABLE t ADD COLUMN c{n} INT DEFAULT {n}"),
+                            );
+                            // A disjoint second relation churns the catalog (CREATE then DROP) without
+                            // touching `t`'s data — exercises catalog publishes that add/remove keys.
+                            let _ = run_write(&shared, "CREATE TABLE t2 (a INT)");
+                            let _ = run_write(&shared, "DROP TABLE t2");
+                        }
+                    })
+                };
+                let readers: Vec<_> = (0..(THREADS - 1))
+                    .map(|_| {
+                        let shared = Arc::clone(&shared);
+                        let barrier = Arc::clone(&barrier);
+                        thread::spawn(move || {
+                            barrier.wait();
+                            for _ in 0..60 {
+                                // `SELECT id FROM t` projects only the original column, so its result
+                                // is independent of how many columns the concurrent ADD COLUMNs have
+                                // added — it must ALWAYS be the contiguous committed prefix 1..=base,
+                                // for every catalog generation the reader could pin. A torn / split
+                                // (catalog, data) pair — or a half-applied catalog — would surface as a
+                                // panic, an error, or a wrong row set here.
+                                let ids = visible_ids(&shared, "t");
+                                let expected: Vec<i64> = (1..=base).collect();
+                                assert_eq!(
+                                    ids, expected,
+                                    "rep {rep}: a read concurrent with committed DDL returned an \
+                                     inconsistent (catalog, data) row set"
+                                );
+                                // `SELECT *` pins one catalog generation; every projected column must
+                                // have a value for every row at the read's snapshot (the ADD COLUMN
+                                // backfill is committed atomically with the catalog change, and the
+                                // catalog is published after `committed_seq`, so the data the reader
+                                // sees is always at least as new as the schema it bound). A torn pair
+                                // would panic or error; we require the call to succeed and return
+                                // exactly `base` rows whatever the column count happens to be.
+                                match run(&shared, "SELECT * FROM t") {
+                                    Ok(QueryOutcome::Rows { rows, columns }) => {
+                                        assert_eq!(
+                                            rows.len(),
+                                            base as usize,
+                                            "rep {rep}: SELECT * row count drifted under concurrent DDL"
+                                        );
+                                        for row in &rows {
+                                            assert_eq!(
+                                                row.len(),
+                                                columns.len(),
+                                                "rep {rep}: a row's value count disagrees with the \
+                                                 pinned catalog's column count (torn schema/data)"
+                                            );
+                                        }
+                                    }
+                                    Ok(other) => {
+                                        panic!("rep {rep}: SELECT * returned non-rows {other:?}")
+                                    }
+                                    Err(err) => {
+                                        panic!("rep {rep}: SELECT * under concurrent DDL failed: {err:?}")
+                                    }
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                writer.join().unwrap();
+                for r in readers {
+                    r.join().unwrap();
+                }
+                // After all the ADD COLUMNs, `t` still holds exactly `base` rows and `SELECT id` is
+                // still the original prefix — the schema grew but the data is consistent.
+                assert_eq!(scalar_i64(&shared, "SELECT COUNT(*) FROM t"), base);
+                assert_eq!(visible_ids(&shared, "t"), (1..=base).collect::<Vec<_>>());
+            }
+        },
+    );
+}
