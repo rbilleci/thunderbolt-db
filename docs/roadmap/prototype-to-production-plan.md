@@ -691,12 +691,20 @@ Also still owed: grow the harness to the Phase-5 open-loop/p99.9/steady-state sh
    CUDA driver-submit floor (~89% @c64) → thread 3. Open follow-ups: generalize the drain to the
    shared `launch_on_pooled_stream` (pre-existing identical window, 3 routes); wire the `#[ignore]`
    GPU e2e parity gate into CI. (Telemetry double-count + a parallel-flaky GPU module-cache test were both fixed in the thread-1 wrap-up.)
-2. **Remaining projection/gather routes** (perf) — `equal_any_project`, `compare_project`,
-   `row_indices` still use the pre-pool per-call orchestration. Apply the now-PROVEN recipe from
-   thread 1: pooled private stream + `*Async` mem ops + pinned-D2H + the output-buffer pool
-   (`8c476939`) + the `.map_err(drain_err)?` drain guard. Expect similar multi-× wins. Lead-in:
-   first wire the `#[ignore]` GPU e2e parity gate into CI so each route is validated by default
-   as the recipe is applied.
+2. **Remaining projection/gather routes** (perf) — ✅ **RESOLVED 2026-06-15.** All three migrated
+   to the pooled-async substrate via the thread-1 recipe, each through implement → adversarial
+   audit → benchmark → commit (GPU parity gate now CI-wired locally, `da7e658e`). c64 A/B vs each
+   route's pre-migration HEAD: **`equal_any_project` (`d66e0a8f`) 59.7× p50 / 37.5× qps**
+   (26.8 ms→449 µs — needed an `impl Drop` stream-drain after an audit caught a cross-thread UAF on
+   its submit→complete split); **`compare_project` (`f3b17f12`) 7.2× p50 / 9.1× qps** (29 ms→4 ms —
+   plateau is SERIAL-kernel-bound, single-thread ordered-append); **`row_indices` (`2e325095`)
+   ~157× p50 / ~29× qps** (13.2 ms→84 µs — this was ~73% of the old text-route cascade wall). Every
+   curve flipped from collapse/anti-scaling to rises-then-plateaus. Open follow-ups: (a)
+   `compare_project` parallel ordered-compaction kernel (prefix-sum + scatter) to lift its
+   serial-kernel floor; (b) `row_indices`' parallel atomic-append emits indices in non-deterministic
+   (atomic-schedule) order for ≥33 matches — verify no consumer / parity reference requires ordered
+   indices (pre-existing, kernel byte-unchanged); (c) generalize the `drain_err` drop-guard to the
+   shared `launch_on_pooled_stream` (pre-existing identical window, ~3 routes).
 3. **Batched / async GPU submission** (perf, architectural) — now the **VALIDATED** next perf
    lever: thread 1 removed the default-stream serializer, exposing the per-call host CUDA
    driver-submit floor (~19 µs/op serialized ⇒ the ~45–52k qps plateau / sub-ms p50 measured on
