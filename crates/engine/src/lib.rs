@@ -7826,6 +7826,118 @@ struct RelationalIndexKey {
     value: String,
 }
 
+/// The off-lock read boundary a `prepare_*` reads against (write-half MVCC, Stage 2).
+///
+/// `commit_seq` is both the read visibility (`is_visible` boundary) AND the version stamp the
+/// matching `apply_delta` writes — the Stage 0 unification. `next_row_id` snapshots
+/// `relational_next_row_id` so `prepare_insert` can compute deterministic row keys without
+/// mutating the engine. Under the still-serialized commit these equal the values the old direct
+/// apply used; Stage 4 will take this snapshot at statement start instead.
+#[derive(Debug, Clone, Copy)]
+struct DmlReadSnapshot {
+    commit_seq: TxnId,
+    next_row_id: u64,
+}
+
+/// A single row slot a write touches: `(table, row_key)`. Inserts claim a fresh slot; updates
+/// rewrite an existing slot in place (old version tombstoned + new version at the same key);
+/// deletes tombstone a slot. This is the per-row conflict point for Stage 4's first-committer-wins
+/// SI validation (a recent-commits ledger keyed by `(table, row_key)`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RowWriteKey {
+    table: String,
+    row_key: String,
+}
+
+/// A unique-index slot a write claims or releases: `(table, column, value)` for a column carrying
+/// a unique index. Two transactions writing the same unique slot conflict (first-committer-wins),
+/// so this is the second conflict dimension Stage 4 validates. Non-unique value-index appends are
+/// NOT conflict points and are carried in [`PreparedMutation`], not here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UniqueIndexSlotKey {
+    table: String,
+    column: String,
+    value: String,
+}
+
+/// The complete, reusable write-set a `prepare_*` computes: every row slot and every
+/// unique-index slot the matching `apply_delta` will touch — no more, no less. Stage 4's
+/// conflict detector consumes exactly this shape to validate a prepared txn against commits since
+/// its snapshot. Kept as ordered `Vec`s (small per statement); callers that need set semantics can
+/// collect into a `BTreeSet` (the keys are `Ord`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WriteSet {
+    rows: Vec<RowWriteKey>,
+    unique_slots: Vec<UniqueIndexSlotKey>,
+}
+
+impl WriteSet {
+    /// Append the unique-index slots `values` occupies for `table`. Mirrors
+    /// `validate_unique_indexes_for_rows`: for each unique index, resolve the column position
+    /// (skip if the column is absent, as the validator does) and record `(table, column, value)`.
+    fn add_unique_slots(&mut self, table: &RelationalTable, values: &[SqlValue]) {
+        for index in table.indexes.iter().filter(|index| index.unique) {
+            let Some(column_idx) = table
+                .columns
+                .iter()
+                .position(|column| column.name == index.column)
+            else {
+                continue;
+            };
+            self.unique_slots.push(UniqueIndexSlotKey {
+                table: table.name.clone(),
+                column: index.column.clone(),
+                value: relational_index_value(&values[column_idx]),
+            });
+        }
+    }
+}
+
+/// The concrete, installable mutation a `prepare_*` produced, paired with its [`WriteSet`] in a
+/// [`WriteDelta`]. Holds everything `apply_delta` needs to mutate engine state and nothing it must
+/// recompute. The value-index entries (all columns, unique or not) are precomputed here so apply
+/// is a pure install.
+#[derive(Debug, Clone)]
+enum PreparedMutation {
+    /// New rows to install at reserved keys; `inserted_rows` is `(row_key, values)` and
+    /// `value_index_entries` is the per-(table,column,value) row-key appends. `seq_advances`
+    /// is the post-state (`last_value`, `is_called`) for each sequence consumed by `nextval`
+    /// column defaults: `prepare_insert` reads the sequence state and computes the values
+    /// purely (into a local scratch), recording the final advancement here for `apply_delta`
+    /// to install — keeping prepare free of the sequence mutation `nextval` would otherwise do.
+    Insert {
+        table: String,
+        inserted_rows: Vec<(String, Vec<SqlValue>)>,
+        value_index_entries: BTreeMap<RelationalIndexKey, Vec<String>>,
+        seq_advances: BTreeMap<String, (i64, bool)>,
+    },
+    /// In-place version rewrites; `installs` is `(tuple_id, row_key, new_values)` (tuple_id is the
+    /// existing version chain to tombstone+append onto), plus the new images' value-index appends.
+    Update {
+        table: String,
+        installs: Vec<(u64, String, Vec<SqlValue>)>,
+        value_index_entries: BTreeMap<RelationalIndexKey, Vec<String>>,
+    },
+    /// Existing versions to tombstone, by tuple_id.
+    Delete { tuple_ids: Vec<u64> },
+}
+
+/// A prepared (but not yet installed) write: the [`WriteSet`] for conflict detection plus the
+/// [`PreparedMutation`] to install (write-half MVCC, Stage 2). Produced PURELY by `prepare_*`
+/// from a [`DmlReadSnapshot`] (no engine mutation); installed by [`Engine::apply_delta`] under
+/// the commit lock, stamped with `commit_seq`. `rows_consumed` is how many row-ids the install
+/// advances `relational_next_row_id` by (inserts only).
+#[derive(Debug, Clone)]
+struct WriteDelta {
+    // Computed and asserted-on now (write-set-correctness tests); the production reader is Stage
+    // 4's SI conflict detector (validate the prepared write-set against commits since the
+    // snapshot). Not yet read by non-test code, hence the scoped allow until Stage 4 lands.
+    #[allow(dead_code)]
+    write_set: WriteSet,
+    rows_consumed: u64,
+    mutation: PreparedMutation,
+}
+
 const PUBLIC_SCHEMA_NAME: &str = "public";
 const FIRST_USER_RELATION_OID: u32 = 16_384;
 const FIRST_USER_COLUMN_ID: u32 = 1;
@@ -10036,6 +10148,46 @@ impl Engine {
                 let value = self.apply_sequence_nextval(SequenceNextVal {
                     name: sequence.clone(),
                 })?;
+                i32::try_from(value).map(SqlValue::Int4).map_err(|_| {
+                    EngineError::ApplyFailed(
+                        "sequence value is out of range for int4 default".to_string(),
+                    )
+                })
+            }
+        }
+    }
+
+    /// PURE column-default evaluation for `prepare_insert` (write-half MVCC, Stage 2). Identical
+    /// arithmetic to [`Engine::evaluate_column_default`] / [`Engine::apply_sequence_nextval`], but
+    /// `nextval` advances a per-call `seq_state` scratch (seeded lazily from the engine's sequence
+    /// catalog) instead of mutating `self`. The scratch's final `(last_value, is_called)` per
+    /// sequence is installed by `apply_delta`, so a prepare→apply pair advances the sequence by
+    /// exactly what the old in-line apply did — while prepare stays `&self`.
+    fn evaluate_column_default_pure(
+        &self,
+        default: &ColumnDefault,
+        seq_state: &mut BTreeMap<String, (i64, bool)>,
+    ) -> Result<SqlValue, EngineError> {
+        match default {
+            ColumnDefault::Literal(value) => Ok(value.clone()),
+            ColumnDefault::SequenceNextVal { sequence, .. } => {
+                self.preflight_sequence_target(sequence)?;
+                let entry = seq_state.entry(sequence.clone()).or_insert_with(|| {
+                    let seq = self
+                        .relational_sequences
+                        .get(sequence)
+                        .expect("sequence target preflighted");
+                    (seq.last_value, seq.is_called)
+                });
+                let (last_value, is_called) = *entry;
+                let value = if is_called {
+                    last_value.checked_add(1).ok_or_else(|| {
+                        EngineError::ApplyFailed("sequence value overflow".to_string())
+                    })?
+                } else {
+                    last_value
+                };
+                *entry = (value, true);
                 i32::try_from(value).map(SqlValue::Int4).map_err(|_| {
                     EngineError::ApplyFailed(
                         "sequence value is out of range for int4 default".to_string(),
@@ -13219,12 +13371,37 @@ impl Engine {
         self.apply_insert_with_profile(insert, txn_id, None)
     }
 
-    fn apply_insert_with_profile(
-        &mut self,
-        insert: Insert,
-        txn_id: TxnId,
+    /// The off-lock read boundary a `prepare_*` runs against (write-half MVCC, Stage 2).
+    ///
+    /// Under serialization today `commit_seq` is the entry's commit `Index` and `next_row_id`
+    /// is `relational_next_row_id` captured immediately before apply — so `prepare_*` reads
+    /// exactly what the old direct apply read, and computes the identical row keys. When the
+    /// commit lock is removed (Stage 4) this becomes a true snapshot taken at statement start.
+    fn dml_read_snapshot(&self, commit_seq: TxnId) -> DmlReadSnapshot {
+        DmlReadSnapshot {
+            commit_seq,
+            next_row_id: self.relational_next_row_id,
+        }
+    }
+
+    /// PURE preflight + encode for `INSERT` (write-half MVCC, Stage 2). Reads only from the
+    /// `snapshot` (no `&mut self`, no engine mutation); runs the unique / check / FK preflight
+    /// exactly as the old `apply_insert_with_profile`; encodes the new row versions and computes
+    /// the write-set. The returned [`WriteDelta`] is what [`Engine::apply_delta`] installs.
+    ///
+    /// One deliberate refinement vs. the old in-line apply: the old code evaluated `nextval`
+    /// column defaults (mutating the sequence) BEFORE the preflight, so a preflight FAILURE still
+    /// advanced the sequence. Here the advance is deferred to `apply_delta`, so a prepare that
+    /// fails preflight advances nothing — the Stage-4 abort-is-side-effect-free semantics. This is
+    /// not observable on the live paths: `execute_text` / the COPY path run the same preflight
+    /// BEFORE committing, so a constraint-violating INSERT never reaches apply in the first place.
+    fn prepare_insert(
+        &self,
+        insert: &Insert,
+        snapshot: DmlReadSnapshot,
         mut profile: Option<&mut RelationalCopyAdmissionProfile>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<WriteDelta, EngineError> {
+        let txn_id = snapshot.commit_seq;
         let table = self
             .relational_catalog
             .get(&insert.table)
@@ -13250,7 +13427,12 @@ impl Engine {
         };
         let row_prepare_started = Instant::now();
         let mut new_rows = Vec::with_capacity(insert.rows.len());
-        for row in insert.rows {
+        // Sequence advancement scratch: keeps `prepare_insert` pure (no `&mut self`) while
+        // evaluating `nextval` column defaults. Seeded lazily from the engine's sequence catalog,
+        // advanced per row in source order (matching the old in-line apply), then installed by
+        // `apply_delta`.
+        let mut seq_state: BTreeMap<String, (i64, bool)> = BTreeMap::new();
+        for row in &insert.rows {
             if row.len() != column_indexes.len() {
                 return Err(EngineError::ApplyFailed(
                     "INSERT value count must match target columns".to_string(),
@@ -13271,7 +13453,7 @@ impl Engine {
             for (idx, value) in values.iter_mut().enumerate() {
                 if value.is_none() {
                     if let Some(default) = table.columns[idx].default.clone() {
-                        *value = Some(self.evaluate_column_default(&default)?);
+                        *value = Some(self.evaluate_column_default_pure(&default, &mut seq_state)?);
                     }
                 }
             }
@@ -13338,42 +13520,52 @@ impl Engine {
             }
         }
 
-        let mvcc_insert_started = Instant::now();
+        // Encode the new versions against the snapshot's `next_row_id` base (pure: does not bump
+        // `relational_next_row_id` — `apply_delta` advances it by `rows_consumed`). These row keys
+        // are exactly what the old `apply_insert` assigned because, under the still-serialized
+        // commit, the snapshot is taken immediately before apply.
+        let rows_consumed = new_rows.len() as u64;
         let mut inserted_rows = Vec::with_capacity(new_rows.len());
-        for values in new_rows {
-            let row_id = self.relational_next_row_id;
-            self.relational_next_row_id += 1;
+        for (offset, values) in new_rows.into_iter().enumerate() {
+            let row_id = snapshot.next_row_id + offset as u64;
             let row_key = relational_row_key(&insert.table, row_id);
-            self.mvcc_store
-                .tuple_insert_reserved_key(
-                    NewTuple {
-                        key: row_key.clone(),
-                        value: encode_relational_row(&values),
-                    },
-                    txn_id,
-                )
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             inserted_rows.push((row_key, values));
         }
-        if let Some(profile) = profile.as_mut() {
-            profile.mvcc_insert_micros += mvcc_insert_started.elapsed().as_micros();
+        let value_index_entries =
+            relational_value_index_entries_for_rows(&insert.table, &table.columns, &inserted_rows);
+
+        let mut write_set = WriteSet::default();
+        for (row_key, values) in &inserted_rows {
+            // Each inserted version claims its own row slot.
+            write_set.rows.push(RowWriteKey {
+                table: insert.table.clone(),
+                row_key: row_key.clone(),
+            });
+            // ... and any unique-index slot the new row occupies (first-committer-wins point).
+            write_set.add_unique_slots(&table, values);
         }
-        let value_index_started = Instant::now();
-        for (key, mut row_keys) in
-            relational_value_index_entries_for_rows(&insert.table, &table.columns, &inserted_rows)
-        {
-            self.relational_value_index
-                .entry(key)
-                .or_default()
-                .append(&mut row_keys);
-        }
-        if let Some(profile) = profile.as_mut() {
-            profile.value_index_append_micros += value_index_started.elapsed().as_micros();
-        }
-        Ok(())
+
+        Ok(WriteDelta {
+            write_set,
+            rows_consumed,
+            mutation: PreparedMutation::Insert {
+                table: insert.table.clone(),
+                inserted_rows,
+                value_index_entries,
+                seq_advances: seq_state,
+            },
+        })
     }
 
-    fn apply_delete(&mut self, delete: Delete, txn_id: TxnId) -> Result<(), EngineError> {
+    /// PURE preflight + scan for `DELETE` (write-half MVCC, Stage 2). Resolves which existing
+    /// versions match (against `snapshot`), runs the inbound-FK preflight as the old
+    /// `apply_delete`, and records the tombstone write-set. No engine mutation.
+    fn prepare_delete(
+        &self,
+        delete: &Delete,
+        snapshot: DmlReadSnapshot,
+    ) -> Result<WriteDelta, EngineError> {
+        let txn_id = snapshot.commit_seq;
         let table = self
             .relational_catalog
             .get(&delete.table)
@@ -13381,13 +13573,15 @@ impl Engine {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", delete.table))
             })?
             .clone();
-        let filter_groups = bind_delete_filter_groups(&table, &delete)
+        let filter_groups = bind_delete_filter_groups(&table, delete)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
         let visibility = StorageVisibility {
             read_txn_id: txn_id,
         };
         let prefix = relational_key_prefix(&delete.table);
-        let mut tuple_ids = Vec::new();
+        // Resolve (tuple_id, key, row) for each matching version: tuple_id is what apply
+        // tombstones; key/row feed the write-set's row + unique-slot entries.
+        let mut deletes: Vec<(u64, String, Vec<SqlValue>)> = Vec::new();
         let mut cursor = self
             .mvcc_store
             .seq_scan_open(visibility)
@@ -13404,7 +13598,7 @@ impl Engine {
                     .iter()
                     .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
             }) {
-                tuple_ids.push(tuple.tuple_id);
+                deletes.push((tuple.tuple_id, tuple.key.clone(), row));
             }
         }
         drop(cursor);
@@ -13415,7 +13609,10 @@ impl Engine {
                 .iter()
                 .any(|foreign_key| foreign_key.referenced_table == table.name)
         }) {
-            let deleted_ids = tuple_ids.iter().copied().collect::<BTreeSet<_>>();
+            let deleted_ids = deletes
+                .iter()
+                .map(|(tuple_id, _, _)| *tuple_id)
+                .collect::<BTreeSet<_>>();
             let mut candidate_rows = Vec::new();
             let mut cursor = self
                 .mvcc_store
@@ -13433,15 +13630,36 @@ impl Engine {
             self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
         }
 
-        for tuple_id in tuple_ids {
-            self.mvcc_store
-                .tuple_delete(tuple_id, txn_id)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        let mut write_set = WriteSet::default();
+        let mut tuple_ids = Vec::with_capacity(deletes.len());
+        for (tuple_id, key, row) in &deletes {
+            tuple_ids.push(*tuple_id);
+            write_set.rows.push(RowWriteKey {
+                table: delete.table.clone(),
+                row_key: key.clone(),
+            });
+            // A delete releases the row's unique-index slots; record them as written so a
+            // concurrent insert reusing the value conflicts (Stage 4 first-committer-wins).
+            write_set.add_unique_slots(&table, row);
         }
-        Ok(())
+
+        Ok(WriteDelta {
+            write_set,
+            rows_consumed: 0,
+            mutation: PreparedMutation::Delete { tuple_ids },
+        })
     }
 
-    fn apply_update(&mut self, update: Update, txn_id: TxnId) -> Result<(), EngineError> {
+    /// PURE preflight + scan + encode for `UPDATE` (write-half MVCC, Stage 2). Resolves the
+    /// matching versions, applies the assignments to encode the new row images, runs the unique /
+    /// check / FK preflight as the old `apply_update`, and records the write-set (old slot
+    /// tombstoned + new version + unique slots). No engine mutation.
+    fn prepare_update(
+        &self,
+        update: &Update,
+        snapshot: DmlReadSnapshot,
+    ) -> Result<WriteDelta, EngineError> {
+        let txn_id = snapshot.commit_seq;
         let table = self
             .relational_catalog
             .get(&update.table)
@@ -13449,7 +13667,7 @@ impl Engine {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", update.table))
             })?
             .clone();
-        let assignments = bind_update_assignments(&table, &update)
+        let assignments = bind_update_assignments(&table, update)
             .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
         let filter_groups = bind_delete_filter_groups(
             &table,
@@ -13522,22 +13740,157 @@ impl Engine {
             self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
         }
 
-        let mut updated_rows = Vec::with_capacity(updates.len());
-        for (tuple_id, row_key, values) in updates {
-            self.mvcc_store
-                .tuple_update(tuple_id, encode_relational_row(&values), txn_id)
-                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            updated_rows.push((row_key, values));
+        let updated_rows: Vec<(String, Vec<SqlValue>)> = updates
+            .iter()
+            .map(|(_, key, row)| (key.clone(), row.clone()))
+            .collect();
+        let value_index_entries =
+            relational_value_index_entries_for_rows(&update.table, &table.columns, &updated_rows);
+
+        let mut write_set = WriteSet::default();
+        for (_, key, row) in &updates {
+            // An UPDATE tombstones the old version and installs a new one at the SAME row key,
+            // so the row slot is written once.
+            write_set.rows.push(RowWriteKey {
+                table: update.table.clone(),
+                row_key: key.clone(),
+            });
+            // The new image's unique-index slots are claimed by this txn.
+            write_set.add_unique_slots(&table, row);
         }
-        for (key, mut row_keys) in
-            relational_value_index_entries_for_rows(&update.table, &table.columns, &updated_rows)
-        {
-            self.relational_value_index
-                .entry(key)
-                .or_default()
-                .append(&mut row_keys);
+
+        // `updates` is already `(tuple_id, row_key, new_values)` — exactly the install shape.
+        Ok(WriteDelta {
+            write_set,
+            rows_consumed: 0,
+            mutation: PreparedMutation::Update {
+                table: update.table.clone(),
+                installs: updates,
+                value_index_entries,
+            },
+        })
+    }
+
+    /// Install a prepared [`WriteDelta`], stamping new versions with `commit_seq` (Stage 0
+    /// stamp/boundary unification: `commit_seq == entry.index`). This is the ONLY `&mut self`
+    /// half of the write apply. It mutates exactly the structures the write-set names — the
+    /// mvcc store (version inserts / tombstones), `relational_value_index`, and
+    /// `relational_next_row_id` — and nothing else. Still called under the existing commit lock
+    /// (no concurrency until Stage 4); the combination `prepare_* (off-lock) + apply_delta`
+    /// is byte-identical to the old direct apply.
+    fn apply_delta(
+        &mut self,
+        delta: WriteDelta,
+        commit_seq: TxnId,
+        mut profile: Option<&mut RelationalCopyAdmissionProfile>,
+    ) -> Result<(), EngineError> {
+        match delta.mutation {
+            PreparedMutation::Insert {
+                table: _table,
+                inserted_rows,
+                value_index_entries,
+                seq_advances,
+            } => {
+                // Install the sequence advancement `prepare_insert` computed for `nextval`
+                // column defaults (before the row inserts, matching the old apply where defaults
+                // were evaluated first). Idempotent assignment of the final `(last_value,
+                // is_called)` — same end-state as the old in-line `apply_sequence_nextval` calls.
+                for (sequence, (last_value, is_called)) in seq_advances {
+                    if let Some(seq) = self.relational_sequences.get_mut(&sequence) {
+                        seq.last_value = last_value;
+                        seq.is_called = is_called;
+                    }
+                }
+                let mvcc_insert_started = Instant::now();
+                for (row_key, values) in &inserted_rows {
+                    // Reserve the row-id this insert consumes (matches the old in-line bump);
+                    // `prepare_insert` already computed `row_key` from the same base.
+                    self.relational_next_row_id += 1;
+                    self.mvcc_store
+                        .tuple_insert_reserved_key(
+                            NewTuple {
+                                key: row_key.clone(),
+                                value: encode_relational_row(values),
+                            },
+                            commit_seq,
+                        )
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+                if let Some(profile) = profile.as_mut() {
+                    profile.mvcc_insert_micros += mvcc_insert_started.elapsed().as_micros();
+                }
+                let value_index_started = Instant::now();
+                for (key, mut row_keys) in value_index_entries {
+                    self.relational_value_index
+                        .entry(key)
+                        .or_default()
+                        .append(&mut row_keys);
+                }
+                if let Some(profile) = profile.as_mut() {
+                    profile.value_index_append_micros += value_index_started.elapsed().as_micros();
+                }
+                debug_assert_eq!(inserted_rows.len() as u64, delta.rows_consumed);
+            }
+            PreparedMutation::Update {
+                table: _table,
+                installs,
+                value_index_entries,
+            } => {
+                for (tuple_id, _row_key, values) in &installs {
+                    self.mvcc_store
+                        .tuple_update(*tuple_id, encode_relational_row(values), commit_seq)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+                for (key, mut row_keys) in value_index_entries {
+                    self.relational_value_index
+                        .entry(key)
+                        .or_default()
+                        .append(&mut row_keys);
+                }
+            }
+            PreparedMutation::Delete { tuple_ids } => {
+                for tuple_id in tuple_ids {
+                    self.mvcc_store
+                        .tuple_delete(tuple_id, commit_seq)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+            }
         }
         Ok(())
+    }
+
+    fn apply_insert_with_profile(
+        &mut self,
+        insert: Insert,
+        txn_id: TxnId,
+        mut profile: Option<&mut RelationalCopyAdmissionProfile>,
+    ) -> Result<(), EngineError> {
+        // Stage 2 split: PURE prepare (preflight + encode + write-set) then a `&mut self` install,
+        // both under the existing commit lock so the result is byte-identical to the old direct
+        // apply. `txn_id` is the commit-seq (== `entry.index`), used as BOTH the read boundary and
+        // the version stamp exactly as before. The snapshot is taken immediately before prepare, so
+        // `next_row_id` and the read visibility match what the in-line apply used.
+        let snapshot = self.dml_read_snapshot(txn_id);
+        let delta = self.prepare_insert(&insert, snapshot, profile.as_deref_mut())?;
+        self.apply_delta(delta, txn_id, profile)
+    }
+
+    fn apply_delete(&mut self, delete: Delete, txn_id: TxnId) -> Result<(), EngineError> {
+        // Stage 2 split: PURE prepare (resolve matches + FK preflight + write-set) then a
+        // `&mut self` tombstone install. `txn_id` is the commit-seq used as both the read boundary
+        // and the version stamp, identical to the old direct apply (still under the commit lock).
+        let snapshot = self.dml_read_snapshot(txn_id);
+        let delta = self.prepare_delete(&delete, snapshot)?;
+        self.apply_delta(delta, txn_id, None)
+    }
+
+    fn apply_update(&mut self, update: Update, txn_id: TxnId) -> Result<(), EngineError> {
+        // Stage 2 split: PURE prepare (resolve matches + encode new images + preflight +
+        // write-set) then a `&mut self` version-rewrite install. `txn_id` is the commit-seq used as
+        // both the read boundary and the version stamp, identical to the old direct apply.
+        let snapshot = self.dml_read_snapshot(txn_id);
+        let delta = self.prepare_update(&update, snapshot)?;
+        self.apply_delta(delta, txn_id, None)
     }
 
     fn preflight_unique_index_constraints(
@@ -52296,6 +52649,482 @@ mod tests {
                 .rows
                 .is_empty(),
             "row hidden at the live boundary after delete"
+        );
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Write-half MVCC — Stage 2: pure `prepare_*` + `apply_delta` split.
+    // ----------------------------------------------------------------------------------------
+
+    /// A snapshot of every piece of engine state a DML `apply_delta` may mutate, used to assert
+    /// `prepare_*` is pure (no engine mutation).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MutableEngineState {
+        versions: Vec<TupleVersion>,
+        value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
+        next_row_id: u64,
+        sequences: BTreeMap<String, (i64, bool)>,
+    }
+
+    fn capture_mutable_state(e: &Engine) -> MutableEngineState {
+        let mut versions = e.mvcc_store.all_versions();
+        versions.sort_by(|a, b| (a.tuple_id, &a.value).cmp(&(b.tuple_id, &b.value)));
+        MutableEngineState {
+            versions,
+            value_index: e.relational_value_index.clone(),
+            next_row_id: e.relational_next_row_id,
+            sequences: e
+                .relational_sequences
+                .iter()
+                .map(|(name, seq)| (name.clone(), (seq.last_value, seq.is_called)))
+                .collect(),
+        }
+    }
+
+    /// The commit-seq the NEXT commit would receive under serialization (== `entry.index`), which
+    /// is what a directly-driven `prepare_*`/`apply_delta` pair must use to be byte-identical.
+    fn next_commit_snapshot(e: &Engine) -> DmlReadSnapshot {
+        e.dml_read_snapshot(e.visible_up_to() + 1)
+    }
+
+    fn parse_insert(sql: &str) -> Insert {
+        match parse_command(sql).unwrap() {
+            Command::Insert(insert) => insert,
+            other => panic!("expected INSERT, got {other:?}"),
+        }
+    }
+
+    fn parse_update(sql: &str) -> Update {
+        match parse_command(sql).unwrap() {
+            Command::Update(update) => update,
+            other => panic!("expected UPDATE, got {other:?}"),
+        }
+    }
+
+    fn parse_delete(sql: &str) -> Delete {
+        match parse_command(sql).unwrap() {
+            Command::Delete(delete) => delete,
+            other => panic!("expected DELETE, got {other:?}"),
+        }
+    }
+
+    /// The set of relational row keys whose version chain `apply_delta` touched for `commit_seq`:
+    /// a NEW version created by `commit_seq` (insert / update-new) OR an EXISTING version
+    /// tombstoned by `commit_seq` (delete / update-old). Derived purely from the version chains so
+    /// it is independent of the write-set under test.
+    fn keys_touched_at(e: &Engine, commit_seq: TxnId) -> BTreeSet<String> {
+        e.mvcc_store
+            .all_versions()
+            .into_iter()
+            .filter(|v| v.created_by == commit_seq || v.deleted_by == Some(commit_seq))
+            .map(|v| v.key)
+            .collect()
+    }
+
+    #[test]
+    fn prepare_dml_does_not_mutate_engine_state() {
+        // Stage 2 invariant (a): `prepare_*` is PURE — calling it leaves every mutable engine
+        // structure (versions, value index, row-id counter, sequences) byte-for-byte unchanged.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO t (id, label) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        )
+        .unwrap();
+
+        let before = capture_mutable_state(&e);
+
+        // INSERT prepare — no mutation.
+        let snapshot = next_commit_snapshot(&e);
+        let insert_delta = e
+            .prepare_insert(
+                &parse_insert("INSERT INTO t (id, label) VALUES (4, 'd')"),
+                snapshot,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            capture_mutable_state(&e),
+            before,
+            "prepare_insert mutated engine state"
+        );
+
+        // UPDATE prepare — no mutation.
+        let update_delta = e
+            .prepare_update(
+                &parse_update("UPDATE t SET label = 'z' WHERE id = 2"),
+                next_commit_snapshot(&e),
+            )
+            .unwrap();
+        assert_eq!(
+            capture_mutable_state(&e),
+            before,
+            "prepare_update mutated engine state"
+        );
+
+        // DELETE prepare — no mutation.
+        let delete_delta = e
+            .prepare_delete(
+                &parse_delete("DELETE FROM t WHERE id = 3"),
+                next_commit_snapshot(&e),
+            )
+            .unwrap();
+        assert_eq!(
+            capture_mutable_state(&e),
+            before,
+            "prepare_delete mutated engine state"
+        );
+
+        // The prepared deltas are non-trivial (we actually exercised the work).
+        assert!(!insert_delta.write_set.rows.is_empty());
+        assert!(matches!(
+            insert_delta.mutation,
+            PreparedMutation::Insert { .. }
+        ));
+        assert!(!update_delta.write_set.rows.is_empty());
+        assert!(!delete_delta.write_set.rows.is_empty());
+    }
+
+    #[test]
+    fn prepare_insert_with_sequence_default_is_pure_and_advances_on_apply() {
+        // The trickiest purity case: a `nextval` (SERIAL) column default. `prepare_insert` must NOT
+        // advance the sequence (pure), but the prepared delta must, and `apply_delta` must install
+        // exactly the advancement the old in-line apply produced.
+        let seq_name = "s_id_seq"; // SERIAL auto-creates `<table>_<col>_seq`.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE s (id SERIAL, v TEXT)")
+            .unwrap();
+        let seq_before = e
+            .relational_sequences
+            .get(seq_name)
+            .map(|s| (s.last_value, s.is_called));
+        assert!(seq_before.is_some(), "implicit SERIAL sequence created");
+
+        let before = capture_mutable_state(&e);
+        let snapshot = next_commit_snapshot(&e);
+        // Two rows, both consuming the default -> two nextval advances captured in the delta.
+        let delta = e
+            .prepare_insert(
+                &parse_insert("INSERT INTO s (v) VALUES ('x'), ('y')"),
+                snapshot,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            capture_mutable_state(&e),
+            before,
+            "prepare_insert advanced the sequence (not pure)"
+        );
+        let PreparedMutation::Insert {
+            ref seq_advances,
+            ref inserted_rows,
+            ..
+        } = delta.mutation
+        else {
+            panic!("expected Insert mutation");
+        };
+        assert!(
+            seq_advances.contains_key(seq_name),
+            "sequence advancement recorded in the delta"
+        );
+        // The two rows got the two successive sequence values (1, then 2 on a fresh seq).
+        assert_eq!(inserted_rows[0].1[0], SqlValue::Int4(1));
+        assert_eq!(inserted_rows[1].1[0], SqlValue::Int4(2));
+
+        // Parity: a fresh engine running the SAME insert through the public path lands on the same
+        // sequence state.
+        let mut golden = Engine::new_local();
+        golden
+            .execute_text(1, "CREATE TABLE s (id SERIAL, v TEXT)")
+            .unwrap();
+        golden
+            .execute_text(2, "INSERT INTO s (v) VALUES ('x'), ('y')")
+            .unwrap();
+
+        // Apply the prepared delta on `e` and compare the sequence state.
+        let commit_seq = snapshot.commit_seq;
+        e.apply_delta(delta, commit_seq, None).unwrap();
+        let seq_e = e
+            .relational_sequences
+            .get(seq_name)
+            .map(|s| (s.last_value, s.is_called));
+        let seq_g = golden
+            .relational_sequences
+            .get(seq_name)
+            .map(|s| (s.last_value, s.is_called));
+        assert_eq!(
+            seq_e, seq_g,
+            "sequence advanced to the same state as the public path"
+        );
+    }
+
+    #[test]
+    fn prepare_insert_failing_preflight_advances_nothing() {
+        // Pins the one deliberate refinement vs. the old in-line apply: when `prepare_insert`
+        // fails its (unique) preflight, it advances NOTHING — not the sequence, not the row-id,
+        // not the store. (The old apply advanced the sequence before preflighting.) This is the
+        // Stage-4 abort-is-side-effect-free property; unobservable on live paths because
+        // `execute_text` preflights before committing.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE p (id SERIAL, code INT UNIQUE)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO p (code) VALUES (100)")
+            .unwrap();
+
+        let before = capture_mutable_state(&e);
+        // A second row with the SAME unique `code` -> unique preflight must reject it.
+        let err = e.prepare_insert(
+            &parse_insert("INSERT INTO p (code) VALUES (100)"),
+            next_commit_snapshot(&e),
+            None,
+        );
+        assert!(err.is_err(), "duplicate unique value must fail preflight");
+        assert_eq!(
+            capture_mutable_state(&e),
+            before,
+            "a failed prepare_insert advanced engine state (sequence/row-id/store)"
+        );
+    }
+
+    #[test]
+    fn write_set_is_exactly_the_keys_apply_touches_for_insert() {
+        // Stage 2 invariant (b), INSERT: the write-set's row keys equal exactly the row keys
+        // `apply_delta` installs — no missing, no spurious entries.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO t (id, label) VALUES (1, 'a')")
+            .unwrap();
+
+        let snapshot = next_commit_snapshot(&e);
+        let commit_seq = snapshot.commit_seq;
+        let delta = e
+            .prepare_insert(
+                &parse_insert("INSERT INTO t (id, label) VALUES (2, 'b'), (3, 'c')"),
+                snapshot,
+                None,
+            )
+            .unwrap();
+        let declared: BTreeSet<String> = delta
+            .write_set
+            .rows
+            .iter()
+            .map(|r| r.row_key.clone())
+            .collect();
+        assert_eq!(
+            declared.len(),
+            delta.write_set.rows.len(),
+            "no duplicate row keys"
+        );
+
+        e.apply_delta(delta, commit_seq, None).unwrap();
+        let touched = keys_touched_at(&e, commit_seq);
+        assert_eq!(declared, touched, "INSERT write-set != keys apply touched");
+    }
+
+    #[test]
+    fn write_set_is_exactly_the_keys_apply_touches_for_update() {
+        // Stage 2 invariant (b), UPDATE: the write-set's row keys equal exactly the row keys whose
+        // chain apply rewrote (old tombstoned + new created at the same key).
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO t (id, label) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        )
+        .unwrap();
+
+        let snapshot = next_commit_snapshot(&e);
+        let commit_seq = snapshot.commit_seq;
+        // Matches id >= 2 -> ids 2 and 3 rewritten; id=1 untouched.
+        let delta = e
+            .prepare_update(
+                &parse_update("UPDATE t SET label = 'z' WHERE id >= 2"),
+                snapshot,
+            )
+            .unwrap();
+        let declared: BTreeSet<String> = delta
+            .write_set
+            .rows
+            .iter()
+            .map(|r| r.row_key.clone())
+            .collect();
+        assert_eq!(
+            declared.len(),
+            2,
+            "exactly two rows in the update write-set"
+        );
+
+        e.apply_delta(delta, commit_seq, None).unwrap();
+        let touched = keys_touched_at(&e, commit_seq);
+        assert_eq!(declared, touched, "UPDATE write-set != keys apply touched");
+    }
+
+    #[test]
+    fn write_set_is_exactly_the_keys_apply_touches_for_delete() {
+        // Stage 2 invariant (b), DELETE: the write-set's row keys equal exactly the row keys whose
+        // version apply tombstoned.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO t (id, label) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        )
+        .unwrap();
+
+        let snapshot = next_commit_snapshot(&e);
+        let commit_seq = snapshot.commit_seq;
+        let delta = e
+            .prepare_delete(&parse_delete("DELETE FROM t WHERE id >= 2"), snapshot)
+            .unwrap();
+        let declared: BTreeSet<String> = delta
+            .write_set
+            .rows
+            .iter()
+            .map(|r| r.row_key.clone())
+            .collect();
+        assert_eq!(
+            declared.len(),
+            2,
+            "exactly two rows in the delete write-set"
+        );
+
+        e.apply_delta(delta, commit_seq, None).unwrap();
+        let touched = keys_touched_at(&e, commit_seq);
+        assert_eq!(declared, touched, "DELETE write-set != keys apply touched");
+    }
+
+    #[test]
+    fn write_set_records_unique_index_slots_for_unique_insert() {
+        // Stage 2 invariant (b), unique slots: a unique-column insert records exactly the
+        // `(table, column, value)` slots it claims — the Stage 4 first-committer-wins conflict
+        // points — and nothing for non-unique columns.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE u (id INT UNIQUE, label TEXT)")
+            .unwrap();
+
+        let snapshot = next_commit_snapshot(&e);
+        let delta = e
+            .prepare_insert(
+                &parse_insert("INSERT INTO u (id, label) VALUES (7, 'a'), (8, 'b')"),
+                snapshot,
+                None,
+            )
+            .unwrap();
+
+        let slots: BTreeSet<(String, String, String)> = delta
+            .write_set
+            .unique_slots
+            .iter()
+            .map(|s| (s.table.clone(), s.column.clone(), s.value.clone()))
+            .collect();
+        let expected: BTreeSet<(String, String, String)> = [
+            (
+                "u".to_string(),
+                "id".to_string(),
+                relational_index_value(&SqlValue::Int4(7)),
+            ),
+            (
+                "u".to_string(),
+                "id".to_string(),
+                relational_index_value(&SqlValue::Int4(8)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(slots, expected, "unique-slot write-set incorrect");
+        // The non-unique `label` column contributes NO unique slots.
+        assert!(
+            delta
+                .write_set
+                .unique_slots
+                .iter()
+                .all(|s| s.column == "id"),
+            "spurious unique slot for a non-unique column"
+        );
+    }
+
+    #[test]
+    fn prepare_apply_round_trips_to_same_state_as_public_path() {
+        // Stage 2 invariant (c): a directly-driven `prepare_* -> apply_delta` sequence reaches the
+        // SAME engine state (versions, value index, row-id counter, sequences) as running the same
+        // SQL through the public commit path — i.e. the split is behavior-preserving.
+        //
+        // `manual` drives prepare/apply by hand at the commit-seq each commit would receive;
+        // `golden` runs the identical statements through `execute_text`.
+        let mut manual = Engine::new_local();
+        let mut golden = Engine::new_local();
+        for e in [&mut manual, &mut golden] {
+            e.execute_text(1, "CREATE TABLE t (id INT, label TEXT)")
+                .unwrap();
+            e.execute_text(
+                2,
+                "INSERT INTO t (id, label) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        }
+
+        // Drive a mixed workload by hand on `manual`.
+        let insert_snapshot = next_commit_snapshot(&manual);
+        let insert_seq = insert_snapshot.commit_seq;
+        let insert_delta = manual
+            .prepare_insert(
+                &parse_insert("INSERT INTO t (id, label) VALUES (4, 'd')"),
+                insert_snapshot,
+                None,
+            )
+            .unwrap();
+        manual.apply_delta(insert_delta, insert_seq, None).unwrap();
+        manual.visible_up_to = manual.visible_up_to.max(insert_seq);
+
+        let update_snapshot = next_commit_snapshot(&manual);
+        let update_seq = update_snapshot.commit_seq;
+        let update_delta = manual
+            .prepare_update(
+                &parse_update("UPDATE t SET label = 'Z' WHERE id = 2"),
+                update_snapshot,
+            )
+            .unwrap();
+        manual.apply_delta(update_delta, update_seq, None).unwrap();
+        manual.visible_up_to = manual.visible_up_to.max(update_seq);
+
+        let delete_snapshot = next_commit_snapshot(&manual);
+        let delete_seq = delete_snapshot.commit_seq;
+        let delete_delta = manual
+            .prepare_delete(&parse_delete("DELETE FROM t WHERE id = 1"), delete_snapshot)
+            .unwrap();
+        manual.apply_delta(delete_delta, delete_seq, None).unwrap();
+        manual.visible_up_to = manual.visible_up_to.max(delete_seq);
+
+        // The same statements through the public path on `golden`.
+        golden
+            .execute_text(3, "INSERT INTO t (id, label) VALUES (4, 'd')")
+            .unwrap();
+        golden
+            .execute_text(4, "UPDATE t SET label = 'Z' WHERE id = 2")
+            .unwrap();
+        golden
+            .execute_text(5, "DELETE FROM t WHERE id = 1")
+            .unwrap();
+
+        assert_eq!(
+            capture_mutable_state(&manual),
+            capture_mutable_state(&golden),
+            "manual prepare/apply diverged from the public commit path"
+        );
+
+        // And the visible rows agree at each engine's live boundary.
+        let Command::Select(select) = parse_command("SELECT id, label FROM t").unwrap() else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(
+            manual.execute_relational_select(&select).unwrap().rows,
+            golden.execute_relational_select(&select).unwrap().rows,
+            "visible rows diverged"
         );
     }
 }
