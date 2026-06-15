@@ -1,6 +1,8 @@
 # 16. The write-half — concurrent writes via publish-on-commit + MVCC (Thread 4) — design
 
-**Status:** design, pending review of the scope decisions in §7. **Branch:** `phase0-m1-engine-facade`.
+**Status:** scope CONFIRMED 2026-06-15 — **SI for autocommit** (RR/RC/SSI deferred to Stage 5+) and
+**DDL via a catalog latch** (no online DDL this milestone); see §7. Stage 0 in progress.
+**Branch:** `phase0-m1-engine-facade`.
 The largest remaining concurrency piece: reads / ingress / batched-reads all scale; **writes still
 serialize** on the engine write lock.
 
@@ -86,7 +88,12 @@ boundary*: load `committed_seq` once at statement start and thread that `commit_
 4. Atomicity of the multi-structure publish (short lock + `committed_seq` published last).
 5. WAL/visibility crash window (publish strictly after fsync; kill-mid-commit test).
 6. MVCC GC vs active snapshots (`prune_versions_deleted_at_or_before` must not prune below the oldest
-   active **snapshot_seq**; epoch reclamation of generations like residency).
+   active **snapshot_seq**; epoch reclamation of generations like residency). **⚠ Stage 0 introduced a
+   concrete instance (HARD prerequisite for GC wiring):** `checkpoint_vacuum_mvcc_versions` now prunes a
+   commit-`Index` `deleted_by` while its `oldest_active_txn_id`/`last_durable_txn_id` guards reason in
+   façade-txn_id space — mismatched id-spaces ⇒ over-prune (data-corrupting) once `txn_id ≠ Index`. No
+   non-test caller today, so not a live failure, but it MUST be converted to `commit_seq` /
+   oldest-active-`Index` space (+ a BEGIN-gap regression test) **before any GC caller is added**.
 
 ## Staged plan (each: implement → adversarial audit → benchmark/correctness gate → commit)
 

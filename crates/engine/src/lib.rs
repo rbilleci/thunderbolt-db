@@ -6018,7 +6018,6 @@ pub struct Engine {
     relational_next_oid: u32,
     relational_next_column_id: u32,
     relational_next_row_id: u64,
-    txn_ids_by_index: BTreeMap<Index, TxnId>,
     wal_commit_timestamps_micros: BTreeMap<TxnId, u64>,
     txn_manager: TxnManager,
     visible_up_to: Index,
@@ -8960,7 +8959,6 @@ impl Engine {
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
             relational_next_row_id: 1,
-            txn_ids_by_index: BTreeMap::new(),
             wal_commit_timestamps_micros: BTreeMap::new(),
             txn_manager: TxnManager::default(),
             visible_up_to: 0,
@@ -9110,7 +9108,9 @@ impl Engine {
         }
 
         self.repl.wait_committed(token, Duration::from_millis(0))?;
-        self.txn_ids_by_index.insert(token.index, txn_id);
+        // `txn_id` (the façade `next_txn_id`) is the durable transaction *identity* — recorded in the
+        // WAL record and keyed here for PITR-by-txn/commit-timestamp lookups. It is intentionally
+        // DECOUPLED from the MVCC version stamp, which uses the commit `Index` (see `apply_mvcc_entry`).
         self.wal_commit_timestamps_micros
             .insert(txn_id, timestamp_micros);
 
@@ -9141,7 +9141,11 @@ impl Engine {
         mut apply_current: F,
     ) -> Result<(CommitToken, u128), EngineError>
     where
-        F: FnMut(&mut Self) -> Result<(), EngineError>,
+        // `apply_current` receives the commit sequence (the replicator-assigned commit `Index`) so
+        // the directly-applied current entry stamps versions with the SAME commit-seq that
+        // `apply_mvcc_entry` derives from `entry.index` on replay — keeping the live COPY hot path
+        // byte-identical to a WAL replay of the same record (Stage 0 stamp/boundary unification).
+        F: FnMut(&mut Self, Index) -> Result<(), EngineError>,
     {
         if self.repl.role() != Role::Leader {
             return Err(EngineError::NotLeader);
@@ -9167,7 +9171,9 @@ impl Engine {
         }
 
         self.repl.wait_committed(token, Duration::from_millis(0))?;
-        self.txn_ids_by_index.insert(token.index, txn_id);
+        // `txn_id` (the façade `next_txn_id`) is the durable transaction *identity* — recorded in the
+        // WAL record and keyed here for PITR-by-txn/commit-timestamp lookups. It is intentionally
+        // DECOUPLED from the MVCC version stamp, which uses the commit `Index` (see `apply_mvcc_entry`).
         self.wal_commit_timestamps_micros
             .insert(txn_id, timestamp_micros);
 
@@ -9181,8 +9187,9 @@ impl Engine {
             if e.index == token.index {
                 // The caller applies the current entry directly through Engine state. Avoid
                 // cloning and reparsing the large SQL payload through the generic KV state
-                // machine on the COPY hot path while preserving WAL/replay records.
-                apply_current(self)?;
+                // machine on the COPY hot path while preserving WAL/replay records. Pass the
+                // commit sequence (`e.index`) so the stamp matches `apply_mvcc_entry`'s replay stamp.
+                apply_current(self, e.index)?;
             } else {
                 self.sm.apply(e)?;
                 self.apply_mvcc_entry(e)?;
@@ -9349,13 +9356,16 @@ impl Engine {
             return Ok(());
         };
 
-        let txn_id = self
-            .txn_ids_by_index
-            .get(&entry.index)
-            .copied()
-            .unwrap_or(entry.index);
+        // Stage 0 (write-half MVCC): the version stamp is the commit sequence, which is the
+        // replicator-assigned commit `Index` (== WAL append order == read boundary `visible_up_to`).
+        // Deliberately NOT the façade `next_txn_id`: under the future off-lock prepare, txn_id
+        // allocation order diverges from commit order, but `entry.index` is always in commit order.
+        // Because recovery re-proposes WAL records in log order, each entry gets the identical
+        // monotonic `entry.index` on replay, so this re-derives byte-identical `created_by`/
+        // `deleted_by` stamps from log position alone — independent of the recorded façade txn_id.
+        let commit_seq: TxnId = entry.index;
         let visibility = StorageVisibility {
-            read_txn_id: txn_id,
+            read_txn_id: commit_seq,
         };
 
         match cmd {
@@ -9366,11 +9376,11 @@ impl Engine {
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
                 {
                     self.mvcc_store
-                        .tuple_update(tuple.tuple_id, value, txn_id)
+                        .tuple_update(tuple.tuple_id, value, commit_seq)
                         .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 } else {
                     self.mvcc_store
-                        .tuple_insert(NewTuple { key, value }, txn_id)
+                        .tuple_insert(NewTuple { key, value }, commit_seq)
                         .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 }
             }
@@ -9381,7 +9391,7 @@ impl Engine {
                     .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
                 {
                     self.mvcc_store
-                        .tuple_delete(tuple.tuple_id, txn_id)
+                        .tuple_delete(tuple.tuple_id, commit_seq)
                         .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 }
             }
@@ -9397,12 +9407,12 @@ impl Engine {
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
             Command::AddCheckConstraint(add) => self.apply_add_check_constraint(add)?,
-            Command::AddForeignKey(add) => self.apply_add_foreign_key(add, txn_id)?,
-            Command::AddColumn(add) => self.apply_add_column(add, txn_id)?,
-            Command::RenameTable(rename) => self.apply_rename_table(rename, txn_id)?,
+            Command::AddForeignKey(add) => self.apply_add_foreign_key(add, commit_seq)?,
+            Command::AddColumn(add) => self.apply_add_column(add, commit_seq)?,
+            Command::RenameTable(rename) => self.apply_rename_table(rename, commit_seq)?,
             Command::RenameColumn(rename) => self.apply_rename_column(rename)?,
             Command::RenameConstraint(rename) => self.apply_rename_constraint(rename)?,
-            Command::DropColumn(drop) => self.apply_drop_column(drop, txn_id)?,
+            Command::DropColumn(drop) => self.apply_drop_column(drop, commit_seq)?,
             Command::DropConstraint(drop) => self.apply_drop_constraint(drop)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::RenameIndex(rename) => self.apply_rename_index(rename)?,
@@ -9430,8 +9440,8 @@ impl Engine {
                 self.apply_sequence_setval(setval)?;
             }
             Command::RenameSequence(rename) => self.apply_rename_sequence(rename)?,
-            Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
-            Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, txn_id)?,
+            Command::DropTable(drop) => self.apply_drop_table(drop, commit_seq)?,
+            Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, commit_seq)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
             Command::DropView(drop) => self.apply_drop_view(drop)?,
             Command::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop)?,
@@ -9496,9 +9506,9 @@ impl Engine {
             }
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
-            Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
-            Command::Delete(delete) => self.apply_delete(delete, txn_id)?,
-            Command::Update(update) => self.apply_update(update, txn_id)?,
+            Command::Insert(insert) => self.apply_insert(insert, commit_seq)?,
+            Command::Delete(delete) => self.apply_delete(delete, commit_seq)?,
+            Command::Update(update) => self.apply_update(update, commit_seq)?,
             _ => {}
         }
 
@@ -21618,11 +21628,13 @@ impl Engine {
                 txn_id,
                 sql.into_bytes(),
                 timestamp_micros,
-                |engine| {
+                |engine, commit_seq| {
                     let apply_started = Instant::now();
+                    // Stamp with the commit sequence (commit `Index`), NOT the façade txn_id, so the
+                    // live COPY apply produces the same `created_by` a WAL replay would (Stage 0).
                     let result = engine.apply_insert_with_profile(
                         insert.clone(),
-                        txn_id,
+                        commit_seq,
                         Some(&mut apply_profile),
                     );
                     current_apply_total_micros += apply_started.elapsed().as_micros();
@@ -51887,6 +51899,186 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)]]
+        );
+    }
+
+    // ---- Stage 0 (write-half MVCC): commit-seq oracle / stamp == read-boundary unification ----
+
+    /// Replay-determinism: a WAL replay must reproduce **byte-identical** MVCC version stamps
+    /// (`created_by`/`deleted_by`) and identical query results versus the live-applied state.
+    ///
+    /// The façade `txn_id`s used below are deliberately sparse and out of step with commit order
+    /// (100, 250, 9_999, 3, 77_000, ...) to prove the version stamp is derived from the commit
+    /// `Index` (log order), NOT from the recorded façade transaction id. If the stamp still tracked
+    /// the façade txn_id, the live `created_by`/`deleted_by` values would be these arbitrary numbers
+    /// while a replay (which re-proposes in log order) would assign 1,2,3,... — and the byte-for-byte
+    /// version comparison below would fail.
+    #[test]
+    fn stage0_wal_replay_reproduces_byte_identical_version_stamps() {
+        let mut live = Engine::new_local();
+        // Mix of DDL + DML, including UPDATE and DELETE so both `created_by` and `deleted_by`
+        // are exercised. Sparse, non-monotonic-relative-to-commit txn_ids on purpose.
+        live.execute_text(100, "CREATE TABLE acct (id INT, bal INT)")
+            .unwrap();
+        live.execute_text(250, "INSERT INTO acct (id, bal) VALUES (1, 10), (2, 20)")
+            .unwrap();
+        live.execute_text(9_999, "INSERT INTO acct (id, bal) VALUES (3, 30)")
+            .unwrap();
+        live.execute_text(3, "UPDATE acct SET bal = 25 WHERE id = 2")
+            .unwrap();
+        live.execute_text(77_000, "DELETE FROM acct WHERE id = 1")
+            .unwrap();
+        live.execute_text(42, "INSERT INTO acct (id, bal) VALUES (4, 40)")
+            .unwrap();
+
+        // Capture the full version set (ALL versions, visible or not) including stamps.
+        let live_versions = live.mvcc_store.all_versions();
+        let live_visible_up_to = live.visible_up_to();
+
+        // The live stamps must be the commit `Index` sequence (1..=6 for our six commits), NOT the
+        // sparse façade txn_ids — proving the decoupling at the source.
+        let mut live_created: Vec<TxnId> = live_versions.iter().map(|v| v.created_by).collect();
+        live_created.sort_unstable();
+        live_created.dedup();
+        assert!(
+            live_created.iter().all(|&c| (1..=6).contains(&c)),
+            "created_by stamps must be commit-Index values (1..=6), got {live_created:?}"
+        );
+        assert!(
+            !live_created.contains(&100) && !live_created.contains(&250),
+            "stamps must NOT be the façade txn_ids; got {live_created:?}"
+        );
+        // The DELETE of id=1 (the 5th commit) must stamp deleted_by = 5.
+        let deleted_id1 = live_versions
+            .iter()
+            .find(|v| v.deleted_by.is_some())
+            .expect("the deleted row's version must carry a deleted_by stamp");
+        assert_eq!(
+            deleted_id1.deleted_by,
+            Some(5),
+            "deleted_by must be the commit Index of the DELETE statement"
+        );
+
+        // Replay from the durable WAL into a fresh engine.
+        let recovered = Engine::recover_from_durable_wal(live.durable_wal_records()).unwrap();
+        let recovered_versions = recovered.mvcc_store.all_versions();
+
+        // The crux: byte-identical version chains, stamps and all.
+        assert_eq!(
+            recovered_versions, live_versions,
+            "WAL replay must reproduce byte-identical MVCC version stamps"
+        );
+        assert_eq!(
+            recovered.visible_up_to(),
+            live_visible_up_to,
+            "replay must reproduce the same read boundary"
+        );
+
+        // And identical query results.
+        let Command::Select(select) =
+            parse_command("SELECT id, bal FROM acct ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let live_rows = live.execute_relational_select(&select).unwrap().rows;
+        let recovered_rows = recovered.execute_relational_select(&select).unwrap().rows;
+        assert_eq!(recovered_rows, live_rows);
+        assert_eq!(
+            live_rows,
+            vec![
+                vec![SqlValue::Int4(2), SqlValue::Int4(25)],
+                vec![SqlValue::Int4(3), SqlValue::Int4(30)],
+                vec![SqlValue::Int4(4), SqlValue::Int4(40)],
+            ],
+            "id=1 deleted; id=2 updated; id=3,4 present"
+        );
+    }
+
+    /// The read boundary and the version stamp are the SAME monotonic commit sequence: a row
+    /// committed at commit-seq `N` is visible iff the read snapshot's boundary `>= N`, and a delete
+    /// at commit-seq `M` hides it iff the boundary `>= M`. We assert directly against the storage
+    /// visibility predicate using explicit boundaries (`read_txn_id`), which is exactly the unit
+    /// reads thread through `visible_up_to`.
+    #[test]
+    fn stage0_read_boundary_equals_stamp_sequence() {
+        let mut e = Engine::new_local();
+        // commit 1: CREATE TABLE (no row versions)
+        e.execute_text(500, "CREATE TABLE t (id INT)").unwrap();
+        // commit 2: INSERT id=1  -> row version stamped created_by = 2
+        e.execute_text(501, "INSERT INTO t (id) VALUES (1)")
+            .unwrap();
+
+        let row = e
+            .mvcc_store
+            .all_versions()
+            .into_iter()
+            .find(|v| v.deleted_by.is_none())
+            .expect("inserted row version");
+        let n = row.created_by; // the commit-seq at which the row was created
+        assert_eq!(n, 2, "row created at commit Index 2");
+
+        // Helper: how many row versions of table `t` are visible at a given boundary.
+        let table_prefix = relational_key_prefix("t");
+        let visible_at = |engine: &Engine, boundary: TxnId| -> usize {
+            let mut cursor = engine
+                .mvcc_store
+                .seq_scan_open(StorageVisibility {
+                    read_txn_id: boundary,
+                })
+                .unwrap();
+            let mut count = 0;
+            while let Some(tuple) = cursor.next() {
+                if tuple.key.starts_with(&table_prefix) {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        // Visible iff boundary >= N. (read_txn_id == 0 is the "invalid"/empty snapshot.)
+        assert_eq!(visible_at(&e, n - 1), 0, "not visible below the create seq");
+        assert_eq!(visible_at(&e, n), 1, "visible exactly at the create seq");
+        assert_eq!(visible_at(&e, n + 100), 1, "visible above the create seq");
+
+        // commit 3: DELETE id=1 -> the version's deleted_by stamped = 3
+        e.execute_text(502, "DELETE FROM t WHERE id = 1").unwrap();
+        let deleted = e
+            .mvcc_store
+            .all_versions()
+            .into_iter()
+            .find(|v| v.created_by == n)
+            .expect("the original row version still present in the chain");
+        let m = deleted
+            .deleted_by
+            .expect("row now carries a deleted_by stamp");
+        assert_eq!(m, 3, "delete committed at commit Index 3");
+        assert!(m > n, "delete seq strictly after create seq");
+
+        // Between create and delete (n <= boundary < m): still visible.
+        assert_eq!(visible_at(&e, n), 1, "visible at create seq, before delete");
+        assert_eq!(
+            visible_at(&e, m - 1),
+            1,
+            "still visible just below the delete seq"
+        );
+        // At/after the delete seq: hidden.
+        assert_eq!(visible_at(&e, m), 0, "hidden exactly at the delete seq");
+        assert_eq!(visible_at(&e, m + 100), 0, "hidden above the delete seq");
+
+        // And the engine's own live boundary (visible_up_to) agrees: after the delete the row is gone.
+        assert!(
+            e.visible_up_to() >= m,
+            "live read boundary advanced past the delete seq"
+        );
+        let Command::Select(select) = parse_command("SELECT id FROM t").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        assert!(
+            e.execute_relational_select(&select)
+                .unwrap()
+                .rows
+                .is_empty(),
+            "row hidden at the live boundary after delete"
         );
     }
 }
