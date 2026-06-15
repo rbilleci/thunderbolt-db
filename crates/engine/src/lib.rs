@@ -29972,6 +29972,158 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn p8_partitioned_resident_multi_column_lookup_orders_more_than_one_warp_of_matches_per_partition(
+    ) {
+        // Coverage-gap closer (engine side) for the resident row-index host-sort fix. The
+        // partitioned multi-column route iterates partitions in order and, within each partition,
+        // materializes one output row per entry of `match_i32_equal_row_indices_from_payload(..)` in
+        // that vector's order via a strictly positional gather. The CPU/non-resident reference emits
+        // a partition's matching rows in ASCENDING row order. The resident kernel, however, appends
+        // matches in `atom.global.add` SCHEDULE order, which is ascending only while all matches in
+        // a partition fit in ONE warp (<= 32). Every existing partitioned parity test stays under
+        // that boundary (<= 2 matches per partition), so this is the first test that puts MORE THAN
+        // ONE WARP of matches in a SINGLE partition.
+        //
+        // Why this is non-vacuous (would fail/flake WITHOUT the host sort in
+        // `launch_cuda_resident_i32_equal_row_indices`): with > 32 interleaved matches in a
+        // partition, the kernel's cross-warp append order is non-deterministic and is essentially
+        // never ascending, so the positional gather would emit that partition's rows in a
+        // non-deterministic, non-ascending order — diverging from the ascending reference asserted
+        // below and breaking the partitioned ascending-merge. It passes only because the route now
+        // sorts the [0, count) indices host-side. The loop re-runs the query so a sort-less route
+        // surfaces a wrong ordering on at least one iteration.
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
+        )
+        .unwrap();
+
+        const NEEDLE: i32 = 42;
+        // Two partitions. Partition 0 carries a MULTI-WARP block of matches: 200 rows where the
+        // even rows match the needle (100 matches >> 32, interleaved across many warps and several
+        // 128-thread blocks); the projected columns are distinct per row so the asserted order is
+        // load-bearing. Partition 1 is a small non-matching tail (exercises the cross-partition
+        // merge after the multi-warp partition).
+        let p0_rows: usize = 200;
+        let p0_ol_o_id: Vec<i32> = (0..p0_rows as i32)
+            .map(|row| if row % 2 == 0 { NEEDLE } else { row + 1000 })
+            .collect();
+        // Make the other three columns unique, monotonic functions of the row so a mis-ordered
+        // gather is caught by the exact row comparison (not just by the key column).
+        let p0_ol_i_id: Vec<i32> = (0..p0_rows as i32).map(|row| 10_000 + row).collect();
+        let p0_ol_quantity: Vec<i32> = (0..p0_rows as i32).map(|row| 20_000 + row).collect();
+        let p0_ol_amount: Vec<i32> = (0..p0_rows as i32).map(|row| 30_000 + row).collect();
+
+        let p1_ol_o_id = vec![1, 2, 3, 4];
+        let p1_ol_i_id = vec![401, 402, 403, 404];
+        let p1_ol_quantity = vec![17, 18, 19, 20];
+        let p1_ol_amount = vec![801, 802, 803, 804];
+
+        let partition_columns: Vec<[Vec<i32>; 4]> = vec![
+            [p0_ol_o_id, p0_ol_i_id, p0_ol_quantity, p0_ol_amount],
+            [p1_ol_o_id, p1_ol_i_id, p1_ol_quantity, p1_ol_amount],
+        ];
+
+        // CPU reference: rows from each partition in ASCENDING row order, partitions in order.
+        let mut expected_rows: Vec<Vec<SqlValue>> = Vec::new();
+        for columns in &partition_columns {
+            for (row, key) in columns[0].iter().enumerate() {
+                if *key == NEEDLE {
+                    expected_rows.push(vec![
+                        SqlValue::Int4(*key),
+                        SqlValue::Int4(columns[1][row]),
+                        SqlValue::Int4(columns[2][row]),
+                        SqlValue::Int4(columns[3][row]),
+                    ]);
+                }
+            }
+        }
+        assert!(
+            expected_rows.len() > 32,
+            "test must match more than one warp of rows in a single partition"
+        );
+
+        let mut row_cursor = 1usize;
+        let partitions = partition_columns
+            .iter()
+            .enumerate()
+            .map(|(partition_id, columns)| {
+                let row_count = columns[0].len();
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
+                for column in columns {
+                    for value in column {
+                        bytes.extend_from_slice(&(*value).to_le_bytes());
+                    }
+                }
+                let row_start = row_cursor;
+                row_cursor += row_count;
+                BenchmarkRelationalResidencyOwnedPartition {
+                    partition_id: partition_id as u32,
+                    row_start,
+                    row_count,
+                    resident_bytes: bytes.len() as u64,
+                    allocated_bytes: bytes.len() as u64,
+                    resident_device_int4_columns: vec![
+                        "ol_o_id".to_string(),
+                        "ol_i_id".to_string(),
+                        "ol_quantity".to_string(),
+                        "ol_amount".to_string(),
+                    ],
+                    resident_device_text_columns: Vec::new(),
+                    chunks: vec![CudaOwnedDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes,
+                    }],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let installed = e.install_benchmark_relational_residency_owned_partitions(
+            BenchmarkRelationalResidencyOwnedPartitionInstall {
+                table: "order_line",
+                gpu_id: 0,
+                partitions,
+            },
+        );
+        if let Err(err) = installed {
+            assert!(
+                err.to_string().contains("CUDA"),
+                "unexpected partition install error: {err}"
+            );
+            return;
+        }
+
+        let Command::Select(select) = parse_command(
+            "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = 42",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let route = e.plan_relational_resident_route(&select);
+        assert!(route.accepted, "{route:?}");
+        assert_eq!(
+            route.query_shape,
+            "partitioned_int4_equality_multi_column_projection"
+        );
+        assert_eq!(route.partition_count, 2);
+
+        // Re-run so a non-deterministic (sort-less) cross-warp order is caught on some iteration.
+        for iter in 0..25 {
+            let result = e.execute_relational_select(&select).unwrap();
+            assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(result.fallback_reason, None);
+            assert_eq!(
+                result.rows, expected_rows,
+                "partitioned multi-warp resident rows were not in ascending reference order on \
+                 iteration {iter} — the resident route's host sort over [0, count) is missing?"
+            );
+        }
+    }
+
+    #[test]
     fn p8_partitioned_resident_sum_reduces_matches_and_rejects_missing_layout() {
         let mut e = Engine::new_local();
         e.execute_text(

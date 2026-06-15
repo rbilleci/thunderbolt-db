@@ -5422,6 +5422,14 @@ DONE:
             .map_err(drain_err)?;
         copy_pinned_into(&indices_pinned, &mut indices);
         drop(lease);
+        // Correctness (deterministic ascending order): the kernel appends matching row indices in
+        // `atom.global.add` SCHEDULE order, which is ascending only when all matches land in a
+        // single warp (<=32). For >32 matches the append order is non-deterministic across warps,
+        // so a positional gather would emit rows in a non-deterministic order that diverges from
+        // the CPU/non-resident reference (ascending) and breaks the partitioned ascending-merge.
+        // Sort host-side over [0, count) so the route always returns ascending indices identical to
+        // the reference. Cost is O(k log k) host-side, dominated by the per-row D2H gather above.
+        indices.sort_unstable();
         Ok(indices)
     } else {
         // ---- legacy blocking fallback (old driver: no async/pinned symbols) ----
@@ -5469,6 +5477,10 @@ DONE:
                 )
             })?;
         }
+        // Same deterministic-ascending ordering guarantee as the async path above (the kernel's
+        // atom-schedule append order is non-deterministic for >32 matches); sort host-side so this
+        // fallback returns indices identical to the CPU/non-resident reference.
+        indices.sort_unstable();
         Ok(indices)
     }
 }
@@ -10974,6 +10986,86 @@ mod tests {
             .match_i32_equal_row_indices_from_payload(&[(a_offset, 5), (b_offset, 20)], row_count)
             .expect("final match_i32_equal_row_indices");
         assert_eq!(final_rows, vec![1, 3]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_i32_equal_row_indices_multi_warp_returns_ascending_indices() {
+        // Coverage gap closer for the host-sort fix. The kernel appends matching row indices via
+        // `atom.global.add`, so the physical order in the output buffer is the atomic SCHEDULE
+        // order — ascending-by-row ONLY while every matching row lives in a single warp (<= 32
+        // matches; with threads_per_block=128 that is one warp). The moment a SECOND warp races the
+        // counter, the append order across warps is non-deterministic and is NOT ascending row
+        // order. This route's gather is strictly positional, so without a host-side sort the
+        // returned Vec<u64> would (a) come back in a non-deterministic, non-ascending order and (b)
+        // diverge from the CPU/non-resident reference (always ascending) and break the engine's
+        // partitioned ascending-merge.
+        //
+        // This test deliberately uses a MULTI-WARP payload: ~150 matching rows (>> 32, spanning at
+        // least 5 warps within a 128-thread block and several blocks overall) that are INTERLEAVED
+        // with non-matching rows across the whole row range, so the matches are spread over many
+        // warps that race the atomic in parallel. We then assert the EXACT ascending index vector.
+        //
+        // Why this is non-vacuous (would fail/flake WITHOUT the sort): with >32 interleaved matches
+        // the raw atomic-append order is non-deterministic across warps and is essentially never the
+        // ascending order we assert here; the equality below would fail (often flakily). It passes
+        // only because the fix sorts the [0, count) prefix host-side before returning. (Empirically
+        // the single-warp twin above is stable at <= 32; this payload is far past that boundary.)
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // One i32 column. Even rows hold the needle (7), odd rows hold a non-match (-1), so the
+        // matching rows are EXACTLY the even indices [0, 2, 4, ...] — interleaved, not contiguous,
+        // and spread across the whole range so many warps contribute matches. 300 rows => 150
+        // matches (well past the 32-per-warp single-warp boundary, across multiple blocks).
+        const ROW_COUNT: u64 = 300;
+        const NEEDLE: i32 = 7;
+        let col_offset = std::mem::size_of::<u64>() as u64;
+        let column: Vec<i32> = (0..ROW_COUNT)
+            .map(|row| if row % 2 == 0 { NEEDLE } else { -1 })
+            .collect();
+        let expected: Vec<u64> = (0..ROW_COUNT).filter(|row| row % 2 == 0).collect();
+        assert!(
+            expected.len() > 32,
+            "test must use a multi-warp match count to exercise the cross-warp append order"
+        );
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&ROW_COUNT.to_le_bytes());
+        let mut column_bytes = Vec::new();
+        for value in &column {
+            column_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let allocated_len = col_offset + column_bytes.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: col_offset,
+                        bytes: &column_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // Run it repeatedly: a sort-less route would surface a non-ascending permutation on at least
+        // one of these iterations (the cross-warp schedule varies run to run); the sorted route is
+        // exactly ascending every time.
+        for iter in 0..50 {
+            let got = resident
+                .match_i32_equal_row_indices_from_payload(&[(col_offset, NEEDLE)], ROW_COUNT)
+                .expect("multi-warp match_i32_equal_row_indices");
+            assert_eq!(
+                got, expected,
+                "multi-warp row_indices were not ascending on iteration {iter} \
+                 — the host sort over [0, count) is missing or ineffective?"
+            );
+        }
     }
 
     #[test]
