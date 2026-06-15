@@ -6974,6 +6974,8 @@ fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
     comparison: CudaI32Comparison,
 ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuLaunchKernel = unsafe extern "C" fn(
         *mut c_void,
         u32,
@@ -6988,19 +6990,47 @@ fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
         *mut *mut c_void,
     ) -> i32;
 
+    // P2-M2 (compare-route parallel-kernel lever): the legacy kernel was a single-thread
+    // `<<<1,1,1>>>` ascending scan that ordered-appended every matching i32 VALUE, so its output
+    // is the matches in ASCENDING ROW ORDER. That serialized the whole 50k-row scan into one thread
+    // (~277 µs kernel; the route plateaued serial-kernel-bound). This route now runs an ORDERED
+    // PARALLEL COMPACTION over a CONTIGUOUS block partition — byte-identical ascending output, no
+    // atomic-append (which would yield non-deterministic atomic-SCHEDULE order, the hazard fixed in
+    // `row_indices`). The partition is the ordering backbone: block `b` owns the contiguous row
+    // range `[b*chunk, min(b*chunk+chunk, rows))`, so "block order" == "row order".
+    //
+    //   Pass A (`..._count_blocks`, parallel: G blocks x BLOCK threads): each block grid-strides
+    //   its own range and `red.global.add`s its local match count into `block_counts[b]`. This is
+    //   the parallel scan of all rows (analogous to `equal_count`'s parallel reduction).
+    //
+    //   Host (between passes): exclusive-scan `block_counts[0..G]` -> `block_base[b]` = number of
+    //   matches in all blocks `< b` (the base output slot for block `b`); the total match count is
+    //   `block_base[G-1] + block_counts[G-1]`. Tiny (G is the block count), so a host scan avoids a
+    //   third device scan kernel + a hand-authored shared-memory prefix sum.
+    //
+    //   Pass B (`..._scatter_blocks`, G blocks x 1 thread): block `b` re-scans ITS range ASCENDING
+    //   and appends each matching value at `block_base[b] + local++`. One thread per block makes the
+    //   intra-block order ascending BY CONSTRUCTION (no atomics in the ordering path), and disjoint
+    //   `block_base` ranges keep blocks independent — so the global output is exactly the ascending
+    //   per-row matches, identical to the old serial kernel for ANY row_count and match pattern. The
+    //   serial span drops from `rows` to one `chunk` (the longest single-thread pass-B range).
+    //
+    // Both kernels loop over `[start, end)` (grid-stride in A, serial in B), so they are correct for
+    // any `chunk`/grid; the host sizes `chunk` so `G = ceil(rows/chunk) <= 65535` for every row_count
+    // (the CUDA grid-x max), rounding `chunk` up when rows would exceed `65535 * CHUNK_ROWS`.
     const PTX: &[u8] = br#"
 .version 6.0
-.target sm_30
+.target sm_60
 .address_size 64
 
-.visible .entry gpu_db_resident_i32_compare_project(
+.visible .entry gpu_db_resident_i32_compare_count_blocks(
     .param .u64 resident_ptr,
     .param .u64 byte_offset,
     .param .u64 row_count,
+    .param .u64 chunk_rows,
     .param .s32 needle,
     .param .u32 comparison,
-    .param .u64 out_values_ptr,
-    .param .u64 out_count_ptr
+    .param .u64 out_block_counts_ptr
 )
 {
     .reg .pred %p_done;
@@ -7013,34 +7043,56 @@ fn launch_cuda_resident_i32_compare_project<R: CudaResidentReadSource>(
     .reg .pred %p_code_gt;
     .reg .pred %p_code_gte;
     .reg .pred %p_match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %comparison;
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
-    .reg .u64 %out_values;
-    .reg .u64 %out_count;
+    .reg .u64 %chunk;
     .reg .u64 %base;
+    .reg .u64 %block_counts;
+    .reg .u64 %start;
+    .reg .u64 %end;
     .reg .u64 %idx;
+    .reg .u64 %tmp64;
     .reg .u64 %input_addr;
-    .reg .u64 %output_addr;
     .reg .u64 %matches;
-    .reg .u32 %comparison;
+    .reg .u64 %count_addr;
     .reg .s32 %needle;
     .reg .s32 %r_value;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %offset, [byte_offset];
     ld.param.u64 %rows, [row_count];
+    ld.param.u64 %chunk, [chunk_rows];
     ld.param.s32 %needle, [needle];
     ld.param.u32 %comparison, [comparison];
-    ld.param.u64 %out_values, [out_values_ptr];
-    ld.param.u64 %out_count, [out_count_ptr];
+    ld.param.u64 %block_counts, [out_block_counts_ptr];
 
     add.u64 %base, %resident, %offset;
-    mov.u64 %idx, 0;
+
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+
+    // start = bid * chunk; end = min(start + chunk, rows)
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %start, %tmp64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p_done, %end, %rows;
+    @%p_done mov.u64 %end, %rows;
+
+    // idx = start + lane; stride = blockDim (grid-stride WITHIN this block's range)
+    cvt.u64.u32 %tmp64, %lane;
+    add.u64 %idx, %start, %tmp64;
+    cvt.u64.u32 %tmp64, %bdim;
+
     mov.u64 %matches, 0;
 
 loop:
-    setp.ge.u64 %p_done, %idx, %rows;
+    setp.ge.u64 %p_done, %idx, %end;
     @%p_done bra done;
     mul.lo.u64 %input_addr, %idx, 4;
     add.u64 %input_addr, %base, %input_addr;
@@ -7063,17 +7115,126 @@ loop:
     and.pred %p_gte, %p_gte, %p_code_gte;
     or.pred %p_match, %p_match, %p_gte;
     @!%p_match bra next;
-    mul.lo.u64 %output_addr, %matches, 4;
+    add.u64 %matches, %matches, 1;
+
+next:
+    add.u64 %idx, %idx, %tmp64;
+    bra loop;
+
+done:
+    // Accumulate this thread's local matches into the block's slot. Threads of a block race here,
+    // but ADDITION is commutative so the per-block TOTAL is order-independent (the ordering is
+    // established by the contiguous partition + pass B, never by this reduction).
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %count_addr, %tmp64, 8;
+    add.u64 %count_addr, %block_counts, %count_addr;
+    red.global.add.u64 [%count_addr], %matches;
+    ret;
+}
+
+.visible .entry gpu_db_resident_i32_compare_scatter_blocks(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 row_count,
+    .param .u64 chunk_rows,
+    .param .s32 needle,
+    .param .u32 comparison,
+    .param .u64 block_base_ptr,
+    .param .u64 out_values_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_match;
+    .reg .u32 %bid;
+    .reg .u32 %comparison;
+    .reg .u64 %resident;
+    .reg .u64 %offset;
+    .reg .u64 %rows;
+    .reg .u64 %chunk;
+    .reg .u64 %base;
+    .reg .u64 %block_base;
+    .reg .u64 %out_values;
+    .reg .u64 %start;
+    .reg .u64 %end;
+    .reg .u64 %idx;
+    .reg .u64 %tmp64;
+    .reg .u64 %input_addr;
+    .reg .u64 %slot;
+    .reg .u64 %output_addr;
+    .reg .u64 %base_addr;
+    .reg .s32 %needle;
+    .reg .s32 %r_value;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %offset, [byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %chunk, [chunk_rows];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %block_base, [block_base_ptr];
+    ld.param.u64 %out_values, [out_values_ptr];
+
+    add.u64 %base, %resident, %offset;
+
+    mov.u32 %bid, %ctaid.x;
+
+    // start = bid * chunk; end = min(start + chunk, rows)
+    cvt.u64.u32 %tmp64, %bid;
+    mul.lo.u64 %start, %tmp64, %chunk;
+    add.u64 %end, %start, %chunk;
+    setp.gt.u64 %p_done, %end, %rows;
+    @%p_done mov.u64 %end, %rows;
+
+    // slot = block_base[bid]  (this block's exclusive-prefix base output index)
+    mul.lo.u64 %base_addr, %tmp64, 8;
+    add.u64 %base_addr, %block_base, %base_addr;
+    ld.global.u64 %slot, [%base_addr];
+
+    mov.u64 %idx, %start;
+
+loop:
+    setp.ge.u64 %p_done, %idx, %end;
+    @%p_done bra done;
+    mul.lo.u64 %input_addr, %idx, 4;
+    add.u64 %input_addr, %base, %input_addr;
+    ld.global.s32 %r_value, [%input_addr];
+    setp.lt.s32 %p_lt, %r_value, %needle;
+    setp.le.s32 %p_lte, %r_value, %needle;
+    setp.gt.s32 %p_gt, %r_value, %needle;
+    setp.ge.s32 %p_gte, %r_value, %needle;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    mov.pred %p_match, 0;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    @!%p_match bra next;
+    // Append ascending within this block: output[slot] = value; slot += 1.
+    mul.lo.u64 %output_addr, %slot, 4;
     add.u64 %output_addr, %out_values, %output_addr;
     st.global.s32 [%output_addr], %r_value;
-    add.u64 %matches, %matches, 1;
+    add.u64 %slot, %slot, 1;
 
 next:
     add.u64 %idx, %idx, 1;
     bra loop;
 
 done:
-    st.global.u64 [%out_count], %matches;
     ret;
 }
 "#;
@@ -7102,6 +7263,22 @@ done:
             .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
+    // Blocking memset/HtoD for the fallback path (zero the block-count scratch; upload the
+    // host-scanned per-block base offsets).
+    let cu_memset_d8 = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            .lib()
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident.lib().get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
 
     let values_bytes = usize::try_from(
         row_count
@@ -7109,67 +7286,121 @@ done:
             .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
     )
     .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    const COUNT_BYTES: usize = std::mem::size_of::<u64>();
 
-    // P2-M2 (compare-route async lever): this single-frame range/comparison projection had the
-    // same default/NULL-stream-serialized wall as the other projection routes — a per-call
-    // `cuMemAlloc` (values + count), a per-call `cuModuleLoadData`, a whole-context
-    // `cuCtxSynchronize`, and two blocking default-stream `cuMemcpyDtoH` (the count, then the
-    // values). The driver serializes those memory ops + the JIT + the whole-context sync across
-    // concurrent readers, so a measured c1≈c64 flatline (~290–300 qps) — no scaling. The fix
-    // moves the kernel + both D2H onto the route's pooled private stream via the `*Async`
-    // variants behind exactly TWO `cuStreamSynchronize` (one after the kernel so the
-    // device-computed match count is readable to size the values read; one after the values
-    // D2H), stages both readbacks through pooled pinned (page-locked) host buffers, leases its
-    // device output buffers + private stream + module from the shared pools/cache (no per-call
-    // alloc/JIT), and removes the whole-context sync. No HtoD and no memset are needed: the
-    // kernel takes the needle/comparison as scalar params and writes the count unconditionally,
-    // and the values buffer is read back only over [0, count) so pooled stale bytes are never
-    // observed. The PTX kernel is byte-for-byte unchanged, so results are identical.
+    // ---- ordered-compaction grid shape ----
+    // Contiguous partition: block `b` owns rows `[b*chunk, min(b*chunk+chunk, rows))`. `chunk` is
+    // sized so the block count `G = ceil(rows/chunk)` stays within the CUDA grid-x max (65_535) for
+    // ANY row_count: start at CHUNK_ROWS rows/block and round `chunk` up if rows would need more
+    // than 65_535 blocks. Both kernels loop over their range, so any `chunk` is correct.
+    const BLOCK: u32 = 256;
+    const CHUNK_ROWS: u64 = 256;
+    const MAX_GRID: u64 = 65_535;
+    let chunk = CHUNK_ROWS.max(row_count.div_ceil(MAX_GRID));
+    let grid_u64 = row_count.div_ceil(chunk);
+    debug_assert!((1..=MAX_GRID).contains(&grid_u64));
+    let grid = u32::try_from(grid_u64)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let block_counts_len = grid as usize;
+    let block_scratch_bytes = block_counts_len
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    // P2-M2 (compare-route parallel-kernel lever): this single-frame range/comparison projection
+    // already ran on the pooled-async substrate (private stream, pinned D2H, two covering syncs, no
+    // per-call alloc/JIT/whole-context sync), but its kernel was the legacy single-thread
+    // `<<<1,1,1>>>` scan, so the route plateaued serial-kernel-bound (~277 µs for a 50k-row scan).
+    // The kernel is now an ORDERED PARALLEL COMPACTION (two passes over a contiguous block
+    // partition; see the PTX header): a parallel per-block match count, a tiny host exclusive scan
+    // of those counts into per-block base offsets, then a parallel scatter that appends each block's
+    // matches ascending at its base. The output is byte-identical ascending-per-row values for any
+    // row_count and match pattern (no atomic-append, so no atomic-schedule non-determinism). The
+    // device scratch is the `block_counts` / `block_base` arrays (G u64 each), leased from the same
+    // `OutputBufferPool` as the values buffer.
     //
-    // The whole async path is gated on the optional async + pinned-host driver symbols; on an
-    // old driver lacking them the route keeps a blocking path (still cached-module +
-    // pooled-buffer + pooled-stream, just blocking D2H), so correctness is unconditional and
-    // only the acceleration is best-effort.
-    let async_ops = resident.primary().cu_memcpy_dtoh_async;
+    // The whole async path is gated on the optional async + pinned-host driver symbols; on an old
+    // driver lacking them the route keeps a blocking path (still cached-module + pooled-buffer +
+    // pooled-stream, just blocking memset/HtoD/D2H), so correctness is unconditional and only the
+    // acceleration is best-effort.
+    let async_ops = match (
+        resident.primary().cu_memcpy_dtoh_async,
+        resident.primary().cu_memcpy_htod_async,
+        resident.primary().cu_memset_d8_async,
+    ) {
+        (Some(dtoh), Some(htod), Some(memset)) => Some((dtoh, htod, memset)),
+        _ => None,
+    };
 
-    // Pooled device output buffers (no per-call cuMemAlloc/cuMemFree). Reused buffers are NOT
-    // zeroed; the kernel overwrites the count unconditionally and every value is read back only
-    // over the [0, count) prefix, so stale bytes are never observed.
+    // Pooled device buffers (no per-call cuMemAlloc/cuMemFree): the values output plus the two
+    // block-offset scratch arrays. `block_counts` is zeroed before pass A (the count kernel
+    // red-adds into it); `block_base` is overwritten by the HtoD upload; `values` is read back only
+    // over the [0, total) prefix, so pooled stale bytes are never observed.
     let values_guard = resident
         .primary()
         .lease_device_buffer(values_bytes.max(1))?;
-    let count_guard = resident.primary().lease_device_buffer(COUNT_BYTES)?;
+    let block_counts_guard = resident
+        .primary()
+        .lease_device_buffer(block_scratch_bytes)?;
+    let block_base_guard = resident
+        .primary()
+        .lease_device_buffer(block_scratch_bytes)?;
 
-    // P2-M2: cached module (no per-launch cuModuleLoadData) — keyed by the kernel entry name and
-    // launched concurrently on distinct streams.
+    // P2-M2: cached modules (no per-launch cuModuleLoadData) — both kernel entries live in one PTX
+    // module; the cache is keyed per entry name and launched concurrently on distinct streams.
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
     ptx.push(0);
-    let function = resident
+    let count_fn = resident
         .primary()
-        .cached_function(c"gpu_db_resident_i32_compare_project", &ptx)?;
+        .cached_function(c"gpu_db_resident_i32_compare_count_blocks", &ptx)?;
+    let scatter_fn = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_compare_scatter_blocks", &ptx)?;
 
+    // Shared kernel scalar args (pointers/needle/comparison/chunk are identical across both passes;
+    // each pass binds its own output pointer).
     let mut resident_arg = resident.device_ptr();
     let mut offset_arg = byte_offset;
     let mut rows_arg = row_count;
+    let mut chunk_arg = chunk;
     let mut needle_arg = needle;
     let mut comparison_arg = comparison.code();
+    let mut block_counts_arg = block_counts_guard.ptr;
+    let mut block_base_arg = block_base_guard.ptr;
     let mut values_arg = values_guard.ptr;
-    let mut count_arg = count_guard.ptr;
-    let mut args = [
+    let mut count_args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut offset_arg as *mut u64).cast::<c_void>(),
         (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut chunk_arg as *mut u64).cast::<c_void>(),
         (&mut needle_arg as *mut i32).cast::<c_void>(),
         (&mut comparison_arg as *mut u32).cast::<c_void>(),
+        (&mut block_counts_arg as *mut u64).cast::<c_void>(),
+    ];
+    let mut scatter_args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut offset_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut chunk_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut comparison_arg as *mut u32).cast::<c_void>(),
+        (&mut block_base_arg as *mut u64).cast::<c_void>(),
         (&mut values_arg as *mut u64).cast::<c_void>(),
-        (&mut count_arg as *mut u64).cast::<c_void>(),
     ];
 
-    // This kernel is the legacy single-thread (1,1,1) sequential scan + ordered append; its grid
-    // shape is preserved exactly so the appended order — and thus the result bytes — is identical.
-    if let Some(dtoh_async) = async_ops {
+    // Host exclusive scan of the per-block match counts into per-block base output slots; returns
+    // (block_base, total_matches). The base of block 0 is 0, and total is the sum of all counts —
+    // both kernels see the SAME contiguous partition, so prefix-by-block == prefix-by-row.
+    fn exclusive_scan_blocks(counts: &[u64]) -> (Vec<u64>, u64) {
+        let mut base = Vec::with_capacity(counts.len());
+        let mut running = 0_u64;
+        for &c in counts {
+            base.push(running);
+            running = running.saturating_add(c);
+        }
+        (base, running)
+    }
+
+    if let Some((dtoh_async, htod_async, memset_async)) = async_ops {
         // ---- async-on-pooled-stream path (the lever) ----
         // Bind the shared primary context (idempotent) and lease the pooled private stream.
         resident.primary().set_current()?;
@@ -7212,15 +7443,86 @@ done:
             err
         };
 
-        // (1) Stream-ordered kernel launch (no HtoD/memset needed for this route).
+        // (1) Stream-ordered zero of the block-count scratch, then the parallel COUNT kernel
+        // (pass A). Start the timer before pass A so the recorded span covers BOTH kernels — the
+        // meaningful "new kernel time" vs the old serial kernel.
         if timed {
             check_cuda(unsafe { (resident.primary().cu_event_record)(pooled.start_event, stream) })
                 .map_err(drain_err)?;
         }
+        check_cuda(unsafe { memset_async(block_counts_guard.ptr, 0, block_scratch_bytes, stream) })
+            .map_err(drain_err)?;
         check_cuda(unsafe {
             cu_launch_kernel(
-                function,
+                count_fn,
+                grid,
                 1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                count_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })
+        .map_err(drain_err)?;
+
+        // (2) Stream-ordered read of the per-block counts, then sync #1: the count kernel is now
+        // complete so the host can exclusive-scan the counts into base offsets and size the values
+        // read. The counts stage through a pooled pinned host buffer for a truly-async DMA.
+        let mut block_counts = vec![0_u64; block_counts_len];
+        let counts_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            block_counts_guard.ptr,
+            &mut block_counts,
+        )
+        .map_err(drain_err)?;
+        // Covering sync #1: drains on its own error too (the counts D2H is still enqueued).
+        check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
+            .map_err(drain_err)?;
+        copy_pinned_into(&counts_pinned, &mut block_counts);
+        drop(counts_pinned);
+
+        let (block_base, output_count) = exclusive_scan_blocks(&block_counts);
+        if output_count > row_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(output_count).unwrap_or(usize::MAX),
+            ));
+        }
+
+        // (3) Upload the host-scanned base offsets (HtoD, staged through a pooled pinned buffer for
+        // a truly-async DMA), then launch the parallel SCATTER kernel (pass B: one thread per block,
+        // ascending append within each block's range at base+local), then stop the timer.
+        let base_pinned = resident
+            .primary()
+            .lease_pinned_host_buffer(block_scratch_bytes);
+        if let Some(pinned) = &base_pinned {
+            // SAFETY: leased with capacity >= block_scratch_bytes; copy the base offsets into the
+            // pinned region (page-aligned) before the async HtoD reads from it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    block_base.as_ptr(),
+                    pinned.ptr.cast::<u64>(),
+                    block_base.len(),
+                );
+            }
+        }
+        let base_src: *const c_void = base_pinned
+            .as_ref()
+            .map(|p| p.ptr.cast_const())
+            .unwrap_or_else(|| block_base.as_ptr().cast::<c_void>());
+        check_cuda(unsafe {
+            htod_async(block_base_guard.ptr, base_src, block_scratch_bytes, stream)
+        })
+        .map_err(drain_err)?;
+        check_cuda(unsafe {
+            cu_launch_kernel(
+                scatter_fn,
+                grid,
                 1,
                 1,
                 1,
@@ -7228,7 +7530,7 @@ done:
                 1,
                 0,
                 stream,
-                args.as_mut_ptr(),
+                scatter_args.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         })
@@ -7238,27 +7540,31 @@ done:
                 .map_err(drain_err)?;
         }
 
-        // (2) Stream-ordered read of the 8-byte match count, then sync #1: now the kernel is
-        // complete and the count is known, so the values read can be sized. The count stages
-        // through a small pooled pinned host buffer for a truly-async DMA.
-        let mut output_count = 0_u64;
-        let count_pinned = resident.primary().lease_pinned_host_buffer(COUNT_BYTES);
-        let count_dst: *mut c_void = count_pinned
-            .as_ref()
-            .map(|p| p.ptr)
-            .unwrap_or_else(|| (&mut output_count as *mut u64).cast::<c_void>());
-        check_cuda(unsafe { dtoh_async(count_dst, count_guard.ptr, COUNT_BYTES, stream) })
-            .map_err(drain_err)?;
-        // Covering sync #1: drains on its own error too (the count D2H is still enqueued).
+        let mut output = vec![
+            0_i32;
+            usize::try_from(output_count).map_err(|_| {
+                CudaRuntimeProbeError::InvalidInputLength(usize::MAX)
+            })?
+        ];
+
+        // (4) Stream-ordered result D2H of the populated [0, total) values prefix into a pooled
+        // pinned host buffer, then ONE sync #2; copy the pinned bytes into the owned Vec. This sync
+        // also covers the still-enqueued base HtoD + scatter kernel (both ordered before it).
+        let values_pinned = stage_result_dtoh_async(
+            resident.primary(),
+            dtoh_async,
+            stream,
+            values_guard.ptr,
+            &mut output,
+        )
+        .map_err(drain_err)?;
+        // Covering sync #2: drains on its own error too (the HtoD/scatter/values D2H are enqueued).
         check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
             .map_err(drain_err)?;
-        if let Some(pinned) = &count_pinned {
-            // SAFETY: the sync above completed the 8-byte D2H into the pinned region; read the
-            // u64 out by typed pointer (pinned host memory is page-aligned).
-            unsafe {
-                output_count = pinned.ptr.cast::<u64>().read();
-            }
-        }
+        // Keep the base staging buffer alive until after the sync that completes its HtoD.
+        drop(base_pinned);
+        copy_pinned_into(&values_pinned, &mut output);
+
         if timed {
             let mut elapsed_ms = 0.0_f32;
             check_cuda(unsafe {
@@ -7275,43 +7581,58 @@ done:
             resident.record_kernel_event_elapsed_us(None);
         }
 
-        if output_count > row_count {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(
-                usize::try_from(output_count).unwrap_or(usize::MAX),
-            ));
-        }
-        let mut output = vec![
-            0_i32;
-            usize::try_from(output_count).map_err(|_| {
-                CudaRuntimeProbeError::InvalidInputLength(usize::MAX)
-            })?
-        ];
-
-        // (3) Stream-ordered result D2H of the populated [0, count) values prefix into a pooled
-        // pinned host buffer, then ONE sync #2; copy the pinned bytes into the owned Vec.
-        let values_pinned = stage_result_dtoh_async(
-            resident.primary(),
-            dtoh_async,
-            stream,
-            values_guard.ptr,
-            &mut output,
-        )
-        .map_err(drain_err)?;
-        // Covering sync #2: drains on its own error too (the values D2H is still enqueued).
-        check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
-            .map_err(drain_err)?;
-        copy_pinned_into(&values_pinned, &mut output);
         drop(lease);
         Ok(output)
     } else {
         // ---- legacy blocking fallback (old driver: no async/pinned symbols) ----
         // Still cached-module + pooled-buffer + pooled-stream (per-stream sync, no whole-context
-        // cuCtxSynchronize); just blocking D2H. The route owns its output buffers, so no pooled
-        // scratch is requested.
+        // cuCtxSynchronize); just blocking memset/HtoD/D2H. Run the same two passes with a blocking
+        // counts D2H + host scan + base HtoD between them.
+        check_cuda(unsafe { cu_memset_d8(block_counts_guard.ptr, 0, block_scratch_bytes) })?;
         launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
             cu_launch_kernel(
-                function,
+                count_fn,
+                grid,
                 1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                count_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        })?;
+
+        let mut block_counts = vec![0_u64; block_counts_len];
+        if !block_counts.is_empty() {
+            check_cuda(unsafe {
+                cu_memcpy_dtoh(
+                    block_counts.as_mut_ptr().cast::<c_void>(),
+                    block_counts_guard.ptr,
+                    block_scratch_bytes,
+                )
+            })?;
+        }
+        let (block_base, output_count) = exclusive_scan_blocks(&block_counts);
+        if output_count > row_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(output_count).unwrap_or(usize::MAX),
+            ));
+        }
+
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                block_base_guard.ptr,
+                block_base.as_ptr().cast::<c_void>(),
+                block_scratch_bytes,
+            )
+        })?;
+        launch_on_pooled_stream(resident, None, |stream, _scratch| unsafe {
+            cu_launch_kernel(
+                scatter_fn,
+                grid,
                 1,
                 1,
                 1,
@@ -7319,24 +7640,10 @@ done:
                 1,
                 0,
                 stream,
-                args.as_mut_ptr(),
+                scatter_args.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         })?;
-
-        let mut output_count = 0_u64;
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                (&mut output_count as *mut u64).cast::<c_void>(),
-                count_guard.ptr,
-                COUNT_BYTES,
-            )
-        })?;
-        if output_count > row_count {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(
-                usize::try_from(output_count).unwrap_or(usize::MAX),
-            ));
-        }
 
         let mut output = vec![
             0_i32;
@@ -10839,6 +11146,135 @@ mod tests {
             )
             .expect("final project_i32_compare");
         assert_eq!(final_rows, vec![20, 30, 20, 40]);
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_i32_compare_project_multi_block_returns_ascending_row_order() {
+        // Coverage gap closer for the PARALLEL ordered-compaction kernel (analogue of the
+        // `row_indices` multi-warp ascending test). `compare_project` must return the matching i32
+        // VALUES in ASCENDING ROW ORDER, byte-identical to the legacy single-thread scan, for ANY
+        // row_count. The new kernel parallelizes this as an ordered compaction over a CONTIGUOUS
+        // block partition (chunk = 256 rows/block): a parallel per-block count, a host exclusive
+        // scan into per-block base offsets, then a per-block ascending scatter at base+local. This
+        // test drives a payload that is FAR past one block AND one warp (~700 matches across ~20
+        // blocks) and asserts the EXACT expected vector — proving the compaction preserves row order
+        // ACROSS BLOCKS, not just within one.
+        //
+        // Why it is NON-VACUOUS (would fail under an unordered impl): the matching VALUES are a
+        // by-row SCRAMBLED sequence (a hash of the row index), so the correct ascending-row-order
+        // output is deliberately NOT sorted-by-value and NOT contiguous. An atomic-append
+        // implementation would emit the matches in atomic-SCHEDULE order — non-deterministic across
+        // the ~20 racing blocks — which is essentially never this exact by-row sequence; a "sort the
+        // values" shortcut would emit them sorted, which this sequence is not. Only a compaction that
+        // is stable by row across blocks reproduces the asserted vector. We also assert the expected
+        // sequence is not already sorted (so the sort shortcut provably diverges) and run the route
+        // repeatedly (a schedule-ordered impl would flake across iterations).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // 5000 rows => grid = ceil(5000/256) = 20 blocks (multi-block AND multi-warp). Every 7th row
+        // matches (Gt 0): its value is a positive by-row hash (scrambled); other rows hold -1 (a Gt 0
+        // non-match). 5000/7 ≈ 715 matches spread across all 20 blocks.
+        const ROW_COUNT: u64 = 5000;
+        const NEEDLE: i32 = 0;
+        let col_offset = std::mem::size_of::<u64>() as u64;
+        // Positive by-row hash in [1, 1_000_000], deterministic and scrambled relative to row order.
+        let row_value = |row: u64| -> i32 {
+            let h = row.wrapping_mul(2_654_435_761) ^ (row << 13) ^ 0x9E37_79B9;
+            (1 + (h % 1_000_000)) as i32
+        };
+        let column: Vec<i32> = (0..ROW_COUNT)
+            .map(|row| if row % 7 == 0 { row_value(row) } else { -1 })
+            .collect();
+        // Reference = matches in ASCENDING ROW ORDER (exactly what the serial kernel emits).
+        let expected: Vec<i32> = (0..ROW_COUNT)
+            .filter(|row| row % 7 == 0)
+            .map(row_value)
+            .collect();
+
+        assert!(
+            expected.len() > 32,
+            "test must use a multi-warp/multi-block match count to exercise cross-block order"
+        );
+        // The expected by-row order must NOT already be sorted, or a "sort the values" impl would
+        // pass vacuously. (The hash scrambles values relative to row order, so this holds.)
+        let mut sorted = expected.clone();
+        sorted.sort_unstable();
+        assert_ne!(
+            expected, sorted,
+            "expected by-row sequence is accidentally sorted — pick a payload that isn't, else the \
+             test cannot distinguish ordered compaction from a value sort"
+        );
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&ROW_COUNT.to_le_bytes());
+        let mut column_bytes = Vec::new();
+        for value in &column {
+            column_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let allocated_len = col_offset + column_bytes.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: col_offset,
+                        bytes: &column_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        // Run repeatedly: an atomic-schedule-ordered impl would surface a non-ascending-by-row
+        // permutation on at least one iteration (the cross-block schedule varies run to run); the
+        // ordered compaction is exactly the by-row sequence every time.
+        for iter in 0..50 {
+            let got = resident
+                .project_i32_compare_from_payload(
+                    col_offset,
+                    ROW_COUNT,
+                    NEEDLE,
+                    CudaI32Comparison::Gt,
+                )
+                .expect("multi-block project_i32_compare");
+            assert_eq!(
+                got, expected,
+                "multi-block compare_project values were not in ascending ROW order on iteration \
+                 {iter} — the parallel compaction is not stable across blocks (atomic-append \
+                 schedule order?) or the per-block base offsets are wrong"
+            );
+        }
+
+        // Boundary coverage in the same payload shape: 0 matches, all matches, and a count that
+        // straddles a block boundary, each byte-identical to the by-row reference.
+        // (a) 0 matches: Gt a value larger than every row value.
+        let none = resident
+            .project_i32_compare_from_payload(
+                col_offset,
+                ROW_COUNT,
+                2_000_000,
+                CudaI32Comparison::Gt,
+            )
+            .expect("zero-match project_i32_compare");
+        assert!(none.is_empty(), "Gt 2_000_000 must match nothing");
+        // (b) all matches: Gte i32::MIN matches every row, ascending by row == the raw column.
+        let all = resident
+            .project_i32_compare_from_payload(
+                col_offset,
+                ROW_COUNT,
+                i32::MIN,
+                CudaI32Comparison::Gte,
+            )
+            .expect("all-match project_i32_compare");
+        assert_eq!(
+            all, column,
+            "Gte i32::MIN must return the whole column in row order"
+        );
     }
 
     #[test]
