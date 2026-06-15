@@ -19388,8 +19388,15 @@ impl Engine {
         }
 
         let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        // Borrow the stored snapshot (`_ref`) instead of `relational_residency_snapshot`, whose
+        // `.clone()` deep-copies `resident_rows: Vec<Vec<SqlValue>>` — an O(rows) host allocation on
+        // EVERY per-call lookup. That clone (not the kernel) was this route's per-call wall: ~99% of
+        // the time on a 50k-row table, dwarfing the ~40µs migrated parallel count kernel. The proven
+        // sibling routes (multi-column / projection / count) already borrow via `_ref`, and the live
+        // memory-pressure gate runs in the planner before this route is entered, so reading the
+        // stored snapshot here is behaviorally identical to them (and to the prior clone).
         let snapshot = self
-            .relational_residency_snapshot(&table.name)
+            .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has no resident snapshot",
@@ -19417,7 +19424,7 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let byte_offset = resident_device_int4_column_offset(snapshot, &table, filter_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
