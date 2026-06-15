@@ -699,12 +699,16 @@ Also still owed: grow the harness to the Phase-5 open-loop/p99.9/steady-state sh
    its submit→complete split); **`compare_project` (`f3b17f12`) 7.2× p50 / 9.1× qps** (29 ms→4 ms —
    plateau is SERIAL-kernel-bound, single-thread ordered-append); **`row_indices` (`2e325095`)
    ~157× p50 / ~29× qps** (13.2 ms→84 µs — this was ~73% of the old text-route cascade wall). Every
-   curve flipped from collapse/anti-scaling to rises-then-plateaus. Open follow-ups: (a)
-   `compare_project` parallel ordered-compaction kernel (prefix-sum + scatter) to lift its
-   serial-kernel floor; (b) `row_indices`' parallel atomic-append emits indices in non-deterministic
-   (atomic-schedule) order for ≥33 matches — verify no consumer / parity reference requires ordered
-   indices (pre-existing, kernel byte-unchanged); (c) generalize the `drain_err` drop-guard to the
-   shared `launch_on_pooled_stream` (pre-existing identical window, ~3 routes).
+   curve flipped from collapse/anti-scaling to rises-then-plateaus. **Follow-ups all ✅ DONE
+   2026-06-15:** (a) `compare_project` parallelized via a two-pass ordered compaction (`e9cb7696`):
+   c64 204× p50 / 64× qps (56 ms→276 µs), serial-kernel floor gone — now host-submit-bound ~70k qps;
+   (b) `row_indices` order WAS a real bug (verdict A — the parity tests and the partitioned merge
+   require ascending order, passing only by ≤32-match single-warp luck) → fixed with a host
+   `indices.sort_unstable()` on both paths + >32-match parity tests (`4b750a94`); (c) the `drain_err`
+   drop-guard was centralized into `launch_on_pooled_stream` (`cbb13032`), closing the drop-without-
+   complete window for the 3 un-migrated direct callers (`row_count`/`equal_count`/`equal_project`)
+   and the migrated routes' blocking fallbacks. Optional remaining: a fully-parallel intra-block scan
+   for `compare_project` (one-thread-per-block scatter is ~6× of a serial kernel, not the max).
 3. **Batched / async GPU submission** (perf, architectural) — now the **VALIDATED** next perf
    lever: thread 1 removed the default-stream serializer, exposing the per-call host CUDA
    driver-submit floor (~19 µs/op serialized ⇒ the ~45–52k qps plateau / sub-ms p50 measured on
