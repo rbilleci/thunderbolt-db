@@ -139,16 +139,105 @@ pub struct WalArchiveObjectBackup {
     pub objects: Vec<WalArchiveObject>,
 }
 
+/// The durable backing for a [`WalBuffer`].
+///
+/// When present, every `flush_all` rewrites the buffer's full record prefix to a single segment
+/// file via [`write_wal_segment`] (atomic temp-write + `sync_all` + rename) and then fsyncs the
+/// segment's **parent directory** so the rename — i.e. the segment file's *existence* — is itself
+/// crash-durable, not just the file's bytes. The parent directory is fsynced once, the first time
+/// the segment is installed (the directory entry never changes afterward — the segment keeps the
+/// same path and is replaced in place by atomic rename), so steady-state commits pay a single
+/// file fsync.
+#[derive(Debug, Clone)]
+struct WalDurableSegment {
+    segment_path: PathBuf,
+}
+
+/// Group-commit accounting for a [`WalBuffer`].
+///
+/// Each `flush_all` that performs a real fsync batches **all** currently-unflushed records into a
+/// single segment write / single fsync — that batch is one *group*. While the writer is serialized
+/// (Stage 1), commits arrive one at a time, so the common case is a size-1 group; the same code
+/// path amortizes automatically once Stage 4 lets multiple committers enqueue records before a
+/// designated flusher drives one `flush_all`. These counters let a microbenchmark observe the
+/// fsync-per-commit cost now and the batching ratio (`durable_records / flush_groups`) later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalGroupCommitStats {
+    /// Number of `flush_all` calls that performed a real durable fsync (one group each).
+    pub flush_groups: u64,
+    /// Total records made durable across all groups.
+    pub durable_records: u64,
+    /// Largest single group (records fsynced by one `flush_all`).
+    pub max_group_size: usize,
+}
+
+impl WalGroupCommitStats {
+    /// Mean records-per-fsync (the group-commit amortization ratio). `0.0` before any flush.
+    pub fn mean_group_size(&self) -> f64 {
+        if self.flush_groups == 0 {
+            0.0
+        } else {
+            self.durable_records as f64 / self.flush_groups as f64
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WalBuffer {
     records: Vec<WalRecord>,
     flushed: usize,
     fail_next_flush: bool,
+    durable: Option<WalDurableSegment>,
+    group_commit: WalGroupCommitStats,
 }
 
 impl WalBuffer {
+    /// An in-memory WAL buffer with no durable backing (the default — `flush_all` only advances the
+    /// in-memory durable watermark). Used by ephemeral engines and the bulk of the test suite.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A WAL buffer backed by a real, fsync-durable segment file at `segment_path`.
+    ///
+    /// `flush_all` persists the buffer's record prefix to that file and fsyncs both the file and
+    /// its parent directory before advancing the durable watermark. Recovery
+    /// reads the segment back with [`read_wal_segment`].
+    pub fn with_durable_segment(segment_path: impl Into<PathBuf>) -> Self {
+        Self {
+            durable: Some(WalDurableSegment {
+                segment_path: segment_path.into(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// The durable segment path, if this buffer is backed by one.
+    pub fn durable_segment_path(&self) -> Option<&Path> {
+        self.durable.as_ref().map(|d| d.segment_path.as_path())
+    }
+
+    /// Whether `flush_all` performs a real fsync (vs. in-memory watermark advance only).
+    pub fn is_durable(&self) -> bool {
+        self.durable.is_some()
+    }
+
     pub fn append(&mut self, rec: WalRecord) {
         self.records.push(rec);
+    }
+
+    /// Seed the buffer with records already known to be durable (e.g. recovered from a segment),
+    /// marking them as the flushed prefix WITHOUT performing any I/O. Used right after a durable
+    /// segment is installed on a recovered engine so the next real `flush_all` rewrites a segment
+    /// that still contains the recovered history rather than only the newly-appended tail. Must be
+    /// called on an otherwise-empty buffer.
+    pub fn reinstate_durable_records(&mut self, records: Vec<WalRecord>) {
+        debug_assert!(
+            self.records.is_empty(),
+            "reinstate_durable_records on a non-empty WAL buffer"
+        );
+        self.flushed = records.len();
+        self.records = records;
     }
 
     pub fn len(&self) -> usize {
@@ -166,6 +255,18 @@ impl WalBuffer {
         }
     }
 
+    /// Make every appended record durable.
+    ///
+    /// In-memory mode: advances the durable watermark to the full record count.
+    ///
+    /// Durable mode: this is the **commit fsync** and the group-commit point. It writes the
+    /// buffer's entire record prefix to the segment as one atomic, fsynced unit (and fsyncs the
+    /// parent directory the first time the segment is installed), batching all currently-unflushed
+    /// records into a single fsync. Only after the fsync succeeds is the in-memory durable
+    /// watermark advanced — so a caller that gates visibility on `flushed_count` can never publish
+    /// a record whose WAL bytes are not yet on disk (the WAL-before-visibility invariant). On any
+    /// I/O error the watermark is left untouched and the error is returned, so the caller can roll
+    /// back the in-flight commit before it becomes visible.
     pub fn flush_all(&mut self) -> Result<(), EngineError> {
         if self.fail_next_flush {
             self.fail_next_flush = false;
@@ -173,7 +274,26 @@ impl WalBuffer {
                 "simulated wal flush failure".to_string(),
             ));
         }
-        self.flushed = self.records.len();
+        let target = self.records.len();
+        let group_size = target.saturating_sub(self.flushed);
+        if let Some(durable) = self.durable.as_ref() {
+            if group_size > 0 {
+                let segment_path = durable.segment_path.clone();
+                // Persist the FULL durable prefix (the segment is rewritten in place by atomic
+                // rename), fsyncing the segment file's bytes (`write_wal_segment` -> `sync_all`).
+                write_wal_segment(&segment_path, &self.records[..target])?;
+                // Then fsync the parent directory so the rename (the dentry->inode mapping) is durable
+                // before the watermark advances. Done after EVERY rename, not just the first install:
+                // each commit's rename-over-existing mutates the dentry, and the WAL-before-visibility
+                // invariant must not depend on the filesystem journal-ordering that metadata vs the data.
+                sync_segment_parent_dir(&segment_path)?;
+                self.group_commit.flush_groups += 1;
+                self.group_commit.durable_records += group_size as u64;
+                self.group_commit.max_group_size = self.group_commit.max_group_size.max(group_size);
+            }
+        }
+        // Watermark advances only after the fsync has succeeded (or in in-memory mode).
+        self.flushed = target;
         Ok(())
     }
 
@@ -189,6 +309,12 @@ impl WalBuffer {
         self.records.len().saturating_sub(self.flushed)
     }
 
+    /// Group-commit accounting (fsync groups, durable records, largest group). See
+    /// [`WalGroupCommitStats`].
+    pub fn group_commit_stats(&self) -> WalGroupCommitStats {
+        self.group_commit
+    }
+
     pub fn checkpoint_meta(&self) -> WalCheckpointMeta {
         WalCheckpointMeta {
             durable_record_count: self.flushed,
@@ -199,6 +325,32 @@ impl WalBuffer {
     pub fn fail_next_flush(&mut self) {
         self.fail_next_flush = true;
     }
+}
+
+/// Fsync the parent directory of `segment_path` so a freshly-`rename`d segment file's directory
+/// entry is durable across a crash (POSIX: an fsync of the file does not guarantee the containing
+/// directory entry is persisted). A best-effort no-op on platforms / filesystems that refuse to
+/// open a directory for fsync is intentionally NOT done — a hard error here means the existence of
+/// the just-written WAL could be lost on crash, which would violate durability, so it propagates.
+fn sync_segment_parent_dir(segment_path: &Path) -> Result<(), EngineError> {
+    let parent = segment_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let Some(parent) = parent else {
+        // No parent component (e.g. a bare relative file name) — the current working directory is
+        // the container; there is nothing portable to fsync, so treat as durable.
+        return Ok(());
+    };
+    let dir = File::open(parent).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to open WAL segment directory for fsync {}: {err}",
+            parent.display()
+        ))
+    })?;
+    dir.sync_all().map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to fsync WAL segment directory {}: {err}",
+            parent.display()
+        ))
+    })
 }
 
 pub fn write_wal_segment(path: impl AsRef<Path>, records: &[WalRecord]) -> Result<(), EngineError> {
@@ -3287,6 +3439,151 @@ mod tests {
                 last_durable_txn_id: Some(11),
             }
         );
+    }
+
+    #[test]
+    fn durable_flush_persists_records_to_real_segment() {
+        let path = test_wal_path("durable-flush");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        assert!(wal.is_durable());
+        assert_eq!(wal.durable_segment_path(), Some(path.as_path()));
+
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"CREATE TABLE t (id INT)".to_vec(),
+        });
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: b"INSERT INTO t (id) VALUES (1)".to_vec(),
+        });
+        // Nothing on disk until the flush.
+        assert!(!path.exists());
+
+        wal.flush_all().unwrap();
+        assert_eq!(wal.flushed_count(), 2);
+
+        // The flushed records are now a real, CRC-checked, fsynced segment.
+        let recovered = read_wal_segment(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].txn_id, 1);
+        assert_eq!(
+            recovered[1].payload,
+            b"INSERT INTO t (id) VALUES (1)".to_vec()
+        );
+    }
+
+    #[test]
+    fn durable_flush_rewrites_full_prefix_so_history_is_preserved() {
+        let path = test_wal_path("durable-history");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"one".to_vec(),
+        });
+        wal.flush_all().unwrap();
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: b"two".to_vec(),
+        });
+        wal.flush_all().unwrap();
+
+        // The second flush must rewrite the segment with BOTH records, not just the new tail.
+        let recovered = read_wal_segment(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].txn_id, 1);
+        assert_eq!(recovered[1].txn_id, 2);
+    }
+
+    #[test]
+    fn durable_group_commit_stats_count_one_group_per_fsync() {
+        let path = test_wal_path("durable-groups");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+
+        // Two records, then ONE flush => a single group of size 2.
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"a".to_vec(),
+        });
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: b"b".to_vec(),
+        });
+        wal.flush_all().unwrap();
+        // One more record, separate flush => a second group of size 1.
+        wal.append(WalRecord {
+            txn_id: 3,
+            payload: b"c".to_vec(),
+        });
+        wal.flush_all().unwrap();
+        // A flush with nothing new must NOT count as a group (no fsync performed).
+        wal.flush_all().unwrap();
+
+        let _ = fs::remove_file(&path);
+        let stats = wal.group_commit_stats();
+        assert_eq!(stats.flush_groups, 2);
+        assert_eq!(stats.durable_records, 3);
+        assert_eq!(stats.max_group_size, 2);
+        assert!((stats.mean_group_size() - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn durable_flush_failure_leaves_no_durable_advance() {
+        let path = test_wal_path("durable-fail");
+        let mut wal = WalBuffer::with_durable_segment(&path);
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"a".to_vec(),
+        });
+
+        wal.fail_next_flush();
+        let err = wal.flush_all().unwrap_err();
+        assert!(matches!(err, EngineError::Durability(_)));
+        // The watermark did not advance and (because the simulated failure short-circuits before
+        // any I/O) the segment was never created — nothing partially durable.
+        assert_eq!(wal.flushed_count(), 0);
+        assert!(!path.exists());
+
+        // A subsequent successful flush makes the record durable.
+        wal.flush_all().unwrap();
+        let recovered = read_wal_segment(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(wal.flushed_count(), 1);
+    }
+
+    #[test]
+    fn in_memory_flush_writes_no_segment() {
+        // The default buffer is in-memory only: flush advances the watermark but touches no disk.
+        let mut wal = WalBuffer::new();
+        assert!(!wal.is_durable());
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"a".to_vec(),
+        });
+        wal.flush_all().unwrap();
+        assert_eq!(wal.flushed_count(), 1);
+        assert_eq!(wal.group_commit_stats(), WalGroupCommitStats::default());
+    }
+
+    #[test]
+    fn reinstate_durable_records_seeds_flushed_prefix() {
+        let mut wal = WalBuffer::new();
+        wal.reinstate_durable_records(vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"a".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"b".to_vec(),
+            },
+        ]);
+        assert_eq!(wal.len(), 2);
+        assert_eq!(wal.flushed_count(), 2);
+        assert_eq!(wal.unflushed_count(), 0);
     }
 
     #[test]

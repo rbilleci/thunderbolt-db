@@ -56,7 +56,7 @@ use gpu_db_wal::{
     write_wal_control_file, write_wal_segment, WalArchiveManifest, WalArchiveObjectBackup,
     WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalArchiveTimeline,
     WalArchiveTimelineBranch, WalArchiveTimelinePrunePlan, WalArchiveTimelineRegistry,
-    WalArchiveTimelineSelection, WalBuffer, WalControlFile, WalRecord,
+    WalArchiveTimelineSelection, WalBuffer, WalControlFile, WalGroupCommitStats, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -8984,8 +8984,74 @@ impl Engine {
         s
     }
 
+    /// A fresh engine whose commit path is **crash-durable**: every committed mutation's WAL record
+    /// is fsynced to `segment_path` (file bytes + parent-directory entry) before the commit becomes
+    /// visible (`visible_up_to` is bumped). The default [`Engine::new_local`] keeps the WAL purely
+    /// in-memory; this is the constructor to use when durability is required.
+    pub fn with_durable_wal_segment(segment_path: impl Into<std::path::PathBuf>) -> Self {
+        Self::with_durable_wal_segment_and_planner_config(segment_path, PlannerConfig::default())
+    }
+
+    pub fn with_durable_wal_segment_and_planner_config(
+        segment_path: impl Into<std::path::PathBuf>,
+        planner_cfg: PlannerConfig,
+    ) -> Self {
+        let mut engine = Self::with_planner_config(planner_cfg);
+        engine.wal = WalBuffer::with_durable_segment(segment_path);
+        engine
+    }
+
+    /// Open (recover) a durable database from an existing WAL `segment_path` and keep writing to it.
+    ///
+    /// On crash recovery this is the realistic entry point: it replays every record that was fsync-
+    /// durable in the segment — reconstructing exactly the committed state, since each record is
+    /// re-applied through [`Engine::commit_mutation`], which re-derives the MVCC stamp from the
+    /// commit `Index` (Stage 0 stamp/boundary unification) — and then continues to append durably to
+    /// the same segment. A torn or partially-written trailing record is rejected by the segment's
+    /// CRC at [`read_wal_segment`] time, so a commit whose fsync did not complete is never replayed
+    /// (no visible-but-not-durable state). If the segment does not exist yet, this behaves like
+    /// [`Engine::with_durable_wal_segment`] (a fresh durable database).
+    pub fn open_durable_wal_segment(
+        segment_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, EngineError> {
+        Self::open_durable_wal_segment_with_planner_config(segment_path, PlannerConfig::default())
+    }
+
+    pub fn open_durable_wal_segment_with_planner_config(
+        segment_path: impl AsRef<std::path::Path>,
+        planner_cfg: PlannerConfig,
+    ) -> Result<Self, EngineError> {
+        let segment_path = segment_path.as_ref();
+        let recovered_records = if segment_path.exists() {
+            read_wal_segment(segment_path)?
+        } else {
+            Vec::new()
+        };
+        let mut engine = Self::with_planner_config(planner_cfg);
+        // Replay the durable prefix WITHOUT a durable backing so the replay does not rewrite the
+        // segment on every record; then install the durable segment so post-recovery commits append
+        // durably to the same file. The replayed records are then re-marked durable so the segment
+        // (rewritten on the next commit's flush) continues to include them.
+        for record in &recovered_records {
+            engine.commit_mutation(record.txn_id, record.payload.clone())?;
+        }
+        engine.wal = WalBuffer::with_durable_segment(segment_path);
+        engine.wal.reinstate_durable_records(recovered_records);
+        Ok(engine)
+    }
+
     pub fn simulate_next_wal_flush_failure(&mut self) {
         self.wal.fail_next_flush();
+    }
+
+    /// Group-commit accounting for the live WAL (fsync groups, durable records, largest group).
+    pub fn wal_group_commit_stats(&self) -> WalGroupCommitStats {
+        self.wal.group_commit_stats()
+    }
+
+    /// Whether the engine's commit path is crash-durable (WAL fsynced before visibility).
+    pub fn wal_is_durable(&self) -> bool {
+        self.wal.is_durable()
     }
 
     pub fn mark_gpu_unavailable(&mut self, gpu_id: u16) {
@@ -50314,6 +50380,157 @@ mod tests {
             }
         );
         assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
+    }
+
+    // Query the `id` values from `people`, sorted, for crash-recovery assertions.
+    fn select_people_ids(engine: &mut Engine) -> Vec<i32> {
+        let Command::Select(select) = parse_command("SELECT id FROM people ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = engine.execute_relational_select(&select).unwrap();
+        result
+            .rows
+            .into_iter()
+            .map(|row| match row.into_iter().next().unwrap() {
+                SqlValue::Int4(v) => v,
+                other => panic!("expected Int4, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn durable_engine_recovers_committed_rows_after_simulated_crash() {
+        let path = test_wal_path("durable-recover");
+
+        // --- session 1: a durable engine commits two statements, then "crashes" (is dropped). ---
+        {
+            let mut e = Engine::with_durable_wal_segment(&path);
+            assert!(e.wal_is_durable());
+            e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+                .unwrap();
+            e.execute_text(
+                2,
+                "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+            )
+            .unwrap();
+            // Each committed statement fsynced its WAL before becoming visible.
+            assert!(e.wal_group_commit_stats().flush_groups >= 2);
+            assert_eq!(e.wal_unflushed_count(), 0);
+        } // engine dropped == process crash; only the fsynced segment survives.
+
+        // --- session 2: reopen from the durable segment. The committed effects must survive. ---
+        let mut recovered = Engine::open_durable_wal_segment(&path).unwrap();
+        assert!(recovered.wal_is_durable());
+        assert_eq!(recovered.wal_flushed_count(), 2);
+        assert_eq!(select_people_ids(&mut recovered), vec![1, 2]);
+
+        // Post-recovery commits keep appending durably to the SAME segment (history preserved).
+        recovered
+            .execute_text(3, "INSERT INTO people (id, name) VALUES (3, 'Grace')")
+            .unwrap();
+        drop(recovered);
+        let mut reopened = Engine::open_durable_wal_segment(&path).unwrap();
+        assert_eq!(reopened.wal_flushed_count(), 3);
+        assert_eq!(select_people_ids(&mut reopened), vec![1, 2, 3]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn durable_engine_does_not_recover_a_txn_whose_wal_fsync_failed() {
+        // The precise WAL-before-visibility boundary: a commit whose WAL fsync does NOT complete
+        // must be neither durable NOR visible — no torn state, no visible-but-not-durable row.
+        let path = test_wal_path("durable-fsync-boundary");
+
+        let mut e = Engine::with_durable_wal_segment(&path);
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        // txn 1 (CREATE) and txn 2 (INSERT id=1) are fsync-durable and visible.
+        assert_eq!(select_people_ids(&mut e), vec![1]);
+        let durable_before = e.wal_flushed_count();
+        assert_eq!(durable_before, 2);
+
+        // Now the next WAL fsync fails mid-commit (kill-mid-commit). The commit must abort.
+        e.simulate_next_wal_flush_failure();
+        let failed = e.execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Linus')");
+        assert!(
+            matches!(
+                failed,
+                Err(ExecuteError::Engine(EngineError::Durability(_)))
+            ),
+            "expected the fsync-failed commit to abort with a durability error, got {failed:?}"
+        );
+
+        // The failed txn is invisible in the SAME (live) session: not durable, not applied.
+        assert_eq!(e.wal_flushed_count(), durable_before);
+        assert_eq!(select_people_ids(&mut e), vec![1]);
+
+        // "Crash" and recover from the durable segment: only the fsync-durable txns come back;
+        // the failed INSERT (id=2) is absent.
+        drop(e);
+        let mut recovered = Engine::open_durable_wal_segment(&path).unwrap();
+        assert_eq!(recovered.wal_flushed_count(), 2);
+        assert_eq!(
+            select_people_ids(&mut recovered),
+            vec![1],
+            "a txn whose WAL fsync did not complete must not be visible after recovery"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn durable_recovery_rejects_a_torn_trailing_record() {
+        // A crash that leaves a partially-written (torn) trailing record on disk must be detected
+        // by the segment CRC at recovery time — recovery fails loudly rather than replaying garbage
+        // or silently truncating, so there is never torn state.
+        let path = test_wal_path("durable-torn");
+        {
+            let mut e = Engine::with_durable_wal_segment(&path);
+            e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+                .unwrap();
+            e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+                .unwrap();
+        }
+
+        // Corrupt the last byte of the durable segment (simulates a torn write of the last record).
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        std::fs::write(&path, bytes).unwrap();
+
+        let result = Engine::open_durable_wal_segment(&path);
+        let _ = std::fs::remove_file(&path);
+        match result {
+            Err(EngineError::Durability(msg)) => {
+                assert!(
+                    msg.contains("checksum mismatch"),
+                    "expected a CRC durability error for a torn record, got {msg:?}"
+                );
+            }
+            Err(other) => panic!("expected a CRC durability error, got {other:?}"),
+            Ok(_) => panic!("expected recovery to reject a torn trailing record"),
+        }
+    }
+
+    #[test]
+    fn open_durable_wal_segment_on_missing_path_is_a_fresh_durable_db() {
+        let path = test_wal_path("durable-fresh");
+        assert!(!path.exists());
+        let mut e = Engine::open_durable_wal_segment(&path).unwrap();
+        assert!(e.wal_is_durable());
+        assert_eq!(e.wal_flushed_count(), 0);
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO people (id, name) VALUES (7, 'Ada')")
+            .unwrap();
+        drop(e);
+
+        let mut recovered = Engine::open_durable_wal_segment(&path).unwrap();
+        assert_eq!(select_people_ids(&mut recovered), vec![7]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
