@@ -3314,6 +3314,7 @@ fn launch_cuda_resident_i32_equal_project(
     .param .s32 needle2,
     .param .s32 needle3,
     .param .u64 out_values_ptr,
+    .param .u64 out_row_indices_ptr,
     .param .u64 out_count_ptr
 )
 {
@@ -3341,6 +3342,7 @@ fn launch_cuda_resident_i32_equal_project(
     .reg .u64 %projection_offset2;
     .reg .u64 %projection_offset3;
     .reg .u64 %out_values;
+    .reg .u64 %out_row_indices;
     .reg .u64 %out_count;
     .reg .u64 %row_byte;
     .reg .u64 %addr;
@@ -3371,6 +3373,7 @@ fn launch_cuda_resident_i32_equal_project(
     ld.param.s32 %needle2, [needle2];
     ld.param.s32 %needle3, [needle3];
     ld.param.u64 %out_values, [out_values_ptr];
+    ld.param.u64 %out_row_indices, [out_row_indices_ptr];
     ld.param.u64 %out_count, [out_count_ptr];
 
     mov.u32 %r_tid, %tid.x;
@@ -3422,6 +3425,11 @@ MATCHED:
     mov.u32 %one, 1;
     atom.global.add.u32 %slot, [%out_count], %one;
     cvt.u64.u32 %slot64, %slot;
+
+    mul.lo.u64 %out_addr, %slot64, 8;
+    add.u64 %out_addr, %out_row_indices, %out_addr;
+    st.global.u64 [%out_addr], %idx;
+
     cvt.u64.u32 %projection_count64, %projection_count;
     mul.lo.u64 %base_slot, %slot64, %projection_count64;
     mul.lo.u64 %base_slot, %base_slot, 4;
@@ -3531,6 +3539,17 @@ DONE:
     // Reused buffers are NOT zeroed; only the atomic-append counter is memset, and only
     // [0, count) is read back, so stale bytes in the values buffer are never observed.
     let values_guard = resident.primary().lease_device_buffer(output_bytes)?;
+    // Stable-order fix (Thread-3 Stage 4): the kernel now also tags each match with its `row_index`
+    // (one `st.global.u64` per match) into this buffer, so the host can sort the atomic-append
+    // output into deterministic ASCENDING row order — the same fix `4b750a94` applied to the
+    // `row_indices` route. Sized to worst-case row_count; only [0, count) is read back.
+    let row_indices_bytes = usize::try_from(
+        row_count
+            .checked_mul(std::mem::size_of::<u64>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let row_indices_guard = resident.primary().lease_device_buffer(row_indices_bytes)?;
     let count_guard = resident
         .primary()
         .lease_device_buffer(std::mem::size_of::<u32>())?;
@@ -3563,6 +3582,7 @@ DONE:
         projected_offsets[idx] = *offset;
     }
     let mut output_arg = values_guard.ptr;
+    let mut row_indices_arg = row_indices_guard.ptr;
     let mut count_arg = count_guard.ptr;
     let mut args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
@@ -3582,6 +3602,7 @@ DONE:
         (&mut needles[2] as *mut i32).cast::<c_void>(),
         (&mut needles[3] as *mut i32).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut row_indices_arg as *mut u64).cast::<c_void>(),
         (&mut count_arg as *mut u64).cast::<c_void>(),
     ];
     let threads_per_block = 128;
@@ -3620,22 +3641,112 @@ DONE:
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     let projection_count = projection_offsets.len();
     let mut values = vec![0_i32; match_count_usize.saturating_mul(projection_count)];
-    if !values.is_empty() {
-        check_cuda(unsafe {
-            cu_memcpy_dtoh(
-                values.as_mut_ptr().cast::<c_void>(),
+    let mut row_indices = vec![0_u64; match_count_usize];
+    // The two result arrays (`values` and the Stage-4 `row_indices` order tags) are read back
+    // TOGETHER behind ONE covering `cuStreamSynchronize`: both are staged async on the same pooled
+    // private stream so the second copy overlaps the first on the copy engine — folding the
+    // Stage-4 `row_indices` readback into the existing value transfer with ZERO added synchronous
+    // round-trips (it was a separate blocking NULL-stream `cuMemcpyDtoH`, a fixed ~6-7 µs p50
+    // regression including the 1-row point lookup, when added as a third serial barrier). On an old
+    // driver lacking the async/pinned symbols the route keeps the original blocking copies, so
+    // correctness is unconditional and only the overlap is best-effort. `values`/`row_indices` are
+    // each read back only over their populated [0, match_count) prefix (`vec![..]` length), so the
+    // worst-case device buffers' stale tails are never observed.
+    if !values.is_empty() || !row_indices.is_empty() {
+        if let Some(dtoh_async) = resident.primary().cu_memcpy_dtoh_async {
+            resident.primary().set_current()?;
+            struct StreamLease<'a> {
+                primary: &'a GpuPrimaryContext,
+                pooled: Option<PooledStream>,
+            }
+            impl Drop for StreamLease<'_> {
+                fn drop(&mut self) {
+                    if let Some(pooled) = self.pooled.take() {
+                        self.primary.release_pooled_stream(pooled);
+                    }
+                }
+            }
+            let lease = StreamLease {
+                primary: resident.primary(),
+                pooled: Some(resident.primary().acquire_pooled_stream()?),
+            };
+            let stream = lease
+                .pooled
+                .as_ref()
+                .expect("pooled stream just set")
+                .stream;
+            // Drain the stream FIRST on any error from an enqueued async copy (before the leases
+            // unwind), so a buffer is never returned to the pool while a copy is still in flight —
+            // the same drain-before-release contract the text route's staged D2H uses.
+            let drain_err = |err: CudaRuntimeProbeError| -> CudaRuntimeProbeError {
+                unsafe {
+                    let _ = (resident.primary().cu_stream_synchronize)(stream);
+                }
+                err
+            };
+            let values_pinned = stage_result_dtoh_async(
+                resident.primary(),
+                dtoh_async,
+                stream,
                 values_guard.ptr,
-                values.len() * std::mem::size_of::<i32>(),
+                &mut values,
             )
-        })?;
+            .map_err(drain_err)?;
+            let row_indices_pinned = stage_result_dtoh_async(
+                resident.primary(),
+                dtoh_async,
+                stream,
+                row_indices_guard.ptr,
+                &mut row_indices,
+            )
+            .map_err(drain_err)?;
+            // Covering sync: drains on its own error too (both copies are still enqueued).
+            check_cuda(unsafe { (resident.primary().cu_stream_synchronize)(stream) })
+                .map_err(drain_err)?;
+            copy_pinned_into(&values_pinned, &mut values);
+            copy_pinned_into(&row_indices_pinned, &mut row_indices);
+            drop(lease);
+        } else {
+            // ---- legacy blocking default-stream fallback (old driver: no async/pinned symbols) ----
+            if !values.is_empty() {
+                check_cuda(unsafe {
+                    cu_memcpy_dtoh(
+                        values.as_mut_ptr().cast::<c_void>(),
+                        values_guard.ptr,
+                        values.len() * std::mem::size_of::<i32>(),
+                    )
+                })?;
+            }
+            if !row_indices.is_empty() {
+                check_cuda(unsafe {
+                    cu_memcpy_dtoh(
+                        row_indices.as_mut_ptr().cast::<c_void>(),
+                        row_indices_guard.ptr,
+                        row_indices.len() * std::mem::size_of::<u64>(),
+                    )
+                })?;
+            }
+        }
     }
 
     drop(count_guard);
+    drop(row_indices_guard);
     drop(values_guard);
-    Ok(values
+    // Deterministic ASCENDING row order (the `4b750a94` contract for resident projection routes):
+    // the kernel appends matches in `atom.global.add` SCHEDULE order, ascending only within a
+    // single warp (<=32 matches); for >32 the append order is non-deterministic across warps. Pair
+    // each projected row with its tagged `row_index` and sort ascending so this route returns rows
+    // identical to the CPU/non-resident reference AND byte-identical to the batched `equal_any`
+    // path (which applies the same ascending sort in the engine result assembly). O(k log k)
+    // host-side, dominated by the existing per-row D2H gather; for the <=1-row point-lookup shape
+    // it is a no-op.
+    let mut rows = values
         .chunks_exact(projection_count)
-        .map(|row| row.to_vec())
-        .collect())
+        .zip(row_indices)
+        .map(|(row, row_index)| (row_index, row.to_vec()))
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(row_index, _)| *row_index);
+    Ok(rows.into_iter().map(|(_, row)| row).collect())
 }
 
 fn submit_cuda_resident_i32_equal_any_project<R: CudaResidentReadSource>(
@@ -11677,6 +11788,111 @@ mod tests {
                 got, expected,
                 "multi-warp row_indices were not ascending on iteration {iter} \
                  — the host sort over [0, count) is missing or ineffective?"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_resident_i32_equal_project_multi_warp_returns_ascending_row_order() {
+        // Coverage gap closer for the Thread-3 Stage-4 stable-order fix on the FUSED single-needle
+        // multi-column projection kernel (`gpu_db_resident_i32_equal_project`). Like the
+        // `row_indices` kernel, it appends each match via `atom.global.add`, so the physical order
+        // in the output buffer is the atomic SCHEDULE order — ascending-by-row ONLY within a single
+        // warp (<= 32 matches with threads_per_block=128). Past that the cross-warp append order is
+        // non-deterministic. The fix tags each match with its `row_index` and sorts the rows
+        // ascending host-side; this asserts the EXACT ascending-by-row projection for a multi-warp
+        // payload, byte-identical to the CPU/non-resident reference and to the batched `equal_any`
+        // path.
+        //
+        // Why NON-VACUOUS (would fail/flake WITHOUT the sort): the projected VALUES are a by-row
+        // SCRAMBLED sequence (a hash of the row index), so the correct ascending-by-row output is
+        // deliberately NOT sorted-by-value. An atomic-append (sort-less) impl emits matches in
+        // schedule order — non-deterministic across the racing warps, essentially never this exact
+        // by-row sequence; a "sort the values" shortcut would emit them value-sorted, which this
+        // sequence is not. Only an ascending-by-`row_index` sort reproduces the asserted vector. We
+        // assert the expected sequence is not already value-sorted and run the route 50× (a
+        // schedule-ordered impl flakes across iterations).
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        // Two i32 columns: a FILTER column (needle 7 on even rows, -1 on odd) and a PROJECTION
+        // column holding a positive by-row hash (scrambled vs row order). 300 rows => 150 matches
+        // (>> 32, across multiple warps/blocks).
+        const ROW_COUNT: u64 = 300;
+        const NEEDLE: i32 = 7;
+        let filter_offset = std::mem::size_of::<u64>() as u64;
+        let proj_offset = filter_offset + ROW_COUNT * std::mem::size_of::<i32>() as u64;
+        let row_value = |row: u64| -> i32 {
+            let h = row.wrapping_mul(2_654_435_761) ^ (row << 13) ^ 0x9E37_79B9;
+            (1 + (h % 1_000_000)) as i32
+        };
+        let filter_col: Vec<i32> = (0..ROW_COUNT)
+            .map(|row| if row % 2 == 0 { NEEDLE } else { -1 })
+            .collect();
+        let proj_col: Vec<i32> = (0..ROW_COUNT).map(row_value).collect();
+        // Reference: matching rows (even) in ASCENDING ROW ORDER, projecting [filter, proj].
+        let expected: Vec<Vec<i32>> = (0..ROW_COUNT)
+            .filter(|row| row % 2 == 0)
+            .map(|row| vec![NEEDLE, row_value(row)])
+            .collect();
+        assert!(
+            expected.len() > 32,
+            "test must use a multi-warp match count to exercise the cross-warp append order"
+        );
+        // The projected (second-column) by-row sequence must NOT already be value-sorted, or a
+        // "sort the values" impl would pass vacuously.
+        let proj_by_row: Vec<i32> = expected.iter().map(|row| row[1]).collect();
+        let mut proj_sorted = proj_by_row.clone();
+        proj_sorted.sort_unstable();
+        assert_ne!(
+            proj_by_row, proj_sorted,
+            "projected by-row sequence is accidentally value-sorted — pick a payload that isn't"
+        );
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&ROW_COUNT.to_le_bytes());
+        let mut filter_bytes = Vec::new();
+        for value in &filter_col {
+            filter_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut proj_bytes = Vec::new();
+        for value in &proj_col {
+            proj_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let allocated_len = proj_offset + proj_bytes.len() as u64;
+        let resident = runtime
+            .retain_device_memory_chunks(
+                0,
+                allocated_len,
+                &[
+                    CudaDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: &header,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: filter_offset,
+                        bytes: &filter_bytes,
+                    },
+                    CudaDeviceMemoryChunk {
+                        byte_offset: proj_offset,
+                        bytes: &proj_bytes,
+                    },
+                ],
+            )
+            .expect("retain resident device memory");
+
+        for iter in 0..50 {
+            let got = resident
+                .match_project_i32_equal_from_payload(
+                    &[(filter_offset, NEEDLE)],
+                    &[filter_offset, proj_offset],
+                    ROW_COUNT,
+                )
+                .expect("multi-warp match_project_i32_equal");
+            assert_eq!(
+                got, expected,
+                "multi-warp equal_project rows were not in ascending ROW order on iteration {iter} \
+                 — the host sort by tagged row_index is missing or ineffective?"
             );
         }
     }

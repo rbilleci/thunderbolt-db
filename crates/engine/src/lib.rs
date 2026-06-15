@@ -15883,17 +15883,35 @@ impl Engine {
             .try_into()
             .unwrap_or(u64::MAX);
         let materialize_started = Instant::now();
-        let mut rows_by_select = vec![Vec::new(); pending.members.len()];
+        // Stable-order fix (Thread-3 Stage 4): the `equal_any` kernel appends matches in
+        // `atom.global.add` SCHEDULE order, which is non-deterministic for >32 matches (multi-warp)
+        // and differs from the per-query path's order. Tag each scattered row with the kernel's
+        // `row_index` and sort each needle's slice ASCENDING by it, so the batched output is
+        // deterministic and byte-identical to the per-query ascending order (the `row_indices`
+        // order class established by `4b750a94`). For the single-column self-projection every value
+        // equals the needle, so this reorder is a no-op on the emitted value sequence (it only
+        // makes the output deterministic); for multi-column the projected values differ per row, so
+        // the sort is load-bearing for parity.
+        let mut rows_by_select: Vec<Vec<(u64, Vec<SqlValue>)>> =
+            vec![Vec::new(); pending.members.len()];
         for projected in &projected_rows {
-            rows_by_select[projected.needle_index].push(
+            rows_by_select[projected.needle_index].push((
+                projected.row_index,
                 projected
                     .values
                     .iter()
                     .copied()
                     .map(SqlValue::Int4)
                     .collect::<Vec<_>>(),
-            );
+            ));
         }
+        let rows_by_select: Vec<Vec<Vec<SqlValue>>> = rows_by_select
+            .into_iter()
+            .map(|mut slice| {
+                slice.sort_by_key(|(row_index, _)| *row_index);
+                slice.into_iter().map(|(_, row)| row).collect()
+            })
+            .collect();
         let materialization_micros = materialize_started
             .elapsed()
             .as_micros()
@@ -20070,7 +20088,15 @@ impl Engine {
             .try_into()
             .unwrap_or(u64::MAX);
         let materialize_started = Instant::now();
-        let rows_by_select = if all_int4_projection {
+        // Stable-order fix (Thread-3 Stage 4): every branch below scatters matched rows into
+        // per-needle slices in the kernel's `atom.global.add` SCHEDULE order, which is
+        // non-deterministic for >32 matches (multi-warp). Tag each row with its kernel `row_index`
+        // and sort each needle's slice ASCENDING by it (after the branch), so the output is
+        // deterministic and byte-identical to the per-query ascending order (the `row_indices`
+        // order class established by `4b750a94`). The single-element delegation from the per-query
+        // mixed/multi-column path flows through here too, so the per-query and batched paths share
+        // this one sorted assembly and stay byte-identical by construction.
+        let rows_by_select: Vec<Vec<(u64, Vec<SqlValue>)>> = if all_int4_projection {
             let mut rows_by_select = vec![Vec::new(); members.len()];
             let projected_rows = projected_rows.as_ref().ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(
@@ -20079,14 +20105,15 @@ impl Engine {
                 ))
             })?;
             for projected in projected_rows {
-                rows_by_select[projected.needle_index].push(
+                rows_by_select[projected.needle_index].push((
+                    projected.row_index,
                     projected
                         .values
                         .iter()
                         .copied()
                         .map(SqlValue::Int4)
                         .collect::<Vec<_>>(),
-                );
+                ));
             }
             rows_by_select
         } else if let (Some(text_idx), Some(compact_rows)) =
@@ -20115,7 +20142,7 @@ impl Engine {
                         )))
                     })
                     .collect::<Result<Vec<_>, ExecuteError>>()?;
-                rows_by_select[projected.needle_index].push(row);
+                rows_by_select[projected.needle_index].push((projected.row_index, row));
             }
             rows_by_select
         } else {
@@ -20200,10 +20227,19 @@ impl Engine {
                         )))
                     })
                     .collect::<Result<Vec<_>, ExecuteError>>()?;
-                rows_by_select[projected.needle_index].push(row);
+                rows_by_select[projected.needle_index].push((projected.row_index, row));
             }
             rows_by_select
         };
+        // Apply the ascending-by-`row_index` order to every needle's slice (see the stable-order
+        // note above), then strip the index tag back to the materialized rows.
+        let rows_by_select: Vec<Vec<Vec<SqlValue>>> = rows_by_select
+            .into_iter()
+            .map(|mut slice| {
+                slice.sort_by_key(|(row_index, _)| *row_index);
+                slice.into_iter().map(|(_, row)| row).collect()
+            })
+            .collect();
         let materialization_micros = materialize_started
             .elapsed()
             .as_micros()
@@ -30132,6 +30168,218 @@ mod tests {
                 result.rows, expected_rows,
                 "partitioned multi-warp resident rows were not in ascending reference order on \
                  iteration {iter} — the resident route's host sort over [0, count) is missing?"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn p8_batched_multi_column_projection_matches_per_query_for_more_than_one_warp_of_matches() {
+        // Thread-3 Stage-4 ordered-parity gate (multi-column all-int4). The batched submit/complete
+        // path scatters rows per needle in the `equal_any` kernel's `atom.global.add` SCHEDULE
+        // order; the per-query path (`execute_relational_select` -> the multi-column probe) now sorts
+        // its fused `equal_project` output ascending-by-row_index. Both must return the SAME rows in
+        // the SAME (ascending) order for a MULTI-WARP match count (>32, where the atomic-append
+        // order is non-deterministic), so the batched output is byte-identical to the per-query path.
+        //
+        // Non-vacuous: the projected `seq` column is a by-row SCRAMBLED hash, so the ascending-by-row
+        // reference is NOT value-sorted and NOT the atomic-append order. WITHOUT the stable-order
+        // sort the batched scatter would emit a non-deterministic permutation (caught by the exact
+        // comparison and the 25× loop), and it would differ from the per-query path.
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE t (k INT, seq INT)")
+            .unwrap();
+        const NEEDLE: i32 = 7;
+        let rows: usize = 200; // even rows match => 100 matches >> 32 (multi-warp/multi-block).
+        let row_value = |row: usize| -> i32 {
+            let r = row as u64;
+            let h = r.wrapping_mul(2_654_435_761) ^ (r << 13) ^ 0x9E37_79B9;
+            (1 + (h % 1_000_000)) as i32
+        };
+        let mut values = String::new();
+        for row in 0..rows {
+            if row > 0 {
+                values.push_str(", ");
+            }
+            let k = if row % 2 == 0 {
+                NEEDLE
+            } else {
+                row as i32 + 1000
+            };
+            values.push_str(&format!("({k}, {})", row_value(row)));
+        }
+        e.execute_text(2, &format!("INSERT INTO t (k, seq) VALUES {values}"))
+            .unwrap();
+        e.populate_relational_residency_snapshot("t").unwrap();
+
+        let Command::Select(select) = parse_command("SELECT k, seq FROM t WHERE k = 7").unwrap()
+        else {
+            unreachable!()
+        };
+        let route = e.plan_relational_resident_route(&select);
+        if !route.accepted {
+            assert_eq!(
+                route.reason,
+                "resident snapshot has no retained device memory"
+            );
+            return;
+        }
+        assert_eq!(route.query_shape, "int4_equality_multi_column_projection");
+
+        // Ascending-by-row reference (independent of either GPU path).
+        let expected: Vec<Vec<SqlValue>> = (0..rows)
+            .filter(|row| row % 2 == 0)
+            .map(|row| vec![SqlValue::Int4(NEEDLE), SqlValue::Int4(row_value(row))])
+            .collect();
+        assert!(
+            expected.len() > 32,
+            "test must match more than one warp of rows"
+        );
+        // The projected by-row sequence must NOT already be value-sorted, else an atomic-append or
+        // value-sort impl would pass vacuously.
+        let proj_by_row: Vec<i32> = expected
+            .iter()
+            .map(|row| match row[1] {
+                SqlValue::Int4(v) => v,
+                _ => unreachable!(),
+            })
+            .collect();
+        let mut proj_sorted = proj_by_row.clone();
+        proj_sorted.sort_unstable();
+        assert_ne!(
+            proj_by_row, proj_sorted,
+            "projected by-row sequence is accidentally value-sorted — pick a payload that isn't"
+        );
+
+        for iter in 0..25 {
+            let per_query = e.execute_relational_select(&select).unwrap();
+            assert_eq!(
+                per_query.rows, expected,
+                "per-query multi-column rows not ascending-by-row on iteration {iter}"
+            );
+
+            let job = e.prepare_relational_retained_read_job(&select).unwrap();
+            let submission = e
+                .submit_relational_retained_read_jobs_with_resident_device_memory_probe(
+                    std::slice::from_ref(&job),
+                )
+                .unwrap();
+            let batched = e
+                .complete_relational_retained_read_submission(submission)
+                .unwrap();
+            assert_eq!(batched.len(), 1);
+            assert_eq!(
+                batched[0].rows, expected,
+                "batched multi-column rows not ascending-by-row on iteration {iter} \
+                 — the stable-order sort in the result assembly is missing or ineffective?"
+            );
+            assert_eq!(
+                batched[0].rows, per_query.rows,
+                "batched multi-column output diverged from the per-query path on iteration {iter}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn p8_batched_mixed_column_projection_matches_per_query_for_more_than_one_warp_of_matches() {
+        // Thread-3 Stage-4 ordered-parity gate (mixed int4/text). The batched path for the mixed
+        // shape falls through to `..._batch_inner` (the int4 `equal_any` fast path is int4-only), and
+        // the per-query mixed path delegates to the SAME `batch_inner`; both now sort each needle's
+        // slice ascending-by-row_index. They must return the SAME rows in the SAME order for a
+        // MULTI-WARP match count.
+        //
+        // Non-vacuous: the projected `label` text is a by-row SCRAMBLED value, so the ascending-by-row
+        // reference is neither value-sorted nor the atomic-append order. WITHOUT the sort the scatter
+        // is a non-deterministic permutation (caught by the exact comparison + the 25× loop).
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE t (k INT, label TEXT)")
+            .unwrap();
+        const NEEDLE: i32 = 7;
+        let rows: usize = 200; // even rows match => 100 matches >> 32.
+                               // Scrambled-by-row label so the ascending-by-row text order is not lexicographically sorted.
+        let label_value = |row: usize| -> String {
+            let r = row as u64;
+            let h = r.wrapping_mul(2_654_435_761) ^ (r << 13) ^ 0x9E37_79B9;
+            format!("L{:08}", h % 100_000_000)
+        };
+        let mut values = String::new();
+        for row in 0..rows {
+            if row > 0 {
+                values.push_str(", ");
+            }
+            let k = if row % 2 == 0 {
+                NEEDLE
+            } else {
+                row as i32 + 1000
+            };
+            values.push_str(&format!("({k}, '{}')", label_value(row)));
+        }
+        e.execute_text(2, &format!("INSERT INTO t (k, label) VALUES {values}"))
+            .unwrap();
+        e.populate_relational_residency_snapshot("t").unwrap();
+
+        let Command::Select(select) = parse_command("SELECT k, label FROM t WHERE k = 7").unwrap()
+        else {
+            unreachable!()
+        };
+        let route = e.plan_relational_resident_route(&select);
+        if !route.accepted {
+            assert_eq!(
+                route.reason,
+                "resident snapshot has no retained device memory"
+            );
+            return;
+        }
+        assert_eq!(route.query_shape, "int4_equality_mixed_column_projection");
+
+        let expected: Vec<Vec<SqlValue>> = (0..rows)
+            .filter(|row| row % 2 == 0)
+            .map(|row| vec![SqlValue::Int4(NEEDLE), SqlValue::Text(label_value(row))])
+            .collect();
+        assert!(
+            expected.len() > 32,
+            "test must match more than one warp of rows"
+        );
+        let label_by_row: Vec<String> = expected
+            .iter()
+            .map(|row| match &row[1] {
+                SqlValue::Text(v) => v.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let mut label_sorted = label_by_row.clone();
+        label_sorted.sort();
+        assert_ne!(
+            label_by_row, label_sorted,
+            "projected by-row label sequence is accidentally sorted — pick a payload that isn't"
+        );
+
+        for iter in 0..25 {
+            let per_query = e.execute_relational_select(&select).unwrap();
+            assert_eq!(
+                per_query.rows, expected,
+                "per-query mixed rows not ascending-by-row on iteration {iter}"
+            );
+
+            let job = e.prepare_relational_retained_read_job(&select).unwrap();
+            let submission = e
+                .submit_relational_retained_read_jobs_with_resident_device_memory_probe(
+                    std::slice::from_ref(&job),
+                )
+                .unwrap();
+            let batched = e
+                .complete_relational_retained_read_submission(submission)
+                .unwrap();
+            assert_eq!(batched.len(), 1);
+            assert_eq!(
+                batched[0].rows, expected,
+                "batched mixed rows not ascending-by-row on iteration {iter} \
+                 — the stable-order sort in the result assembly is missing or ineffective?"
+            );
+            assert_eq!(
+                batched[0].rows, per_query.rows,
+                "batched mixed output diverged from the per-query path on iteration {iter}"
             );
         }
     }

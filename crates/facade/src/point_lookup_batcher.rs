@@ -2,8 +2,12 @@
 //!
 //! Amortizes the per-call host-side CUDA driver-submit floor by coalescing many
 //! concurrent equality point-lookups into ONE GPU submission. It owns a single
-//! coalescer OS thread (Model 1: synchronous `complete` on that thread) and one
-//! route class (`int4_equality_projection`). The async ingress, instead of a
+//! coalescer OS thread (Model 1: synchronous `complete` on that thread). It batches
+//! every single-predicate int4-equality projection route class — `int4_equality_projection`
+//! (single column), `int4_equality_multi_column_projection` (multiple int4 columns), and
+//! `int4_equality_mixed_column_projection` (int4 + text) (Stage 4 widened this from the
+//! single-column class only); distinct shapes/tables form distinct `route_id` groups and so
+//! distinct engine submits. The async ingress, instead of a
 //! `spawn_blocking(execute_on_shared_engine)` per query, hands a batchable
 //! `SELECT` to [`PointLookupBatcher::enqueue`] and `await`s the returned
 //! `oneshot` while holding no semaphore permit (it is parked, not running).
@@ -95,8 +99,9 @@ impl PointLookupBatcher {
 
     /// Enqueue a batchable equality point-lookup and return the `oneshot` the
     /// caller `await`s. The caller is responsible for having classified `select`
-    /// as batchable (an `int4_equality_projection` on a resident, valid-generation
-    /// table) — see [`crate::execute_on_shared_engine_batched`]. If the coalescer
+    /// as batchable (a single-predicate int4-equality projection — single-column,
+    /// multi-column, or mixed int4/text — on a resident, valid-generation table) —
+    /// see [`crate::execute_on_shared_engine_batched`]. If the coalescer
     /// has already shut down, the returned receiver resolves immediately to an
     /// error (the sender drops), so callers never hang.
     pub fn enqueue(
