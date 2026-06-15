@@ -380,13 +380,14 @@ pub async fn serve_async_with_permits(
 /// `serve_async` over a caller-provided shared engine — e.g. one pre-warmed to GPU residency
 /// before serving (the GPU-retained benchmark).
 ///
-/// **A/B gate (Thread-3 Stage 1).** If the environment variable `GPU_DB_BATCHING` is set to a
-/// truthy value (`1`/`true`/`on`/`yes`, case-insensitive), batchable point-lookups are routed
-/// through a shared [`PointLookupBatcher`] (one coalescer thread, one GPU submission per batch)
-/// and the connection task `await`s a `oneshot` while holding no semaphore permit; every other
-/// statement keeps the unchanged per-query `spawn_blocking` path. When the flag is off (default)
-/// the server behaves exactly as before — this is the OFF arm of the Stage-1 A/B comparison.
-/// `serve_async_with_engine_batching` sets the flag explicitly for benchmarks.
+/// **Point-lookup batching (Thread-3, default ON).** By default batchable point-lookups are
+/// routed through a shared [`PointLookupBatcher`] (one coalescer thread, one GPU submission per
+/// batch) and the connection task `await`s a `oneshot` while holding no semaphore permit; every
+/// other statement keeps the unchanged per-query `spawn_blocking` path. Batching is `>=` the
+/// per-query path at every concurrency (≈parity at c1 via the adaptive `max_wait`, 3.7-4.7× at
+/// high concurrency) and produces byte-identical results, so it is on unless explicitly disabled.
+/// Set `GPU_DB_BATCHING=0` (or `false`/`off`/`no`) to fall back to the per-query path.
+/// `serve_async_with_engine_batching` sets the arm explicitly for benchmarks.
 pub async fn serve_async_with_engine(
     listener: TokioTcpListener,
     engine: Arc<SharedEngine>,
@@ -401,14 +402,27 @@ pub async fn serve_async_with_engine(
     .await
 }
 
-/// Read the `GPU_DB_BATCHING` A/B flag from the environment (default off).
+/// Read the `GPU_DB_BATCHING` flag from the environment. **Default ON** (Thread-3 default-on):
+/// when the variable is unset, or set to anything other than an explicit off value, batching is
+/// enabled. The escape hatch `GPU_DB_BATCHING=0`/`false`/`off`/`no` (case-insensitive) disables
+/// it and restores the unchanged per-query path.
 fn batching_enabled_from_env() -> bool {
-    std::env::var("GPU_DB_BATCHING")
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "1" | "true" | "on" | "yes")
-        })
-        .unwrap_or(false)
+    parse_batching_flag(std::env::var("GPU_DB_BATCHING").ok().as_deref())
+}
+
+/// Pure decode of the `GPU_DB_BATCHING` value (`None` ⇒ unset). **Default ON**: `None`, an empty
+/// value, or any value other than an explicit off token enables batching; only `0`/`false`/`off`/
+/// `no` (case-insensitive, surrounding whitespace ignored) disables it. Kept separate from the
+/// `std::env` read so it is unit-testable without mutating process-global env in parallel tests.
+fn parse_batching_flag(value: Option<&str>) -> bool {
+    match value {
+        // Only an explicit off token disables batching; unset and everything else stays default-on.
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// `serve_async_with_engine` with the point-lookup batching A/B arm chosen explicitly (instead
@@ -522,7 +536,7 @@ async fn run_async_query_loop(
                         )
                         .await?
                     }
-                    // Batching OFF (default A/B arm): the original path, unchanged.
+                    // Batching OFF (GPU_DB_BATCHING=0 escape hatch): the original path, unchanged.
                     None => {
                         let _permit = executor.acquire().await.map_err(|err| err.to_string())?;
                         let engine = Arc::clone(engine);
@@ -676,4 +690,44 @@ async fn read_tagged_frame_async(stream: &mut TokioTcpStream) -> Result<Option<V
         .await
         .map_err(|err| err.to_string())?;
     Ok(Some(frame))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_batching_flag;
+
+    /// Thread-3 default-on: an unset `GPU_DB_BATCHING` enables batching. A default-started
+    /// async server (no env) therefore constructs a `PointLookupBatcher` and routes batchable
+    /// point-lookups through it. (Decoded via the pure helper so the test does not mutate
+    /// process-global env, which is racy across the parallel test runner.)
+    #[test]
+    fn batching_defaults_on_when_unset() {
+        assert!(parse_batching_flag(None));
+    }
+
+    /// The disable escape hatch: `0`/`false`/`off`/`no` (case-insensitive, whitespace-tolerant)
+    /// turns batching off and restores the per-query path.
+    #[test]
+    fn explicit_off_values_disable_batching() {
+        for off in ["0", "false", "off", "no", "FALSE", "Off", "  no  "] {
+            assert!(
+                !parse_batching_flag(Some(off)),
+                "{off:?} should disable batching"
+            );
+        }
+    }
+
+    /// Everything that is not an explicit off token keeps the default-on behavior — including
+    /// the historical truthy values and any unrecognized/empty value (fail safe = on).
+    #[test]
+    fn truthy_and_unrecognized_values_keep_batching_on() {
+        for on in [
+            "1", "true", "on", "yes", "TRUE", "On", "", "enabled", "garbage",
+        ] {
+            assert!(
+                parse_batching_flag(Some(on)),
+                "{on:?} should keep batching on"
+            );
+        }
+    }
 }
