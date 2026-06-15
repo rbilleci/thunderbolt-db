@@ -50,12 +50,89 @@ use tokio::sync::oneshot;
 
 use crate::{map_column, map_value, DbError, ErrorCategory, QueryOutcome, SharedEngine};
 
-/// Default flush triggers. At connection-count 1 a batch is size-1 (the time
-/// trigger fires almost immediately), so there is no single-client regression;
-/// at high concurrency the count trigger fires first and never waits for the
-/// timer. These are the Stage-1 starting point — Stage 2 sweeps them.
+/// Default flush triggers. `max_wait` is now the *ceiling* of an adaptive wait
+/// (see [`AdaptiveWait`]): at connection-count 1 a lone request flushes with
+/// ~zero wait (no partner to coalesce with, so paying the timer is pure cost),
+/// while at high concurrency the wait opens back up to this ceiling so full
+/// batches still form. The count trigger (`max_items`) is unchanged and still
+/// short-circuits the wait the instant a batch fills. These are the Stage-1
+/// starting point — Stage 2 sweeps them.
 const DEFAULT_MAX_ITEMS: usize = 32;
 const DEFAULT_MAX_WAIT: Duration = Duration::from_micros(50);
+
+/// EWMA smoothing factor for the recent-batch-size signal that drives the
+/// adaptive wait. Higher ⇒ reacts faster to a change in offered concurrency;
+/// lower ⇒ steadier. 0.3 reaches ~90% of a step change in ~6 batches, fast
+/// enough to open up within a burst yet damped against single-batch noise.
+const ADAPTIVE_EWMA_ALPHA: f64 = 0.3;
+
+/// The adaptive-wait controller. It turns a cheap "is coalescing actually
+/// happening?" signal into the *effective* time the coalescer is willing to hold
+/// a partial batch open, between 0 and the configured `max_wait` ceiling.
+///
+/// ## Signal
+/// An EWMA of recent flushed batch sizes (`ewma_batch_size`). At rest under a
+/// lone client every batch is size 1, so the EWMA sits at ~1; under real
+/// concurrency batches grow and the EWMA climbs toward `max_items`.
+///
+/// ## Effective wait
+/// `effective = max_wait * frac`, where `frac = (ewma - 1) / (max_items - 1)`
+/// clamped to `[0, 1]`. So a lone client (ewma≈1 ⇒ frac≈0) pays ~0 wait, and a
+/// saturated client (ewma≈max_items ⇒ frac≈1) waits the full ceiling. This is
+/// the *steady-state* term; the inner loop additionally forces the full ceiling
+/// the moment a partner is observed to be already queued (see `coalescer_loop`),
+/// so a burst coalesces immediately without waiting for the EWMA to ramp.
+///
+/// ## Bound (no starvation)
+/// `effective_wait` is by construction `<= max_wait` (frac is clamped to ≤ 1),
+/// and the coalescer always also clamps it against the batcher's real
+/// `time_until_flush_deadline`. A request can therefore NEVER be held past the
+/// configured `max_wait` regardless of the adaptation — the adaptation only ever
+/// shortens the wait, never lengthens it past the ceiling.
+#[derive(Debug)]
+struct AdaptiveWait {
+    max_wait: Duration,
+    max_items: usize,
+    ewma_batch_size: f64,
+}
+
+impl AdaptiveWait {
+    fn new(max_items: usize, max_wait: Duration) -> Self {
+        Self {
+            max_wait,
+            max_items,
+            // Seed at 1.0 (a lone request) so a cold batcher starts in the
+            // ~no-wait regime and only opens up once it observes coalescing.
+            ewma_batch_size: 1.0,
+        }
+    }
+
+    /// The effective wait the coalescer should be willing to hold a partial batch
+    /// open for *right now*, derived purely from the steady-state EWMA signal.
+    /// Always in `[0, max_wait]`.
+    fn effective_wait(&self) -> Duration {
+        // `max_items == 1` means the count trigger fires on the first item, so a
+        // partial batch is never held and the wait is irrelevant; report 0.
+        if self.max_items <= 1 {
+            return Duration::ZERO;
+        }
+        let span = (self.max_items - 1) as f64;
+        // `clamp` passes NaN through and `Duration::mul_f64(NaN)` panics; the EWMA is seeded at
+        // 1.0 and updated only with finite non-negative samples, so `frac` is finite today — guard
+        // the wait math anyway so no future signal source can panic the coalescer thread.
+        let frac = ((self.ewma_batch_size - 1.0) / span).clamp(0.0, 1.0);
+        let frac = if frac.is_finite() { frac } else { 0.0 };
+        self.max_wait.mul_f64(frac)
+    }
+
+    /// Fold one flushed batch's size into the EWMA. Called after every flush so
+    /// the controller tracks the *actual* recent coalescing rate.
+    fn record_batch(&mut self, batch_size: usize) {
+        let sample = batch_size as f64;
+        self.ewma_batch_size =
+            ADAPTIVE_EWMA_ALPHA * sample + (1.0 - ADAPTIVE_EWMA_ALPHA) * self.ewma_batch_size;
+    }
+}
 
 /// One batchable point-lookup request: a parsed `SELECT`, its int4 needle, and
 /// the `oneshot` sender the coalescer answers on. `route_id` is filled in by the
@@ -86,15 +163,40 @@ impl PointLookupBatcher {
 
     /// `new` with explicit flush triggers (for tests / Stage-2 tuning).
     pub fn with_triggers(engine: Arc<SharedEngine>, max_items: usize, max_wait: Duration) -> Self {
+        Self::spawn(engine, max_items, max_wait, None)
+    }
+
+    /// Shared spawn path. `batch_size_observer` is `None` in production; tests pass
+    /// `Some(sender)` to observe each flushed batch's size (the only test seam for
+    /// asserting that a burst actually coalesced) — it does not affect behavior.
+    fn spawn(
+        engine: Arc<SharedEngine>,
+        max_items: usize,
+        max_wait: Duration,
+        batch_size_observer: Option<Sender<usize>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<PointLookupRequest>();
         let coalescer = thread::Builder::new()
             .name("point-lookup-coalescer".to_string())
-            .spawn(move || coalescer_loop(engine, rx, max_items, max_wait))
+            .spawn(move || coalescer_loop(engine, rx, max_items, max_wait, batch_size_observer))
             .expect("spawn point-lookup coalescer thread");
         Self {
             tx: Some(tx),
             coalescer: Some(coalescer),
         }
+    }
+
+    /// Test-only: like [`Self::with_triggers`] but every flushed batch's size is
+    /// reported on `batch_size_observer`, letting tests assert coalescing behavior
+    /// (a lone request ⇒ size-1 batches; a burst ⇒ a larger batch).
+    #[cfg(test)]
+    fn with_triggers_observed(
+        engine: Arc<SharedEngine>,
+        max_items: usize,
+        max_wait: Duration,
+        batch_size_observer: Sender<usize>,
+    ) -> Self {
+        Self::spawn(engine, max_items, max_wait, Some(batch_size_observer))
     }
 
     /// Enqueue a batchable equality point-lookup and return the `oneshot` the
@@ -148,8 +250,10 @@ fn coalescer_loop(
     rx: Receiver<PointLookupRequest>,
     max_items: usize,
     max_wait: Duration,
+    batch_size_observer: Option<Sender<usize>>,
 ) {
     let mut batcher = DualTriggerBatcher::<PointLookupRequest>::new(max_items, max_wait);
+    let mut adaptive = AdaptiveWait::new(max_items, max_wait);
     loop {
         // Block until there is at least one request (or the channel closed). This
         // is the low-rate park point: an empty batcher never busy-waits.
@@ -160,34 +264,95 @@ fn coalescer_loop(
             Err(_) => break,
         };
         if let Some(batch) = batcher.enqueue(first, Instant::now()) {
-            run_batch(&engine, batch); // count trigger fired on the first item (max_items == 1).
+            // Count trigger fired on the first item (max_items == 1).
+            run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
             continue;
         }
-        // Partial batch held: keep pulling without blocking past the flush deadline.
-        // `recv_timeout` wakes us either on a new request or when the oldest item's
-        // `max_wait` elapses, whichever comes first.
+
+        // A partial batch is held. Before deciding how long to wait, drain any
+        // requests ALREADY sitting in the channel without blocking: this both
+        // coalesces them and is the burst detector — if a partner is already
+        // present, concurrency is live *right now*, so we hold the batch open to
+        // the full `max_wait` ceiling regardless of the (possibly cold) EWMA.
+        let mut partner_present = false;
+        let mut flushed_in_drain = false;
+        loop {
+            match rx.try_recv() {
+                Ok(request) => {
+                    partner_present = true;
+                    if let Some(batch) = batcher.enqueue(request, Instant::now()) {
+                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                        // count trigger fired.
+                        flushed_in_drain = true;
+                        break;
+                    }
+                    // else: still partial — keep draining already-queued partners.
+                }
+                // Nothing more buffered (channel still open) — stop draining.
+                Err(mpsc::TryRecvError::Empty) => break,
+                // Owner dropped: run the held partial for real, then let the outer
+                // `recv` observe the close and exit. No request left unanswered.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(batch) = batcher.flush_admin() {
+                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                    }
+                    flushed_in_drain = true;
+                    break;
+                }
+            }
+        }
+        if flushed_in_drain {
+            continue;
+        }
+
+        // Effective wait: full ceiling if a partner is already present (live
+        // concurrency), else the steady-state EWMA-derived wait (≈0 for a lone
+        // client at rest). This is BOUNDED by `max_wait` by construction.
+        let effective_wait = if partner_present {
+            max_wait
+        } else {
+            adaptive.effective_wait()
+        };
+        // Anchor the effective wait to the head item's enqueue time so it shares
+        // the same clock as the batcher's real deadline; clamp against that real
+        // deadline so a request can NEVER be held past the `max_wait` ceiling.
+        let effective_deadline = batcher
+            .first_enqueued_at()
+            .map(|first_at| first_at + effective_wait);
+
+        // Partial batch held: keep pulling without blocking past the (clamped)
+        // effective deadline. `recv_timeout` wakes us on a new request or when the
+        // wait elapses, whichever comes first.
         loop {
             let now = Instant::now();
-            let wait = batcher
+            // The real ceiling countdown (never exceeded), and the adaptive
+            // countdown clamped to it. `min` enforces the starvation bound.
+            let ceiling = batcher
                 .time_until_flush_deadline(now)
                 .unwrap_or(Duration::ZERO);
+            let adaptive_remaining = effective_deadline
+                .map(|d| d.saturating_duration_since(now))
+                .unwrap_or(Duration::ZERO);
+            let wait = adaptive_remaining.min(ceiling);
             if wait.is_zero() {
                 if let Some(batch) = batcher.flush_admin() {
-                    run_batch(&engine, batch);
+                    run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
                 }
                 break;
             }
             match rx.recv_timeout(wait) {
                 Ok(request) => {
                     if let Some(batch) = batcher.enqueue(request, Instant::now()) {
-                        run_batch(&engine, batch); // count trigger fired.
+                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
+                        // count trigger fired.
                         break;
                     }
                     // else: still partial — loop and keep waiting on the deadline.
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(batch) = batcher.maybe_flush_due_to_time(Instant::now()) {
-                        run_batch(&engine, batch);
+                    // The (adaptive or ceiling) deadline elapsed — flush the partial.
+                    if let Some(batch) = batcher.flush_admin() {
+                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
                     }
                     break;
                 }
@@ -197,13 +362,31 @@ fn coalescer_loop(
                     // outer loop whose `recv` now reports the closed channel and we
                     // exit. No request is ever left unanswered.
                     if let Some(batch) = batcher.flush_admin() {
-                        run_batch(&engine, batch);
+                        run_and_record(&engine, batch, &mut adaptive, batch_size_observer.as_ref());
                     }
                     break;
                 }
             }
         }
     }
+}
+
+/// Fold a flushed batch's size into the adaptive-wait signal, then run it. All
+/// flush paths (count, adaptive-time, drain, shutdown) go through here so the
+/// EWMA tracks the *actual* recent coalescing rate across every flush reason.
+/// `observer` is `None` in production; tests use it to assert batch composition.
+fn run_and_record(
+    engine: &SharedEngine,
+    batch: Batch<PointLookupRequest>,
+    adaptive: &mut AdaptiveWait,
+    observer: Option<&Sender<usize>>,
+) {
+    let size = batch.items.len();
+    adaptive.record_batch(size);
+    if let Some(tx) = observer {
+        let _ = tx.send(size);
+    }
+    run_batch(engine, batch);
 }
 
 /// Run one drained batch under a single read lock: group by `route_id`, then
@@ -537,5 +720,176 @@ mod tests {
         assert_eq!(got_2a, ref_2, "batched needle=2 must match per-query");
         assert_eq!(got_2b, ref_2, "duplicate needle=2 must get the same result");
         assert_eq!(got_1, ref_1, "batched needle=1 must match per-query");
+    }
+
+    // --- Adaptive-wait unit tests (no GPU; pure controller + timing/coalescing) ---
+
+    #[test]
+    fn adaptive_wait_is_zero_for_a_lone_client_and_full_when_saturated() {
+        let max_wait = Duration::from_micros(50);
+        let mut a = AdaptiveWait::new(32, max_wait);
+        // Cold start is a lone client (EWMA seeded at 1) ⇒ no wait at all.
+        assert_eq!(
+            a.effective_wait(),
+            Duration::ZERO,
+            "a lone client must pay ~0 wait"
+        );
+        // Drive the EWMA to saturation with repeated full batches ⇒ full ceiling.
+        for _ in 0..50 {
+            a.record_batch(32);
+        }
+        assert_eq!(
+            a.effective_wait(),
+            max_wait,
+            "a saturated client must wait the full ceiling"
+        );
+    }
+
+    #[test]
+    fn adaptive_wait_is_bounded_by_max_wait_for_any_signal() {
+        let max_wait = Duration::from_micros(50);
+        let mut a = AdaptiveWait::new(32, max_wait);
+        // Even if the EWMA is pushed absurdly high (more than max_items), the
+        // fraction clamps to 1.0 so the effective wait never exceeds the ceiling.
+        for _ in 0..100 {
+            a.record_batch(10_000);
+        }
+        assert!(
+            a.effective_wait() <= max_wait,
+            "effective wait {:?} must never exceed the ceiling {:?}",
+            a.effective_wait(),
+            max_wait
+        );
+        // And an intermediate signal lands strictly between 0 and the ceiling.
+        let mut mid = AdaptiveWait::new(32, max_wait);
+        for _ in 0..50 {
+            mid.record_batch(16);
+        }
+        let w = mid.effective_wait();
+        assert!(
+            w > Duration::ZERO && w < max_wait,
+            "a mid-concurrency signal must be between 0 and the ceiling, got {w:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_wait_max_items_one_never_waits() {
+        // max_items == 1 means the count trigger fires on the first item, so the
+        // wait is irrelevant and must report zero (no divide-by-zero either).
+        let a = AdaptiveWait::new(1, Duration::from_micros(50));
+        assert_eq!(a.effective_wait(), Duration::ZERO);
+    }
+
+    #[test]
+    fn record_batch_moves_the_ewma_toward_the_sample() {
+        let mut a = AdaptiveWait::new(32, Duration::from_micros(50));
+        let before = a.ewma_batch_size;
+        a.record_batch(32);
+        assert!(
+            a.ewma_batch_size > before,
+            "a large batch must raise the EWMA"
+        );
+        // It is a smoothing average, not a jump to the sample.
+        assert!(
+            a.ewma_batch_size < 32.0,
+            "one sample must not snap the EWMA to the sample value"
+        );
+    }
+
+    /// A lone (c1-like) request must flush with ~no wait even when the configured
+    /// `max_wait` ceiling is large: the old fixed-wait code would block the full
+    /// ceiling, the adaptive code returns almost immediately. We use a 1s ceiling
+    /// and require the answer well under it (generous margin for CI jitter).
+    #[test]
+    fn lone_request_flushes_with_near_zero_wait() {
+        let engine = cpu_engine_with_table();
+        let max_wait = Duration::from_secs(1);
+        let batcher = PointLookupBatcher::with_triggers(engine, 32, max_wait);
+        let start = Instant::now();
+        let rx = batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), 1);
+        // CPU engine ⇒ this resolves to an error, but it must resolve FAST.
+        let outcome = recv_within(rx, Duration::from_secs(2)).expect("waiter must get a response");
+        let elapsed = start.elapsed();
+        assert!(outcome.is_err());
+        assert!(
+            elapsed < max_wait / 4,
+            "a lone request waited {elapsed:?}, near the {max_wait:?} ceiling — adaptive \
+             shortening did not kick in"
+        );
+    }
+
+    /// A concurrent burst must still coalesce: with a count trigger above the burst
+    /// size and a non-trivial ceiling, the requests are served in FEWER batches
+    /// than there are requests (i.e. at least one batch coalesced > 1 item). The
+    /// observer reports each flushed batch's size.
+    #[test]
+    fn concurrent_burst_still_coalesces() {
+        let engine = cpu_engine_with_table();
+        let (obs_tx, obs_rx) = mpsc::channel::<usize>();
+        // Count trigger (64) above the burst (16) so coalescing is via the wait,
+        // not the count trigger; a 200ms ceiling gives the burst time to gather.
+        let batcher = PointLookupBatcher::with_triggers_observed(
+            engine,
+            64,
+            Duration::from_millis(200),
+            obs_tx,
+        );
+        let n = 16usize;
+        let receivers: Vec<_> = (0..n)
+            .map(|needle| batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), needle as i32))
+            .collect();
+        // Every request is still answered (completeness preserved).
+        for rx in receivers {
+            let outcome = recv_within(rx, Duration::from_secs(3)).expect("every waiter answered");
+            assert!(outcome.is_err());
+        }
+        // Drop the batcher so the observer channel closes once the coalescer exits,
+        // then collect every reported batch size.
+        drop(batcher);
+        let mut sizes = Vec::new();
+        let mut total: usize = 0;
+        while let Ok(sz) = obs_rx.recv_timeout(Duration::from_secs(2)) {
+            total += sz;
+            sizes.push(sz);
+        }
+        assert_eq!(total, n, "every request must appear in exactly one batch");
+        assert!(
+            sizes.len() < n,
+            "a concurrent burst must coalesce into fewer than {n} batches, got sizes {sizes:?}"
+        );
+        let max_batch = sizes.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_batch > 1,
+            "at least one batch must have coalesced >1 request, got sizes {sizes:?}"
+        );
+    }
+
+    /// Even when the adaptive wait is "open" (a partner was present so the coalescer
+    /// holds to the full ceiling), a held partial batch must STILL flush within the
+    /// configured ceiling — no starvation. We send two requests (so a partner is
+    /// present ⇒ full-ceiling hold) with a count trigger above 2, and require both
+    /// answered comfortably within a small multiple of the ceiling.
+    #[test]
+    fn held_partial_batch_never_starves_past_the_ceiling() {
+        let engine = cpu_engine_with_table();
+        let max_wait = Duration::from_millis(20);
+        // max_items=8 so two requests never hit the count trigger and the time
+        // bound is the only thing that flushes them.
+        let batcher = PointLookupBatcher::with_triggers(engine, 8, max_wait);
+        let start = Instant::now();
+        let r1 = batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), 1);
+        let r2 = batcher.enqueue(select("SELECT id FROM t WHERE id = 1"), 2);
+        let o1 = recv_within(r1, Duration::from_secs(2)).expect("first waiter answered");
+        let o2 = recv_within(r2, Duration::from_secs(2)).expect("second waiter answered");
+        let elapsed = start.elapsed();
+        assert!(o1.is_err() && o2.is_err());
+        // Bound: a held partial flushes by the ceiling. Allow generous slack for
+        // scheduling jitter, but it must be a small multiple of max_wait, proving
+        // the wait is bounded and not unbounded/forever.
+        assert!(
+            elapsed < max_wait * 20,
+            "a held partial waited {elapsed:?}, far past the {max_wait:?} ceiling — \
+             the starvation bound is broken"
+        );
     }
 }
