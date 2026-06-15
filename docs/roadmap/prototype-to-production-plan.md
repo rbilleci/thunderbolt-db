@@ -574,6 +574,38 @@ and a harness that measures it:
 - **Exit:** a customer can `apt install`/`helm install`, connect a standard driver,
   run a real schema, scrape metrics, and survive a node failure.
 
+### Phase 7 — Data-structure efficiency audit (cross-cutting sweep, after all functional phases)
+**Goal:** systematically find and fix inefficient data-structure / algorithm choices on the
+hot paths. Motivated by a concrete miss in the write-half (Thread 4): the per-commit publish
+(`MvccData::with_table_mut`) deep-cloned the *entire* table — `InMemoryTupleStore` version
+chains **and** the value-index — on **every** commit → O(table) per write → O(n²) write
+throughput plus allocator/bandwidth churn that starved lock-free readers (reads under 8
+concurrent writers degraded ~165×/1800× p50/p99, and the concurrent path was *slower* than
+the lock it replaced). It was **correct** and passed two adversarial correctness audits, yet
+nearly sank the milestone's own thesis — because correctness review does not catch
+asymptotics. The fix (structurally-shared `imbl::OrdMap` + `Arc` chains → O(1) clone,
+O(k·log n) commit) restored it. This phase turns that one-off discovery into a deliberate
+sweep so the next such landmine is found by design, not by benchmark surprise.
+- **Inventory every hot-path container** and record, per use, its profile: clone/copy cost,
+  per-op **allocations**, lookup/insert/iterate complexity, lock granularity, cache behavior.
+  Cover at least: the MVCC store + its indexes (rows, value-index, unique-slot, the
+  recent-commits ledger, active-snapshots), GPU residency maps + generation chains, the
+  executor's host/device buffer pools, the point-lookup batcher/coalescer, the WAL buffer +
+  replication log, and the protocol/type (de)serialization paths.
+- **Flag the anti-patterns:** whole-collection `.clone()` on a hot path; O(n) work per
+  request/commit; `Vec`/`BTreeMap` where a persistent / arena / lock-free / copy-on-write
+  structure fits; per-op heap churn; copies that could be `Arc`/borrow; and lock scopes that
+  serialize readers against writers.
+- **Method:** drive each candidate under the **Phase 5 open-loop load harness** with
+  allocation + flamegraph profiling and an explicit **per-op-cost-vs-n scaling check** (does
+  cost grow with table / connection / chain size?) — the deep-clone bug was invisible at
+  small n and obvious at scale, so every hot structure gets a size sweep, not a single point.
+- **Gate:** every identified hotspot gets a before/after benchmark (p50/**p99**/alloc-per-op)
+  **and** an adversarial correctness re-audit of the swapped structure; no regression ships.
+- **Exit:** a written data-structure audit (one row per hot-path container: chosen type,
+  complexity, alloc profile, evidence) with no remaining O(n)/O(n²)-per-op surprises on the
+  commit, read, or execute hot paths.
+
 ---
 
 ## 6. Strategic Recommendation: stage the commercial envelope
