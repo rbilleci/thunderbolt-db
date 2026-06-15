@@ -29,3 +29,4 @@ serde = { version = "1", features = ["derive"] }
 libloading = "0.8"
 imbl = "7"
 arc-swap = "1"
+tikv-jemallocator = "0.6"

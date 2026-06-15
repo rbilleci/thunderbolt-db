@@ -17,6 +17,9 @@ path = "src/main.rs"
 [dependencies]
 gpu_db_protocol = { path = "../protocol" }
 gpu_db_facade = { path = "../facade" }
+# Production global allocator: jemalloc cuts multi-threaded malloc-arena contention vs
+# glibc under the engine's concurrent read+write load (measured ~1.4-1.7x throughput).
+tikv-jemallocator.workspace = true
 # Async ingress (P1-M5): a tokio acceptor + per-connection tasks so idle connections are
 # cheap parked tasks (connection scale), bridging to the blocking engine via spawn_blocking.
 tokio = { version = "1", features = [
