@@ -7962,7 +7962,7 @@ done:
 #[allow(dead_code)] // S2 primitive: wired into the production adaptive sort operator in S4.
 fn launch_cuda_resident_i64_argsort_bitonic(
     resident: &CudaResidentDeviceMemory,
-    keys_byte_offset: u64,
+    keys_device_ptr: u64,
     n: u64,
     descending: bool,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -8203,13 +8203,7 @@ sdone:
     if n > u64::from(u32::MAX) {
         return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
     }
-    let key_end = n
-        .checked_mul(std::mem::size_of::<i64>() as u64)
-        .and_then(|b| keys_byte_offset.checked_add(b))
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if key_end > resident.metadata().allocated_bytes {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(key_end as usize));
-    }
+    // `keys_device_ptr` is an absolute device address; the caller owns its [ptr, ptr+n*8) sizing.
     let n_pad = n
         .checked_next_power_of_two()
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
@@ -8286,10 +8280,7 @@ sdone:
     const BLOCK: u32 = 256;
     let grid = n_pad.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
 
-    let mut src_arg = resident
-        .device_ptr()
-        .checked_add(keys_byte_offset)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut src_arg = keys_device_ptr;
     let mut n_arg = n;
     let mut n_pad_arg = n_pad;
     let mut kw_arg = keys_work.ptr;
@@ -8390,7 +8381,7 @@ sdone:
 #[allow(dead_code)] // wired into the engine grouped/projection ORDER BY path in S4/S5.
 fn launch_cuda_resident_i64_argsort_radix(
     resident: &CudaResidentDeviceMemory,
-    keys_byte_offset: u64,
+    keys_device_ptr: u64,
     n: u64,
     descending: bool,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -8908,13 +8899,7 @@ wave_done:
     if n > u64::from(u32::MAX) {
         return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
     }
-    let key_end = n
-        .checked_mul(std::mem::size_of::<i64>() as u64)
-        .and_then(|b| keys_byte_offset.checked_add(b))
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if key_end > resident.metadata().allocated_bytes {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(key_end as usize));
-    }
+    // `keys_device_ptr` is an absolute device address; the caller owns its [ptr, ptr+n*8) sizing.
     let n_usize =
         usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
@@ -9015,10 +9000,7 @@ wave_done:
         err
     };
 
-    let src_keys_base = resident
-        .device_ptr()
-        .checked_add(keys_byte_offset)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let src_keys_base = keys_device_ptr;
     let mask: u64 = if descending {
         0x7FFF_FFFF_FFFF_FFFF
     } else {
@@ -9188,14 +9170,14 @@ const ADAPTIVE_SORT_CROSSOVER_ROWS: u64 = 10_000;
 #[allow(dead_code)] // wired into the engine grouped/projection ORDER BY path in S5.
 fn launch_cuda_resident_i64_argsort_adaptive(
     resident: &CudaResidentDeviceMemory,
-    keys_byte_offset: u64,
+    keys_device_ptr: u64,
     n: u64,
     descending: bool,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
     if n < ADAPTIVE_SORT_CROSSOVER_ROWS {
-        launch_cuda_resident_i64_argsort_bitonic(resident, keys_byte_offset, n, descending)
+        launch_cuda_resident_i64_argsort_bitonic(resident, keys_device_ptr, n, descending)
     } else {
-        launch_cuda_resident_i64_argsort_radix(resident, keys_byte_offset, n, descending)
+        launch_cuda_resident_i64_argsort_radix(resident, keys_device_ptr, n, descending)
     }
 }
 
@@ -9212,14 +9194,13 @@ fn launch_cuda_resident_i64_argsort_adaptive(
 #[allow(dead_code)] // wired into the engine ORDER BY/LIMIT path in S5.
 fn launch_cuda_resident_i64_order_by_limit(
     resident: &CudaResidentDeviceMemory,
-    keys_byte_offset: u64,
+    keys_device_ptr: u64,
     n: u64,
     descending: bool,
     offset: u64,
     limit: Option<u64>,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
-    let perm =
-        launch_cuda_resident_i64_argsort_adaptive(resident, keys_byte_offset, n, descending)?;
+    let perm = launch_cuda_resident_i64_argsort_adaptive(resident, keys_device_ptr, n, descending)?;
     let start = usize::try_from(offset)
         .unwrap_or(usize::MAX)
         .min(perm.len());
@@ -9243,7 +9224,7 @@ fn launch_cuda_resident_i64_order_by_limit(
 #[cfg(test)]
 fn launch_cuda_resident_i64_argsort_radix_serial(
     resident: &CudaResidentDeviceMemory,
-    keys_byte_offset: u64,
+    keys_device_ptr: u64,
     n: u64,
     descending: bool,
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -9458,13 +9439,7 @@ done:
     if n > u64::from(u32::MAX) {
         return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
     }
-    let key_end = n
-        .checked_mul(std::mem::size_of::<i64>() as u64)
-        .and_then(|b| keys_byte_offset.checked_add(b))
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    if key_end > resident.metadata().allocated_bytes {
-        return Err(CudaRuntimeProbeError::InvalidInputLength(key_end as usize));
-    }
+    // `keys_device_ptr` is an absolute device address; the caller owns its [ptr, ptr+n*8) sizing.
     let n_usize =
         usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
@@ -9530,10 +9505,7 @@ done:
         err
     };
 
-    let mut src_arg = resident
-        .device_ptr()
-        .checked_add(keys_byte_offset)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut src_arg = keys_device_ptr;
     let mut n_arg = n;
     let mut mask_arg: u64 = if descending {
         0x7FFF_FFFF_FFFF_FFFF
@@ -9607,8 +9579,8 @@ done:
 #[allow(dead_code)] // wired into the engine grouped HAVING path in S5.
 fn launch_cuda_resident_having_filter(
     resident: &CudaResidentDeviceMemory,
-    group_byte_offset: u64,
-    agg_byte_offset: u64,
+    group_device_ptr: u64,
+    agg_device_ptr: u64,
     n: u64,
     clauses: &[Vec<(u32, u32, i64)>],
 ) -> Result<Vec<u32>, CudaRuntimeProbeError> {
@@ -9636,17 +9608,8 @@ fn launch_cuda_resident_having_filter(
     if n > u64::from(u32::MAX) {
         return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
     }
-    // Both key columns are i64; bound-check their read ranges against the resident allocation.
-    let allocated = resident.metadata().allocated_bytes;
-    for off in [group_byte_offset, agg_byte_offset] {
-        let end = n
-            .checked_mul(std::mem::size_of::<i64>() as u64)
-            .and_then(|b| off.checked_add(b))
-            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-        if end > allocated {
-            return Err(CudaRuntimeProbeError::InvalidInputLength(end as usize));
-        }
-    }
+    // `group_device_ptr`/`agg_device_ptr` are absolute device addresses (i64 columns); the caller
+    // owns their [ptr, ptr+n*8) sizing.
     let n_usize =
         usize::try_from(n).map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
 
@@ -9764,14 +9727,8 @@ fn launch_cuda_resident_having_filter(
     };
 
     const BLOCK: u32 = 256;
-    let mut group_arg = resident
-        .device_ptr()
-        .checked_add(group_byte_offset)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let mut agg_arg = resident
-        .device_ptr()
-        .checked_add(agg_byte_offset)
-        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut group_arg = group_device_ptr;
+    let mut agg_arg = agg_device_ptr;
     let mut n_arg = n;
     let mut nclauses_arg = n_clauses;
     let mut coff_arg = clause_off_buf.ptr;
@@ -16477,7 +16434,9 @@ mod tests {
                     ],
                 )
                 .expect("retain keys");
-            (resident, off)
+            // Primitives take an absolute device key pointer; hand back device_ptr()+off.
+            let key_ptr = resident.device_ptr() + off;
+            (resident, key_ptr)
         };
         let verify = |keys: &[i64], idx: &[u32], descending: bool| {
             assert_eq!(idx.len(), keys.len());
@@ -16609,7 +16568,9 @@ mod tests {
                     ],
                 )
                 .expect("retain keys");
-            (resident, off)
+            // Primitives take an absolute device key pointer; hand back device_ptr()+off.
+            let key_ptr = resident.device_ptr() + off;
+            (resident, key_ptr)
         };
 
         let mut cases: Vec<Vec<i64>> = Vec::new();
@@ -16748,7 +16709,9 @@ mod tests {
                     ],
                 )
                 .expect("retain keys");
-            (resident, off)
+            // Primitives take an absolute device key pointer; hand back device_ptr()+off.
+            let key_ptr = resident.device_ptr() + off;
+            (resident, key_ptr)
         };
 
         // Sizes straddling ADAPTIVE_SORT_CROSSOVER_ROWS (10_000): below -> bitonic arm, at/above ->
@@ -16815,8 +16778,14 @@ mod tests {
             let (resident, agg_off) = retain(&group, &agg);
             let nn = n as u64;
             let run = |clauses: &[Vec<(u32, u32, i64)>]| {
-                launch_cuda_resident_having_filter(&resident, 0, agg_off, nn, clauses)
-                    .expect("having filter")
+                launch_cuda_resident_having_filter(
+                    &resident,
+                    resident.device_ptr(),
+                    resident.device_ptr() + agg_off,
+                    nn,
+                    clauses,
+                )
+                .expect("having filter")
             };
             let range = |lo: usize, hi: usize| -> Vec<u32> { (lo..hi).map(|r| r as u32).collect() };
             let (k, a, b) = ((n / 3) as i64, (n / 4) as i64, (3 * n / 4) as i64);
@@ -16902,8 +16871,14 @@ mod tests {
             let agg: Vec<i64> = (0..n as i64).map(|r| r - 500).collect();
             let (resident, agg_off) = retain(&group, &agg);
             let run = |c: &[Vec<(u32, u32, i64)>]| {
-                launch_cuda_resident_having_filter(&resident, 0, agg_off, n as u64, c)
-                    .expect("having neg")
+                launch_cuda_resident_having_filter(
+                    &resident,
+                    resident.device_ptr(),
+                    resident.device_ptr() + agg_off,
+                    n as u64,
+                    c,
+                )
+                .expect("having neg")
             };
             assert_eq!(run(&[vec![(1, 4, 0)]]), mk_range(500, 1_000), "neg agg>=0");
             assert_eq!(run(&[vec![(1, 2, -1)]]), mk_range(0, 500), "neg agg<=-1");
@@ -16919,7 +16894,14 @@ mod tests {
             let agg: Vec<i64> = vec![i64::MIN, -1, 0, 1, i64::MAX];
             let (resident, agg_off) = retain(&group, &agg);
             let run = |c: &[Vec<(u32, u32, i64)>]| {
-                launch_cuda_resident_having_filter(&resident, 0, agg_off, 5, c).expect("having ext")
+                launch_cuda_resident_having_filter(
+                    &resident,
+                    resident.device_ptr(),
+                    resident.device_ptr() + agg_off,
+                    5,
+                    c,
+                )
+                .expect("having ext")
             };
             assert_eq!(run(&[vec![(1, 4, 0)]]), vec![2_u32, 3, 4], "ext agg>=0");
             assert_eq!(run(&[vec![(1, 2, 0)]]), vec![0_u32, 1, 2], "ext agg<=0");
@@ -16942,8 +16924,14 @@ mod tests {
             let agg: Vec<i64> = (0..n as i64).map(|r| r % 2).collect();
             let (resident, agg_off) = retain(&group, &agg);
             let run = |c: &[Vec<(u32, u32, i64)>]| {
-                launch_cuda_resident_having_filter(&resident, 0, agg_off, n as u64, c)
-                    .expect("having scat")
+                launch_cuda_resident_having_filter(
+                    &resident,
+                    resident.device_ptr(),
+                    resident.device_ptr() + agg_off,
+                    n as u64,
+                    c,
+                )
+                .expect("having scat")
             };
             let odds: Vec<u32> = (0..n / 2).map(|k| (2 * k + 1) as u32).collect();
             let evens: Vec<u32> = (0..n / 2).map(|k| (2 * k) as u32).collect();
@@ -16982,7 +16970,9 @@ mod tests {
                     ],
                 )
                 .expect("retain keys");
-            (resident, off)
+            // Primitives take an absolute device key pointer; hand back device_ptr()+off.
+            let key_ptr = resident.device_ptr() + off;
+            (resident, key_ptr)
         };
 
         let n = 100_usize;
