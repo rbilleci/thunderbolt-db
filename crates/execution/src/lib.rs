@@ -2819,6 +2819,219 @@ fn launch_cuda_resident_i32_compare_count(
     needle: i32,
     comparison: CudaI32Comparison,
 ) -> Result<u64, CudaRuntimeProbeError> {
+    type CuMemsetD8Async = unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+
+    // P2-M2 parallelization of the comparison-count scan: this is the serial
+    // `gpu_db_resident_i32_compare_count` predicate (4-way `<`/`<=`/`>`/`>=` against `needle`)
+    // dropped into the proven `gpu_db_resident_i32_equal_count_parallel` grid-stride skeleton —
+    // each thread accumulates its partial match count over a `gridDim*blockDim`-strided slice and
+    // `red.global.add.u64`s it into the single output counter. `target sm_60` is required for the
+    // reduction op (the old serial kernel targeted sm_30). Launched on a pooled private stream via
+    // `launch_on_pooled_stream` (cached module — no per-call re-JIT, pooled scratch — no per-call
+    // `cuMemAlloc`/`cuMemFree`, async memset + event timing + centralized error drain).
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_60
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_compare_count_parallel(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 row_count,
+    .param .s32 needle,
+    .param .u32 comparison,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_match;
+    .reg .u32 %lane;
+    .reg .u32 %bdim;
+    .reg .u32 %bid;
+    .reg .u32 %gdim;
+    .reg .u32 %tmp32;
+    .reg .u64 %resident;
+    .reg .u64 %offset;
+    .reg .u64 %rows;
+    .reg .u64 %out;
+    .reg .u64 %base;
+    .reg .u64 %idx;
+    .reg .u64 %stride;
+    .reg .u64 %addr;
+    .reg .u64 %off_bytes;
+    .reg .u64 %matches;
+    .reg .u32 %comparison;
+    .reg .s32 %needle;
+    .reg .s32 %r_value;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %offset, [byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %out, [out_ptr];
+
+    add.u64 %base, %resident, %offset;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %bdim, %ntid.x;
+    mov.u32 %bid, %ctaid.x;
+    mov.u32 %gdim, %nctaid.x;
+    mad.lo.u32 %tmp32, %bid, %bdim, %lane;
+    cvt.u64.u32 %idx, %tmp32;
+    mul.lo.u32 %tmp32, %gdim, %bdim;
+    cvt.u64.u32 %stride, %tmp32;
+
+    mov.u64 %matches, 0;
+
+loop:
+    setp.ge.u64 %p_done, %idx, %rows;
+    @%p_done bra done;
+    mul.lo.u64 %off_bytes, %idx, 4;
+    add.u64 %addr, %base, %off_bytes;
+    ld.global.s32 %r_value, [%addr];
+    setp.lt.s32 %p_lt, %r_value, %needle;
+    setp.le.s32 %p_lte, %r_value, %needle;
+    setp.gt.s32 %p_gt, %r_value, %needle;
+    setp.ge.s32 %p_gte, %r_value, %needle;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    mov.pred %p_match, 0;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    @!%p_match bra next;
+    add.u64 %matches, %matches, 1;
+
+next:
+    add.u64 %idx, %idx, %stride;
+    bra loop;
+
+done:
+    red.global.add.u64 [%out], %matches;
+    ret;
+}
+"#;
+
+    let bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if bytes > resident.metadata().allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+    }
+
+    let cu_launch_kernel = unsafe {
+        resident
+            .lib()
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memset_d8_async = unsafe {
+        resident
+            .lib()
+            .get::<CuMemsetD8Async>(b"cuMemsetD8Async\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+    let function = resident
+        .primary()
+        .cached_function(c"gpu_db_resident_i32_compare_count_parallel", &ptx)?;
+
+    // The grid-stride loop covers any row_count regardless of grid size, so clamping the
+    // grid is correctness-safe (extra rows are handled by wrapping). The kernel computes
+    // `stride = gridDim * blockDim` in u32: with grid ≤ 65_535 and BLOCK ≤ 1024 (the CUDA
+    // block-size max) the product stays ≤ ~67M, well within u32 — do not raise BLOCK such
+    // that `65_535 * BLOCK` could overflow u32.
+    const BLOCK: u32 = 256;
+    let grid: u32 = row_count.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32;
+
+    let mut output_bytes = [0_u8; std::mem::size_of::<u64>()];
+    launch_on_pooled_stream(resident, Some(&mut output_bytes), |stream, output_ptr| {
+        // Zero the scratch on the stream (the kernel red-adds into it), ordered before the
+        // kernel launch on the same stream.
+        let memset_rc =
+            unsafe { cu_memset_d8_async(output_ptr, 0, std::mem::size_of::<u64>(), stream) };
+        if memset_rc != 0 {
+            return memset_rc;
+        }
+        let mut resident_arg = resident.device_ptr();
+        let mut offset_arg = byte_offset;
+        let mut rows_arg = row_count;
+        let mut needle_arg = needle;
+        let mut comparison_arg = comparison.code();
+        let mut output_arg = output_ptr;
+        let mut args = [
+            (&mut resident_arg as *mut u64).cast::<c_void>(),
+            (&mut offset_arg as *mut u64).cast::<c_void>(),
+            (&mut rows_arg as *mut u64).cast::<c_void>(),
+            (&mut needle_arg as *mut i32).cast::<c_void>(),
+            (&mut comparison_arg as *mut u32).cast::<c_void>(),
+            (&mut output_arg as *mut u64).cast::<c_void>(),
+        ];
+        unsafe {
+            cu_launch_kernel(
+                function,
+                grid,
+                1,
+                1,
+                BLOCK,
+                1,
+                1,
+                0,
+                stream,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    })?;
+
+    Ok(u64::from_le_bytes(output_bytes))
+}
+
+/// Single-thread `(1,1,1)` serial comparison-count — retained ONLY (under `#[cfg(test)]`) as the
+/// on-GPU A/B parity + perf baseline for the P2-M2 parallel compare-count migration. The production
+/// route is the parallel `launch_cuda_resident_i32_compare_count`; this is the previously-shipped
+/// serial kernel kept as a device-side reference oracle (no CPU operator re-implementation).
+#[cfg(test)]
+fn launch_cuda_resident_i32_compare_count_serial(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    row_count: u64,
+    needle: i32,
+    comparison: CudaI32Comparison,
+) -> Result<u64, CudaRuntimeProbeError> {
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
@@ -13131,6 +13344,147 @@ mod tests {
                 0.0
             };
             println!("| {n} | {expected} | {serial_ms:.3} | {parallel_ms:.3} | {speedup:.1}x |");
+            largest_serial_ms = serial_ms;
+            largest_parallel_ms = parallel_ms;
+        }
+
+        assert!(
+            largest_parallel_ms < largest_serial_ms,
+            "parallel kernel ({largest_parallel_ms:.3} ms) did not beat the serial (1,1,1) \
+             kernel ({largest_serial_ms:.3} ms) on the largest table — milestone premise unmet"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn gpu_parallel_i32_compare_count_matches_serial_and_wins_on_large_tables() {
+        // P2-M2 — compare-count parallelization parity + perf gate (GPU-native oracle).
+        //
+        // `launch_cuda_resident_i32_compare_count` was a single-thread `(1,1,1)` serial scan; it is
+        // now a grid-stride + `red.global.add.u64` parallel kernel (the same skeleton as
+        // `gpu_db_resident_i32_equal_count_parallel`) on a pooled private stream. Mirroring the
+        // sibling equal_count gate, this A/Bs the parallel kernel against the retained serial
+        // reference ON THE GPU (no CPU oracle): it hard-asserts (a) the parallel count EQUALS the
+        // serial count at every size for every comparison code (`<`/`<=`/`>`/`>=`) and for the
+        // composed BETWEEN — across sub-block, block-boundary, multi-block, and a row count that
+        // exceeds one full `gridDim*blockDim` grid-stride pass (1<<24 > 65_535*256, the wrap path)
+        // — and (b) the parallel kernel beats the serial `(1,1,1)` kernel on the largest table.
+        use std::time::Instant;
+
+        let runtime = CudaDriverRuntime::probe().expect("requires a local NVIDIA driver and GPU");
+
+        let needle = 3_i32;
+        let sizes: [u64; 7] = [1, 256, 257, 4_096, 65_536, 1 << 20, 1 << 24];
+        let comparisons = [
+            CudaI32Comparison::Lt,
+            CudaI32Comparison::Lte,
+            CudaI32Comparison::Gt,
+            CudaI32Comparison::Gte,
+        ];
+        println!("p2_m2_compare_count: needle={needle} (value[i] = i % 7)");
+        println!("| rows | serial ms | parallel ms | speedup |");
+        println!("|---:|---:|---:|---:|");
+
+        let mut largest_serial_ms = 0.0_f64;
+        let mut largest_parallel_ms = 0.0_f64;
+        for &n in &sizes {
+            let values: Vec<i32> = (0..n).map(|i| (i % 7) as i32).collect();
+            // SAFETY: `i32` is POD with no padding; viewing the Vec as native (little-endian)
+            // bytes matches the kernel's `ld.global.s32`, and `values` outlives the retain copy.
+            let column_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
+            };
+            let header = n.to_le_bytes();
+            let allocated = std::mem::size_of::<u64>() as u64 + column_bytes.len() as u64;
+            let resident = runtime
+                .retain_device_memory_chunks(
+                    0,
+                    allocated,
+                    &[
+                        CudaDeviceMemoryChunk {
+                            byte_offset: 0,
+                            bytes: &header,
+                        },
+                        CudaDeviceMemoryChunk {
+                            byte_offset: std::mem::size_of::<u64>() as u64,
+                            bytes: column_bytes,
+                        },
+                    ],
+                )
+                .expect("retain resident column");
+            let offset = std::mem::size_of::<u64>() as u64;
+
+            // Parity: parallel == serial for every comparison (GPU-vs-GPU; the serial reference is
+            // the previously-shipped kernel, so matching it proves the parallel regression-safe).
+            for &comparison in &comparisons {
+                let serial = launch_cuda_resident_i32_compare_count_serial(
+                    &resident, offset, n, needle, comparison,
+                )
+                .expect("serial compare count");
+                let parallel = resident
+                    .count_i32_compare_from_payload(offset, n, needle, comparison)
+                    .expect("parallel compare count");
+                assert_eq!(
+                    parallel, serial,
+                    "parallel != serial at rows={n} comparison={comparison:?}"
+                );
+            }
+
+            // BETWEEN composes two compare-counts; check the parallel-based public route against a
+            // serial-composed reference (Gte lower − Gt upper, saturating).
+            let (lower, upper) = (2_i32, 5_i32);
+            let serial_between = launch_cuda_resident_i32_compare_count_serial(
+                &resident,
+                offset,
+                n,
+                lower,
+                CudaI32Comparison::Gte,
+            )
+            .expect("serial gte")
+            .saturating_sub(
+                launch_cuda_resident_i32_compare_count_serial(
+                    &resident,
+                    offset,
+                    n,
+                    upper,
+                    CudaI32Comparison::Gt,
+                )
+                .expect("serial gt"),
+            );
+            let parallel_between = resident
+                .count_i32_between_from_payload(offset, n, lower, upper)
+                .expect("parallel between count");
+            assert_eq!(
+                parallel_between, serial_between,
+                "between parallel != serial at rows={n}"
+            );
+
+            // Timing: best-of-3 latency on Gte (a 4/7-selectivity scan), like the equal_count gate.
+            let mut serial_ms = f64::MAX;
+            let mut parallel_ms = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                launch_cuda_resident_i32_compare_count_serial(
+                    &resident,
+                    offset,
+                    n,
+                    needle,
+                    CudaI32Comparison::Gte,
+                )
+                .unwrap();
+                serial_ms = serial_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                let t = Instant::now();
+                resident
+                    .count_i32_compare_from_payload(offset, n, needle, CudaI32Comparison::Gte)
+                    .unwrap();
+                parallel_ms = parallel_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let speedup = if parallel_ms > 0.0 {
+                serial_ms / parallel_ms
+            } else {
+                0.0
+            };
+            println!("| {n} | {serial_ms:.3} | {parallel_ms:.3} | {speedup:.1}x |");
             largest_serial_ms = serial_ms;
             largest_parallel_ms = parallel_ms;
         }
