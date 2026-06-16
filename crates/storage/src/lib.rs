@@ -111,6 +111,14 @@ pub struct InMemoryTupleStore {
     // version chain is `Arc`-wrapped so a clone shares chains until one is mutated, at which point
     // `Arc::make_mut` copies ONLY that chain (copy-on-write). Iteration stays in `TupleId` order.
     versions: imbl::OrdMap<TupleId, std::sync::Arc<Vec<TupleVersion>>>,
+    // Row-`key` → `TupleId`s index, so a by-`key` fetch is O(matches·chain_depth + log n) instead of
+    // scanning every chain (`versions` is keyed by `TupleId`; the row key lives inside each
+    // `TupleVersion`, so without this an equality point-lookup resolves in O(rows)). Maintained in
+    // lockstep with `versions` and published in the SAME immutable generation. Each slot holds a
+    // `Vec<TupleId>` for defensive multiplicity, mirroring the engine value-index's append + dedup-
+    // on-read contract; relational row keys are unique per table so a slot is normally a single id.
+    // `Arc`-wrapped like a chain, so a clone shares id-lists until `Arc::make_mut` copies one (COW).
+    key_to_tuple_ids: imbl::OrdMap<String, std::sync::Arc<Vec<TupleId>>>,
 }
 
 impl InMemoryTupleStore {
@@ -118,6 +126,7 @@ impl InMemoryTupleStore {
         Self {
             next_tuple_id: 1,
             versions: imbl::OrdMap::new(),
+            key_to_tuple_ids: imbl::OrdMap::new(),
         }
     }
 
@@ -146,7 +155,12 @@ impl InMemoryTupleStore {
         // shrinks a chain in place when it is uniquely owned, copying only a chain shared with a
         // live snapshot (COW), exactly as the per-version mutation sites do.
         let mut pruned = imbl::OrdMap::new();
+        // Keys whose chain is fully GC'd here; their id-list entry is dropped from the key index
+        // after the loop (can't mutate `key_to_tuple_ids` while iterating `versions`). A chain's
+        // versions all share one `key`, so the first version names it.
+        let mut dropped: Vec<(String, TupleId)> = Vec::new();
         for (id, chain) in self.versions.iter() {
+            let chain_key = chain.first().map(|version| version.key.clone());
             let mut chain = std::sync::Arc::clone(chain);
             std::sync::Arc::make_mut(&mut chain).retain(|version| {
                 version
@@ -155,9 +169,14 @@ impl InMemoryTupleStore {
             });
             if !chain.is_empty() {
                 pruned.insert(*id, chain);
+            } else if let Some(chain_key) = chain_key {
+                dropped.push((chain_key, *id));
             }
         }
         self.versions = pruned;
+        for (key, id) in dropped {
+            self.index_key_remove(&key, id);
+        }
 
         let remaining_versions = self.version_count();
         PruneStats {
@@ -179,6 +198,31 @@ impl InMemoryTupleStore {
             && version
                 .deleted_by
                 .is_none_or(|deleted_by| deleted_by > visibility.read_txn_id)
+    }
+
+    // Record a fresh chain's `tuple_id` under its row `key`. `Arc::make_mut` copies the id-list ONLY
+    // if a live snapshot still shares it (copy-on-write), exactly like the version-chain mutation
+    // sites, so a pinned reader's generation is never mutated. Called from the insert paths, which
+    // allocate a chain at a new `tuple_id`; an update/delete reuses the same `tuple_id`+`key` (a new
+    // version is pushed into the SAME chain) so the index is unchanged.
+    fn index_key_insert(&mut self, key: &str, tuple_id: TupleId) {
+        let mut ids = self.key_to_tuple_ids.get(key).cloned().unwrap_or_default();
+        std::sync::Arc::make_mut(&mut ids).push(tuple_id);
+        self.key_to_tuple_ids.insert(key.to_string(), ids);
+    }
+
+    // Drop a chain's `tuple_id` from its key's id-list (the prune path, when a chain is fully GC'd);
+    // remove the slot entirely once its list is empty. COW via `Arc::make_mut`, same as inserts.
+    fn index_key_remove(&mut self, key: &str, tuple_id: TupleId) {
+        if let Some(ids) = self.key_to_tuple_ids.get(key).cloned() {
+            let mut ids = ids;
+            std::sync::Arc::make_mut(&mut ids).retain(|id| *id != tuple_id);
+            if ids.is_empty() {
+                self.key_to_tuple_ids.remove(key);
+            } else {
+                self.key_to_tuple_ids.insert(key.to_string(), ids);
+            }
+        }
     }
 
     fn current_version_mut(
@@ -214,6 +258,36 @@ impl InMemoryTupleStore {
             .collect())
     }
 
+    // The visible versions of every chain whose row key is `key`, resolved through the key index
+    // (O(matches·chain_depth + log n)) rather than scanning every chain. The per-version
+    // `is_visible` predicate is byte-identical to `visible_versions`: the candidate set is narrowed
+    // by KEY only, so the result is exactly the rows visible at the pinned `read_txn_id` that match
+    // `key` — identical to `visible_versions().filter(|v| v.key == key)`, just without the full scan.
+    // The `v.key == key` guard is defensive against a stale id-list entry. A missing key yields an
+    // empty result, matching the old filtered seq-scan.
+    fn index_lookup(
+        &self,
+        key: &str,
+        visibility: Visibility,
+    ) -> Result<Vec<TupleVersion>, StorageError> {
+        Self::validate_visibility(visibility)?;
+        let Some(tuple_ids) = self.key_to_tuple_ids.get(key) else {
+            return Ok(Vec::new());
+        };
+        Ok(tuple_ids
+            .iter()
+            .filter_map(|tuple_id| {
+                self.versions.get(tuple_id).and_then(|versions| {
+                    versions
+                        .iter()
+                        .rev()
+                        .find(|version| Self::is_visible(version, visibility) && version.key == key)
+                        .cloned()
+                })
+            })
+            .collect())
+    }
+
     fn key_exists(&self, key: &str) -> bool {
         self.versions.values().any(|versions| {
             versions
@@ -235,6 +309,7 @@ impl InMemoryTupleStore {
 
         let tuple_id = self.next_tuple_id;
         self.next_tuple_id += 1;
+        let key = tuple.key.clone();
         self.versions.insert(
             tuple_id,
             std::sync::Arc::new(vec![TupleVersion {
@@ -245,6 +320,7 @@ impl InMemoryTupleStore {
                 deleted_by: None,
             }]),
         );
+        self.index_key_insert(&key, tuple_id);
         Ok(tuple_id)
     }
 
@@ -265,6 +341,7 @@ impl InMemoryTupleStore {
         if self.versions.contains_key(&tuple_id) {
             return Err(StorageError::AlreadyExists);
         }
+        let key = tuple.key.clone();
         self.versions.insert(
             tuple_id,
             std::sync::Arc::new(vec![TupleVersion {
@@ -275,6 +352,7 @@ impl InMemoryTupleStore {
                 deleted_by: None,
             }]),
         );
+        self.index_key_insert(&key, tuple_id);
         Ok(tuple_id)
     }
 
@@ -404,12 +482,24 @@ impl TupleStore for InMemoryTupleStore {
         key: &str,
         visibility: Visibility,
     ) -> Result<Box<dyn IndexScanCursor + '_>, StorageError> {
-        let versions = self
-            .visible_versions(visibility)?
-            .into_iter()
-            .filter(|version| version.key == key)
-            .collect();
-        Ok(Box::new(InMemoryCursor::new(versions)))
+        // Resolve via the key index — O(matches·chain_depth + log n) — instead of filtering a full
+        // visible-version scan. Visibility filtering is unchanged, so the rows are identical to the
+        // old `visible_versions().filter(|v| v.key == key)`.
+        Ok(Box::new(InMemoryCursor::new(
+            self.index_lookup(key, visibility)?,
+        )))
+    }
+
+    // Override the O(rows) trait default (which opens an index scan and takes its first row): a
+    // by-key point fetch resolves the newest visible version directly through the key index, so an
+    // equality point-lookup is O(log n + matches) instead of scanning every chain. The newest
+    // version comes first because `index_lookup` searches each chain newest-first (`.rev()`).
+    fn tuple_fetch_by_key(
+        &self,
+        key: &str,
+        visibility: Visibility,
+    ) -> Result<Option<TupleVersion>, StorageError> {
+        Ok(self.index_lookup(key, visibility)?.into_iter().next())
     }
 }
 
@@ -853,5 +943,268 @@ mod tests {
             ),
             Err(StorageError::InvalidVisibility)
         );
+    }
+
+    // The old by-key resolution: a full visible-version scan filtered by key. The key index must
+    // return exactly these rows (visibility filtering is unchanged; only the candidate set narrows).
+    fn seq_scan_filter_oracle(
+        store: &InMemoryTupleStore,
+        key: &str,
+        visibility: Visibility,
+    ) -> Vec<TupleVersion> {
+        store
+            .visible_versions(visibility)
+            .unwrap()
+            .into_iter()
+            .filter(|version| version.key == key)
+            .collect()
+    }
+
+    fn drain_index_scan(
+        store: &InMemoryTupleStore,
+        key: &str,
+        visibility: Visibility,
+    ) -> Vec<TupleVersion> {
+        let mut cursor = store.index_scan_open(key, visibility).unwrap();
+        let mut rows = Vec::new();
+        while let Some(version) = cursor.next() {
+            rows.push(version);
+        }
+        rows
+    }
+
+    #[test]
+    fn by_key_fetch_matches_seq_scan_filter_across_chain_and_visibility() {
+        let mut store = InMemoryTupleStore::new();
+        // A second, unrelated chain so the index must actually discriminate by key (and a full scan
+        // would have to skip it).
+        store
+            .tuple_insert(
+                NewTuple {
+                    key: "acct:2".to_string(),
+                    value: "other".to_string(),
+                },
+                1,
+            )
+            .unwrap();
+        // acct:1: insert@3 -> update@5 -> delete@7, exercising a multi-version chain.
+        let acct_1 = store
+            .tuple_insert(
+                NewTuple {
+                    key: "acct:1".to_string(),
+                    value: "open".to_string(),
+                },
+                3,
+            )
+            .unwrap();
+        store.tuple_update(acct_1, "closed".to_string(), 5).unwrap();
+        store.tuple_delete(acct_1, 7).unwrap();
+
+        // At every visibility boundary around the chain's events, the index path, the cursor, and the
+        // seq-scan-filter oracle must all agree — including before the row exists and after it is
+        // deleted (both empty), and for a key that was never inserted.
+        for read_txn_id in [2, 3, 4, 5, 6, 7, 8] {
+            let visibility = Visibility { read_txn_id };
+            let oracle = seq_scan_filter_oracle(&store, "acct:1", visibility);
+            assert_eq!(
+                store.index_lookup("acct:1", visibility).unwrap(),
+                oracle,
+                "index_lookup diverged at read_txn_id={read_txn_id}"
+            );
+            assert_eq!(
+                drain_index_scan(&store, "acct:1", visibility),
+                oracle,
+                "index_scan_open diverged at read_txn_id={read_txn_id}"
+            );
+            assert_eq!(
+                store.tuple_fetch_by_key("acct:1", visibility).unwrap(),
+                oracle.into_iter().next(),
+                "tuple_fetch_by_key diverged at read_txn_id={read_txn_id}"
+            );
+        }
+
+        // Spot-check the resolved values along the chain.
+        assert_eq!(
+            store
+                .tuple_fetch_by_key("acct:1", Visibility { read_txn_id: 4 })
+                .unwrap()
+                .map(|v| v.value),
+            Some("open".to_string())
+        );
+        assert_eq!(
+            store
+                .tuple_fetch_by_key("acct:1", Visibility { read_txn_id: 6 })
+                .unwrap()
+                .map(|v| v.value),
+            Some("closed".to_string())
+        );
+        assert_eq!(
+            store
+                .tuple_fetch_by_key("acct:1", Visibility { read_txn_id: 7 })
+                .unwrap(),
+            None
+        );
+
+        // A key that was never inserted resolves empty, identical to the old filtered scan.
+        let visibility = Visibility { read_txn_id: 8 };
+        assert!(seq_scan_filter_oracle(&store, "missing", visibility).is_empty());
+        assert_eq!(
+            store.index_lookup("missing", visibility).unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            store.tuple_fetch_by_key("missing", visibility).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn by_key_fetch_resolves_multiple_distinct_keys() {
+        let mut store = InMemoryTupleStore::new();
+        for n in 1..=5 {
+            store
+                .tuple_insert(
+                    NewTuple {
+                        key: format!("acct:{n}"),
+                        value: format!("v{n}"),
+                    },
+                    1,
+                )
+                .unwrap();
+        }
+        let visibility = Visibility { read_txn_id: 1 };
+        for n in 1..=5 {
+            let key = format!("acct:{n}");
+            assert_eq!(
+                store.index_lookup(&key, visibility).unwrap(),
+                seq_scan_filter_oracle(&store, &key, visibility)
+            );
+            assert_eq!(
+                store
+                    .tuple_fetch_by_key(&key, visibility)
+                    .unwrap()
+                    .map(|v| v.value),
+                Some(format!("v{n}"))
+            );
+        }
+    }
+
+    #[test]
+    fn by_key_fetch_after_prune_that_removes_a_key() {
+        let mut store = InMemoryTupleStore::new();
+        let acct_1 = store
+            .tuple_insert(
+                NewTuple {
+                    key: "acct:1".to_string(),
+                    value: "open".to_string(),
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .tuple_insert(
+                NewTuple {
+                    key: "acct:2".to_string(),
+                    value: "keep".to_string(),
+                },
+                2,
+            )
+            .unwrap();
+        store.tuple_delete(acct_1, 5).unwrap();
+
+        // Pruning at the delete boundary drops acct:1's whole chain → its key index slot must go too.
+        let stats = store.prune_versions_deleted_at_or_before(5);
+        assert_eq!(stats.removed_tuples, 1);
+        assert!(
+            !store.key_to_tuple_ids.contains_key("acct:1"),
+            "pruned key must be removed from the key index"
+        );
+        assert!(store.key_to_tuple_ids.contains_key("acct:2"));
+
+        let visibility = Visibility { read_txn_id: 6 };
+        // The pruned key now resolves empty, and the surviving key is unaffected — both matching the
+        // seq-scan-filter oracle.
+        assert_eq!(
+            store.index_lookup("acct:1", visibility).unwrap(),
+            seq_scan_filter_oracle(&store, "acct:1", visibility)
+        );
+        assert_eq!(
+            store.tuple_fetch_by_key("acct:1", visibility).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.index_lookup("acct:2", visibility).unwrap(),
+            seq_scan_filter_oracle(&store, "acct:2", visibility)
+        );
+        assert_eq!(
+            store
+                .tuple_fetch_by_key("acct:2", visibility)
+                .unwrap()
+                .map(|v| v.value),
+            Some("keep".to_string())
+        );
+    }
+
+    // Every live version chain's current key must be present in the key index (the maintenance
+    // invariant the read path depends on). Exercised across inserts, updates, deletes, and a prune.
+    fn assert_key_index_covers_live_chains(store: &InMemoryTupleStore) {
+        for chain in store.versions.values() {
+            let key = &chain.last().expect("chain is non-empty").key;
+            let ids = store
+                .key_to_tuple_ids
+                .get(key)
+                .unwrap_or_else(|| panic!("live key {key:?} missing from key index"));
+            assert!(
+                ids.contains(&chain[0].tuple_id),
+                "live chain {} not recorded under key {key:?}",
+                chain[0].tuple_id
+            );
+        }
+    }
+
+    #[test]
+    fn key_index_covers_every_live_chain() {
+        let mut store = InMemoryTupleStore::new();
+        let a = store
+            .tuple_insert(
+                NewTuple {
+                    key: "a".to_string(),
+                    value: "1".to_string(),
+                },
+                1,
+            )
+            .unwrap();
+        let b = store
+            .tuple_insert(
+                NewTuple {
+                    key: "b".to_string(),
+                    value: "1".to_string(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .tuple_insert_reserved_key_with_id(
+                100,
+                NewTuple {
+                    key: "c".to_string(),
+                    value: "1".to_string(),
+                },
+                1,
+            )
+            .unwrap();
+        assert_key_index_covers_live_chains(&store);
+
+        store.tuple_update(a, "2".to_string(), 2).unwrap();
+        assert_key_index_covers_live_chains(&store);
+
+        store.tuple_delete(b, 3).unwrap();
+        // The chain still exists (its delete version is still retained), so its key is still indexed.
+        assert_key_index_covers_live_chains(&store);
+
+        // Prune drops b's chain; the invariant must still hold for what remains.
+        store.prune_versions_deleted_at_or_before(3);
+        assert_key_index_covers_live_chains(&store);
+        assert!(!store.key_to_tuple_ids.contains_key("b"));
     }
 }
